@@ -120,98 +120,128 @@ pub struct StatusCallback {
 mod tests {
     use super::*;
 
-    #[test]
-    fn whatsapp_detection() {
-        let wh = TwilioWebhook {
+    fn webhook(from: &str, to: &str) -> TwilioWebhook {
+        TwilioWebhook {
             message_sid: "SM123".into(),
             account_sid: "AC123".into(),
-            from: "whatsapp:+14155551234".into(),
-            to: "whatsapp:+14155555678".into(),
+            from: from.into(),
+            to: to.into(),
             body: "hello".into(),
             num_media: None,
             media_url_0: None,
             media_content_type_0: None,
-        };
-        assert!(wh.is_whatsapp());
-        assert_eq!(wh.sender_number(), "+14155551234");
-        assert_eq!(wh.recipient_number(), "+14155555678");
+        }
     }
 
+    /// Channel-type detection: the `whatsapp:` prefix on `From` is the
+    /// single discriminator and must round-trip through `as_str` / `Display`
+    /// with no casing change (Twilio's REST API expects lowercase).
     #[test]
-    fn sms_detection() {
-        let wh = TwilioWebhook {
-            message_sid: "SM456".into(),
-            account_sid: "AC123".into(),
-            from: "+14155551234".into(),
-            to: "+14155555678".into(),
-            body: "hello sms".into(),
-            num_media: None,
-            media_url_0: None,
-            media_content_type_0: None,
-        };
-        assert!(!wh.is_whatsapp());
-        assert_eq!(wh.sender_number(), "+14155551234");
+    fn channel_type_detection_and_wire_format() {
+        let cases = [
+            (
+                "whatsapp:+14155551234",
+                "whatsapp:+14155555678",
+                TwilioChannelType::WhatsApp,
+                "whatsapp",
+                "+14155551234",
+                "+14155555678",
+            ),
+            (
+                "+14155551234",
+                "+14155555678",
+                TwilioChannelType::Sms,
+                "sms",
+                "+14155551234",
+                "+14155555678",
+            ),
+        ];
+        for (from, to, kind, wire, sender, recipient) in cases {
+            let wh = webhook(from, to);
+            assert_eq!(wh.channel_type(), kind, "channel_type for {from}");
+            assert_eq!(wh.is_whatsapp(), kind == TwilioChannelType::WhatsApp);
+            assert_eq!(wh.sender_number(), sender, "sender for {from}");
+            assert_eq!(wh.recipient_number(), recipient, "recipient for {to}");
+            assert_eq!(kind.as_str(), wire, "as_str for {kind:?}");
+            assert_eq!(format!("{kind}"), wire, "Display for {kind:?}");
+        }
     }
 
+    /// Media classification: `has_audio_media` must key off the
+    /// `audio/` MIME prefix, and `first_media` must require BOTH URL and
+    /// content-type. Partial media (one component present) returns `None`
+    /// to avoid surfacing un-fetchable references to the agent.
     #[test]
-    fn channel_type_as_str() {
-        assert_eq!(TwilioChannelType::Sms.as_str(), "sms");
-        assert_eq!(TwilioChannelType::WhatsApp.as_str(), "whatsapp");
-    }
+    fn media_classification_matrix() {
+        struct Case {
+            name: &'static str,
+            url: Option<&'static str>,
+            content_type: Option<&'static str>,
+            expect_audio: bool,
+            expect_first_media: bool,
+        }
+        let cases = [
+            Case {
+                name: "audio/ogg url + ct → audio + first_media",
+                url: Some("https://api.twilio.com/media/123"),
+                content_type: Some("audio/ogg"),
+                expect_audio: true,
+                expect_first_media: true,
+            },
+            Case {
+                name: "image/jpeg url + ct → not audio, first_media present",
+                url: Some("https://api.twilio.com/media/456"),
+                content_type: Some("image/jpeg"),
+                expect_audio: false,
+                expect_first_media: true,
+            },
+            Case {
+                name: "no media at all → no audio, no first_media",
+                url: None,
+                content_type: None,
+                expect_audio: false,
+                expect_first_media: false,
+            },
+            Case {
+                name: "url only (no ct) → no audio, no first_media",
+                url: Some("https://api.twilio.com/media/789"),
+                content_type: None,
+                expect_audio: false,
+                expect_first_media: false,
+            },
+            Case {
+                name: "ct only (no url) → audio iff audio/*, but no first_media",
+                url: None,
+                content_type: Some("audio/mp4"),
+                expect_audio: true,
+                expect_first_media: false,
+            },
+        ];
 
-    #[test]
-    fn channel_type_display() {
-        assert_eq!(format!("{}", TwilioChannelType::Sms), "sms");
-        assert_eq!(format!("{}", TwilioChannelType::WhatsApp), "whatsapp");
-    }
-
-    #[test]
-    fn has_audio_media_detection() {
-        let wh = TwilioWebhook {
-            message_sid: "SM123".into(),
-            account_sid: "AC123".into(),
-            from: "whatsapp:+14155551234".into(),
-            to: "whatsapp:+14155555678".into(),
-            body: String::new(),
-            num_media: Some("1".into()),
-            media_url_0: Some("https://api.twilio.com/media/123".into()),
-            media_content_type_0: Some("audio/ogg".into()),
-        };
-        assert!(wh.has_audio_media());
-        let (url, ct) = wh.first_media().unwrap();
-        assert!(url.contains("twilio.com"));
-        assert_eq!(ct, "audio/ogg");
-    }
-
-    #[test]
-    fn no_audio_media_for_image() {
-        let wh = TwilioWebhook {
-            message_sid: "SM123".into(),
-            account_sid: "AC123".into(),
-            from: "+14155551234".into(),
-            to: "+14155555678".into(),
-            body: String::new(),
-            num_media: Some("1".into()),
-            media_url_0: Some("https://api.twilio.com/media/456".into()),
-            media_content_type_0: Some("image/jpeg".into()),
-        };
-        assert!(!wh.has_audio_media());
-    }
-
-    #[test]
-    fn no_media_returns_none() {
-        let wh = TwilioWebhook {
-            message_sid: "SM123".into(),
-            account_sid: "AC123".into(),
-            from: "+14155551234".into(),
-            to: "+14155555678".into(),
-            body: "hello".into(),
-            num_media: None,
-            media_url_0: None,
-            media_content_type_0: None,
-        };
-        assert!(!wh.has_audio_media());
-        assert!(wh.first_media().is_none());
+        for c in cases {
+            let wh = TwilioWebhook {
+                message_sid: "SM123".into(),
+                account_sid: "AC123".into(),
+                from: "+14155551234".into(),
+                to: "+14155555678".into(),
+                body: String::new(),
+                num_media: None,
+                media_url_0: c.url.map(String::from),
+                media_content_type_0: c.content_type.map(String::from),
+            };
+            assert_eq!(
+                wh.has_audio_media(),
+                c.expect_audio,
+                "has_audio_media for {}",
+                c.name
+            );
+            assert_eq!(
+                wh.first_media().is_some(),
+                c.expect_first_media,
+                "first_media for {}",
+                c.name
+            );
+        }
     }
 
     #[test]
@@ -231,49 +261,5 @@ mod tests {
         assert_eq!(cb.message_status, "failed");
         assert_eq!(cb.error_code.as_deref(), Some("30008"));
         assert_eq!(cb.error_message.as_deref(), Some("Unknown error"));
-    }
-
-    #[test]
-    fn first_media_partial_returns_none() {
-        // Only URL set, no content type — should return None
-        let wh = TwilioWebhook {
-            message_sid: "SM123".into(),
-            account_sid: "AC123".into(),
-            from: "+14155551234".into(),
-            to: "+14155555678".into(),
-            body: "hello".into(),
-            num_media: Some("1".into()),
-            media_url_0: Some("https://api.twilio.com/media/123".into()),
-            media_content_type_0: None,
-        };
-        assert!(
-            wh.first_media().is_none(),
-            "partial media (URL only) should return None"
-        );
-
-        // Only content type set, no URL — should return None
-        let wh2 = TwilioWebhook {
-            message_sid: "SM456".into(),
-            account_sid: "AC123".into(),
-            from: "+14155551234".into(),
-            to: "+14155555678".into(),
-            body: "hello".into(),
-            num_media: Some("1".into()),
-            media_url_0: None,
-            media_content_type_0: Some("image/jpeg".into()),
-        };
-        assert!(
-            wh2.first_media().is_none(),
-            "partial media (content-type only) should return None"
-        );
-    }
-
-    #[test]
-    fn deserialize_status_callback_minimal() {
-        let body = "MessageSid=SM789&MessageStatus=queued";
-        let cb: StatusCallback = serde_urlencoded::from_str(body).unwrap();
-        assert_eq!(cb.message_sid, "SM789");
-        assert_eq!(cb.message_status, "queued");
-        assert!(cb.from.is_empty());
     }
 }

@@ -171,29 +171,26 @@ fn parse_markdown_link(chars: &[char], start: usize) -> Option<(String, String, 
 mod tests {
     use super::*;
 
+    /// Every markdown→mrkdwn delimiter mapping in one table — Slack's
+    /// mrkdwn collapses both bold sigils (`**` and `__`) into single-`*`,
+    /// reframes `[text](url)` as `<url|text>`, and renders all ATX header
+    /// levels as bold (mrkdwn has no header tag).
     #[test]
-    fn bold_double_asterisk() {
-        assert_eq!(markdown_to_mrkdwn("**hello**"), "*hello*");
-    }
-
-    #[test]
-    fn bold_double_underscore() {
-        assert_eq!(markdown_to_mrkdwn("__hello__"), "*hello*");
-    }
-
-    #[test]
-    fn link_conversion() {
-        assert_eq!(
-            markdown_to_mrkdwn("[click here](https://example.com)"),
-            "<https://example.com|click here>"
-        );
-    }
-
-    #[test]
-    fn header_conversion() {
-        assert_eq!(markdown_to_mrkdwn("# Title"), "*Title*");
-        assert_eq!(markdown_to_mrkdwn("## Subtitle"), "*Subtitle*");
-        assert_eq!(markdown_to_mrkdwn("### Section"), "*Section*");
+    fn delimiters_map_to_mrkdwn_targets() {
+        let cases = [
+            ("**hello**", "*hello*"),
+            ("__hello__", "*hello*"),
+            (
+                "[click here](https://example.com)",
+                "<https://example.com|click here>",
+            ),
+            ("# Title", "*Title*"),
+            ("## Subtitle", "*Subtitle*"),
+            ("### Section", "*Section*"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(markdown_to_mrkdwn(input), expected, "input={input:?}");
+        }
     }
 
     #[test]
@@ -215,33 +212,13 @@ mod tests {
         );
     }
 
+    /// Inputs that should pass through unchanged: plain text, empty,
+    /// multi-line plain, and unmatched delimiters (no closing pair).
     #[test]
-    fn plain_text_unchanged() {
-        assert_eq!(markdown_to_mrkdwn("hello world"), "hello world");
-    }
-
-    #[test]
-    fn multiline_preserved() {
-        let input = "line 1\nline 2\nline 3";
-        assert_eq!(markdown_to_mrkdwn(input), input);
-    }
-
-    #[test]
-    fn unmatched_bold_preserved() {
-        assert_eq!(markdown_to_mrkdwn("**unclosed"), "**unclosed");
-    }
-
-    #[test]
-    fn empty_string() {
-        assert_eq!(markdown_to_mrkdwn(""), "");
-    }
-
-    #[test]
-    fn bold_then_link() {
-        // Bold and link side by side (not nested)
-        assert_eq!(
-            markdown_to_mrkdwn("**bold** and [link](https://x.com)"),
-            "*bold* and <https://x.com|link>"
-        );
+    fn passthrough_inputs_are_unchanged() {
+        let identities = ["hello world", "", "line 1\nline 2\nline 3", "**unclosed"];
+        for input in identities {
+            assert_eq!(markdown_to_mrkdwn(input), input, "no-op for {input:?}");
+        }
     }
 }

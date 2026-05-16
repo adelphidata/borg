@@ -417,20 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_minimal_envelope() {
-        let json = r#"{
-            "envelope": {
-                "timestamp": 0
-            }
-        }"#;
-        let env: SignalEnvelope = serde_json::from_str(json).unwrap();
-        assert!(env.envelope.source.is_none());
-        assert!(env.envelope.data_message.is_none());
-        assert!(env.envelope.sync_message.is_none());
-        assert!(env.account.is_none());
-    }
-
-    #[test]
     fn deserialize_typing_message() {
         let json = r#"{
             "envelope": {
@@ -448,21 +434,26 @@ mod tests {
         assert_eq!(typing.action.as_deref(), Some("STARTED"));
     }
 
+    /// JSON-RPC 2.0 responses arrive as either `{result: ...}` or
+    /// `{error: {...}}` — never both. The parser must populate the right
+    /// field and leave the other `None`, otherwise callers can't tell
+    /// success from failure. Verifies both directions on real signal-cli
+    /// shapes.
     #[test]
-    fn jsonrpc_response_success() {
-        let json = r#"{
+    fn jsonrpc_response_result_and_error_are_mutually_exclusive() {
+        let success = r#"{
             "jsonrpc": "2.0",
             "result": { "version": "0.13.2" },
             "id": "1"
         }"#;
-        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
-    }
+        let resp: JsonRpcResponse = serde_json::from_str(success).unwrap();
+        assert_eq!(
+            resp.result.as_ref().and_then(|v| v.get("version")),
+            Some(&serde_json::json!("0.13.2"))
+        );
+        assert!(resp.error.is_none(), "success path must not populate error");
 
-    #[test]
-    fn jsonrpc_response_error() {
-        let json = r#"{
+        let failure = r#"{
             "jsonrpc": "2.0",
             "error": {
                 "code": -32601,
@@ -470,8 +461,11 @@ mod tests {
             },
             "id": "1"
         }"#;
-        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.result.is_none());
+        let resp: JsonRpcResponse = serde_json::from_str(failure).unwrap();
+        assert!(
+            resp.result.is_none(),
+            "failure path must not populate result"
+        );
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");

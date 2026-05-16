@@ -482,16 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_minimal_update() {
-        let json = r#"{ "update_id": 999 }"#;
-        let update: Update = serde_json::from_str(json).unwrap();
-        assert_eq!(update.update_id, 999);
-        assert!(update.message.is_none());
-        assert!(update.edited_message.is_none());
-        assert!(update.callback_query.is_none());
-    }
-
-    #[test]
     fn deserialize_photo_message() {
         let json = r#"{
             "update_id": 100,

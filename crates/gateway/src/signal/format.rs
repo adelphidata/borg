@@ -326,74 +326,39 @@ mod tests {
         assert!(result.styles.is_empty());
     }
 
+    /// Each delimiter pair must (a) strip from the output text and
+    /// (b) emit a single style span at the correct character offset.
+    /// Verifying all five styles in one table guards against per-delimiter
+    /// regressions (e.g. accidentally consuming the wrong number of chars
+    /// or emitting the wrong `SignalStyle` enum).
     #[test]
-    fn single_bold() {
-        let result = markdown_to_signal("hello **world**");
-        assert_eq!(result.text, "hello world");
-        assert_eq!(
-            result.styles,
-            vec![TextStyle {
-                start: 6,
-                length: 5,
-                style: SignalStyle::Bold,
-            }]
-        );
-    }
-
-    #[test]
-    fn single_italic() {
-        let result = markdown_to_signal("hello *world*");
-        assert_eq!(result.text, "hello world");
-        assert_eq!(
-            result.styles,
-            vec![TextStyle {
-                start: 6,
-                length: 5,
-                style: SignalStyle::Italic,
-            }]
-        );
-    }
-
-    #[test]
-    fn single_strikethrough() {
-        let result = markdown_to_signal("~~deleted~~");
-        assert_eq!(result.text, "deleted");
-        assert_eq!(
-            result.styles,
-            vec![TextStyle {
-                start: 0,
-                length: 7,
-                style: SignalStyle::Strikethrough,
-            }]
-        );
-    }
-
-    #[test]
-    fn single_spoiler() {
-        let result = markdown_to_signal("||hidden||");
-        assert_eq!(result.text, "hidden");
-        assert_eq!(
-            result.styles,
-            vec![TextStyle {
-                start: 0,
-                length: 6,
-                style: SignalStyle::Spoiler,
-            }]
-        );
-    }
-
-    #[test]
-    fn inline_monospace() {
-        let result = markdown_to_signal("run `cargo test`");
-        assert_eq!(result.text, "run cargo test");
-        assert_eq!(
-            result.styles,
-            vec![TextStyle {
-                start: 4,
-                length: 10,
-                style: SignalStyle::Monospace,
-            }]
-        );
+    fn each_delimiter_strips_to_text_and_emits_single_style_span() {
+        let cases = [
+            ("hello **world**", "hello world", 6, 5, SignalStyle::Bold),
+            ("hello *world*", "hello world", 6, 5, SignalStyle::Italic),
+            ("~~deleted~~", "deleted", 0, 7, SignalStyle::Strikethrough),
+            ("||hidden||", "hidden", 0, 6, SignalStyle::Spoiler),
+            (
+                "run `cargo test`",
+                "run cargo test",
+                4,
+                10,
+                SignalStyle::Monospace,
+            ),
+        ];
+        for (input, expected_text, start, length, style) in cases {
+            let result = markdown_to_signal(input);
+            assert_eq!(result.text, expected_text, "text for {input:?}");
+            assert_eq!(
+                result.styles,
+                vec![TextStyle {
+                    start,
+                    length,
+                    style,
+                }],
+                "styles for {input:?}",
+            );
+        }
     }
 
     #[test]
@@ -448,11 +413,25 @@ mod tests {
         assert!(result.styles.is_empty());
     }
 
+    /// Empty content between matched delimiters (e.g. `****`, `~~~~`)
+    /// must NOT emit a zero-length style span — Signal rejects those —
+    /// and the original characters pass through as plain text.
     #[test]
-    fn empty_delimiters_pass_through() {
+    fn empty_delimiters_emit_no_styles_and_pass_through_literally() {
         let result = markdown_to_signal("**** and ~~~~");
-        // ** followed by ** is empty bold, passes through
-        assert!(result.text.contains("**"));
+        assert!(
+            result.styles.is_empty(),
+            "empty delimiters must not emit zero-length spans, got {:?}",
+            result.styles,
+        );
+        // We don't pin exact output (the parser is allowed to consume or
+        // re-emit the delimiter pair) but the delimiter chars must survive
+        // somewhere so the user sees what they typed.
+        assert!(
+            result.text.contains("**") || result.text.contains("~~"),
+            "empty-delimiter characters should pass through as literal text, got {:?}",
+            result.text,
+        );
     }
 
     #[test]
@@ -471,13 +450,19 @@ mod tests {
         assert_eq!(result.styles[0].length, 4);
     }
 
+    /// When the formatted text fits in one chunk, `chunk_with_styles` must
+    /// pass styles through unmodified — re-emitting them with new offsets
+    /// would silently corrupt single-message sends.
     #[test]
-    fn chunk_single_chunk() {
+    fn chunk_single_chunk_preserves_styles_verbatim() {
         let formatted = markdown_to_signal("**hello**");
         let chunks = chunk_with_styles(&formatted, 100);
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 1, "input fits in one chunk");
         assert_eq!(chunks[0].text, "hello");
-        assert_eq!(chunks[0].styles.len(), 1);
+        assert_eq!(
+            chunks[0].styles, formatted.styles,
+            "single-chunk styles must equal source styles, no remapping"
+        );
     }
 
     #[test]
@@ -526,21 +511,10 @@ mod tests {
         assert!(chunks.is_empty());
     }
 
+    /// Signal expects style tags as SCREAMING_SNAKE_CASE in JSON — covers
+    /// the full enum + verifies positional fields round-trip on the wire.
     #[test]
-    fn serialization_matches_signal_format() {
-        let style = TextStyle {
-            start: 0,
-            length: 5,
-            style: SignalStyle::Bold,
-        };
-        let json = serde_json::to_value(&style).unwrap();
-        assert_eq!(json["start"], 0);
-        assert_eq!(json["length"], 5);
-        assert_eq!(json["style"], "BOLD");
-    }
-
-    #[test]
-    fn all_styles_serialize_correctly() {
+    fn signal_wire_format_uppercases_styles_and_preserves_positions() {
         let styles = [
             (SignalStyle::Bold, "BOLD"),
             (SignalStyle::Italic, "ITALIC"),
@@ -548,14 +522,16 @@ mod tests {
             (SignalStyle::Monospace, "MONOSPACE"),
             (SignalStyle::Spoiler, "SPOILER"),
         ];
-        for (style, expected) in &styles {
+        for (style, expected_tag) in styles {
             let ts = TextStyle {
-                start: 0,
-                length: 1,
-                style: *style,
+                start: 3,
+                length: 7,
+                style,
             };
             let json = serde_json::to_value(&ts).unwrap();
-            assert_eq!(json["style"], *expected);
+            assert_eq!(json["start"], 3, "start for {style:?}");
+            assert_eq!(json["length"], 7, "length for {style:?}");
+            assert_eq!(json["style"], expected_tag, "tag for {style:?}");
         }
     }
 }

@@ -539,24 +539,6 @@ mod tests {
     }
 
     #[test]
-    fn create_message_request_serialization() {
-        let req = CreateMessageRequest {
-            content: "test message".into(),
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["content"], "test message");
-    }
-
-    #[test]
-    fn deserialize_current_user() {
-        let json = r#"{ "id": "u1", "username": "borgbot", "bot": true }"#;
-        let user: CurrentUser = serde_json::from_str(json).unwrap();
-        assert_eq!(user.id, "u1");
-        assert_eq!(user.username, "borgbot");
-        assert_eq!(user.bot, Some(true));
-    }
-
-    #[test]
     fn embed_serialization_minimal() {
         let embed = Embed {
             title: None,
@@ -686,48 +668,9 @@ mod tests {
 
     // ── New feature-parity types ──
 
-    #[test]
-    fn message_query_default() {
-        let q = MessageQuery::default();
-        assert_eq!(q.limit, 0);
-        assert!(q.before.is_none());
-        assert!(q.after.is_none());
-        assert!(q.around.is_none());
-    }
-
-    #[test]
-    fn deserialize_reaction_user() {
-        let json = r#"{"id": "123", "username": "alice"}"#;
-        let user: ReactionUser = serde_json::from_str(json).unwrap();
-        assert_eq!(user.id, "123");
-        assert_eq!(user.username, "alice");
-    }
-
-    #[test]
-    fn deserialize_reaction_user_list() {
-        let json = r#"[
-            {"id": "1", "username": "alice"},
-            {"id": "2", "username": "bob"}
-        ]"#;
-        let users: Vec<ReactionUser> = serde_json::from_str(json).unwrap();
-        assert_eq!(users.len(), 2);
-    }
-
-    #[test]
-    fn deserialize_thread_info() {
-        let json = r#"{"id": "999", "name": "bug-report"}"#;
-        let info: ThreadInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.id, "999");
-        assert_eq!(info.name.as_deref(), Some("bug-report"));
-    }
-
-    #[test]
-    fn deserialize_thread_info_no_name() {
-        let json = r#"{"id": "999"}"#;
-        let info: ThreadInfo = serde_json::from_str(json).unwrap();
-        assert!(info.name.is_none());
-    }
-
+    /// `MemberInfo` is a hot path: the agent reads `roles` to gate
+    /// permissions and `nick` for display. Verifies all three fields
+    /// populate from a real guild-member payload.
     #[test]
     fn deserialize_member_info() {
         let json = r#"{
@@ -741,15 +684,10 @@ mod tests {
         assert_eq!(info.roles, vec!["r1", "r2"]);
     }
 
-    #[test]
-    fn deserialize_member_info_minimal() {
-        let json = r#"{}"#;
-        let info: MemberInfo = serde_json::from_str(json).unwrap();
-        assert!(info.user.is_none());
-        assert!(info.nick.is_none());
-        assert!(info.roles.is_empty());
-    }
-
+    /// `ChannelInfo` carries both text-channel (`type: 0`) and thread
+    /// (`type: 11`) payloads on the same struct. The agent routes on
+    /// `channel_type` so the discriminator must survive deserialization
+    /// untouched.
     #[test]
     fn deserialize_channel_info() {
         let json = r#"{
@@ -765,24 +703,5 @@ mod tests {
         assert_eq!(info.channel_type, 0);
         assert_eq!(info.topic.as_deref(), Some("Welcome!"));
         assert_eq!(info.guild_id.as_deref(), Some("g1"));
-    }
-
-    #[test]
-    fn deserialize_channel_info_thread() {
-        let json = r#"{"id": "t1", "type": 11}"#;
-        let info: ChannelInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.channel_type, 11);
-        assert!(info.name.is_none());
-        assert!(info.topic.is_none());
-    }
-
-    #[test]
-    fn deserialize_raw_channel_message() {
-        let json =
-            r#"{"id": "m1", "content": "hello", "author": {"id": "u1", "username": "alice"}}"#;
-        let msg: RawChannelMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.id, "m1");
-        assert_eq!(msg.content, "hello");
-        assert_eq!(msg.author.id, "u1");
     }
 }

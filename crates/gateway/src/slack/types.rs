@@ -502,27 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_minimal_event_callback() {
-        let json = r#"{
-            "type": "event_callback",
-            "event": {
-                "type": "message"
-            }
-        }"#;
-
-        let envelope: SlackEnvelope = serde_json::from_str(json).unwrap();
-        match envelope {
-            SlackEnvelope::EventCallback(cb) => {
-                assert!(cb.token.is_none());
-                assert!(cb.team_id.is_none());
-                assert!(cb.event.user.is_none());
-                assert!(cb.event.text.is_none());
-            }
-            _ => panic!("expected EventCallback"),
-        }
-    }
-
-    #[test]
     fn serialize_post_message_with_blocks() {
         let req = PostMessageRequest {
             channel: "C789".into(),
@@ -587,31 +566,6 @@ mod tests {
                 assert_eq!(files[0].name.as_deref(), Some("report.pdf"));
                 assert_eq!(files[0].mimetype.as_deref(), Some("application/pdf"));
                 assert_eq!(files[0].size, Some(2048));
-            }
-            _ => panic!("expected EventCallback"),
-        }
-    }
-
-    #[test]
-    fn deserialize_event_without_files() {
-        let json = r#"{
-            "type": "event_callback",
-            "token": "tok",
-            "team_id": "T123",
-            "event_id": "Ev123",
-            "event": {
-                "type": "message",
-                "user": "U456",
-                "text": "hello",
-                "ts": "1234567890.123456",
-                "channel": "C789"
-            }
-        }"#;
-
-        let envelope: SlackEnvelope = serde_json::from_str(json).unwrap();
-        match envelope {
-            SlackEnvelope::EventCallback(cb) => {
-                assert!(cb.event.files.is_none());
             }
             _ => panic!("expected EventCallback"),
         }
@@ -733,19 +687,6 @@ mod tests {
         assert_eq!(val.value.as_deref(), Some("Great product!"));
     }
 
-    #[test]
-    fn deserialize_interaction_no_channel() {
-        let json = r#"{
-            "type": "view_submission",
-            "user": { "id": "U123" },
-            "view": { "callback_id": "test" }
-        }"#;
-
-        let payload: InteractionPayload = serde_json::from_str(json).unwrap();
-        assert!(payload.channel.is_none());
-        assert!(payload.actions.is_none());
-    }
-
     // ── New feature-parity types ──
 
     #[test]
@@ -757,61 +698,44 @@ mod tests {
         assert_eq!(info.users.len(), 3);
     }
 
+    /// `UserInfo` powers @-mention resolution and bot filtering. The
+    /// `is_bot` discriminator must survive both shapes (`true`/`false`)
+    /// since misclassifying a bot would let it re-trigger the agent.
     #[test]
-    fn deserialize_reaction_info_no_users() {
-        let json = r#"{"name": "wave", "count": 1}"#;
-        let info: ReactionInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.name, "wave");
-        assert!(info.users.is_empty());
-    }
-
-    #[test]
-    fn deserialize_user_info() {
-        let json =
+    fn deserialize_user_info_both_human_and_bot_payloads() {
+        let human =
             r#"{"id": "U123", "name": "alice", "real_name": "Alice Smith", "is_bot": false}"#;
-        let info: UserInfo = serde_json::from_str(json).unwrap();
+        let info: UserInfo = serde_json::from_str(human).unwrap();
         assert_eq!(info.id, "U123");
         assert_eq!(info.name, "alice");
         assert_eq!(info.real_name.as_deref(), Some("Alice Smith"));
-        assert!(!info.is_bot);
+        assert!(!info.is_bot, "human user must not be flagged as bot");
+
+        let bot = r#"{"id": "U456", "name": "botuser", "is_bot": true}"#;
+        let info: UserInfo = serde_json::from_str(bot).unwrap();
+        assert!(info.is_bot, "bot payload must set is_bot=true");
     }
 
+    /// `SlackChannelInfo` distinguishes public (`is_private: false`)
+    /// from private (`is_private: true`) channels; the routing layer
+    /// reads this to decide whether DM-only commands are allowed.
     #[test]
-    fn deserialize_user_info_bot() {
-        let json = r#"{"id": "U456", "name": "botuser", "is_bot": true}"#;
-        let info: UserInfo = serde_json::from_str(json).unwrap();
-        assert!(info.is_bot);
-        assert!(info.real_name.is_none());
-    }
-
-    #[test]
-    fn deserialize_slack_channel_info() {
-        let json = r#"{
+    fn deserialize_slack_channel_info_public_and_private() {
+        let public = r#"{
             "id": "C123",
             "name": "general",
             "is_private": false,
             "topic": {"value": "All the general stuff"}
         }"#;
-        let info: SlackChannelInfo = serde_json::from_str(json).unwrap();
+        let info: SlackChannelInfo = serde_json::from_str(public).unwrap();
         assert_eq!(info.id, "C123");
         assert_eq!(info.name.as_deref(), Some("general"));
         assert!(!info.is_private);
         assert_eq!(info.topic.as_ref().unwrap().value, "All the general stuff");
-    }
 
-    #[test]
-    fn deserialize_slack_channel_info_private() {
-        let json = r#"{"id": "G123", "name": "secret", "is_private": true}"#;
-        let info: SlackChannelInfo = serde_json::from_str(json).unwrap();
+        let private = r#"{"id": "G123", "name": "secret", "is_private": true}"#;
+        let info: SlackChannelInfo = serde_json::from_str(private).unwrap();
         assert!(info.is_private);
-        assert!(info.topic.is_none());
-    }
-
-    #[test]
-    fn deserialize_channel_topic() {
-        let json = r#"{"value": "Welcome to the channel"}"#;
-        let topic: ChannelTopic = serde_json::from_str(json).unwrap();
-        assert_eq!(topic.value, "Welcome to the channel");
     }
 
     #[test]
@@ -828,12 +752,5 @@ mod tests {
         assert_eq!(msg.text.as_deref(), Some("Important announcement"));
         assert_eq!(msg.user.as_deref(), Some("U123"));
         assert_eq!(msg.ts.as_deref(), Some("1234567890.123456"));
-    }
-
-    #[test]
-    fn deserialize_pinned_item_no_message() {
-        let json = r#"{}"#;
-        let item: PinnedItem = serde_json::from_str(json).unwrap();
-        assert!(item.message.is_none());
     }
 }

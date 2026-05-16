@@ -21,42 +21,33 @@ impl MessageDeduplicator {
 mod tests {
     use super::*;
 
+    /// Signal's dedup key is the tuple `(sender, timestamp)` — not just one
+    /// component. Verifies the macro key extraction uses both: messages that
+    /// share only one component must still be admitted as new. (Generic LRU
+    /// behavior is covered by `BoundedDedup` tests; only the tuple-key axis
+    /// is signal-specific.)
     #[test]
-    fn new_message_not_duplicate() {
+    fn tuple_key_uses_both_sender_and_timestamp() {
         let mut dedup = MessageDeduplicator::with_capacity(100);
-        assert!(!dedup.seen("+15551234567", 1700000000000));
-    }
+        let sender_a = "+15551234567";
+        let sender_b = "+15559876543";
+        let ts1 = 1_700_000_000_000_i64;
+        let ts2 = 1_700_000_001_000_i64;
 
-    #[test]
-    fn same_message_is_duplicate() {
-        let mut dedup = MessageDeduplicator::with_capacity(100);
-        assert!(!dedup.seen("+15551234567", 1700000000000));
-        assert!(dedup.seen("+15551234567", 1700000000000));
-    }
-
-    #[test]
-    fn different_sender_same_timestamp_not_duplicate() {
-        let mut dedup = MessageDeduplicator::with_capacity(100);
-        assert!(!dedup.seen("+15551234567", 1700000000000));
-        assert!(!dedup.seen("+15559876543", 1700000000000));
-    }
-
-    #[test]
-    fn same_sender_different_timestamp_not_duplicate() {
-        let mut dedup = MessageDeduplicator::with_capacity(100);
-        assert!(!dedup.seen("+15551234567", 1700000000000));
-        assert!(!dedup.seen("+15551234567", 1700000001000));
-    }
-
-    #[test]
-    fn eviction_on_capacity() {
-        let mut dedup = MessageDeduplicator::with_capacity(3);
-        assert!(!dedup.seen("a", 1));
-        assert!(!dedup.seen("b", 2));
-        assert!(!dedup.seen("c", 3));
-        // Capacity full — next insert evicts oldest ("a", 1)
-        assert!(!dedup.seen("d", 4));
-        // "a" was evicted → treated as new again.
-        assert!(!dedup.seen("a", 1));
+        assert!(!dedup.seen(sender_a, ts1), "first sighting must be fresh");
+        assert!(
+            dedup.seen(sender_a, ts1),
+            "exact (sender, ts) repeat must dedupe"
+        );
+        assert!(
+            !dedup.seen(sender_b, ts1),
+            "same ts, different sender must NOT dedupe \
+             (timestamp collisions across senders are expected on Signal)"
+        );
+        assert!(
+            !dedup.seen(sender_a, ts2),
+            "same sender, different ts must NOT dedupe \
+             (a new message from the same person)"
+        );
     }
 }

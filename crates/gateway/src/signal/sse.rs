@@ -222,46 +222,46 @@ fn calculate_backoff(consecutive_errors: u32) -> Duration {
 mod tests {
     use super::*;
 
+    /// signal/sse.rs is a thin adapter over `resilience::backoff` —
+    /// the only signal-specific invariants are (a) the first attempt
+    /// floors at `MIN_BACKOFF` and (b) any number of attempts caps at
+    /// `MAX_BACKOFF + jitter`. Exhaustive backoff curve testing lives in
+    /// `resilience::backoff` upstream.
     #[test]
-    fn backoff_increases_with_errors() {
-        let b1 = calculate_backoff(1);
-        let b3 = calculate_backoff(3);
-        assert!(b1.as_secs_f64() >= MIN_BACKOFF.as_secs_f64());
-        // b3 base (without jitter) should be larger than b1 base
-        let b3_max = MAX_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION);
-        assert!(b3.as_secs_f64() <= b3_max);
+    fn backoff_floors_at_min_and_caps_at_max_plus_jitter() {
+        let max_with_jitter = MAX_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION);
+
+        let first = calculate_backoff(1);
+        assert!(
+            first.as_secs_f64() >= MIN_BACKOFF.as_secs_f64(),
+            "first attempt must not be below MIN_BACKOFF, got {first:?}"
+        );
+        assert!(
+            first.as_secs_f64() <= MIN_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION) + 0.01,
+            "first attempt must not exceed MIN_BACKOFF + jitter, got {first:?}"
+        );
+
+        let saturated = calculate_backoff(100);
+        assert!(
+            saturated.as_secs_f64() <= max_with_jitter,
+            "any attempt count must cap at MAX_BACKOFF + jitter, got {saturated:?}"
+        );
     }
 
+    /// `url_encode` builds the SSE subscription URL — `+` MUST become
+    /// `%2B` (Signal phone numbers contain `+`, and `+` is a space in
+    /// query strings) and reserved chars MUST percent-encode. Pure
+    /// passthrough chars (alnum) stay unchanged.
     #[test]
-    fn backoff_capped_at_max() {
-        let b = calculate_backoff(100);
-        assert!(b.as_secs_f64() <= MAX_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION));
-    }
-
-    #[test]
-    fn backoff_first_attempt() {
-        let b = calculate_backoff(1);
-        // First attempt: base = MIN_BACKOFF * factor^0 = MIN_BACKOFF
-        assert!(b.as_secs_f64() >= MIN_BACKOFF.as_secs_f64());
-        assert!(b.as_secs_f64() <= MIN_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION) + 0.01);
-    }
-
-    #[test]
-    fn url_encode_phone_number() {
-        let encoded = url_encode("+15559876543");
-        assert_eq!(encoded, "%2B15559876543");
-    }
-
-    #[test]
-    fn url_encode_plain_string() {
-        let encoded = url_encode("hello");
-        assert_eq!(encoded, "hello");
-    }
-
-    #[test]
-    fn url_encode_special_chars() {
-        let encoded = url_encode("a b+c&d=e");
-        assert_eq!(encoded, "a%20b%2Bc%26d%3De");
+    fn url_encode_percent_encodes_reserved_chars_and_preserves_alnum() {
+        let cases = [
+            ("+15559876543", "%2B15559876543"),
+            ("hello", "hello"),
+            ("a b+c&d=e", "a%20b%2Bc%26d%3De"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(url_encode(input), expected, "url_encode({input:?})");
+        }
     }
 
     #[test]

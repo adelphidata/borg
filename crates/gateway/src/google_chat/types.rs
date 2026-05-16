@@ -212,90 +212,55 @@ mod tests {
         assert_eq!(space.space_type.as_deref(), Some("ROOM"));
     }
 
+    /// EventType is deserialized from a string tag via a hand-rolled
+    /// `Deserialize` impl. The Google Chat API spec defines the four
+    /// well-known tags below; everything else MUST fall back to
+    /// `Unknown(original_string)` so unhandled events surface in logs
+    /// rather than failing the webhook with a 400.
     #[test]
-    fn deserialize_added_to_space() {
-        let json = r#"{
-            "type": "ADDED_TO_SPACE",
-            "space": {
-                "name": "spaces/SPACE1",
-                "type": "DM"
-            },
-            "user": {
-                "name": "users/USER1",
-                "displayName": "Alice",
-                "type": "HUMAN"
-            }
-        }"#;
-
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, EventType::AddedToSpace);
-        assert!(event.message.is_none());
+    fn event_type_tag_mapping_with_unknown_fallback() {
+        let cases = [
+            ("MESSAGE", EventType::Message),
+            ("ADDED_TO_SPACE", EventType::AddedToSpace),
+            ("REMOVED_FROM_SPACE", EventType::RemovedFromSpace),
+            ("CARD_CLICKED", EventType::CardClicked),
+            (
+                "WIDGET_UPDATED",
+                EventType::Unknown("WIDGET_UPDATED".into()),
+            ),
+            ("", EventType::Unknown(String::new())),
+        ];
+        for (tag, expected) in cases {
+            let json = format!(r#"{{"type": "{tag}"}}"#);
+            let event: ChatEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event.event_type, expected, "tag={tag:?}");
+        }
     }
 
+    /// `thread` MUST be omitted entirely (not `"thread": null`) when absent
+    /// — Google Chat rejects null thread refs. Verified at the JSON-key
+    /// level via `skip_serializing_if`.
     #[test]
-    fn deserialize_removed_from_space() {
-        let json = r#"{"type": "REMOVED_FROM_SPACE", "space": {"name": "spaces/SPACE1"}}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, EventType::RemovedFromSpace);
-    }
-
-    #[test]
-    fn deserialize_card_clicked() {
-        let json = r#"{"type": "CARD_CLICKED"}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, EventType::CardClicked);
-    }
-
-    #[test]
-    fn deserialize_unknown_event_type() {
-        let json = r#"{"type": "WIDGET_UPDATED"}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            event.event_type,
-            EventType::Unknown("WIDGET_UPDATED".into())
-        );
-    }
-
-    #[test]
-    fn deserialize_minimal_event() {
-        let json = r#"{"type": "MESSAGE"}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, EventType::Message);
-        assert!(event.message.is_none());
-        assert!(event.user.is_none());
-        assert!(event.space.is_none());
-        assert!(event.token.is_none());
-        assert!(event.event_time.is_none());
-    }
-
-    #[test]
-    fn serialize_chat_response() {
-        let resp = ChatResponse::new("Hello!");
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["text"], "Hello!");
-    }
-
-    #[test]
-    fn serialize_create_message_request_with_thread() {
-        let req = CreateMessageRequest {
+    fn create_message_request_omits_thread_when_none() {
+        let with_thread = CreateMessageRequest {
             text: "reply".into(),
             thread: Some(ThreadRequest {
                 name: "spaces/SPACE1/threads/THREAD1".into(),
             }),
         };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["text"], "reply");
-        assert_eq!(json["thread"]["name"], "spaces/SPACE1/threads/THREAD1");
-    }
+        let v = serde_json::to_value(&with_thread).unwrap();
+        assert_eq!(v["text"], "reply");
+        assert_eq!(v["thread"]["name"], "spaces/SPACE1/threads/THREAD1");
 
-    #[test]
-    fn serialize_create_message_request_without_thread() {
-        let req = CreateMessageRequest {
+        let without_thread = CreateMessageRequest {
             text: "hello".into(),
             thread: None,
         };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["text"], "hello");
-        assert!(json.get("thread").is_none());
+        let v = serde_json::to_value(&without_thread).unwrap();
+        assert_eq!(v["text"], "hello");
+        assert!(
+            v.get("thread").is_none(),
+            "thread must be omitted (not null) when None"
+        );
     }
 }

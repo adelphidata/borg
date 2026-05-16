@@ -913,18 +913,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/auth.test"),
-            "https://slack.com/api/auth.test"
-        );
-        assert_eq!(
-            format!("{SLACK_API_BASE}/chat.postMessage"),
-            "https://slack.com/api/chat.postMessage"
-        );
-    }
-
-    #[test]
     fn post_message_request_serialization() {
         let req = PostMessageRequest {
             channel: "C789".into(),
@@ -960,260 +948,91 @@ mod tests {
         assert_eq!(chunks[2].len(), 500);
     }
 
+    /// Slack returns string error codes; the retry layer keys off
+    /// `is_fatal_slack_error` to decide whether the request is worth
+    /// re-attempting. Misclassifying an auth/permission error as transient
+    /// would burn retry budget on a guaranteed-failure call;
+    /// misclassifying a `ratelimited` or transient 5xx as fatal would
+    /// surface a permanent failure to the user when the channel could have
+    /// recovered. Both directions must be exercised.
     #[test]
-    fn set_thread_status_serializes_correct_json() {
-        let body = serde_json::json!({
-            "channel_id": "C123",
-            "thread_ts": "1234567890.123456",
-            "status": "is typing...",
-        });
-        assert_eq!(body["channel_id"], "C123");
-        assert_eq!(body["thread_ts"], "1234567890.123456");
-        assert_eq!(body["status"], "is typing...");
-    }
-
-    #[test]
-    fn reaction_serializes_correct_json() {
-        let body = serde_json::json!({
-            "channel": "C123",
-            "timestamp": "1234567890.123456",
-            "name": "thinking_face",
-        });
-        assert_eq!(body["channel"], "C123");
-        assert_eq!(body["timestamp"], "1234567890.123456");
-        assert_eq!(body["name"], "thinking_face");
-    }
-
-    #[test]
-    fn circuit_breaker_initialized() {
-        let client = SlackClient::new("xoxb-test").unwrap();
-        assert!(!client.circuit_breaker.is_open());
-    }
-
-    #[test]
-    fn file_upload_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/files.upload"),
-            "https://slack.com/api/files.upload"
-        );
-    }
-
-    #[test]
-    fn is_fatal_slack_error_classifies_auth_errors() {
-        assert!(is_fatal_slack_error("invalid_auth"));
-        assert!(is_fatal_slack_error("token_revoked"));
-        assert!(is_fatal_slack_error("account_inactive"));
-        assert!(is_fatal_slack_error("not_authed"));
-        assert!(is_fatal_slack_error("token_expired"));
-    }
-
-    #[test]
-    fn is_fatal_slack_error_classifies_permission_errors() {
-        assert!(is_fatal_slack_error("missing_scope"));
-        assert!(is_fatal_slack_error("no_permission"));
-        assert!(is_fatal_slack_error("channel_not_found"));
-        assert!(is_fatal_slack_error("not_in_channel"));
-        assert!(is_fatal_slack_error("is_archived"));
-    }
-
-    #[test]
-    fn is_fatal_slack_error_excludes_transient_errors() {
-        // These should NOT be fatal — they can succeed on retry.
-        assert!(!is_fatal_slack_error("ratelimited"));
-        assert!(!is_fatal_slack_error("server_error"));
-        assert!(!is_fatal_slack_error("service_unavailable"));
-        assert!(!is_fatal_slack_error("timeout"));
-        assert!(!is_fatal_slack_error("unknown_error"));
-        assert!(!is_fatal_slack_error(""));
-    }
-
-    #[test]
-    fn slack_error_hint_present_for_known_errors() {
-        assert!(slack_error_hint("invalid_auth").contains("SLACK_BOT_TOKEN"));
-        assert!(slack_error_hint("not_in_channel").contains("invite"));
-        assert!(slack_error_hint("channel_not_found").contains("channel"));
-        assert!(slack_error_hint("missing_scope").contains("scope"));
-        assert!(slack_error_hint("is_archived").contains("archived"));
-    }
-
-    #[test]
-    fn slack_error_hint_empty_for_unknown() {
-        assert_eq!(slack_error_hint("ratelimited"), "");
-        assert_eq!(slack_error_hint(""), "");
-    }
-
-    // ── New API method tests ──
-
-    #[test]
-    fn edit_message_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/chat.update"),
-            "https://slack.com/api/chat.update"
-        );
-    }
-
-    #[test]
-    fn delete_message_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/chat.delete"),
-            "https://slack.com/api/chat.delete"
-        );
-    }
-
-    #[test]
-    fn fetch_thread_replies_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/conversations.replies"),
-            "https://slack.com/api/conversations.replies"
-        );
-    }
-
-    #[test]
-    fn list_reactions_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/reactions.get"),
-            "https://slack.com/api/reactions.get"
-        );
-    }
-
-    #[test]
-    fn pin_message_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/pins.add"),
-            "https://slack.com/api/pins.add"
-        );
-    }
-
-    #[test]
-    fn unpin_message_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/pins.remove"),
-            "https://slack.com/api/pins.remove"
-        );
-    }
-
-    #[test]
-    fn list_pins_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/pins.list"),
-            "https://slack.com/api/pins.list"
-        );
-    }
-
-    #[test]
-    fn get_user_info_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/users.info"),
-            "https://slack.com/api/users.info"
-        );
-    }
-
-    #[test]
-    fn list_channels_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/conversations.list"),
-            "https://slack.com/api/conversations.list"
-        );
-    }
-
-    #[test]
-    fn get_channel_info_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/conversations.info"),
-            "https://slack.com/api/conversations.info"
-        );
-    }
-
-    #[test]
-    fn views_endpoints_url_construction() {
-        for method in ["views.open", "views.update", "views.publish"] {
-            assert_eq!(
-                format!("{SLACK_API_BASE}/{method}"),
-                format!("https://slack.com/api/{method}")
+    fn is_fatal_slack_error_separates_permanent_from_retryable() {
+        let fatal = [
+            // Auth + token state — never retryable.
+            "invalid_auth",
+            "token_revoked",
+            "account_inactive",
+            "not_authed",
+            "token_expired",
+            // Permission / topology — won't change on retry.
+            "missing_scope",
+            "no_permission",
+            "channel_not_found",
+            "not_in_channel",
+            "is_archived",
+            // Pin-specific terminal states.
+            "already_pinned",
+            "not_pinned",
+            "message_not_found",
+        ];
+        let retryable = [
+            "ratelimited",
+            "server_error",
+            "service_unavailable",
+            "timeout",
+            "unknown_error",
+            "",
+        ];
+        for code in fatal {
+            assert!(
+                is_fatal_slack_error(code),
+                "{code:?} must classify as fatal (no retry)"
+            );
+        }
+        for code in retryable {
+            assert!(
+                !is_fatal_slack_error(code),
+                "{code:?} must classify as retryable"
             );
         }
     }
 
+    /// Operator-facing hints for known fatal codes MUST contain the
+    /// keyword the user is most likely to grep for when fixing the
+    /// underlying problem (e.g. the env-var name for invalid_auth, the
+    /// verb "invite" for not_in_channel). Unknown codes return an empty
+    /// hint so callers can fall back to the raw code.
     #[test]
-    fn views_open_body_serialization_carries_trigger_id_and_view() {
-        // views.open requires both fields. Confirm their names + that the
-        // view payload survives round-trip without flattening.
+    fn slack_error_hint_targets_recovery_keyword_per_fatal_code() {
+        let cases = [
+            ("invalid_auth", "SLACK_BOT_TOKEN"),
+            ("not_in_channel", "invite"),
+            ("channel_not_found", "channel"),
+            ("missing_scope", "scope"),
+            ("is_archived", "archived"),
+        ];
+        for (code, keyword) in cases {
+            let hint = slack_error_hint(code);
+            assert!(
+                hint.contains(keyword),
+                "hint for {code:?} must contain {keyword:?}, got {hint:?}"
+            );
+        }
+        assert_eq!(slack_error_hint("ratelimited"), "");
+        assert_eq!(slack_error_hint(""), "");
+    }
+
+    /// `views.open` requires both `trigger_id` and `view` and rejects
+    /// the request if the view payload is flattened. Verifies the body
+    /// shape survives the surrounding object construction without
+    /// reshaping.
+    #[test]
+    fn views_open_body_carries_trigger_id_and_nested_view() {
         let view = serde_json::json!({"type": "modal", "title": {"type":"plain_text","text":"Hi"}});
         let body = serde_json::json!({"trigger_id": "tr1", "view": view });
         assert_eq!(body["trigger_id"], "tr1");
         assert_eq!(body["view"]["type"], "modal");
         assert_eq!(body["view"]["title"]["text"], "Hi");
-    }
-
-    #[test]
-    fn send_ephemeral_url_construction() {
-        assert_eq!(
-            format!("{SLACK_API_BASE}/chat.postEphemeral"),
-            "https://slack.com/api/chat.postEphemeral"
-        );
-    }
-
-    #[test]
-    fn edit_message_body_serialization() {
-        let body = serde_json::json!({
-            "channel": "C123",
-            "ts": "1234567890.123456",
-            "text": "updated text",
-        });
-        assert_eq!(body["channel"], "C123");
-        assert_eq!(body["ts"], "1234567890.123456");
-        assert_eq!(body["text"], "updated text");
-    }
-
-    #[test]
-    fn delete_message_body_serialization() {
-        let body = serde_json::json!({
-            "channel": "C123",
-            "ts": "1234567890.123456",
-        });
-        assert_eq!(body["channel"], "C123");
-        assert_eq!(body["ts"], "1234567890.123456");
-    }
-
-    #[test]
-    fn pin_message_body_serialization() {
-        let body = serde_json::json!({
-            "channel": "C123",
-            "timestamp": "1234567890.123456",
-        });
-        assert_eq!(body["channel"], "C123");
-        assert_eq!(body["timestamp"], "1234567890.123456");
-    }
-
-    #[test]
-    fn send_ephemeral_body_serialization() {
-        let mut body = serde_json::json!({
-            "channel": "C123",
-            "user": "U456",
-            "text": "only you can see this",
-        });
-        body["thread_ts"] = serde_json::Value::String("1234567890.123456".into());
-        assert_eq!(body["channel"], "C123");
-        assert_eq!(body["user"], "U456");
-        assert_eq!(body["text"], "only you can see this");
-        assert_eq!(body["thread_ts"], "1234567890.123456");
-    }
-
-    #[test]
-    fn send_ephemeral_body_no_thread() {
-        let body = serde_json::json!({
-            "channel": "C123",
-            "user": "U456",
-            "text": "ephemeral msg",
-        });
-        assert!(body.get("thread_ts").is_none());
-    }
-
-    #[test]
-    fn is_fatal_slack_error_classifies_pin_errors() {
-        assert!(is_fatal_slack_error("already_pinned"));
-        assert!(is_fatal_slack_error("not_pinned"));
-        assert!(is_fatal_slack_error("message_not_found"));
     }
 
     #[test]

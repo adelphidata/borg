@@ -21,14 +21,6 @@ impl EventDeduplicator {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            by_event_id: BoundedDedup::new(capacity),
-            by_channel_ts: BoundedDedup::new(capacity),
-        }
-    }
-
     /// Returns `true` if this `event_id` has been seen before.
     pub fn is_duplicate(&mut self, event_id: &str) -> bool {
         self.by_event_id.is_duplicate(&event_id.to_string())
@@ -55,81 +47,55 @@ impl Default for EventDeduplicator {
 mod tests {
     use super::*;
 
+    /// Slack's `EventDeduplicator` differs from the other channels by holding
+    /// **two independent keyspaces**: `event_id` and `(channel, ts)`. Per
+    /// CLAUDE.md, only the slack-specific invariant — that the two axes do
+    /// not cross-pollute — is worth testing here; generic first-seen / LRU
+    /// behavior is covered by `BoundedDedup` tests upstream.
     #[test]
-    fn first_seen_not_duplicate() {
+    fn event_id_and_channel_ts_keyspaces_are_independent() {
         let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate("Ev001"));
-    }
 
-    #[test]
-    fn second_seen_is_duplicate() {
-        let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate("Ev001"));
-        assert!(dedup.is_duplicate("Ev001"));
-    }
-
-    #[test]
-    fn different_ids_not_duplicate() {
-        let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate("Ev001"));
-        assert!(!dedup.is_duplicate("Ev002"));
-        assert!(!dedup.is_duplicate("Ev003"));
-    }
-
-    #[test]
-    fn eviction_at_capacity() {
-        let mut dedup = EventDeduplicator::with_capacity(3);
-
-        assert!(!dedup.is_duplicate("Ev1"));
-        assert!(!dedup.is_duplicate("Ev2"));
-        assert!(!dedup.is_duplicate("Ev3"));
-        // Capacity full — next insert evicts Ev1
-        assert!(!dedup.is_duplicate("Ev4"));
-        // Ev1 was evicted, no longer detected as duplicate
-        assert!(!dedup.is_duplicate("Ev1"));
-        // Ev2 was evicted by Ev1's re-insertion
-        assert!(!dedup.is_duplicate("Ev2"));
-    }
-
-    #[test]
-    fn duplicate_after_many_inserts() {
-        let mut dedup = EventDeduplicator::new();
-        for i in 1..=500 {
-            assert!(!dedup.is_duplicate(&format!("Ev{i}")));
-        }
-        // All 500 should still be in the buffer (capacity=5000)
-        assert!(dedup.is_duplicate("Ev1"));
-        assert!(dedup.is_duplicate("Ev500"));
-    }
-
-    #[test]
-    fn channel_ts_dedup_first_seen() {
-        let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate_channel_ts("C123", "1234567890.111111"));
-    }
-
-    #[test]
-    fn channel_ts_dedup_second_seen() {
-        let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate_channel_ts("C123", "1234567890.111111"));
-        assert!(dedup.is_duplicate_channel_ts("C123", "1234567890.111111"));
-    }
-
-    #[test]
-    fn channel_ts_dedup_different_channel_same_ts() {
-        let mut dedup = EventDeduplicator::new();
-        assert!(!dedup.is_duplicate_channel_ts("C123", "1234567890.111111"));
-        assert!(!dedup.is_duplicate_channel_ts("C456", "1234567890.111111"));
-    }
-
-    #[test]
-    fn channel_ts_dedup_independent_of_event_id() {
-        let mut dedup = EventDeduplicator::new();
-        // Different event_ids, same channel+ts — second should be a duplicate
-        // on the (channel, ts) axis even though event_ids differ.
+        // Same (channel, ts) twice should dedupe even when interleaved with
+        // unrelated `event_id` traffic — Slack delivers `message` and
+        // `app_mention` as distinct events for one user action.
         assert!(!dedup.is_duplicate("EvA"));
         assert!(!dedup.is_duplicate_channel_ts("C1", "111.222"));
         assert!(!dedup.is_duplicate("EvB"));
-        assert!(dedup.is_duplicate_channel_ts("C1", "111.222"));
+        assert!(
+            dedup.is_duplicate_channel_ts("C1", "111.222"),
+            "(channel, ts) must dedupe regardless of event_id traffic"
+        );
+
+        // And the inverse: `event_id` keyspace must not mark a fresh
+        // (channel, ts) tuple as seen just because the same string appeared
+        // as an event_id.
+        let mut dedup2 = EventDeduplicator::new();
+        assert!(!dedup2.is_duplicate("C9:999.000"));
+        assert!(
+            !dedup2.is_duplicate_channel_ts("C9", "999.000"),
+            "event_id traffic must not poison the (channel, ts) axis"
+        );
+    }
+
+    /// Both `(channel, ts)` components must participate in the key. A bug
+    /// that hashed only the channel (or only the timestamp) would silently
+    /// drop legitimate messages.
+    #[test]
+    fn channel_ts_uses_both_components() {
+        let mut dedup = EventDeduplicator::new();
+        assert!(!dedup.is_duplicate_channel_ts("C123", "1234567890.111111"));
+        assert!(
+            !dedup.is_duplicate_channel_ts("C456", "1234567890.111111"),
+            "different channel with same ts must not dedupe"
+        );
+        assert!(
+            !dedup.is_duplicate_channel_ts("C123", "1234567890.222222"),
+            "same channel with different ts must not dedupe"
+        );
+        assert!(
+            dedup.is_duplicate_channel_ts("C123", "1234567890.111111"),
+            "exact tuple repeat must dedupe"
+        );
     }
 }

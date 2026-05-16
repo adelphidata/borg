@@ -76,103 +76,83 @@ pub fn extract_retry_after(header_value: Option<&str>, default_secs: u64) -> u64
 mod tests {
     use super::*;
 
+    /// Full HTTP status → `TeamsErrorKind` matrix. Boundary codes for
+    /// each range are exercised so an off-by-one in `classify_status`
+    /// (e.g. shifting the 5xx range, accidentally swallowing 429 into the
+    /// 4xx Permanent bucket) fails a specific row.
     #[test]
-    fn classify_401_as_auth() {
-        assert_eq!(classify_status(401, None), TeamsErrorKind::Auth);
+    fn classify_status_matrix() {
+        let cases: &[(u16, TeamsErrorKind)] = &[
+            (401, TeamsErrorKind::Auth),
+            (403, TeamsErrorKind::Auth),
+            (408, TeamsErrorKind::Transient),
+            (500, TeamsErrorKind::Transient),
+            (502, TeamsErrorKind::Transient),
+            (503, TeamsErrorKind::Transient),
+            (504, TeamsErrorKind::Transient),
+            (400, TeamsErrorKind::Permanent),
+            (404, TeamsErrorKind::Permanent),
+            // 2xx and zero must NOT classify as a known retryable bucket.
+            (200, TeamsErrorKind::Unknown),
+            (0, TeamsErrorKind::Unknown),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(&classify_status(*status, None), expected, "status={status}");
+        }
     }
 
+    /// 429 carries a `Retry-After` payload that drives backoff. The
+    /// header MUST be parsed when valid, capped at `MAX_RETRY_AFTER_SECS`
+    /// to prevent multi-hour stalls, and fall back to the default when
+    /// missing or unparseable.
     #[test]
-    fn classify_403_as_auth() {
-        assert_eq!(classify_status(403, None), TeamsErrorKind::Auth);
+    fn classify_429_extracts_capped_retry_after_with_default_fallback() {
+        let cases: &[(Option<&str>, u64)] = &[
+            (Some("30"), 30),
+            (None, DEFAULT_RETRY_AFTER_SECS),
+            (Some("999"), MAX_RETRY_AFTER_SECS),
+            (Some("not-a-number"), DEFAULT_RETRY_AFTER_SECS),
+        ];
+        for (header, expected_secs) in cases {
+            assert_eq!(
+                classify_status(429, *header),
+                TeamsErrorKind::Throttled {
+                    retry_after_secs: *expected_secs,
+                },
+                "Retry-After={header:?}"
+            );
+        }
     }
 
+    /// `extract_retry_after` is the lower-level helper that owns
+    /// trimming, capping, default fallback, and the zero-is-valid axis
+    /// (zero means "retry immediately" per RFC 7231 §7.1.3, not an error).
     #[test]
-    fn classify_429_with_retry_after() {
-        assert_eq!(
-            classify_status(429, Some("30")),
-            TeamsErrorKind::Throttled {
-                retry_after_secs: 30
-            }
-        );
+    fn extract_retry_after_handles_trim_cap_default_and_zero() {
+        let cases: &[(Option<&str>, u64)] = &[
+            (Some("30"), 30),
+            (None, 5),
+            (Some("abc"), 5),
+            (Some("600"), MAX_RETRY_AFTER_SECS),
+            (Some("  15  "), 15),
+            (Some("0"), 0),
+        ];
+        for (header, expected) in cases {
+            assert_eq!(
+                extract_retry_after(*header, 5),
+                *expected,
+                "header={header:?}"
+            );
+        }
     }
 
+    /// Every kind must produce a non-empty, kind-distinguishing hint —
+    /// the operator-facing log message would be useless otherwise. Also
+    /// guards against accidentally returning the same generic hint for
+    /// all variants (a regression that would erase retry semantics from
+    /// logs).
     #[test]
-    fn classify_429_without_retry_after() {
-        assert_eq!(
-            classify_status(429, None),
-            TeamsErrorKind::Throttled {
-                retry_after_secs: DEFAULT_RETRY_AFTER_SECS
-            }
-        );
-    }
-
-    #[test]
-    fn classify_429_caps_retry_after() {
-        assert_eq!(
-            classify_status(429, Some("999")),
-            TeamsErrorKind::Throttled {
-                retry_after_secs: MAX_RETRY_AFTER_SECS
-            }
-        );
-    }
-
-    #[test]
-    fn classify_429_invalid_header_uses_default() {
-        assert_eq!(
-            classify_status(429, Some("not-a-number")),
-            TeamsErrorKind::Throttled {
-                retry_after_secs: DEFAULT_RETRY_AFTER_SECS
-            }
-        );
-    }
-
-    #[test]
-    fn classify_408_as_transient() {
-        assert_eq!(classify_status(408, None), TeamsErrorKind::Transient);
-    }
-
-    #[test]
-    fn classify_500_as_transient() {
-        assert_eq!(classify_status(500, None), TeamsErrorKind::Transient);
-    }
-
-    #[test]
-    fn classify_502_as_transient() {
-        assert_eq!(classify_status(502, None), TeamsErrorKind::Transient);
-    }
-
-    #[test]
-    fn classify_503_as_transient() {
-        assert_eq!(classify_status(503, None), TeamsErrorKind::Transient);
-    }
-
-    #[test]
-    fn classify_504_as_transient() {
-        assert_eq!(classify_status(504, None), TeamsErrorKind::Transient);
-    }
-
-    #[test]
-    fn classify_400_as_permanent() {
-        assert_eq!(classify_status(400, None), TeamsErrorKind::Permanent);
-    }
-
-    #[test]
-    fn classify_404_as_permanent() {
-        assert_eq!(classify_status(404, None), TeamsErrorKind::Permanent);
-    }
-
-    #[test]
-    fn classify_200_as_unknown() {
-        assert_eq!(classify_status(200, None), TeamsErrorKind::Unknown);
-    }
-
-    #[test]
-    fn classify_0_as_unknown() {
-        assert_eq!(classify_status(0, None), TeamsErrorKind::Unknown);
-    }
-
-    #[test]
-    fn error_hint_non_empty_for_all_variants() {
+    fn error_hint_is_non_empty_and_unique_per_kind() {
         let variants = [
             TeamsErrorKind::Auth,
             TeamsErrorKind::Throttled {
@@ -182,39 +162,15 @@ mod tests {
             TeamsErrorKind::Permanent,
             TeamsErrorKind::Unknown,
         ];
-        for kind in &variants {
-            let hint = error_hint(kind);
-            assert!(!hint.is_empty(), "hint for {kind:?} should not be empty");
+        let hints: Vec<&'static str> = variants.iter().map(error_hint).collect();
+        for (kind, hint) in variants.iter().zip(&hints) {
+            assert!(!hint.is_empty(), "hint for {kind:?} is empty");
         }
-    }
-
-    #[test]
-    fn extract_retry_after_valid() {
-        assert_eq!(extract_retry_after(Some("30"), 5), 30);
-    }
-
-    #[test]
-    fn extract_retry_after_missing() {
-        assert_eq!(extract_retry_after(None, 5), 5);
-    }
-
-    #[test]
-    fn extract_retry_after_invalid() {
-        assert_eq!(extract_retry_after(Some("abc"), 5), 5);
-    }
-
-    #[test]
-    fn extract_retry_after_capped() {
-        assert_eq!(extract_retry_after(Some("600"), 5), MAX_RETRY_AFTER_SECS);
-    }
-
-    #[test]
-    fn extract_retry_after_whitespace() {
-        assert_eq!(extract_retry_after(Some("  15  "), 5), 15);
-    }
-
-    #[test]
-    fn extract_retry_after_zero() {
-        assert_eq!(extract_retry_after(Some("0"), 5), 0);
+        let unique: std::collections::HashSet<_> = hints.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            hints.len(),
+            "every TeamsErrorKind must map to a distinct hint, got duplicates in {hints:?}"
+        );
     }
 }

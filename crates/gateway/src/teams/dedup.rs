@@ -10,28 +10,7 @@ crate::dedup_wrapper!(
     is_duplicate(activity_id: &str) => activity_id.to_string();
 );
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_seen_not_duplicate() {
-        let mut dedup = ActivityDeduplicator::new();
-        assert!(!dedup.is_duplicate("act-1"));
-    }
-
-    #[test]
-    fn second_seen_is_duplicate() {
-        let mut dedup = ActivityDeduplicator::new();
-        assert!(!dedup.is_duplicate("act-1"));
-        assert!(dedup.is_duplicate("act-1"));
-    }
-
-    #[test]
-    fn different_ids_not_duplicate() {
-        let mut dedup = ActivityDeduplicator::new();
-        assert!(!dedup.is_duplicate("act-1"));
-        assert!(!dedup.is_duplicate("act-2"));
-        assert!(!dedup.is_duplicate("act-3"));
-    }
-}
+// Dedup semantics (first-seen / repeat-seen / LRU eviction) are covered
+// by `BoundedDedup<K>` tests in `message_processing::dedup`. The macro
+// substitution here is a passthrough `&str -> String`, so per-channel
+// re-tests would be near-duplicate fluff per CLAUDE.md.

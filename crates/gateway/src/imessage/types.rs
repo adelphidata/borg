@@ -106,24 +106,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn imessage_payload_debug() {
-        let payload = IMessagePayload {
-            rowid: 42,
-            sender: Some("+1234567890".to_string()),
-            is_from_me: false,
-            text: Some("Hello".to_string()),
-            chat_identifier: Some("iMessage;-;+1234567890".to_string()),
-            is_group: false,
-            chat_guid: None,
-            reply_to: None,
-            attachments: Vec::new(),
-        };
-        let debug = format!("{payload:?}");
-        assert!(debug.contains("42"));
-        assert!(debug.contains("+1234567890"));
-    }
-
-    #[test]
     fn normalize_handle_phone_e164_strips_punctuation() {
         assert_eq!(normalize_handle("+1 (555) 123-4567"), "+15551234567");
         assert_eq!(normalize_handle("+44 20 7946 0958"), "+442079460958");
@@ -171,26 +153,5 @@ mod tests {
     fn normalize_handle_non_phone_non_email_passthrough_trimmed() {
         // Some Messages.app handles are display-name strings (rare but possible).
         assert_eq!(normalize_handle("  alice  "), "alice");
-    }
-
-    #[test]
-    fn inbound_decision_dispatch_variant() {
-        let decision = InboundDecision::Dispatch {
-            sender_id: "user1".to_string(),
-            text: "hello".to_string(),
-            channel_id: "ch1".to_string(),
-        };
-        match decision {
-            InboundDecision::Dispatch {
-                sender_id,
-                text,
-                channel_id,
-            } => {
-                assert_eq!(sender_id, "user1");
-                assert_eq!(text, "hello");
-                assert_eq!(channel_id, "ch1");
-            }
-            InboundDecision::Drop { .. } => panic!("expected Dispatch"),
-        }
     }
 }

@@ -35,37 +35,29 @@ impl fmt::Display for ProbeStatus {
 mod tests {
     use super::*;
 
+    /// `ProbeStatus::Display` is the user-facing surface for
+    /// `borg status` / onboarding diagnostics. Two invariants must hold:
+    /// `NoDiskAccess` MUST mention "Full Disk Access" verbatim (operators
+    /// search for that string when troubleshooting macOS Privacy
+    /// settings), and `QueryError` MUST propagate the inner error message
+    /// so the user can act on it.
     #[test]
-    fn probe_status_display_ok() {
+    fn probe_status_display_carries_actionable_signal() {
         assert_eq!(ProbeStatus::Ok.to_string(), "ok");
-    }
-
-    #[test]
-    fn probe_status_display_no_db() {
         assert_eq!(ProbeStatus::NoDb.to_string(), "no chat.db found");
-    }
 
-    #[test]
-    fn probe_status_display_no_disk_access() {
-        let s = ProbeStatus::NoDiskAccess.to_string();
-        assert!(s.contains("Full Disk Access"));
-    }
+        let no_access = ProbeStatus::NoDiskAccess.to_string();
+        assert!(
+            no_access.contains("Full Disk Access"),
+            "NoDiskAccess must name the macOS setting verbatim, got {no_access:?}"
+        );
 
-    #[test]
-    fn probe_status_display_query_error() {
-        let s = ProbeStatus::QueryError("table missing".to_string()).to_string();
-        assert!(s.contains("query error"));
-        assert!(s.contains("table missing"));
-    }
-
-    #[test]
-    fn probe_result_fields() {
-        let result = ProbeResult {
-            status: ProbeStatus::Ok,
-            max_rowid: Some(42),
-        };
-        assert!(matches!(result.status, ProbeStatus::Ok));
-        assert_eq!(result.max_rowid, Some(42));
+        let err = ProbeStatus::QueryError("table missing".to_string()).to_string();
+        assert!(err.contains("query error"), "got {err:?}");
+        assert!(
+            err.contains("table missing"),
+            "QueryError must propagate the inner error message, got {err:?}"
+        );
     }
 }
 

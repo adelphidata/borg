@@ -66,82 +66,56 @@ fn strip_header(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    /// Header conversion is the entire job of this function: each
+    /// `#`-prefixed line (any depth 1–6, possibly indented) becomes
+    /// `**bold**`. All other markdown — and every line inside a fenced
+    /// code block — is a no-op so Discord's native renderer handles it.
     #[test]
-    fn header_h1_to_bold() {
-        assert_eq!(markdown_to_discord("# Title"), "**Title**");
+    fn each_header_depth_converts_to_bold_and_indented_headers_still_match() {
+        let cases = [
+            ("# Title", "**Title**"),
+            ("## Subtitle", "**Subtitle**"),
+            ("### Section", "**Section**"),
+            ("###### Deep", "**Deep**"),
+            ("  # Indented", "**Indented**"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(markdown_to_discord(input), expected, "input={input:?}");
+        }
     }
 
+    /// Non-header markdown (bold, links, block quotes, plain text, empty)
+    /// and `#` lines inside fenced/inline code blocks MUST pass through
+    /// unmodified — Discord's renderer handles them natively and any
+    /// alteration would corrupt the formatting users see.
     #[test]
-    fn header_h2_to_bold() {
-        assert_eq!(markdown_to_discord("## Subtitle"), "**Subtitle**");
+    fn non_header_and_code_block_content_passes_through_unchanged() {
+        let identities = [
+            "**bold**",
+            "[click](https://example.com)",
+            "> quoted text",
+            "hello world",
+            "",
+            "`# not a header`",
+            "line 1\nline 2\nline 3",
+            "```\n# Not a header\n## Also not\n```",
+        ];
+        for input in identities {
+            assert_eq!(
+                markdown_to_discord(input),
+                input,
+                "must be a no-op for {input:?}"
+            );
+        }
     }
 
-    #[test]
-    fn header_h3_to_bold() {
-        assert_eq!(markdown_to_discord("### Section"), "**Section**");
-    }
-
-    #[test]
-    fn header_h6_to_bold() {
-        assert_eq!(markdown_to_discord("###### Deep"), "**Deep**");
-    }
-
-    #[test]
-    fn code_block_headers_preserved() {
-        let input = "```\n# Not a header\n## Also not\n```";
-        assert_eq!(markdown_to_discord(input), input);
-    }
-
-    #[test]
-    fn inline_code_preserved() {
-        // Inline code with a hash is not a header
-        assert_eq!(markdown_to_discord("`# not a header`"), "`# not a header`");
-    }
-
-    #[test]
-    fn bold_preserved() {
-        assert_eq!(markdown_to_discord("**bold**"), "**bold**");
-    }
-
-    #[test]
-    fn link_preserved() {
-        assert_eq!(
-            markdown_to_discord("[click](https://example.com)"),
-            "[click](https://example.com)"
-        );
-    }
-
-    #[test]
-    fn block_quote_preserved() {
-        assert_eq!(markdown_to_discord("> quoted text"), "> quoted text");
-    }
-
-    #[test]
-    fn plain_text_unchanged() {
-        assert_eq!(markdown_to_discord("hello world"), "hello world");
-    }
-
-    #[test]
-    fn empty_string() {
-        assert_eq!(markdown_to_discord(""), "");
-    }
-
+    /// The mixed multi-line case is the integration check: headers
+    /// convert, code-block content stays literal, and surrounding plain
+    /// text is preserved verbatim.
     #[test]
     fn multiline_mixed() {
         let input = "# Title\nSome text\n```\n# code comment\n```\n## Another heading";
         let expected = "**Title**\nSome text\n```\n# code comment\n```\n**Another heading**";
         assert_eq!(markdown_to_discord(input), expected);
-    }
-
-    #[test]
-    fn multiline_preserved() {
-        let input = "line 1\nline 2\nline 3";
-        assert_eq!(markdown_to_discord(input), input);
-    }
-
-    #[test]
-    fn header_with_leading_spaces() {
-        // Indented headers should still be converted
-        assert_eq!(markdown_to_discord("  # Indented"), "**Indented**");
     }
 }

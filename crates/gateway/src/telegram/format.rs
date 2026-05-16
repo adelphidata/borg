@@ -164,52 +164,34 @@ mod tests {
         );
     }
 
+    /// Every supported markdown delimiter must map to its Telegram HTML
+    /// counterpart. Verifying all variants in one table guards against
+    /// (a) emitting the wrong tag, (b) consuming the wrong number of
+    /// delimiter chars, and (c) the language-tag stripping logic on
+    /// fenced code drifting from the no-language path.
     #[test]
-    fn bold_conversion() {
-        assert_eq!(
-            markdown_to_telegram_html("this is **bold** text"),
-            "this is <b>bold</b> text"
-        );
-    }
-
-    #[test]
-    fn italic_conversion() {
-        assert_eq!(
-            markdown_to_telegram_html("this is *italic* text"),
-            "this is <i>italic</i> text"
-        );
-    }
-
-    #[test]
-    fn inline_code_conversion() {
-        assert_eq!(
-            markdown_to_telegram_html("use `cargo build` here"),
-            "use <code>cargo build</code> here"
-        );
-    }
-
-    #[test]
-    fn code_block_conversion() {
-        assert_eq!(
-            markdown_to_telegram_html("```rust\nfn main() {}\n```"),
-            "<pre>fn main() {}\n</pre>"
-        );
-    }
-
-    #[test]
-    fn code_block_no_language() {
-        assert_eq!(
-            markdown_to_telegram_html("```\nhello\n```"),
-            "<pre>hello\n</pre>"
-        );
-    }
-
-    #[test]
-    fn link_conversion() {
-        assert_eq!(
-            markdown_to_telegram_html("click [here](https://example.com) now"),
-            r#"click <a href="https://example.com">here</a> now"#
-        );
+    fn each_delimiter_maps_to_telegram_html_tag() {
+        let cases = [
+            ("this is **bold** text", "this is <b>bold</b> text"),
+            ("this is *italic* text", "this is <i>italic</i> text"),
+            (
+                "use `cargo build` here",
+                "use <code>cargo build</code> here",
+            ),
+            ("```rust\nfn main() {}\n```", "<pre>fn main() {}\n</pre>"),
+            ("```\nhello\n```", "<pre>hello\n</pre>"),
+            (
+                "click [here](https://example.com) now",
+                r#"click <a href="https://example.com">here</a> now"#,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                markdown_to_telegram_html(input),
+                expected,
+                "input={input:?}"
+            );
+        }
     }
 
     #[test]
@@ -279,10 +261,18 @@ mod tests {
         assert_eq!(rest.chars().count(), 5);
     }
 
+    /// Nested `***...***` is not in our delimiter grammar — but the
+    /// parser must NOT panic, hang, or drop the inner content. The
+    /// graceful-fallback contract: output is non-empty and the original
+    /// inner text survives (possibly with literal delimiter chars
+    /// passing through).
     #[test]
-    fn nested_bold_italic_not_supported_gracefully() {
-        // We don't support nesting, but it shouldn't panic
+    fn nested_bold_italic_passes_inner_text_through_without_panic() {
         let result = markdown_to_telegram_html("***bold italic***");
         assert!(!result.is_empty());
+        assert!(
+            result.contains("bold italic"),
+            "inner text must survive even when nested delimiters aren't supported, got {result:?}"
+        );
     }
 }
