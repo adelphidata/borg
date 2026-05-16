@@ -27,8 +27,7 @@ pub fn run_host_security_checks(checks: &mut Vec<DiagnosticCheck>) {
 /// a permanent unactionable warning, so we skip it entirely off-root.
 #[cfg(unix)]
 fn is_effective_root() -> bool {
-    // SAFETY: `geteuid` is async-signal-safe and has no preconditions.
-    unsafe { libc::geteuid() == 0 }
+    nix::unistd::geteuid().is_root()
 }
 
 #[cfg(not(unix))]

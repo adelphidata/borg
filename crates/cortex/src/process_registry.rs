@@ -656,16 +656,15 @@ enum KillOutcome {
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     // `kill(pid, 0)` checks signal-delivery permission without actually
-    // signalling. `ESRCH` (3) is the canonical "no such process".
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let err = std::io::Error::last_os_error();
+    // signalling. `ESRCH` is the canonical "no such process".
     // EPERM means the process exists but we can't signal it — count as
     // alive, since the registry shouldn't fabricate deaths.
-    matches!(err.raw_os_error(), Some(libc::EPERM) | Some(libc::EINVAL))
+    use nix::errno::Errno;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::EPERM | Errno::EINVAL) => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(unix))]
@@ -677,12 +676,13 @@ fn pid_alive(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
     if pid == 0 {
         return KillOutcome::SignalFailed;
     }
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let term = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if term != 0 {
+    let target = Pid::from_raw(pid as i32);
+    if kill(target, Signal::SIGTERM).is_err() {
         return KillOutcome::SignalFailed;
     }
     // Poll up to `grace_secs` for the process to exit. 100ms granularity
@@ -697,9 +697,7 @@ fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
     if !pid_alive(pid) {
         return KillOutcome::TermSufficed;
     }
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let kill = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if kill != 0 && pid_alive(pid) {
+    if kill(target, Signal::SIGKILL).is_err() && pid_alive(pid) {
         return KillOutcome::SignalFailed;
     }
     KillOutcome::NeededKill

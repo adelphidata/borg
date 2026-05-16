@@ -454,9 +454,7 @@ fn install_secure_dependencies_apt() -> Result<()> {
 
 #[cfg(unix)]
 fn is_root() -> bool {
-    // SAFETY: `geteuid` has no preconditions; it returns the effective UID
-    // of the current process. No memory or thread invariants involved.
-    unsafe { libc::geteuid() == 0 }
+    nix::unistd::geteuid().is_root()
 }
 #[cfg(not(unix))]
 fn is_root() -> bool {
@@ -500,11 +498,11 @@ pub fn kill_other_borg_processes() {
                 if let Ok(pid) = line.trim().parse::<u32>() {
                     if pid != my_pid {
                         tracing::info!("Killing {name} process {pid}");
-                        // SAFETY: `libc::kill` is a pure FFI call; passing a
-                        // numeric pid + signal has no memory preconditions.
-                        unsafe {
-                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                        }
+                        // Best-effort cleanup; ignore failures.
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
                     }
                 }
             }

@@ -67,8 +67,9 @@ pub(super) fn is_light_terminal() -> bool {
 /// using `poll(2)` with a 100ms timeout, then restores terminal state.
 #[cfg(unix)]
 fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::io::Read;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsFd;
 
     let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
     let _guard = if !was_raw {
@@ -87,14 +88,8 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
     let deadline = std::time::Instant::now() + Duration::from_millis(100);
 
     let stdin = std::io::stdin();
-    let fd = stdin.as_raw_fd();
     let mut stdin_lock = stdin.lock();
-
-    let mut poll_fd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
 
     loop {
         let remaining = deadline
@@ -103,9 +98,8 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
         if remaining <= 0 || total >= buf.len() {
             break;
         }
-        // SAFETY: `poll_fd` is a valid stack-allocated `pollfd` with fd=stdin;
-        // we pass a count of 1 matching the single-entry array.
-        let ret = unsafe { libc::poll(&mut poll_fd, 1, remaining) };
+        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO);
+        let ret = poll(&mut fds, timeout).unwrap_or(0);
         if ret <= 0 {
             break;
         }

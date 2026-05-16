@@ -67,6 +67,7 @@ portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+nix = { workspace = true }
 
 [features]
 # Opt-in lane that exercises tool handlers against real network targets

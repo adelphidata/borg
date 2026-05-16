@@ -86,12 +86,13 @@ pub fn bind_uds(path: &Path) -> Result<UnixListener> {
             .with_context(|| format!("removing stale socket at {}", path.display()))?;
     }
 
-    // SAFETY: setting the process umask is inherently global; we restore it
-    // immediately after the bind. Acceptable because borgd is single-instance
-    // and this only runs once per process at startup.
-    let prev_umask = unsafe { libc::umask(0o177) };
+    // Tighten umask to 0o177 around bind so the socket inode is created
+    // already-private. Process-global, but borgd is single-instance and
+    // this only runs once at startup.
+    use nix::sys::stat::{umask, Mode};
+    let prev_umask = umask(Mode::from_bits_truncate(0o177));
     let bind_result = UnixListener::bind(path);
-    unsafe { libc::umask(prev_umask) };
+    umask(prev_umask);
     let listener = bind_result.with_context(|| format!("binding UDS at {}", path.display()))?;
 
     let perms = std::fs::Permissions::from_mode(0o600);

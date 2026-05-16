@@ -69,6 +69,9 @@ tracing-opentelemetry = { workspace = true }
 qrcodegen = { workspace = true }
 rusqlite = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [features]
 # Exposes test-only constructors (e.g. `DaemonClient::lazy_for_tests`) outside
 # of `cargo test`. Off by default so production binaries cannot accidentally
