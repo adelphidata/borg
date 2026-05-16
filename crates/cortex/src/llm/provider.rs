@@ -708,7 +708,7 @@ mod tests {
     fn is_openai_compatible() {
         assert!(Provider::OpenRouter.is_openai_compatible());
         assert!(Provider::OpenAi.is_openai_compatible());
-        assert!(Provider::Gemini.is_openai_compatible());
+        assert!(!Provider::Gemini.is_openai_compatible());
         assert!(Provider::DeepSeek.is_openai_compatible());
         assert!(Provider::Groq.is_openai_compatible());
         assert!(Provider::Ollama.is_openai_compatible());

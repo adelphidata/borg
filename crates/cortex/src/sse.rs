@@ -280,11 +280,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_stops_stream() {
+    async fn cancellation_stops_stream_without_emitting_done() {
+        // Regression guard: when the cancel token fires, the SSE loop must
+        // exit cleanly WITHOUT pushing `StreamEvent::Done`. The agent-loop
+        // consumer treats `Done` as authoritative end-of-turn, so emitting
+        // it on a revocation-driven cancel would commit a truncated turn
+        // before the outer retry loop's rotation delivers the real response.
         let (tx, mut rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
-
-        // Create a stream that yields one chunk then "blocks" (empty)
         let stream = make_stream(vec![]);
         cancel.cancel();
 
@@ -292,10 +295,17 @@ mod tests {
             SseAction::Continue
         })
         .await;
+        assert!(
+            result.is_ok(),
+            "cancel arm returns Ok so the outer reclassifier can decide"
+        );
 
-        assert!(result.is_ok());
-        let e = rx.recv().await.unwrap();
-        assert!(matches!(e, StreamEvent::Done));
+        drop(tx);
+        let event = rx.recv().await;
+        assert!(
+            event.is_none(),
+            "cancel arm must not push any StreamEvent; channel should be empty (got {event:?})"
+        );
     }
 
     #[tokio::test]
