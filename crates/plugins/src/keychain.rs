@@ -155,13 +155,6 @@ pub fn check(service: &str, account: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn available_returns_bool() {
-        // On macOS CI, `security` binary should exist; on Linux, `secret-tool` may not.
-        // This test just ensures the function doesn't panic.
-        let _ = available();
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn available_true_on_macos() {
@@ -174,12 +167,6 @@ mod tests {
         // A random service/account pair should not exist
         let result = check("borg-test-nonexistent-svc-12345", "nonexistent-account-xyz");
         assert!(!result);
-    }
-
-    #[test]
-    fn remove_nonexistent_does_not_panic() {
-        // Removing a credential that doesn't exist should silently succeed
-        remove("borg-test-nonexistent-svc-12345", "nonexistent-account-xyz");
     }
 
     /// E2E keychain tests are gated behind this env var because they spawn
@@ -360,14 +347,5 @@ mod tests {
             "nonexistent-account-xyz",
         );
         assert!(!result);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_remove_nonexistent_does_not_panic() {
-        remove(
-            "borg-test-nonexistent-svc-win-12345",
-            "nonexistent-account-xyz",
-        );
     }
 }

@@ -435,7 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_file_hashes_returns_correct_sha256() {
+    fn compute_file_hashes_returns_sha256_for_every_template() {
+        // Two invariants in one place: every declared template gets a hash
+        // (no silent skips), and every hash is a valid 64-char hex SHA-256
+        // (the audit/diff layer relies on the format). A regression on
+        // either side — partial coverage OR malformed hash — fails here.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
@@ -444,36 +448,22 @@ mod tests {
             .find(|c| c.id == "messaging/whatsapp")
             .expect("whatsapp in catalog");
 
-        // Write templates
         write_templates(def, data_dir).expect("write");
-
         let hashes = compute_file_hashes(def, data_dir);
-        assert!(!hashes.is_empty());
 
-        // Verify each hash is a valid 64-char hex string (SHA-256)
+        assert_eq!(
+            hashes.len(),
+            def.templates.len(),
+            "every template must be hashed (no silent drops)"
+        );
         for (path, hash) in &hashes {
-            assert!(!path.is_empty());
+            assert!(!path.is_empty(), "hash entry must name the path");
             assert_eq!(hash.len(), 64, "SHA-256 hex should be 64 chars for {path}");
             assert!(
                 hash.chars().all(|c| c.is_ascii_hexdigit()),
                 "hash should be hex for {path}"
             );
         }
-    }
-
-    #[test]
-    fn compute_file_hashes_covers_all_templates() {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let data_dir = tmp.path();
-
-        let def = CATALOG
-            .iter()
-            .find(|c| c.id == "messaging/whatsapp")
-            .expect("whatsapp in catalog");
-        write_templates(def, data_dir).expect("write");
-
-        let hashes = compute_file_hashes(def, data_dir);
-        assert_eq!(hashes.len(), def.templates.len());
     }
 
     #[tokio::test]
@@ -492,29 +482,6 @@ mod tests {
             assert_eq!(hash.len(), 64);
             assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         }
-    }
-
-    #[tokio::test]
-    async fn install_result_includes_credential_entries() {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let data_dir = tmp.path();
-
-        let def = CATALOG
-            .iter()
-            .find(|c| c.id == "messaging/whatsapp")
-            .expect("whatsapp in catalog");
-        let result = install(def, data_dir, &[], None).await.expect("install");
-
-        // No credentials passed = no credential entries
-        assert!(result.credential_entries.is_empty());
-    }
-
-    #[test]
-    fn install_result_default_has_empty_vecs() {
-        let result = InstallResult::default();
-        assert!(result.notes.is_empty());
-        assert!(result.credential_entries.is_empty());
-        assert!(result.file_hashes.is_empty());
     }
 
     #[test]

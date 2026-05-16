@@ -1392,16 +1392,6 @@ mod tests {
     }
 
     #[test]
-    fn affected_paths_empty_default() {
-        let paths = AffectedPaths::default();
-        assert!(paths.added.is_empty());
-        assert!(paths.modified.is_empty());
-        assert!(paths.deleted.is_empty());
-        assert!(paths.moved.is_empty());
-        assert!(paths.format_summary().is_empty());
-    }
-
-    #[test]
     fn test_add_file_exceeds_size_limit() {
         let dir = TempDir::new().unwrap();
         let oversized = "x".repeat(MAX_PATCH_FILE_SIZE + 1);

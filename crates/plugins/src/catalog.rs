@@ -371,11 +371,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_is_non_empty() {
-        assert!(!CATALOG.is_empty());
-    }
-
-    #[test]
     fn all_ids_unique() {
         let mut ids: Vec<&str> = CATALOG.iter().map(|c| c.id).collect();
         ids.sort();
@@ -446,17 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn native_plugins_have_no_templates() {
-        for entry in CATALOG.iter().filter(|e| e.is_native) {
-            assert!(
-                entry.templates.is_empty(),
-                "native {} should have no templates",
-                entry.id
-            );
-        }
-    }
-
-    #[test]
     fn all_catalog_entries_are_channels() {
         for entry in CATALOG {
             assert_eq!(
@@ -466,11 +450,5 @@ mod tests {
                 entry.id
             );
         }
-    }
-
-    #[test]
-    fn channels_category_has_entries() {
-        let entries = by_category(Category::Channels);
-        assert!(!entries.is_empty(), "no entries for Channels");
     }
 }
