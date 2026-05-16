@@ -128,8 +128,8 @@ impl DispatchHarness {
     }
 
     /// Insert a `scheduled_tasks` row, due now, with the given preamble.
-    fn seed_due_prompt_task(&self, id: &str, pre_run_command: Option<&str>) {
-        let db = Database::open().expect("open db");
+    async fn seed_due_prompt_task(&self, id: &str, pre_run_command: Option<&str>) {
+        let db = Database::open().await.expect("open db");
         let now = chrono::Utc::now().timestamp();
         db.create_task(&NewTask {
             id,
@@ -152,6 +152,7 @@ impl DispatchHarness {
             pre_run_timeout_ms: Some(5_000),
             min_interval_secs: None,
         })
+        .await
         .expect("create due prompt task");
     }
 
@@ -182,8 +183,8 @@ impl DispatchHarness {
         let started = std::time::Instant::now();
         while started.elapsed() < Duration::from_secs(15) {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let db = Database::open().expect("db");
-            if let Ok(rows) = db.task_run_history(task_id, 5) {
+            let db = Database::open().await.expect("db");
+            if let Ok(rows) = db.task_run_history(task_id, 5).await {
                 if !rows.is_empty() {
                     recorded = true;
                     break;
@@ -231,7 +232,8 @@ async fn success_preamble_injects_preprocessed_context_block() {
 
     let h = DispatchHarness::setup().await;
     h.mount_text_response("ok").await;
-    h.seed_due_prompt_task("preamble-success", Some("echo hello-from-preamble"));
+    h.seed_due_prompt_task("preamble-success", Some("echo hello-from-preamble"))
+        .await;
 
     let (server, recorded) = h.run_until_task_recorded("preamble-success").await;
     assert!(
@@ -285,7 +287,8 @@ async fn failure_preamble_still_invokes_llm_with_failed_status() {
     h.mount_text_response("noted").await;
     // `sh -c "exit 7"` exits with code 7; render_pre_run_block must surface
     // that as `status="failed" exit_code="7"`.
-    h.seed_due_prompt_task("preamble-failure", Some("exit 7"));
+    h.seed_due_prompt_task("preamble-failure", Some("exit 7"))
+        .await;
 
     let (server, recorded) = h.run_until_task_recorded("preamble-failure").await;
     assert!(

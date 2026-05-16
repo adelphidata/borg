@@ -52,12 +52,21 @@ impl Database {
         dimension: usize,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO embedding_cache
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO embedding_cache
              (provider, model, content_hash, embedding, dimension, last_accessed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params!(provider, model, content_hash, embedding, dimension as i64, now),
-        ).await?;
+                params!(
+                    provider,
+                    model,
+                    content_hash,
+                    embedding,
+                    dimension as i64,
+                    now
+                ),
+            )
+            .await?;
         Ok(())
     }
 
@@ -82,18 +91,16 @@ impl Database {
     }
 
     /// Mark a session as indexed.
-    pub async fn mark_session_indexed(
-        &self,
-        session_id: &str,
-        message_count: usize,
-    ) -> Result<()> {
+    pub async fn mark_session_indexed(&self, session_id: &str, message_count: usize) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO session_index_status
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO session_index_status
              (session_id, indexed_at, message_count)
              VALUES (?1, ?2, ?3)",
-            params!(session_id, now, message_count as i64),
-        ).await?;
+                params!(session_id, now, message_count as i64),
+            )
+            .await?;
         Ok(())
     }
 
@@ -144,16 +151,15 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_embedding(
-        &self,
-        scope: &str,
-        filename: &str,
-    ) -> Result<Option<EmbeddingRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, scope, filename, content_hash, embedding, dimension, model, created_at
+    pub async fn get_embedding(&self, scope: &str, filename: &str) -> Result<Option<EmbeddingRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope, filename, content_hash, embedding, dimension, model, created_at
              FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
-            params!(scope, filename),
-        ).await?;
+                params!(scope, filename),
+            )
+            .await?;
         match rows.next().await? {
             Some(row) => Ok(Some(EmbeddingRow {
                 id: row.get::<i64>(0)?,
@@ -170,11 +176,14 @@ impl Database {
     }
 
     pub async fn get_all_embeddings(&self, scope: &str) -> Result<Vec<EmbeddingRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, scope, filename, content_hash, embedding, dimension, model, created_at
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope, filename, content_hash, embedding, dimension, model, created_at
              FROM memory_embeddings WHERE scope = ?1",
-            params!(scope),
-        ).await?;
+                params!(scope),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(EmbeddingRow {
@@ -192,10 +201,13 @@ impl Database {
     }
 
     pub async fn delete_embedding(&self, scope: &str, filename: &str) -> Result<bool> {
-        let count = self.conn.execute(
-            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
-            params!(scope, filename),
-        ).await?;
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+                params!(scope, filename),
+            )
+            .await?;
         Ok(count > 0)
     }
 
@@ -223,46 +235,55 @@ impl Database {
         filename: &str,
         chunks: &[ChunkData],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().await?;
-        tx.execute(
-            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
-            params!(scope, filename),
-        )
-        .await?;
-        let now = chrono::Utc::now().timestamp();
-        for chunk in chunks {
-            tx.execute(
-                "INSERT INTO memory_chunks
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<()> = async {
+            self.conn.execute(
+                "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                params!(scope, filename),
+            )
+            .await?;
+            let now = chrono::Utc::now().timestamp();
+            for chunk in chunks {
+                self.conn.execute(
+                    "INSERT INTO memory_chunks
                     (scope, filename, chunk_index, start_line, end_line, content, content_hash, embedding, dimension, model, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(scope, filename, chunk_index) DO UPDATE SET
                     start_line = ?4, end_line = ?5, content = ?6, content_hash = ?7,
                     embedding = ?8, dimension = ?9, model = ?10, created_at = ?11",
-                params!(
-                    scope,
-                    filename,
-                    chunk.chunk_index,
-                    chunk.start_line,
-                    chunk.end_line,
-                    chunk.content.as_str(),
-                    chunk.content_hash.as_str(),
-                    chunk.embedding.as_deref(),
-                    chunk.dimension.map(|d| d as i64),
-                    chunk.model.as_deref(),
-                    now,
-                ),
-            ).await?;
+                    params!(
+                        scope,
+                        filename,
+                        chunk.chunk_index,
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.content.as_str(),
+                        chunk.content_hash.as_str(),
+                        chunk.embedding.as_deref(),
+                        chunk.dimension.map(|d| d as i64),
+                        chunk.model.as_deref(),
+                        now,
+                    ),
+                ).await?;
+            }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("memory: rollback after upsert_chunks failure failed: {re}");
+                }
+                Err(e)
+            }
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Retrieve all chunks for a given scope, optionally limited to `limit` rows.
-    pub async fn get_all_chunks(
-        &self,
-        scope: &str,
-        limit: Option<usize>,
-    ) -> Result<Vec<ChunkRow>> {
+    pub async fn get_all_chunks(&self, scope: &str, limit: Option<usize>) -> Result<Vec<ChunkRow>> {
         let base = "SELECT id, scope, filename, chunk_index, start_line, end_line, content, content_hash, embedding, created_at
                      FROM memory_chunks WHERE scope = ?1 ORDER BY filename, chunk_index";
         let mut rows = if let Some(n) = limit {
@@ -290,24 +311,19 @@ impl Database {
     }
 
     /// Delete all chunks for a specific file.
-    pub async fn delete_chunks_for_file(
-        &self,
-        scope: &str,
-        filename: &str,
-    ) -> Result<bool> {
-        let count = self.conn.execute(
-            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
-            params!(scope, filename),
-        ).await?;
+    pub async fn delete_chunks_for_file(&self, scope: &str, filename: &str) -> Result<bool> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                params!(scope, filename),
+            )
+            .await?;
         Ok(count > 0)
     }
 
     /// Retrieve all chunks for a specific file in a scope.
-    pub async fn get_chunks_for_file(
-        &self,
-        scope: &str,
-        filename: &str,
-    ) -> Result<Vec<ChunkRow>> {
+    pub async fn get_chunks_for_file(&self, scope: &str, filename: &str) -> Result<Vec<ChunkRow>> {
         let mut rows = self.conn.query(
             "SELECT id, scope, filename, chunk_index, start_line, end_line, content, content_hash, embedding, created_at
              FROM memory_chunks WHERE scope = ?1 AND filename = ?2 ORDER BY chunk_index",
@@ -406,15 +422,18 @@ impl Database {
             return Ok(Vec::new());
         }
         let candidate_limit = limit.saturating_mul(4).min(200).max(limit);
-        let mut rows = self.conn.query(
-            "SELECT id, scope, filename, chunk_index, start_line, end_line,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope, filename, chunk_index, start_line, end_line,
                     content, content_hash, embedding, created_at
              FROM memory_chunks
              WHERE content MATCH ?1
                AND scope = ?2
              LIMIT ?3",
-            params!(sanitized, scope, candidate_limit as i64),
-        ).await?;
+                params!(sanitized, scope, candidate_limit as i64),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push((
@@ -443,35 +462,47 @@ impl Database {
     /// Also invalidates stale embeddings and chunks for the replaced entry so
     /// search results don't surface outdated content. Runs in an immediate
     /// transaction to keep the entry row and its index entries consistent.
-    pub async fn upsert_memory_entry(
-        &self,
-        scope: &str,
-        name: &str,
-        content: &str,
-    ) -> Result<()> {
+    pub async fn upsert_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
         let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.unchecked_transaction().await?;
-        tx.execute(
-            "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<()> = async {
+            self.conn.execute(
+                "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(scope, name) DO UPDATE SET
                 content = ?3, content_hash = ?4, updated_at = ?5, estimated_tokens = NULL",
-            params!(scope, name, content, hash, now),
-        ).await?;
-        // Stale search-index cleanup: embeddings and chunks will be regenerated
-        // by the caller's background embedding task after this returns.
-        tx.execute(
-            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.execute(
-            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.commit().await?;
-        Ok(())
+                params!(scope, name, content, hash, now),
+            ).await?;
+            // Stale search-index cleanup: embeddings and chunks will be regenerated
+            // by the caller's background embedding task after this returns.
+            self.conn.execute(
+                "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+                params!(scope, name),
+            )
+            .await?;
+            self.conn.execute(
+                "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                params!(scope, name),
+            )
+            .await?;
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "memory: rollback after upsert_memory_entry failure failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Retrieve a memory entry by scope and name.
@@ -480,11 +511,14 @@ impl Database {
         scope: &str,
         name: &str,
     ) -> Result<Option<MemoryEntryRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, scope, name, content, content_hash, created_at, updated_at
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope, name, content, content_hash, created_at, updated_at
              FROM memory_entries WHERE scope = ?1 AND name = ?2",
-            params!(scope, name),
-        ).await?;
+                params!(scope, name),
+            )
+            .await?;
         match rows.next().await? {
             Some(row) => Ok(Some(MemoryEntryRow {
                 id: row.get::<i64>(0)?,
@@ -502,30 +536,56 @@ impl Database {
     /// Delete a memory entry along with its embeddings and chunks.
     /// Returns true if the entry row was deleted.
     pub async fn delete_memory_entry(&self, scope: &str, name: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction().await?;
-        let count = tx.execute(
-            "DELETE FROM memory_entries WHERE scope = ?1 AND name = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.execute(
-            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.execute(
-            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.commit().await?;
-        Ok(count > 0)
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<u64> = async {
+            let count = self
+                .conn
+                .execute(
+                    "DELETE FROM memory_entries WHERE scope = ?1 AND name = ?2",
+                    params!(scope, name),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+                    params!(scope, name),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                    params!(scope, name),
+                )
+                .await?;
+            Ok(count)
+        }
+        .await;
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(count > 0)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "memory: rollback after delete_memory_entry failure failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// List all memory entries for a scope, ordered by updated_at DESC.
     pub async fn list_memory_entries(&self, scope: &str) -> Result<Vec<MemoryEntryRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, scope, name, content, content_hash, created_at, updated_at
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, scope, name, content, content_hash, created_at, updated_at
              FROM memory_entries WHERE scope = ?1 ORDER BY updated_at DESC",
-            params!(scope),
-        ).await?;
+                params!(scope),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(MemoryEntryRow {
@@ -546,52 +606,65 @@ impl Database {
     /// Runs in an immediate transaction so concurrent appenders don't interleave a
     /// read-modify-write and drop one another's writes. Also invalidates stale
     /// embeddings/chunks so the background re-embedder produces a fresh index.
-    pub async fn append_memory_entry(
-        &self,
-        scope: &str,
-        name: &str,
-        content: &str,
-    ) -> Result<()> {
+    pub async fn append_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.unchecked_transaction().await?;
-        let existing: Option<String> = {
-            let mut rows = tx
-                .query(
-                    "SELECT content FROM memory_entries WHERE scope = ?1 AND name = ?2",
-                    params!(scope, name),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Some(row.get::<String>(0)?),
-                None => None,
-            }
-        };
-        let new_content = match existing {
-            Some(prev) => {
-                let sep = if prev.ends_with('\n') { "" } else { "\n" };
-                format!("{prev}{sep}{content}")
-            }
-            None => content.to_string(),
-        };
-        let hash = format!("{:x}", Sha256::digest(new_content.as_bytes()));
-        tx.execute(
-            "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<()> = async {
+            let existing: Option<String> = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT content FROM memory_entries WHERE scope = ?1 AND name = ?2",
+                        params!(scope, name),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Some(row.get::<String>(0)?),
+                    None => None,
+                }
+            };
+            let new_content = match existing {
+                Some(prev) => {
+                    let sep = if prev.ends_with('\n') { "" } else { "\n" };
+                    format!("{prev}{sep}{content}")
+                }
+                None => content.to_string(),
+            };
+            let hash = format!("{:x}", Sha256::digest(new_content.as_bytes()));
+            self.conn.execute(
+                "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(scope, name) DO UPDATE SET
                 content = ?3, content_hash = ?4, updated_at = ?5, estimated_tokens = NULL",
-            params!(scope, name, new_content, hash, now),
-        ).await?;
-        tx.execute(
-            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.execute(
-            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
-            params!(scope, name),
-        ).await?;
-        tx.commit().await?;
-        Ok(())
+                params!(scope, name, new_content, hash, now),
+            ).await?;
+            self.conn.execute(
+                "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+                params!(scope, name),
+            )
+            .await?;
+            self.conn.execute(
+                "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                params!(scope, name),
+            )
+            .await?;
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "memory: rollback after append_memory_entry failure failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// List all distinct scopes that have at least one memory entry.
@@ -709,11 +782,13 @@ impl Database {
     /// the column to NULL, so the value here is only valid against the entry's
     /// current `content_hash`.
     pub async fn set_memory_tokens(&self, scope: &str, name: &str, tokens: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memory_entries SET estimated_tokens = ?1
+        self.conn
+            .execute(
+                "UPDATE memory_entries SET estimated_tokens = ?1
              WHERE scope = ?2 AND name = ?3",
-            params!(tokens, scope, name),
-        ).await?;
+                params!(tokens, scope, name),
+            )
+            .await?;
         Ok(())
     }
 
@@ -742,21 +817,26 @@ impl Database {
         model: &str,
         content_hash: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE embedding_cache SET last_accessed_at = unixepoch()
+        self.conn
+            .execute(
+                "UPDATE embedding_cache SET last_accessed_at = unixepoch()
              WHERE provider = ?1 AND model = ?2 AND content_hash = ?3",
-            params!(provider, model, content_hash),
-        ).await?;
+                params!(provider, model, content_hash),
+            )
+            .await?;
         Ok(())
     }
 
     /// Prune embedding cache entries not accessed within `max_age_secs`. Returns rows deleted.
     pub async fn prune_embedding_cache(&self, max_age_secs: i64) -> Result<usize> {
         let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
-        let count = self.conn.execute(
-            "DELETE FROM embedding_cache WHERE last_accessed_at < ?1",
-            params!(cutoff),
-        ).await?;
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM embedding_cache WHERE last_accessed_at < ?1",
+                params!(cutoff),
+            )
+            .await?;
         Ok(count as usize)
     }
 
@@ -768,13 +848,16 @@ impl Database {
     /// timestamp ties at the boundary still leave exactly `max_entries` rows
     /// (a `last_accessed_at <= cutoff` shape would over-delete on ties).
     pub async fn prune_embedding_cache_by_count(&self, max_entries: usize) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM embedding_cache WHERE id NOT IN (
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM embedding_cache WHERE id NOT IN (
                 SELECT id FROM embedding_cache
                 ORDER BY last_accessed_at DESC, id DESC LIMIT ?1
             )",
-            params!(max_entries as i64),
-        ).await?;
+                params!(max_entries as i64),
+            )
+            .await?;
         Ok(count as usize)
     }
 }

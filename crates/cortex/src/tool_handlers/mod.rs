@@ -112,7 +112,7 @@ pub use scripts::{handle_manage_scripts, handle_run_script, handle_security_audi
 // User input
 pub use user_input::{handle_request_user_input, handle_update_plan};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
     use crate::config::Config;

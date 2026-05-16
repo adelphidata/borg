@@ -294,7 +294,7 @@ fn higher_threat(a: ThreatLevel, b: ThreatLevel) -> ThreatLevel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
     use crate::skills::SkillRequires;

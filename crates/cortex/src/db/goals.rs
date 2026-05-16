@@ -157,11 +157,7 @@ impl Database {
 
     /// Apply a [`GoalUpdate`] patch. Returns `Ok(None)` if no goal exists or
     /// the optional CAS guard rejected the update.
-    pub async fn update_goal(
-        &self,
-        session_id: &str,
-        patch: GoalUpdate,
-    ) -> Result<Option<Goal>> {
+    pub async fn update_goal(&self, session_id: &str, patch: GoalUpdate) -> Result<Option<Goal>> {
         let existing = match self.get_goal(session_id).await? {
             Some(g) => g,
             None => return Ok(None),
@@ -227,8 +223,10 @@ impl Database {
         let now = now_unix();
         // Single SQL UPDATE so the read-modify-write is atomic w.r.t. other
         // SQLite writers in this process.
-        let affected = self.conn.execute(
-            "UPDATE goals
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE goals
                 SET tokens_used = tokens_used + ?2,
                     time_used_seconds = time_used_seconds + ?3,
                     status = CASE
@@ -241,14 +239,15 @@ impl Database {
               WHERE session_id = ?1
                 AND status = 'active'
                 AND (?5 IS NULL OR goal_id = ?5)",
-            params!(
-                session_id,
-                token_delta,
-                time_delta_seconds,
-                now,
-                expected_goal_id.map(|s| s.to_string()),
-            ),
-        ).await?;
+                params!(
+                    session_id,
+                    token_delta,
+                    time_delta_seconds,
+                    now,
+                    expected_goal_id.map(std::string::ToString::to_string),
+                ),
+            )
+            .await?;
         let current = self.get_goal(session_id).await?;
         if affected == 0 {
             Ok(GoalAccountingOutcome::Unchanged(current))

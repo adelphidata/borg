@@ -724,7 +724,7 @@ impl SettingsPopup {
         }
         // Reload config from defaults+DB. Falls back to compiled defaults if
         // the daemon's settings table is unreadable.
-        *config = Config::load_from_db().unwrap_or_default();
+        *config = crate::async_bridge::block_on(Config::load_from_db()).unwrap_or_default();
         self.refresh_customized_keys();
         self.sync_select_indices(config);
         if failed > 0 {

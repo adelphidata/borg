@@ -269,12 +269,12 @@ impl Verifier for TailscaleVerifier {
 mod tests {
     use super::*;
     use cortex::db::Database;
-    use rusqlite::Connection;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex as TokioMutex;
 
-    fn db() -> Arc<Mutex<Database>> {
-        let d = Database::from_connection(Connection::open_in_memory().expect("db")).expect("init");
-        Arc::new(Mutex::new(d))
+    async fn db() -> Arc<TokioMutex<Database>> {
+        let d = Database::test_db().await;
+        Arc::new(TokioMutex::new(d))
     }
 
     /// Stub source: returns canned JSON, counts how many times it was called.
@@ -319,12 +319,14 @@ mod tests {
         }
     }
 
-    fn seed_paired(db: &Arc<Mutex<Database>>, fp: &str, principal: &str) {
-        let g = db.lock().expect("lock");
+    async fn seed_paired(db: &Arc<TokioMutex<Database>>, fp: &str, principal: &str) {
+        let g = db.lock().await;
         let serial = g
             .insert_internal_cert("client", "PEM", fp, principal, 0, 1_000_000)
+            .await
             .expect("cert");
         g.insert_paired_device(fp, principal, "{}", principal, serial)
+            .await
             .expect("pair");
     }
 
@@ -341,14 +343,14 @@ mod tests {
         )
     }
 
-    #[test]
-    fn rejects_peer_ip_not_in_tailscale_status() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_peer_ip_not_in_tailscale_status() {
         // Real failure mode: a verifier that accepts any IP would silently
         // strip the Tailscale pin the user explicitly chose, downgrading to
         // pure TOFU. The peer here is paired but its IP is absent from
         // status — the verifier MUST refuse.
-        let shared = db();
-        seed_paired(&shared, "fp-A", "alice");
+        let shared = db().await;
+        seed_paired(&shared, "fp-A", "alice").await;
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
         let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
@@ -363,10 +365,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn accepts_when_peer_ip_matches_paired_device_in_status() {
-        let shared = db();
-        seed_paired(&shared, "fp-A", "alice");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_when_peer_ip_matches_paired_device_in_status() {
+        let shared = db().await;
+        seed_paired(&shared, "fp-A", "alice").await;
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
         let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
@@ -376,16 +378,17 @@ mod tests {
         assert_eq!(v.verify_with_peer("fp-A", None, ctx).unwrap(), "alice");
     }
 
-    #[test]
-    fn rejects_revoked_fingerprint_even_if_ip_matches() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_revoked_fingerprint_even_if_ip_matches() {
         // Order-of-checks invariant: revocation > tailscale-IP match. If the
         // verifier returned UnknownDevice or accepted the peer because the IP
         // matched, the audit trail would lose the revocation signal.
-        let shared = db();
-        seed_paired(&shared, "fp-bad", "evil");
+        let shared = db().await;
+        seed_paired(&shared, "fp-bad", "evil").await;
         {
-            let g = shared.lock().expect("lock");
+            let g = shared.lock().await;
             g.add_revoked_fingerprint("fp-bad", Some("compromised"))
+                .await
                 .expect("revoke");
         }
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
@@ -400,14 +403,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_cache_does_not_outlive_ttl() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_cache_does_not_outlive_ttl() {
         // Real failure mode: a missing TTL bound (or a too-long TTL) means
         // tailscale node churn isn't picked up; a too-short TTL forks
         // `tailscale` on every gRPC connection. Three connections inside the
         // window should fork once; one after the TTL must re-fork.
-        let shared = db();
-        seed_paired(&shared, "fp-A", "alice");
+        let shared = db().await;
+        seed_paired(&shared, "fp-A", "alice").await;
         // Self must be non-empty (a logged-out tailscaled is now refused;
         // see `rejects_when_tailscale_status_has_no_self_node`).
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
@@ -436,13 +439,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_without_peer_ip_is_hard_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_without_peer_ip_is_hard_error() {
         // Guards the call-site contract: if the gRPC interceptor forgets to
         // thread peer_ip through `verify_with_peer`, the connection refuses
         // rather than silently dropping the Tailscale pin.
-        let shared = db();
-        seed_paired(&shared, "fp-A", "alice");
+        let shared = db().await;
+        seed_paired(&shared, "fp-A", "alice").await;
         let source = StubSource::new(&status_with(&[], &["100.64.0.2"]));
         let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
@@ -457,18 +460,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_verifier_fails_closed_when_tailscale_binary_absent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_verifier_fails_closed_when_tailscale_binary_absent() {
         // Daemon-startup invariant: `security.verifier = tailscale` with no
         // tailscale binary on PATH must surface as a hard error so we don't
         // silently downgrade to TOFU. This pins the factory contract.
-        let shared = db();
+        let shared = db().await;
         let source: Arc<dyn TailscaleStatusSource> = Arc::new(MissingSource);
         let res = super::super::build_verifier(
             cortex::config::VerifierKind::Tailscale,
             shared,
             Some(source),
-        );
+        )
+        .await;
         let err = match res {
             Ok(_) => panic!("must fail-closed"),
             Err(e) => e,
@@ -480,15 +484,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_when_tailscale_status_has_no_self_node() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_when_tailscale_status_has_no_self_node() {
         // Real failure mode: a logged-out tailscaled returns `Self: null`.
         // With an empty self_ips set, every peer IP would pass the "non-self"
         // filter and TOFU would be silently re-enabled. The verifier MUST
         // refuse instead — fail-closed matches the operator's chosen
         // posture.
-        let shared = db();
-        seed_paired(&shared, "fp-A", "alice");
+        let shared = db().await;
+        seed_paired(&shared, "fp-A", "alice").await;
         let json = r#"{"Self": null, "Peer": {"abc": {"TailscaleIPs": ["100.64.0.2"]}}}"#;
         let source = StubSource::new(json);
         let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
@@ -507,10 +511,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_verifier_returns_tofu_for_tofu_kind() {
-        let shared = db();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_verifier_returns_tofu_for_tofu_kind() {
+        let shared = db().await;
         let v = super::super::build_verifier(cortex::config::VerifierKind::Tofu, shared, None)
+            .await
             .expect("build");
         // TOFU verifier ignores peer ctx; an unknown fingerprint should
         // surface as UnknownDevice (not Tailscale*) — proves we built the

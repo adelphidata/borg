@@ -91,8 +91,8 @@ impl Database {
                     plugin_id,
                     credential_key,
                     storage_type,
-                    keychain_service.map(|s| s.to_string()),
-                    env_var.map(|s| s.to_string()),
+                    keychain_service.map(std::string::ToString::to_string),
+                    env_var.map(std::string::ToString::to_string),
                 ),
             )
             .await?;
@@ -257,52 +257,70 @@ impl Database {
         tools: &[(&str, &str, &str)],
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.unchecked_transaction().await?;
-        tx.execute(
-            "INSERT OR REPLACE INTO wasm_plugins
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<()> = async {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO wasm_plugins
              (plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key, signature,
               local_hmac, manifest_path, wasm_path, status, quarantine_reason, installed_at, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'verified', NULL, ?10, ?10)",
-            params!(
-                plugin.plugin_id,
-                plugin.manifest_json,
-                plugin.manifest_sha256,
-                plugin.wasm_sha256,
-                plugin.publisher_key,
-                plugin.signature,
-                plugin.local_hmac,
-                plugin.manifest_path,
-                plugin.wasm_path,
-                now,
-            ),
-        ).await?;
-        tx.execute(
-            "DELETE FROM wasm_plugin_tools WHERE plugin_id = ?1",
-            params!(plugin.plugin_id),
-        )
-        .await?;
-        for (name, description, schema) in tools {
-            tx.execute(
-                "INSERT INTO wasm_plugin_tools
-                 (plugin_id, name, description, input_schema_json, installed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params!(plugin.plugin_id, *name, *description, *schema, now),
+                params!(
+                    plugin.plugin_id,
+                    plugin.manifest_json,
+                    plugin.manifest_sha256,
+                    plugin.wasm_sha256,
+                    plugin.publisher_key,
+                    plugin.signature,
+                    plugin.local_hmac,
+                    plugin.manifest_path,
+                    plugin.wasm_path,
+                    now,
+                ),
+            ).await?;
+            self.conn.execute(
+                "DELETE FROM wasm_plugin_tools WHERE plugin_id = ?1",
+                params!(plugin.plugin_id),
             )
             .await?;
+            for (name, description, schema) in tools {
+                self.conn.execute(
+                    "INSERT INTO wasm_plugin_tools
+                 (plugin_id, name, description, input_schema_json, installed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!(plugin.plugin_id, *name, *description, *schema, now),
+                )
+                .await?;
+            }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "plugins: rollback after insert_wasm_plugin failure failed: {re}"
+                    );
+                }
+                Err(e)
+            }
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Return a WASM plugin row by id.
     pub async fn get_wasm_plugin(&self, plugin_id: &str) -> Result<Option<WasmPluginRow>> {
-        let mut rows = self.conn.query(
-            "SELECT plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key,
                     signature, local_hmac, manifest_path, wasm_path, status, quarantine_reason,
                     installed_at, verified_at
              FROM wasm_plugins WHERE plugin_id = ?1",
-            params!(plugin_id),
-        ).await?;
+                params!(plugin_id),
+            )
+            .await?;
         match rows.next().await? {
             Some(row) => Ok(Some(WasmPluginRow {
                 plugin_id: row.get::<String>(0)?,
@@ -467,9 +485,7 @@ impl Database {
     }
 
     /// List verified WASM tool definitions to advertise to the LLM.
-    pub async fn list_verified_wasm_tool_definitions(
-        &self,
-    ) -> Result<Vec<WasmToolDefinitionRow>> {
+    pub async fn list_verified_wasm_tool_definitions(&self) -> Result<Vec<WasmToolDefinitionRow>> {
         let mut rows = self
             .conn
             .query(

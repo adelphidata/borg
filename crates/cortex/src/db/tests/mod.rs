@@ -7,10 +7,10 @@
 
 use super::*;
 use crate::multi_agent::SubAgentStatus;
-use rusqlite::params;
+use turso::params;
 
-pub(super) fn test_db() -> Database {
-    Database::test_db()
+pub(super) async fn test_db() -> Database {
+    Database::test_db().await
 }
 
 pub(super) fn simple_task<'a>(

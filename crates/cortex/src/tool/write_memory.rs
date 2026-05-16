@@ -310,7 +310,7 @@ mod tests {
             append: false,
             scope: Some("nonexistent_scope_just_for_test".into()),
         };
-        let _ = handle(&args, &config, &config_arc, &mut caches);
+        let _ = handle(&args, &config, &config_arc, &mut caches).await;
         assert_eq!(
             caches.identity_for_test(),
             Some("stale-identity"),

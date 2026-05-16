@@ -79,6 +79,7 @@ impl ReadOnlyToolHandler for ReadMemoryHandler {
 
     async fn call(&self, arguments: serde_json::Value) -> Result<serde_json::Value, McpError> {
         cortex::tool_handlers::handle_read_memory(&arguments)
+            .await
             .map(serde_json::Value::String)
             .map_err(|e| McpError::internal(format!("read_memory failed: {e}")))
     }

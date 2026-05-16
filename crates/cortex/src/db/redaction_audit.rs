@@ -36,7 +36,7 @@ impl Database {
             return Ok(());
         }
         let now = chrono::Utc::now().timestamp();
-        let context_key_owned = context_key.map(|s| s.to_string());
+        let context_key_owned = context_key.map(std::string::ToString::to_string);
         for hit in hits {
             self.conn
                 .execute(

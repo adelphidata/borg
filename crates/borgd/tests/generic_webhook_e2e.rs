@@ -24,10 +24,11 @@ mod common;
 
 /// Set up a webhook definition row and return the plaintext secret
 /// the user would see once.
-fn create_webhook(name: &str, sender_path: &str) -> String {
-    let db = cortex::db::Database::open().expect("open db");
+async fn create_webhook(name: &str, sender_path: &str) -> String {
+    let db = cortex::db::Database::open().await.expect("open db");
     let created =
         gateway::generic_webhook::definitions::create(&db, name, sender_path, None, "$.body")
+            .await
             .expect("create webhook");
     created.secret
 }
@@ -53,7 +54,7 @@ fn sign(secret_plaintext: &str, ts: i64, body: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generic_webhook_signed_post_dispatches_to_agent() {
     let harness = common::boot_gateway(true).await;
-    let secret = create_webhook("e2e-hook", "$.user");
+    let secret = create_webhook("e2e-hook", "$.user").await;
     // Webhook session key = `<extracted-sender>:`; the JSONPath
     // `$.user` returns "alice" from the payload below.
     common::register_stub_for_session("alice:", vec![AgentEvent::TurnComplete]);

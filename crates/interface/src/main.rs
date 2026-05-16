@@ -42,6 +42,7 @@ use crate::commands::status::{BondAction, StatusAction};
 use crate::commands::tasks::{CronAction, TasksAction};
 
 mod api_key_store;
+mod async_bridge;
 mod commands;
 mod credentials;
 // Daemon client lib lives in this crate to keep dev workflow tight; many of
@@ -383,7 +384,9 @@ async fn async_main() -> Result<()> {
     let _telemetry_guard;
 
     {
-        let config = cortex::config::Config::load_from_db().unwrap_or_default();
+        let config = cortex::config::Config::load_from_db()
+            .await
+            .unwrap_or_default();
 
         // Install the process-global output-redaction policy for standalone
         // `borg` (TUI / REPL without `borgd`). When `borgd` is the host the
@@ -392,7 +395,7 @@ async fn async_main() -> Result<()> {
         // `security.output_redaction` (default true). The policy will still
         // strip secrets even if the audit-DB open fails — failing closed
         // (i.e. skipping redaction) would be the wrong choice security-wise.
-        match cortex::db::Database::open() {
+        match cortex::db::Database::open().await {
             Ok(db) => {
                 use std::sync::{Arc, Mutex};
                 cortex::output_redaction::install_global(
@@ -520,11 +523,11 @@ async fn async_main() -> Result<()> {
             json,
             mode,
         }) => repl::one_shot(&message, json, mode.as_deref()).await?,
-        Some(Commands::Status { action }) => commands::status::dispatch_status(action)?,
-        Some(Commands::Bond { action }) => commands::status::dispatch_bond(action)?,
-        Some(Commands::Doctor { action }) => commands::doctor::dispatch_doctor(action)?,
-        Some(Commands::Skills { action }) => commands::skills::dispatch_skills(action)?,
-        Some(Commands::Memory { action }) => commands::memory::dispatch_memory(action)?,
+        Some(Commands::Status { action }) => commands::status::dispatch_status(action).await?,
+        Some(Commands::Bond { action }) => commands::status::dispatch_bond(action).await?,
+        Some(Commands::Doctor { action }) => commands::doctor::dispatch_doctor(action).await?,
+        Some(Commands::Skills { action }) => commands::skills::dispatch_skills(action).await?,
+        Some(Commands::Memory { action }) => commands::memory::dispatch_memory(action).await?,
         Some(Commands::Heal) => commands::heal::run_heal().await?,
         Some(Commands::Sessions { action }) => {
             commands::sessions::dispatch_sessions(action).await?
@@ -533,40 +536,39 @@ async fn async_main() -> Result<()> {
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
         Some(Commands::Plugins) => plugins::list_plugins()?,
-        Some(Commands::Plugin { action }) => commands::wasm_plugin::dispatch(action)?,
-        Some(Commands::Settings { action }) => commands::settings::dispatch_settings(action)?,
+        Some(Commands::Plugin { action }) => commands::wasm_plugin::dispatch(action).await?,
+        Some(Commands::Settings { action }) => {
+            commands::settings::dispatch_settings(action).await?
+        }
         Some(Commands::Logs {
             count,
             verbose,
             activity,
             level,
             category,
-        }) => commands::settings::dispatch_logs(
-            count,
-            verbose,
-            activity,
-            &level,
-            category.as_deref(),
-        )?,
+        }) => {
+            commands::settings::dispatch_logs(count, verbose, activity, &level, category.as_deref())
+                .await?
+        }
         Some(Commands::Tasks { action }) => commands::tasks::dispatch_tasks(action)?,
         Some(Commands::Cron { action }) => commands::tasks::dispatch_cron(action)?,
-        Some(Commands::Providers { action }) => commands::providers::dispatch(action)?,
-        Some(Commands::Usage) => commands::status::run_usage()?,
+        Some(Commands::Providers { action }) => commands::providers::dispatch(action).await?,
+        Some(Commands::Usage) => commands::status::run_usage().await?,
         Some(Commands::Pairing { action }) => commands::pairing::dispatch_pairing(action)?,
         Some(Commands::Poke) => commands::misc::run_poke().await?,
         Some(Commands::Dream) => commands::misc::run_dream().await?,
         Some(Commands::Cancel { session }) => commands::misc::run_cancel(session).await?,
         Some(Commands::Away { message }) => commands::misc::run_away(message).await?,
         Some(Commands::Available) => commands::misc::run_available().await?,
-        Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action)?,
+        Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action).await?,
         Some(Commands::Update(args)) => {
             commands::misc::run_update(args.prerelease, args.check).await?
         }
         Some(Commands::ClientToken { action }) => {
-            commands::client_token::dispatch_client_token(action)?
+            commands::client_token::dispatch_client_token(action).await?
         }
         Some(Commands::Auth { action }) => commands::auth::dispatch_auth(action)?,
-        Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action)?,
+        Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action).await?,
         Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
         Some(Commands::Acp) => unreachable!("ACP handled before interactive bootstrap"),
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
@@ -594,9 +596,11 @@ async fn async_main() -> Result<()> {
             AuditCmd::Verify => commands::audit::run_verify().await?,
         },
         Some(Commands::Backup { action }) => match action {
-            BackupCmd::Create => commands::backup::run_create()?,
-            BackupCmd::Verify { file } => commands::backup::run_verify(&file)?,
-            BackupCmd::Restore { file, force } => commands::backup::run_restore(&file, force)?,
+            BackupCmd::Create => commands::backup::run_create().await?,
+            BackupCmd::Verify { file } => commands::backup::run_verify(&file).await?,
+            BackupCmd::Restore { file, force } => {
+                commands::backup::run_restore(&file, force).await?
+            }
         },
     }
 
@@ -636,90 +640,15 @@ async fn is_onboarded_async() -> bool {
             return state.onboarded;
         }
     }
-    // Daemon unreachable (crash loop, never started, or just slow). Without
-    // this fallback every transient daemon outage re-prompts onboarding,
-    // which clobbers existing state. The sentinel is a single read of a
-    // boolean settings row — safe to do directly without migrations.
-    match read_onboarded_sentinel(&db_path) {
-        Ok(v) => v,
-        Err(SentinelError::Transient(e)) => {
-            // Lock contention / IO blip: assume onboarded so a transient
-            // daemon-write race doesn't re-prompt the wizard and clobber
-            // existing state.
-            tracing::warn!("is_onboarded: transient DB read failure ({e}); assuming onboarded");
-            true
-        }
-        Err(SentinelError::Fatal(e)) => {
-            // Corrupt DB / missing schema / not-a-database: there's nothing
-            // to clobber, and re-running the wizard is the recovery path.
-            tracing::warn!("is_onboarded: DB unusable ({e}); will re-run onboarding");
-            false
-        }
-    }
-}
-
-enum SentinelError {
-    /// SQLITE_BUSY / SQLITE_LOCKED / IO — likely recovers on next run.
-    Transient(anyhow::Error),
-    /// SQLITE_CORRUPT / SQLITE_NOTADB / missing `settings` table — DB is
-    /// effectively empty for our purposes; safe to re-onboard.
-    Fatal(anyhow::Error),
-}
-
-impl std::fmt::Display for SentinelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SentinelError::Transient(e) | SentinelError::Fatal(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-/// Best-effort read of the `onboarded` settings row without running
-/// migrations or contending with the daemon's writer connection.
-///
-/// Distinguishes three cases:
-/// - row present and "true" → onboarded
-/// - row absent or != "true" → not onboarded
-/// - DB locked / query error → returns `Err` (caller decides; see above)
-///
-/// Sets a busy_timeout so a mid-write daemon (BEGIN IMMEDIATE / checkpoint)
-/// doesn't immediately surface as `SQLITE_BUSY`.
-fn read_onboarded_sentinel(db_path: &std::path::Path) -> Result<bool, SentinelError> {
-    use rusqlite::ffi::ErrorCode;
-    let classify = |e: rusqlite::Error| -> SentinelError {
-        match &e {
-            rusqlite::Error::SqliteFailure(err, _) => match err.code {
-                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
-                    SentinelError::Transient(e.into())
-                }
-                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
-                    SentinelError::Fatal(e.into())
-                }
-                _ => SentinelError::Transient(e.into()),
-            },
-            // Missing `settings` table on a partially-initialized DB.
-            rusqlite::Error::SqlInputError { .. } => SentinelError::Fatal(e.into()),
-            _ => SentinelError::Transient(e.into()),
-        }
-    };
-
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(classify)?;
-    conn.busy_timeout(std::time::Duration::from_secs(2))
-        .map_err(classify)?;
-    let value: Option<String> = match conn.query_row(
-        "SELECT value FROM settings WHERE key = 'onboarded'",
-        [],
-        |r| r.get::<_, String>(0),
-    ) {
-        Ok(v) => Some(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(classify(e)),
-    };
-    Ok(matches!(value.as_deref(), Some("true")))
+    // Daemon unreachable (crash loop, never started, or just slow). The DB
+    // is encrypted at rest, so we can't peek at the `onboarded` settings
+    // row without going through the full Turso open path (KEK + migrations)
+    // — which races the daemon's writer. The conservative call when a DB
+    // file exists is to assume onboarded; re-prompting the wizard during a
+    // transient daemon outage would clobber existing state, which is worse
+    // than the rare case of skipping onboarding on a half-initialized DB.
+    tracing::warn!("is_onboarded: daemon unreachable but DB file present; assuming onboarded");
+    true
 }
 
 /// Sync wrapper used by `ensure_onboarded` (which is itself called from a

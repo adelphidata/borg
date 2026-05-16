@@ -50,7 +50,7 @@ pub use cortex::paths::kek_file_path;
 /// Build the KEK store for this daemon process. Resolves `Auto` and
 /// persists the chosen backend so the posture snapshot reads a concrete
 /// value on the very next call.
-pub fn build_kek_store(
+pub async fn build_kek_store(
     borg_home: &Path,
     cfg: &CoreConfig,
     settings_db: &Database,
@@ -67,7 +67,7 @@ pub fn build_kek_store(
         KekBackend::Auto => {
             if probe_keychain() {
                 tracing::info!("KEK backend: os_keychain (auto-detected)");
-                persist_resolved_backend(settings_db, KekBackend::OsKeychain);
+                persist_resolved_backend(settings_db, KekBackend::OsKeychain).await;
                 Ok(Arc::new(KeychainStore::new()))
             } else {
                 tracing::warn!(
@@ -82,7 +82,7 @@ pub fn build_kek_store(
                 // lost, and silently rewriting it would invalidate the
                 // existing encrypted blob.
                 let store = open_file_store_auto(borg_home)?;
-                persist_resolved_backend(settings_db, KekBackend::File);
+                persist_resolved_backend(settings_db, KekBackend::File).await;
                 Ok(store)
             }
         }
@@ -216,13 +216,13 @@ fn write_file_0600(path: &Path, body: &[u8]) -> Result<()> {
 /// and commit, the next start re-probes — same outcome, slightly
 /// slower bootstrap. We log so a chronic write failure surfaces in
 /// `borg doctor`.
-fn persist_resolved_backend(db: &Database, backend: KekBackend) {
+async fn persist_resolved_backend(db: &Database, backend: KekBackend) {
     // Only commit if the stored setting is still `auto` — guards against
     // a concurrent installer (`borg service install --secure`) writing
     // `os_keychain` while a daemon-side probe transiently fails and
     // would otherwise stomp it back to `file`. If the user has made an
     // explicit choice, respect it.
-    match db.get_setting("security.kek_backend") {
+    match db.get_setting("security.kek_backend").await {
         Ok(Some(v)) if v != "auto" => {
             tracing::debug!(
                 "kek_backend already set to {v}; skipping auto-resolve persist of {backend}"
@@ -238,7 +238,7 @@ fn persist_resolved_backend(db: &Database, backend: KekBackend) {
         }
     }
     let value = backend.to_string();
-    if let Err(e) = db.set_setting("security.kek_backend", &value) {
+    if let Err(e) = db.set_setting("security.kek_backend", &value).await {
         tracing::warn!(
             "could not persist resolved kek_backend={value}: {e} \
             (probe will repeat on next start)"
@@ -255,20 +255,19 @@ fn persist_resolved_backend(db: &Database, backend: KekBackend) {
 mod tests {
     use super::*;
     use cortex::config::Config;
-    use rusqlite::Connection;
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
     /// Process-wide guard: tests in this module mutate the global
     /// `BORG_KEK_PASSPHRASE` env var, and Cargo runs them on a shared
     /// thread pool. Without serialization a "remove_var" in one test races
     /// with a "set_var" in another and produces flakes that look like
-    /// production bugs.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// production bugs. Async-aware mutex so the guard can safely live
+    /// across `.await` points without tripping `clippy::await_holding_lock`.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    fn fresh_db_and_home() -> (tempfile::TempDir, Database) {
+    async fn fresh_db_and_home() -> (tempfile::TempDir, Database) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = Database::from_connection(Connection::open_in_memory().expect("open in-mem db"))
-            .expect("init test db");
+        let db = Database::test_db().await;
         (tmp, db)
     }
 
@@ -277,11 +276,11 @@ mod tests {
     /// "always boots" headless guarantee breaks: a user who runs
     /// `borgd` directly (no `borg service install`) on a CI/dev box
     /// where the OS keychain isn't usable would see a hard error.
-    #[test]
-    fn auto_fallback_provisions_kek_env_when_missing() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    #[tokio::test]
+    async fn auto_fallback_provisions_kek_env_when_missing() {
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var(PASSPHRASE_ENV);
-        let (home, _db) = fresh_db_and_home();
+        let (home, _db) = fresh_db_and_home().await;
         let store =
             open_file_store_auto(home.path()).expect("auto fallback must provision and open");
         store.put("ca-key", b"PEM").expect("put");
@@ -306,11 +305,11 @@ mod tests {
     /// regenerate the passphrase — regenerating would invalidate the
     /// already-encrypted KEK blob and re-mint the CA on every boot,
     /// invalidating every paired device.
-    #[test]
-    fn auto_fallback_reads_existing_kek_env_without_regenerating() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    #[tokio::test]
+    async fn auto_fallback_reads_existing_kek_env_without_regenerating() {
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var(PASSPHRASE_ENV);
-        let (home, _db) = fresh_db_and_home();
+        let (home, _db) = fresh_db_and_home().await;
         let secrets = home.path().join("secrets");
         std::fs::create_dir_all(&secrets).unwrap();
         let env_path = secrets.join(KEK_ENV_FILE);
@@ -332,14 +331,15 @@ mod tests {
     /// probe failure in a daemon restart loop could clobber the
     /// installer's choice and flip the deploy into a state where it
     /// can't find its passphrase.
-    #[test]
-    fn persist_resolved_backend_respects_explicit_setting() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (_home, db) = fresh_db_and_home();
+    #[tokio::test]
+    async fn persist_resolved_backend_respects_explicit_setting() {
+        let _g = ENV_LOCK.lock().await;
+        let (_home, db) = fresh_db_and_home().await;
         db.set_setting("security.kek_backend", "os_keychain")
+            .await
             .unwrap();
-        persist_resolved_backend(&db, KekBackend::File);
-        let stored = db.get_setting("security.kek_backend").unwrap();
+        persist_resolved_backend(&db, KekBackend::File).await;
+        let stored = db.get_setting("security.kek_backend").await.unwrap();
         assert_eq!(
             stored.as_deref(),
             Some("os_keychain"),
@@ -350,46 +350,49 @@ mod tests {
     /// When the setting is still `auto`, persisting the resolved value
     /// is allowed — that's how the very first daemon start records its
     /// decision so subsequent boots skip the probe.
-    #[test]
-    fn persist_resolved_backend_writes_when_setting_is_auto() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (_home, db) = fresh_db_and_home();
-        db.set_setting("security.kek_backend", "auto").unwrap();
-        persist_resolved_backend(&db, KekBackend::File);
-        let stored = db.get_setting("security.kek_backend").unwrap();
+    #[tokio::test]
+    async fn persist_resolved_backend_writes_when_setting_is_auto() {
+        let _g = ENV_LOCK.lock().await;
+        let (_home, db) = fresh_db_and_home().await;
+        db.set_setting("security.kek_backend", "auto")
+            .await
+            .unwrap();
+        persist_resolved_backend(&db, KekBackend::File).await;
+        let stored = db.get_setting("security.kek_backend").await.unwrap();
         assert_eq!(stored.as_deref(), Some("file"));
     }
 
-    #[test]
-    fn explicit_file_backend_uses_file_store_and_round_trips() {
+    #[tokio::test]
+    async fn explicit_file_backend_uses_file_store_and_round_trips() {
         // Reflects the `--secure` non-Debian fallback path: the installer
         // wrote `kek_backend=file`, supplied a passphrase via env, and the
         // daemon must boot a working FileKekStore even when the OS keychain
         // is unavailable in CI.
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, db) = fresh_db_and_home();
+        let _g = ENV_LOCK.lock().await;
+        let (home, db) = fresh_db_and_home().await;
         std::env::set_var(PASSPHRASE_ENV, "test-passphrase");
         let mut cfg = Config::default();
         cfg.security.kek_backend = KekBackend::File;
-        let store =
-            build_kek_store(home.path(), &cfg, &db).expect("build file store should succeed");
+        let store = build_kek_store(home.path(), &cfg, &db)
+            .await
+            .expect("build file store should succeed");
         store.put("ca-key", b"PEM").expect("put");
         assert_eq!(store.get("ca-key").expect("get"), b"PEM".to_vec());
         std::env::remove_var(PASSPHRASE_ENV);
     }
 
-    #[test]
-    fn explicit_file_backend_errors_when_passphrase_missing() {
+    #[tokio::test]
+    async fn explicit_file_backend_errors_when_passphrase_missing() {
         // Real failure mode: systemd unit lost the EnvironmentFile, daemon
         // restarts, and we must hard-fail with a clear message rather than
         // silently boot with a default-passphrase empty store (which would
         // mint a fresh CA and invalidate every paired device).
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, db) = fresh_db_and_home();
+        let _g = ENV_LOCK.lock().await;
+        let (home, db) = fresh_db_and_home().await;
         std::env::remove_var(PASSPHRASE_ENV);
         let mut cfg = Config::default();
         cfg.security.kek_backend = KekBackend::File;
-        let result = build_kek_store(home.path(), &cfg, &db);
+        let result = build_kek_store(home.path(), &cfg, &db).await;
         match result {
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -402,17 +405,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_file_backend_errors_when_passphrase_is_empty() {
+    #[tokio::test]
+    async fn explicit_file_backend_errors_when_passphrase_is_empty() {
         // Defense-in-depth: empty-string env is a common mistake (e.g. a
         // missing `=value` in EnvironmentFile). We don't want to encrypt
         // with an empty passphrase silently.
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, db) = fresh_db_and_home();
+        let _g = ENV_LOCK.lock().await;
+        let (home, db) = fresh_db_and_home().await;
         std::env::set_var(PASSPHRASE_ENV, "");
         let mut cfg = Config::default();
         cfg.security.kek_backend = KekBackend::File;
-        let result = build_kek_store(home.path(), &cfg, &db);
+        let result = build_kek_store(home.path(), &cfg, &db).await;
         std::env::remove_var(PASSPHRASE_ENV);
         assert!(result.is_err(), "must reject empty passphrase");
     }
@@ -432,9 +435,9 @@ mod tests {
     /// same on-disk file + passphrase, and assert the same private key
     /// comes back. Catches "fresh CA on every boot" regressions that
     /// would invalidate every paired device.
-    #[test]
-    fn file_backend_persists_kek_across_restart() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    #[tokio::test]
+    async fn file_backend_persists_kek_across_restart() {
+        let _g = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         std::env::set_var(PASSPHRASE_ENV, "integration-passphrase");
@@ -442,9 +445,10 @@ mod tests {
         cfg.security.kek_backend = KekBackend::File;
 
         // Round 1: build store, write a sentinel CA private key.
-        let db1 =
-            Database::from_connection(Connection::open_in_memory().expect("db")).expect("init db1");
-        let store1 = build_kek_store(home, &cfg, &db1).expect("kek round 1");
+        let db1 = Database::test_db().await;
+        let store1 = build_kek_store(home, &cfg, &db1)
+            .await
+            .expect("kek round 1");
         let sentinel_key = b"-----BEGIN PRIVATE KEY-----\nFAKE_CA_PEM\n-----END PRIVATE KEY-----";
         store1.put("root-ca-key", sentinel_key).expect("put");
         drop(store1);
@@ -466,9 +470,10 @@ mod tests {
         // Round 2: rebuild from disk + same passphrase. The CA private
         // key must round-trip — that's the property a paired device
         // depends on across daemon restarts.
-        let db2 =
-            Database::from_connection(Connection::open_in_memory().expect("db")).expect("init db2");
-        let store2 = build_kek_store(home, &cfg, &db2).expect("kek round 2");
+        let db2 = Database::test_db().await;
+        let store2 = build_kek_store(home, &cfg, &db2)
+            .await
+            .expect("kek round 2");
         let recovered = store2
             .get("root-ca-key")
             .expect("round-2 store must return the sentinel KEK entry");

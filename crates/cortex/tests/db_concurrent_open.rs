@@ -10,14 +10,14 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::sync::Arc;
 
 use cortex::db::Database;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 
-#[test]
-fn concurrent_open_on_fresh_db_does_not_double_migrate() {
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_open_on_fresh_db_does_not_double_migrate() {
     const N: usize = 8;
 
     let tmp = TempDir::new().expect("tempdir");
@@ -29,17 +29,17 @@ fn concurrent_open_on_fresh_db_does_not_double_migrate() {
     for _ in 0..N {
         let path = path.clone();
         let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || -> anyhow::Result<u32> {
-            barrier.wait();
-            let db = Database::open_at(&path)?;
-            db.schema_version()
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let db = Database::open_at(&path).await?;
+            db.schema_version().await
         }));
     }
 
     for h in handles {
         let version = h
-            .join()
-            .expect("thread panicked")
+            .await
+            .expect("task panicked")
             .expect("Database::open_at must succeed under concurrent first-time init");
         assert!(
             version >= 1,

@@ -12,63 +12,77 @@ impl Database {
         self.conn.execute(
             "INSERT INTO delivery_queue (id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?8, ?8)",
-            params!(d.id, d.channel_name, d.sender_id, d.channel_id.map(|s| s.to_string()), d.session_id.map(|s| s.to_string()), d.payload_json, d.max_retries, now),
+            params!(d.id, d.channel_name, d.sender_id, d.channel_id.map(std::string::ToString::to_string), d.session_id.map(std::string::ToString::to_string), d.payload_json, d.max_retries, now),
         ).await?;
         Ok(())
     }
 
     pub async fn claim_pending_deliveries(&self, limit: u32) -> Result<Vec<DeliveryRow>> {
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.unchecked_transaction().await?;
-
-        let mut stmt = tx.prepare(
-            "SELECT id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, next_retry_at, created_at, updated_at, error
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<Vec<DeliveryRow>> = async {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, next_retry_at, created_at, updated_at, error
              FROM delivery_queue
              WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)
              ORDER BY created_at ASC
              LIMIT ?2",
-        ).await?;
-        let mut rows_iter = stmt.query(params!(now, limit as i64)).await?;
-        let mut rows = Vec::new();
-        while let Some(row) = rows_iter.next().await? {
-            rows.push(DeliveryRow {
-                id: row.get::<String>(0)?,
-                channel_name: row.get::<String>(1)?,
-                sender_id: row.get::<String>(2)?,
-                channel_id: row.get::<Option<String>>(3)?,
-                session_id: row.get::<Option<String>>(4)?,
-                payload_json: row.get::<String>(5)?,
-                status: row.get::<String>(6)?,
-                retry_count: row.get::<i64>(7)? as i32,
-                max_retries: row.get::<i64>(8)? as i32,
-                next_retry_at: row.get::<Option<i64>>(9)?,
-                created_at: row.get::<i64>(10)?,
-                updated_at: row.get::<i64>(11)?,
-                error: row.get::<Option<String>>(12)?,
-            });
-        }
-        drop(rows_iter);
-        drop(stmt);
+            ).await?;
+            let mut rows_iter = stmt.query(params!(now, limit as i64)).await?;
+            let mut rows = Vec::new();
+            while let Some(row) = rows_iter.next().await? {
+                rows.push(DeliveryRow {
+                    id: row.get::<String>(0)?,
+                    channel_name: row.get::<String>(1)?,
+                    sender_id: row.get::<String>(2)?,
+                    channel_id: row.get::<Option<String>>(3)?,
+                    session_id: row.get::<Option<String>>(4)?,
+                    payload_json: row.get::<String>(5)?,
+                    status: row.get::<String>(6)?,
+                    retry_count: row.get::<i64>(7)? as i32,
+                    max_retries: row.get::<i64>(8)? as i32,
+                    next_retry_at: row.get::<Option<i64>>(9)?,
+                    created_at: row.get::<i64>(10)?,
+                    updated_at: row.get::<i64>(11)?,
+                    error: row.get::<Option<String>>(12)?,
+                });
+            }
+            drop(rows_iter);
+            drop(stmt);
 
-        // Mark claimed rows as in_progress.
-        for row in &rows {
-            tx.execute(
-                "UPDATE delivery_queue SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
-                params!(now, row.id.clone()),
-            )
-            .await?;
-        }
+            // Mark claimed rows as in_progress.
+            for row in &rows {
+                self.conn.execute(
+                    "UPDATE delivery_queue SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
+                    params!(now, row.id.clone()),
+                )
+                .await?;
+            }
 
-        tx.commit().await?;
-        Ok(rows)
+            Ok(rows)
+        }.await;
+        match result {
+            Ok(rows) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(rows)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("delivery: rollback after claim failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn mark_delivered(&self, id: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "UPDATE delivery_queue SET status = 'delivered', updated_at = ?1 WHERE id = ?2",
-            params!(now, id),
-        ).await?;
+        self.conn
+            .execute(
+                "UPDATE delivery_queue SET status = 'delivered', updated_at = ?1 WHERE id = ?2",
+                params!(now, id),
+            )
+            .await?;
         Ok(())
     }
 

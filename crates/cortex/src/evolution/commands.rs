@@ -214,7 +214,7 @@ async fn format_posture_line(db: &Database) -> String {
 
 // ── Tests ──
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

@@ -32,7 +32,7 @@ impl Database {
         expires_at: i64,
         reason: Option<&str>,
     ) -> Result<()> {
-        let reason_owned = reason.map(|s| s.to_string());
+        let reason_owned = reason.map(std::string::ToString::to_string);
         self.conn
             .execute(
                 "INSERT INTO doctor_squelches (category, name, squelched_at, expires_at, reason)

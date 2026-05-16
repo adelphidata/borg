@@ -55,7 +55,11 @@ pub struct WalVacuumOutcome {
 /// Read `(freelist_count, page_count, page_size)` for fragmentation gating.
 async fn fragmentation_stats(db: &Database) -> Result<(i64, i64, i64)> {
     async fn read_pragma(db: &Database, sql: &str) -> Result<i64> {
-        let mut rows = db.conn().query(sql, ()).await.with_context(|| sql.to_string())?;
+        let mut rows = db
+            .conn()
+            .query(sql, ())
+            .await
+            .with_context(|| sql.to_string())?;
         match rows.next().await? {
             Some(row) => Ok(row.get::<i64>(0)?),
             None => Ok(0),
@@ -104,18 +108,17 @@ pub(crate) fn should_vacuum(
 /// either step log + continue — they never propagate up. The maintenance
 /// sweep treats this as best-effort housekeeping; one failed checkpoint
 /// must not abort the rest of the sweep.
-pub async fn run_wal_and_vacuum(
-    db: &Database,
-    now: i64,
-    interval_days: u32,
-) -> WalVacuumOutcome {
+pub async fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVacuumOutcome {
     let mut outcome = WalVacuumOutcome::default();
 
     // 1. Always: WAL checkpoint (TRUNCATE). Returns three integers:
     //    busy (0/1), log_pages, checkpointed_pages. We surface
     //    checkpointed_pages as the reclaimed count.
     let checkpoint_result: Result<i64> = async {
-        let mut rows = db.conn().query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        let mut rows = db
+            .conn()
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await?;
         match rows.next().await? {
             Some(row) => Ok(row.get::<i64>(2)?),
             None => Ok(0),

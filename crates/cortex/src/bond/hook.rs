@@ -57,7 +57,10 @@ impl BondHook {
     async fn record(&self, event_type: &str, delta: i32, reason: &str) {
         let db = self.db.lock().await;
 
-        if let Err(e) = db.record_bond_event_chained(event_type, delta, reason).await {
+        if let Err(e) = db
+            .record_bond_event_chained(event_type, delta, reason)
+            .await
+        {
             tracing::warn!("bond: failed to record event: {e}");
             return;
         }

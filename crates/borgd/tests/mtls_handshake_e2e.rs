@@ -19,8 +19,9 @@
 //! controls all state through the shared `Arc<Mutex<Database>>`.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use borgd::auth::{auth_interceptor, build_server_tls_config, build_verifier, ServerCertMaterial};
 use borgd::pki_grpc::PkiSvc;
@@ -34,7 +35,6 @@ use protocols::pki::pki_client::PkiClient;
 use protocols::pki::pki_server::PkiServer;
 use protocols::pki::PkiEmpty;
 use rcgen::KeyPair;
-use rusqlite::Connection;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::service::interceptor::InterceptedService;
@@ -71,14 +71,14 @@ async fn spawn_mtls_server() -> ServerHandle {
     })
     .expect("tls config");
 
-    let db = Arc::new(Mutex::new(
-        Database::from_connection(Connection::open_in_memory().expect("db")).expect("init"),
-    ));
+    let db = Arc::new(Mutex::new(Database::test_db().await));
     let audit = AuditWriter::new(db.clone());
     // Use the same factory path the daemon uses — calling TofuVerifier::new
     // directly would silently bypass the security.verifier contract these
     // tests are supposed to guard.
-    let verifier = build_verifier(VerifierKind::Tofu, db.clone(), None).expect("build verifier");
+    let verifier = build_verifier(VerifierKind::Tofu, db.clone(), None)
+        .await
+        .expect("build verifier");
     let interceptor = auth_interceptor(verifier, audit.clone());
 
     let pki = PkiServer::new(PkiSvc::new(
@@ -230,11 +230,13 @@ async fn handshake_succeeds_with_paired_client_cert_and_rpc_is_accepted() {
 
     // TOFU prerequisite: paired_devices must hold the fingerprint.
     {
-        let g = h.db.lock().expect("lock");
+        let g = h.db.lock().await;
         let serial = g
             .insert_internal_cert("client", &ccert, &fp, "alice-laptop", 0, 100)
+            .await
             .expect("insert cert");
         g.insert_paired_device(&fp, "alice-laptop", "{}", "alice-laptop", serial)
+            .await
             .expect("insert paired");
     }
 
@@ -262,13 +264,16 @@ async fn revoked_cert_passes_tls_but_rpc_is_rejected_unauthenticated() {
     let h = spawn_mtls_server().await;
     let (ccert, ckey, fp) = mint_client_cert(&h.ca_cert_pem, &h.ca_key_pkcs8_pem, "bob-laptop");
     {
-        let g = h.db.lock().expect("lock");
+        let g = h.db.lock().await;
         let serial = g
             .insert_internal_cert("client", &ccert, &fp, "bob-laptop", 0, 100)
+            .await
             .expect("insert cert");
         g.insert_paired_device(&fp, "bob-laptop", "{}", "bob-laptop", serial)
+            .await
             .expect("insert paired");
         g.add_revoked_fingerprint(&fp, Some("test-revoke"))
+            .await
             .expect("revoke");
     }
 
@@ -291,11 +296,7 @@ async fn revoked_cert_passes_tls_but_rpc_is_rejected_unauthenticated() {
         "got {err:?} — expected Unauthenticated"
     );
 
-    let events =
-        h.db.lock()
-            .expect("lock")
-            .list_audit_events()
-            .expect("audit");
+    let events = h.db.lock().await.list_audit_events().await.expect("audit");
     let kinds: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
     assert!(
         kinds.contains(&audit_events::GRPC_AUTH_FAILURE),

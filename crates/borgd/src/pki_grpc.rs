@@ -5,7 +5,8 @@
 //! the admin-side counterpart to the SPAKE2 bootstrap socket — it does not
 //! itself run PAKE.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use cortex::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
 use identity::{
@@ -70,18 +71,18 @@ impl Pki for PkiSvc {
         let expires_at = now + PAIRING_TTL_SECS;
 
         {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             g.create_pairing_code(&code, PAIRING_INTENT, PAIRING_TTL_SECS)
+                .await
                 .map_err(|e| Status::internal(format!("create pairing code: {e}")))?;
         }
-        self.audit.emit(
-            audit_events::PAIRING_REQUESTED,
-            &principal,
-            &json!({"device_label": r.device_label, "expires_at": expires_at}),
-        );
+        self.audit
+            .emit(
+                audit_events::PAIRING_REQUESTED,
+                &principal,
+                &json!({"device_label": r.device_label, "expires_at": expires_at}),
+            )
+            .await;
 
         // Caution: code is intentionally returned to the admin caller. We do
         // NOT log it.
@@ -106,12 +107,10 @@ impl Pki for PkiSvc {
 
         // Look up the device + its current cert.
         let (device_label, _old_serial) = {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             let dev = g
                 .find_active_paired_device(&principal.fingerprint)
+                .await
                 .map_err(|e| Status::internal(format!("db: {e}")))?
                 .ok_or_else(|| Status::not_found("device not paired"))?;
             (dev.device_label, dev.cert_serial)
@@ -136,10 +135,7 @@ impl Pki for PkiSvc {
         let new_fp = fingerprint_sha256(&issued.cert_der);
 
         let new_serial = {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             let serial = g
                 .insert_internal_cert(
                     "client",
@@ -149,25 +145,31 @@ impl Pki for PkiSvc {
                     issued.not_before,
                     issued.not_after,
                 )
+                .await
                 .map_err(|e| Status::internal(format!("persist new cert: {e}")))?;
             // The fingerprint-pinning model: on renewal the new cert has a
             // different fingerprint, but we keep the SAME paired_devices row
             // by updating its cert_serial. The client uses the new key+cert.
             g.insert_paired_device(&new_fp, &device_label, "{}", &principal.id, serial)
+                .await
                 .map_err(|e| Status::internal(format!("update paired device: {e}")))?;
             // Mark the old cert renewed.
-            let _ = g.add_revoked_fingerprint(&principal.fingerprint, Some("renewed"));
+            let _ = g
+                .add_revoked_fingerprint(&principal.fingerprint, Some("renewed"))
+                .await;
             serial
         };
-        self.audit.emit(
-            audit_events::CERT_RENEWED,
-            &principal.id,
-            &json!({
-                "old_fingerprint": principal.fingerprint,
-                "new_fingerprint": new_fp,
-                "new_serial": new_serial,
-            }),
-        );
+        self.audit
+            .emit(
+                audit_events::CERT_RENEWED,
+                &principal.id,
+                &json!({
+                    "old_fingerprint": principal.fingerprint,
+                    "new_fingerprint": new_fp,
+                    "new_serial": new_serial,
+                }),
+            )
+            .await;
 
         Ok(Response::new(RenewCertResponse {
             new_cert_pem: issued.cert_pem,
@@ -192,18 +194,18 @@ impl Pki for PkiSvc {
             Some(r.reason.as_str())
         };
         {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             g.revoke_paired_device(&r.fingerprint, reason)
+                .await
                 .map_err(|e| Status::internal(format!("revoke: {e}")))?;
         }
-        self.audit.emit(
-            audit_events::CERT_REVOKED,
-            &principal,
-            &json!({"fingerprint": r.fingerprint, "reason": r.reason}),
-        );
+        self.audit
+            .emit(
+                audit_events::CERT_REVOKED,
+                &principal,
+                &json!({"fingerprint": r.fingerprint, "reason": r.reason}),
+            )
+            .await;
         Ok(Response::new(PkiEmpty {}))
     }
 
@@ -212,11 +214,9 @@ impl Pki for PkiSvc {
         _req: Request<PkiEmpty>,
     ) -> Result<Response<PairedDeviceList>, Status> {
         let rows = {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             g.list_paired_devices()
+                .await
                 .map_err(|e| Status::internal(format!("list: {e}")))?
         };
         let devices = rows
@@ -245,11 +245,9 @@ impl Pki for PkiSvc {
             .clone();
         let now = chrono::Utc::now().timestamp();
         let not_after = {
-            let g = self
-                .db
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self.db.lock().await;
             g.paired_device_cert_expiry(&principal.fingerprint)
+                .await
                 .map_err(|e| Status::internal(format!("db: {e}")))?
                 .unwrap_or(0)
         };
@@ -269,7 +267,7 @@ impl Pki for PkiSvc {
         &self,
         _req: Request<PkiEmpty>,
     ) -> Result<Response<VerifyAuditResponse>, Status> {
-        let outcome = self.audit.verify();
+        let outcome = self.audit.verify().await;
         let resp = match outcome {
             AuditChainOutcome::Ok => VerifyAuditResponse {
                 outcome: "ok".into(),

@@ -28,12 +28,7 @@ pub fn hash_pairing_code(code: &str) -> String {
 }
 
 impl Database {
-    pub async fn create_pairing_code(
-        &self,
-        code: &str,
-        intent: &str,
-        ttl_secs: i64,
-    ) -> Result<()> {
+    pub async fn create_pairing_code(&self, code: &str, intent: &str, ttl_secs: i64) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let expires = now.saturating_add(ttl_secs);
         self.conn
@@ -50,52 +45,63 @@ impl Database {
         let hash = hash_pairing_code(code);
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self.conn.unchecked_transaction().await?;
-
-        let row: Option<(i64, Option<i64>, i64)> = {
-            let mut rows = tx
-                .query(
-                    "SELECT expires_at, consumed_at, attempts
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<ConsumeOutcome> = async {
+            let row: Option<(i64, Option<i64>, i64)> = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT expires_at, consumed_at, attempts
                  FROM pairing_codes WHERE code_hash = ?1",
-                    params!(hash.clone()),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(r) => Some((
-                    r.get::<i64>(0)?,
-                    r.get::<Option<i64>>(1)?,
-                    r.get::<i64>(2)?,
-                )),
-                None => None,
-            }
-        };
-
-        let outcome = match row {
-            None => ConsumeOutcome::Unknown,
-            Some((_, Some(_), _)) => ConsumeOutcome::AlreadyConsumed,
-            Some((expires_at, None, _)) if expires_at <= now => ConsumeOutcome::Expired,
-            Some((_, None, attempts)) if attempts >= MAX_ATTEMPTS_PER_CODE => {
-                ConsumeOutcome::RateLimited
-            }
-            Some((_, None, _)) => {
-                let n = tx
-                    .execute(
-                        "UPDATE pairing_codes
-                     SET consumed_at = ?1
-                     WHERE code_hash = ?2 AND consumed_at IS NULL",
-                        params!(now, hash),
+                        params!(hash.clone()),
                     )
                     .await?;
-                if n == 1 {
-                    ConsumeOutcome::Accepted
-                } else {
-                    ConsumeOutcome::AlreadyConsumed
+                match rows.next().await? {
+                    Some(r) => Some((r.get::<i64>(0)?, r.get::<Option<i64>>(1)?, r.get::<i64>(2)?)),
+                    None => None,
                 }
-            }
-        };
+            };
 
-        tx.commit().await?;
-        Ok(outcome)
+            let outcome = match row {
+                None => ConsumeOutcome::Unknown,
+                Some((_, Some(_), _)) => ConsumeOutcome::AlreadyConsumed,
+                Some((expires_at, None, _)) if expires_at <= now => ConsumeOutcome::Expired,
+                Some((_, None, attempts)) if attempts >= MAX_ATTEMPTS_PER_CODE => {
+                    ConsumeOutcome::RateLimited
+                }
+                Some((_, None, _)) => {
+                    let n = self
+                        .conn
+                        .execute(
+                            "UPDATE pairing_codes
+                     SET consumed_at = ?1
+                     WHERE code_hash = ?2 AND consumed_at IS NULL",
+                            params!(now, hash),
+                        )
+                        .await?;
+                    if n == 1 {
+                        ConsumeOutcome::Accepted
+                    } else {
+                        ConsumeOutcome::AlreadyConsumed
+                    }
+                }
+            };
+
+            Ok(outcome)
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("device_pairing: rollback after consume failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn bump_pairing_attempts(&self, code: &str) -> Result<()> {
@@ -198,9 +204,7 @@ mod tests {
             .await
             .expect("mint");
         for _ in 0..MAX_ATTEMPTS_PER_CODE {
-            db.bump_pairing_attempts("ZZZZ-9999")
-                .await
-                .expect("bump");
+            db.bump_pairing_attempts("ZZZZ-9999").await.expect("bump");
         }
         assert_eq!(
             db.consume_pairing_code("ZZZZ-9999").await.expect("q"),
@@ -227,9 +231,6 @@ mod tests {
             )
             .await
             .expect("expired");
-        assert_eq!(
-            db.count_active_pairing_codes().await.expect("count"),
-            1
-        );
+        assert_eq!(db.count_active_pairing_codes().await.expect("count"), 1);
     }
 }

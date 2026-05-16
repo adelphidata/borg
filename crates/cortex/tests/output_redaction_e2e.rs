@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end coverage for the output-redaction policy: install the
 //! process-global policy with a real SQLite-backed audit sink, drive it

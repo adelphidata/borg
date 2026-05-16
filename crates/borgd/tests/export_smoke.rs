@@ -60,9 +60,10 @@ async fn export_session_round_trips_messages() {
     // write (the canonical writer the daemon's reader will read back).
     let session_id = "export-smoke-1";
     {
-        let db = Database::open().expect("seed db");
+        let db = Database::open().await.expect("seed db");
         let now = chrono::Utc::now().timestamp();
         db.upsert_session(session_id, now, now, 0, "test-model", "Smoke Session")
+            .await
             .expect("upsert");
         db.insert_message(
             session_id,
@@ -73,6 +74,7 @@ async fn export_session_round_trips_messages() {
             None,
             None,
         )
+        .await
         .expect("user msg");
         db.insert_message(
             session_id,
@@ -83,6 +85,7 @@ async fn export_session_round_trips_messages() {
             None,
             None,
         )
+        .await
         .expect("assistant msg");
     }
 

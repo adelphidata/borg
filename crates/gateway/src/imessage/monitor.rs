@@ -64,9 +64,7 @@ async fn monitor_loop(
     // If no state, initialize to current max ROWID (only process future messages)
     if last_rowid == 0 {
         let conn = open_chatdb(&db_path_str).await?;
-        let mut rows = conn
-            .query("SELECT MAX(ROWID) FROM message", ())
-            .await?;
+        let mut rows = conn.query("SELECT MAX(ROWID) FROM message", ()).await?;
         last_rowid = match rows.next().await? {
             Some(row) => row.get::<Option<i64>>(0)?.unwrap_or(0),
             None => 0,
@@ -375,8 +373,9 @@ async fn poll_new_messages_with_conn(
     conn: &turso::Connection,
     last_rowid: i64,
 ) -> Result<Vec<IMessagePayload>> {
-    let mut rows = conn.query(
-        "SELECT m.ROWID, m.text, m.date, h.id, m.is_from_me, m.cache_roomnames, \
+    let mut rows = conn
+        .query(
+            "SELECT m.ROWID, m.text, m.date, h.id, m.is_from_me, m.cache_roomnames, \
          c.chat_identifier, c.guid, m.thread_originator_guid, \
          parent.text AS reply_text, ph.id AS reply_sender \
          FROM message m \
@@ -390,8 +389,9 @@ async fn poll_new_messages_with_conn(
          )) \
          ORDER BY m.ROWID ASC \
          LIMIT 50",
-        turso::params!(last_rowid),
-    ).await?;
+            turso::params!(last_rowid),
+        )
+        .await?;
 
     let mut messages = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -943,7 +943,11 @@ mod tests {
     #[tokio::test]
     async fn sql_extracts_basic_message() {
         let conn = build_fixture_db().await;
-        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+15551234567')").await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (1, '+15551234567')",
+        )
+        .await;
         exec(
             &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, '+15551234567', 'iMessage;-;+15551234567')",
@@ -955,7 +959,11 @@ mod tests {
              VALUES (10, 'msg-10', 'hello world', 1, 0)",
         )
         .await;
-        exec(&conn, "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)").await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)",
+        )
+        .await;
 
         let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert_eq!(msgs.len(), 1);
@@ -971,8 +979,16 @@ mod tests {
     #[tokio::test]
     async fn sql_extracts_reply_context() {
         let conn = build_fixture_db().await;
-        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')").await;
-        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (2, 'bob@x.com')").await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (2, 'bob@x.com')",
+        )
+        .await;
         exec(
             &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'g1', 'g1')",

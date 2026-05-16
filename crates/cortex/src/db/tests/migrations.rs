@@ -1,15 +1,29 @@
 use super::*;
 
+async fn query_i64(db: &Database, sql: &str) -> i64 {
+    let mut stmt = db.conn.prepare(sql).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let row = rows.next().await.unwrap().expect("row");
+    row.get::<i64>(0).unwrap()
+}
+
+async fn query_string(db: &Database, sql: &str) -> String {
+    let mut stmt = db.conn.prepare(sql).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let row = rows.next().await.unwrap().expect("row");
+    row.get::<String>(0).unwrap()
+}
+
 // Schema version reaches CURRENT_VERSION on a freshly-initialized DB. If a new
 // migrate_vN is added without bumping CURRENT_VERSION, the compile-time guard
 // in `db/mod.rs` fires; this catches the runtime variant where the constant is
 // bumped but the meta row never gets written.
-#[test]
-fn fresh_db_reaches_current_schema_version() {
-    let db = test_db();
-    let v = db.schema_version().unwrap();
+#[tokio::test]
+async fn fresh_db_reaches_current_schema_version() {
+    let db = test_db().await;
+    let v = db.schema_version().await.unwrap();
     assert!(v > 0, "schema_version must be set after init");
-    let recorded = db.get_meta("schema_version").unwrap().unwrap();
+    let recorded = db.get_meta("schema_version").await.unwrap().unwrap();
     assert_eq!(
         recorded.parse::<u32>().unwrap(),
         v,
@@ -20,18 +34,18 @@ fn fresh_db_reaches_current_schema_version() {
 // Two test DBs share no state but both reach a working, identical schema.
 // Catches a class of regressions where init_connection's ordering (pragmas →
 // migrations → settings seed → salt) silently fails the second time.
-#[test]
-fn test_db_is_repeatedly_constructible() {
-    let db_a = test_db();
-    let db_b = test_db();
+#[tokio::test]
+async fn test_db_is_repeatedly_constructible() {
+    let db_a = test_db().await;
+    let db_b = test_db().await;
     assert_eq!(
-        db_a.schema_version().unwrap(),
-        db_b.schema_version().unwrap()
+        db_a.schema_version().await.unwrap(),
+        db_b.schema_version().await.unwrap()
     );
     // Independent salts — proves get_or_create_hmac_salt actually runs per-DB
     // (not cached at process scope).
-    let salt_a = db_a.get_meta("hmac_salt").unwrap().unwrap();
-    let salt_b = db_b.get_meta("hmac_salt").unwrap().unwrap();
+    let salt_a = db_a.get_meta("hmac_salt").await.unwrap().unwrap();
+    let salt_b = db_b.get_meta("hmac_salt").await.unwrap().unwrap();
     assert_ne!(salt_a, salt_b, "each in-memory DB must mint its own salt");
 }
 
@@ -39,42 +53,36 @@ fn test_db_is_repeatedly_constructible() {
 // :memory: silently downgrades to MEMORY, so we accept either — but
 // foreign_keys MUST be enabled or migrations that depend on FK enforcement
 // (task_runs → scheduled_tasks) become silently broken.
-#[test]
-fn pragmas_enabled_after_init() {
-    let db = test_db();
-    let fk: i64 = db
-        .conn
-        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-        .unwrap();
+#[tokio::test]
+async fn pragmas_enabled_after_init() {
+    let db = test_db().await;
+    let fk = query_i64(&db, "PRAGMA foreign_keys").await;
     assert_eq!(fk, 1, "foreign_keys must be ON");
 
-    let mode: String = db
-        .conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
+    let mode = query_string(&db, "PRAGMA journal_mode").await;
     // In-memory DBs report "memory"; file-backed DBs report "wal".
     assert!(
         mode == "wal" || mode == "memory",
         "unexpected journal_mode: {mode}"
     );
 
-    let av: i64 = db
-        .conn
-        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
-        .unwrap();
+    let av = query_i64(&db, "PRAGMA auto_vacuum").await;
     assert_eq!(av, 2, "auto_vacuum must be INCREMENTAL (2)");
 }
 
 // task_runs.task_id REFERENCES scheduled_tasks(id). With foreign_keys=ON, an
 // orphan insert must fail. If this test ever passes silently, either the FK
 // was dropped from a migration or PRAGMA foreign_keys regressed.
-#[test]
-fn foreign_key_enforced_task_runs_to_scheduled_tasks() {
-    let db = test_db();
-    let res = db.conn.execute(
-        "INSERT INTO task_runs (task_id, started_at, duration_ms) VALUES (?1, ?2, 0)",
-        rusqlite::params!["nonexistent_task_id", 0i64],
-    );
+#[tokio::test]
+async fn foreign_key_enforced_task_runs_to_scheduled_tasks() {
+    let db = test_db().await;
+    let res = db
+        .conn
+        .execute(
+            "INSERT INTO task_runs (task_id, started_at, duration_ms) VALUES (?1, ?2, 0)",
+            params!("nonexistent_task_id", 0i64),
+        )
+        .await;
     let err = res.expect_err("FK violation must be rejected");
     let msg = err.to_string().to_lowercase();
     assert!(
@@ -84,12 +92,14 @@ fn foreign_key_enforced_task_runs_to_scheduled_tasks() {
 
     // Positive control: a row pointing at a real task succeeds.
     db.create_task(&simple_task("real", "n", "p", "interval", "1h", Some(0)))
+        .await
         .unwrap();
     db.conn
         .execute(
             "INSERT INTO task_runs (task_id, started_at, duration_ms) VALUES (?1, ?2, 0)",
-            rusqlite::params!["real", 0i64],
+            params!("real", 0i64),
         )
+        .await
         .unwrap();
 }
 
@@ -98,19 +108,21 @@ fn foreign_key_enforced_task_runs_to_scheduled_tasks() {
 // the trigger, the integrity invariant silently disappears. This test pairs
 // with the existing `append_only_triggers_block_*` tests in vitals.rs by
 // checking the trigger metadata directly rather than going through the API.
-#[test]
-fn append_only_triggers_present_on_chain_tables() {
-    let db = test_db();
+#[tokio::test]
+async fn append_only_triggers_present_on_chain_tables() {
+    let db = test_db().await;
     for table in ["vitals_events", "bond_events", "evolution_events"] {
-        let trigger_count: i64 = db
+        let mut stmt = db
             .conn
-            .query_row(
+            .prepare(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type='trigger' AND tbl_name = ?1",
-                rusqlite::params![table],
-                |r| r.get(0),
             )
+            .await
             .unwrap();
+        let mut rows = stmt.query(params!(table)).await.unwrap();
+        let row = rows.next().await.unwrap().expect("row");
+        let trigger_count: i64 = row.get(0).unwrap();
         assert!(
             trigger_count >= 2,
             "{table} should have at least UPDATE and DELETE block triggers, got {trigger_count}"
@@ -120,29 +132,31 @@ fn append_only_triggers_present_on_chain_tables() {
 
 // scheduled_tasks must expose the pre_run preamble columns (Hermes-style script
 // preprocessing) and the legacy workflow/project tables must not exist.
-#[test]
-fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {
-    let db = test_db();
+#[tokio::test]
+async fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {
+    let db = test_db().await;
     for absent in ["workflows", "workflow_steps", "projects"] {
-        let count: i64 = db
+        let mut stmt = db
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
-                rusqlite::params![absent],
-                |r| r.get(0),
-            )
+            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1")
+            .await
             .unwrap();
+        let mut rows = stmt.query(params!(absent)).await.unwrap();
+        let row = rows.next().await.unwrap().expect("row");
+        let count: i64 = row.get(0).unwrap();
         assert_eq!(count, 0, "{absent} must not exist");
     }
 
-    let cols: Vec<String> = db
+    let mut stmt = db
         .conn
         .prepare("PRAGMA table_info(scheduled_tasks)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut cols: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        cols.push(row.get::<String>(1).unwrap());
+    }
     for required in ["pre_run_command", "pre_run_cwd", "pre_run_timeout_ms"] {
         assert!(
             cols.iter().any(|c| c == required),
@@ -154,10 +168,10 @@ fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {
 // Re-running schema_version() when the meta row is corrupted (non-numeric)
 // MUST degrade to 0 rather than panic — otherwise a single bad meta write
 // would brick startup. Documented in db/mod.rs:451-460.
-#[test]
-fn corrupted_schema_version_degrades_to_zero() {
-    let db = test_db();
-    db.set_meta("schema_version", "not-a-number").unwrap();
-    let v = db.schema_version().unwrap();
+#[tokio::test]
+async fn corrupted_schema_version_degrades_to_zero() {
+    let db = test_db().await;
+    db.set_meta("schema_version", "not-a-number").await.unwrap();
+    let v = db.schema_version().await.unwrap();
     assert_eq!(v, 0, "non-numeric schema_version must degrade to 0");
 }

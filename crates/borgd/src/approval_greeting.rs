@@ -34,13 +34,14 @@ pub async fn send(
                 sender = sender_id,
                 "Approval greeting delivered via LLM"
             );
-            if let Ok(adb) = cortex::db::Database::open() {
+            if let Ok(adb) = cortex::db::Database::open().await {
                 cortex::activity_log::log_activity(
                     &adb,
                     "info",
                     "pairing",
                     &format!("Approval greeting delivered to {channel_name}:{sender_id}"),
-                );
+                )
+                .await;
             }
         }
         Err(e) => {

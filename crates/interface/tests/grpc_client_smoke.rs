@@ -254,18 +254,22 @@ async fn start_harness() -> Harness {
         next: StdMutex<Option<Arc<dyn SessionBackend>>>,
     }
     impl SessionFactory for StubFactory {
-        fn open(
-            &self,
-            _resume_id: Option<&str>,
+        fn open<'a>(
+            &'a self,
+            _resume_id: Option<&'a str>,
             _execution_context: Option<cortex::execution_context::ExecutionContext>,
-        ) -> anyhow::Result<SessionHost> {
-            let backend = self
-                .next
-                .lock()
-                .expect("factory mutex poisoned")
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("stub factory already consumed"))?;
-            Ok(SessionHost::new(backend))
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SessionHost>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let backend = self
+                    .next
+                    .lock()
+                    .expect("factory mutex poisoned")
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("stub factory already consumed"))?;
+                Ok(SessionHost::new(backend))
+            })
         }
     }
     let backend: Arc<dyn SessionBackend> = Arc::new(StubBackend { id: "stub".into() });

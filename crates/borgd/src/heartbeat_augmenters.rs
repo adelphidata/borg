@@ -59,6 +59,11 @@ use crate::maintenance::cooldowns::CooldownTable;
 use crate::maintenance::MonthlyBudgetTracker;
 use cortex::config::Config;
 use cortex::db::Database;
+use std::future::Future;
+use std::pin::Pin;
+
+/// Boxed future returned by an async augmenter check.
+pub type AugmenterCheckFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
 /// A single proactive nudge check.
 ///
@@ -79,7 +84,7 @@ pub struct Augmenter {
     /// list) should influence the decision; `None` if the DB failed to
     /// open, in which case the check should fall back to its
     /// no-DB-available behavior.
-    pub check: fn(&Config, Option<&Database>) -> Option<String>,
+    pub check: for<'a> fn(&'a Config, Option<&'a Database>) -> AugmenterCheckFuture<'a>,
 }
 
 /// Ordered list of heartbeat augmenters. Append new entries here to add
@@ -127,20 +132,21 @@ const SESSION_START_AUGMENTER_IDS: &[&str] = &["no_channels_configured", "identi
 /// skip them. When `db` is `None` (e.g. the DB failed to open) cooldown is
 /// bypassed and every firing augmenter is returned — we prefer an extra
 /// nudge to a silent heartbeat.
-pub fn collect(config: &Config, db: Option<&Database>) -> Vec<String> {
-    collect_matching(config, db, |_| true)
+pub async fn collect(config: &Config, db: Option<&Database>) -> Vec<String> {
+    collect_matching(config, db, |_| true).await
 }
 
 /// Session-start greetings use a smaller proactive set than scheduled
 /// heartbeats. Today that means only the no-channels nudge so opening the TUI
 /// still teaches the user how to reach Borg proactively on the go.
-pub fn collect_session_start(config: &Config, db: Option<&Database>) -> Vec<String> {
+pub async fn collect_session_start(config: &Config, db: Option<&Database>) -> Vec<String> {
     collect_matching(config, db, |aug| {
         SESSION_START_AUGMENTER_IDS.contains(&aug.id)
     })
+    .await
 }
 
-fn collect_matching(
+async fn collect_matching(
     config: &Config,
     db: Option<&Database>,
     include: impl Fn(&Augmenter) -> bool,
@@ -152,17 +158,17 @@ fn collect_matching(
         if !include(aug) {
             continue;
         }
-        let Some(snippet) = (aug.check)(config, db) else {
+        let Some(snippet) = (aug.check)(config, db).await else {
             continue;
         };
         if let Some(table) = &cooldowns {
             let cd = table.for_augmenter(aug.id, aug.cooldown_secs);
-            if !cd.is_ready(now) {
+            if !cd.is_ready(now).await {
                 // Either the cooldown window hasn't elapsed or the meta
                 // read failed — both mean "skip" rather than "spam".
                 continue;
             }
-            cd.record_fired(now);
+            cd.record_fired(now).await;
         }
         out.push(snippet);
     }
@@ -170,7 +176,7 @@ fn collect_matching(
 }
 
 /// No messaging channels configured — nudge the user to run `borg add`.
-fn check_no_channels(config: &Config, _db: Option<&Database>) -> Option<String> {
+async fn check_no_channels_inner(config: &Config, _db: Option<&Database>) -> Option<String> {
     if config.has_any_native_channel() {
         return None;
     }
@@ -178,6 +184,9 @@ fn check_no_channels(config: &Config, _db: Option<&Database>) -> Option<String> 
     // script-based channels (iMessage, SMS, WhatsApp templates). For v1,
     // native coverage is sufficient — those are the recommended defaults.
     Some(NO_CHANNELS_NUDGE.to_string())
+}
+fn check_no_channels<'a>(config: &'a Config, db: Option<&'a Database>) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_no_channels_inner(config, db))
 }
 
 const NO_CHANNELS_NUDGE: &str = "\
@@ -194,7 +203,10 @@ repeat yourself if you've already raised this recently.";
 /// Respects the `security.host_audit` config toggle. Findings the user has
 /// squelched via `/doctor` are filtered out here so they don't fire the
 /// nudge; the squelch is the user's "I see it, stop reminding me" signal.
-fn check_critical_host_security(config: &Config, db: Option<&Database>) -> Option<String> {
+async fn check_critical_host_security_inner(
+    config: &Config,
+    db: Option<&Database>,
+) -> Option<String> {
     if !config.security.host_audit {
         return None;
     }
@@ -205,7 +217,7 @@ fn check_critical_host_security(config: &Config, db: Option<&Database>) -> Optio
 
     if let Some(db) = db {
         let now = unix_now() as i64;
-        if let Ok(squelches) = db.doctor_squelch_list_active(now) {
+        if let Ok(squelches) = db.doctor_squelch_list_active(now).await {
             let active: std::collections::HashSet<(String, String)> = squelches
                 .into_iter()
                 .map(|r| (r.category, r.name))
@@ -215,6 +227,12 @@ fn check_critical_host_security(config: &Config, db: Option<&Database>) -> Optio
     }
 
     build_security_nudge(&checks)
+}
+fn check_critical_host_security<'a>(
+    config: &'a Config,
+    db: Option<&'a Database>,
+) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_critical_host_security_inner(config, db))
 }
 
 /// Build an LLM directive from diagnostic checks. Returns `None` when
@@ -264,18 +282,21 @@ fn build_security_nudge(checks: &[cortex::doctor::DiagnosticCheck]) -> Option<St
 /// Window for `task_runs` failures is the last 24h — long enough to surface
 /// overnight breakage on the morning tick, short enough that the same failure
 /// stops being mentioned once it ages out.
-fn check_task_health(_config: &Config, db: Option<&Database>) -> Option<String> {
+async fn check_task_health_inner(_config: &Config, db: Option<&Database>) -> Option<String> {
     // Without a DB we cannot ground anything — stay silent rather than
     // hallucinate. The heartbeat-grounding regression is the whole point.
     let db = db?;
-    build_task_health_nudge(db, unix_now() as i64)
+    build_task_health_nudge(db, unix_now() as i64).await
+}
+fn check_task_health<'a>(config: &'a Config, db: Option<&'a Database>) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_task_health_inner(config, db))
 }
 
 const TASK_HEALTH_WINDOW_SECS: i64 = 24 * 60 * 60;
 const TASK_HEALTH_MAX_LISTED: usize = 5;
 
-fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
-    let failing_tasks = match db.tasks_with_last_error() {
+async fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
+    let failing_tasks = match db.tasks_with_last_error().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("task_health: tasks_with_last_error failed: {e}");
@@ -283,7 +304,7 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
         }
     };
     let since = now - TASK_HEALTH_WINDOW_SECS;
-    let recent_failed = match db.count_failed_runs_since(since) {
+    let recent_failed = match db.count_failed_runs_since(since).await {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("task_health: count_failed_runs_since failed: {e}");
@@ -300,7 +321,10 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
     // this, the agent saw a count and asked the user for IDs the system
     // already knows.
     let recent_groups = if recent_failed > 0 {
-        match db.failed_runs_grouped_since(since, TASK_HEALTH_MAX_LISTED) {
+        match db
+            .failed_runs_grouped_since(since, TASK_HEALTH_MAX_LISTED)
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("task_health: failed_runs_grouped_since failed: {e}");
@@ -402,10 +426,10 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
 ///
 /// Coexists with `budget.warning_threshold` / `BudgetEngine` — that's
 /// the system-event side; this is the conversational side.
-fn check_budget_threshold(config: &Config, db: Option<&Database>) -> Option<String> {
+async fn check_budget_threshold_inner(config: &Config, db: Option<&Database>) -> Option<String> {
     let db = db?;
     let limit = config.budget.monthly_token_limit;
-    let bucket = match db.monthly_budget_pct(limit) {
+    let bucket = match db.monthly_budget_pct(limit).await {
         Ok(Some(b)) => b,
         Ok(None) => return None,
         Err(e) => {
@@ -414,15 +438,21 @@ fn check_budget_threshold(config: &Config, db: Option<&Database>) -> Option<Stri
         }
     };
 
-    let total = db.monthly_token_total().ok()?;
+    let total = db.monthly_token_total().await.ok()?;
     // Typed handle replaces the inline meta-string bookkeeping. The
     // tracker owns the per-month key and the "is this bucket new?"
     // bookkeeping; the augmenter just decides whether to emit text.
     let tracker = MonthlyBudgetTracker::new(db);
-    if !tracker.should_announce(chrono::Utc::now(), bucket) {
+    if !tracker.should_announce(chrono::Utc::now(), bucket).await {
         return None;
     }
     Some(build_budget_nudge(bucket, total, limit))
+}
+fn check_budget_threshold<'a>(
+    config: &'a Config,
+    db: Option<&'a Database>,
+) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_budget_threshold_inner(config, db))
 }
 
 fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
@@ -445,11 +475,20 @@ fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
 /// directive mixes structured `request_user_input` choices with
 /// free-form chat follow-up because `request_user_input` is
 /// multiple-choice only (max 4 questions, 2-4 options each).
-fn check_identity_unpersonalized(_config: &Config, _db: Option<&Database>) -> Option<String> {
+async fn check_identity_unpersonalized_inner(
+    _config: &Config,
+    _db: Option<&Database>,
+) -> Option<String> {
     if cortex::identity::is_personalized() {
         return None;
     }
     Some(IDENTITY_NUDGE.to_string())
+}
+fn check_identity_unpersonalized<'a>(
+    config: &'a Config,
+    db: Option<&'a Database>,
+) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_identity_unpersonalized_inner(config, db))
 }
 
 const IDENTITY_NUDGE: &str = "\
@@ -475,12 +514,16 @@ already asked recently.";
 /// Two guards: meta flag must be set, AND it must have been set at
 /// least `GATEWAY_NUDGE_GRACE_SECS` ago, so we don't race the daily
 /// 02:00 maintenance pass.
-pub(crate) fn check_gateway_unrecoverable(
+pub(crate) async fn check_gateway_unrecoverable_inner(
     _config: &Config,
     db: Option<&Database>,
 ) -> Option<String> {
     let db = db?;
-    let flag = db.get_meta(GATEWAY_UNRECOVERABLE_KEY).ok().flatten()?;
+    let flag = db
+        .get_meta(GATEWAY_UNRECOVERABLE_KEY)
+        .await
+        .ok()
+        .flatten()?;
     if flag != "1" {
         return None;
     }
@@ -492,6 +535,7 @@ pub(crate) fn check_gateway_unrecoverable(
     let now = unix_now() as i64;
     let set_at: i64 = db
         .get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
+        .await
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
@@ -500,6 +544,12 @@ pub(crate) fn check_gateway_unrecoverable(
         return None;
     }
     Some(GATEWAY_NUDGE.to_string())
+}
+pub(crate) fn check_gateway_unrecoverable<'a>(
+    config: &'a Config,
+    db: Option<&'a Database>,
+) -> AugmenterCheckFuture<'a> {
+    Box::pin(check_gateway_unrecoverable_inner(config, db))
 }
 
 pub(crate) const GATEWAY_UNRECOVERABLE_KEY: &str = "gateway_unrecoverable";
@@ -528,7 +578,6 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// Keys that `has_any_native_channel` checks — cleared before each test
@@ -594,11 +643,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn collect_session_start_includes_no_channels_nudge() {
+    #[tokio::test]
+    async fn collect_session_start_includes_no_channels_nudge() {
         let _env = EnvGuard::clear_native();
         let config = Config::default();
-        let nudges = collect_session_start(&config, None);
+        let nudges = collect_session_start(&config, None).await;
         assert!(
             nudges
                 .iter()
@@ -607,12 +656,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collect_session_start_excludes_security_nudge() {
+    #[tokio::test]
+    async fn collect_session_start_excludes_security_nudge() {
         let _env = EnvGuard::clear_native();
         let mut config = Config::default();
         config.security.host_audit = true;
-        let nudges = collect_session_start(&config, None);
+        let nudges = collect_session_start(&config, None).await;
         assert!(
             nudges
                 .iter()
@@ -638,29 +687,30 @@ mod tests {
         }
     }
 
-    fn in_memory_db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("open in-memory sqlite"))
-            .expect("init in-memory db")
+    async fn in_memory_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn check_no_channels_returns_none_when_channel_configured() {
+    #[tokio::test]
+    async fn check_no_channels_returns_none_when_channel_configured() {
         let _guard = EnvGuard::clear_native();
         std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
         let cfg = Config::default();
-        assert!(check_no_channels(&cfg, None).is_none());
+        assert!(check_no_channels(&cfg, None).await.is_none());
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
     }
 
-    #[test]
-    fn check_no_channels_returns_some_when_no_channels() {
+    #[tokio::test]
+    async fn check_no_channels_returns_some_when_no_channels() {
         let _guard = EnvGuard::clear_native();
         let cfg = Config::default();
         // Skip if the OS keychain has real channel credentials (dev machine)
         if cfg.has_any_native_channel() {
             return;
         }
-        let snippet = check_no_channels(&cfg, None).expect("nudge should fire");
+        let snippet = check_no_channels(&cfg, None)
+            .await
+            .expect("nudge should fire");
         assert!(snippet.contains("/plugins"));
         assert!(snippet.contains("borg plugins"));
     }
@@ -685,24 +735,24 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn collect_fires_once_then_respects_cooldown() {
+    #[tokio::test]
+    async fn collect_fires_once_then_respects_cooldown() {
         let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
         if cfg.has_any_native_channel() {
             return;
         }
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
-        let first = collect(&cfg, Some(&db));
+        let first = collect(&cfg, Some(&db)).await;
         assert_eq!(
             count_no_channels(&first),
             1,
             "expected no-channels nudge on first call, got: {first:?}"
         );
 
-        let second = collect(&cfg, Some(&db));
+        let second = collect(&cfg, Some(&db)).await;
         assert_eq!(
             count_no_channels(&second),
             0,
@@ -710,25 +760,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collect_fires_again_after_cooldown_elapses() {
+    #[tokio::test]
+    async fn collect_fires_again_after_cooldown_elapses() {
         let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
         if cfg.has_any_native_channel() {
             return;
         }
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
         // First firing persists a timestamp.
-        assert_eq!(count_no_channels(&collect(&cfg, Some(&db))), 1);
+        assert_eq!(count_no_channels(&collect(&cfg, Some(&db)).await), 1);
 
         // Rewind the stored timestamp to simulate cooldown elapsing.
         let stale = unix_now().saturating_sub(25 * 60 * 60);
         db.set_meta(&meta_key_for("no_channels_configured"), &stale.to_string())
+            .await
             .unwrap();
 
-        let again = collect(&cfg, Some(&db));
+        let again = collect(&cfg, Some(&db)).await;
         assert_eq!(
             count_no_channels(&again),
             1,
@@ -736,8 +787,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collect_without_db_always_returns_firing_checks() {
+    #[tokio::test]
+    async fn collect_without_db_always_returns_firing_checks() {
         let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
@@ -746,33 +797,34 @@ mod tests {
         }
         // No DB → no cooldown enforcement; the no-channels snippet is
         // returned on every call.
-        assert_eq!(count_no_channels(&collect(&cfg, None)), 1);
-        assert_eq!(count_no_channels(&collect(&cfg, None)), 1);
+        assert_eq!(count_no_channels(&collect(&cfg, None).await), 1);
+        assert_eq!(count_no_channels(&collect(&cfg, None).await), 1);
     }
 
-    #[test]
-    fn collect_silent_when_channel_configured() {
+    #[tokio::test]
+    async fn collect_silent_when_channel_configured() {
         let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         std::env::set_var("SLACK_BOT_TOKEN", "xoxb-test");
         let cfg = channel_only_config();
-        let db = in_memory_db();
-        assert_eq!(count_no_channels(&collect(&cfg, Some(&db))), 0);
+        let db = in_memory_db().await;
+        assert_eq!(count_no_channels(&collect(&cfg, Some(&db)).await), 0);
         std::env::remove_var("SLACK_BOT_TOKEN");
     }
 
-    #[test]
-    fn collect_skips_augmenter_on_db_read_error() {
+    #[tokio::test]
+    async fn collect_skips_augmenter_on_db_read_error() {
         let _guard = EnvGuard::clear_native();
         let cfg = channel_only_config();
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
         // Drop the meta table to make get_meta fail
         db.conn()
             .execute_batch("DROP TABLE IF EXISTS meta")
+            .await
             .unwrap();
 
         // Should skip augmenters (not spam) rather than treat as never-fired
-        let result = collect(&cfg, Some(&db));
+        let result = collect(&cfg, Some(&db)).await;
         assert!(
             result.is_empty(),
             "expected no augmenters to fire when DB reads fail, got {result:?}"
@@ -783,23 +835,23 @@ mod tests {
 
     use cortex::doctor::DiagnosticCheck;
 
-    #[test]
-    fn check_critical_host_security_respects_config_toggle() {
+    #[tokio::test]
+    async fn check_critical_host_security_respects_config_toggle() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = false;
         assert!(
-            check_critical_host_security(&cfg, None).is_none(),
+            check_critical_host_security(&cfg, None).await.is_none(),
             "should return None when host_audit is disabled"
         );
     }
 
-    #[test]
-    fn check_critical_host_security_runs_when_enabled() {
+    #[tokio::test]
+    async fn check_critical_host_security_runs_when_enabled() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        let result = check_critical_host_security(&cfg, None);
+        let result = check_critical_host_security(&cfg, None).await;
         if let Some(ref snippet) = result {
             assert!(snippet.contains("Critical host security"));
             // Trailer must point the user at the actionable hint baked
@@ -812,8 +864,8 @@ mod tests {
 
     // ── build_security_nudge unit tests (synthetic DiagnosticCheck data) ──
 
-    #[test]
-    fn build_security_nudge_returns_none_when_all_pass() {
+    #[tokio::test]
+    async fn build_security_nudge_returns_none_when_all_pass() {
         let checks = vec![
             DiagnosticCheck::pass("Host Security", "Application Firewall"),
             DiagnosticCheck::pass("Host Security", "risky listening ports"),
@@ -822,13 +874,13 @@ mod tests {
         assert!(build_security_nudge(&checks).is_none());
     }
 
-    #[test]
-    fn build_security_nudge_returns_none_on_empty_checks() {
+    #[tokio::test]
+    async fn build_security_nudge_returns_none_on_empty_checks() {
         assert!(build_security_nudge(&[]).is_none());
     }
 
-    #[test]
-    fn build_security_nudge_includes_warn_issues() {
+    #[tokio::test]
+    async fn build_security_nudge_includes_warn_issues() {
         let checks = vec![
             DiagnosticCheck::pass("Host Security", "SSH daemon config"),
             DiagnosticCheck::warn(
@@ -851,8 +903,8 @@ mod tests {
         assert!(!nudge.contains("SSH daemon config"));
     }
 
-    #[test]
-    fn build_security_nudge_includes_fail_issues() {
+    #[tokio::test]
+    async fn build_security_nudge_includes_fail_issues() {
         let checks = vec![DiagnosticCheck::fail(
             "Host Security",
             "firewall",
@@ -863,8 +915,8 @@ mod tests {
         assert!(nudge.contains("next step"));
     }
 
-    #[test]
-    fn build_security_nudge_mixed_pass_warn_fail() {
+    #[tokio::test]
+    async fn build_security_nudge_mixed_pass_warn_fail() {
         let checks = vec![
             DiagnosticCheck::pass("Host Security", "risky listening ports"),
             DiagnosticCheck::warn(
@@ -880,8 +932,8 @@ mod tests {
         assert_eq!(nudge.matches("  - ").count(), 2);
     }
 
-    #[test]
-    fn build_security_nudge_single_issue_format() {
+    #[tokio::test]
+    async fn build_security_nudge_single_issue_format() {
         let checks = vec![DiagnosticCheck::warn(
             "Host Security",
             "FileVault disk encryption",
@@ -893,8 +945,8 @@ mod tests {
         assert!(nudge.ends_with("Keep it brief."));
     }
 
-    #[test]
-    fn squelching_alf_drops_it_from_the_security_nudge() {
+    #[tokio::test]
+    async fn squelching_alf_drops_it_from_the_security_nudge() {
         // Regression: a squelched (category, name) pair must not surface
         // through `check_critical_host_security` even if the underlying
         // host check still flags it. We can't force ALF off in tests, but
@@ -903,7 +955,7 @@ mod tests {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
         let now = unix_now() as i64;
         db.doctor_squelch_set(
@@ -913,9 +965,10 @@ mod tests {
             now + 60_000,
             Some("test-ack"),
         )
+        .await
         .unwrap();
 
-        if let Some(snippet) = check_critical_host_security(&cfg, Some(&db)) {
+        if let Some(snippet) = check_critical_host_security(&cfg, Some(&db)).await {
             assert!(
                 !snippet.contains("Application Firewall"),
                 "squelched finding leaked into nudge: {snippet}"
@@ -923,18 +976,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_security_augmenter_cooldown_works() {
+    #[tokio::test]
+    async fn host_security_augmenter_cooldown_works() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
-        let first = collect(&cfg, Some(&db));
+        let first = collect(&cfg, Some(&db)).await;
         let has_security_nudge = first.iter().any(|s| s.contains("Critical host security"));
 
         if has_security_nudge {
-            let second = collect(&cfg, Some(&db));
+            let second = collect(&cfg, Some(&db)).await;
             assert!(
                 !second.iter().any(|s| s.contains("Critical host security")),
                 "security nudge should be suppressed by cooldown on second call"
@@ -951,7 +1004,7 @@ mod tests {
 
     use cortex::db::NewTask;
 
-    fn make_task(db: &Database, id: &str, name: &str) {
+    async fn make_task(db: &Database, id: &str, name: &str) {
         db.create_task(&NewTask {
             id,
             name,
@@ -971,42 +1024,46 @@ mod tests {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create task");
     }
 
-    #[test]
-    fn task_health_returns_none_when_no_failures() {
-        let db = in_memory_db();
-        make_task(&db, "t1", "healthy");
+    #[tokio::test]
+    async fn task_health_returns_none_when_no_failures() {
+        let db = in_memory_db().await;
+        make_task(&db, "t1", "healthy").await;
         // Default seeded tasks (Daily Summary, etc.) have no last_error
         // and no run history — augmenter must stay silent.
         assert!(
-            build_task_health_nudge(&db, 1_000_000).is_none(),
+            build_task_health_nudge(&db, 1_000_000).await.is_none(),
             "augmenter must not fire on a clean DB"
         );
     }
 
-    #[test]
-    fn task_health_returns_none_without_db() {
+    #[tokio::test]
+    async fn task_health_returns_none_without_db() {
         // No DB → cannot ground claims → must stay silent. This is the core
         // regression guard against the original "5 failed task runs"
         // hallucination: we never fire without source-of-truth.
         let cfg = Config::default();
-        assert!(check_task_health(&cfg, None).is_none());
+        assert!(check_task_health(&cfg, None).await.is_none());
     }
 
-    #[test]
-    fn task_health_surfaces_tasks_with_last_error() {
-        let db = in_memory_db();
-        make_task(&db, "t1", "daily_summary");
-        make_task(&db, "t2", "weekly_report");
+    #[tokio::test]
+    async fn task_health_surfaces_tasks_with_last_error() {
+        let db = in_memory_db().await;
+        make_task(&db, "t1", "daily_summary").await;
+        make_task(&db, "t2", "weekly_report").await;
         db.set_task_retry("t1", 1, "openrouter 429", 9999)
+            .await
             .expect("set t1 error");
         db.set_task_retry("t2", 1, "timeout", 9999)
+            .await
             .expect("set t2 error");
 
-        let nudge =
-            build_task_health_nudge(&db, 1_000_000).expect("must fire when tasks carry last_error");
+        let nudge = build_task_health_nudge(&db, 1_000_000)
+            .await
+            .expect("must fire when tasks carry last_error");
         // Names verbatim (so the LLM can't freelance) — both must appear.
         assert!(
             nudge.contains("daily_summary"),
@@ -1031,25 +1088,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_counts_failed_runs_in_window() {
-        let db = in_memory_db();
-        make_task(&db, "t1", "task1");
+    #[tokio::test]
+    async fn task_health_counts_failed_runs_in_window() {
+        let db = in_memory_db().await;
+        make_task(&db, "t1", "task1").await;
 
         let now = 1_000_000_i64;
         // Within window (last 24h)
         db.record_task_run("t1", now - 60, 100, None, Some("e1"))
+            .await
             .expect("record");
         db.record_task_run("t1", now - 120, 100, None, Some("e2"))
+            .await
             .expect("record");
         // Outside window
         db.record_task_run("t1", now - (48 * 60 * 60), 100, None, Some("ancient"))
+            .await
             .expect("record");
         // Successes — must not be counted as failures
         db.record_task_run("t1", now - 30, 100, Some("ok"), None)
+            .await
             .expect("record");
 
-        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        let nudge = build_task_health_nudge(&db, now).await.expect("must fire");
         assert!(
             nudge.contains("2 task_run(s) failed in the last 24h"),
             "expected 24h failed-run count = 2, got: {nudge}"
@@ -1065,32 +1126,36 @@ mod tests {
         assert!(!nudge.contains(" 5 "), "fabricated count leaked: {nudge}");
     }
 
-    #[test]
-    fn task_health_lists_windowed_failures_when_last_error_already_cleared() {
+    #[tokio::test]
+    async fn task_health_lists_windowed_failures_when_last_error_already_cleared() {
         // Regression for the bug behind this commit: the heartbeat once
         // produced "2 task runs have failed in the last 24 hours. Want me to
         // investigate? ... if you share the task IDs". The agent had no IDs
         // because `tasks_with_last_error` was empty (failures cleared by a
         // later success) and the recent-failed branch was just a count.
         // After the fix, the nudge must list task IDs even in that case.
-        let db = in_memory_db();
-        make_task(&db, "tsk_alpha", "daily_summary");
-        make_task(&db, "tsk_beta", "weekly_report");
+        let db = in_memory_db().await;
+        make_task(&db, "tsk_alpha", "daily_summary").await;
+        make_task(&db, "tsk_beta", "weekly_report").await;
 
         let now = 1_000_000_i64;
         // Two failures inside the window for daily_summary, one for weekly_report.
         db.record_task_run("tsk_alpha", now - 60, 100, None, Some("openrouter 429"))
+            .await
             .expect("record");
         db.record_task_run("tsk_alpha", now - 120, 100, None, Some("upstream timeout"))
+            .await
             .expect("record");
         db.record_task_run("tsk_beta", now - 90, 100, None, Some("rate limited"))
+            .await
             .expect("record");
         // Successes after — important: simulates last_error being cleared.
         db.record_task_run("tsk_alpha", now - 30, 100, Some("ok"), None)
+            .await
             .expect("record");
         // No `set_task_retry` — `tasks_with_last_error()` is empty.
 
-        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        let nudge = build_task_health_nudge(&db, now).await.expect("must fire");
         assert!(
             !nudge.contains("task(s) carry a last_error"),
             "first block should be skipped when no task carries last_error: {nudge}"
@@ -1120,8 +1185,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_trailer_demands_names_and_cause() {
+    #[tokio::test]
+    async fn task_health_trailer_demands_names_and_cause() {
         // Regression: the LLM once produced "2 failed task runs — want me to
         // take a look?" without naming the failed tasks or surfacing the
         // cause, even though the augmenter shipped task names + last_error.
@@ -1129,15 +1194,17 @@ mod tests {
         // cap. This test pins the new contract: naming each failed task AND
         // including a snippet from its last_error are *required content*,
         // not nice-to-haves.
-        let db = in_memory_db();
-        make_task(&db, "tsk_a", "alpha");
+        let db = in_memory_db().await;
+        make_task(&db, "tsk_a", "alpha").await;
         let now = 1_000_000_i64;
         db.record_task_run("tsk_a", now - 60, 100, None, Some("boom"))
+            .await
             .expect("record");
         db.set_task_retry("tsk_a", 1, "still broken", now + 10_000)
+            .await
             .expect("set");
 
-        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        let nudge = build_task_health_nudge(&db, now).await.expect("must fire");
         // Tie the trailer assertions to the full render pipeline — without
         // this, the test passes even if the trailer were dropped from the
         // builder and only the constant existed somewhere unreachable.
@@ -1171,20 +1238,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_dedupes_tasks_appearing_in_both_blocks() {
+    #[tokio::test]
+    async fn task_health_dedupes_tasks_appearing_in_both_blocks() {
         // A task that currently carries `last_error` AND has windowed failed
         // runs should appear once (in the last_error block), not twice.
-        let db = in_memory_db();
-        make_task(&db, "tsk_dup", "duplicated");
+        let db = in_memory_db().await;
+        make_task(&db, "tsk_dup", "duplicated").await;
 
         let now = 1_000_000_i64;
         db.record_task_run("tsk_dup", now - 60, 100, None, Some("boom"))
+            .await
             .expect("record");
         db.set_task_retry("tsk_dup", 1, "still broken", now + 10_000)
+            .await
             .expect("set");
 
-        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        let nudge = build_task_health_nudge(&db, now).await.expect("must fire");
         assert_eq!(
             nudge.matches("id=tsk_dup").count(),
             1,
@@ -1202,16 +1271,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_truncates_long_failure_list() {
-        let db = in_memory_db();
+    #[tokio::test]
+    async fn task_health_truncates_long_failure_list() {
+        let db = in_memory_db().await;
         for i in 0..7 {
             let id = format!("t{i}");
             let name = format!("task_{i}");
-            make_task(&db, &id, &name);
-            db.set_task_retry(&id, 1, "boom", 9999).expect("set error");
+            make_task(&db, &id, &name).await;
+            db.set_task_retry(&id, 1, "boom", 9999)
+                .await
+                .expect("set error");
         }
-        let nudge = build_task_health_nudge(&db, 1_000_000).expect("must fire");
+        let nudge = build_task_health_nudge(&db, 1_000_000)
+            .await
+            .expect("must fire");
         // Cap is 5 listed + a "… and N more (truncated)" line.
         assert!(
             nudge.contains("… and 2 more (truncated)"),
@@ -1224,21 +1297,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_size_stays_bounded_under_worst_case() {
+    #[tokio::test]
+    async fn task_health_size_stays_bounded_under_worst_case() {
         // Bloat guard: every heartbeat tick that fires this nudge ships its
         // text inside <proactive_nudges> straight to the LLM. Cap = 5 listed
         // tasks at 120-char trimmed errors; everything else truncates. Pin
         // 2KB as the upper bound so a future field addition trips this test.
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         for i in 0..20 {
             let id = format!("id-{i}");
             let name = format!("task_with_a_reasonably_long_name_{i}");
-            make_task(&db, &id, &name);
+            make_task(&db, &id, &name).await;
             db.set_task_retry(&id, 1, &"x".repeat(500), 9999)
+                .await
                 .expect("set");
         }
-        let nudge = build_task_health_nudge(&db, 1_000_000).expect("must fire");
+        let nudge = build_task_health_nudge(&db, 1_000_000)
+            .await
+            .expect("must fire");
         assert!(
             nudge.len() < 2048,
             "nudge must stay under 2KB even with many long-error tasks; got {} bytes:\n{nudge}",
@@ -1246,50 +1322,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_health_collect_respects_cooldown() {
+    #[tokio::test]
+    async fn task_health_collect_respects_cooldown() {
         let _guard = EnvGuard::clear_native();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials (no_channels would also fire)
         if cfg.has_any_native_channel() {
             return;
         }
-        let db = in_memory_db();
-        make_task(&db, "t1", "broken");
-        db.set_task_retry("t1", 1, "boom", 9999).expect("set");
+        let db = in_memory_db().await;
+        make_task(&db, "t1", "broken").await;
+        db.set_task_retry("t1", 1, "boom", 9999).await.expect("set");
 
-        let first = collect(&cfg, Some(&db));
+        let first = collect(&cfg, Some(&db)).await;
         assert!(
             first.iter().any(|s| s.contains("broken")),
             "first call should include task_health nudge: {first:?}"
         );
-        let second = collect(&cfg, Some(&db));
+        let second = collect(&cfg, Some(&db)).await;
         assert!(
             !second.iter().any(|s| s.contains("broken")),
             "cooldown should suppress task_health on second call: {second:?}"
         );
     }
 
-    #[test]
-    fn host_security_cooldown_resets_after_48h() {
+    #[tokio::test]
+    async fn host_security_cooldown_resets_after_48h() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        let db = in_memory_db();
+        let db = in_memory_db().await;
 
-        let _ = collect(&cfg, Some(&db));
+        let _ = collect(&cfg, Some(&db)).await;
 
         // Simulate 49h elapsed for the security augmenter.
         let stale = unix_now().saturating_sub(49 * 60 * 60);
         db.set_meta(&meta_key_for("critical_host_security"), &stale.to_string())
+            .await
             .unwrap();
 
-        let result = collect(&cfg, Some(&db));
+        let result = collect(&cfg, Some(&db)).await;
         let has_security = result.iter().any(|s| s.contains("Critical host security"));
 
         // If it fired, cooldown must now suppress it again.
         if has_security {
-            let again = collect(&cfg, Some(&db));
+            let again = collect(&cfg, Some(&db)).await;
             assert!(
                 !again.iter().any(|s| s.contains("Critical host security")),
                 "security nudge should be suppressed after re-firing"
@@ -1309,42 +1386,47 @@ mod tests {
         cfg
     }
 
-    #[test]
-    fn budget_threshold_returns_none_without_db() {
+    #[tokio::test]
+    async fn budget_threshold_returns_none_without_db() {
         // No DB → can't ground numbers → must stay silent. Same regression
         // shape as task_health.
         let cfg = budget_only_config(1000);
-        assert!(check_budget_threshold(&cfg, None).is_none());
+        assert!(check_budget_threshold(&cfg, None).await.is_none());
     }
 
-    #[test]
-    fn budget_threshold_silent_when_unlimited() {
+    #[tokio::test]
+    async fn budget_threshold_silent_when_unlimited() {
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(0);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(10_000_000, 0, 10_000_000, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+        assert!(check_budget_threshold(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn budget_threshold_silent_below_75pct() {
+    #[tokio::test]
+    async fn budget_threshold_silent_below_75pct() {
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(1000);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(740, 0, 740, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+        assert!(check_budget_threshold(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn budget_threshold_fires_at_75pct_with_real_numbers() {
+    #[tokio::test]
+    async fn budget_threshold_fires_at_75pct_with_real_numbers() {
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(1000);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        let nudge = check_budget_threshold(&cfg, Some(&db)).expect("must fire at 80%");
+        let nudge = check_budget_threshold(&cfg, Some(&db))
+            .await
+            .expect("must fire at 80%");
         // Anti-hallucination: bucketed pct, total, and limit must all be present.
         assert!(nudge.contains("75%"), "missing bucket 75%: {nudge}");
         assert!(nudge.contains("800"), "missing total tokens: {nudge}");
@@ -1355,62 +1437,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn budget_threshold_does_not_refire_at_same_bucket_within_month() {
+    #[tokio::test]
+    async fn budget_threshold_does_not_refire_at_same_bucket_within_month() {
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(1000);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        assert!(check_budget_threshold(&cfg, Some(&db)).is_some());
+        assert!(check_budget_threshold(&cfg, Some(&db)).await.is_some());
         // Same bucket on the next tick → silent. The persisted month-bucket
         // is the regression guard: without it, the user sees the same 75%
         // nag every cooldown window.
-        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+        assert!(check_budget_threshold(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn budget_threshold_refires_when_bucket_increases() {
+    #[tokio::test]
+    async fn budget_threshold_refires_when_bucket_increases() {
         // Crossing 75 → 90 must be allowed even within the same month —
         // otherwise the user only ever hears about the first threshold and
         // misses the more urgent ones.
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(1000);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        let first = check_budget_threshold(&cfg, Some(&db)).expect("75% must fire");
+        let first = check_budget_threshold(&cfg, Some(&db))
+            .await
+            .expect("75% must fire");
         assert!(first.contains("75%"));
 
         db.log_token_usage(150, 0, 150, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        let second = check_budget_threshold(&cfg, Some(&db)).expect("90% must fire");
+        let second = check_budget_threshold(&cfg, Some(&db))
+            .await
+            .expect("90% must fire");
         assert!(second.contains("90%"), "expected 90% bucket: {second}");
 
         db.log_token_usage(100, 0, 100, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        let third = check_budget_threshold(&cfg, Some(&db)).expect("100% must fire");
+        let third = check_budget_threshold(&cfg, Some(&db))
+            .await
+            .expect("100% must fire");
         assert!(third.contains("100%"), "expected 100% bucket: {third}");
     }
 
-    #[test]
-    fn budget_threshold_resets_on_new_month_key() {
+    #[tokio::test]
+    async fn budget_threshold_resets_on_new_month_key() {
         // Simulate a previous month's bucket persisted under last month's
         // key. A fresh month sees an empty key and fires from scratch.
         let _guard = EnvGuard::clear_native();
         let cfg = budget_only_config(1000);
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.set_meta("heartbeat_budget_last_bucket_2099-01", "100")
+            .await
             .unwrap();
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
-        let nudge =
-            check_budget_threshold(&cfg, Some(&db)).expect("must fire — this month's key is empty");
+        let nudge = check_budget_threshold(&cfg, Some(&db))
+            .await
+            .expect("must fire — this month's key is empty");
         assert!(nudge.contains("75%"));
     }
 
-    #[test]
-    fn budget_nudge_size_stays_bounded() {
+    #[tokio::test]
+    async fn budget_nudge_size_stays_bounded() {
         // The directive ships verbatim into <proactive_nudges>. Bake in an
         // upper bound so a future field addition trips this test rather
         // than silently bloating every heartbeat tick.
@@ -1422,8 +1517,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn budget_collect_respects_cooldown() {
+    #[tokio::test]
+    async fn budget_collect_respects_cooldown() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = budget_only_config(1000);
         // Skip if OS keychain has real channel credentials (no_channels would also fire)
@@ -1431,16 +1526,17 @@ mod tests {
             return;
         }
         cfg.security.host_audit = false;
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
 
-        let first = collect(&cfg, Some(&db));
+        let first = collect(&cfg, Some(&db)).await;
         assert!(
             first.iter().any(|s| s.contains("75%")),
             "first call should include budget nudge: {first:?}"
         );
-        let second = collect(&cfg, Some(&db));
+        let second = collect(&cfg, Some(&db)).await;
         assert!(
             !second.iter().any(|s| s.contains("75%")),
             "cooldown should suppress budget nudge on second call: {second:?}"
@@ -1452,8 +1548,8 @@ mod tests {
     // These exercise `is_personalized_content` indirectly via the augmenter.
     // The pure helper is also unit-tested in cortex/src/identity.rs.
 
-    #[test]
-    fn identity_directive_mentions_required_tools() {
+    #[tokio::test]
+    async fn identity_directive_mentions_required_tools() {
         // Regression guard: the LLM follow-up depends on these exact tool
         // names. If a future refactor renames or drops them from the
         // directive the agent will silently stop completing the flow.
@@ -1462,8 +1558,8 @@ mod tests {
         assert!(IDENTITY_NUDGE.contains("IDENTITY"));
     }
 
-    #[test]
-    fn identity_directive_offers_structured_questions() {
+    #[tokio::test]
+    async fn identity_directive_offers_structured_questions() {
         // The `request_user_input` tool is multiple-choice only. The
         // directive must seed concrete option labels so the LLM produces
         // a valid tool call instead of inventing free-form prompts.
@@ -1472,8 +1568,8 @@ mod tests {
         assert!(IDENTITY_NUDGE.contains("Work"));
     }
 
-    #[test]
-    fn identity_nudge_size_stays_bounded() {
+    #[tokio::test]
+    async fn identity_nudge_size_stays_bounded() {
         assert!(
             IDENTITY_NUDGE.len() < 1024,
             "identity nudge should stay under 1KB; got {} bytes",
@@ -1481,79 +1577,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn identity_unpersonalized_fires_when_file_missing() {
+    #[tokio::test]
+    async fn identity_unpersonalized_fires_when_file_missing() {
         let _g = EnvGuard::clear_native_with_isolated_data_dir();
         // No file at all → unpersonalized.
         let cfg = Config::default();
         let nudge = check_identity_unpersonalized(&cfg, None)
+            .await
             .expect("must fire when IDENTITY.md is missing");
         assert!(nudge.contains("IDENTITY.md"));
     }
 
-    #[test]
-    fn identity_unpersonalized_fires_on_raw_template() {
+    #[tokio::test]
+    async fn identity_unpersonalized_fires_on_raw_template() {
         let _g = EnvGuard::clear_native_with_isolated_data_dir();
         let template = include_str!("../../interface/templates/IDENTITY.md");
         cortex::identity::save_identity(template).expect("write template");
         let cfg = Config::default();
-        assert!(check_identity_unpersonalized(&cfg, None).is_some());
+        assert!(check_identity_unpersonalized(&cfg, None).await.is_some());
     }
 
-    #[test]
-    fn identity_unpersonalized_silent_when_personalized() {
+    #[tokio::test]
+    async fn identity_unpersonalized_silent_when_personalized() {
         let _g = EnvGuard::clear_native_with_isolated_data_dir();
         cortex::identity::save_identity(
             "# Borg\n\nYou are Borg, an AI personal assistant belonging to Mike.\n\n## Personality\nWry, direct.\n\n## Communication Style\nTerse.\n\n## What Matters\nShipping.\n",
         )
         .expect("write filled");
         let cfg = Config::default();
-        assert!(check_identity_unpersonalized(&cfg, None).is_none());
+        assert!(check_identity_unpersonalized(&cfg, None).await.is_none());
     }
 
     // ── gateway_unrecoverable augmenter tests ──
 
-    #[test]
-    fn gateway_silent_without_db() {
+    #[tokio::test]
+    async fn gateway_silent_without_db() {
         let cfg = Config::default();
-        assert!(check_gateway_unrecoverable(&cfg, None).is_none());
+        assert!(check_gateway_unrecoverable(&cfg, None).await.is_none());
     }
 
-    #[test]
-    fn gateway_silent_when_meta_unset() {
+    #[tokio::test]
+    async fn gateway_silent_when_meta_unset() {
         let cfg = Config::default();
-        let db = in_memory_db();
-        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+        let db = in_memory_db().await;
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn gateway_silent_within_one_hour_grace() {
+    #[tokio::test]
+    async fn gateway_silent_within_one_hour_grace() {
         // The grace window is the whole point of layering this augmenter
         // *behind* the daily 02:00 self-healing pass — without it, the
         // augmenter would race maintenance and nag during the recovery
         // attempt itself.
         let cfg = Config::default();
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         let now = unix_now() as i64;
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &(now - 30).to_string())
+            .await
             .unwrap();
-        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn gateway_fires_after_grace() {
+    #[tokio::test]
+    async fn gateway_fires_after_grace() {
         let cfg = Config::default();
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         let now = unix_now() as i64;
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(
             GATEWAY_UNRECOVERABLE_AT_KEY,
             &(now - 2 * 60 * 60).to_string(),
         )
+        .await
         .unwrap();
-        let nudge =
-            check_gateway_unrecoverable(&cfg, Some(&db)).expect("must fire after grace elapsed");
+        let nudge = check_gateway_unrecoverable(&cfg, Some(&db))
+            .await
+            .expect("must fire after grace elapsed");
         // Directive must mention the log path + restart command — those
         // are the user's actual escape hatches when chat is one-way.
         assert!(nudge.contains("daemon.err"), "missing log path: {nudge}");
@@ -1564,81 +1664,85 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gateway_silent_when_flag_cleared() {
+    #[tokio::test]
+    async fn gateway_silent_when_flag_cleared() {
         // A successful recovery clears the flag — the augmenter must
         // observe this immediately, even if `_at` is still set.
         let cfg = Config::default();
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         let now = unix_now() as i64;
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "0").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "0").await.unwrap();
         db.set_meta(
             GATEWAY_UNRECOVERABLE_AT_KEY,
             &(now - 2 * 60 * 60).to_string(),
         )
+        .await
         .unwrap();
-        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).await.is_none());
     }
 
-    #[test]
-    fn gateway_collect_respects_cooldown() {
+    #[tokio::test]
+    async fn gateway_collect_respects_cooldown() {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = false;
         if cfg.has_any_native_channel() {
             return;
         }
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         let now = unix_now() as i64;
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(
             GATEWAY_UNRECOVERABLE_AT_KEY,
             &(now - 2 * 60 * 60).to_string(),
         )
+        .await
         .unwrap();
-        let first = collect(&cfg, Some(&db));
+        let first = collect(&cfg, Some(&db)).await;
         assert!(
             first.iter().any(|s| s.contains("Gateway")),
             "first tick should include gateway nudge: {first:?}"
         );
-        let second = collect(&cfg, Some(&db));
+        let second = collect(&cfg, Some(&db)).await;
         assert!(
             !second.iter().any(|s| s.contains("Gateway")),
             "cooldown should suppress on second tick: {second:?}"
         );
     }
 
-    #[test]
-    fn session_start_includes_identity_nudge() {
+    #[tokio::test]
+    async fn session_start_includes_identity_nudge() {
         // Opening the TUI with no IDENTITY.md should prompt the user to
         // personalize — that's how new users discover the flow.
         let _g = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = Config::default();
-        let nudges = collect_session_start(&cfg, None);
+        let nudges = collect_session_start(&cfg, None).await;
         assert!(
             nudges.iter().any(|n| n.contains("IDENTITY.md")),
             "expected identity nudge in session-start, got: {nudges:?}"
         );
     }
 
-    #[test]
-    fn session_start_excludes_budget_and_gateway_nudges() {
+    #[tokio::test]
+    async fn session_start_excludes_budget_and_gateway_nudges() {
         // The session-start subset must stay focused — the heavy
         // operational nudges only fire on scheduled ticks.
         let _g = EnvGuard::clear_native_with_isolated_data_dir();
         let mut cfg = budget_only_config(1000);
         cfg.security.host_audit = false;
-        let db = in_memory_db();
+        let db = in_memory_db().await;
         db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .await
             .unwrap();
         let now = unix_now() as i64;
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(
             GATEWAY_UNRECOVERABLE_AT_KEY,
             &(now - 2 * 60 * 60).to_string(),
         )
+        .await
         .unwrap();
-        let nudges = collect_session_start(&cfg, Some(&db));
+        let nudges = collect_session_start(&cfg, Some(&db)).await;
         assert!(
             nudges
                 .iter()

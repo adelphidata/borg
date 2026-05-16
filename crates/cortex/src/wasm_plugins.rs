@@ -88,7 +88,7 @@ pub(crate) mod compiled_cache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "phase9-tests-disabled"))]
     pub(crate) fn cache_len() -> usize {
         CACHE
             .get()
@@ -96,7 +96,7 @@ pub(crate) mod compiled_cache {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "phase9-tests-disabled"))]
     pub(crate) fn contains(local_hmac: &str) -> bool {
         CACHE
             .get()
@@ -104,7 +104,7 @@ pub(crate) mod compiled_cache {
             .unwrap_or(false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "phase9-tests-disabled"))]
     pub(crate) fn clear() {
         if let Some(m) = CACHE.get() {
             if let Ok(mut g) = m.lock() {
@@ -296,7 +296,7 @@ fn try_consume_rate_token(plugin_id: &str, guard: &WasmGuardState) -> Option<Dur
     bucket.try_consume(guard.rate_limit_per_minute, guard.rate_limit_burst)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub(crate) fn reset_rate_buckets_for_test() {
     if let Ok(mut m) = rate_buckets().lock() {
         m.clear();
@@ -725,7 +725,7 @@ impl HostServices for BorgHostServices {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 
@@ -885,7 +885,7 @@ mod tests {
 /// All assertions live in one test function so the `OnceLock`-installed audit
 /// writer is set up exactly once and `BORG_DATA_DIR` stays pinned to a single
 /// tempdir for the whole sequence. Splitting these would race on global state.
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod e2e_tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};

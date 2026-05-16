@@ -216,14 +216,14 @@ impl Admin for AdminSvc {
 
     async fn heal(&self, _req: Request<Empty>) -> Result<Response<HealReport>, TStatus> {
         let reg = self.process_registry_handle();
-        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let config = cortex::config::Config::load_from_db()?;
+        let report = async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
             cortex::maintenance::run_daily_maintenance_with_registry(&db, &config, reg.as_ref())
-        })
+                .await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("heal task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("heal failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("heal failed: {e}")))?;
         Ok(Response::new(HealReport {
             pruned_logs: report.log_files_deleted as u64,
             pruned_activity: report.activity_rows_deleted as u64,
@@ -242,6 +242,7 @@ impl Admin for AdminSvc {
 
     async fn dream(&self, _req: Request<Empty>) -> Result<Response<DreamReport>, TStatus> {
         let config = cortex::config::Config::load_from_db()
+            .await
             .map_err(|e| TStatus::internal(format!("dream config load failed: {e}")))?;
         let report = cortex::memory::consolidation::run_dream(&config)
             .await
@@ -287,9 +288,11 @@ impl Admin for AdminSvc {
         _req: Request<Empty>,
     ) -> Result<Response<SettingsSnapshot>, TStatus> {
         let resolver = SettingsResolver::load()
+            .await
             .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
         let entries = resolver
             .list_all()
+            .await
             .map_err(|e| TStatus::internal(format!("settings list failed: {e}")))?;
         Ok(Response::new(SettingsSnapshot {
             entries: entries
@@ -306,22 +309,26 @@ impl Admin for AdminSvc {
     async fn set_setting(&self, req: Request<SettingMutation>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
         let resolver = SettingsResolver::load()
+            .await
             .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
         resolver
             .set(&req.key, &req.value)
+            .await
             .map_err(|e| TStatus::invalid_argument(format!("set `{}` failed: {e}", req.key)))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(Empty {}))
     }
 
     async fn unset_setting(&self, req: Request<SettingKey>) -> Result<Response<Empty>, TStatus> {
         let key = req.into_inner().key;
         let resolver = SettingsResolver::load()
+            .await
             .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
         resolver
             .unset(&key)
+            .await
             .map_err(|e| TStatus::invalid_argument(format!("unset `{key}` failed: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(Empty {}))
     }
 
@@ -329,29 +336,27 @@ impl Admin for AdminSvc {
         // Combine in-memory live sessions with the most recent persisted ones.
         let live: std::collections::HashSet<String> =
             self.registry.live_ids().into_iter().collect();
-        let sessions =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SessionSummary>> {
-                let db = Database::open()?;
-                let rows = db.list_sessions(100)?;
-                let mut sessions = Vec::with_capacity(rows.len());
-                for r in rows {
-                    let count = db.count_session_messages(&r.id).unwrap_or(0);
-                    let mut title = r.title.clone();
-                    if live.contains(&r.id) && !title.contains("(live)") {
-                        title = format!("{title} (live)");
-                    }
-                    sessions.push(SessionSummary {
-                        id: r.id,
-                        title,
-                        message_count: count as u64,
-                        updated_unix_ts: r.updated_at as u64,
-                    });
+        let sessions = async {
+            let db = Database::open().await?;
+            let rows = db.list_sessions(100).await?;
+            let mut sessions = Vec::with_capacity(rows.len());
+            for r in rows {
+                let count = db.count_session_messages(&r.id).await.unwrap_or(0);
+                let mut title = r.title.clone();
+                if live.contains(&r.id) && !title.contains("(live)") {
+                    title = format!("{title} (live)");
                 }
-                Ok(sessions)
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("list_sessions task panicked: {e}")))?
-            .map_err(|e| TStatus::internal(format!("list_sessions failed: {e}")))?;
+                sessions.push(SessionSummary {
+                    id: r.id,
+                    title,
+                    message_count: count as u64,
+                    updated_unix_ts: r.updated_at as u64,
+                });
+            }
+            anyhow::Ok(sessions)
+        }
+        .await
+        .map_err(|e| TStatus::internal(format!("list_sessions failed: {e}")))?;
         Ok(Response::new(SessionList { sessions }))
     }
 
@@ -360,30 +365,28 @@ impl Admin for AdminSvc {
         req: Request<SessionRef>,
     ) -> Result<Response<SessionDetail>, TStatus> {
         let id = req.into_inner().id;
-        let detail =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<SessionDetail>> {
-                let db = Database::open()?;
-                let Some(row) = db.session_by_id(&id)? else {
-                    return Ok(None);
-                };
-                let messages = db.load_session_messages(&row.id)?;
-                Ok(Some(SessionDetail {
-                    id: row.id,
-                    title: row.title,
-                    messages: messages
-                        .into_iter()
-                        .map(|m| MessageView {
-                            role: m.role,
-                            text: m.content.unwrap_or_default(),
-                            unix_ts: m.created_at as u64,
-                        })
-                        .collect(),
-                }))
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("get_session task panicked: {e}")))?
-            .map_err(|e| TStatus::internal(format!("get_session failed: {e}")))?
-            .ok_or_else(|| TStatus::not_found("session not found".to_string()))?;
+        let detail = async {
+            let db = Database::open().await?;
+            let Some(row) = db.session_by_id(&id).await? else {
+                return anyhow::Ok(None);
+            };
+            let messages = db.load_session_messages(&row.id).await?;
+            Ok(Some(SessionDetail {
+                id: row.id,
+                title: row.title,
+                messages: messages
+                    .into_iter()
+                    .map(|m| MessageView {
+                        role: m.role,
+                        text: m.content.unwrap_or_default(),
+                        unix_ts: m.created_at as u64,
+                    })
+                    .collect(),
+            }))
+        }
+        .await
+        .map_err(|e| TStatus::internal(format!("get_session failed: {e}")))?
+        .ok_or_else(|| TStatus::not_found("session not found".to_string()))?;
         Ok(Response::new(detail))
     }
 
@@ -393,13 +396,12 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<ScheduledTaskList>, TStatus> {
-        let rows = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.list_tasks()
-        })
+        let rows = async {
+            let db = Database::open().await?;
+            db.list_tasks().await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("list_tasks task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_tasks failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("list_tasks failed: {e}")))?;
         Ok(Response::new(ScheduledTaskList {
             tasks: rows.into_iter().map(scheduled_task_row_to_proto).collect(),
         }))
@@ -412,9 +414,9 @@ impl Admin for AdminSvc {
         let req = req.into_inner();
         let id = uuid::Uuid::new_v4().to_string();
         let id_for_lookup = id.clone();
-        let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let inserted = async {
             use cortex::db::NewTask;
-            let db = Database::open()?;
+            let db = Database::open().await?;
             let delivery_channel =
                 (!req.delivery_channel.is_empty()).then_some(req.delivery_channel.as_str());
             let delivery_target =
@@ -459,11 +461,10 @@ impl Admin for AdminSvc {
                 pre_run_timeout_ms: None,
                 min_interval_secs: None,
             };
-            db.create_task(&new_task)?;
-            Ok(db.list_tasks()?.into_iter().find(|t| t.id == id))
-        })
+            db.create_task(&new_task).await?;
+            anyhow::Ok(db.list_tasks().await?.into_iter().find(|t| t.id == id))
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("create_task task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("create_task failed: {e}")))?
         .ok_or_else(|| {
             TStatus::internal(format!(
@@ -478,13 +479,12 @@ impl Admin for AdminSvc {
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
         let id = req.into_inner().id;
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.delete_task(&id)
-        })
+        let removed = async {
+            let db = Database::open().await?;
+            db.delete_task(&id).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("delete_task task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("delete_task failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("delete_task failed: {e}")))?;
         if !removed {
             return Err(TStatus::not_found("scheduled task not found"));
         }
@@ -497,9 +497,9 @@ impl Admin for AdminSvc {
     ) -> Result<Response<ScheduledTask>, TStatus> {
         let req = req.into_inner();
         let id_for_lookup = req.id.clone();
-        let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let updated = async {
             use cortex::db::UpdateTask;
-            let db = Database::open()?;
+            let db = Database::open().await?;
             // Empty string sentinel = "leave unchanged", matching the
             // ScheduledTaskUpdate proto semantics + Option<&str> on UpdateTask.
             let update = UpdateTask {
@@ -511,16 +511,15 @@ impl Admin for AdminSvc {
                     .then_some(req.schedule_expr.as_str()),
                 timezone: (!req.timezone.is_empty()).then_some(req.timezone.as_str()),
             };
-            let found = db.update_task(&req.id, &update)?;
+            let found = db.update_task(&req.id, &update).await?;
             if !found {
-                return Ok(None);
+                return anyhow::Ok(None);
             }
             // Re-read the row so the caller observes the persisted state, not
             // a locally-merged copy that could drift if a column gets added.
-            Ok(db.list_tasks()?.into_iter().find(|t| t.id == req.id))
-        })
+            Ok(db.list_tasks().await?.into_iter().find(|t| t.id == req.id))
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("update_task task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("update_task failed: {e}")))?
         .ok_or_else(|| TStatus::not_found(format!("scheduled task `{id_for_lookup}` not found")))?;
         Ok(Response::new(scheduled_task_row_to_proto(updated)))
@@ -546,18 +545,17 @@ impl Admin for AdminSvc {
     ) -> Result<Response<Empty>, TStatus> {
         let id = req.into_inner().id;
         let id_for_err = id.clone();
-        let found = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-            let db = Database::open()?;
-            if db.get_task_by_id(&id)?.is_none() {
-                return Ok(false);
+        let found = async {
+            let db = Database::open().await?;
+            if db.get_task_by_id(&id).await?.is_none() {
+                return anyhow::Ok(false);
             }
             let now = chrono::Utc::now().timestamp();
-            db.update_task_next_run(&id, Some(now))?;
-            db.clear_task_retry(&id)?;
+            db.update_task_next_run(&id, Some(now)).await?;
+            db.clear_task_retry(&id).await?;
             Ok(true)
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("run_scheduled_task_now panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("run_scheduled_task_now failed: {e}")))?;
         if !found {
             return Err(TStatus::not_found(format!(
@@ -579,13 +577,14 @@ impl Admin for AdminSvc {
         } else {
             req.limit as usize
         };
-        let runs = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.task_run_history(&id, limit)
-        })
+        let runs = async {
+            let db = Database::open().await?;
+            db.task_run_history(&id, limit).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("get_scheduled_task_runs panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("get_scheduled_task_runs failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("get_scheduled_task_runs failed: {e}"))
+        })?;
         Ok(Response::new(ScheduledTaskRunList {
             runs: runs.into_iter().map(task_run_row_to_proto).collect(),
         }))
@@ -597,28 +596,26 @@ impl Admin for AdminSvc {
     ) -> Result<Response<ScheduledTaskDetail>, TStatus> {
         let id = req.into_inner().id;
         let id_for_err = id.clone();
-        let detail =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ScheduledTaskDetail>> {
-                let db = Database::open()?;
-                let Some(row) = db.get_task_by_id(&id)? else {
-                    return Ok(None);
-                };
-                let last = db.last_task_run(&id)?;
-                let proto_task = scheduled_task_row_to_proto(row.clone());
-                Ok(Some(ScheduledTaskDetail {
-                    task: Some(proto_task),
-                    max_retries: row.max_retries,
-                    retry_count: row.retry_count,
-                    retry_after_unix: row.retry_after.unwrap_or(0),
-                    last_error: row.last_error.unwrap_or_default(),
-                    timeout_ms: row.timeout_ms,
-                    has_last_run: last.is_some(),
-                    last_run: last.map(task_run_row_to_proto),
-                }))
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail panicked: {e}")))?
-            .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
+        let detail = async {
+            let db = Database::open().await?;
+            let Some(row) = db.get_task_by_id(&id).await? else {
+                return anyhow::Ok(None);
+            };
+            let last = db.last_task_run(&id).await?;
+            let proto_task = scheduled_task_row_to_proto(row.clone());
+            Ok(Some(ScheduledTaskDetail {
+                task: Some(proto_task),
+                max_retries: row.max_retries,
+                retry_count: row.retry_count,
+                retry_after_unix: row.retry_after.unwrap_or(0),
+                last_error: row.last_error.unwrap_or_default(),
+                timeout_ms: row.timeout_ms,
+                has_last_run: last.is_some(),
+                last_run: last.map(task_run_row_to_proto),
+            }))
+        }
+        .await
+        .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
         let detail = detail.ok_or_else(|| {
             TStatus::not_found(format!("scheduled task `{id_for_err}` not found"))
         })?;
@@ -639,17 +636,17 @@ impl Admin for AdminSvc {
             req.format
         };
         let session_id = req.session_id;
-        let (rendered, suggested) =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-                use cortex::export::{export_session, ExportFormat, ExportOptions};
-                use std::str::FromStr;
-                let format = ExportFormat::from_str(&format_str)?;
-                let db = Database::open()?;
-                export_session(&db, &session_id, ExportOptions { format })
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("export_session panicked: {e}")))?
-            .map_err(|e| TStatus::invalid_argument(format!("export_session failed: {e}")))?;
+        let (rendered, suggested) = async {
+            use cortex::export::{export_session, ExportFormat, ExportOptions};
+            use std::str::FromStr;
+            let format = ExportFormat::from_str(&format_str)?;
+            let db = Database::open().await?;
+            export_session(&db, &session_id, ExportOptions { format }).await
+        }
+        .await
+        .map_err(|e: anyhow::Error| {
+            TStatus::invalid_argument(format!("export_session failed: {e}"))
+        })?;
         Ok(Response::new(ExportSessionResponse {
             content: rendered.into_bytes(),
             suggested_filename: suggested,
@@ -663,14 +660,13 @@ impl Admin for AdminSvc {
         req: Request<PairingFilter>,
     ) -> Result<Response<PairingRequestList>, TStatus> {
         let filter = req.into_inner().channel_name;
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
+        let rows = async {
+            let db = Database::open().await?;
             let f = (!filter.is_empty()).then_some(filter.as_str());
-            db.list_pairings(f)
-        })
+            db.list_pairings(f).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("list_pairings task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_pairings failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("list_pairings failed: {e}")))?;
         Ok(Response::new(PairingRequestList {
             requests: rows.into_iter().map(pairing_row_to_proto).collect(),
         }))
@@ -681,13 +677,16 @@ impl Admin for AdminSvc {
         req: Request<PairingApproval>,
     ) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.approve_pairing(&req.channel_name, &req.code).map(|_| ())
-        })
+        async {
+            let db = Database::open().await?;
+            db.approve_pairing(&req.channel_name, &req.code)
+                .await
+                .map(|_| ())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("approve_pairing task panicked: {e}")))?
-        .map_err(|e| TStatus::failed_precondition(format!("approve_pairing failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::failed_precondition(format!("approve_pairing failed: {e}"))
+        })?;
         Ok(Response::new(Empty {}))
     }
 
@@ -696,14 +695,15 @@ impl Admin for AdminSvc {
         req: Request<PairingFilter>,
     ) -> Result<Response<ApprovedSenderList>, TStatus> {
         let filter = req.into_inner().channel_name;
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
+        let rows = async {
+            let db = Database::open().await?;
             let f = (!filter.is_empty()).then_some(filter.as_str());
-            db.list_approved_senders(f)
-        })
+            db.list_approved_senders(f).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("list_approved_senders task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_approved_senders failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("list_approved_senders failed: {e}"))
+        })?;
         Ok(Response::new(ApprovedSenderList {
             senders: rows.into_iter().map(approved_sender_row_to_proto).collect(),
         }))
@@ -714,13 +714,12 @@ impl Admin for AdminSvc {
         req: Request<ApprovedSenderRef>,
     ) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.revoke_sender(&req.channel_name, &req.sender_id)
-        })
+        let removed = async {
+            let db = Database::open().await?;
+            db.revoke_sender(&req.channel_name, &req.sender_id).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("revoke_sender task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("revoke_sender failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("revoke_sender failed: {e}")))?;
         if !removed {
             return Err(TStatus::not_found("approved sender not found"));
         }
@@ -734,18 +733,17 @@ impl Admin for AdminSvc {
         _req: Request<Empty>,
     ) -> Result<Response<DaemonStatus>, TStatus> {
         let live_count = self.registry.live_ids().len() as u64;
-        let snapshot = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let cfg = cortex::config::Config::load_from_db()?;
-            let tasks = db.list_tasks()?;
-            let pairings = db.list_pairings(None)?;
+        let snapshot = async {
+            let db = Database::open().await?;
+            let cfg = cortex::config::Config::load_from_db().await?;
+            let tasks = db.list_tasks().await?;
+            let pairings = db.list_pairings(None).await?;
             let active = tasks.iter().filter(|t| t.status == "active").count() as u64;
             let paused = tasks.iter().filter(|t| t.status == "paused").count() as u64;
             let pending = pairings.iter().filter(|p| p.status == "pending").count() as u64;
-            Ok((cfg, active, paused, pending))
-        })
+            anyhow::Ok((cfg, active, paused, pending))
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("daemon_status task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("daemon_status failed: {e}")))?;
         let (cfg, active, paused, pending) = snapshot;
         Ok(Response::new(DaemonStatus {
@@ -764,9 +762,8 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<AmbientStatus>, TStatus> {
-        let snap = tokio::task::spawn_blocking(load_ambient_status)
+        let snap = load_ambient_status()
             .await
-            .map_err(|e| TStatus::internal(format!("ambient_status panicked: {e}")))?
             .map_err(|e| TStatus::internal(format!("ambient_status failed: {e}")))?;
         Ok(Response::new(snap))
     }
@@ -775,15 +772,16 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<WarningList>, TStatus> {
-        let warnings = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<String>> {
-            let db = Database::open()?;
-            Ok(db
-                .latest_doctor_run()?
-                .map(|r| r.persistent_warnings)
-                .unwrap_or_default())
-        })
+        let warnings = async {
+            let db = Database::open().await?;
+            anyhow::Ok(
+                db.latest_doctor_run()
+                    .await?
+                    .map(|r| r.persistent_warnings)
+                    .unwrap_or_default(),
+            )
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("persistent_warnings panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("persistent_warnings failed: {e}")))?;
         Ok(Response::new(WarningList { warnings }))
     }
@@ -811,7 +809,7 @@ impl Admin for AdminSvc {
         let channel = req.channel;
         let sender_id = req.sender_id;
         tokio::spawn(async move {
-            let config = match cortex::config::Config::load_from_db() {
+            let config = match cortex::config::Config::load_from_db().await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("approval greeting: load_from_db failed: {e}");
@@ -876,13 +874,12 @@ impl Admin for AdminSvc {
         let level = req.level;
         let source = req.source;
         let message = req.message;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
-            cortex::activity_log::log_activity(&db, &level, &source, &message);
-            Ok(())
-        })
+        async {
+            let db = Database::open().await?;
+            cortex::activity_log::log_activity(&db, &level, &source, &message).await;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("log_activity panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("log_activity failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
@@ -905,11 +902,13 @@ impl Admin for AdminSvc {
         } else {
             Some(req.category)
         };
-        let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let db = Database::open()?;
-            let entries = db.query_activity(count, min_level.as_deref(), category.as_deref())?;
+        let text = async {
+            let db = Database::open().await?;
+            let entries = db
+                .query_activity(count, min_level.as_deref(), category.as_deref())
+                .await?;
             if entries.is_empty() {
-                return Ok("No activity log entries.".to_string());
+                return anyhow::Ok("No activity log entries.".to_string());
             }
             Ok(entries
                 .iter()
@@ -917,9 +916,8 @@ impl Admin for AdminSvc {
                 .map(cortex::activity_log::format_activity_entry)
                 .collect::<Vec<_>>()
                 .join("\n"))
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("get_activity_log_text panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("get_activity_log_text failed: {e}")))?;
         Ok(Response::new(ActivityLogText { text }))
     }
@@ -932,12 +930,16 @@ impl Admin for AdminSvc {
         if req.plugin_id.is_empty() {
             return Err(TStatus::invalid_argument("plugin_id required"));
         }
-        let recorded = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
-            let db = Database::open()?;
-            db.insert_plugin(&req.plugin_id, &req.plugin_name, &req.kind, &req.category)?;
+        let recorded = async {
+            let db = Database::open().await?;
+            db.insert_plugin(&req.plugin_id, &req.plugin_name, &req.kind, &req.category)
+                .await?;
             let mut count = 0u32;
             for fh in &req.file_hashes {
-                if let Err(e) = db.insert_file_hash(&req.plugin_id, &fh.path, &fh.hash) {
+                if let Err(e) = db
+                    .insert_file_hash(&req.plugin_id, &fh.path, &fh.hash)
+                    .await
+                {
                     tracing::warn!("plugin_install: insert_file_hash {}: {e}", fh.path);
                 } else {
                     count += 1;
@@ -945,7 +947,8 @@ impl Admin for AdminSvc {
             }
             if let Some(t) = &req.installed_tool {
                 if !t.name.is_empty() {
-                    db.insert_installed_tool(&t.name, &t.description, &t.runtime, &t.plugin_id)?;
+                    db.insert_installed_tool(&t.name, &t.description, &t.runtime, &t.plugin_id)
+                        .await?;
                 }
             }
             if let Some(c) = &req.installed_channel {
@@ -956,16 +959,16 @@ impl Admin for AdminSvc {
                         &c.runtime,
                         &c.plugin_id,
                         &c.webhook,
-                    )?;
+                    )
+                    .await?;
                 }
             }
             if !req.credentials_json.is_empty() {
-                db.set_setting("credentials", &req.credentials_json)?;
+                db.set_setting("credentials", &req.credentials_json).await?;
             }
-            Ok(count)
-        })
+            anyhow::Ok(count)
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("plugin_install panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("plugin_install failed: {e}")))?;
         Ok(Response::new(PluginInstallResponse {
             file_hashes_recorded: recorded,
@@ -983,15 +986,14 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<OnboardingState>, TStatus> {
-        let onboarded = tokio::task::spawn_blocking(|| -> anyhow::Result<bool> {
-            let db = Database::open()?;
-            Ok(matches!(
-                db.get_setting("onboarded")?.as_deref(),
+        let onboarded = async {
+            let db = Database::open().await?;
+            anyhow::Ok(matches!(
+                db.get_setting("onboarded").await?.as_deref(),
                 Some("true")
             ))
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("get_onboarding_state panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("get_onboarding_state failed: {e}")))?;
         Ok(Response::new(OnboardingState { onboarded }))
     }
@@ -1000,13 +1002,12 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Empty>, TStatus> {
-        tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
-            let db = Database::open()?;
-            db.set_setting("onboarded", "true")?;
-            Ok(())
-        })
+        async {
+            let db = Database::open().await?;
+            db.set_setting("onboarded", "true").await?;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("set_onboarding_complete panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("set_onboarding_complete failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
@@ -1027,17 +1028,16 @@ impl Admin for AdminSvc {
             return Err(TStatus::invalid_argument("provider required"));
         }
         let provider_for_lookup = provider.clone();
-        let body = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ApiKeyRouting>> {
-            let db = Database::open()?;
+        let body = async {
+            let db = Database::open().await?;
             let key = format!("credentials.{provider_for_lookup}");
-            let raw = db.get_setting(&key)?;
+            let raw = db.get_setting(&key).await?;
             match raw {
-                Some(s) if !s.is_empty() => Ok(Some(serde_json::from_str(&s)?)),
+                Some(s) if !s.is_empty() => anyhow::Ok(Some(serde_json::from_str(&s)?)),
                 _ => Ok(None),
             }
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("get_api_key panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("get_api_key failed: {e}")))?;
 
         let value = match body {
@@ -1089,15 +1089,14 @@ impl Admin for AdminSvc {
             }
         };
         let provider = req.provider;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
+        async {
+            let db = Database::open().await?;
             let key = format!("credentials.{provider}");
             let json = serde_json::to_string(&routing)?;
-            db.set_setting(&key, &json)?;
-            Ok(())
-        })
+            db.set_setting(&key, &json).await?;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("set_api_key panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("set_api_key failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
@@ -1107,22 +1106,21 @@ impl Admin for AdminSvc {
         if provider.is_empty() {
             return Err(TStatus::invalid_argument("provider required"));
         }
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
+        async {
+            let db = Database::open().await?;
             let key = format!("credentials.{provider}");
-            db.delete_setting(&key)?;
-            Ok(())
-        })
+            db.delete_setting(&key).await?;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("unset_api_key panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("unset_api_key failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 
     async fn list_api_keys(&self, _req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
-        let entries = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<ApiKeyEntry>> {
-            let db = Database::open()?;
-            let rows = db.list_settings()?;
+        let entries = async {
+            let db = Database::open().await?;
+            let rows = db.list_settings().await?;
             let mut out = Vec::new();
             for (key, value, _) in rows {
                 if !key.starts_with("credentials.") {
@@ -1147,10 +1145,9 @@ impl Admin for AdminSvc {
                     backend: backend.to_string(),
                 });
             }
-            Ok(out)
-        })
+            anyhow::Ok(out)
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("list_api_keys panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("list_api_keys failed: {e}")))?;
         Ok(Response::new(ApiKeyList { entries }))
     }
@@ -1159,13 +1156,14 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<MonthlyTokenTotal>, TStatus> {
-        let total = tokio::task::spawn_blocking(|| -> anyhow::Result<u64> {
-            let db = Database::open()?;
-            db.monthly_token_total()
-        })
+        let total = async {
+            let db = Database::open().await?;
+            db.monthly_token_total().await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("monthly_token_total panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("monthly_token_total failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("monthly_token_total failed: {e}"))
+        })?;
         Ok(Response::new(MonthlyTokenTotal { total }))
     }
 
@@ -1173,13 +1171,12 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<MonthlyTotalCost>, TStatus> {
-        let cost = tokio::task::spawn_blocking(|| -> anyhow::Result<Option<f64>> {
-            let db = Database::open()?;
-            db.monthly_total_cost()
-        })
+        let cost = async {
+            let db = Database::open().await?;
+            db.monthly_total_cost().await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("monthly_total_cost panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("monthly_total_cost failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("monthly_total_cost failed: {e}")))?;
         let (cost_val, present) = match cost {
             Some(c) => (c, true),
             None => (0.0, false),
@@ -1213,8 +1210,8 @@ impl Admin for AdminSvc {
             }
         };
         let id_for_err = req.id.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
+        async {
+            let db = Database::open().await?;
             let display_name = if req.display_name.is_empty() {
                 req.id.clone()
             } else {
@@ -1233,11 +1230,10 @@ impl Admin for AdminSvc {
                 api_key_env,
                 enabled: true,
             };
-            row.insert(db.conn())?;
-            Ok(())
-        })
+            row.insert(&db).await?;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("add_provider task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("add_provider '{id_for_err}' failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
@@ -1251,14 +1247,13 @@ impl Admin for AdminSvc {
             return Err(TStatus::invalid_argument("id must be non-empty"));
         }
         let id_for_err = id.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
+        async {
+            let db = Database::open().await?;
             // Idempotent — `false` (already absent) is a successful no-op.
-            cortex::providers::ProviderRow::delete(db.conn(), &id)?;
-            Ok(())
-        })
+            cortex::providers::ProviderRow::delete(&db, &id).await?;
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("remove_provider task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("remove_provider '{id_for_err}' failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
@@ -1271,8 +1266,8 @@ impl Admin for AdminSvc {
     ) -> Result<Response<CreateWebhookResponse>, TStatus> {
         let req = req.into_inner();
         let name = req.name.clone();
-        let created = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
+        let created = async {
+            let db = Database::open().await?;
             let thread_path = if req.thread_path.is_empty() {
                 None
             } else {
@@ -1285,10 +1280,12 @@ impl Admin for AdminSvc {
                 thread_path,
                 &req.body_path,
             )
-        })
+            .await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("create_webhook task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("create_webhook '{name}' failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("create_webhook '{name}' failed: {e}"))
+        })?;
         Ok(Response::new(CreateWebhookResponse {
             name: created.row.name,
             hmac_secret: created.row.secret_hash,
@@ -1297,13 +1294,12 @@ impl Admin for AdminSvc {
 
     async fn revoke_webhook(&self, req: Request<WebhookRef>) -> Result<Response<Empty>, TStatus> {
         let name = req.into_inner().name;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
-            gateway::generic_webhook::definitions::revoke(&db, &name)
-        })
+        async {
+            let db = Database::open().await?;
+            gateway::generic_webhook::definitions::revoke(&db, &name).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("revoke_webhook task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("revoke_webhook failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("revoke_webhook failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 
@@ -1315,13 +1311,14 @@ impl Admin for AdminSvc {
     ) -> Result<Response<IssueClientTokenResponse>, TStatus> {
         let req = req.into_inner();
         let label = req.label.clone();
-        let issued = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            cortex::auth::tokens::issue(&db, &req.label, &req.scopes)
-        })
+        let issued = async {
+            let db = Database::open().await?;
+            cortex::auth::tokens::issue(&db, &req.label, &req.scopes).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("issue_client_token task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("issue_client_token '{label}' failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("issue_client_token '{label}' failed: {e}"))
+        })?;
         Ok(Response::new(IssueClientTokenResponse {
             id: issued.row.id,
             label: issued.row.label,
@@ -1335,13 +1332,12 @@ impl Admin for AdminSvc {
     ) -> Result<Response<RevokedClientToken>, TStatus> {
         let label = req.into_inner().label;
         let label_for_err = label.clone();
-        let row = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            cortex::auth::tokens::revoke_by_label(&db, &label)
-        })
+        let row = async {
+            let db = Database::open().await?;
+            cortex::auth::tokens::revoke_by_label(&db, &label).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("revoke_client_token task panicked: {e}")))?
-        .map_err(|e| {
+        .map_err(|e: anyhow::Error| {
             TStatus::internal(format!("revoke_client_token '{label_for_err}' failed: {e}"))
         })?;
         Ok(Response::new(RevokedClientToken {
@@ -1367,14 +1363,14 @@ impl Admin for AdminSvc {
                 "expires_at_unix must be in the future",
             ));
         }
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
+        async {
+            let db = Database::open().await?;
             let reason = (!req.reason.is_empty()).then_some(req.reason.as_str());
             db.doctor_squelch_set(&req.category, &req.name, now, req.expires_at_unix, reason)
-        })
+                .await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("doctor_squelch_set task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("doctor_squelch_set failed: {e}")))?;
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("doctor_squelch_set failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 
@@ -1388,13 +1384,14 @@ impl Admin for AdminSvc {
                 "category and name must be non-empty",
             ));
         }
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.doctor_squelch_clear(&req.category, &req.name)
-        })
+        let removed = async {
+            let db = Database::open().await?;
+            db.doctor_squelch_clear(&req.category, &req.name).await
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("doctor_squelch_clear task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("doctor_squelch_clear failed: {e}")))?;
+        .map_err(|e: anyhow::Error| {
+            TStatus::internal(format!("doctor_squelch_clear failed: {e}"))
+        })?;
         Ok(Response::new(DoctorSquelchClearResponse { removed }))
     }
 
@@ -1412,19 +1409,17 @@ impl Admin for AdminSvc {
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<CredentialList>, TStatus> {
         let req = req.into_inner();
-        let providers =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ProviderCredentials>> {
-                let db = Database::open()?;
-                let config = cortex::config::Config::load_from_db()?;
-                let pool = build_primary_pool(&config, &db)?;
-                if !req.provider.is_empty() && !pool_provider_matches(&pool, &req.provider) {
-                    return Ok(vec![]);
-                }
-                Ok(vec![credential_pool_to_proto(&config, &pool)])
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("list_credentials task panicked: {e}")))?
-            .map_err(|e| TStatus::internal(format!("list_credentials failed: {e}")))?;
+        let providers = async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
+            let pool = build_primary_pool(&config, &db).await?;
+            if !req.provider.is_empty() && !pool_provider_matches(&pool, &req.provider) {
+                return anyhow::Ok(vec![]);
+            }
+            Ok(vec![credential_pool_to_proto(&config, &pool)])
+        }
+        .await
+        .map_err(|e| TStatus::internal(format!("list_credentials failed: {e}")))?;
         Ok(Response::new(CredentialList { providers }))
     }
 
@@ -1439,10 +1434,10 @@ impl Admin for AdminSvc {
         }
         let provider = req.provider;
         let label_in = req.label;
-        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<CredentialEntry> {
-            let db = Database::open()?;
-            let config = cortex::config::Config::load_from_db()?;
-            let pool = build_primary_pool(&config, &db)?;
+        let entry = async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
+            let pool = build_primary_pool(&config, &db).await?;
             require_provider_match(&pool, &provider)?;
             let label = if label_in.trim().is_empty() {
                 // Count live entries only — tombstones shouldn't bump the
@@ -1462,12 +1457,11 @@ impl Admin for AdminSvc {
                 label,
                 cortex::llm::credential_pool::CredentialSource::Manual,
             );
-            Ok(pooled_to_proto(pool.provider_str(), &cred))
-        })
+            anyhow::Ok(pooled_to_proto(pool.provider_str(), &cred))
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("add_credential task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("add_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(entry))
     }
 
@@ -1479,10 +1473,10 @@ impl Admin for AdminSvc {
         if req.target.trim().is_empty() {
             return Err(TStatus::invalid_argument("target must not be empty"));
         }
-        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<CredentialEntry> {
-            let db = Database::open()?;
-            let config = cortex::config::Config::load_from_db()?;
-            let pool = build_primary_pool(&config, &db)?;
+        let entry = async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
+            let pool = build_primary_pool(&config, &db).await?;
             require_provider_match(&pool, &req.provider)?;
             let (idx_zero, _existing) = pool
                 .resolve_target(&req.target)
@@ -1490,12 +1484,11 @@ impl Admin for AdminSvc {
             let removed = pool
                 .remove_index(idx_zero + 1)
                 .ok_or_else(|| anyhow::anyhow!("index out of range after resolve"))?;
-            Ok(pooled_to_proto(pool.provider_str(), &removed))
-        })
+            anyhow::Ok(pooled_to_proto(pool.provider_str(), &removed))
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("remove_credential task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("remove_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(entry))
     }
 
@@ -1504,17 +1497,16 @@ impl Admin for AdminSvc {
         req: Request<ResetCredentialsRequest>,
     ) -> Result<Response<ResetCredentialsResponse>, TStatus> {
         let req = req.into_inner();
-        let cleared = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-            let db = Database::open()?;
-            let config = cortex::config::Config::load_from_db()?;
-            let pool = build_primary_pool(&config, &db)?;
+        let cleared = async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
+            let pool = build_primary_pool(&config, &db).await?;
             require_provider_match(&pool, &req.provider)?;
-            Ok(pool.reset_cooldowns() as u64)
-        })
+            anyhow::Ok(pool.reset_cooldowns() as u64)
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("reset_credentials task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("reset_credentials: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(ResetCredentialsResponse { cleared }))
     }
 
@@ -1529,101 +1521,95 @@ impl Admin for AdminSvc {
         // Normalize hyphenated forms (`claude-code`) to the discoverer's
         // canonical `name()` (`claude_code`) — the registry keys on underscores.
         let kind = raw_kind.replace('-', "_");
-        let entries =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CredentialEntry>> {
-                use anyhow::Context;
-                use cortex::llm::credential_pool::{
-                    is_safe_base_url, pool_load_config_for_provider, AuthType, CredentialPool,
-                    PoolLoadConfig,
-                };
-                use cortex::llm::credential_sources::discoverer_by_name;
-                use cortex::llm::provider::Provider;
+        let entries = async {
+            use anyhow::Context;
+            use cortex::llm::credential_pool::{
+                is_safe_base_url, pool_load_config_for_provider, AuthType, CredentialPool,
+                PoolLoadConfig,
+            };
+            use cortex::llm::credential_sources::discoverer_by_name;
+            use cortex::llm::provider::Provider;
 
-                let discoverer = discoverer_by_name(&kind).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown OAuth kind `{kind}` — try claude_code | codex | qwen_cli"
-                    )
-                })?;
-                let provider = discoverer.provider();
+            let discoverer = discoverer_by_name(&kind).ok_or_else(|| {
+                anyhow::anyhow!("unknown OAuth kind `{kind}` — try claude_code | codex | qwen_cli")
+            })?;
+            let provider = discoverer.provider();
 
-                let db = Database::open()?;
-                let db_path = cortex::config::Config::db_path()?;
-                let config = cortex::config::Config::load_from_db()?;
+            let db = Database::open().await?;
+            let db_path = cortex::config::Config::db_path()?;
+            let config = cortex::config::Config::load_from_db().await?;
 
-                // Build a load config pointing at this OAuth provider. Pairing
-                // seeds the pool regardless of whether the operator has switched
-                // their primary to that flavor yet, so we bypass
-                // `config.llm.provider`. Env-var seeding is disabled — pairing
-                // is an explicit operator action, not an env scan.
-                let mut load_cfg: PoolLoadConfig = pool_load_config_for_provider(
-                    provider,
-                    config.llm.credential_strategy,
-                    config.llm.credential_cooldown_secs,
-                    config.llm.max_concurrent_per_credential,
-                    vec![],
-                );
-                load_cfg.proactive_rate_limit_threshold_pct =
-                    config.llm.proactive_rate_limit_threshold_pct;
-                load_cfg.proactive_rate_limit_min_window_secs =
-                    config.llm.proactive_rate_limit_min_window_secs;
-                load_cfg.env_vars.clear();
-                let pool = CredentialPool::load(&db, &db_path, provider, load_cfg)?;
+            // Build a load config pointing at this OAuth provider. Pairing
+            // seeds the pool regardless of whether the operator has switched
+            // their primary to that flavor yet, so we bypass
+            // `config.llm.provider`. Env-var seeding is disabled — pairing
+            // is an explicit operator action, not an env scan.
+            let mut load_cfg: PoolLoadConfig = pool_load_config_for_provider(
+                provider,
+                config.llm.credential_strategy,
+                config.llm.credential_cooldown_secs,
+                config.llm.max_concurrent_per_credential,
+                vec![],
+            );
+            load_cfg.proactive_rate_limit_threshold_pct =
+                config.llm.proactive_rate_limit_threshold_pct;
+            load_cfg.proactive_rate_limit_min_window_secs =
+                config.llm.proactive_rate_limit_min_window_secs;
+            load_cfg.env_vars.clear();
+            let pool = CredentialPool::load(&db, &db_path, provider, load_cfg).await?;
 
-                let home = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME for OAuth discovery"))?;
-                let discovered = discoverer
-                    .discover(&home)
-                    .with_context(|| format!("running discoverer `{}`", discoverer.name()))?;
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME for OAuth discovery"))?;
+            let discovered = discoverer
+                .discover(&home)
+                .with_context(|| format!("running discoverer `{}`", discoverer.name()))?;
 
-                let mut out = Vec::new();
-                for disc in discovered {
-                    // Custom-endpoint sources carry a per-credential base_url
-                    // that needs SSRF-style validation before it lands in the
-                    // pool — operator-writable files can otherwise redirect
-                    // traffic on next request.
-                    if let Some(url) = disc.base_url.as_deref() {
-                        if !is_safe_base_url(url) {
-                            anyhow::bail!(
-                                "discoverer `{}` returned unsafe base_url `{}` — must be https or http+loopback",
-                                discoverer.name(),
-                                url
-                            );
-                        }
+            let mut out = Vec::new();
+            for disc in discovered {
+                // Custom-endpoint sources carry a per-credential base_url
+                // that needs SSRF-style validation before it lands in the
+                // pool — operator-writable files can otherwise redirect
+                // traffic on next request.
+                if let Some(url) = disc.base_url.as_deref() {
+                    if !is_safe_base_url(url) {
+                        anyhow::bail!(
+                            "discoverer `{}` returned unsafe base_url `{}` — must be https or http+loopback",
+                            discoverer.name(),
+                            url
+                        );
                     }
-                    let source = match provider {
-                        Provider::Custom => {
-                            cortex::llm::credential_pool::CredentialSource::Custom {
-                                name: discoverer.name().to_string(),
-                                base_url: disc.base_url.clone().unwrap_or_default(),
-                            }
-                        }
-                        _ => cortex::llm::credential_pool::CredentialSource::OAuth {
-                            name: discoverer.name().to_string(),
-                        },
-                    };
-                    let auth_type = if disc.refresh_token.is_some() {
-                        AuthType::OAuth
-                    } else {
-                        AuthType::ApiKey
-                    };
-                    let cred = pool.add_entry_full(
-                        disc.access_token,
-                        disc.label,
-                        source,
-                        auth_type,
-                        disc.refresh_token,
-                        disc.expires_at_ms,
-                        disc.base_url,
-                        disc.extra_json,
-                    );
-                    out.push(pooled_to_proto(pool.provider_str(), &cred));
                 }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("pair_credential task panicked: {e}")))?
-            .map_err(|e| TStatus::invalid_argument(format!("pair_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+                let source = match provider {
+                    Provider::Custom => cortex::llm::credential_pool::CredentialSource::Custom {
+                        name: discoverer.name().to_string(),
+                        base_url: disc.base_url.clone().unwrap_or_default(),
+                    },
+                    _ => cortex::llm::credential_pool::CredentialSource::OAuth {
+                        name: discoverer.name().to_string(),
+                    },
+                };
+                let auth_type = if disc.refresh_token.is_some() {
+                    AuthType::OAuth
+                } else {
+                    AuthType::ApiKey
+                };
+                let cred = pool.add_entry_full(
+                    disc.access_token,
+                    disc.label,
+                    source,
+                    auth_type,
+                    disc.refresh_token,
+                    disc.expires_at_ms,
+                    disc.base_url,
+                    disc.extra_json,
+                );
+                out.push(pooled_to_proto(pool.provider_str(), &cred));
+            }
+            anyhow::Ok(out)
+        }
+        .await
+        .map_err(|e| TStatus::invalid_argument(format!("pair_credential: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(PairCredentialResponse { entries }))
     }
 
@@ -1644,26 +1630,26 @@ impl Admin for AdminSvc {
         )?;
         let provider = req.provider;
         let strategy_value = req.strategy;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let db = Database::open()?;
-            let config = cortex::config::Config::load_from_db()?;
-            let pool = build_primary_pool(&config, &db)?;
+        async {
+            let db = Database::open().await?;
+            let config = cortex::config::Config::load_from_db().await?;
+            let pool = build_primary_pool(&config, &db).await?;
             require_provider_match(&pool, &provider)?;
             // Persist via the settings registry so it's restart-stable, and
             // notify the runtime config reload so the live LlmClient picks
             // up the new strategy on its next rebuild.
-            let resolver = cortex::settings::SettingsResolver::load()?;
+            let resolver = cortex::settings::SettingsResolver::load().await?;
             // The `json_quoted` setter wraps the value itself before
             // deserializing — we pass the raw variant string.
             resolver
                 .set("llm.credential_strategy", &strategy_value)
+                .await
                 .map_err(|e| anyhow::anyhow!("set llm.credential_strategy: {e}"))?;
-            Ok(())
-        })
+            anyhow::Ok(())
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("set_credential_strategy task panicked: {e}")))?
         .map_err(|e| TStatus::invalid_argument(format!("set_credential_strategy: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx);
+        notify_runtime_config_reload(&self.config_notify_tx).await;
         Ok(Response::new(Empty {}))
     }
 
@@ -1709,18 +1695,18 @@ impl Admin for AdminSvc {
 
     async fn get_goal(&self, req: Request<GoalRef>) -> Result<Response<GoalDetail>, TStatus> {
         let session_id_req = req.into_inner().session_id;
-        let detail = tokio::task::spawn_blocking(move || -> anyhow::Result<GoalDetail> {
-            let db = Database::open()?;
-            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
-                return Ok(GoalDetail::default());
+        let detail = async {
+            let db = Database::open().await?;
+            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
+                return anyhow::Ok(GoalDetail::default());
             };
             Ok(db
-                .get_goal(&session_id)?
+                .get_goal(&session_id)
+                .await?
                 .map(|g| goal_to_detail(&g))
                 .unwrap_or_default())
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("get_goal task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("get_goal failed: {e}")))?;
         Ok(Response::new(detail))
     }
@@ -1742,167 +1728,159 @@ impl Admin for AdminSvc {
             None
         };
         let bus = self.goal_bus_handle();
-        let outcome =
-            tokio::task::spawn_blocking(move || -> Result<SetGoalOutcome, SetGoalError> {
-                let db = Database::open().map_err(SetGoalError::Internal)?;
-                let session_id = resolve_goal_session_id(&db, &session_id_req)
-                    .map_err(SetGoalError::Internal)?
-                    .ok_or_else(|| {
-                        SetGoalError::Precondition("no active session — start a turn first".into())
+        let outcome = async {
+            let db = Database::open().await.map_err(SetGoalError::Internal)?;
+            let session_id = resolve_goal_session_id(&db, &session_id_req)
+                .await
+                .map_err(SetGoalError::Internal)?
+                .ok_or_else(|| {
+                    SetGoalError::Precondition("no active session — start a turn first".into())
+                })?;
+            match op {
+                GoalMutationOp::Unspecified => unreachable!(),
+                GoalMutationOp::Create => {
+                    let obj = cortex::goals::validate_objective(&objective)
+                        .map_err(SetGoalError::Invalid)?;
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(SetGoalError::Invalid)?;
+                    let inserted = db
+                        .insert_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
+                        .await
+                        .map_err(SetGoalError::Internal)?;
+                    let goal = inserted.ok_or_else(|| {
+                        SetGoalError::AlreadyExists("goal already exists for this session".into())
                     })?;
-                match op {
-                    GoalMutationOp::Unspecified => unreachable!(),
-                    GoalMutationOp::Create => {
-                        let obj = cortex::goals::validate_objective(&objective)
-                            .map_err(SetGoalError::Invalid)?;
-                        let budget = cortex::goals::validate_budget(token_budget)
-                            .map_err(SetGoalError::Invalid)?;
-                        let inserted = db
-                            .insert_goal(
-                                &session_id,
-                                &obj,
-                                cortex::goals::GoalStatus::Active,
-                                budget,
-                            )
-                            .map_err(SetGoalError::Internal)?;
-                        let goal = inserted.ok_or_else(|| {
-                            SetGoalError::AlreadyExists(
-                                "goal already exists for this session".into(),
-                            )
-                        })?;
-                        Ok(SetGoalOutcome {
-                            goal: Some(goal),
-                            kind: cortex::goals::event_kind::CREATED,
-                        })
-                    }
-                    GoalMutationOp::Replace => {
-                        let obj = cortex::goals::validate_objective(&objective)
-                            .map_err(SetGoalError::Invalid)?;
-                        let budget = cortex::goals::validate_budget(token_budget)
-                            .map_err(SetGoalError::Invalid)?;
-                        let existed = db
-                            .get_goal(&session_id)
-                            .map_err(SetGoalError::Internal)?
-                            .is_some();
-                        let g = db
-                            .replace_goal(
-                                &session_id,
-                                &obj,
-                                cortex::goals::GoalStatus::Active,
-                                budget,
-                            )
-                            .map_err(SetGoalError::Internal)?;
-                        Ok(SetGoalOutcome {
-                            goal: Some(g),
-                            kind: if existed {
-                                cortex::goals::event_kind::REPLACED
-                            } else {
-                                cortex::goals::event_kind::CREATED
-                            },
-                        })
-                    }
-                    GoalMutationOp::SetStatus => {
-                        let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
-                            .ok_or_else(|| {
-                                SetGoalError::Invalid(format!(
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind: cortex::goals::event_kind::CREATED,
+                    })
+                }
+                GoalMutationOp::Replace => {
+                    let obj = cortex::goals::validate_objective(&objective)
+                        .map_err(SetGoalError::Invalid)?;
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(SetGoalError::Invalid)?;
+                    let existed = db
+                        .get_goal(&session_id)
+                        .await
+                        .map_err(SetGoalError::Internal)?
+                        .is_some();
+                    let g = db
+                        .replace_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
+                        .await
+                        .map_err(SetGoalError::Internal)?;
+                    Ok(SetGoalOutcome {
+                        goal: Some(g),
+                        kind: if existed {
+                            cortex::goals::event_kind::REPLACED
+                        } else {
+                            cortex::goals::event_kind::CREATED
+                        },
+                    })
+                }
+                GoalMutationOp::SetStatus => {
+                    let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
+                        .ok_or_else(|| {
+                            SetGoalError::Invalid(format!(
                                 "status must be one of active|paused|complete (got {status_raw:?})"
                             ))
-                            })?;
-                        if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
-                            return Err(SetGoalError::Invalid(
-                                "budget_limited is system-only; cannot be set via RPC".into(),
-                            ));
-                        }
-                        let current = db
-                            .get_goal(&session_id)
-                            .map_err(SetGoalError::Internal)?
-                            .ok_or_else(|| {
-                                SetGoalError::Precondition("no goal set for this session".into())
-                            })?;
-                        use cortex::goals::GoalStatus as S;
-                        let allowed = matches!(
-                            (current.status, new_status),
-                            (S::Active, S::Paused)
-                                | (S::Paused, S::Active)
-                                | (S::Active, S::Complete)
-                                | (S::Paused, S::Complete)
-                                | (S::BudgetLimited, S::Complete)
-                        );
-                        if !allowed {
-                            return Err(SetGoalError::Invalid(format!(
-                                "illegal transition {} -> {}",
-                                current.status.as_str(),
-                                new_status.as_str()
-                            )));
-                        }
-                        let updated = db
-                            .update_goal(
-                                &session_id,
-                                cortex::db::GoalUpdate {
-                                    status: Some(new_status),
-                                    expected_goal_id: Some(current.goal_id),
-                                    ..Default::default()
-                                },
-                            )
-                            .map_err(SetGoalError::Internal)?;
-                        let goal = updated.ok_or_else(|| {
-                            SetGoalError::Precondition(
-                                "goal changed concurrently during status update".into(),
-                            )
                         })?;
-                        let kind = if goal.status == cortex::goals::GoalStatus::Complete {
-                            cortex::goals::event_kind::COMPLETED
-                        } else {
-                            cortex::goals::event_kind::STATUS_CHANGED
-                        };
-                        Ok(SetGoalOutcome {
-                            goal: Some(goal),
-                            kind,
-                        })
+                    if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
+                        return Err(SetGoalError::Invalid(
+                            "budget_limited is system-only; cannot be set via RPC".into(),
+                        ));
                     }
-                    GoalMutationOp::SetBudget => {
-                        let budget = cortex::goals::validate_budget(token_budget)
-                            .map_err(SetGoalError::Invalid)?;
-                        let current = db
-                            .get_goal(&session_id)
-                            .map_err(SetGoalError::Internal)?
-                            .ok_or_else(|| {
-                                SetGoalError::Precondition("no goal set for this session".into())
-                            })?;
-                        let updated = db
-                            .update_goal(
-                                &session_id,
-                                cortex::db::GoalUpdate {
-                                    token_budget: Some(budget),
-                                    expected_goal_id: Some(current.goal_id),
-                                    ..Default::default()
-                                },
-                            )
-                            .map_err(SetGoalError::Internal)?;
-                        let goal = updated.ok_or_else(|| {
-                            SetGoalError::Precondition(
-                                "goal changed concurrently during budget update".into(),
-                            )
+                    let current = db
+                        .get_goal(&session_id)
+                        .await
+                        .map_err(SetGoalError::Internal)?
+                        .ok_or_else(|| {
+                            SetGoalError::Precondition("no goal set for this session".into())
                         })?;
-                        Ok(SetGoalOutcome {
-                            goal: Some(goal),
-                            kind: cortex::goals::event_kind::BUDGET_CHANGED,
-                        })
+                    use cortex::goals::GoalStatus as S;
+                    let allowed = matches!(
+                        (current.status, new_status),
+                        (S::Active, S::Paused)
+                            | (S::Paused, S::Active)
+                            | (S::Active, S::Complete)
+                            | (S::Paused, S::Complete)
+                            | (S::BudgetLimited, S::Complete)
+                    );
+                    if !allowed {
+                        return Err(SetGoalError::Invalid(format!(
+                            "illegal transition {} -> {}",
+                            current.status.as_str(),
+                            new_status.as_str()
+                        )));
                     }
+                    let updated = db
+                        .update_goal(
+                            &session_id,
+                            cortex::db::GoalUpdate {
+                                status: Some(new_status),
+                                expected_goal_id: Some(current.goal_id),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(SetGoalError::Internal)?;
+                    let goal = updated.ok_or_else(|| {
+                        SetGoalError::Precondition(
+                            "goal changed concurrently during status update".into(),
+                        )
+                    })?;
+                    let kind = if goal.status == cortex::goals::GoalStatus::Complete {
+                        cortex::goals::event_kind::COMPLETED
+                    } else {
+                        cortex::goals::event_kind::STATUS_CHANGED
+                    };
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind,
+                    })
                 }
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("set_goal task panicked: {e}")))?
-            .map_err(|e| match e {
-                SetGoalError::Invalid(msg) => TStatus::invalid_argument(format!("set_goal: {msg}")),
-                SetGoalError::Precondition(msg) => {
-                    TStatus::failed_precondition(format!("set_goal: {msg}"))
+                GoalMutationOp::SetBudget => {
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(SetGoalError::Invalid)?;
+                    let current = db
+                        .get_goal(&session_id)
+                        .await
+                        .map_err(SetGoalError::Internal)?
+                        .ok_or_else(|| {
+                            SetGoalError::Precondition("no goal set for this session".into())
+                        })?;
+                    let updated = db
+                        .update_goal(
+                            &session_id,
+                            cortex::db::GoalUpdate {
+                                token_budget: Some(budget),
+                                expected_goal_id: Some(current.goal_id),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(SetGoalError::Internal)?;
+                    let goal = updated.ok_or_else(|| {
+                        SetGoalError::Precondition(
+                            "goal changed concurrently during budget update".into(),
+                        )
+                    })?;
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind: cortex::goals::event_kind::BUDGET_CHANGED,
+                    })
                 }
-                SetGoalError::AlreadyExists(msg) => {
-                    TStatus::already_exists(format!("set_goal: {msg}"))
-                }
-                SetGoalError::Internal(err) => TStatus::internal(format!("set_goal: {err}")),
-            })?;
+            }
+        }
+        .await
+        .map_err(|e| match e {
+            SetGoalError::Invalid(msg) => TStatus::invalid_argument(format!("set_goal: {msg}")),
+            SetGoalError::Precondition(msg) => {
+                TStatus::failed_precondition(format!("set_goal: {msg}"))
+            }
+            SetGoalError::AlreadyExists(msg) => TStatus::already_exists(format!("set_goal: {msg}")),
+            SetGoalError::Internal(err) => TStatus::internal(format!("set_goal: {err}")),
+        })?;
 
         let detail = outcome
             .goal
@@ -1923,16 +1901,15 @@ impl Admin for AdminSvc {
     async fn clear_goal(&self, req: Request<GoalRef>) -> Result<Response<Empty>, TStatus> {
         let session_id_req = req.into_inner().session_id;
         let bus = self.goal_bus_handle();
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-            let db = Database::open()?;
-            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
-                return Ok(None);
+        let removed = async {
+            let db = Database::open().await?;
+            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
+                return anyhow::Ok(None);
             };
-            let did_remove = db.delete_goal(&session_id)?;
+            let did_remove = db.delete_goal(&session_id).await?;
             Ok(if did_remove { Some(session_id) } else { None })
-        })
+        }
         .await
-        .map_err(|e| TStatus::internal(format!("clear_goal task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("clear_goal failed: {e}")))?;
         if let (Some(bus), Some(session_id)) = (bus, removed) {
             bus.publish(crate::goal_bus::DaemonGoalEvent {
@@ -1951,17 +1928,15 @@ impl Admin for AdminSvc {
     ) -> Result<Response<GoalDetail>, TStatus> {
         let session_id_req = req.into_inner().session_id;
         let bus = self.goal_bus_handle();
-        let paused =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<cortex::goals::Goal>> {
-                let db = Database::open()?;
-                let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
-                    return Ok(None);
-                };
-                db.pause_active_goal(&session_id)
-            })
-            .await
-            .map_err(|e| TStatus::internal(format!("pause_goal task panicked: {e}")))?
-            .map_err(|e| TStatus::internal(format!("pause_goal failed: {e}")))?;
+        let paused = async {
+            let db = Database::open().await?;
+            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
+                return anyhow::Ok(None);
+            };
+            db.pause_active_goal(&session_id).await
+        }
+        .await
+        .map_err(|e: anyhow::Error| TStatus::internal(format!("pause_goal failed: {e}")))?;
         let detail = paused.as_ref().map(goal_to_detail).unwrap_or_default();
         if let (Some(bus), Some(goal)) = (bus, paused.as_ref()) {
             bus.publish(crate::goal_bus::DaemonGoalEvent {
@@ -2042,7 +2017,7 @@ enum SetGoalError {
 /// "the most recently active session"; matches the TUI's `latest_session_id`
 /// behaviour so users issuing `/goal …` from a freshly-opened terminal hit
 /// the session they expect. Returns `None` when no session exists yet.
-fn resolve_goal_session_id(
+async fn resolve_goal_session_id(
     db: &cortex::db::Database,
     requested: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -2050,7 +2025,7 @@ fn resolve_goal_session_id(
     if !trimmed.is_empty() {
         return Ok(Some(trimmed.to_string()));
     }
-    Ok(db.list_sessions(1)?.into_iter().next().map(|r| r.id))
+    Ok(db.list_sessions(1).await?.into_iter().next().map(|r| r.id))
 }
 
 /// Convert the core goal struct to its wire projection. `Option<i64>` budget
@@ -2090,7 +2065,7 @@ fn process_entry_to_proto(entry: ProcessEntry) -> PbSubprocess {
     }
 }
 
-fn notify_runtime_config_reload(
+async fn notify_runtime_config_reload(
     config_notify_tx: &Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
 ) {
     let tx = {
@@ -2102,7 +2077,7 @@ fn notify_runtime_config_reload(
     let Some(tx) = tx else {
         return;
     };
-    match cortex::config::Config::load_from_db() {
+    match cortex::config::Config::load_from_db().await {
         Ok(config) => {
             if tx.try_send(config).is_err() {
                 tracing::debug!("config watcher notify queue full; poll loop will pick it up");
@@ -2121,11 +2096,11 @@ enum ApiKeyRouting {
     Keychain { service: String, account: String },
 }
 
-fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
-    let db = Database::open()?;
-    let evo = db.get_evolution_state()?;
-    let vitals = db.get_vitals_state()?;
-    let bond_events = db.get_all_bond_events()?;
+async fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
+    let db = Database::open().await?;
+    let evo = db.get_evolution_state().await?;
+    let vitals = db.get_vitals_state().await?;
+    let bond_events = db.get_all_bond_events().await?;
     let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
     let bond = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
     let mood = cortex::evolution::compute_mood(&evo, &vitals, &bond);
@@ -2141,13 +2116,12 @@ fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
 }
 
 async fn update_task_status(id: String, status: &'static str) -> Result<Response<Empty>, TStatus> {
-    let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let db = Database::open()?;
-        db.update_task_status(&id, status)
-    })
+    let updated = async {
+        let db = Database::open().await?;
+        db.update_task_status(&id, status).await
+    }
     .await
-    .map_err(|e| TStatus::internal(format!("update_task_status panicked: {e}")))?
-    .map_err(|e| TStatus::internal(format!("update_task_status failed: {e}")))?;
+    .map_err(|e: anyhow::Error| TStatus::internal(format!("update_task_status failed: {e}")))?;
     if !updated {
         return Err(TStatus::not_found("scheduled task not found"));
     }
@@ -2208,7 +2182,7 @@ fn approved_sender_row_to_proto(r: cortex::db::ApprovedSenderRow) -> ApprovedSen
 
 // ── Credential pool helpers ─────────────────────────────────────────────
 
-fn build_primary_pool(
+async fn build_primary_pool(
     config: &cortex::config::Config,
     _db: &cortex::db::Database,
 ) -> anyhow::Result<std::sync::Arc<cortex::llm::credential_pool::CredentialPool>> {
@@ -2222,6 +2196,7 @@ fn build_primary_pool(
         config.llm.proactive_rate_limit_threshold_pct,
         config.llm.proactive_rate_limit_min_window_secs,
     )
+    .await
     .ok_or_else(|| {
         anyhow::anyhow!(
             "could not build credential pool for primary provider — check DB path and llm.api_keys config"

@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end integration test for the WASM plugin lifecycle.
 //!

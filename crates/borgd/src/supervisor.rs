@@ -31,30 +31,26 @@ use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// `Database` is `!Sync` (the underlying `rusqlite::Connection` holds a
-/// `RefCell`), so subsystems that need to write to the activity log
-/// from across `await` points share access through a `std::sync::Mutex`.
-/// Same pattern `cortex::activity_log::ActivityHook` uses.
-pub type DbHandle = Arc<Mutex<Database>>;
+/// `Database` is now `Send + Sync` (turso connection is internally `Arc`'d),
+/// so subsystems share access through a plain `Arc`. The legacy
+/// `Arc<Mutex<Database>>` wrapper became dead weight once the SQL layer
+/// went async.
+pub type DbHandle = Arc<Database>;
 
-fn try_log(db: &DbHandle, level: &str, category: &str, message: &str) {
-    if let Ok(guard) = db.lock() {
-        if let Err(e) = guard.log_activity(level, category, message, None) {
-            tracing::debug!("supervisor: activity log write failed: {e}");
-        }
+async fn try_log(db: &DbHandle, level: &str, category: &str, message: &str) {
+    if let Err(e) = db.log_activity(level, category, message, None).await {
+        tracing::debug!("supervisor: activity log write failed: {e}");
     }
 }
 
-fn try_observe_issue(db: &DbHandle, key: &str, ts: i64, status: &str) {
-    if let Ok(guard) = db.lock() {
-        if let Err(e) = guard.upsert_issue_state_observed(key, ts, status) {
-            tracing::debug!("supervisor: issue-state observe failed: {e}");
-        }
+async fn try_observe_issue(db: &DbHandle, key: &str, ts: i64, status: &str) {
+    if let Err(e) = db.upsert_issue_state_observed(key, ts, status).await {
+        tracing::debug!("supervisor: issue-state observe failed: {e}");
     }
 }
 
@@ -237,7 +233,8 @@ async fn supervised_loop<F, Fut, E>(
                     "warn",
                     "subsystem",
                     &format!("{}: returned Err: {msg}", cfg.name),
-                );
+                )
+                .await;
             }
             IterationOutcome::Panicked(msg) => {
                 tracing::error!("subsystem {}: panicked: {msg}", cfg.name);
@@ -246,7 +243,8 @@ async fn supervised_loop<F, Fut, E>(
                     "error",
                     "subsystem",
                     &format!("{}: panicked: {msg}", cfg.name),
-                );
+                )
+                .await;
             }
             IterationOutcome::Aborted => {
                 tracing::warn!(
@@ -261,7 +259,8 @@ async fn supervised_loop<F, Fut, E>(
                         "{}: externally aborted (likely watchdog stall recovery)",
                         cfg.name
                     ),
-                );
+                )
+                .await;
             }
         }
 
@@ -289,8 +288,9 @@ async fn supervised_loop<F, Fut, E>(
                     recent_restarts.len(),
                     cfg.restart_window,
                 ),
-            );
-            try_observe_issue(&db, &key, unix_now, "fail");
+            )
+            .await;
+            try_observe_issue(&db, &key, unix_now, "fail").await;
             if let Some(cb) = cfg.on_degraded.as_ref() {
                 // The callback runs sync inside the supervisor task. A
                 // panic here must NOT prevent the degraded-state log /
@@ -380,7 +380,8 @@ pub fn spawn_liveness_watchdog(
                         &format!(
                             "{name}: watchdog detected stall (~{stall_secs}s, counter={now_val}); restart triggered"
                         ),
-                    );
+                    )
+                    .await;
                     abort.abort();
                     return;
                 }
@@ -398,24 +399,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn test_db() -> DbHandle {
-        // `Database::test_db` is gated behind cfg(test) in cortex and not
-        // visible from borgd's tests. Build the equivalent in-memory DB
-        // through the public from_connection entry point instead.
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        Arc::new(Mutex::new(
-            Database::from_connection(conn).expect("init test db"),
-        ))
+    async fn test_db() -> DbHandle {
+        // The DbHandle is now a plain `Arc<Database>` — turso's connection is
+        // internally Arc'd, so the Mutex wrapper that pre-dated the async DB
+        // is no longer needed.
+        Arc::new(Database::test_db().await)
     }
 
     /// Convenience: query activity rows through the `DbHandle`.
-    fn read_activity(
+    async fn read_activity(
         db: &DbHandle,
         level: Option<&str>,
         category: Option<&str>,
     ) -> Vec<cortex::db::ActivityEntry> {
-        let g = db.lock().unwrap();
-        g.query_activity(50, level, category).unwrap()
+        db.query_activity(50, level, category).await.unwrap()
     }
 
     fn fast_cfg(name: &'static str, max_restarts: u32) -> SupervisorConfig {
@@ -431,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn respawns_after_panic_then_succeeds() {
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_clone = attempts.clone();
@@ -466,7 +463,7 @@ mod tests {
 
         // Two panic restart rows (the 3rd attempt succeeded so wrote no row).
         // `error`-level rows count too — panics are logged at error.
-        let rows = read_activity(&db, Some("warn"), Some("subsystem"));
+        let rows = read_activity(&db, Some("warn"), Some("subsystem")).await;
         let panic_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.message.contains("panicked"))
@@ -481,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn enters_degraded_state_after_max_restarts() {
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_clone = attempts.clone();
@@ -509,7 +506,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
 
         // One degraded-state error row.
-        let error_rows = read_activity(&db, Some("error"), Some("subsystem"));
+        let error_rows = read_activity(&db, Some("error"), Some("subsystem")).await;
         let degrade_rows: Vec<_> = error_rows
             .iter()
             .filter(|r| r.message.contains("degraded"))
@@ -523,14 +520,23 @@ mod tests {
 
         // Issue state row exists with status fail.
         let row: Option<(String, String)> = {
-            let g = db.lock().unwrap();
-            g.conn()
-                .query_row(
+            let mut stmt = db
+                .conn()
+                .prepare(
                     "SELECT issue_key, last_status FROM maintenance_issue_state WHERE issue_key = ?1",
-                    rusqlite::params!["Subsystem:degrade-test"],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
-                .ok()
+                .await
+                .expect("prepare issue_state lookup");
+            let mut rows = stmt
+                .query([turso::Value::from("Subsystem:degrade-test")])
+                .await
+                .expect("query issue_state");
+            rows.next().await.expect("fetch row").map(|r| {
+                (
+                    r.get::<String>(0).expect("issue_key"),
+                    r.get::<String>(1).expect("last_status"),
+                )
+            })
         };
         let row = row.expect("issue_state row must exist for degraded subsystem");
         assert_eq!(row.0, "Subsystem:degrade-test");
@@ -539,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_returns_without_counting_restart() {
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
@@ -564,7 +570,7 @@ mod tests {
             .expect("supervisor task panicked");
 
         // No restart rows.
-        let rows = read_activity(&db, Some("warn"), Some("subsystem"));
+        let rows = read_activity(&db, Some("warn"), Some("subsystem")).await;
         let restart_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.message.contains("panicked") || r.message.contains("returned Err"))
@@ -579,7 +585,7 @@ mod tests {
     async fn watchdog_aborts_when_counter_stuck() {
         // A liveness counter that never moves must trigger an abort
         // after WATCHDOG_MAX_STALE_POLLS polls.
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let liveness = Arc::new(AtomicU64::new(42));
 
@@ -615,7 +621,7 @@ mod tests {
         );
 
         // Watchdog logged a warn row.
-        let rows = read_activity(&db, Some("warn"), Some("subsystem"));
+        let rows = read_activity(&db, Some("warn"), Some("subsystem")).await;
         let stall_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.message.contains("watchdog detected stall"))
@@ -634,7 +640,7 @@ mod tests {
     async fn watchdog_does_not_abort_when_counter_advances() {
         // A counter that advances on every poll must NOT trigger an
         // abort, even after many polling intervals.
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let liveness = Arc::new(AtomicU64::new(0));
 
@@ -676,7 +682,7 @@ mod tests {
         );
 
         // No stall rows logged.
-        let rows = read_activity(&db, Some("warn"), Some("subsystem"));
+        let rows = read_activity(&db, Some("warn"), Some("subsystem")).await;
         let stall_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.message.contains("watchdog detected stall"))
@@ -693,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_exit_does_not_respawn() {
-        let db = test_db();
+        let db = test_db().await;
         let cancel = CancellationToken::new();
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_clone = attempts.clone();

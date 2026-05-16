@@ -262,7 +262,7 @@ impl BudgetEngine {
                         actual.to_storage_string(),
                         principal_scope.unwrap_or("default").to_string(),
                         metadata,
-                        session_id.map(|s| s.to_string()),
+                        session_id.map(std::string::ToString::to_string),
                         now,
                     ),
                 )

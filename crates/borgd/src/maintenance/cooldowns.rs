@@ -23,8 +23,8 @@ impl<'a> Cooldown<'a> {
     /// `Err(())` — DB read failed; caller should skip the augmenter on this
     /// tick rather than treat it as never-fired (matches the prior
     /// fail-closed behavior).
-    pub(crate) fn last_fired(&self) -> Result<u64, ()> {
-        match self.db.get_meta(&self.key) {
+    pub(crate) async fn last_fired(&self) -> Result<u64, ()> {
+        match self.db.get_meta(&self.key).await {
             Ok(Some(s)) => Ok(s.parse().unwrap_or(0)),
             Ok(None) => Ok(0),
             Err(e) => {
@@ -36,8 +36,8 @@ impl<'a> Cooldown<'a> {
 
     /// True if `cooldown_secs` has elapsed since the last firing (or no
     /// previous firing exists). Treats DB-read failures as "do not fire".
-    pub(crate) fn is_ready(&self, now_secs: u64) -> bool {
-        match self.last_fired() {
+    pub(crate) async fn is_ready(&self, now_secs: u64) -> bool {
+        match self.last_fired().await {
             Ok(last) => now_secs.saturating_sub(last) >= self.cooldown_secs,
             Err(()) => false,
         }
@@ -45,8 +45,8 @@ impl<'a> Cooldown<'a> {
 
     /// Record a firing. Failures log+continue — losing this write means
     /// at most one duplicate nudge before the next persisted tick.
-    pub(crate) fn record_fired(&self, now_secs: u64) {
-        if let Err(e) = self.db.set_meta(&self.key, &now_secs.to_string()) {
+    pub(crate) async fn record_fired(&self, now_secs: u64) {
+        if let Err(e) = self.db.set_meta(&self.key, &now_secs.to_string()).await {
             tracing::warn!("heartbeat cooldowns: failed to persist '{}': {e}", self.key);
         }
     }
@@ -85,45 +85,50 @@ pub(crate) fn meta_key_for(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
-    fn db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("open in-memory"))
-            .expect("init db")
+    async fn db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn cooldown_is_ready_when_never_fired() {
-        let db = db();
+    #[tokio::test]
+    async fn cooldown_is_ready_when_never_fired() {
+        let db = db().await;
         let table = CooldownTable::new(&db);
         let cd = table.for_augmenter("test_aug", 60);
-        assert!(cd.is_ready(1_000), "never-fired cooldown must be ready");
+        assert!(
+            cd.is_ready(1_000).await,
+            "never-fired cooldown must be ready"
+        );
     }
 
-    #[test]
-    fn cooldown_blocks_within_window_and_releases_after() {
-        let db = db();
+    #[tokio::test]
+    async fn cooldown_blocks_within_window_and_releases_after() {
+        let db = db().await;
         let table = CooldownTable::new(&db);
         let cd = table.for_augmenter("test_aug", 100);
 
-        cd.record_fired(1_000);
-        assert!(!cd.is_ready(1_050), "still inside cooldown window");
-        assert!(cd.is_ready(1_100), "exactly at cooldown boundary releases");
-        assert!(cd.is_ready(1_200), "well past cooldown window");
+        cd.record_fired(1_000).await;
+        assert!(!cd.is_ready(1_050).await, "still inside cooldown window");
+        assert!(
+            cd.is_ready(1_100).await,
+            "exactly at cooldown boundary releases"
+        );
+        assert!(cd.is_ready(1_200).await, "well past cooldown window");
     }
 
-    #[test]
-    fn cooldown_skips_when_meta_table_unreadable() {
+    #[tokio::test]
+    async fn cooldown_skips_when_meta_table_unreadable() {
         // Drop the meta table so reads fail — we must NOT treat that as
         // "never fired" (which would spam the user); we must skip.
-        let db = db();
+        let db = db().await;
         db.conn()
             .execute_batch("DROP TABLE IF EXISTS meta")
+            .await
             .expect("drop meta");
         let table = CooldownTable::new(&db);
         let cd = table.for_augmenter("test_aug", 60);
         assert!(
-            !cd.is_ready(1_000),
+            !cd.is_ready(1_000).await,
             "DB read failure must fail-closed (do not fire)"
         );
     }

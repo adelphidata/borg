@@ -172,8 +172,8 @@ impl SessionHost {
     }
 
     /// Start a fresh agent session in this host.
-    pub fn new_agent_session(&self) -> Result<String> {
-        self.inner.backend.new_agent_session()
+    pub async fn new_agent_session(&self) -> Result<String> {
+        self.inner.backend.new_agent_session().await
     }
 
     /// Load an existing agent session in this host.
@@ -195,8 +195,8 @@ impl SessionHost {
     /// history. Used by the daemon to bridge proactive deliveries
     /// (heartbeats) into the same session the user is replying in,
     /// so the agent has the context for follow-up turns.
-    pub fn append_assistant_message(&self, text: &str) -> Result<()> {
-        self.inner.backend.append_assistant_message(text)
+    pub async fn append_assistant_message(&self, text: &str) -> Result<()> {
+        self.inner.backend.append_assistant_message(text).await
     }
 
     /// Fork the active agent session at its last message. Forwards to the
@@ -510,7 +510,7 @@ mod tests {
             Ok(())
         }
 
-        fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
+        async fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
             self.append_calls.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -916,8 +916,10 @@ mod tests {
         let host = SessionHost::new(backend);
 
         host.append_assistant_message("[heartbeat] 2 task runs failed")
+            .await
             .expect("append must succeed");
         host.append_assistant_message("follow-up text")
+            .await
             .expect("append must succeed");
 
         let recorded = append_calls.lock().unwrap();

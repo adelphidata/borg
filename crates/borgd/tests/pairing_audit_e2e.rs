@@ -12,25 +12,23 @@
 //! The test stands up the daemon's pairing components in-process (no real
 //! gRPC server / no spawning `borgd`) so it runs cheaply in CI.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use borgd::pairing::device::{
     client as pair_client, mint_pairing_code, BootstrapListener, BootstrapState,
 };
 use cortex::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
 use identity::{ca::generate_root_ca, MemoryKekStore};
-use rusqlite::Connection;
 
 const PAIR_INTENT: &str = "device";
 
-fn shared_db() -> Arc<Mutex<Database>> {
-    Arc::new(Mutex::new(
-        Database::from_connection(Connection::open_in_memory().expect("db")).expect("init"),
-    ))
+async fn shared_db() -> Arc<Mutex<Database>> {
+    Arc::new(Mutex::new(Database::test_db().await))
 }
 
-fn make_state() -> BootstrapState {
-    let db = shared_db();
+async fn make_state() -> BootstrapState {
+    let db = shared_db().await;
     let _kek = MemoryKekStore::new();
     let ca = generate_root_ca("borg-test-ca").expect("ca");
     let audit = AuditWriter::new(db.clone());
@@ -54,11 +52,12 @@ async fn wait_for_socket(p: &std::path::Path) {
 
 #[tokio::test]
 async fn full_pair_then_revoke_then_audit_verify_round_trip() {
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
 
@@ -82,8 +81,9 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     let events = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_audit_events()
+        .await
         .expect("audit");
     let kinds: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
     assert!(
@@ -99,8 +99,9 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     let devices = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_paired_devices()
+        .await
         .expect("list");
     assert_eq!(devices.len(), 1);
     let fp = devices[0].fingerprint.clone();
@@ -108,38 +109,43 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
 
     // 3. Revoke the device.
     {
-        let g = state.db.lock().expect("lock");
-        g.revoke_paired_device(&fp, Some("test")).expect("revoke");
+        let g = state.db.lock().await;
+        g.revoke_paired_device(&fp, Some("test"))
+            .await
+            .expect("revoke");
     }
     assert!(state
         .db
         .lock()
-        .expect("lock")
+        .await
         .is_fingerprint_revoked(&fp)
+        .await
         .expect("query"));
     assert!(state
         .db
         .lock()
-        .expect("lock")
+        .await
         .find_active_paired_device(&fp)
+        .await
         .expect("query")
         .is_none());
 
     // 4. Audit chain still verifies clean.
-    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+    assert_eq!(state.audit.verify().await, AuditChainOutcome::Ok);
 
     // 5. Tamper with one event; verify reports the right seq.
     let target_seq = events.iter().last().map(|e| e.seq).expect("non-empty");
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = '{\"tampered\":true}' WHERE seq = ?1",
-                rusqlite::params![target_seq],
+                turso::params!(target_seq),
             )
+            .await
             .expect("tamper");
     }
-    match state.audit.verify() {
+    match state.audit.verify().await {
         AuditChainOutcome::Tampered { seq } => assert_eq!(seq, target_seq),
         other => panic!("expected Tampered, got {other:?}"),
     }
@@ -149,10 +155,11 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
 
 #[tokio::test]
 async fn wrong_code_is_denied_no_cert_issued_chain_intact() {
-    let state = make_state();
+    let state = make_state().await;
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code("REAL-CODE", PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -172,8 +179,9 @@ async fn wrong_code_is_denied_no_cert_issued_chain_intact() {
     let events = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_audit_events()
+        .await
         .expect("list");
     assert!(events
         .iter()
@@ -181,7 +189,7 @@ async fn wrong_code_is_denied_no_cert_issued_chain_intact() {
     assert!(events
         .iter()
         .all(|e| e.event_type != audit_events::CERT_ISSUED));
-    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+    assert_eq!(state.audit.verify().await, AuditChainOutcome::Ok);
 
     server.abort();
 }
@@ -193,12 +201,14 @@ async fn expired_pairing_code_through_bootstrap_listener_is_denied() {
     // moves the check or short-circuits it would let a stale code from a
     // previous pairing attempt be honored. Existing unit test covers the
     // SQL path; this one drives the same behavior through the listener.
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         // 1-second TTL. Stale before the client even connects.
-        g.create_pairing_code(&code, PAIR_INTENT, 1).expect("mint");
+        g.create_pairing_code(&code, PAIR_INTENT, 1)
+            .await
+            .expect("mint");
     }
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -219,8 +229,9 @@ async fn expired_pairing_code_through_bootstrap_listener_is_denied() {
     let events = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_audit_events()
+        .await
         .expect("list");
     assert!(
         events
@@ -232,12 +243,12 @@ async fn expired_pairing_code_through_bootstrap_listener_is_denied() {
     assert!(events
         .iter()
         .all(|e| e.event_type != audit_events::CERT_ISSUED));
-    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+    assert_eq!(state.audit.verify().await, AuditChainOutcome::Ok);
 
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
     // Real failure mode: the verifier loads `paired_devices` by fingerprint
     // and only consults `revoked_fingerprints` if the row still exists.
@@ -247,11 +258,12 @@ async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
     use borgd::auth::{build_verifier, VerifierError};
     use cortex::config::VerifierKind;
 
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -271,22 +283,26 @@ async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
     let fp = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_paired_devices()
+        .await
         .expect("list")[0]
         .fingerprint
         .clone();
 
     // Pre-revocation: verifier accepts.
-    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None).expect("build verifier");
+    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None)
+        .await
+        .expect("build verifier");
     assert!(v.verify(&fp, None).is_ok(), "fresh paired device verifies");
 
     // Revoke and confirm verifier now blocks.
     state
         .db
         .lock()
-        .expect("lock")
+        .await
         .revoke_paired_device(&fp, Some("compromised"))
+        .await
         .expect("revoke");
     match v.verify(&fp, None) {
         Err(VerifierError::Revoked(got)) => assert_eq!(got, fp),
@@ -296,7 +312,7 @@ async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
     // TOFU pin: after Alice pairs with FP1, an attacker presenting FP2
     // (even under Alice's principal label) must be rejected. The verifier's
@@ -305,11 +321,12 @@ async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
     use borgd::auth::{build_verifier, VerifierError};
     use cortex::config::VerifierKind;
 
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -327,7 +344,9 @@ async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
         .await
         .expect("pair");
 
-    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None).expect("build verifier");
+    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None)
+        .await
+        .expect("build verifier");
     match v.verify("fp-attacker-not-paired", None) {
         Err(VerifierError::UnknownDevice(fp)) => {
             assert_eq!(fp, "fp-attacker-not-paired")
@@ -338,7 +357,7 @@ async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn near_expiry_paired_device_reports_renewal_due_via_db_lookup() {
     // Real failure mode: the renewal hint reads `not_after` from
     // `internal_ca_certs` joined on `paired_devices.cert_serial`. A typo
@@ -348,22 +367,26 @@ async fn near_expiry_paired_device_reports_renewal_due_via_db_lookup() {
     // verifier helper.
     use borgd::auth::verifier::{near_expiry, RENEWAL_WINDOW_SECS};
 
-    let state = make_state();
+    let state = make_state().await;
     let now = chrono::Utc::now().timestamp();
     let near = now + RENEWAL_WINDOW_SECS / 2;
     let far = now + RENEWAL_WINDOW_SECS * 4;
 
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         let s_near = g
             .insert_internal_cert("client", "PEM-NEAR", "fp-near", "alice", 0, near)
+            .await
             .expect("cert");
         g.insert_paired_device("fp-near", "alice", "{}", "alice", s_near)
+            .await
             .expect("pair");
         let s_far = g
             .insert_internal_cert("client", "PEM-FAR", "fp-far", "bob", 0, far)
+            .await
             .expect("cert");
         g.insert_paired_device("fp-far", "bob", "{}", "bob", s_far)
+            .await
             .expect("pair");
     }
 
@@ -373,11 +396,12 @@ async fn near_expiry_paired_device_reports_renewal_due_via_db_lookup() {
 
 #[tokio::test]
 async fn replayed_code_is_rejected_after_first_use() {
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -400,8 +424,9 @@ async fn replayed_code_is_rejected_after_first_use() {
     let devices = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_paired_devices()
+        .await
         .expect("list");
     assert_eq!(devices.len(), 1, "only one device should be paired");
 
@@ -416,14 +441,15 @@ async fn rate_limit_blocks_listener_with_pairing_denied_audit() {
     // `PAIRING_DENIED` audit event with reason `RateLimited` instead of
     // letting the code be consumed. A regression that ignored the
     // RateLimited variant would silently let a 6th attempt succeed.
-    let state = make_state();
+    let state = make_state().await;
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
         for _ in 0..5 {
-            g.bump_pairing_attempts(&code).expect("bump");
+            g.bump_pairing_attempts(&code).await.expect("bump");
         }
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -443,8 +469,9 @@ async fn rate_limit_blocks_listener_with_pairing_denied_audit() {
     let events = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_audit_events()
+        .await
         .expect("list");
     let denied = events
         .iter()
@@ -459,11 +486,12 @@ async fn rate_limit_blocks_listener_with_pairing_denied_audit() {
     assert!(state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_paired_devices()
+        .await
         .expect("list")
         .is_empty());
-    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+    assert_eq!(state.audit.verify().await, AuditChainOutcome::Ok);
 
     server.abort();
 }
@@ -482,14 +510,15 @@ async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
     use borgd::pki_grpc::PkiSvc;
     use protocols::pki::{pki_server::Pki, RenewCertRequest};
 
-    let state = make_state();
+    let state = make_state().await;
 
     // Pair an "alice" device end-to-end first so we have a real cert + DB
     // rows to renew against.
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -510,8 +539,9 @@ async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
     let old_fp = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_paired_devices()
+        .await
         .expect("list")[0]
         .fingerprint
         .clone();
@@ -539,16 +569,17 @@ async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
     assert_ne!(new_fp, old_fp, "renewal must mint a fresh fingerprint");
 
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         // New fingerprint is the active paired device.
         let active = g
             .find_active_paired_device(&new_fp)
+            .await
             .expect("query")
             .expect("new fp must be paired");
         assert_eq!(active.device_label, "alice-laptop");
         // Old fingerprint is in the revoked list.
         assert!(
-            g.is_fingerprint_revoked(&old_fp).expect("query"),
+            g.is_fingerprint_revoked(&old_fp).await.expect("query"),
             "old fingerprint must be revoked after renewal",
         );
     }
@@ -557,8 +588,9 @@ async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
     let events = state
         .db
         .lock()
-        .expect("lock")
+        .await
         .list_audit_events()
+        .await
         .expect("list");
     let renewed = events
         .iter()
@@ -569,7 +601,7 @@ async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
         "payload must reference both fingerprints; got {}",
         renewed.event_json,
     );
-    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+    assert_eq!(state.audit.verify().await, AuditChainOutcome::Ok);
 }
 
 #[tokio::test]
@@ -582,13 +614,14 @@ async fn verify_audit_chain_grpc_reports_tampered_seq() {
     use borgd::pki_grpc::PkiSvc;
     use protocols::pki::{pki_server::Pki, PkiEmpty};
 
-    let state = make_state();
+    let state = make_state().await;
 
     // Pair once so the chain has more than one event.
     let code = mint_pairing_code();
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .await
             .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -623,24 +656,25 @@ async fn verify_audit_chain_grpc_reports_tampered_seq() {
     assert_eq!(resp.tampered_seq, -1);
 
     // Tamper with a non-final row. Pick a non-tombstoned row deterministically.
-    let target_seq: i64 = state
-        .db
-        .lock()
-        .expect("lock")
-        .conn()
-        .query_row(
-            "SELECT seq FROM audit_log_chain ORDER BY seq ASC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .expect("read seq");
+    let target_seq: i64 = {
+        let g = state.db.lock().await;
+        let mut stmt = g
+            .conn()
+            .prepare("SELECT seq FROM audit_log_chain ORDER BY seq ASC LIMIT 1")
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query(()).await.expect("query");
+        let row = rows.next().await.expect("next").expect("row");
+        row.get::<i64>(0).expect("seq col")
+    };
     {
-        let g = state.db.lock().expect("lock");
+        let g = state.db.lock().await;
         g.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = '{\"hacked\":true}' WHERE seq = ?1",
-                rusqlite::params![target_seq],
+                turso::params!(target_seq),
             )
+            .await
             .expect("tamper");
     }
 

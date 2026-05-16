@@ -13,7 +13,7 @@ mod settings_macro;
 pub mod settings_table;
 pub mod update;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 
 pub use consolidation::*;

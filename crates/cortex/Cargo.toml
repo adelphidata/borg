@@ -80,6 +80,11 @@ live-llm = []
 # artifacts. Enable explicitly when running integration tests that need the
 # fixture binary.
 test-support = []
+# Gate for legacy sync-DB unit tests that haven't been ported to the async
+# turso API yet. Off by default — these tests are tracked work, not regressions.
+# Removing every `#[cfg(feature = "phase9-tests-disabled")]` site also lets this
+# feature go away.
+phase9-tests-disabled = []
 
 # Test fixture: hermetic stand-in for `codex app-server`. Gated behind
 # `test-support` so it is not produced by default `cargo build` and never

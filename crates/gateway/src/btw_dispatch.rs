@@ -74,8 +74,8 @@ pub fn maybe_prefix_btw(text: &str, response_context: &serde_json::Value) -> Str
 /// opened, or the session has no messages — `run_btw` works fine with an empty
 /// snapshot, and a missing snapshot must not turn into a hard failure on the
 /// user-facing side question.
-pub fn load_channel_snapshot(channel_name: &str, sender_id: &str) -> Vec<Message> {
-    let db = match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+pub async fn load_channel_snapshot(channel_name: &str, sender_id: &str) -> Vec<Message> {
+    let db = match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!("/btw: failed to open DB for snapshot: {e:#}");
@@ -84,7 +84,7 @@ pub fn load_channel_snapshot(channel_name: &str, sender_id: &str) -> Vec<Message
     };
 
     // We only want the existing session — never create a new one for /btw.
-    let session_id = match db.lookup_channel_session(channel_name, sender_id) {
+    let session_id = match db.lookup_channel_session(channel_name, sender_id).await {
         Ok(Some(id)) => id,
         Ok(None) => return Vec::new(),
         Err(e) => {
@@ -93,7 +93,7 @@ pub fn load_channel_snapshot(channel_name: &str, sender_id: &str) -> Vec<Message
         }
     };
 
-    match db.load_session_messages(&session_id) {
+    match db.load_session_messages(&session_id).await {
         Ok(rows) => rows.iter().filter_map(message_row_to_message).collect(),
         Err(e) => {
             tracing::warn!("/btw: failed to load session messages: {e:#}");
@@ -163,7 +163,7 @@ where
     }
 
     let channel_name = channel.names()[0].to_string();
-    let snapshot = load_channel_snapshot(&channel_name, &inbound.sender_id);
+    let snapshot = load_channel_snapshot(&channel_name, &inbound.sender_id).await;
 
     let response_text = match run(question.to_string(), snapshot).await {
         Ok(text) if !text.trim().is_empty() => text,

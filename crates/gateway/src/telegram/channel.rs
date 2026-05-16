@@ -129,7 +129,7 @@ impl NativeChannel for TelegramChannel {
         .await
     }
 
-    fn prepare_response_context(
+    async fn prepare_response_context(
         &self,
         response_context: &mut serde_json::Value,
         db: Option<&Database>,
@@ -139,12 +139,15 @@ impl NativeChannel for TelegramChannel {
             return Ok(());
         };
         let mut ctx: TelegramResponseContext = serde_json::from_value(response_context.clone())?;
-        ctx.voice_reply_mode = Some(crate::voice::resolve_voice_reply_mode(
-            db,
-            config,
-            "telegram",
-            &ctx.chat_id.to_string(),
-        )?);
+        ctx.voice_reply_mode = Some(
+            crate::voice::resolve_voice_reply_mode(
+                db,
+                config,
+                "telegram",
+                &ctx.chat_id.to_string(),
+            )
+            .await?,
+        );
         *response_context = serde_json::to_value(ctx)?;
         Ok(())
     }
@@ -217,14 +220,14 @@ mod tests {
         assert!(back.voice_reply_mode.is_none());
     }
 
-    #[test]
-    fn prepare_response_context_reads_mode_from_provided_db() {
-        let db =
-            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+    #[tokio::test]
+    async fn prepare_response_context_reads_mode_from_provided_db() {
+        let db = Database::test_db().await;
         db.set_setting(
             &crate::voice::voice_mode_setting_key("telegram", "42"),
             crate::voice::VoiceReplyMode::VoiceOnly.as_str(),
         )
+        .await
         .unwrap();
         let channel = TelegramChannel {
             client: Arc::new(TelegramClient::new("token").unwrap()),
@@ -245,6 +248,7 @@ mod tests {
 
         channel
             .prepare_response_context(&mut response_context, Some(&db), &Config::default())
+            .await
             .unwrap();
 
         let back: TelegramResponseContext = serde_json::from_value(response_context).unwrap();

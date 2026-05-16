@@ -12,7 +12,9 @@ use protocols::session::agent_event::Kind;
 use protocols::session::session_client::SessionClient;
 use protocols::session::session_server::SessionServer;
 use protocols::session::{OpenRequest, SendRequest, StreamRequest};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -54,18 +56,20 @@ impl SessionBackend for DelayedDeltas {
 struct OneShotFactory(Mutex<Option<Arc<dyn SessionBackend>>>);
 
 impl SessionFactory for OneShotFactory {
-    fn open(
-        &self,
-        _resume: Option<&str>,
+    fn open<'a>(
+        &'a self,
+        _resume: Option<&'a str>,
         _execution_context: Option<cortex::execution_context::ExecutionContext>,
-    ) -> Result<SessionHost, anyhow::Error> {
-        let b = self
-            .0
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("factory exhausted"))?;
-        Ok(SessionHost::new(b))
+    ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let b = self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("factory exhausted"))?;
+            Ok(SessionHost::new(b))
+        })
     }
 }
 

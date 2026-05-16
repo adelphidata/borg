@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::params;
+use turso::params;
 
 #[test]
 fn log_and_query_token_usage() {

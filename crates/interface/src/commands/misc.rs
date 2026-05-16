@@ -31,14 +31,14 @@ pub(crate) enum ServiceAction {
 
 /// Dispatch for `borg migrate ...` — either the interactive TUI or a direct
 /// migration from the named source.
-pub(crate) fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Result<()> {
+pub(crate) async fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Result<()> {
     match action {
         None => crate::migrate_tui::run(),
         Some(MigrateSubcommand::Hermes) => {
-            run_migrate_direct(cortex::migrate::MigrationSource::Hermes)
+            run_migrate_direct(cortex::migrate::MigrationSource::Hermes).await
         }
         Some(MigrateSubcommand::Claw) => {
-            run_migrate_direct(cortex::migrate::MigrationSource::OpenClaw)
+            run_migrate_direct(cortex::migrate::MigrationSource::OpenClaw).await
         }
     }
 }
@@ -53,9 +53,11 @@ pub(crate) async fn dispatch_service(action: ServiceAction) -> Result<()> {
     }
 }
 
-pub(crate) fn run_doctor() -> Result<()> {
-    let config = cortex::config::Config::load_from_db().unwrap_or_default();
-    let report = cortex::doctor::run_diagnostics(&config);
+pub(crate) async fn run_doctor() -> Result<()> {
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
+    let report = cortex::doctor::run_diagnostics(&config).await;
     println!("{}", report.format());
     let (_pass, _warn, fail) = report.counts();
     if fail > 0 {
@@ -128,7 +130,7 @@ pub(crate) async fn run_poke() -> Result<()> {
         }
     }
 
-    let config = cortex::config::Config::load_from_db()?;
+    let config = cortex::config::Config::load_from_db().await?;
     let url = format!(
         "http://{}:{}/internal/poke",
         config.gateway.host, config.gateway.port
@@ -188,7 +190,7 @@ pub(crate) fn format_dream_report(report: &protocols::admin::DreamReport) -> Str
 }
 
 pub(crate) async fn run_cancel(session: Option<String>) -> Result<()> {
-    let config = cortex::config::Config::load_from_db()?;
+    let config = cortex::config::Config::load_from_db().await?;
     let url = format!(
         "http://{}:{}/internal/cancel",
         config.gateway.host, config.gateway.port
@@ -223,7 +225,7 @@ pub(crate) async fn run_cancel(session: Option<String>) -> Result<()> {
 }
 
 pub(crate) async fn run_away(message: Option<String>) -> Result<()> {
-    let config = cortex::config::Config::load_from_db()?;
+    let config = cortex::config::Config::load_from_db().await?;
     let url = format!(
         "http://{}:{}/internal/away",
         config.gateway.host, config.gateway.port
@@ -253,7 +255,7 @@ pub(crate) async fn run_away(message: Option<String>) -> Result<()> {
 }
 
 pub(crate) async fn run_available() -> Result<()> {
-    let config = cortex::config::Config::load_from_db()?;
+    let config = cortex::config::Config::load_from_db().await?;
     let url = format!(
         "http://{}:{}/internal/available",
         config.gateway.host, config.gateway.port
@@ -274,7 +276,7 @@ pub(crate) async fn run_available() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_migrate_direct(source: cortex::migrate::MigrationSource) -> Result<()> {
+pub(crate) async fn run_migrate_direct(source: cortex::migrate::MigrationSource) -> Result<()> {
     use cortex::migrate::{self, MigrationCategories};
 
     if !source.is_installed() {
@@ -287,7 +289,9 @@ pub(crate) fn run_migrate_direct(source: cortex::migrate::MigrationSource) -> Re
 
     let categories = MigrationCategories::default();
     let data = migrate::parse_source(source, &categories)?;
-    let config = cortex::config::Config::load_from_db().unwrap_or_default();
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
     let borg_dir = cortex::config::Config::data_dir()?;
     let plan = migrate::plan::build_plan(source, &data, &config, &borg_dir);
 
@@ -310,7 +314,7 @@ pub(crate) fn run_migrate_direct(source: cortex::migrate::MigrationSource) -> Re
         return Ok(());
     }
 
-    let result = migrate::apply::apply_plan(&plan, &data, &borg_dir)?;
+    let result = migrate::apply::apply_plan(&plan, &data, &borg_dir).await?;
     eprintln!("Migration complete:");
     if result.config_changes_applied > 0 {
         eprintln!(

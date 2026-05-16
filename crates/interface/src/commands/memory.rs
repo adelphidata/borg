@@ -52,45 +52,45 @@ pub(crate) enum MemoryAction {
     },
 }
 
-pub(crate) fn dispatch_memory(action: MemoryAction) -> Result<()> {
+pub(crate) async fn dispatch_memory(action: MemoryAction) -> Result<()> {
     match action {
-        MemoryAction::List { scope } => run_list(&scope),
-        MemoryAction::Read { scope, name } => run_read(&scope, &name),
+        MemoryAction::List { scope } => run_list(&scope).await,
+        MemoryAction::Read { scope, name } => run_read(&scope, &name).await,
         MemoryAction::Write {
             scope,
             name,
             content,
             file,
             append,
-        } => run_write(&scope, &name, content, file, append),
+        } => run_write(&scope, &name, content, file, append).await,
         MemoryAction::Search {
             query,
             scope,
             top_k,
-        } => run_search(&query, &scope, top_k),
-        MemoryAction::Delete { scope, name } => run_delete(&scope, &name),
+        } => run_search(&query, &scope, top_k).await,
+        MemoryAction::Delete { scope, name } => run_delete(&scope, &name).await,
     }
 }
 
-fn run_list(scope: &str) -> Result<()> {
+async fn run_list(scope: &str) -> Result<()> {
     if scope == "all" {
-        let db = cortex::db::Database::open_readonly()?;
-        let scopes = db.list_memory_scopes()?;
+        let db = cortex::db::Database::open_readonly().await?;
+        let scopes = db.list_memory_scopes().await?;
         if scopes.is_empty() {
             println!("No memory entries.");
             return Ok(());
         }
         for s in scopes {
-            print_scope_listing(&s)?;
+            print_scope_listing(&s).await?;
         }
     } else {
-        print_scope_listing(scope)?;
+        print_scope_listing(scope).await?;
     }
     Ok(())
 }
 
-fn print_scope_listing(scope: &str) -> Result<()> {
-    let entries = cortex::memory::list_memory_entries(scope)?;
+async fn print_scope_listing(scope: &str) -> Result<()> {
+    let entries = cortex::memory::list_memory_entries(scope).await?;
     println!("=== {scope} ({} entries) ===", entries.len());
     if entries.is_empty() {
         return Ok(());
@@ -105,15 +105,16 @@ fn print_scope_listing(scope: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_read(scope: &str, name: &str) -> Result<()> {
+async fn run_read(scope: &str, name: &str) -> Result<()> {
     let name = name.strip_suffix(".md").unwrap_or(name);
-    let content = cortex::memory::read_memory_db(name, scope)?
+    let content = cortex::memory::read_memory_db(name, scope)
+        .await?
         .ok_or_else(|| anyhow!("memory entry '{scope}/{name}' not found"))?;
     print!("{content}");
     Ok(())
 }
 
-fn run_write(
+async fn run_write(
     scope: &str,
     name: &str,
     content: Option<String>,
@@ -127,7 +128,7 @@ fn run_write(
             // Reuse the same blocked-paths filter that gates fs_read/fs_write
             // so the agent can't shell out to `borg memory write --file ...`
             // and exfiltrate `.ssh/`, `.env`, etc. into long-term memory.
-            let config = cortex::config::Config::load_from_db()?;
+            let config = cortex::config::Config::load_from_db().await?;
             if cortex::tool_handlers::filesystem::is_blocked_path(
                 &p,
                 &config.security.blocked_paths,
@@ -148,14 +149,14 @@ fn run_write(
     } else {
         cortex::memory::WriteMode::Overwrite
     };
-    let msg = cortex::memory::write_memory_db(name, &body, mode, scope)?;
+    let msg = cortex::memory::write_memory_db(name, &body, mode, scope).await?;
     println!("{msg}");
     Ok(())
 }
 
-fn run_search(query: &str, scope: &str, top_k: usize) -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let hits = db.fts_search(scope, query, top_k)?;
+async fn run_search(query: &str, scope: &str, top_k: usize) -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let hits = db.fts_search(scope, query, top_k).await?;
     if hits.is_empty() {
         println!("No matches in scope '{scope}'.");
         return Ok(());
@@ -177,9 +178,9 @@ fn run_search(query: &str, scope: &str, top_k: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_delete(scope: &str, name: &str) -> Result<()> {
+async fn run_delete(scope: &str, name: &str) -> Result<()> {
     let name = name.strip_suffix(".md").unwrap_or(name);
-    let removed = cortex::memory::delete_memory_db(name, scope)?;
+    let removed = cortex::memory::delete_memory_db(name, scope).await?;
     if removed {
         println!("Deleted {scope}/{name}");
     } else {
@@ -192,13 +193,15 @@ fn run_delete(scope: &str, name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn write_without_content_or_file_errors() {
+    #[tokio::test]
+    async fn write_without_content_or_file_errors() {
         // Both `--content` and `--file` omitted should fail loud rather than
         // silently writing an empty memory entry. clap allows both to be None
         // (they're individually optional); the runtime check is the only
         // guard, so we pin it.
-        let err = run_write("global", "test-entry", None, None, false).unwrap_err();
+        let err = run_write("global", "test-entry", None, None, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("--content"));
     }
 }

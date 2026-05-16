@@ -46,11 +46,20 @@ pub fn auth_interceptor(
             .as_ref()
             .and_then(|cs| cs.first().map(|c| c.as_ref().to_vec()))
             .ok_or_else(|| {
-                audit.emit(
-                    cortex::db::audit_events::GRPC_AUTH_FAILURE,
-                    "system",
-                    &json!({"reason": "no_peer_cert"}),
-                );
+                // Interceptor closure is sync; audit emit is async post-turso
+                // migration. Schedule the write on the current runtime so the
+                // auth-failure row still lands in the hash chain. Failing the
+                // request itself stays synchronous.
+                let audit = audit.clone();
+                tokio::spawn(async move {
+                    audit
+                        .emit(
+                            cortex::db::audit_events::GRPC_AUTH_FAILURE,
+                            "system",
+                            &json!({"reason": "no_peer_cert"}),
+                        )
+                        .await;
+                });
                 Status::unauthenticated("no client certificate presented")
             })?;
 
@@ -67,18 +76,29 @@ pub fn auth_interceptor(
                 Ok(req)
             }
             Err(e) => {
-                audit.emit(
-                    cortex::db::audit_events::GRPC_AUTH_FAILURE,
-                    "system",
-                    &json!({"reason": e.to_string(), "fingerprint": fingerprint}),
-                );
-                if let VerifierError::TofuMismatch { .. } = e {
-                    audit.emit(
-                        cortex::db::audit_events::TOFU_MISMATCH,
-                        "system",
-                        &json!({"fingerprint": fingerprint}),
-                    );
-                }
+                let audit_clone = audit.clone();
+                let reason = e.to_string();
+                let fp_failure = fingerprint.clone();
+                let fp_tofu = fingerprint.clone();
+                let is_tofu = matches!(e, VerifierError::TofuMismatch { .. });
+                tokio::spawn(async move {
+                    audit_clone
+                        .emit(
+                            cortex::db::audit_events::GRPC_AUTH_FAILURE,
+                            "system",
+                            &json!({"reason": reason, "fingerprint": fp_failure}),
+                        )
+                        .await;
+                    if is_tofu {
+                        audit_clone
+                            .emit(
+                                cortex::db::audit_events::TOFU_MISMATCH,
+                                "system",
+                                &json!({"fingerprint": fp_tofu}),
+                            )
+                            .await;
+                    }
+                });
                 Err(Status::unauthenticated(e.to_string()))
             }
         }

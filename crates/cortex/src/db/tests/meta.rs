@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::params;
+use turso::params;
 
 #[test]
 fn meta_get_set() {

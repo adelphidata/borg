@@ -41,28 +41,31 @@ struct DaemonSessionFactory {
 }
 
 impl SessionFactory for DaemonSessionFactory {
-    fn open(
-        &self,
-        resume_id: Option<&str>,
+    fn open<'a>(
+        &'a self,
+        resume_id: Option<&'a str>,
         execution_context: Option<cortex::execution_context::ExecutionContext>,
-    ) -> Result<SessionHost> {
-        let config = self.config_rx.borrow().clone();
-        // Inject the daemon-wide subprocess registry into the session's
-        // ExecutionContext so every tool handler that spawns a child can
-        // register it. Falls through to a registry-less context when the
-        // request didn't carry workspace coordinates.
-        let execution_context = execution_context
-            .map(|ctx| ctx.with_process_registry(Some(self.process_registry.clone())));
-        let backend = AgentBackend::new(
-            config,
-            BorgMetrics::noop(),
-            resume_id,
-            Some(self.config_rx.clone()),
-            Some(self.cost_event_sink.clone()),
-            execution_context,
-            self.goal_bus.clone(),
-        )?;
-        Ok(SessionHost::new(backend))
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SessionHost>> + Send + 'a>> {
+        Box::pin(async move {
+            let config = self.config_rx.borrow().clone();
+            // Inject the daemon-wide subprocess registry into the session's
+            // ExecutionContext so every tool handler that spawns a child can
+            // register it. Falls through to a registry-less context when the
+            // request didn't carry workspace coordinates.
+            let execution_context = execution_context
+                .map(|ctx| ctx.with_process_registry(Some(self.process_registry.clone())));
+            let backend = AgentBackend::new(
+                config,
+                BorgMetrics::noop(),
+                resume_id,
+                Some(self.config_rx.clone()),
+                Some(self.cost_event_sink.clone()),
+                execution_context,
+                self.goal_bus.clone(),
+            )
+            .await?;
+            Ok(SessionHost::new(backend))
+        })
     }
 }
 
@@ -120,7 +123,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     tracing::info!(socket = %socket_path.display(), "borgd listening on UDS");
 
-    let initial_core_config = CoreConfig::load_from_db().unwrap_or_default();
+    let initial_core_config = CoreConfig::load_from_db().await.unwrap_or_default();
     let config_watcher =
         ConfigWatcher::start(initial_core_config.clone()).context("start config watcher")?;
     let metrics = BorgMetrics::noop();
@@ -191,11 +194,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // (onboarding ran before host-timezone auto-detection landed), detect it
     // now so heartbeat quiet hours anchor to local time. Idempotent and
     // write-once — explicit user values are preserved.
-    if let Ok(db) = Database::open() {
-        match db.get_setting("user.timezone") {
+    if let Ok(db) = Database::open().await {
+        match db.get_setting("user.timezone").await {
             Ok(None) => {
                 if let Some(tz) = cortex::config::Config::detect_host_timezone() {
-                    if let Err(e) = db.set_setting("user.timezone", &tz) {
+                    if let Err(e) = db.set_setting("user.timezone", &tz).await {
                         tracing::warn!("borgd: failed to persist auto-detected timezone: {e}");
                     } else {
                         tracing::info!("borgd: auto-detected user.timezone = {tz}");
@@ -207,7 +210,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     }
 
-    let extras = match CoreConfig::load_from_db() {
+    let extras = match CoreConfig::load_from_db().await {
         Ok(core_config) => {
             let handles = orchestrator::start(
                 registry.clone(),
@@ -216,7 +219,8 @@ pub async fn run(cfg: Config) -> Result<()> {
                 config_watcher.subscribe(),
                 cost_event_sink.clone(),
                 goal_bus.clone(),
-            );
+            )
+            .await;
             grpc::AdminExtras {
                 heartbeat_bus: Some(handles.heartbeat_bus),
                 executor: Some(handles.executor),
@@ -248,25 +252,28 @@ pub async fn run(cfg: Config) -> Result<()> {
     // subsequent starts. We open a daemon-owned `Database` here and wrap it
     // in `Arc<Mutex>` so the AuditWriter and Pki service share the single
     // writer with the audit chain.
-    let db_for_pki = Database::open().context("opening DB for PKI bootstrap")?;
-    let pki_db = Arc::new(Mutex::new(db_for_pki));
+    let db_for_pki = Database::open()
+        .await
+        .context("opening DB for PKI bootstrap")?;
+    let pki_db = Arc::new(tokio::sync::Mutex::new(db_for_pki));
     let kek = {
         // Resolve KEK backend before locking pki_db for cert ops. The
         // factory probes the OS keychain on `Auto`, falls back to the
         // passphrase-encrypted file, and persists the resolved choice so
         // posture snapshots see a concrete `kek_backend` value.
-        let pki_cfg =
-            CoreConfig::load_from_db().context("loading config for KEK backend selection")?;
-        let g = pki_db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        build_kek_store(&cfg.borg_home, &pki_cfg, &g).context("build KEK store")?
+        let pki_cfg = CoreConfig::load_from_db()
+            .await
+            .context("loading config for KEK backend selection")?;
+        let g = pki_db.lock().await;
+        build_kek_store(&cfg.borg_home, &pki_cfg, &g)
+            .await
+            .context("build KEK store")?
     };
     let (ca_cert_pem, ca_key_pem) = {
-        let g = pki_db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ensure_root_ca(&g, kek.as_ref()).context("ensure root CA")?
+        let g = pki_db.lock().await;
+        ensure_root_ca(&g, kek.as_ref())
+            .await
+            .context("ensure root CA")?
     };
     // Derive the server-cert SAN from the bind address. Loopback (or no
     // `--listen`) gives `["localhost"]`; non-loopback requires the operator
@@ -275,10 +282,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     // startup instead of silently minting an unusable cert.
     let san_dns = derive_server_san(cfg.listen_tcp.as_deref()).context("derive server cert SAN")?;
     let (server_cert_pem, server_key_pem, _server_serial) = {
-        let g = pki_db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let g = pki_db.lock().await;
         ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
+            .await
             .context("ensure server cert")?
     };
     let server_tls_material = ServerCertMaterial {
@@ -301,16 +307,25 @@ pub async fn run(cfg: Config) -> Result<()> {
     // A spawned watcher reinstalls the policy whenever the setting flips
     // so /settings → toggle takes effect on the next message without a
     // daemon restart.
+    // `output_redaction::RedactionPolicy::from_db` expects an
+    // `Arc<std::sync::Mutex<Database>>` (its audit closure briefly snapshots
+    // the turso `Connection` under the sync lock and drops the guard before
+    // awaiting). Open a dedicated handle so we don't have to thread the
+    // wider `tokio::sync::Mutex<Database>` through that closure signature.
+    let redaction_db = Database::open()
+        .await
+        .context("opening DB for redaction policy")?;
+    let redaction_db_handle = Arc::new(Mutex::new(redaction_db));
     {
-        let core_cfg = CoreConfig::load_from_db().unwrap_or_default();
+        let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
         cortex::output_redaction::install_global(
             cortex::output_redaction::RedactionPolicy::from_db(
                 core_cfg.security.output_redaction,
-                pki_db.clone(),
+                redaction_db_handle.clone(),
             ),
         );
         let mut rx = config_watcher.subscribe();
-        let db_for_policy = pki_db.clone();
+        let db_for_policy = redaction_db_handle.clone();
         tokio::spawn(async move {
             let mut current = core_cfg.security.output_redaction;
             loop {
@@ -331,11 +346,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    audit.emit(
-        audit_events::DAEMON_START,
-        "system",
-        &json!({"pid": std::process::id()}),
-    );
+    audit
+        .emit(
+            audit_events::DAEMON_START,
+            "system",
+            &json!({"pid": std::process::id()}),
+        )
+        .await;
 
     // Wire shutdown-signal forwarding now that the audit writer is available.
     // `forward_signals_to` blocks on the first signal, emits DAEMON_STOP, and
@@ -348,15 +365,15 @@ pub async fn run(cfg: Config) -> Result<()> {
     // logged and do NOT block daemon startup — XP writes will fall back
     // to `Default × 1.00` with `FallbackReason::PostureUndetermined`.
     {
-        let g = pki_db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let core_cfg = CoreConfig::load_from_db().unwrap_or_default();
+        let g = pki_db.lock().await;
+        let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
         match cortex::evolution::security::maybe_emit_posture_change(
             &g,
             &core_cfg,
             cortex::evolution::security::PostureSource::DaemonStartReconcile,
-        ) {
+        )
+        .await
+        {
             Ok(cortex::evolution::security::EmitOutcome::Emitted {
                 state, previous, ..
             }) => {
@@ -432,10 +449,12 @@ pub async fn run(cfg: Config) -> Result<()> {
         // would silently downgrade `security.verifier` to its default, so
         // surface it instead.
         let verifier_kind = CoreConfig::load_from_db()
+            .await
             .context("load config for TCP listener verifier")?
             .security
             .verifier;
         let verifier = build_verifier(verifier_kind, pki_db.clone(), None)
+            .await
             .context("build verifier for TCP listener")?;
         let tls_cfg = build_server_tls_config(&server_tls_material)
             .context("build server TLS config for TCP listener")?;
@@ -510,7 +529,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// is still alive and the chain bookends `DAEMON_START` on every clean exit.
 async fn forward_signals_to(tx: broadcast::Sender<()>, audit: AuditWriter) {
     let reason = wait_for_shutdown_signal().await;
-    emit_daemon_stop(&audit, reason);
+    emit_daemon_stop(&audit, reason).await;
     // If all receivers were dropped (shutdown already in progress) the send
     // fails harmlessly — there's no one left to notify.
     let _ = tx.send(());
@@ -565,12 +584,14 @@ async fn wait_for_shutdown_signal() -> &'static str {
 
 /// Emit the `DAEMON_STOP` audit event. Pulled into its own function so the
 /// shutdown-side audit invariant is unit-testable without faking signals.
-pub(crate) fn emit_daemon_stop(audit: &AuditWriter, reason: &str) {
-    audit.emit(
-        audit_events::DAEMON_STOP,
-        "system",
-        &json!({"reason": reason, "pid": std::process::id()}),
-    );
+pub(crate) async fn emit_daemon_stop(audit: &AuditWriter, reason: &str) {
+    audit
+        .emit(
+            audit_events::DAEMON_STOP,
+            "system",
+            &json!({"reason": reason, "pid": std::process::id()}),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -578,36 +599,37 @@ mod tests {
     use super::{bind_uds, emit_daemon_stop, format_posture_transition};
     use cortex::db::{audit_events, AuditWriter, Database};
     use cortex::evolution::security::PostureState;
-    use rusqlite::Connection;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-    #[test]
-    fn emit_daemon_stop_appends_event_with_reason_to_audit_chain() {
+    #[tokio::test]
+    async fn emit_daemon_stop_appends_event_with_reason_to_audit_chain() {
         // Real failure mode: graceful shutdowns that don't bookend the
         // DAEMON_START row leave the audit chain ambiguous about whether the
         // daemon exited cleanly or was killed mid-write. Spec §"Hash-chained
         // audit log" mandates daemon start/stop events on by default.
-        let db =
-            Database::from_connection(Connection::open_in_memory().expect("db")).expect("init");
+        let db = Database::test_db().await;
         let writer = AuditWriter::new(Arc::new(Mutex::new(db)));
         // Seed a DAEMON_START so we can also confirm chain integrity post-stop.
-        writer.emit(
-            audit_events::DAEMON_START,
-            "system",
-            &serde_json::json!({"pid": 1}),
-        );
+        writer
+            .emit(
+                audit_events::DAEMON_START,
+                "system",
+                &serde_json::json!({"pid": 1}),
+            )
+            .await;
 
-        emit_daemon_stop(&writer, "sigterm");
+        emit_daemon_stop(&writer, "sigterm").await;
 
-        let outcome = writer.verify();
+        let outcome = writer.verify().await;
         assert!(
             matches!(outcome, cortex::db::AuditChainOutcome::Ok),
             "chain should still verify after stop, got {outcome:?}"
         );
         let dbref = writer.db();
-        let g = dbref.lock().expect("lock");
-        let events = g.list_audit_events().expect("list");
+        let g = dbref.lock().await;
+        let events = g.list_audit_events().await.expect("list");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, audit_events::DAEMON_START);
         assert_eq!(events[1].event_type, audit_events::DAEMON_STOP);

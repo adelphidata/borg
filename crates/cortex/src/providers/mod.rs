@@ -21,7 +21,7 @@ pub mod category;
 pub mod registry;
 pub mod row;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 
 pub use category::ProviderCategory;

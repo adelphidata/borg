@@ -35,32 +35,30 @@ pub(crate) enum WebhookAction {
 }
 
 /// Dispatch for `borg webhook …`.
-pub(crate) fn dispatch_webhook(action: Option<WebhookAction>) -> Result<()> {
+pub(crate) async fn dispatch_webhook(action: Option<WebhookAction>) -> Result<()> {
     match action {
         Some(WebhookAction::Create {
             name,
             sender,
             body,
             thread,
-        }) => run_create(&name, &sender, thread.as_deref(), &body),
-        Some(WebhookAction::List) | None => run_list(),
-        Some(WebhookAction::Revoke { name }) => run_revoke(&name),
+        }) => run_create(&name, &sender, thread.as_deref(), &body).await,
+        Some(WebhookAction::List) | None => run_list().await,
+        Some(WebhookAction::Revoke { name }) => run_revoke(&name).await,
     }
 }
 
-fn run_create(
+async fn run_create(
     name: &str,
     sender_path: &str,
     thread_path: Option<&str>,
     body_path: &str,
 ) -> Result<()> {
-    let resp = tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .create_webhook(name, sender_path, thread_path, body_path)
-            .await
-            .with_context(|| format!("creating webhook '{name}'"))
-    })?;
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    let resp = client
+        .create_webhook(name, sender_path, thread_path, body_path)
+        .await
+        .with_context(|| format!("creating webhook '{name}'"))?;
     println!(
         "Created webhook `{}` at /v1/webhook/{}",
         resp.name, resp.name
@@ -76,9 +74,9 @@ fn run_create(
     Ok(())
 }
 
-fn run_list() -> Result<()> {
-    let db = Database::open_readonly()?;
-    let rows = definitions::list(&db)?;
+async fn run_list() -> Result<()> {
+    let db = Database::open_readonly().await?;
+    let rows = definitions::list(&db).await?;
     if rows.is_empty() {
         println!("No webhook definitions.");
         return Ok(());
@@ -106,14 +104,12 @@ fn run_list() -> Result<()> {
     Ok(())
 }
 
-fn run_revoke(name: &str) -> Result<()> {
-    tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .revoke_webhook(name)
-            .await
-            .with_context(|| format!("revoking webhook '{name}'"))
-    })?;
+async fn run_revoke(name: &str) -> Result<()> {
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    client
+        .revoke_webhook(name)
+        .await
+        .with_context(|| format!("revoking webhook '{name}'"))?;
     println!("Revoked webhook `{name}`.");
     Ok(())
 }

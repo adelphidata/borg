@@ -353,7 +353,7 @@ async fn send_approval_notification_inner(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;

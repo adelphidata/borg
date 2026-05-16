@@ -22,25 +22,25 @@ pub(crate) enum SkillsAction {
     },
 }
 
-pub(crate) fn dispatch_skills(action: Option<SkillsAction>) -> Result<()> {
+pub(crate) async fn dispatch_skills(action: Option<SkillsAction>) -> Result<()> {
     match action {
-        None | Some(SkillsAction::List) => run_list(),
-        Some(SkillsAction::Show { name }) => run_show(&name),
-        Some(SkillsAction::Enable { name }) => run_set_enabled(&name, true),
-        Some(SkillsAction::Disable { name }) => run_set_enabled(&name, false),
+        None | Some(SkillsAction::List) => run_list().await,
+        Some(SkillsAction::Show { name }) => run_show(&name).await,
+        Some(SkillsAction::Enable { name }) => run_set_enabled(&name, true).await,
+        Some(SkillsAction::Disable { name }) => run_set_enabled(&name, false).await,
     }
 }
 
-fn load_skills() -> Result<Vec<cortex::skills::Skill>> {
+async fn load_skills() -> Result<Vec<cortex::skills::Skill>> {
     // Propagate DB-load errors instead of silently using defaults — toggling a
     // skill against the wrong baseline would let the operator believe a change
     // landed when the daemon's effective config is something else entirely.
-    let config = cortex::config::Config::load_from_db()?;
+    let config = cortex::config::Config::load_from_db().await?;
     cortex::skills::load_all_skills(&std::collections::HashMap::new(), &config.skills)
 }
 
-fn run_list() -> Result<()> {
-    let skills = load_skills()?;
+async fn run_list() -> Result<()> {
+    let skills = load_skills().await?;
     if skills.is_empty() {
         println!("No skills found.");
         return Ok(());
@@ -62,8 +62,8 @@ fn run_list() -> Result<()> {
     Ok(())
 }
 
-fn run_show(name: &str) -> Result<()> {
-    let skills = load_skills()?;
+async fn run_show(name: &str) -> Result<()> {
+    let skills = load_skills().await?;
     let skill = skills
         .into_iter()
         .find(|s| s.manifest.name == name)
@@ -72,9 +72,9 @@ fn run_show(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_set_enabled(name: &str, enabled: bool) -> Result<()> {
+async fn run_set_enabled(name: &str, enabled: bool) -> Result<()> {
     // Validate the skill exists so we don't silently write a key for a typo'd name.
-    let skills = load_skills()?;
+    let skills = load_skills().await?;
     if !skills.iter().any(|s| s.manifest.name == name) {
         return Err(anyhow!(
             "skill '{name}' not found — run `borg skills` to list known skills"
@@ -82,8 +82,8 @@ fn run_set_enabled(name: &str, enabled: bool) -> Result<()> {
     }
     let key = format!("skills.entries.{name}.enabled");
     let value = enabled.to_string();
-    let resolver = cortex::settings::SettingsResolver::load()?;
-    resolver.set(&key, &value)?;
+    let resolver = cortex::settings::SettingsResolver::load().await?;
+    resolver.set(&key, &value).await?;
     let status = if enabled { "enabled" } else { "disabled" };
     println!("{name}: {status}");
     Ok(())
@@ -93,14 +93,25 @@ fn run_set_enabled(name: &str, enabled: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn enable_unknown_skill_errors_without_writing() {
+    #[tokio::test]
+    async fn enable_unknown_skill_errors_without_writing() {
         // Regression: a typo'd skill name must not silently land a
         // `skills.entries.<typo>.enabled = true` row in the DB. The CLI is
         // reachable from `run_shell`, so a confused agent could otherwise
         // pollute the settings table with junk keys that ride forward forever.
-        let err = run_set_enabled("definitely-not-a-real-skill-xyz", true).unwrap_err();
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        // SAFETY: tests are single-threaded by default for env-var mutations
+        // here; this binding scope ends with the function.
+        unsafe {
+            std::env::set_var("BORG_HOME", tmp.path());
+        }
+        let err = run_set_enabled("definitely-not-a-real-skill-xyz", true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
+        unsafe {
+            std::env::remove_var("BORG_HOME");
+        }
         assert!(
             msg.contains("not found"),
             "expected 'not found' in error, got: {msg}"

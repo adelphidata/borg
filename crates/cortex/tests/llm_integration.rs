@@ -138,7 +138,7 @@ async fn text_only_response() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -171,7 +171,7 @@ async fn single_tool_call() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -209,7 +209,7 @@ async fn parallel_tool_calls() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -243,7 +243,7 @@ async fn usage_data_extracted() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -273,7 +273,7 @@ async fn rate_limit_429() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     let result = client.stream_chat(&user_message("hi"), None, tx).await;
@@ -308,7 +308,7 @@ async fn auth_error_401() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     let result = client.stream_chat(&user_message("hi"), None, tx).await;
@@ -341,7 +341,7 @@ async fn empty_stream() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -372,7 +372,7 @@ async fn usage_only_no_choices() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -402,7 +402,7 @@ async fn server_error_500() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     let result = client.stream_chat(&user_message("hi"), None, tx).await;
@@ -447,7 +447,7 @@ async fn eof_without_trailing_newline_flushes_last_delta() {
         .await;
 
     let config = test_config(&server.uri());
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -503,7 +503,7 @@ async fn xai_streams_via_openai_compat_transport() {
     config.llm.model = "grok-4-fast-non-reasoning".into();
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -596,7 +596,7 @@ async fn gemini_streams_via_openai_compat_transport() {
     config.llm.model = "gemini-2.5-flash".into();
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -694,7 +694,7 @@ async fn azure_openai_uses_api_key_header_not_bearer() {
     config.llm.model = "gpt-4o-prod".into();
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
 
     client
@@ -777,7 +777,7 @@ async fn azure_openai_uses_entra_bearer_when_no_api_key_is_configured() {
     config.llm.model = "gpt-4o-prod".into();
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("ping"), None, tx)
@@ -839,7 +839,7 @@ async fn vertex_gemini_uses_gcp_bearer_and_openai_compat_body() {
     config.llm.base_url = Some(format!("{}/vertex/openai/chat/completions", server.uri()));
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("ping"), None, tx)
@@ -907,7 +907,7 @@ async fn vertex_claude_uses_gcp_bearer_and_vertex_anthropic_body() {
     config.llm.base_url = Some(format!("{}/vertex/claude:streamRawPredict", server.uri()));
     config.llm.max_retries = 0;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("ping"), None, tx)

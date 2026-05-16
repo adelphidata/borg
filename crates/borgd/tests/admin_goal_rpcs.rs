@@ -47,7 +47,7 @@ async fn start_harness() -> Harness {
     }
     // Force the DB to materialize and run migrations now so the test body
     // can seed sessions/goals through the same file the handlers reopen.
-    let _ = Database::open().expect("seed DB open");
+    let _ = Database::open().await.expect("seed DB open");
 
     let socket = tmp.path().join("borgd.sock");
     let listener = bind_uds(&socket).expect("bind_uds");
@@ -95,9 +95,10 @@ async fn channel(socket: &Path) -> Channel {
 }
 
 /// Seed a session row (`goals` rows have FK → `sessions.id`).
-fn seed_session(id: &str) {
-    let db = Database::open().expect("db");
+async fn seed_session(id: &str) {
+    let db = Database::open().await.expect("db");
     db.upsert_session(id, 0, 0, 0, "test-model", "test")
+        .await
         .expect("seed session");
 }
 
@@ -127,15 +128,16 @@ async fn get_goal_resolves_latest_and_reports_absence() {
     );
 
     // Seed a session + goal, then ask for "latest" → must return that row.
-    seed_session("sess-latest");
+    seed_session("sess-latest").await;
     {
-        let db = Database::open().unwrap();
+        let db = Database::open().await.unwrap();
         db.insert_goal(
             "sess-latest",
             "ship it",
             cortex::goals::GoalStatus::Active,
             Some(5000),
         )
+        .await
         .expect("insert")
         .expect("returned");
     }
@@ -154,7 +156,7 @@ async fn get_goal_resolves_latest_and_reports_absence() {
     assert_eq!(resp.token_budget, 5000);
 
     // Negative: explicit session_id that has no goal row.
-    seed_session("sess-without-goal");
+    seed_session("sess-without-goal").await;
     let resp = admin
         .get_goal(GoalRef {
             session_id: "sess-without-goal".into(),
@@ -181,7 +183,7 @@ async fn set_goal_create_rejects_duplicate() {
     let chan = channel(&h.socket).await;
     let mut admin = AdminClient::new(chan);
 
-    seed_session("sess-create");
+    seed_session("sess-create").await;
     let detail = admin
         .set_goal(GoalMutation {
             session_id: "sess-create".into(),
@@ -234,7 +236,7 @@ async fn set_goal_replace_regenerates_goal_id() {
     let chan = channel(&h.socket).await;
     let mut admin = AdminClient::new(chan);
 
-    seed_session("sess-replace");
+    seed_session("sess-replace").await;
     let first = admin
         .set_goal(GoalMutation {
             session_id: "sess-replace".into(),
@@ -284,7 +286,7 @@ async fn set_goal_status_rejects_illegal_transitions() {
     let chan = channel(&h.socket).await;
     let mut admin = AdminClient::new(chan);
 
-    seed_session("sess-status");
+    seed_session("sess-status").await;
     admin
         .set_goal(GoalMutation {
             session_id: "sess-status".into(),
@@ -381,7 +383,7 @@ async fn pause_goal_on_interrupt_is_idempotent_noop_when_absent() {
     assert!(!resp.present, "no sessions → absence, got: {resp:?}");
 
     // Negative: session with no goal — also absence.
-    seed_session("sess-pause");
+    seed_session("sess-pause").await;
     let resp = admin
         .pause_goal_on_interrupt(GoalRef {
             session_id: "sess-pause".into(),
@@ -445,7 +447,7 @@ async fn clear_goal_removes_row_and_is_noop_when_absent() {
     let chan = channel(&h.socket).await;
     let mut admin = AdminClient::new(chan);
 
-    seed_session("sess-clear");
+    seed_session("sess-clear").await;
 
     // Negative: clearing with no row must succeed silently.
     admin

@@ -303,18 +303,17 @@ async fn check_sender_access_control(
     channel_name: &str,
     sender_id: &str,
 ) -> Result<cortex::pairing::AccessCheckResult> {
-    let ch = channel_name.to_string();
-    let sid = sender_id.to_string();
-    let cfg = config.clone();
-    let agent_name = config.user.agent_name.clone();
-    let access = tokio::task::spawn_blocking(move || {
-        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
-            .context("Failed to open database for pairing check")?;
-        cortex::pairing::check_sender_access(&db, &cfg, &ch, &sid, agent_name.as_deref())
-    })
+    let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+        .await
+        .context("Failed to open database for pairing check")?;
+    cortex::pairing::check_sender_access(
+        &db,
+        config,
+        channel_name,
+        sender_id,
+        config.user.agent_name.as_deref(),
+    )
     .await
-    .context("Pairing check task panicked")??;
-    Ok(access)
 }
 
 /// Result of session resolution and command handling.
@@ -347,28 +346,26 @@ async fn resolve_session_and_commands(
     } else {
         base_key
     };
-    let channel_name_owned = channel_name.to_string();
-    let session_key_clone = session_key.clone();
-    let (db, session_id) = tokio::task::spawn_blocking(move || {
-        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
-            .context("Failed to open database")?;
-        let session_id = db
-            .resolve_channel_session(&channel_name_owned, &session_key_clone)
-            .context("Failed to resolve channel session")?;
-        Ok::<_, anyhow::Error>((db, session_id))
-    })
-    .await
-    .context("DB task panicked")??;
+    let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+        .await
+        .context("Failed to open database")?;
+    let session_id = db
+        .resolve_channel_session(channel_name, &session_key)
+        .await
+        .context("Failed to resolve channel session")?;
 
     // Log inbound message
-    if let Err(e) = db.log_channel_message(
-        channel_name,
-        &inbound.sender_id,
-        "inbound",
-        Some(&inbound.text),
-        None,
-        Some(&session_id),
-    ) {
+    if let Err(e) = db
+        .log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "inbound",
+            Some(&inbound.text),
+            None,
+            Some(&session_id),
+        )
+        .await
+    {
         warn!("Failed to log inbound message for channel '{channel_name}': {e}");
     }
 
@@ -387,14 +384,17 @@ async fn resolve_session_and_commands(
         } else {
             "Nothing to cancel.".to_string()
         };
-        if let Err(e) = db.log_channel_message(
-            channel_name,
-            &inbound.sender_id,
-            "outbound",
-            Some(&response),
-            None,
-            Some(&session_id),
-        ) {
+        if let Err(e) = db
+            .log_channel_message(
+                channel_name,
+                &inbound.sender_id,
+                "outbound",
+                Some(&response),
+                None,
+                Some(&session_id),
+            )
+            .await
+        {
             // Secondary logging failure (the response itself succeeded).
             // DEBUG keeps daemon.log clean on flaky DB locks.
             debug!("Failed to log /cancel response: {e}");
@@ -422,14 +422,17 @@ async fn resolve_session_and_commands(
             Ok(resp) => format!("Poke failed (HTTP {})", resp.status()),
             Err(e) => format!("Poke failed: {e}"),
         };
-        if let Err(e) = db.log_channel_message(
-            channel_name,
-            &inbound.sender_id,
-            "outbound",
-            Some(&response),
-            None,
-            Some(&session_id),
-        ) {
+        if let Err(e) = db
+            .log_channel_message(
+                channel_name,
+                &inbound.sender_id,
+                "outbound",
+                Some(&response),
+                None,
+                Some(&session_id),
+            )
+            .await
+        {
             debug!("Failed to log /poke response: {e}");
         }
         return Ok(SessionResolution {
@@ -451,14 +454,17 @@ async fn resolve_session_and_commands(
                 Ok(Err(e)) => format!("Dream failed: {e}"),
                 Err(e) => format!("Dream failed: {e}"),
             };
-        if let Err(e) = db.log_channel_message(
-            channel_name,
-            &inbound.sender_id,
-            "outbound",
-            Some(&response),
-            None,
-            Some(&session_id),
-        ) {
+        if let Err(e) = db
+            .log_channel_message(
+                channel_name,
+                &inbound.sender_id,
+                "outbound",
+                Some(&response),
+                None,
+                Some(&session_id),
+            )
+            .await
+        {
             debug!("Failed to log /dream response: {e}");
         }
         return Ok(SessionResolution {
@@ -478,15 +484,20 @@ async fn resolve_session_and_commands(
         &session_key,
         &session_id,
         &inbound.sender_id,
-    ) {
-        if let Err(e) = db.log_channel_message(
-            channel_name,
-            &inbound.sender_id,
-            "outbound",
-            Some(&response),
-            None,
-            Some(&session_id),
-        ) {
+    )
+    .await
+    {
+        if let Err(e) = db
+            .log_channel_message(
+                channel_name,
+                &inbound.sender_id,
+                "outbound",
+                Some(&response),
+                None,
+                Some(&session_id),
+            )
+            .await
+        {
             debug!("Failed to log command response: {e}");
         }
         return Ok(SessionResolution {
@@ -886,25 +897,27 @@ async fn enforce_access_control(
                 return Ok(Some((String::new(), String::new())));
             }
             info!("Pairing challenge issued for sender '{sender_id}' on channel '{channel_name}'");
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
                 cortex::activity_log::log_activity(
                     &adb,
                     "info",
                     "gateway",
                     &format!("Pairing challenge issued for {sender_id}"),
-                );
+                )
+                .await;
             }
             Ok(Some((message, String::new())))
         }
         cortex::pairing::AccessCheckResult::Denied { reason } => {
             info!("Access denied for sender '{sender_id}' on channel '{channel_name}': {reason}");
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
                 cortex::activity_log::log_activity(
                     &adb,
                     "warn",
                     "gateway",
                     &format!("Access denied for {sender_id} on {channel_name}"),
-                );
+                )
+                .await;
             }
             Ok(Some((
                 "Access denied. Contact the Borg owner for access.".to_string(),
@@ -924,13 +937,14 @@ async fn invoke_agent_inner(
     progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
     // Phase 1: Activity logging
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         cortex::activity_log::log_activity(
             &adb,
             "info",
             "gateway",
             &format!("Webhook from {channel_name}: {}", inbound.sender_id),
-        );
+        )
+        .await;
     }
 
     // Phase 2: Route resolution + activation check
@@ -1099,14 +1113,17 @@ async fn invoke_agent_inner(
             &response_text,
         )
         .into_owned();
-    if let Err(e) = db.log_channel_message(
-        channel_name,
-        &inbound.sender_id,
-        "outbound",
-        Some(&redacted_response),
-        None,
-        Some(&session_id),
-    ) {
+    if let Err(e) = db
+        .log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "outbound",
+            Some(&redacted_response),
+            None,
+            Some(&session_id),
+        )
+        .await
+    {
         warn!("Failed to log outbound message for channel '{channel_name}': {e}");
     }
 
@@ -1222,6 +1239,7 @@ async fn process_message(
     let total_chunks = chunks.len();
 
     let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+        .await
         .context("Failed to open database")?;
 
     for (i, chunk) in chunks.iter().enumerate() {
@@ -1246,15 +1264,18 @@ async fn process_message(
 
         // Enqueue to delivery queue for persistence (without secrets)
         let delivery_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = db.enqueue_delivery(&NewDelivery {
-            id: &delivery_id,
-            channel_name,
-            sender_id: &inbound.sender_id,
-            channel_id: inbound.channel_id.as_deref(),
-            session_id: Some(&_session_id),
-            payload_json: &persist_str,
-            max_retries: retry_policy.max_retries as i32,
-        }) {
+        if let Err(e) = db
+            .enqueue_delivery(&NewDelivery {
+                id: &delivery_id,
+                channel_name,
+                sender_id: &inbound.sender_id,
+                channel_id: inbound.channel_id.as_deref(),
+                session_id: Some(&_session_id),
+                payload_json: &persist_str,
+                max_retries: retry_policy.max_retries as i32,
+            })
+            .await
+        {
             warn!("Failed to enqueue delivery for channel '{channel_name}': {e}");
         }
 
@@ -1268,7 +1289,7 @@ async fn process_message(
                     i + 1,
                     total_chunks
                 );
-                if let Err(e) = db.mark_delivered(&delivery_id) {
+                if let Err(e) = db.mark_delivered(&delivery_id).await {
                     warn!("Failed to mark delivery '{delivery_id}' as delivered: {e}");
                 }
                 if let Some(h) = health {
@@ -1277,7 +1298,7 @@ async fn process_message(
             }
             RetryOutcome::PermanentFailure(e) | RetryOutcome::Exhausted(e) => {
                 warn!("Outbound failure for channel '{}': {e}", channel_name);
-                record_delivery_failure_sync(&db, &delivery_id, &e);
+                record_delivery_failure(&db, &delivery_id, &e).await;
                 if let Some(h) = health {
                     h.write().await.record_error(channel_name, &e);
                 }
@@ -1288,8 +1309,8 @@ async fn process_message(
     Ok(response_text)
 }
 
-fn record_delivery_failure_sync(db: &Database, delivery_id: &str, error: &str) {
-    if let Err(db_err) = db.mark_failed(delivery_id, error, None) {
+async fn record_delivery_failure(db: &Database, delivery_id: &str, error: &str) {
+    if let Err(db_err) = db.mark_failed(delivery_id, error, None).await {
         warn!("Failed to mark delivery '{delivery_id}' as failed: {db_err}");
     }
 }
@@ -1671,16 +1692,15 @@ mod tests {
     // -- Pairing integration tests --
 
     /// New sender with DmPolicy::Pairing receives a non-empty challenge message.
-    #[test]
-    fn pairing_new_sender_gets_challenge() {
-        let db =
-            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-                .unwrap();
+    #[tokio::test]
+    async fn pairing_new_sender_gets_challenge() {
+        let db = cortex::db::Database::test_db().await;
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
 
         let result =
             cortex::pairing::check_sender_access(&db, &config, "telegram", "new_user", None)
+                .await
                 .unwrap();
         match result {
             cortex::pairing::AccessCheckResult::Challenge { code, message } => {
@@ -1709,8 +1729,8 @@ mod tests {
 
     /// DM activation + pairing integration: a DM from a new sender should activate
     /// and then receive a pairing challenge (not be silently dropped).
-    #[test]
-    fn dm_activation_then_pairing_produces_response() {
+    #[tokio::test]
+    async fn dm_activation_then_pairing_produces_response() {
         let route = default_route();
         let config = Config::default(); // default dm_policy = Pairing
 
@@ -1720,11 +1740,10 @@ mod tests {
         assert!(should_respond, "DMs must always activate");
 
         // Step 2: Pairing check should return a non-empty challenge
-        let db =
-            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-                .unwrap();
+        let db = cortex::db::Database::test_db().await;
         let result =
             cortex::pairing::check_sender_access(&db, &config, "telegram", "starter_user", None)
+                .await
                 .unwrap();
         match result {
             cortex::pairing::AccessCheckResult::Challenge { message, .. } => {
@@ -1738,16 +1757,15 @@ mod tests {
     }
 
     /// DmPolicy::Disabled returns a non-empty denial message (not silently dropped).
-    #[test]
-    fn disabled_policy_returns_nonempty_denial() {
-        let db =
-            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-                .unwrap();
+    #[tokio::test]
+    async fn disabled_policy_returns_nonempty_denial() {
+        let db = cortex::db::Database::test_db().await;
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
 
-        let result =
-            cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
+        let result = cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
+            .await
+            .unwrap();
         match result {
             cortex::pairing::AccessCheckResult::Denied { reason } => {
                 assert!(!reason.trim().is_empty(), "denial reason must not be empty");
@@ -1757,16 +1775,15 @@ mod tests {
     }
 
     /// DmPolicy::Open lets any sender through without challenge.
-    #[test]
-    fn open_policy_allows_any_sender() {
-        let db =
-            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-                .unwrap();
+    #[tokio::test]
+    async fn open_policy_allows_any_sender() {
+        let db = cortex::db::Database::test_db().await;
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
 
-        let result =
-            cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
+        let result = cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
+            .await
+            .unwrap();
         assert!(matches!(
             result,
             cortex::pairing::AccessCheckResult::Allowed
@@ -1774,28 +1791,28 @@ mod tests {
     }
 
     /// After approval, the same sender is allowed through.
-    #[test]
-    fn approved_sender_passes_pairing() {
-        let db =
-            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-                .unwrap();
+    #[tokio::test]
+    async fn approved_sender_passes_pairing() {
+        let db = cortex::db::Database::test_db().await;
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
 
         // Get challenge
-        let result =
-            cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None).unwrap();
+        let result = cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
+            .await
+            .unwrap();
         let code = match result {
             cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
         // Approve
-        db.approve_pairing("telegram", &code).unwrap();
+        db.approve_pairing("telegram", &code).await.unwrap();
 
         // Now should be allowed
-        let result =
-            cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None).unwrap();
+        let result = cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
+            .await
+            .unwrap();
         assert!(matches!(
             result,
             cortex::pairing::AccessCheckResult::Allowed

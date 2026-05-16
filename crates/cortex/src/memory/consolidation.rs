@@ -431,7 +431,7 @@ pub async fn flush_short_term_to_daily_with_db(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

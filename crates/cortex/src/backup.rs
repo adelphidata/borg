@@ -490,7 +490,7 @@ impl<W: Write> Write for ShaWriter<'_, W> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

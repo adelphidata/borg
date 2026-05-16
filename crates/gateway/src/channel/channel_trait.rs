@@ -90,7 +90,7 @@ pub trait NativeChannel: Send + Sync {
 
     /// Mutate channel-specific response context after the shared DB work has
     /// completed but before delivery is queued or sent.
-    fn prepare_response_context(
+    async fn prepare_response_context(
         &self,
         response_context: &mut serde_json::Value,
         db: Option<&Database>,
@@ -361,11 +361,13 @@ pub async fn dispatch_webhook(
                         // Persist to delivery queue for at-least-once guarantee.
                         // A single DB connection is reused for enqueue + status update.
                         let delivery_id = uuid::Uuid::new_v4().to_string();
-                        let db =
-                            Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).ok();
+                        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+                            .await
+                            .ok();
 
-                        if let Err(e) =
-                            channel.prepare_response_context(&mut response_context, db.as_ref(), &config)
+                        if let Err(e) = channel
+                            .prepare_response_context(&mut response_context, db.as_ref(), &config)
+                            .await
                         {
                             tracing::warn!(
                                 "Failed to prepare {channel_name} response context: {e}"
@@ -388,7 +390,7 @@ pub async fn dispatch_webhook(
                                 payload_json: &payload_str,
                                 max_retries: 3,
                             };
-                            if let Err(e) = db.enqueue_delivery(&new_delivery) {
+                            if let Err(e) = db.enqueue_delivery(&new_delivery).await {
                                 tracing::warn!("Failed to enqueue {channel_name} delivery: {e}");
                             }
                         }
@@ -400,7 +402,7 @@ pub async fn dispatch_webhook(
                         {
                             Ok(()) => {
                                 if let Some(ref db) = db {
-                                    if let Err(e) = db.mark_delivered(&delivery_id) {
+                                    if let Err(e) = db.mark_delivered(&delivery_id).await {
                                         tracing::warn!("Failed to mark delivery {delivery_id} as delivered: {e}");
                                     }
                                 }
@@ -410,11 +412,10 @@ pub async fn dispatch_webhook(
                                 // Mark as failed — drain loop will retry
                                 if let Some(ref db) = db {
                                     let retry_at = chrono::Utc::now().timestamp() + 30;
-                                    if let Err(e2) = db.mark_failed(
-                                        &delivery_id,
-                                        &e.to_string(),
-                                        Some(retry_at),
-                                    ) {
+                                    if let Err(e2) = db
+                                        .mark_failed(&delivery_id, &e.to_string(), Some(retry_at))
+                                        .await
+                                    {
                                         tracing::warn!("Failed to mark delivery {delivery_id} as failed: {e2}");
                                     }
                                 }

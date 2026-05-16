@@ -59,9 +59,20 @@ fn shared_data_dir() -> &'static Path {
         // Initialise the DB once so subsequent fixtures can write to it
         // without racing migrations. Onboarding flag set so the ACP
         // transport's `require_onboarding` gate passes.
-        let db = cortex::db::Database::open().expect("open shared test DB");
-        db.set_setting("onboarded", "true")
-            .expect("seed onboarded=true");
+        // OnceLock::get_or_init is sync; the DB API is async post-turso.
+        // `block_in_place` releases the worker thread so the inner block_on
+        // can drive the migrations to completion without deadlocking the
+        // multi-thread runtime this fixture runs on.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let db = cortex::db::Database::open()
+                    .await
+                    .expect("open shared test DB");
+                db.set_setting("onboarded", "true")
+                    .await
+                    .expect("seed onboarded=true");
+            })
+        });
         td
     });
     dir.path()
@@ -107,7 +118,7 @@ impl BorgdFixture {
         let uds_path = socket_dir.path().join("borgd.sock");
         let registry = SessionRegistry::new();
         let capability_router = Arc::new(CapabilityRouter::new());
-        let core_config = CoreConfig::load_from_db().unwrap_or_default();
+        let core_config = CoreConfig::load_from_db().await.unwrap_or_default();
         let cost_event_bus = CostEventBus::new(&core_config, BorgMetrics::noop());
         let services = build_services(registry, factory.clone(), capability_router, cost_event_bus);
 

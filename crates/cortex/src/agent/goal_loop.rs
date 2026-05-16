@@ -166,7 +166,8 @@ impl Agent {
                 reason: SteeringReason::BudgetLimited,
                 body,
             });
-            self.emit_goal_vitals_event("goal_budget_limited", &goal).await;
+            self.emit_goal_vitals_event("goal_budget_limited", &goal)
+                .await;
             self.emit_goal_lifecycle(event_kind::BUDGET_LIMITED, Some(&goal));
         }
         Some(goal)

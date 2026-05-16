@@ -13,17 +13,17 @@ use cortex::backup::{create_backup, live_schema_version, restore_backup, verify_
 use cortex::config::Config;
 use cortex::paths::{self, BorgSubdir};
 
-pub fn run_create() -> Result<()> {
+pub async fn run_create() -> Result<()> {
     let home = Config::data_dir().context("locate BORG_HOME")?;
     let out_dir = paths::subdir(&home, BorgSubdir::Backups);
-    let schema_version = live_schema_version()?;
+    let schema_version = live_schema_version().await?;
     let path = create_backup(&home, &out_dir, schema_version).context("create backup")?;
     println!("backup: {}", path.display());
     Ok(())
 }
 
-pub fn run_verify(file: &Path) -> Result<()> {
-    let report = verify_backup(file).context("verify backup")?;
+pub async fn run_verify(file: &Path) -> Result<()> {
+    let report = verify_backup(file).await.context("verify backup")?;
     println!(
         "backup OK: schema_version={}  created_at={}  messages={}  audit={}",
         report.manifest.schema_version,
@@ -42,9 +42,11 @@ pub fn run_verify(file: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_restore(file: &Path, force: bool) -> Result<()> {
+pub async fn run_restore(file: &Path, force: bool) -> Result<()> {
     let home = Config::data_dir().context("locate BORG_HOME")?;
-    restore_backup(file, &home, force).context("restore backup")?;
+    restore_backup(file, &home, force)
+        .await
+        .context("restore backup")?;
     println!("restored {} into {}", file.display(), home.display());
     Ok(())
 }

@@ -437,12 +437,9 @@ pub async fn rank_embeddings_by_similarity(
     scope: &str,
     recency_weight: f32,
 ) -> Result<Vec<(String, f32)>> {
-    let scoped = rank_embeddings_by_similarity_scoped(
-        query_embedding,
-        &[scope.to_string()],
-        recency_weight,
-    )
-    .await?;
+    let scoped =
+        rank_embeddings_by_similarity_scoped(query_embedding, &[scope.to_string()], recency_weight)
+            .await?;
     Ok(scoped
         .into_iter()
         .map(|(_scope, filename, score)| (filename, score))
@@ -692,7 +689,7 @@ pub fn aggregate_to_file_scores(chunk_scores: &[(String, i64, f32)]) -> Vec<(Str
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

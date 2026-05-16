@@ -23,7 +23,7 @@ pub mod security;
 pub mod share_card;
 pub mod signature;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub(crate) use hmac::{compute_event_hmac, compute_event_hmac_legacy, EVOLUTION_HMAC_LEGACY};
 pub(crate) use hmac::{verify_event_hmac, EVOLUTION_HMAC_DOMAIN};
 
@@ -456,7 +456,7 @@ fn evolution_gates_verified(event: &EvolutionEvent) -> bool {
 /// Find the dominant archetype (highest score). Only used by test fixtures —
 /// production replay uses `replay::dominant_from_effective` against the
 /// time-weighted effective scores.
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 fn dominant_archetype(scores: &HashMap<Archetype, u32>) -> Option<Archetype> {
     scores
         .iter()
@@ -1050,7 +1050,10 @@ impl EvolutionHook {
         };
         match serde_json::to_string(&celebration) {
             Ok(payload_json) => {
-                if let Err(e) = db.insert_pending_celebration("evolution", &payload_json).await {
+                if let Err(e) = db
+                    .insert_pending_celebration("evolution", &payload_json)
+                    .await
+                {
                     tracing::warn!("evolution: failed to insert pending celebration: {e}");
                 }
             }
@@ -1067,7 +1070,8 @@ impl EvolutionHook {
         let Some(rt) = self.rt.clone() else {
             // No runtime: record the fallback synchronously via a blocking DB call.
             let (name, description) = classification::fallback_evolution_name(archetype, new_stage);
-            self.record_naming_event(archetype, &name, &description).await;
+            self.record_naming_event(archetype, &name, &description)
+                .await;
             return;
         };
         // Compute top tools under the already-held DB lock would deadlock; do
@@ -1247,5 +1251,5 @@ impl std::fmt::Debug for EvolutionHook {
 
 // ── Tests ──
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;

@@ -171,7 +171,8 @@ impl MigrateState {
         match migrate::parse_source(source, &self.categories) {
             Ok(data) => {
                 let borg_dir = Config::data_dir().unwrap_or_default();
-                let config = Config::load_from_db().unwrap_or_default();
+                let config =
+                    crate::async_bridge::block_on(Config::load_from_db()).unwrap_or_default();
                 let plan = migrate::plan::build_plan(source, &data, &config, &borg_dir);
                 self.preview_lines = plan.summary_lines();
                 self.source_data = Some(data);
@@ -192,7 +193,7 @@ impl MigrateState {
         };
 
         let borg_dir = Config::data_dir().unwrap_or_default();
-        match migrate::apply::apply_plan(plan, data, &borg_dir) {
+        match crate::async_bridge::block_on(migrate::apply::apply_plan(plan, data, &borg_dir)) {
             Ok(result) => {
                 self.result = Some(result);
                 self.done = true;

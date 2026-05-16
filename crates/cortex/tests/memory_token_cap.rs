@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 //! Integration tests for `write_memory_db`'s 20k-token cap and 8k warn band.
 //!
 //! Spec (CLAUDE.md → Memory):

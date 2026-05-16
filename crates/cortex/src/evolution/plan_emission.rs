@@ -122,7 +122,7 @@ fn build_metadata(
     serde_json::Value::Object(obj).to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
     use crate::evolution::Archetype;

@@ -389,7 +389,9 @@ impl App<'_> {
     }
 
     fn cmd_memory(&mut self) -> Result<AppAction> {
-        let memory = cortex::memory::load_memory_context_db(self.config.memory.max_context_tokens)?;
+        let memory = crate::async_bridge::block_on(cortex::memory::load_memory_context_db(
+            self.config.memory.max_context_tokens,
+        ))?;
         let text = if memory.is_empty() {
             "No memories loaded.".to_string()
         } else {
@@ -555,7 +557,7 @@ impl App<'_> {
     }
 
     fn cmd_memory_cleanup(&mut self) -> Result<AppAction> {
-        match cortex::memory::list_memory_inventory(&self.config) {
+        match crate::async_bridge::block_on(cortex::memory::list_memory_inventory(&self.config)) {
             Ok(items) => {
                 if items.is_empty() {
                     self.push_system_message(
@@ -819,9 +821,10 @@ impl App<'_> {
     /// Show the active squelch list, with how long each one has left.
     fn cmd_doctor_squelch_list(&mut self) -> Result<AppAction> {
         let now = chrono::Utc::now().timestamp();
-        match cortex::db::Database::open_readonly()
-            .and_then(|db| db.doctor_squelch_list_active(now))
-        {
+        match crate::async_bridge::block_on(async {
+            let db = cortex::db::Database::open_readonly().await?;
+            db.doctor_squelch_list_active(now).await
+        }) {
             Ok(rows) => {
                 if rows.is_empty() {
                     self.push_system_message(

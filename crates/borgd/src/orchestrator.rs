@@ -17,7 +17,7 @@ use cortex::config::Config;
 use cortex::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -59,18 +59,23 @@ fn spawn_gateway(
 /// shut down the supervisor (the alternative is a noisy crash that
 /// hides the underlying gateway failure).
 fn mark_gateway_unrecoverable() {
-    let db = match cortex::db::Database::open() {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!("mark_gateway_unrecoverable: failed to open db: {e}");
-            return;
-        }
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    write_gateway_unrecoverable_meta(&db, now);
+    // The callback runs inside an async supervisor task, but the
+    // `on_degraded` callback type is sync — spawn the actual DB writes
+    // as a fire-and-forget task on the current runtime.
+    tokio::spawn(async {
+        let db = match cortex::db::Database::open().await {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("mark_gateway_unrecoverable: failed to open db: {e}");
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        write_gateway_unrecoverable_meta(&db, now).await;
+    });
 }
 
 /// Inner helper for [`mark_gateway_unrecoverable`] — pulled out so unit
@@ -83,12 +88,15 @@ fn mark_gateway_unrecoverable() {
 /// write, the next heartbeat would see `flag="1"` with no `_at` and
 /// would race the daily 02:00 self-healing pass this layered design
 /// exists to avoid.
-fn write_gateway_unrecoverable_meta(db: &cortex::db::Database, now: i64) {
+async fn write_gateway_unrecoverable_meta(db: &cortex::db::Database, now: i64) {
     use crate::heartbeat_augmenters::{GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY};
-    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &now.to_string()) {
+    if let Err(e) = db
+        .set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &now.to_string())
+        .await
+    {
         tracing::warn!("mark_gateway_unrecoverable: failed to set timestamp: {e}");
     }
-    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1") {
+    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await {
         tracing::warn!("mark_gateway_unrecoverable: failed to set flag: {e}");
     }
 }
@@ -113,7 +121,7 @@ pub struct OrchestratorHandles {
 /// handles so the gRPC layer can wire `Admin.Poke` and
 /// `SubscribeHeartbeatEvents`. Each task observes `shutdown` and drains on
 /// cancellation.
-pub fn start(
+pub async fn start(
     registry: SessionRegistry,
     config: Config,
     shutdown: CancellationToken,
@@ -145,8 +153,8 @@ pub fn start(
     // subsystem will fail too. Panicking loud at orchestrator start
     // is better than degrading silently. Production callers
     // (run_lifecycle, daemon::run) have already validated DB access.
-    let supervisor_db: DbHandle = match cortex::db::Database::open() {
-        Ok(db) => Arc::new(Mutex::new(db)),
+    let supervisor_db: DbHandle = match cortex::db::Database::open().await {
+        Ok(db) => Arc::new(db),
         Err(e) => panic!(
             "orchestrator: cortex::db::Database::open() failed: {e}; daemon cannot supervise without DB"
         ),
@@ -311,13 +319,14 @@ pub fn start(
 /// cancelled. Used by the cli's `service::run_daemon` shim. Caller is
 /// responsible for any pre-flight setup (auto-spawning a borgd binary etc.).
 pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
-    let config = Config::load_from_db()?;
+    let config = Config::load_from_db().await?;
     cortex::activity_log::log_activity(
-        &cortex::db::Database::open()?,
+        &cortex::db::Database::open().await?,
         "info",
         "system",
         "Daemon orchestrator started (cli shim)",
-    );
+    )
+    .await;
     let registry = SessionRegistry::new();
     let (_config_tx, config_rx) = watch::channel(config.clone());
     let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(crate::cost_events::CostEventBus::new(
@@ -331,7 +340,8 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         config_rx,
         cost_event_sink,
         GoalEventBus::new(),
-    );
+    )
+    .await;
     shutdown.cancelled().await;
     Ok(())
 }
@@ -342,13 +352,9 @@ mod tests {
     use crate::heartbeat_augmenters::{
         check_gateway_unrecoverable, GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY,
     };
-    use rusqlite::Connection;
 
-    fn in_memory_db() -> cortex::db::Database {
-        cortex::db::Database::from_connection(
-            Connection::open_in_memory().expect("open in-memory sqlite"),
-        )
-        .expect("init in-memory db")
+    async fn in_memory_db() -> cortex::db::Database {
+        cortex::db::Database::test_db().await
     }
 
     /// Round-trip guard: the orchestrator's meta writes must be the exact
@@ -356,9 +362,9 @@ mod tests {
     /// — without this test, a typo in `GATEWAY_UNRECOVERABLE_KEY` here
     /// would silently disable the augmenter and only surface in
     /// production after a real gateway crash.
-    #[test]
-    fn write_gateway_unrecoverable_meta_round_trips_to_augmenter() {
-        let db = in_memory_db();
+    #[tokio::test]
+    async fn write_gateway_unrecoverable_meta_round_trips_to_augmenter() {
+        let db = in_memory_db().await;
         // Stamp the abandonment two hours in the past so we're past the
         // 1h grace and the augmenter actually fires.
         let two_hours_ago = (std::time::SystemTime::now()
@@ -366,16 +372,19 @@ mod tests {
             .unwrap()
             .as_secs() as i64)
             - 2 * 60 * 60;
-        write_gateway_unrecoverable_meta(&db, two_hours_ago);
+        write_gateway_unrecoverable_meta(&db, two_hours_ago).await;
 
         assert_eq!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "flag must be persisted under the augmenter's key"
         );
         let cfg = Config::default();
         assert!(
-            check_gateway_unrecoverable(&cfg, Some(&db)).is_some(),
+            check_gateway_unrecoverable(&cfg, Some(&db)).await.is_some(),
             "augmenter must observe the orchestrator's write and fire"
         );
     }
@@ -384,18 +393,19 @@ mod tests {
     /// flag write, the augmenter must stay silent — there's nothing to
     /// nudge about. Guards the reverse half of the write-order
     /// invariant.
-    #[test]
-    fn timestamp_alone_without_flag_does_not_fire() {
-        let db = in_memory_db();
+    #[tokio::test]
+    async fn timestamp_alone_without_flag_does_not_fire() {
+        let db = in_memory_db().await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &(now - 7200).to_string())
+            .await
             .unwrap();
         let cfg = Config::default();
         assert!(
-            check_gateway_unrecoverable(&cfg, Some(&db)).is_none(),
+            check_gateway_unrecoverable(&cfg, Some(&db)).await.is_none(),
             "augmenter must require the flag, not just the timestamp"
         );
     }
@@ -403,13 +413,13 @@ mod tests {
     /// Flag without a timestamp (simulating mid-write death) must NOT
     /// instantly fire — the augmenter falls back to `now`, so the 1h
     /// grace re-arms cleanly.
-    #[test]
-    fn flag_without_timestamp_does_not_fire_immediately() {
-        let db = in_memory_db();
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+    #[tokio::test]
+    async fn flag_without_timestamp_does_not_fire_immediately() {
+        let db = in_memory_db().await;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         let cfg = Config::default();
         assert!(
-            check_gateway_unrecoverable(&cfg, Some(&db)).is_none(),
+            check_gateway_unrecoverable(&cfg, Some(&db)).await.is_none(),
             "missing timestamp must not be treated as `0` (would race the daily heal)"
         );
     }

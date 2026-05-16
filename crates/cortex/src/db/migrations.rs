@@ -227,13 +227,15 @@ impl Database {
 
     async fn seed_default_budget(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO budgets
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO budgets
              (id, scope, reset_period, hard_cap_usd, soft_cap_usd,
               current_spent_usd, current_period_start, created_at, updated_at)
              VALUES ('default', 'default', 'daily', '20', '5', '0', ?1, ?1, ?1)",
-            params!(now),
-        ).await?;
+                params!(now),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -268,27 +270,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    session_id UNINDEXED,
-    role UNINDEXED,
-    content,
-    content='messages',
-    content_rowid='id'
-);
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, session_id, role, content)
-    VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
-    VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
-    VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
-    INSERT INTO messages_fts(rowid, session_id, role, content)
-    VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
-END;
+-- FTS lives on a turso `USING fts` index method (see `migrate_v2` for the
+-- historical context — Borg has no released DBs so we emit the final shape
+-- directly here). BM25 ranking is computed in Rust (`crate::memory::bm25`).
+CREATE INDEX IF NOT EXISTS messages_fts ON messages USING fts (content);
 
 -- Per-session goals --------------------------------------------------------
 CREATE TABLE IF NOT EXISTS goals (
@@ -598,28 +583,8 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope_file ON memory_chunks(scope, filename);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
-    scope UNINDEXED,
-    filename UNINDEXED,
-    chunk_index UNINDEXED,
-    content,
-    content='memory_chunks',
-    content_rowid='id'
-);
-CREATE TRIGGER IF NOT EXISTS memory_chunks_ai AFTER INSERT ON memory_chunks BEGIN
-    INSERT INTO memory_chunks_fts(rowid, scope, filename, chunk_index, content)
-    VALUES (new.id, new.scope, new.filename, new.chunk_index, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS memory_chunks_ad AFTER DELETE ON memory_chunks BEGIN
-    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, scope, filename, chunk_index, content)
-    VALUES ('delete', old.id, old.scope, old.filename, old.chunk_index, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS memory_chunks_au AFTER UPDATE ON memory_chunks BEGIN
-    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, scope, filename, chunk_index, content)
-    VALUES ('delete', old.id, old.scope, old.filename, old.chunk_index, old.content);
-    INSERT INTO memory_chunks_fts(rowid, scope, filename, chunk_index, content)
-    VALUES (new.id, new.scope, new.filename, new.chunk_index, new.content);
-END;
+-- See messages_fts above: turso `USING fts` index method, BM25 in Rust.
+CREATE INDEX IF NOT EXISTS memory_chunks_fts ON memory_chunks USING fts (content);
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

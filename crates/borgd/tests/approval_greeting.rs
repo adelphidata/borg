@@ -125,7 +125,7 @@ async fn send_approval_greeting_accepts_request_when_executor_wired() {
     // Materialize DB so Config::load_from_db() inside the spawned greeting
     // task has something to read; the agent will then fail to construct
     // (no LLM provider) — that's logged + ignored, which is the design.
-    let _ = cortex::db::Database::open().expect("seed db");
+    let _ = cortex::db::Database::open().await.expect("seed db");
 
     let socket = tmp.path().join("borgd.sock");
     let listener = bind_uds(&socket).expect("bind_uds");

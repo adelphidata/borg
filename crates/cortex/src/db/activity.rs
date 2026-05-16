@@ -18,7 +18,13 @@ impl Database {
             .execute(
                 "INSERT INTO activity_log (level, category, message, detail, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params!(level, category, message, detail.map(|s| s.to_string()), now),
+                params!(
+                    level,
+                    category,
+                    message,
+                    detail.map(std::string::ToString::to_string),
+                    now
+                ),
             )
             .await?;
         Ok(())

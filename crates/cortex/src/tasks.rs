@@ -53,10 +53,7 @@ pub fn format_run_status(status: &str) -> &str {
 
 /// Advance a task's next_run using raw SQL on a connection (for use within transactions).
 /// Returns Ok(()) on success.
-pub async fn advance_next_run_raw(
-    conn: &turso::Connection,
-    task: &ScheduledTaskRow,
-) -> Result<()> {
+pub async fn advance_next_run_raw(conn: &turso::Connection, task: &ScheduledTaskRow) -> Result<()> {
     match task.schedule_type.as_str() {
         SCHEDULE_TYPE_ONCE => {
             conn.execute(
@@ -304,11 +301,7 @@ pub async fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Res
 /// executions don't sit forever — the daemon-startup-only
 /// [`Database::recover_stale_runs`] is not enough when the daemon
 /// stays alive but a single task wedges.
-pub async fn recover_wedged_runs(
-    db: &Database,
-    now: i64,
-    default_grace_secs: i64,
-) -> Result<u64> {
+pub async fn recover_wedged_runs(db: &Database, now: i64, default_grace_secs: i64) -> Result<u64> {
     db.recover_wedged_runs(now, default_grace_secs).await
 }
 

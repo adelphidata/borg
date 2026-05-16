@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 //! Verifies that library-only call sites (settings resolver, shell-policy

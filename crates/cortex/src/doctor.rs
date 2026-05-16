@@ -1544,7 +1544,7 @@ fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

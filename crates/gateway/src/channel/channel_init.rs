@@ -46,9 +46,9 @@ fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -> Option<St
     config.resolve_credential_or_env(key)
 }
 
-fn log_gateway_activity(message: &str) {
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        cortex::activity_log::log_activity(&adb, "info", "gateway", message);
+async fn log_gateway_activity(message: &str) {
+    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+        cortex::activity_log::log_activity(&adb, "info", "gateway", message).await;
     }
 }
 
@@ -74,7 +74,7 @@ pub(crate) async fn init_telegram(
                         "Telegram native integration active (bot: @{})",
                         me.username.as_deref().unwrap_or(&me.first_name)
                     );
-                    log_gateway_activity("Telegram native integration active");
+                    log_gateway_activity("Telegram native integration active").await;
                     let bot_username = me.username.clone();
 
                     // Set webhook if public_url is configured
@@ -136,7 +136,7 @@ pub(crate) async fn init_slack(
                         resp.user.as_deref().unwrap_or("unknown"),
                         resp.team.as_deref().unwrap_or("unknown"),
                     );
-                    log_gateway_activity("Slack native integration active");
+                    log_gateway_activity("Slack native integration active").await;
                     let bot_uid = client.bot_user_id().map(String::from);
                     (Some(Arc::new(client)), bot_uid)
                 }

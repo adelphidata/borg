@@ -30,32 +30,32 @@ pub(crate) enum BondAction {
 }
 
 /// Dispatch for `borg status ...`.
-pub(crate) fn dispatch_status(action: Option<StatusAction>) -> Result<()> {
+pub(crate) async fn dispatch_status(action: Option<StatusAction>) -> Result<()> {
     match action {
-        None => run_status(),
-        Some(StatusAction::History) => run_status_history(),
-        Some(StatusAction::Archetypes) => run_status_archetypes(),
-        Some(StatusAction::Xp) => run_status_xp(),
-        Some(StatusAction::Evolution) => run_status_evolution(),
-        Some(StatusAction::Card { out }) => run_status_card(out),
+        None => run_status().await,
+        Some(StatusAction::History) => run_status_history().await,
+        Some(StatusAction::Archetypes) => run_status_archetypes().await,
+        Some(StatusAction::Xp) => run_status_xp().await,
+        Some(StatusAction::Evolution) => run_status_evolution().await,
+        Some(StatusAction::Card { out }) => run_status_card(out).await,
     }
 }
 
 /// Dispatch for `borg bond ...`.
-pub(crate) fn dispatch_bond(action: Option<BondAction>) -> Result<()> {
+pub(crate) async fn dispatch_bond(action: Option<BondAction>) -> Result<()> {
     match action {
-        Some(BondAction::History { count }) => run_bond_history(count),
-        None => run_bond_status(),
+        Some(BondAction::History { count }) => run_bond_history(count).await,
+        None => run_bond_status().await,
     }
 }
 
-pub(crate) fn run_status() -> Result<()> {
+pub(crate) async fn run_status() -> Result<()> {
     let now = chrono::Utc::now();
-    let config = cortex::config::Config::load_from_db()?;
-    let db = cortex::db::Database::open_readonly()?;
+    let config = cortex::config::Config::load_from_db().await?;
+    let db = cortex::db::Database::open_readonly().await?;
 
     if config.evolution.enabled {
-        if let Ok(evo_state) = db.get_evolution_state() {
+        if let Ok(evo_state) = db.get_evolution_state().await {
             println!("Borg Status");
             println!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
             println!();
@@ -64,17 +64,17 @@ pub(crate) fn run_status() -> Result<()> {
         }
     }
 
-    let state = db.get_vitals_state()?;
+    let state = db.get_vitals_state().await?;
     let state = cortex::vitals::apply_decay(&state, now);
     let mut drift = cortex::vitals::detect_drift(&state, now);
     let since = (now - chrono::Duration::days(7)).timestamp();
-    let events = db.vitals_events_since(since)?;
+    let events = db.vitals_events_since(since).await?;
     if cortex::vitals::detect_failure_drift(&events) {
         drift.push(cortex::vitals::DriftFlag::RepeatedFailures);
     }
     println!("{}", cortex::vitals::format_status(&state, &events, &drift));
 
-    if let Ok(bond_events) = db.get_all_bond_events() {
+    if let Ok(bond_events) = db.get_all_bond_events().await {
         let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
         let bond_state = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
         println!("Bond");
@@ -99,76 +99,79 @@ pub(crate) fn format_bar(value: usize, width: usize) -> String {
     )
 }
 
-pub(crate) fn run_status_history() -> Result<()> {
-    let config = cortex::config::Config::load_from_db()?;
+pub(crate) async fn run_status_history() -> Result<()> {
+    let config = cortex::config::Config::load_from_db().await?;
     if !config.evolution.enabled {
         println!(
             "Evolution system is disabled. Enable with: borg settings set evolution.enabled true"
         );
         return Ok(());
     }
-    let db = cortex::db::Database::open_readonly()?;
-    let events = db.evolution_events_since(0)?;
+    let db = cortex::db::Database::open_readonly().await?;
+    let events = db.evolution_events_since(0).await?;
     let mut events = events;
     events.reverse();
     println!("{}", cortex::evolution::format_history(&events));
     Ok(())
 }
 
-pub(crate) fn run_status_xp() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
+pub(crate) async fn run_status_xp() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
     let output = cortex::evolution::commands::dispatch(
         cortex::evolution::commands::EvolutionCommand::Xp,
         &db,
-    )?;
+    )
+    .await?;
     print!("{}", output.text);
     Ok(())
 }
 
-pub(crate) fn run_status_evolution() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
+pub(crate) async fn run_status_evolution() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
     let output = cortex::evolution::commands::dispatch(
         cortex::evolution::commands::EvolutionCommand::Evolution,
         &db,
-    )?;
+    )
+    .await?;
     print!("{}", output.text);
     Ok(())
 }
 
-pub(crate) fn run_status_card(out: Option<std::path::PathBuf>) -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
+pub(crate) async fn run_status_card(out: Option<std::path::PathBuf>) -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
     let output = cortex::evolution::commands::dispatch(
         cortex::evolution::commands::EvolutionCommand::Card { out },
         &db,
-    )?;
+    )
+    .await?;
     print!("{}", output.text);
     Ok(())
 }
 
-pub(crate) fn run_status_archetypes() -> Result<()> {
-    let config = cortex::config::Config::load_from_db()?;
+pub(crate) async fn run_status_archetypes() -> Result<()> {
+    let config = cortex::config::Config::load_from_db().await?;
     if !config.evolution.enabled {
         println!(
             "Evolution system is disabled. Enable with: borg settings set evolution.enabled true"
         );
         return Ok(());
     }
-    let db = cortex::db::Database::open_readonly()?;
-    let state = db.get_evolution_state()?;
+    let db = cortex::db::Database::open_readonly().await?;
+    let state = db.get_evolution_state().await?;
     println!("{}", cortex::evolution::format_archetype_scores(&state));
     Ok(())
 }
 
-pub(crate) fn run_bond_status() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let events = db.get_all_bond_events()?;
+pub(crate) async fn run_bond_status() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let events = db.get_all_bond_events().await?;
     let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
     let state = cortex::bond::replay_events_with_key(&bond_key, &events);
-    let correction_rate = cortex::bond::compute_correction_rate(&db);
-    let routine_rate = cortex::bond::compute_routine_success_rate(&db);
-    let pref_count = cortex::bond::compute_preference_learning_count(&db);
+    let correction_rate = cortex::bond::compute_correction_rate(&db).await;
+    let routine_rate = cortex::bond::compute_routine_success_rate(&db).await;
+    let pref_count = cortex::bond::compute_preference_learning_count(&db).await;
     let since = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp();
-    let recent = db.bond_events_since(since)?;
+    let recent = db.bond_events_since(since).await?;
     println!(
         "{}",
         cortex::bond::format_status(&state, correction_rate, routine_rate, pref_count, &recent)
@@ -176,18 +179,18 @@ pub(crate) fn run_bond_status() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_bond_history(count: usize) -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let events = db.bond_events_recent(count)?;
+pub(crate) async fn run_bond_history(count: usize) -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let events = db.bond_events_recent(count).await?;
     println!("{}", cortex::bond::format_history(&events));
     Ok(())
 }
 
-pub(crate) fn run_usage() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let total_tokens = db.monthly_token_total()?;
-    let total_cost = db.monthly_total_cost()?;
-    let by_model = db.monthly_usage_by_model()?;
+pub(crate) async fn run_usage() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let total_tokens = db.monthly_token_total().await?;
+    let total_cost = db.monthly_total_cost().await?;
+    let by_model = db.monthly_usage_by_model().await?;
 
     println!("Token usage for current month");
     println!("────────────────────────────────────────");
@@ -196,7 +199,7 @@ pub(crate) fn run_usage() -> Result<()> {
         println!("Estimated cost: ${cost:.4}");
     }
 
-    if let Ok((prompt_sum, cached_sum, created_sum)) = {
+    let cache_summary = {
         use chrono::Datelike;
         let now = chrono::Utc::now();
         let month_start = now
@@ -206,8 +209,9 @@ pub(crate) fn run_usage() -> Result<()> {
             .and_hms_opt(0, 0, 0)
             .map(|dt| dt.and_utc().timestamp())
             .unwrap_or(0);
-        db.cache_token_summary_since(month_start)
-    } {
+        db.cache_token_summary_since(month_start).await
+    };
+    if let Ok((prompt_sum, cached_sum, created_sum)) = cache_summary {
         if prompt_sum > 0 && (cached_sum > 0 || created_sum > 0) {
             let pct = cached_sum as f64 / prompt_sum as f64 * 100.0;
             println!(
@@ -240,7 +244,9 @@ pub(crate) fn run_usage() -> Result<()> {
         }
     }
 
-    let config = cortex::config::Config::load_from_db().unwrap_or_default();
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
     let budget_limit = config.budget.monthly_token_limit;
     if budget_limit > 0 {
         let pct = total_tokens as f64 / budget_limit as f64 * 100.0;
@@ -248,7 +254,7 @@ pub(crate) fn run_usage() -> Result<()> {
         println!("Budget: {total_tokens}/{budget_limit} tokens ({pct:.1}%) used");
     }
 
-    if let Ok(Some(snap)) = cortex::budgets::BudgetEngine::status_snapshot(db.conn(), None) {
+    if let Ok(Some(snap)) = cortex::budgets::BudgetEngine::status_snapshot(&db, None).await {
         let period = match snap.reset_period {
             cortex::budgets::engine::ResetPeriod::Daily => "daily",
             cortex::budgets::engine::ResetPeriod::Weekly => "weekly",

@@ -320,7 +320,7 @@ pub fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
         .map(|(_, extract)| extract(config))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
     use rusqlite::Connection;

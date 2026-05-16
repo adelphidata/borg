@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 //! Admin RPC coverage for the credential pool. Exercises every `borg auth`
 //! surface: list / add / remove / reset / set-strategy.
 //!

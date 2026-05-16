@@ -270,7 +270,9 @@ fn remove_credential(service: &str, key: &str) {
 /// the only statements issued, which is the application-boundary read-only
 /// enforcement called out in the migration plan (Turso has no
 /// `SQLITE_OPEN_READ_ONLY` open-flag equivalent).
-pub(crate) fn imessage_post_install(data_dir: std::path::PathBuf) -> crate::catalog::PostInstallFuture {
+pub(crate) fn imessage_post_install(
+    data_dir: std::path::PathBuf,
+) -> crate::catalog::PostInstallFuture {
     Box::pin(async move {
         let mut notes = Vec::new();
         let state_path = data_dir
@@ -343,9 +345,7 @@ async fn open_messages_db(db_path: &std::path::Path) -> anyhow::Result<turso::Co
 }
 
 async fn read_max_rowid(conn: &turso::Connection) -> anyhow::Result<Option<i64>> {
-    let mut rows = conn
-        .query("SELECT MAX(ROWID) FROM message", ())
-        .await?;
+    let mut rows = conn.query("SELECT MAX(ROWID) FROM message", ()).await?;
     if let Some(row) = rows.next().await? {
         Ok(row.get::<Option<i64>>(0)?)
     } else {

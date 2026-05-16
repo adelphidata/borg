@@ -13,7 +13,8 @@ pub mod tailscale_verifier;
 pub mod tls;
 pub mod verifier;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use cortex::config::VerifierKind;
 use cortex::db::Database;
@@ -44,7 +45,7 @@ pub use verifier::{PeerCtx, Verifier, VerifierError};
 /// handed to `auth_interceptor` MUST come from this factory — calling
 /// `TofuVerifier::new` directly bypasses the `security.verifier` config
 /// and silently downgrades the operator's security choice.
-pub fn build_verifier(
+pub async fn build_verifier(
     kind: VerifierKind,
     db: Arc<Mutex<Database>>,
     tailscale_source: Option<Arc<dyn TailscaleStatusSource>>,

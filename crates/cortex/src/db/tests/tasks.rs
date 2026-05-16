@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::params;
+use turso::params;
 
 #[test]
 fn create_and_list_tasks() {

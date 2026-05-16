@@ -243,7 +243,9 @@ mod tests {
         // the request-path's perspective. Listing still surfaces them
         // for audit.
         let db = db().await;
-        create(&db, "live", "$.s", None, "$.b").await.expect("create");
+        create(&db, "live", "$.s", None, "$.b")
+            .await
+            .expect("create");
         create(&db, "doomed", "$.s", None, "$.b")
             .await
             .expect("create");
@@ -254,7 +256,10 @@ mod tests {
             lookup(&db, "doomed").await.expect("lookup").is_none(),
             "revoked webhook must not lookup as live"
         );
-        assert!(lookup(&db, "never-existed").await.expect("lookup").is_none());
+        assert!(lookup(&db, "never-existed")
+            .await
+            .expect("lookup")
+            .is_none());
 
         let all = list(&db).await.expect("list");
         assert_eq!(all.len(), 2, "list must surface tombstones");

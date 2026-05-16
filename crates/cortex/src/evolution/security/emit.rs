@@ -27,7 +27,7 @@
 use anyhow::{anyhow, Context, Result};
 use turso::params;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 use super::PostureSnapshot;
 use super::{compute_live_snapshot, PostureSource, PostureState};
 use crate::config::Config;

@@ -19,6 +19,7 @@ use protocols::session::{
     PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
     SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -32,11 +33,15 @@ use uuid::Uuid;
 pub trait SessionFactory: Send + Sync + 'static {
     /// Construct a new session host. May return an error if the underlying
     /// agent failed to initialize (bad config, missing API key, etc.).
-    fn open(
-        &self,
-        resume_id: Option<&str>,
+    ///
+    /// Async because constructing an `Agent` now opens the SQLite handle and
+    /// hooks via the turso async layer. Returned future borrows `self` so the
+    /// implementor can stash references without cloning.
+    fn open<'a>(
+        &'a self,
+        resume_id: Option<&'a str>,
         execution_context: Option<cortex::execution_context::ExecutionContext>,
-    ) -> Result<SessionHost, anyhow::Error>;
+    ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>>;
 }
 
 /// Type alias for the boxed server-stream future returned by Send/Stream.
@@ -271,6 +276,7 @@ impl Session for SessionSvc {
         let host = self
             .factory
             .open(resume, execution_context)
+            .await
             .map_err(|e| TStatus::internal(format!("session open failed: {e}")))?;
         let session_id = host.id().to_string();
         let last_event_seq = host.last_event_seq();
@@ -629,6 +635,7 @@ impl Session for SessionSvc {
         let host = self.host_or_err(&req.into_inner().session_id)?;
         let id = host
             .new_agent_session()
+            .await
             .map_err(|e| TStatus::internal(format!("new_session: {e}")))?;
         Ok(Response::new(NewSessionResponse {
             agent_session_id: id,
@@ -679,6 +686,7 @@ impl Session for SessionSvc {
         }
         let host = self.host_or_err(&req.session_id)?;
         host.append_assistant_message(&req.content)
+            .await
             .map_err(|e| TStatus::internal(format!("append_assistant_message: {e}")))?;
         Ok(Response::new(Empty {}))
     }

@@ -10,7 +10,6 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use cortex::db::Database;
 use cortex::ingress::{
     AdmittedIngress, IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId,
 };
@@ -178,6 +177,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use cortex::db::Database;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     use std::sync::Mutex;

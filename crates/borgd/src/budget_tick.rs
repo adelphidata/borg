@@ -30,7 +30,7 @@ pub fn spawn(mut shutdown: broadcast::Receiver<()>) -> tokio::task::JoinHandle<(
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Err(e) = run_once() {
+                    if let Err(e) = run_once().await {
                         tracing::warn!(error = %e, "budget reset tick failed");
                     }
                 }
@@ -43,10 +43,10 @@ pub fn spawn(mut shutdown: broadcast::Receiver<()>) -> tokio::task::JoinHandle<(
     })
 }
 
-fn run_once() -> anyhow::Result<()> {
-    let db = Database::open()?;
+async fn run_once() -> anyhow::Result<()> {
+    let db = Database::open().await?;
     let now = chrono::Utc::now().timestamp();
-    let count = BudgetEngine::reset_if_due(db.conn(), now)?;
+    let count = BudgetEngine::reset_if_due(&db, now).await?;
     if count > 0 {
         tracing::info!(reset_count = count, "advanced expired budget periods");
     }

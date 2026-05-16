@@ -76,7 +76,7 @@ pub async fn boot_gateway(with_executor: bool) -> GatewayHarness {
     // Force a database init so the gateway can open ~/.borg/borg.db
     // without racing — `Database::open()` runs migrations.
     {
-        let _db = cortex::db::Database::open().expect("init borg.db");
+        let _db = cortex::db::Database::open().await.expect("init borg.db");
     }
 
     let port = pick_free_port();
@@ -277,9 +277,11 @@ async fn wait_for_health(base_url: &str) {
 /// Issue a fresh client token via the same code path the
 /// `borg client-token issue` CLI uses, and return the plaintext value
 /// the bearer header should carry.
-pub fn issue_token(label: &str) -> String {
-    let db = cortex::db::Database::open().expect("open db");
-    let issued = cortex::auth::tokens::issue(&db, label, "e2e_test").expect("issue token");
+pub async fn issue_token(label: &str) -> String {
+    let db = cortex::db::Database::open().await.expect("open db");
+    let issued = cortex::auth::tokens::issue(&db, label, "e2e_test")
+        .await
+        .expect("issue token");
     issued.plaintext
 }
 

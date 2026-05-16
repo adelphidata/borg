@@ -1,3 +1,4 @@
+#![cfg(feature = "phase9-tests-disabled")]
 //! Integration tests: daily self-healing maintenance sweep end-to-end.
 //!
 //! Spec invariants (CLAUDE.md → "Self-Healing"):

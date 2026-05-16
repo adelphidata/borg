@@ -674,7 +674,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             "  No channels connected. Add one later with `borg add <name>` (e.g. `borg add telegram`)."
         );
     } else {
-        let mut cfg = match Config::load_from_db() {
+        let mut cfg = match block_on(Config::load_from_db()) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  Warning: failed to load config for channel setup: {e}");

@@ -23,7 +23,9 @@ use protocols::session::session_server::SessionServer;
 use protocols::session::{
     CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest, StreamRequest,
 };
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -116,18 +118,20 @@ impl StubFactory {
 }
 
 impl SessionFactory for StubFactory {
-    fn open(
-        &self,
-        _resume_id: Option<&str>,
+    fn open<'a>(
+        &'a self,
+        _resume_id: Option<&'a str>,
         _execution_context: Option<cortex::execution_context::ExecutionContext>,
-    ) -> Result<SessionHost, anyhow::Error> {
-        let backend = self
-            .next
-            .lock()
-            .expect("factory poisoned")
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("factory exhausted"))?;
-        Ok(SessionHost::new(backend))
+    ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let backend = self
+                .next
+                .lock()
+                .expect("factory poisoned")
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("factory exhausted"))?;
+            Ok(SessionHost::new(backend))
+        })
     }
 }
 

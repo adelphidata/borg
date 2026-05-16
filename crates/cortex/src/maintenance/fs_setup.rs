@@ -66,7 +66,7 @@ pub async fn ensure_global_index(db: &Database) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

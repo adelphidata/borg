@@ -32,15 +32,16 @@ use common::test_db;
 
 // ── Test: record and retrieve vitals events ──
 
-#[test]
-fn record_and_retrieve_events() {
-    let db = test_db();
+#[tokio::test]
+async fn record_and_retrieve_events() {
+    let db = test_db().await;
 
     let deltas = vitals::deltas_for(EventCategory::Interaction);
     db.record_vitals_event("interaction", "test", &deltas, None)
+        .await
         .expect("record event");
 
-    let events = db.vitals_events_since(0).expect("get events");
+    let events = db.vitals_events_since(0).await.expect("get events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].category, "interaction");
     assert_eq!(events[0].source, "test");
@@ -48,19 +49,21 @@ fn record_and_retrieve_events() {
 
 // ── Test: HMAC chain links events ──
 
-#[test]
-fn hmac_chain_links_events() {
-    let db = test_db();
+#[tokio::test]
+async fn hmac_chain_links_events() {
+    let db = test_db().await;
 
     // Record two events
     let d1 = vitals::deltas_for(EventCategory::Interaction);
     let d2 = vitals::deltas_for(EventCategory::Success);
     db.record_vitals_event("interaction", "test", &d1, None)
+        .await
         .expect("record 1");
     db.record_vitals_event("success", "test", &d2, None)
+        .await
         .expect("record 2");
 
-    let events = db.vitals_events_since(0).expect("get events");
+    let events = db.vitals_events_since(0).await.expect("get events");
     assert_eq!(events.len(), 2);
 
     // Events are returned DESC order, so events[0] is newest
@@ -75,15 +78,16 @@ fn hmac_chain_links_events() {
 
 // ── Test: first event chains from "0" ──
 
-#[test]
-fn first_event_chains_from_zero() {
-    let db = test_db();
+#[tokio::test]
+async fn first_event_chains_from_zero() {
+    let db = test_db().await;
 
     let deltas = vitals::deltas_for(EventCategory::Creation);
     db.record_vitals_event("creation", "test", &deltas, None)
+        .await
         .expect("record");
 
-    let events = db.vitals_events_since(0).expect("get events");
+    let events = db.vitals_events_since(0).await.expect("get events");
     assert_eq!(
         events[0].prev_hmac, "0",
         "First event should chain from '0'"
@@ -92,9 +96,9 @@ fn first_event_chains_from_zero() {
 
 // ── Test: multiple event categories recorded independently ──
 
-#[test]
-fn multiple_categories_recorded() {
-    let db = test_db();
+#[tokio::test]
+async fn multiple_categories_recorded() {
+    let db = test_db().await;
 
     let categories = [
         "interaction",
@@ -108,10 +112,11 @@ fn multiple_categories_recorded() {
         let ec = EventCategory::parse(cat).expect("parse category");
         let deltas = vitals::deltas_for(ec);
         db.record_vitals_event(cat, "test", &deltas, None)
+            .await
             .expect("record");
     }
 
-    let events = db.vitals_events_since(0).expect("get events");
+    let events = db.vitals_events_since(0).await.expect("get events");
     assert_eq!(
         events.len(),
         categories.len(),
@@ -285,9 +290,9 @@ fn event_category_parse_unknown() {
 
 // ── Test: metadata stored and retrieved ──
 
-#[test]
-fn metadata_stored_and_retrieved() {
-    let db = test_db();
+#[tokio::test]
+async fn metadata_stored_and_retrieved() {
+    let db = test_db().await;
 
     let deltas = vitals::deltas_for(EventCategory::Interaction);
     db.record_vitals_event(
@@ -296,9 +301,10 @@ fn metadata_stored_and_retrieved() {
         &deltas,
         Some("{\"tool\":\"run_shell\"}"),
     )
+    .await
     .expect("record with metadata");
 
-    let events = db.vitals_events_since(0).expect("get events");
+    let events = db.vitals_events_since(0).await.expect("get events");
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].metadata_json.as_deref(),

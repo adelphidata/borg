@@ -7,10 +7,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex as AsyncMutex;
 use regex::Regex;
 use std::fmt;
 use std::sync::LazyLock;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::Database;
 use crate::hmac_chain;
@@ -783,7 +783,8 @@ impl Hook for VitalsHook {
     async fn execute(&self, ctx: &HookContext) -> HookAction {
         match &ctx.data {
             HookData::SessionStart { .. } => {
-                self.record(EventCategory::Interaction, "session_start").await;
+                self.record(EventCategory::Interaction, "session_start")
+                    .await;
             }
             HookData::AgentStart { user_message } => {
                 if looks_like_negative_sentiment(user_message) {
@@ -792,7 +793,8 @@ impl Hook for VitalsHook {
                 } else if looks_like_correction(user_message) {
                     self.record(EventCategory::Correction, "user_message").await;
                 } else {
-                    self.record(EventCategory::Interaction, "user_message").await;
+                    self.record(EventCategory::Interaction, "user_message")
+                        .await;
                 }
             }
             HookData::ToolResult { name, is_error, .. } => {

@@ -165,7 +165,7 @@ async fn stream_survives_429_then_succeeds_on_second_key() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("hi"), None, tx)
@@ -217,7 +217,7 @@ async fn all_keys_429_surfaces_exhaustion_error() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     let res = client.stream_chat(&user_message("hi"), None, tx).await;
 
@@ -282,7 +282,7 @@ async fn retry_after_header_overrides_config_cooldown() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("hi"), None, tx)
@@ -343,7 +343,7 @@ async fn single_key_pool_429_uses_fallback_provider() {
         .mount(&fallback)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("hi"), None, tx)
@@ -404,7 +404,7 @@ async fn rate_limit_headers_from_success_response_skip_near_empty_key() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
 
     // First request: FillFirst picks A. A succeeds and reports a near-empty
     // bucket via its response headers.
@@ -486,7 +486,7 @@ async fn proactive_disabled_keeps_using_near_empty_credential() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     for _ in 0..2 {
         let (tx, rx) = mpsc::channel(64);
         client
@@ -527,7 +527,7 @@ async fn proactive_within_min_window_does_not_rotate() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     for _ in 0..2 {
         let (tx, rx) = mpsc::channel(64);
         client
@@ -578,7 +578,7 @@ async fn rate_limit_snapshot_captured_from_429_response() {
         .mount(&server)
         .await;
 
-    let mut client = LlmClient::new(&config).expect("client");
+    let mut client = LlmClient::new(&config).await.expect("client");
     let (tx, rx) = mpsc::channel(64);
     client
         .stream_chat(&user_message("hi"), None, tx)

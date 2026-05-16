@@ -22,14 +22,14 @@ use tonic::{Code, Request};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn fresh_admin() -> (AdminSvc, tempfile::TempDir) {
+async fn fresh_admin() -> (AdminSvc, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
         std::env::set_var("BORG_DATA_DIR", tmp.path());
     }
     // Materialize the DB so subsequent handler calls reopen the same file.
-    let _ = Database::open().expect("seed DB open");
+    let _ = Database::open().await.expect("seed DB open");
     (AdminSvc::new(SessionRegistry::new()), tmp)
 }
 
@@ -38,7 +38,7 @@ async fn doctor_squelch_set_then_clear_round_trips_through_db() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin();
+    let (admin, _tmp) = fresh_admin().await;
 
     let now = chrono::Utc::now().timestamp();
     let expires_at = now + 30 * 86_400;
@@ -57,8 +57,8 @@ async fn doctor_squelch_set_then_clear_round_trips_through_db() {
 
     // Verify persisted via a readonly handle so we're not just trusting the
     // handler's own return.
-    let db = Database::open_readonly().expect("readonly");
-    let active = db.doctor_squelch_list_active(now).expect("list");
+    let db = Database::open_readonly().await.expect("readonly");
+    let active = db.doctor_squelch_list_active(now).await.expect("list");
     assert_eq!(active.len(), 1, "set must persist exactly one row");
     assert_eq!(active[0].category, "Host Security");
     assert_eq!(active[0].name, "Application Firewall");
@@ -80,7 +80,7 @@ async fn doctor_squelch_set_then_clear_round_trips_through_db() {
         "clear of an existing row must report removed=true"
     );
 
-    let active_after = db.doctor_squelch_list_active(now).expect("list");
+    let active_after = db.doctor_squelch_list_active(now).await.expect("list");
     assert!(
         active_after.is_empty(),
         "clear must actually delete the row"
@@ -108,7 +108,7 @@ async fn doctor_squelch_set_rejects_empty_and_past_expiry() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin();
+    let (admin, _tmp) = fresh_admin().await;
 
     let future = chrono::Utc::now().timestamp() + 3600;
 
@@ -152,8 +152,8 @@ async fn doctor_squelch_set_rejects_empty_and_past_expiry() {
     assert_eq!(past.code(), Code::InvalidArgument);
 
     // None of the rejected calls should have persisted anything.
-    let db = Database::open_readonly().expect("readonly");
-    let active = db.doctor_squelch_list_active(0).expect("list");
+    let db = Database::open_readonly().await.expect("readonly");
+    let active = db.doctor_squelch_list_active(0).await.expect("list");
     assert!(
         active.is_empty(),
         "rejected calls must not write — found {} row(s)",
@@ -166,7 +166,7 @@ async fn doctor_squelch_clear_rejects_empty_args() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin();
+    let (admin, _tmp) = fresh_admin().await;
 
     let empty = Admin::doctor_squelch_clear(
         &admin,

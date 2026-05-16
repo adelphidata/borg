@@ -33,11 +33,7 @@ impl Database {
     /// Always updates `last_seen_at`. For a divergent hash, updates
     /// `sha256` as well so the next call with the same content reports
     /// `Unchanged`.
-    pub async fn record_skill_seen(
-        &self,
-        name: &str,
-        sha256: &str,
-    ) -> Result<SkillAuditOutcome> {
+    pub async fn record_skill_seen(&self, name: &str, sha256: &str) -> Result<SkillAuditOutcome> {
         let now = chrono::Utc::now().timestamp();
         let mut rows = self
             .conn

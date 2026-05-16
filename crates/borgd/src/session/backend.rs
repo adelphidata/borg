@@ -145,7 +145,7 @@ pub trait SessionBackend: Send + Sync + 'static {
         Err(anyhow::anyhow!("auto_save not supported by this backend"))
     }
     /// Start a fresh agent session, returning the new session id.
-    fn new_agent_session(&self) -> anyhow::Result<String> {
+    async fn new_agent_session(&self) -> anyhow::Result<String> {
         Err(anyhow::anyhow!("new_session not supported by this backend"))
     }
     /// Load an existing agent session from disk by id.
@@ -168,7 +168,7 @@ pub trait SessionBackend: Send + Sync + 'static {
     /// Append a system-injected assistant message to the agent's history.
     /// Default unsupported; production backends mirror it into both
     /// in-memory history and SQLite so the next user turn sees it.
-    fn append_assistant_message(&self, _text: &str) -> anyhow::Result<()> {
+    async fn append_assistant_message(&self, _text: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(
             "append_assistant_message not supported by this backend"
         ))
@@ -204,7 +204,7 @@ impl AgentBackend {
     /// publishes to — passing `None` is fine (the agent loop tolerates an
     /// absent sink), but production wires one through so the TUI footer and
     /// any other subscribers see lifecycle events without polling.
-    pub fn new(
+    pub async fn new(
         config: Config,
         metrics: BorgMetrics,
         resume_id: Option<&str>,
@@ -213,7 +213,7 @@ impl AgentBackend {
         execution_context: Option<cortex::execution_context::ExecutionContext>,
         goal_bus: Option<crate::goal_bus::GoalEventBus>,
     ) -> anyhow::Result<Arc<Self>> {
-        let mut agent = Agent::new(config, metrics)?;
+        let mut agent = Agent::new(config, metrics).await?;
         if let Some(execution_context) = execution_context {
             agent.set_execution_context(execution_context);
         }
@@ -230,25 +230,25 @@ impl AgentBackend {
         // Register the same hook set the in-process REPL/TUI uses. Failed
         // registration is non-fatal — log so operators can debug "why is XP
         // not advancing" rather than have it silently drop.
-        match cortex::vitals::VitalsHook::new() {
+        match cortex::vitals::VitalsHook::new().await {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "vitals hook unavailable"),
         }
-        match cortex::activity_log::ActivityHook::new() {
+        match cortex::activity_log::ActivityHook::new().await {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "activity_log hook unavailable"),
         }
-        match cortex::bond::BondHook::new() {
+        match cortex::bond::BondHook::new().await {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "bond hook unavailable"),
         }
         if agent.config().evolution.enabled {
-            match cortex::evolution::EvolutionHook::new() {
+            match cortex::evolution::EvolutionHook::new().await {
                 Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
                 Err(e) => tracing::warn!(error = %e, "evolution hook unavailable"),
             }
         }
-        match cortex::budgets::BudgetHook::new() {
+        match cortex::budgets::BudgetHook::new().await {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "budget hook unavailable"),
         }
@@ -259,7 +259,7 @@ impl AgentBackend {
         if let Some(id) = resume_id {
             if let Err(e) = agent.load_session(id) {
                 tracing::warn!(session_id = %id, error = %e, "load_session failed; starting fresh");
-                agent.new_session();
+                agent.new_session().await;
             }
         }
 
@@ -358,7 +358,7 @@ impl SessionBackend for AgentBackend {
 
     async fn close_session(&self) -> anyhow::Result<()> {
         let mut agent = self.agent.lock().await;
-        agent.end_session();
+        agent.end_session().await;
         Ok(())
     }
 
@@ -389,9 +389,9 @@ impl SessionBackend for AgentBackend {
         Ok(())
     }
 
-    fn new_agent_session(&self) -> anyhow::Result<String> {
-        let mut agent = lock_agent(&self.agent);
-        agent.new_session();
+    async fn new_agent_session(&self) -> anyhow::Result<String> {
+        let mut agent = self.agent.lock().await;
+        agent.new_session().await;
         Ok(agent.session().meta.id.clone())
     }
 
@@ -424,9 +424,9 @@ impl SessionBackend for AgentBackend {
             .map_err(|e| anyhow::anyhow!("steer channel closed: {e}"))
     }
 
-    fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
-        let mut agent = lock_agent(&self.agent);
-        agent.append_assistant_message(text);
+    async fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
+        let mut agent = self.agent.lock().await;
+        agent.append_assistant_message(text).await;
         Ok(())
     }
 
@@ -440,23 +440,19 @@ impl SessionBackend for AgentBackend {
             agent.session().meta.id.clone()
         };
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<ForkOutcome> {
-            let db = cortex::db::Database::open()?;
-            let msgs = db.load_session_messages(&parent_id)?;
-            let anchor = msgs
-                .last()
-                .map(|m| m.id)
-                .ok_or_else(|| anyhow::anyhow!("session has no messages"))?;
-            drop(db);
-            let forked = cortex::session::fork_session(&parent_id, anchor)?;
-            Ok(ForkOutcome {
-                forked_agent_session_id: forked.meta.id,
-                title: forked.meta.title,
-                message_count: forked.meta.message_count as u64,
-            })
+        let db = cortex::db::Database::open().await?;
+        let msgs = db.load_session_messages(&parent_id).await?;
+        let anchor = msgs
+            .last()
+            .map(|m| m.id)
+            .ok_or_else(|| anyhow::anyhow!("session has no messages"))?;
+        drop(db);
+        let forked = cortex::session::fork_session(&parent_id, anchor).await?;
+        Ok(ForkOutcome {
+            forked_agent_session_id: forked.meta.id,
+            title: forked.meta.title,
+            message_count: forked.meta.message_count as u64,
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("fork task panicked: {e}"))?
     }
 }
 

@@ -56,39 +56,37 @@ pub(crate) enum ProvidersAction {
 }
 
 /// Dispatch `borg providers ...`.
-pub(crate) fn dispatch(action: ProvidersAction) -> Result<()> {
+pub(crate) async fn dispatch(action: ProvidersAction) -> Result<()> {
     match action {
-        ProvidersAction::List => list(),
+        ProvidersAction::List => list().await,
         ProvidersAction::Add {
             id,
             display_name,
             base_url,
             api_key_env,
             category,
-        } => add(id, display_name, base_url, api_key_env, &category),
-        ProvidersAction::Remove { id } => remove(id),
+        } => add(id, display_name, base_url, api_key_env, &category).await,
+        ProvidersAction::Remove { id } => remove(id).await,
         ProvidersAction::RefreshRates { manifest_url } => refresh_rates(manifest_url.as_deref()),
     }
 }
 
-fn remove(id: String) -> Result<()> {
+async fn remove(id: String) -> Result<()> {
     if id.is_empty() {
         bail!("--id must be non-empty");
     }
-    tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .remove_provider(&id)
-            .await
-            .with_context(|| format!("removing provider '{id}'"))
-    })?;
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    client
+        .remove_provider(&id)
+        .await
+        .with_context(|| format!("removing provider '{id}'"))?;
     println!("Removed provider '{id}' (no-op if it wasn't present).");
     Ok(())
 }
 
-fn list() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let rows = ProviderRow::list(db.conn())?;
+async fn list() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let rows = ProviderRow::list(&db).await?;
     if rows.is_empty() {
         println!("No BYO providers configured.");
         println!("(Built-ins openai, anthropic, bedrock, gemini, deepseek, groq, openrouter, ollama, claude_cli are always available.)");
@@ -114,7 +112,7 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn add(
+async fn add(
     id: String,
     display_name: Option<String>,
     base_url: String,
@@ -129,19 +127,17 @@ fn add(
     let _ = parse_category(category_str)?;
     let display_name = display_name.unwrap_or_else(|| id.clone());
 
-    tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .add_provider(
-                &id,
-                &display_name,
-                &base_url,
-                api_key_env.as_deref(),
-                category_str,
-            )
-            .await
-            .with_context(|| format!("inserting provider '{id}'"))
-    })?;
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    client
+        .add_provider(
+            &id,
+            &display_name,
+            &base_url,
+            api_key_env.as_deref(),
+            category_str,
+        )
+        .await
+        .with_context(|| format!("inserting provider '{id}'"))?;
     println!("Added provider '{id}'.");
     Ok(())
 }

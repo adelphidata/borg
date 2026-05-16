@@ -80,14 +80,7 @@ impl BudgetHook {
     /// (treat as priceless — local providers, mostly).
     async fn estimate_for_prompt_tokens(db: &Database, prompt_tokens: u64) -> Usd {
         let (provider_id, model) = active_provider_and_model(db).await;
-        match RateCard::lookup(
-            db,
-            &provider_id,
-            &model,
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        {
+        match RateCard::lookup(db, &provider_id, &model, chrono::Utc::now().timestamp()).await {
             Ok(Some(row)) => RateCard::price(&row, prompt_tokens, 0),
             Ok(None) => Usd::ZERO,
             Err(e) => {

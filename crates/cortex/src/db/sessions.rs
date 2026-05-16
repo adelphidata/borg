@@ -22,13 +22,15 @@ impl Database {
         model: &str,
         title: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO sessions (id, created_at, updated_at, total_tokens, model, title)
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, created_at, updated_at, total_tokens, model, title)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                 updated_at = ?3, total_tokens = ?4, model = ?5, title = ?6",
-            params!(id, created_at, updated_at, total_tokens, model, title),
-        ).await?;
+                params!(id, created_at, updated_at, total_tokens, model, title),
+            )
+            .await?;
         Ok(())
     }
 
@@ -90,13 +92,16 @@ impl Database {
     /// like the heartbeat invoke this with `since=0` (= "all sessions"), which
     /// would otherwise scan the entire table for power users.
     pub async fn sessions_since(&self, since: i64) -> Result<Vec<SessionRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, created_at, updated_at, total_tokens, model, title,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, created_at, updated_at, total_tokens, model, title,
                     parent_session_id, forked_from_message_id
              FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
              LIMIT ?2",
-            params!(since, SESSIONS_SINCE_HARD_CAP),
-        ).await?;
+                params!(since, SESSIONS_SINCE_HARD_CAP),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(SessionRow {
@@ -203,24 +208,28 @@ impl Database {
             anyhow::bail!("anchor message {anchor_message_id} not found in session '{parent_id}'");
         }
 
-        let tx = self.conn.unchecked_transaction().await?;
-        tx.execute(
-            "INSERT INTO sessions
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<u64> = async {
+            self.conn
+                .execute(
+                    "INSERT INTO sessions
                 (id, created_at, updated_at, total_tokens, model, title,
                  parent_session_id, forked_from_message_id)
              VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5, ?6)",
-            params!(
-                new_id,
-                now,
-                parent.model,
-                new_title,
-                parent_id,
-                anchor_message_id,
-            ),
-        )
-        .await?;
-        let copied = tx.execute(
-            "INSERT INTO messages
+                    params!(
+                        new_id,
+                        now,
+                        parent.model,
+                        new_title,
+                        parent_id,
+                        anchor_message_id,
+                    ),
+                )
+                .await?;
+            let copied = self
+                .conn
+                .execute(
+                    "INSERT INTO messages
                 (session_id, role, content, tool_calls_json, tool_call_id,
                  timestamp, created_at, content_parts_json)
              SELECT ?1, role, content, tool_calls_json, tool_call_id,
@@ -228,10 +237,24 @@ impl Database {
              FROM messages
              WHERE session_id = ?2 AND id <= ?3
              ORDER BY id ASC",
-            params!(new_id, parent_id, anchor_message_id),
-        ).await?;
-        tx.commit().await?;
-        Ok(copied as usize)
+                    params!(new_id, parent_id, anchor_message_id),
+                )
+                .await?;
+            Ok(copied)
+        }
+        .await;
+        match result {
+            Ok(copied) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(copied as usize)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("sessions: rollback after fork failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete_session_messages(&self, session_id: &str) -> Result<usize> {
@@ -460,10 +483,7 @@ impl Database {
     /// in the window (asserting MAX, not arbitrary-row, is a tested
     /// invariant). Sorted by message count descending.
     #[instrument(skip_all)]
-    pub async fn channel_activity_since(
-        &self,
-        since_ts: i64,
-    ) -> Result<Vec<ChannelActivityRow>> {
+    pub async fn channel_activity_since(&self, since_ts: i64) -> Result<Vec<ChannelActivityRow>> {
         let mut rows = self
             .conn
             .query(
@@ -489,16 +509,15 @@ impl Database {
 
     /// Keep the last `keep` messages in a session, deleting older ones.
     /// Returns the number of deleted messages.
-    pub async fn compact_session_messages(
-        &self,
-        session_id: &str,
-        keep: usize,
-    ) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN \
+    pub async fn compact_session_messages(&self, session_id: &str, keep: usize) -> Result<usize> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN \
              (SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params!(session_id, keep as i64),
-        ).await?;
+                params!(session_id, keep as i64),
+            )
+            .await?;
         Ok(count as usize)
     }
 
@@ -520,12 +539,10 @@ impl Database {
         // Message ids are i64 from SQLite ROWIDs — safe to embed in SQL.
         let id_list: String = ids_to_delete
             .iter()
-            .map(|id| id.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "DELETE FROM messages WHERE session_id = ?1 AND id IN ({id_list})"
-        );
+        let sql = format!("DELETE FROM messages WHERE session_id = ?1 AND id IN ({id_list})");
         let count = self.conn.execute(&sql, params!(session_id)).await?;
         Ok(count as usize)
     }
@@ -550,22 +567,23 @@ impl Database {
             return Ok(Vec::new());
         }
         let candidate_limit = limit.saturating_mul(4).min(200).max(limit);
-        let mut rows = self.conn.query(
-            "SELECT id, session_id, role, content, created_at
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, session_id, role, content, created_at
              FROM messages
              WHERE content MATCH ?1
              LIMIT ?2",
-            params!(sanitized, candidate_limit as i64),
-        ).await?;
+                params!(sanitized, candidate_limit as i64),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(MessageFtsHit {
                 id: row.get::<i64>(0)?,
                 session_id: row.get::<String>(1)?,
                 role: row.get::<String>(2)?,
-                content: row
-                    .get::<Option<String>>(3)?
-                    .unwrap_or_default(),
+                content: row.get::<Option<String>>(3)?.unwrap_or_default(),
                 created_at: row.get::<i64>(4)?,
                 score: 0.0,
             });

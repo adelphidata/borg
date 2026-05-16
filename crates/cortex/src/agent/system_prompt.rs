@@ -227,10 +227,7 @@ pub(super) const SCHEDULED_TASKS_MAX_LISTED: usize = 5;
 
 /// Pure formatter — extracted so the section can be unit-tested without
 /// constructing a full `Agent` (which requires sessions, metrics, etc.).
-pub(super) async fn render_scheduled_tasks_snapshot(
-    db: &crate::db::Database,
-    now: i64,
-) -> String {
+pub(super) async fn render_scheduled_tasks_snapshot(db: &crate::db::Database, now: i64) -> String {
     let failing = match db.tasks_with_last_error().await {
         Ok(rows) => rows,
         Err(e) => {

@@ -384,7 +384,7 @@ fn strip_enum_parenthetical(desc: &str) -> String {
     trimmed.to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

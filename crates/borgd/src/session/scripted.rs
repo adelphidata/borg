@@ -20,6 +20,8 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use cortex::agent::AgentEvent;
 use cortex::execution_context::{ExecutionContext, TextFileBridge};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -238,21 +240,23 @@ impl ScriptedFactory {
 }
 
 impl SessionFactory for ScriptedFactory {
-    fn open(
-        &self,
-        _resume_id: Option<&str>,
+    fn open<'a>(
+        &'a self,
+        _resume_id: Option<&'a str>,
         execution_context: Option<ExecutionContext>,
-    ) -> Result<SessionHost, anyhow::Error> {
-        self.capture_context
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(execution_context);
-        let backend = self
-            .backends
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
-            .ok_or_else(|| anyhow!("ScriptedFactory exhausted"))?;
-        Ok(SessionHost::new(backend))
+    ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.capture_context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(execution_context);
+            let backend = self
+                .backends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+                .ok_or_else(|| anyhow!("ScriptedFactory exhausted"))?;
+            Ok(SessionHost::new(backend))
+        })
     }
 }

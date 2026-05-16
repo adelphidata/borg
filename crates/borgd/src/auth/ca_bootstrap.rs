@@ -46,8 +46,12 @@ const SERVER_VALIDITY_DAYS: u32 = 90;
 /// → file fallback, or a non-atomic bootstrap that persisted the cert before
 /// the key write succeeded). The orphaned cert is revoked and a fresh CA is
 /// minted so the daemon boots instead of crash-looping.
-pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, String)> {
-    if let Some(row) = db.latest_active_cert("root").context("query root ca")? {
+pub async fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, String)> {
+    if let Some(row) = db
+        .latest_active_cert("root")
+        .await
+        .context("query root ca")?
+    {
         match kek.get(ROOT_CA_KEY) {
             Ok(key_bytes) => {
                 let key_pem = String::from_utf8(key_bytes).context("root CA key not utf-8 PEM")?;
@@ -60,6 +64,7 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
                     "root CA cert in DB but private key missing from KEK; revoking and minting fresh CA — paired devices will need to re-pair"
                 );
                 db.mark_cert_revoked(row.serial, Some("kek-key-missing-self-heal"))
+                    .await
                     .context("revoke orphaned root CA")?;
                 // Server-cert revocation is handled by the unconditional
                 // sweep below — running it on every fresh-root mint also
@@ -83,6 +88,7 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
         meta.not_before,
         meta.not_after,
     )
+    .await
     .context("persist root CA")?;
 
     // Any active server cert here was issued by the previous root and is now
@@ -91,9 +97,11 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
     // boot when there are no server rows yet.
     if let Some(srv) = db
         .latest_active_cert("server")
+        .await
         .context("query server cert after root rotation")?
     {
         db.mark_cert_revoked(srv.serial, Some("root-ca-rotated-self-heal"))
+            .await
             .context("revoke server cert chained to rotated CA")?;
         if let Err(e) = kek.delete(SERVER_CERT_KEY) {
             tracing::warn!(error = %e, "drop orphaned server KEK key after root rotation");
@@ -104,7 +112,7 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
 }
 
 /// Ensure an active server cert exists. Renews if ≤14d to expiry.
-pub fn ensure_server_cert(
+pub async fn ensure_server_cert(
     db: &Database,
     kek: &dyn KekStore,
     ca_cert_pem: &str,
@@ -115,6 +123,7 @@ pub fn ensure_server_cert(
 
     if let Some(row) = db
         .latest_active_cert("server")
+        .await
         .context("query server cert")?
     {
         match kek.get(SERVER_CERT_KEY) {
@@ -132,8 +141,9 @@ pub fn ensure_server_cert(
                 }
                 // Renew: mint new, mark old renewed.
                 let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
-                let serial = persist_server_cert(db, kek, &issued, &new_key)?;
+                let serial = persist_server_cert(db, kek, &issued, &new_key).await?;
                 db.mark_cert_renewed(row.serial)
+                    .await
                     .context("mark old renewed")?;
                 return Ok((issued.cert_pem, new_key, serial));
             }
@@ -143,6 +153,7 @@ pub fn ensure_server_cert(
                     "server cert in DB but private key missing from KEK; revoking and re-issuing"
                 );
                 db.mark_cert_revoked(row.serial, Some("kek-key-missing-self-heal"))
+                    .await
                     .context("revoke orphaned server cert")?;
             }
             Err(e) => return Err(anyhow!("load server cert key from keychain: {e}")),
@@ -150,7 +161,7 @@ pub fn ensure_server_cert(
     }
 
     let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
-    let serial = persist_server_cert(db, kek, &issued, &new_key)?;
+    let serial = persist_server_cert(db, kek, &issued, &new_key).await?;
     Ok((issued.cert_pem, new_key, serial))
 }
 
@@ -167,7 +178,7 @@ fn mint_server_cert(
     issue_server_cert(ca_cert_pem, ca_key_pem, &params).context("issue server cert")
 }
 
-fn persist_server_cert(
+async fn persist_server_cert(
     db: &Database,
     kek: &dyn KekStore,
     issued: &identity::IssuedCert,
@@ -178,14 +189,16 @@ fn persist_server_cert(
     // no DB row, instead of an orphan cert that triggers self-heal next boot.
     kek.put(SERVER_CERT_KEY, key_pem.as_bytes())
         .map_err(|e| anyhow!("stash server key: {e}"))?;
-    let serial = db.insert_internal_cert(
-        "server",
-        &issued.cert_pem,
-        &fp,
-        "borgd",
-        issued.not_before,
-        issued.not_after,
-    )?;
+    let serial = db
+        .insert_internal_cert(
+            "server",
+            &issued.cert_pem,
+            &fp,
+            "borgd",
+            issued.not_before,
+            issued.not_after,
+        )
+        .await?;
     Ok(serial)
 }
 
@@ -193,53 +206,61 @@ fn persist_server_cert(
 mod tests {
     use super::*;
     use identity::MemoryKekStore;
-    use rusqlite::Connection;
 
-    fn db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("db")).expect("init")
+    async fn db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn root_ca_minted_once_then_loaded_from_db() {
+    #[tokio::test]
+    async fn root_ca_minted_once_then_loaded_from_db() {
         let kek = MemoryKekStore::new();
-        let d = db();
-        let (pem1, key1) = ensure_root_ca(&d, &kek).expect("first");
-        let (pem2, key2) = ensure_root_ca(&d, &kek).expect("second");
+        let d = db().await;
+        let (pem1, key1) = ensure_root_ca(&d, &kek).await.expect("first");
+        let (pem2, key2) = ensure_root_ca(&d, &kek).await.expect("second");
         // Identical CA on second call (loaded, not regenerated).
         assert_eq!(pem1, pem2);
         assert_eq!(key1, key2);
     }
 
-    #[test]
-    fn server_cert_minted_once_then_loaded_from_db() {
+    #[tokio::test]
+    async fn server_cert_minted_once_then_loaded_from_db() {
         let kek = MemoryKekStore::new();
-        let d = db();
-        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let d = db().await;
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
         let san = vec!["localhost".to_string()];
-        let (s1, _, serial1) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("first");
-        let (s2, _, serial2) =
-            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("second");
+        let (s1, _, serial1) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("first");
+        let (s2, _, serial2) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("second");
         assert_eq!(s1, s2);
         assert_eq!(serial1, serial2);
     }
 
-    #[test]
-    fn missing_keychain_entry_self_heals_with_fresh_ca() {
+    #[tokio::test]
+    async fn missing_keychain_entry_self_heals_with_fresh_ca() {
         // Self-healing on KEK loss is what unblocks the daemon after a backend
         // swap (e.g. losing kek.enc/passphrase on a headless VPS). Without it
         // the orphaned cert in `internal_ca_certs` puts borgd in a crash loop.
         let kek = MemoryKekStore::new();
-        let d = db();
-        let (orig_pem, orig_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let d = db().await;
+        let (orig_pem, orig_key) = ensure_root_ca(&d, &kek).await.expect("ca");
         // Simulate KEK loss (e.g. file backend wiped, OS keychain swapped).
         kek.delete(ROOT_CA_KEY).expect("delete");
 
-        let (new_pem, new_key) = ensure_root_ca(&d, &kek).expect("self-heal mints fresh CA");
+        let (new_pem, new_key) = ensure_root_ca(&d, &kek)
+            .await
+            .expect("self-heal mints fresh CA");
         assert_ne!(orig_pem, new_pem, "must mint a brand new CA");
         assert_ne!(orig_key, new_key);
 
         // The orphaned row must be revoked, not still active.
-        let active = d.latest_active_cert("root").expect("query").expect("row");
+        let active = d
+            .latest_active_cert("root")
+            .await
+            .expect("query")
+            .expect("row");
         assert_ne!(
             active.pem, orig_pem,
             "old cert should no longer be the latest active"
@@ -247,44 +268,49 @@ mod tests {
         assert_eq!(active.pem, new_pem);
     }
 
-    #[test]
-    fn root_self_heal_also_revokes_server_cert() {
+    #[tokio::test]
+    async fn root_self_heal_also_revokes_server_cert() {
         // If only the root key is missing but the server key is intact, the
         // pre-fix code would mint a new CA, then `ensure_server_cert` would
         // see a still-active server row + valid key and reuse it — yielding
         // a leaf chained to a CA that no longer exists. The cascade in
         // `ensure_root_ca` must revoke the server row too.
         let kek = MemoryKekStore::new();
-        let d = db();
-        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let d = db().await;
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
         let san = vec!["localhost".to_string()];
-        let (orig_server, _, orig_serial) =
-            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("server");
+        let (orig_server, _, orig_serial) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("server");
 
         // Lose only the root CA key.
         kek.delete(ROOT_CA_KEY).expect("wipe root key");
 
-        let (new_ca_pem, new_ca_key) = ensure_root_ca(&d, &kek).expect("self-heal ca");
+        let (new_ca_pem, new_ca_key) = ensure_root_ca(&d, &kek).await.expect("self-heal ca");
         assert_ne!(ca_pem, new_ca_pem);
 
         let (new_server, _, new_serial) =
-            ensure_server_cert(&d, &kek, &new_ca_pem, &new_ca_key, &san).expect("server re-issue");
+            ensure_server_cert(&d, &kek, &new_ca_pem, &new_ca_key, &san)
+                .await
+                .expect("server re-issue");
         assert_ne!(orig_server, new_server, "server cert must be re-issued");
         assert_ne!(orig_serial, new_serial);
     }
 
-    #[test]
-    fn server_cert_self_heals_when_key_missing() {
+    #[tokio::test]
+    async fn server_cert_self_heals_when_key_missing() {
         let kek = MemoryKekStore::new();
-        let d = db();
-        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let d = db().await;
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
         let san = vec!["localhost".to_string()];
-        let (orig, _, orig_serial) =
-            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("first");
+        let (orig, _, orig_serial) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("first");
         kek.delete(SERVER_CERT_KEY).expect("wipe server key");
 
-        let (fresh, _, fresh_serial) =
-            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("self-heal");
+        let (fresh, _, fresh_serial) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("self-heal");
         assert_ne!(orig, fresh);
         assert_ne!(orig_serial, fresh_serial);
     }

@@ -24,7 +24,7 @@ impl Database {
         self.conn.execute(
             "INSERT INTO pairing_requests (id, channel_name, sender_id, code, status, display_name, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
-            params!(id.clone(), channel_name, sender_id, code, display_name.map(|s| s.to_string()), now, expires_at),
+            params!(id.clone(), channel_name, sender_id, code, display_name.map(std::string::ToString::to_string), now, expires_at),
         ).await?;
         Ok(id)
     }
@@ -102,53 +102,64 @@ impl Database {
         let code = code.to_lowercase();
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self.conn.unchecked_transaction().await?;
-
-        // Find the pending request within the transaction
-        let request = {
-            let mut rows = tx.query(
-                "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<PairingRequestRow> = async {
+            // Find the pending request within the transaction
+            let request = {
+                let mut rows = self.conn.query(
+                    "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
                  FROM pairing_requests
                  WHERE channel_name = ?1 AND code = ?2 AND status = 'pending' AND expires_at > ?3",
-                params!(channel_name, code.clone(), now),
-            ).await?;
-            match rows.next().await? {
-                Some(row) => Self::pairing_row_from_turso(&row)?,
-                None => {
-                    anyhow::bail!(
-                        "No pending pairing request found for channel '{channel_name}' with code '{code}'"
-                    );
+                    params!(channel_name, code.clone(), now),
+                ).await?;
+                match rows.next().await? {
+                    Some(row) => Self::pairing_row_from_turso(&row)?,
+                    None => {
+                        anyhow::bail!(
+                            "No pending pairing request found for channel '{channel_name}' with code '{code}'"
+                        );
+                    }
                 }
-            }
-        };
+            };
 
-        tx.execute(
-            "UPDATE pairing_requests SET status = 'approved', approved_at = ?1 WHERE id = ?2",
-            params!(now, request.id.clone()),
-        )
-        .await?;
+            self.conn.execute(
+                "UPDATE pairing_requests SET status = 'approved', approved_at = ?1 WHERE id = ?2",
+                params!(now, request.id.clone()),
+            )
+            .await?;
 
-        tx.execute(
-            "INSERT INTO approved_senders (channel_name, sender_id, display_name, approved_at, pairing_request_id)
+            self.conn.execute(
+                "INSERT INTO approved_senders (channel_name, sender_id, display_name, approved_at, pairing_request_id)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(channel_name, sender_id) DO UPDATE SET
                 approved_at = ?4, pairing_request_id = ?5",
-            params!(
-                request.channel_name.clone(),
-                request.sender_id.clone(),
-                request.display_name.clone(),
-                now,
-                request.id.clone(),
-            ),
-        ).await?;
+                params!(
+                    request.channel_name.clone(),
+                    request.sender_id.clone(),
+                    request.display_name.clone(),
+                    now,
+                    request.id.clone(),
+                ),
+            ).await?;
 
-        tx.commit().await?;
-
-        Ok(PairingRequestRow {
-            status: "approved".into(),
-            approved_at: Some(now),
-            ..request
-        })
+            Ok(request)
+        }.await;
+        match result {
+            Ok(request) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(PairingRequestRow {
+                    status: "approved".into(),
+                    approved_at: Some(now),
+                    ..request
+                })
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("pairing: rollback after approve failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Remove expired pending pairing requests.
@@ -286,10 +297,7 @@ impl Database {
         }
     }
 
-    async fn list_approved_senders_for_channel(
-        &self,
-        ch: &str,
-    ) -> Result<Vec<ApprovedSenderRow>> {
+    async fn list_approved_senders_for_channel(&self, ch: &str) -> Result<Vec<ApprovedSenderRow>> {
         let mut rows = self
             .conn
             .query(
@@ -339,10 +347,7 @@ mod tests {
             .unwrap();
         assert!(!id.is_empty());
 
-        let found = db
-            .find_pending_pairing("telegram", "ABC123")
-            .await
-            .unwrap();
+        let found = db.find_pending_pairing("telegram", "ABC123").await.unwrap();
         assert!(found.is_some());
         let req = found.unwrap();
         assert_eq!(req.channel_name, "telegram");

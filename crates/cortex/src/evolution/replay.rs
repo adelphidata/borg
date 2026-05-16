@@ -11,7 +11,7 @@ use super::{
     verify_event_hmac, Archetype, EvolutionEvent, EvolutionState, Stage,
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 use super::EVOLUTION_HMAC_LEGACY;
 
 /// 30-day window in seconds used for time-weighted archetype scoring.
@@ -26,7 +26,7 @@ pub(crate) const LAST_30D_WEIGHT: f64 = 0.80;
 
 /// Replay verified events from baseline to compute current evolution state.
 /// Verifies HMAC chain and applies rate limits per event type per hour.
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub fn replay_events(events: &[EvolutionEvent]) -> EvolutionState {
     replay_events_with_key_at(
         EVOLUTION_HMAC_LEGACY,

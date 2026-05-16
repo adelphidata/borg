@@ -44,25 +44,23 @@ fn drift_notice_for_vitals(
 #[tonic::async_trait]
 impl Status for StatusSvc {
     async fn get_vitals(&self, _req: Request<Empty>) -> Result<Response<Vitals>, TStatus> {
-        let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let raw = db.get_vitals_state()?;
-            let now = chrono::Utc::now();
-            let state = cortex::vitals::apply_decay(&raw, now);
-            let drift_notice = drift_notice_for_vitals(&raw, now);
-            let evo = match db.get_evolution_state() {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    tracing::warn!(error = %e, "evolution state load failed");
-                    None
-                }
-            };
-            Ok((state, evo, drift_notice))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("vitals task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("vitals load failed: {e}")))?;
-        let (state, evo, drift_notice) = snap;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("vitals load failed: {e}")))?;
+        let raw = db
+            .get_vitals_state()
+            .await
+            .map_err(|e| TStatus::internal(format!("vitals load failed: {e}")))?;
+        let now = chrono::Utc::now();
+        let state = cortex::vitals::apply_decay(&raw, now);
+        let drift_notice = drift_notice_for_vitals(&raw, now);
+        let evo = match db.get_evolution_state().await {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(error = %e, "evolution state load failed");
+                None
+            }
+        };
         let (stage, xp) = match evo {
             Some(e) => {
                 let stage = match e.stage {
@@ -92,13 +90,12 @@ impl Status for StatusSvc {
         // posture event yet, fall back to `Default × 1.00` rather than
         // fabricating a state — `xp_gain` writes use the same fallback path
         // (FallbackReason::PostureUndetermined).
-        let head = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            cortex::evolution::security::current_posture(&db)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("posture task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("posture load failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("posture load failed: {e}")))?;
+        let head = cortex::evolution::security::current_posture(&db)
+            .await
+            .map_err(|e| TStatus::internal(format!("posture load failed: {e}")))?;
         let state = head.unwrap_or(cortex::evolution::security::PostureState::Default);
         Ok(Response::new(Posture {
             posture: state.as_str().into(),
@@ -111,9 +108,8 @@ impl Status for StatusSvc {
         // cap; map it onto the wire field as-is and leave spent at 0 until
         // cost tracking is wired. Renaming the proto field is a wire-break
         // saved for the same change.
-        let cfg = tokio::task::spawn_blocking(Config::load_from_db)
+        let cfg = Config::load_from_db()
             .await
-            .map_err(|e| TStatus::internal(format!("config task panicked: {e}")))?
             .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
         Ok(Response::new(Budget {
             daily_usd_cap: cfg.budget.monthly_token_limit as f64,
@@ -125,13 +121,13 @@ impl Status for StatusSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<EvolutionStateProto>, TStatus> {
-        let state = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.get_evolution_state()
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("evolution task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("evolution load failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("evolution load failed: {e}")))?;
+        let state = db
+            .get_evolution_state()
+            .await
+            .map_err(|e| TStatus::internal(format!("evolution load failed: {e}")))?;
         let archetype_scores = state
             .archetype_scores
             .iter()
@@ -154,20 +150,18 @@ impl Status for StatusSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<BondStateProto>, TStatus> {
-        let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let events = db.get_all_bond_events()?;
-            let key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
-            let state = cortex::bond::replay_events_with_key(&key, &events);
-            let correction = cortex::bond::compute_correction_rate(&db);
-            let routine = cortex::bond::compute_routine_success_rate(&db);
-            let pref = cortex::bond::compute_preference_learning_count(&db);
-            Ok((state, correction, routine, pref))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("bond task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("bond load failed: {e}")))?;
-        let (state, correction, routine, pref) = snap;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("bond load failed: {e}")))?;
+        let events = db
+            .get_all_bond_events()
+            .await
+            .map_err(|e| TStatus::internal(format!("bond load failed: {e}")))?;
+        let key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
+        let state = cortex::bond::replay_events_with_key(&key, &events);
+        let correction = cortex::bond::compute_correction_rate(&db).await;
+        let routine = cortex::bond::compute_routine_success_rate(&db).await;
+        let pref = cortex::bond::compute_preference_learning_count(&db).await;
         Ok(Response::new(BondStateProto {
             score: state.score as f64,
             level: state.level.to_string().to_lowercase(),
@@ -182,13 +176,13 @@ impl Status for StatusSvc {
         req: Request<Int64Cursor>,
     ) -> Result<Response<BondEventList>, TStatus> {
         let since = req.into_inner().since_unix;
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.bond_events_since(since)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("bond_events panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("bond_events failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("bond_events failed: {e}")))?;
+        let rows = db
+            .bond_events_since(since)
+            .await
+            .map_err(|e| TStatus::internal(format!("bond_events failed: {e}")))?;
         Ok(Response::new(BondEventList {
             events: rows
                 .into_iter()
@@ -207,13 +201,13 @@ impl Status for StatusSvc {
         req: Request<Int64Cursor>,
     ) -> Result<Response<EvolutionEventList>, TStatus> {
         let since = req.into_inner().since_unix;
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.evolution_events_since(since)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("evolution_events panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("evolution_events failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("evolution_events failed: {e}")))?;
+        let rows = db
+            .evolution_events_since(since)
+            .await
+            .map_err(|e| TStatus::internal(format!("evolution_events failed: {e}")))?;
         Ok(Response::new(EvolutionEventList {
             events: rows
                 .into_iter()
@@ -232,13 +226,13 @@ impl Status for StatusSvc {
         req: Request<Int64Cursor>,
     ) -> Result<Response<VitalsEventList>, TStatus> {
         let since = req.into_inner().since_unix;
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.vitals_events_since(since)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("vitals_events panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("vitals_events failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("vitals_events failed: {e}")))?;
+        let rows = db
+            .vitals_events_since(since)
+            .await
+            .map_err(|e| TStatus::internal(format!("vitals_events failed: {e}")))?;
         Ok(Response::new(VitalsEventList {
             events: rows
                 .into_iter()
@@ -257,38 +251,38 @@ impl Status for StatusSvc {
     }
 
     async fn get_xp(&self, _req: Request<Empty>) -> Result<Response<XpSnapshot>, TStatus> {
-        let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let state = db.get_evolution_state()?;
-            // Surface the same recent feed `/xp` shows today: level_up +
-            // milestone_unlocked events. Cap matches the popup's window so
-            // the wire response can't unboundedly grow.
-            const RECENT_LIMIT: usize = 20;
-            let mut recent: Vec<XpEvent> = state
-                .level_up_events_recent
-                .iter()
-                .take(RECENT_LIMIT)
-                .map(|e| XpEvent {
-                    timestamp: e.created_at,
-                    source: e.source.clone(),
-                    amount: e.xp_delta.max(0) as u32,
-                })
-                .collect();
-            // Newest first.
-            recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            // Per `level_from_xp` semantics, `xp_to_next_level` is `0` only at
-            // a saturated stage cap; pass it through verbatim so the client
-            // can decide how to render.
-            Ok(XpSnapshot {
-                total_xp: state.total_xp as u64,
-                level: state.level as u32,
-                next_level_xp: state.xp_to_next_level as u64,
-                recent_events: recent,
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("xp load failed: {e}")))?;
+        let state = db
+            .get_evolution_state()
+            .await
+            .map_err(|e| TStatus::internal(format!("xp load failed: {e}")))?;
+        // Surface the same recent feed `/xp` shows today: level_up +
+        // milestone_unlocked events. Cap matches the popup's window so
+        // the wire response can't unboundedly grow.
+        const RECENT_LIMIT: usize = 20;
+        let mut recent: Vec<XpEvent> = state
+            .level_up_events_recent
+            .iter()
+            .take(RECENT_LIMIT)
+            .map(|e| XpEvent {
+                timestamp: e.created_at,
+                source: e.source.clone(),
+                amount: e.xp_delta.max(0) as u32,
             })
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("xp task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("xp load failed: {e}")))?;
+            .collect();
+        // Newest first.
+        recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        // Per `level_from_xp` semantics, `xp_to_next_level` is `0` only at
+        // a saturated stage cap; pass it through verbatim so the client
+        // can decide how to render.
+        let snap = XpSnapshot {
+            total_xp: state.total_xp as u64,
+            level: state.level as u32,
+            next_level_xp: state.xp_to_next_level as u64,
+            recent_events: recent,
+        };
         Ok(Response::new(snap))
     }
 
@@ -297,83 +291,79 @@ impl Status for StatusSvc {
         req: Request<StatusTextRequest>,
     ) -> Result<Response<StatusText>, TStatus> {
         let card_width = req.into_inner().card_width;
-        let snap = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-            let cfg = Config::load_from_db().unwrap_or_default();
-            let db = Database::open()?;
-            let now = chrono::Utc::now();
+        let cfg = Config::load_from_db().await.unwrap_or_default();
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("overview text failed: {e}")))?;
+        let now = chrono::Utc::now();
 
-            let mut sections: Vec<String> = Vec::new();
-            let mut compact_line = String::new();
+        let mut sections: Vec<String> = Vec::new();
+        let mut compact_line = String::new();
 
-            let evo_state = if cfg.evolution.enabled {
-                db.get_evolution_state().ok()
+        let evo_state = if cfg.evolution.enabled {
+            db.get_evolution_state().await.ok()
+        } else {
+            None
+        };
+
+        if let Some(ref evo) = evo_state {
+            compact_line = cortex::evolution::format_compact(evo);
+            let width = if card_width == 0 {
+                48
             } else {
-                None
+                card_width as usize
             };
+            sections.push(cortex::evolution::format_status_section_with_width(
+                evo, width,
+            ));
+        }
 
-            if let Some(ref evo) = evo_state {
-                compact_line = cortex::evolution::format_compact(evo);
-                let width = if card_width == 0 {
-                    48
-                } else {
-                    card_width as usize
-                };
-                sections.push(cortex::evolution::format_status_section_with_width(
-                    evo, width,
-                ));
+        // Vitals
+        if let Ok(state) = db.get_vitals_state().await {
+            let state = cortex::vitals::apply_decay(&state, now);
+            let mut drift = cortex::vitals::detect_drift(&state, now);
+            let since = (now - chrono::Duration::days(7)).timestamp();
+            let events = db.vitals_events_since(since).await.unwrap_or_default();
+            if cortex::vitals::detect_failure_drift(&events) {
+                drift.push(cortex::vitals::DriftFlag::RepeatedFailures);
             }
+            sections.push(cortex::vitals::format_status(&state, &events, &drift));
+        }
 
-            // Vitals
-            if let Ok(state) = db.get_vitals_state() {
-                let state = cortex::vitals::apply_decay(&state, now);
-                let mut drift = cortex::vitals::detect_drift(&state, now);
-                let since = (now - chrono::Duration::days(7)).timestamp();
-                let events = db.vitals_events_since(since).unwrap_or_default();
-                if cortex::vitals::detect_failure_drift(&events) {
-                    drift.push(cortex::vitals::DriftFlag::RepeatedFailures);
-                }
-                sections.push(cortex::vitals::format_status(&state, &events, &drift));
+        // Bond
+        if let Ok(bond_events) = db.get_all_bond_events().await {
+            let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
+            let bond_state = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
+            let correction_rate = cortex::bond::compute_correction_rate(&db).await;
+            let routine_rate = cortex::bond::compute_routine_success_rate(&db).await;
+            let pref_count = cortex::bond::compute_preference_learning_count(&db).await;
+            let since = (now - chrono::Duration::days(7)).timestamp();
+            let recent = db.bond_events_since(since).await.unwrap_or_default();
+            sections.push(cortex::bond::format_status(
+                &bond_state,
+                correction_rate,
+                routine_rate,
+                pref_count,
+                &recent,
+            ));
+        }
+
+        if let Some(ref evo) = evo_state {
+            sections.push(cortex::evolution::format_archetype_scores(evo));
+        }
+
+        if cfg.evolution.enabled {
+            if let Ok(mut events) = db.evolution_events_since(0).await {
+                events.reverse();
+                sections.push(cortex::evolution::format_history(&events));
             }
+        }
 
-            // Bond
-            if let Ok(bond_events) = db.get_all_bond_events() {
-                let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
-                let bond_state = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
-                let correction_rate = cortex::bond::compute_correction_rate(&db);
-                let routine_rate = cortex::bond::compute_routine_success_rate(&db);
-                let pref_count = cortex::bond::compute_preference_learning_count(&db);
-                let since = (now - chrono::Duration::days(7)).timestamp();
-                let recent = db.bond_events_since(since).unwrap_or_default();
-                sections.push(cortex::bond::format_status(
-                    &bond_state,
-                    correction_rate,
-                    routine_rate,
-                    pref_count,
-                    &recent,
-                ));
-            }
-
-            if let Some(ref evo) = evo_state {
-                sections.push(cortex::evolution::format_archetype_scores(evo));
-            }
-
-            if cfg.evolution.enabled {
-                if let Ok(mut events) = db.evolution_events_since(0) {
-                    events.reverse();
-                    sections.push(cortex::evolution::format_history(&events));
-                }
-            }
-
-            // Join with blank-line separator, mirroring `push_section`.
-            let text = sections.join("\n");
-            Ok((text, compact_line))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("overview text task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("overview text failed: {e}")))?;
+        // Join with blank-line separator, mirroring `push_section`.
+        let text = sections.join("\n");
         Ok(Response::new(StatusText {
-            text: snap.0,
-            compact_class_line: snap.1,
+            text,
+            compact_class_line: compact_line,
         }))
     }
 
@@ -381,37 +371,33 @@ impl Status for StatusSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<StatusText>, TStatus> {
-        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
-            let db = Database::open()?;
-            let out = cortex::evolution::commands::dispatch(
-                cortex::evolution::commands::EvolutionCommand::Evolution,
-                &db,
-            )?;
-            Ok(out.text)
-        })
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("evolution text failed: {e}")))?;
+        let out = cortex::evolution::commands::dispatch(
+            cortex::evolution::commands::EvolutionCommand::Evolution,
+            &db,
+        )
         .await
-        .map_err(|e| TStatus::internal(format!("evolution text task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("evolution text failed: {e}")))?;
         Ok(Response::new(StatusText {
-            text,
+            text: out.text,
             compact_class_line: String::new(),
         }))
     }
 
     async fn get_xp_text(&self, _req: Request<Empty>) -> Result<Response<StatusText>, TStatus> {
-        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
-            let db = Database::open()?;
-            let out = cortex::evolution::commands::dispatch(
-                cortex::evolution::commands::EvolutionCommand::Xp,
-                &db,
-            )?;
-            Ok(out.text)
-        })
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("xp text failed: {e}")))?;
+        let out = cortex::evolution::commands::dispatch(
+            cortex::evolution::commands::EvolutionCommand::Xp,
+            &db,
+        )
         .await
-        .map_err(|e| TStatus::internal(format!("xp text task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("xp text failed: {e}")))?;
         Ok(Response::new(StatusText {
-            text,
+            text: out.text,
             compact_class_line: String::new(),
         }))
     }
@@ -420,18 +406,19 @@ impl Status for StatusSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<StatusText>, TStatus> {
-        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
-            let cfg = Config::load_from_db().unwrap_or_default();
-            if !cfg.evolution.enabled {
-                return Ok("Evolution system is disabled.".to_string());
-            }
-            let db = Database::open()?;
-            let state = db.get_evolution_state()?;
-            Ok(cortex::evolution::format_archetype_scores(&state))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("archetypes text task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("archetypes text failed: {e}")))?;
+        let cfg = Config::load_from_db().await.unwrap_or_default();
+        let text = if !cfg.evolution.enabled {
+            "Evolution system is disabled.".to_string()
+        } else {
+            let db = Database::open()
+                .await
+                .map_err(|e| TStatus::internal(format!("archetypes text failed: {e}")))?;
+            let state = db
+                .get_evolution_state()
+                .await
+                .map_err(|e| TStatus::internal(format!("archetypes text failed: {e}")))?;
+            cortex::evolution::format_archetype_scores(&state)
+        };
         Ok(Response::new(StatusText {
             text,
             compact_class_line: String::new(),
@@ -442,19 +429,20 @@ impl Status for StatusSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<StatusText>, TStatus> {
-        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
-            let cfg = Config::load_from_db().unwrap_or_default();
-            if !cfg.evolution.enabled {
-                return Ok("Evolution system is disabled.".to_string());
-            }
-            let db = Database::open()?;
-            let mut events = db.evolution_events_since(0)?;
+        let cfg = Config::load_from_db().await.unwrap_or_default();
+        let text = if !cfg.evolution.enabled {
+            "Evolution system is disabled.".to_string()
+        } else {
+            let db = Database::open()
+                .await
+                .map_err(|e| TStatus::internal(format!("history text failed: {e}")))?;
+            let mut events = db
+                .evolution_events_since(0)
+                .await
+                .map_err(|e| TStatus::internal(format!("history text failed: {e}")))?;
             events.reverse();
-            Ok(cortex::evolution::format_history(&events))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("history text task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("history text failed: {e}")))?;
+            cortex::evolution::format_history(&events)
+        };
         Ok(Response::new(StatusText {
             text,
             compact_class_line: String::new(),
@@ -466,13 +454,12 @@ impl Status for StatusSvc {
         req: Request<UsageRequest>,
     ) -> Result<Response<StatusText>, TStatus> {
         let days = req.into_inner().days;
-        let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let db = Database::open()?;
-            cortex::usage::format_usage_text(&db, days)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("usage text task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("usage text failed: {e}")))?;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("usage text failed: {e}")))?;
+        let text = cortex::usage::format_usage_text(&db, days)
+            .await
+            .map_err(|e| TStatus::internal(format!("usage text failed: {e}")))?;
         Ok(Response::new(StatusText {
             text,
             compact_class_line: String::new(),
@@ -483,9 +470,8 @@ impl Status for StatusSvc {
         // The scheduler's exact next-fire timestamp lives inside the daemon
         // task and isn't routed here yet. Return the configured interval —
         // better than fabricating "next at +30s".
-        let cfg = tokio::task::spawn_blocking(Config::load_from_db)
+        let cfg = Config::load_from_db()
             .await
-            .map_err(|e| TStatus::internal(format!("config task panicked: {e}")))?
             .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
         let next_in = parse_interval_seconds(&cfg.heartbeat.interval).unwrap_or(0);
         Ok(Response::new(Heartbeat {

@@ -16,7 +16,6 @@ use axum::{
 /// whole body before invoking the handler.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 use cortex::auth::tokens;
-use cortex::db::Database;
 
 use super::server::McpServer;
 
@@ -82,6 +81,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
+    use cortex::db::Database;
     use std::sync::Arc;
     use tower::ServiceExt;
 

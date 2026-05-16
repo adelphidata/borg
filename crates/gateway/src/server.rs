@@ -291,18 +291,19 @@ impl GatewayServer {
             }
         })?;
         info!("Gateway listening on {addr} with {channel_count} channel(s)");
-        if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+        if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
             cortex::activity_log::log_activity(
                 &adb,
                 "info",
                 "gateway",
                 &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
-            );
+            )
+            .await;
         }
 
         // Replay unfinished deliveries from previous run
-        if let Ok(db) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-            match db.replay_unfinished() {
+        if let Ok(db) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+            match db.replay_unfinished().await {
                 Ok(0) => {}
                 Ok(n) => info!("Reset {n} in-flight delivery(ies) to pending"),
                 Err(e) => warn!("Failed to replay unfinished deliveries: {e}"),
@@ -379,13 +380,17 @@ impl GatewayServer {
                                     typing.stop().await;
                                     let voice_reply_mode = match Database::open_with_timeout(
                                         Database::GATEWAY_BUSY_TIMEOUT_MS,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         Ok(db) => match crate::voice::resolve_voice_reply_mode(
                                             &db,
                                             &config,
                                             "telegram",
                                             &chat_id.to_string(),
-                                        ) {
+                                        )
+                                        .await
+                                        {
                                             Ok(mode) => Some(mode),
                                             Err(e) => {
                                                 warn!(
@@ -824,7 +829,7 @@ async fn readyz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     let mut ready = true;
 
     // Check database connectivity
-    match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+    match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         Ok(_) => {
             checks.insert("database".into(), serde_json::json!("ok"));
         }
@@ -932,8 +937,9 @@ async fn restart_handler(
         );
     }
     info!("Gateway restart requested via /internal/restart");
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        cortex::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested");
+    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+        cortex::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested")
+            .await;
     }
     state.shutdown.cancel();
     (
@@ -1507,7 +1513,7 @@ async fn drain_pending_deliveries(
     state: &Arc<AppState>,
     health: &Arc<RwLock<ChannelHealthRegistry>>,
 ) {
-    let mut db = match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+    let db = match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         Ok(db) => db,
         Err(e) => {
             warn!("Drain loop: failed to open database: {e}");
@@ -1515,7 +1521,7 @@ async fn drain_pending_deliveries(
         }
     };
 
-    let deliveries = match db.claim_pending_deliveries(20) {
+    let deliveries = match db.claim_pending_deliveries(20).await {
         Ok(d) => d,
         Err(e) => {
             warn!("Drain loop: failed to claim deliveries: {e}");
@@ -1540,7 +1546,10 @@ async fn drain_pending_deliveries(
                     "Drain loop: channel '{}' not found, marking failed",
                     delivery.channel_name
                 );
-                if let Err(e) = db.mark_failed(&delivery.id, "channel not found", None) {
+                if let Err(e) = db
+                    .mark_failed(&delivery.id, "channel not found", None)
+                    .await
+                {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {e}");
                 }
                 continue;
@@ -1569,13 +1578,13 @@ async fn drain_pending_deliveries(
         .await
         {
             crate::resilience::retry::RetryOutcome::Success(_) => {
-                if let Err(e) = db.mark_delivered(&delivery.id) {
+                if let Err(e) = db.mark_delivered(&delivery.id).await {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery success status: {e}");
                 }
                 health.write().await.record_outbound(&delivery.channel_name);
             }
             crate::resilience::retry::RetryOutcome::PermanentFailure(e) => {
-                if let Err(db_err) = db.mark_failed(&delivery.id, &e, None) {
+                if let Err(db_err) = db.mark_failed(&delivery.id, &e, None).await {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
                 }
                 health
@@ -1585,7 +1594,7 @@ async fn drain_pending_deliveries(
             }
             crate::resilience::retry::RetryOutcome::Exhausted(e) => {
                 let next_retry = chrono::Utc::now().timestamp() + 60;
-                if let Err(db_err) = db.mark_failed(&delivery.id, &e, Some(next_retry)) {
+                if let Err(db_err) = db.mark_failed(&delivery.id, &e, Some(next_retry)).await {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
                 }
                 health

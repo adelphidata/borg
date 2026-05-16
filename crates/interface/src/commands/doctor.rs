@@ -28,17 +28,17 @@ pub(crate) enum DoctorAction {
     },
 }
 
-pub(crate) fn dispatch_doctor(action: Option<DoctorAction>) -> Result<()> {
+pub(crate) async fn dispatch_doctor(action: Option<DoctorAction>) -> Result<()> {
     match action {
-        None => super::misc::run_doctor(),
-        Some(DoctorAction::Squelches) => run_list(),
+        None => super::misc::run_doctor().await,
+        Some(DoctorAction::Squelches) => run_list().await,
         Some(DoctorAction::Squelch {
             category,
             name,
             ttl_days,
             reason,
-        }) => run_squelch(&category, &name, ttl_days, reason.as_deref()),
-        Some(DoctorAction::Unsquelch { category, name }) => run_unsquelch(&category, &name),
+        }) => run_squelch(&category, &name, ttl_days, reason.as_deref()).await,
+        Some(DoctorAction::Unsquelch { category, name }) => run_unsquelch(&category, &name).await,
     }
 }
 
@@ -49,9 +49,9 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-fn run_list() -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let rows = db.doctor_squelch_list_active(now_unix())?;
+async fn run_list() -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let rows = db.doctor_squelch_list_active(now_unix()).await?;
     if rows.is_empty() {
         println!("No active squelches.");
         return Ok(());
@@ -72,16 +72,19 @@ fn run_list() -> Result<()> {
     Ok(())
 }
 
-fn run_squelch(category: &str, name: &str, ttl_days: i64, reason: Option<&str>) -> Result<()> {
+async fn run_squelch(
+    category: &str,
+    name: &str,
+    ttl_days: i64,
+    reason: Option<&str>,
+) -> Result<()> {
     let now = now_unix();
     let expires_at = now + ttl_days * SECS_PER_DAY;
-    tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .doctor_squelch_set(category, name, expires_at, reason)
-            .await
-            .with_context(|| format!("squelching {category} / {name}"))
-    })?;
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    client
+        .doctor_squelch_set(category, name, expires_at, reason)
+        .await
+        .with_context(|| format!("squelching {category} / {name}"))?;
     let when = chrono::DateTime::from_timestamp(expires_at, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "?".to_string());
@@ -89,14 +92,12 @@ fn run_squelch(category: &str, name: &str, ttl_days: i64, reason: Option<&str>) 
     Ok(())
 }
 
-fn run_unsquelch(category: &str, name: &str) -> Result<()> {
-    let removed = tokio::runtime::Handle::current().block_on(async {
-        let mut client = crate::daemon_client::connect_or_spawn().await?;
-        client
-            .doctor_squelch_clear(category, name)
-            .await
-            .with_context(|| format!("clearing squelch for {category} / {name}"))
-    })?;
+async fn run_unsquelch(category: &str, name: &str) -> Result<()> {
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    let removed = client
+        .doctor_squelch_clear(category, name)
+        .await
+        .with_context(|| format!("clearing squelch for {category} / {name}"))?;
     if removed {
         println!("Cleared squelch for {category} / {name}");
     } else {

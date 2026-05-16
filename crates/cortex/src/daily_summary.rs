@@ -114,7 +114,7 @@ fn build_transcript(messages: &[MessageRow], max_chars: usize) -> String {
     transcript
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

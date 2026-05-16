@@ -92,10 +92,15 @@ pub fn bm25_score(query_terms: &[&str], doc: &str, corpus: &CorpusStats) -> f64 
     for raw in query_terms {
         let term = raw.to_lowercase();
         let df = *corpus.doc_freq.get(&term).unwrap_or(&0) as f64;
-        // Robertson/Spärck Jones IDF with the +1 smoothing used by Lucene's
-        // BM25Similarity. Clamps at zero — a term in every doc contributes
-        // nothing, never a negative penalty.
-        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        // Lucene BM25Similarity-style IDF with explicit clamp on the
+        // trivial case (df == n): a term present in every candidate doc
+        // contributes nothing rather than the small positive value the
+        // `+1` smoothing would otherwise yield.
+        let idf = if df >= n {
+            0.0
+        } else {
+            ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+        };
         let tf_in_doc = *tf.get(term.as_str()).unwrap_or(&0) as f64;
         if tf_in_doc == 0.0 || idf <= 0.0 {
             continue;
@@ -122,7 +127,10 @@ pub fn score_candidates(query: &str, candidate_docs: &[&str]) -> Vec<f32> {
         return vec![0.0; candidate_docs.len()];
     }
     let query_terms: Vec<&str> = query_terms_owned.iter().map(String::as_str).collect();
-    let docs_owned: Vec<String> = candidate_docs.iter().map(|s| s.to_string()).collect();
+    let docs_owned: Vec<String> = candidate_docs
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     let corpus = CorpusStats::from_docs(&docs_owned);
     let raw: Vec<f64> = candidate_docs
         .iter()
@@ -141,6 +149,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
     static TOK: LazyLock<Regex> = LazyLock::new(|| {
         // \w is \p{Alphabetic} + digits + underscore in regex with default
         // unicode support, which is enabled by the workspace dep.
+        #[allow(clippy::expect_used)]
         Regex::new(r"\w+").expect("static regex compiles")
     });
     TOK.find_iter(s)
@@ -152,7 +161,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn build(query: &[&str], docs: &[&str]) -> (Vec<String>, CorpusStats) {
+    fn build(docs: &[&str]) -> (Vec<String>, CorpusStats) {
         let docs_owned: Vec<String> = docs.iter().map(|s| s.to_string()).collect();
         let corpus = CorpusStats::from_docs(&docs_owned);
         (docs_owned, corpus)
@@ -169,7 +178,7 @@ mod tests {
             "rust async tokio filler filler filler filler filler filler filler filler filler",
             "filler filler filler filler filler filler filler filler filler filler filler filler",
         ];
-        let (owned, corpus) = build(&["rust", "async", "tokio"], &docs);
+        let (owned, corpus) = build(&docs);
         let dense = bm25_score(&["rust", "async", "tokio"], &owned[0], &corpus);
         let sparse = bm25_score(&["rust", "async", "tokio"], &owned[1], &corpus);
         let none = bm25_score(&["rust", "async", "tokio"], &owned[2], &corpus);
@@ -177,7 +186,10 @@ mod tests {
             dense > sparse,
             "dense ({dense}) should outrank sparse ({sparse})"
         );
-        assert!(sparse > none, "sparse ({sparse}) should outrank none ({none})");
+        assert!(
+            sparse > none,
+            "sparse ({sparse}) should outrank none ({none})"
+        );
     }
 
     #[test]
@@ -187,12 +199,12 @@ mod tests {
         // should give all weight to the rare-term doc, even though both
         // docs contain "the" with similar frequency.
         let docs = [
-            "the the the the neutrino neutrino",  // doc with rare term
-            "the the the the cat cat cat cat",    // doc without
+            "the the the the neutrino neutrino", // doc with rare term
+            "the the the the cat cat cat cat",   // doc without
             "the the the the dog dog dog",
             "the the the the bird bird",
         ];
-        let (owned, corpus) = build(&["the", "neutrino"], &docs);
+        let (owned, corpus) = build(&docs);
         let rare_present = bm25_score(&["the", "neutrino"], &owned[0], &corpus);
         let rare_absent = bm25_score(&["the", "neutrino"], &owned[1], &corpus);
         // The "the" contribution must be zero on its own (IDF clamp).
@@ -246,7 +258,10 @@ mod tests {
         let scores = score_candidates("rust async tokio", &docs);
         assert_eq!(scores.len(), 3);
         let max = scores.iter().cloned().fold(0.0_f32, f32::max);
-        assert!((max - 1.0).abs() < 1e-6, "max should normalize to 1.0 (got {max})");
+        assert!(
+            (max - 1.0).abs() < 1e-6,
+            "max should normalize to 1.0 (got {max})"
+        );
         // Best-matching doc must outscore others.
         assert!(scores[0] > scores[1]);
         assert!(scores[1] > scores[2]);
@@ -265,10 +280,7 @@ mod tests {
     #[test]
     fn corpus_stats_repeated_term_counts_as_one_doc() {
         // "alpha" appears 3x in one doc — doc_freq must still be 1, not 3.
-        let stats = CorpusStats::from_docs(&[
-            "alpha alpha alpha".to_string(),
-            "beta".to_string(),
-        ]);
+        let stats = CorpusStats::from_docs(&["alpha alpha alpha".to_string(), "beta".to_string()]);
         assert_eq!(stats.doc_freq.get("alpha"), Some(&1));
     }
 }

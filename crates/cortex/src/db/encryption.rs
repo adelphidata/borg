@@ -6,6 +6,12 @@
 //! the same OS-keychain / passphrase-file trust root as the rest of borg's
 //! secret storage. The KEK never leaves the keystore; only the derived
 //! sub-key reaches Turso.
+//!
+//! The derivation primitives are kept available even though the only caller
+//! (`Database::open_encrypted`) is currently dormant — flipping the encrypted
+//! at-rest lane on later wires this in without re-deriving from scratch.
+
+#![allow(dead_code)]
 
 use anyhow::Result;
 use hkdf::Hkdf;

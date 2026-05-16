@@ -169,11 +169,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let b = db
-            .web_search_cache_get("brave", &h)
-            .await
-            .unwrap()
-            .unwrap();
+        let b = db.web_search_cache_get("brave", &h).await.unwrap().unwrap();
         assert_eq!(t.body, "from-tavily");
         assert_eq!(b.body, "from-brave");
         assert_eq!(db.web_search_cache_count().await.unwrap(), 2);

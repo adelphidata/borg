@@ -143,7 +143,9 @@ async fn harness(call_id: &str, tool_name: &str, args_json: &str) -> Harness {
 
 /// Drive one agent turn end-to-end and return the resulting history.
 async fn run_one_turn(mut config: Config, prompt: &str) -> Vec<cortex::types::Message> {
-    let mut agent = Agent::new(config.clone(), BorgMetrics::default()).expect("Agent::new");
+    let mut agent = Agent::new(config.clone(), BorgMetrics::default())
+        .await
+        .expect("Agent::new");
     // `Agent::new` clones the config internally; the local `config` binding is
     // unused after this. (We keep it as `mut` for symmetry with future cases
     // that may toggle further fields after construction.)

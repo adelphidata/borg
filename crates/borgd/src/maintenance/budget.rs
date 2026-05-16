@@ -32,9 +32,9 @@ impl<'a> MonthlyBudgetTracker<'a> {
     /// when no bucket has been persisted yet (or when meta access fails —
     /// "behave as if never announced" matches the augmenter's prior
     /// behavior).
-    pub(crate) fn last_bucket(&self, now: chrono::DateTime<chrono::Utc>) -> u8 {
+    pub(crate) async fn last_bucket(&self, now: chrono::DateTime<chrono::Utc>) -> u8 {
         let key = Self::month_key(now);
-        match self.db.get_meta(&key) {
+        match self.db.get_meta(&key).await {
             Ok(Some(s)) => s.parse().unwrap_or(0),
             Ok(None) => 0,
             Err(e) => {
@@ -47,21 +47,25 @@ impl<'a> MonthlyBudgetTracker<'a> {
     /// Persist the most-recently-announced bucket so the same threshold
     /// doesn't re-fire within the calendar month. Logs and continues on
     /// failure — losing this write means at most one duplicate nudge.
-    pub(crate) fn record_bucket(&self, now: chrono::DateTime<chrono::Utc>, bucket: u8) {
+    pub(crate) async fn record_bucket(&self, now: chrono::DateTime<chrono::Utc>, bucket: u8) {
         let key = Self::month_key(now);
-        if let Err(e) = self.db.set_meta(&key, &bucket.to_string()) {
+        if let Err(e) = self.db.set_meta(&key, &bucket.to_string()).await {
             tracing::warn!("monthly_budget: failed to persist bucket {bucket}: {e}");
         }
     }
 
     /// Decide whether `bucket` is a new high for the current month and, if
     /// so, persist it. Returns `true` when the augmenter should fire.
-    pub(crate) fn should_announce(&self, now: chrono::DateTime<chrono::Utc>, bucket: u8) -> bool {
-        let last = self.last_bucket(now);
+    pub(crate) async fn should_announce(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        bucket: u8,
+    ) -> bool {
+        let last = self.last_bucket(now).await;
         if bucket <= last {
             return false;
         }
-        self.record_bucket(now, bucket);
+        self.record_bucket(now, bucket).await;
         true
     }
 }

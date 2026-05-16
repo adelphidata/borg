@@ -288,7 +288,7 @@ pub fn is_dream_command(text: &str) -> bool {
 /// `handler::invoke_agent_with_auto_reply` via [`is_cancel_command`] so the
 /// async cancellation path can run without holding a DB reference.
 #[allow(clippy::too_many_arguments)]
-pub fn try_handle_command(
+pub async fn try_handle_command(
     text: &str,
     db: &Database,
     config: &Config,
@@ -303,34 +303,34 @@ pub fn try_handle_command(
         Command::Start => handle_help(), // welcome approved users with help; unapproved users see pairing challenge before reaching here
         Command::Help => handle_help(),
         Command::Commands => handle_commands(),
-        Command::Status => handle_status(db, session_id),
-        Command::New => handle_new(db, channel_name, session_key),
-        Command::Reset => handle_reset(db, session_id),
-        Command::Usage => handle_usage(db, config, session_id),
+        Command::Status => handle_status(db, session_id).await,
+        Command::New => handle_new(db, channel_name, session_key).await,
+        Command::Reset => handle_reset(db, session_id).await,
+        Command::Usage => handle_usage(db, config, session_id).await,
         Command::Skill => return None, // Pass through to agent
         Command::Skills => handle_skills(config),
-        Command::WhoAmI => handle_whoami(sender_id, channel_name, db),
-        Command::Memory => handle_memory(config),
-        Command::Doctor => handle_doctor(config),
+        Command::WhoAmI => handle_whoami(sender_id, channel_name, db).await,
+        Command::Memory => handle_memory(config).await,
+        Command::Doctor => handle_doctor(config).await,
         Command::Dream => return None,
-        Command::Pairing => handle_pairing(db, channel_name, sender_id),
-        Command::Voice => handle_voice(db, config, channel_name, channel_id, args),
+        Command::Pairing => handle_pairing(db, channel_name, sender_id).await,
+        Command::Voice => handle_voice(db, config, channel_name, channel_id, args).await,
         // Handled out-of-band in the caller; see `is_cancel_command`.
         Command::Cancel => return None,
-        Command::Mode => handle_mode(db, config, session_id, args),
+        Command::Mode => handle_mode(db, config, session_id, args).await,
         Command::Plan => {
-            return handle_plan(db, session_id, args);
+            return handle_plan(db, session_id, args).await;
         }
-        Command::Compact => handle_compact(db, session_id, args),
-        Command::Undo => handle_undo(db, session_id),
-        Command::History => handle_history(db, session_id, args),
-        Command::Schedule => handle_schedule(db),
-        Command::Settings => handle_settings(db, config, args),
+        Command::Compact => handle_compact(db, session_id, args).await,
+        Command::Undo => handle_undo(db, session_id).await,
+        Command::History => handle_history(db, session_id, args).await,
+        Command::Schedule => handle_schedule(db).await,
+        Command::Settings => handle_settings(db, config, args).await,
         // Handled out-of-band in the caller; see `is_poke_command`.
         Command::Poke => return None,
-        Command::Evolution => handle_evolution(db),
-        Command::Xp => handle_xp(db),
-        Command::Card => handle_card(db, args),
+        Command::Evolution => handle_evolution(db).await,
+        Command::Xp => handle_xp(db).await,
+        Command::Card => handle_card(db, args).await,
     };
     Some(response)
 }
@@ -363,15 +363,18 @@ fn handle_commands() -> String {
     lines.join("\n")
 }
 
-fn handle_status(db: &Database, session_id: &str) -> String {
-    let msg_count = db.count_session_messages(session_id).unwrap_or(0);
+async fn handle_status(db: &Database, session_id: &str) -> String {
+    let msg_count = db.count_session_messages(session_id).await.unwrap_or(0);
     let short_id = session_id.get(..8).unwrap_or(session_id);
     format!("Session: {short_id}...\nMessages: {msg_count}")
 }
 
-fn handle_new(db: &Database, channel_name: &str, session_key: &str) -> String {
+async fn handle_new(db: &Database, channel_name: &str, session_key: &str) -> String {
     let new_id = uuid::Uuid::new_v4().to_string();
-    match db.update_channel_session_id(channel_name, session_key, &new_id) {
+    match db
+        .update_channel_session_id(channel_name, session_key, &new_id)
+        .await
+    {
         Ok(true) => {
             let short_id = &new_id[..8];
             format!("New session started ({short_id}...)")
@@ -384,8 +387,8 @@ fn handle_new(db: &Database, channel_name: &str, session_key: &str) -> String {
     }
 }
 
-fn handle_reset(db: &Database, session_id: &str) -> String {
-    match db.delete_session_messages(session_id) {
+async fn handle_reset(db: &Database, session_id: &str) -> String {
+    match db.delete_session_messages(session_id).await {
         Ok(count) => format!("Cleared {count} messages from current session."),
         Err(e) => {
             warn!("Failed to reset session: {e}");
@@ -394,9 +397,9 @@ fn handle_reset(db: &Database, session_id: &str) -> String {
     }
 }
 
-fn handle_usage(db: &Database, config: &Config, session_id: &str) -> String {
-    let msg_count = db.count_session_messages(session_id).unwrap_or(0);
-    let monthly_tokens = db.monthly_token_total().unwrap_or(0);
+async fn handle_usage(db: &Database, config: &Config, session_id: &str) -> String {
+    let msg_count = db.count_session_messages(session_id).await.unwrap_or(0);
+    let monthly_tokens = db.monthly_token_total().await.unwrap_or(0);
 
     let mut lines = vec![
         format!("Session messages: {msg_count}"),
@@ -432,16 +435,17 @@ fn handle_skills(config: &Config) -> String {
     }
 }
 
-fn handle_whoami(sender_id: &str, channel_name: &str, db: &Database) -> String {
+async fn handle_whoami(sender_id: &str, channel_name: &str, db: &Database) -> String {
     let approved = db
         .is_sender_approved(channel_name, sender_id)
+        .await
         .unwrap_or(false);
     let status = if approved { "Approved" } else { "Not approved" };
     format!("Sender: {sender_id}\nChannel: {channel_name}\nPairing: {status}")
 }
 
-fn handle_memory(config: &Config) -> String {
-    match cortex::memory::list_memory_inventory(config) {
+async fn handle_memory(config: &Config) -> String {
+    match cortex::memory::list_memory_inventory(config).await {
         Ok(items) if items.is_empty() => "No memory entries or knowledge files.".to_string(),
         Ok(items) => {
             let mut lines = vec![format!("Memory inventory ({}):", items.len())];
@@ -464,8 +468,8 @@ fn handle_memory(config: &Config) -> String {
     }
 }
 
-fn handle_doctor(config: &Config) -> String {
-    let report = cortex::doctor::run_diagnostics(config);
+async fn handle_doctor(config: &Config) -> String {
+    let report = cortex::doctor::run_diagnostics(config).await;
     let (pass, warnings, fail) = report.counts();
     let mut lines = vec![format!(
         "Diagnostics: {pass} passed, {warnings} warning(s), {fail} failed"
@@ -487,11 +491,12 @@ fn handle_doctor(config: &Config) -> String {
     lines.join("\n")
 }
 
-fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> String {
+async fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> String {
     let mode_key = format!("gw:mode:{session_id}");
     if args.is_empty() {
         let current = db
             .get_setting(&mode_key)
+            .await
             .ok()
             .flatten()
             .unwrap_or_else(|| config.conversation.collaboration_mode.to_string());
@@ -500,7 +505,7 @@ fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> 
     let mode = args.trim().to_ascii_lowercase();
     match mode.as_str() {
         "default" | "execute" | "plan" => {
-            if let Err(e) = db.set_setting(&mode_key, &mode) {
+            if let Err(e) = db.set_setting(&mode_key, &mode).await {
                 warn!("Failed to set mode: {e}");
                 return "Failed to set mode.".to_string();
             }
@@ -510,7 +515,7 @@ fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> 
     }
 }
 
-fn handle_voice(
+async fn handle_voice(
     db: &Database,
     config: &Config,
     channel_name: &str,
@@ -526,13 +531,14 @@ fn handle_voice(
     };
 
     let key = crate::voice::voice_mode_setting_key(channel_name, chat_id);
-    let current = match crate::voice::resolve_voice_reply_mode(db, config, channel_name, chat_id) {
-        Ok(mode) => mode,
-        Err(e) => {
-            warn!("Failed to read voice mode: {e}");
-            return "Failed to read voice mode.".to_string();
-        }
-    };
+    let current =
+        match crate::voice::resolve_voice_reply_mode(db, config, channel_name, chat_id).await {
+            Ok(mode) => mode,
+            Err(e) => {
+                warn!("Failed to read voice mode: {e}");
+                return "Failed to read voice mode.".to_string();
+            }
+        };
     let arg = args.trim().to_ascii_lowercase();
 
     if arg.is_empty() || arg == "status" {
@@ -557,7 +563,7 @@ fn handle_voice(
         }
     }
 
-    if let Err(e) = db.set_setting(&key, next.as_str()) {
+    if let Err(e) = db.set_setting(&key, next.as_str()).await {
         warn!("Failed to set voice mode: {e}");
         return "Failed to update voice mode.".to_string();
     }
@@ -567,9 +573,9 @@ fn handle_voice(
 
 /// Handle `/plan [message]`. Returns `Some(response)` for bare `/plan`,
 /// `None` for `/plan <message>` (pass-through to agent after setting mode).
-fn handle_plan(db: &Database, session_id: &str, args: &str) -> Option<String> {
+async fn handle_plan(db: &Database, session_id: &str, args: &str) -> Option<String> {
     let mode_key = format!("gw:mode:{session_id}");
-    if let Err(e) = db.set_setting(&mode_key, "plan") {
+    if let Err(e) = db.set_setting(&mode_key, "plan").await {
         warn!("Failed to set plan mode: {e}");
         return Some("Failed to enter plan mode.".to_string());
     }
@@ -582,7 +588,7 @@ fn handle_plan(db: &Database, session_id: &str, args: &str) -> Option<String> {
     }
 }
 
-fn handle_compact(db: &Database, session_id: &str, args: &str) -> String {
+async fn handle_compact(db: &Database, session_id: &str, args: &str) -> String {
     let keep: usize = if args.is_empty() {
         20
     } else {
@@ -591,7 +597,7 @@ fn handle_compact(db: &Database, session_id: &str, args: &str) -> String {
             _ => return "Usage: /compact [keep_count] (positive integer, default 20)".to_string(),
         }
     };
-    match db.compact_session_messages(session_id, keep) {
+    match db.compact_session_messages(session_id, keep).await {
         Ok(0) => format!("Nothing to compact (≤{keep} messages)."),
         Ok(deleted) => format!("Compacted: removed {deleted} older messages, kept last {keep}."),
         Err(e) => {
@@ -601,8 +607,8 @@ fn handle_compact(db: &Database, session_id: &str, args: &str) -> String {
     }
 }
 
-fn handle_undo(db: &Database, session_id: &str) -> String {
-    match db.delete_last_assistant_turn(session_id) {
+async fn handle_undo(db: &Database, session_id: &str) -> String {
+    match db.delete_last_assistant_turn(session_id).await {
         Ok(0) => "Nothing to undo.".to_string(),
         Ok(n) => format!("Undone: removed {n} messages from last agent turn."),
         Err(e) => {
@@ -612,7 +618,7 @@ fn handle_undo(db: &Database, session_id: &str) -> String {
     }
 }
 
-fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
+async fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
     let count: usize = if args.is_empty() {
         10
     } else {
@@ -621,7 +627,7 @@ fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
             _ => return "Usage: /history [count] (1-50, default 10)".to_string(),
         }
     };
-    match db.load_session_messages(session_id) {
+    match db.load_session_messages(session_id).await {
         Ok(msgs) if msgs.is_empty() => "No messages in current session.".to_string(),
         Ok(msgs) => {
             let start = msgs.len().saturating_sub(count);
@@ -650,8 +656,8 @@ fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
     }
 }
 
-fn handle_schedule(db: &Database) -> String {
-    match db.list_tasks() {
+async fn handle_schedule(db: &Database) -> String {
+    match db.list_tasks().await {
         Ok(tasks) if tasks.is_empty() => "No scheduled tasks.".to_string(),
         Ok(tasks) => {
             let mut lines = vec![format!("Scheduled tasks ({}):", tasks.len())];
@@ -694,7 +700,7 @@ const GATEWAY_SAFE_SETTING_KEYS: &[&str] = &[
     "skills.max_context_tokens",
 ];
 
-fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
+async fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     if args.is_empty() {
         // Show key settings
         let provider = config.llm.provider.as_deref().unwrap_or("(auto-detect)");
@@ -717,7 +723,7 @@ fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     if parts.len() == 1 {
         // Show single setting value
         let key = parts[0];
-        if let Ok(Some(val)) = db.get_setting(key) {
+        if let Ok(Some(val)) = db.get_setting(key).await {
             return format!("{key} = {val} (DB override)");
         }
         match key {
@@ -742,7 +748,7 @@ fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     let mut clone = config.clone();
     match clone.apply_setting(key, value) {
         Ok(confirmation) => {
-            if let Err(e) = db.set_setting(key, value) {
+            if let Err(e) = db.set_setting(key, value).await {
                 warn!("Failed to persist setting: {e}");
                 return format!("Validated but failed to persist: {e}");
             }
@@ -759,8 +765,8 @@ fn wrap_monospace(text: String) -> String {
     format!("```\n{}\n```", text.trim_end_matches('\n'))
 }
 
-fn handle_evolution(db: &Database) -> String {
-    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Evolution, db) {
+async fn handle_evolution(db: &Database) -> String {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Evolution, db).await {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/evolution dispatch failed: {e}");
@@ -769,8 +775,8 @@ fn handle_evolution(db: &Database) -> String {
     }
 }
 
-fn handle_xp(db: &Database) -> String {
-    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Xp, db) {
+async fn handle_xp(db: &Database) -> String {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Xp, db).await {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/xp dispatch failed: {e}");
@@ -781,11 +787,13 @@ fn handle_xp(db: &Database) -> String {
 
 /// Channels cannot write to the user's filesystem, so `--out <path>` is rejected
 /// outright rather than silently ignored. Inline ASCII card only.
-fn handle_card(db: &Database, args: &str) -> String {
+async fn handle_card(db: &Database, args: &str) -> String {
     if !args.trim().is_empty() {
         return "/card on messaging channels does not accept arguments (no --out).".to_string();
     }
-    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Card { out: None }, db) {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Card { out: None }, db)
+        .await
+    {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/card dispatch failed: {e}");
@@ -794,14 +802,15 @@ fn handle_card(db: &Database, args: &str) -> String {
     }
 }
 
-fn handle_pairing(db: &Database, channel_name: &str, sender_id: &str) -> String {
+async fn handle_pairing(db: &Database, channel_name: &str, sender_id: &str) -> String {
     let approved = db
         .is_sender_approved(channel_name, sender_id)
+        .await
         .unwrap_or(false);
     if approved {
         return format!("You are approved on channel '{channel_name}'.");
     }
-    match db.find_pending_for_sender(channel_name, sender_id) {
+    match db.find_pending_for_sender(channel_name, sender_id).await {
         Ok(Some(_)) => format!(
             "You have a pending pairing request on channel '{channel_name}'. Ask the owner to approve it."
         ),
@@ -1044,23 +1053,24 @@ mod tests {
         assert!(flag.load(Ordering::SeqCst));
     }
 
-    fn gateway_test_db() -> Database {
-        Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap()
+    async fn gateway_test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn handle_memory_lists_inventory_across_stores() {
+    #[tokio::test]
+    async fn handle_memory_lists_inventory_across_stores() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("BORG_DATA_DIR", tmp.path());
 
-        let db = cortex::db::Database::open().unwrap();
+        let db = cortex::db::Database::open().await.unwrap();
         db.upsert_memory_entry("global", "shared-note", "saved fact")
+            .await
             .unwrap();
         let memory_dir = tmp.path().join("memory");
         std::fs::create_dir_all(&memory_dir).unwrap();
         std::fs::write(memory_dir.join("memory.md"), "knowledge file").unwrap();
 
-        let out = handle_memory(&Config::default());
+        let out = handle_memory(&Config::default()).await;
         assert!(out.contains("Memory inventory"));
         assert!(out.contains("[long-term:global] shared-note"));
         assert!(out.contains("[knowledge:global] global/memory.md"));
@@ -1074,20 +1084,20 @@ mod tests {
         assert!(out.contains("/dream"), "{out}");
     }
 
-    #[test]
-    fn handle_card_rejects_out_argument() {
-        let db = gateway_test_db();
-        let out = handle_card(&db, "--out /tmp/x");
+    #[tokio::test]
+    async fn handle_card_rejects_out_argument() {
+        let db = gateway_test_db().await;
+        let out = handle_card(&db, "--out /tmp/x").await;
         assert!(
             out.starts_with("/card on messaging channels does not accept arguments"),
             "got: {out}"
         );
     }
 
-    #[test]
-    fn handle_card_inline_renders_ascii() {
-        let db = gateway_test_db();
-        let out = handle_card(&db, "");
+    #[tokio::test]
+    async fn handle_card_inline_renders_ascii() {
+        let db = gateway_test_db().await;
+        let out = handle_card(&db, "").await;
         assert!(out.contains("Stage:"), "missing Stage: in {out}");
         assert!(
             out.contains('\u{256D}') || out.contains('\u{2570}'),
@@ -1100,20 +1110,24 @@ mod tests {
     // results in a ``` fence so channel formatters (Telegram <pre>, Slack
     // mrkdwn, Discord, Signal MONOSPACE range) render them correctly.
     // Plain-text channels strip the outer fence at send time.
-    #[test]
-    fn evolution_handlers_wrap_success_output_in_code_fence() {
-        let db = gateway_test_db();
+    #[tokio::test]
+    async fn evolution_handlers_wrap_success_output_in_code_fence() {
+        let db = gateway_test_db().await;
 
-        for out in [handle_card(&db, ""), handle_xp(&db), handle_evolution(&db)] {
+        for out in [
+            handle_card(&db, "").await,
+            handle_xp(&db).await,
+            handle_evolution(&db).await,
+        ] {
             assert!(out.starts_with("```\n"), "expected opening fence: {out}");
             assert!(out.ends_with("\n```"), "expected closing fence: {out}");
         }
     }
 
-    #[test]
-    fn handle_card_error_string_is_unwrapped() {
-        let db = gateway_test_db();
-        let out = handle_card(&db, "--out /tmp/x");
+    #[tokio::test]
+    async fn handle_card_error_string_is_unwrapped() {
+        let db = gateway_test_db().await;
+        let out = handle_card(&db, "--out /tmp/x").await;
         assert!(!out.starts_with("```"), "error should not be fenced: {out}");
     }
 
@@ -1159,31 +1173,31 @@ mod tests {
         assert_eq!(names.len(), GATEWAY_COMMANDS.len());
     }
 
-    #[test]
-    fn handle_voice_uses_default_mode_from_config() {
-        let db = gateway_test_db();
+    #[tokio::test]
+    async fn handle_voice_uses_default_mode_from_config() {
+        let db = gateway_test_db().await;
         let config = Config::default();
-        let out = handle_voice(&db, &config, "telegram", Some("42"), "status");
+        let out = handle_voice(&db, &config, "telegram", Some("42"), "status").await;
         assert_eq!(
             out,
             "Voice mode: Off (text only). Voice replies require `tts.enabled = true`."
         );
     }
 
-    #[test]
-    fn handle_voice_rejects_enable_when_tts_is_unavailable() {
-        let db = gateway_test_db();
+    #[tokio::test]
+    async fn handle_voice_rejects_enable_when_tts_is_unavailable() {
+        let db = gateway_test_db().await;
         let config = Config::default();
 
-        let on = handle_voice(&db, &config, "telegram", Some("42"), "on");
+        let on = handle_voice(&db, &config, "telegram", Some("42"), "on").await;
         assert_eq!(on, "Voice replies require `tts.enabled = true`.");
         let key = crate::voice::voice_mode_setting_key("telegram", "42");
-        assert_eq!(db.get_setting(&key).unwrap().as_deref(), None);
+        assert_eq!(db.get_setting(&key).await.unwrap().as_deref(), None);
     }
 
-    #[test]
-    fn handle_voice_can_enable_all_and_voice_only_modes() {
-        let db = gateway_test_db();
+    #[tokio::test]
+    async fn handle_voice_can_enable_all_and_voice_only_modes() {
+        let db = gateway_test_db().await;
         let mut config = Config::default();
         config.tts.enabled = true;
         config.tts.models = vec![cortex::config::TtsModelConfig {
@@ -1195,24 +1209,24 @@ mod tests {
         }];
         std::env::set_var("BORG_TEST_TTS_KEY", "test-key");
 
-        let on = handle_voice(&db, &config, "telegram", Some("42"), "on");
+        let on = handle_voice(&db, &config, "telegram", Some("42"), "on").await;
         assert_eq!(on, "Voice mode: On (voice reply to voice messages)");
-        let status = handle_voice(&db, &config, "telegram", Some("42"), "status");
+        let status = handle_voice(&db, &config, "telegram", Some("42"), "status").await;
         assert_eq!(status, "Voice mode: On (voice reply to voice messages)");
 
-        let tts = handle_voice(&db, &config, "telegram", Some("42"), "tts");
+        let tts = handle_voice(&db, &config, "telegram", Some("42"), "tts").await;
         assert_eq!(tts, "Voice mode: TTS (voice reply to all messages)");
         let key = crate::voice::voice_mode_setting_key("telegram", "42");
-        assert_eq!(db.get_setting(&key).unwrap().as_deref(), Some("all"));
+        assert_eq!(db.get_setting(&key).await.unwrap().as_deref(), Some("all"));
 
         std::env::remove_var("BORG_TEST_TTS_KEY");
     }
 
-    #[test]
-    fn handle_voice_rejects_non_telegram_channels() {
-        let db = gateway_test_db();
+    #[tokio::test]
+    async fn handle_voice_rejects_non_telegram_channels() {
+        let db = gateway_test_db().await;
         let config = Config::default();
-        let out = handle_voice(&db, &config, "slack", Some("C123"), "on");
+        let out = handle_voice(&db, &config, "slack", Some("C123"), "on").await;
         assert_eq!(
             out,
             "Voice mode is currently implemented for Telegram only."

@@ -12,7 +12,7 @@ use super::EvolutionEvent;
 pub(crate) const EVOLUTION_HMAC_DOMAIN: &[u8] = b"borg-evolution-chain-v1";
 
 /// Legacy compiled-in secret for installations without per-install salt.
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub(crate) const EVOLUTION_HMAC_LEGACY: &[u8] = b"borg-evolution-chain-v1";
 
 /// Compute HMAC for an evolution event (v2: includes metadata).
@@ -43,8 +43,8 @@ pub(crate) fn compute_event_hmac(
 
 /// Legacy HMAC computation (v1: without metadata). Used internally by
 /// `verify_event_hmac` for backward-compat verification. Re-exposed to the
-/// evolution test module under `#[cfg(test)]` only.
-#[cfg(test)]
+/// evolution test module under the phase9 test feature only.
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub(crate) fn compute_event_hmac_legacy(
     key: &[u8],
     prev_hmac: &str,

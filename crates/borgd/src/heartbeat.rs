@@ -378,13 +378,15 @@ pub(crate) fn log_heartbeat_activity(source: HeartbeatSource, status: &str, mess
             .collect();
         format!("heartbeat ({source_wire}, {status}): {snippet}")
     };
-    tokio::task::spawn_blocking(move || match cortex::db::Database::open() {
-        Ok(db) => {
-            if let Err(e) = db.log_activity(level, "heartbeat", &summary, None) {
-                tracing::warn!("heartbeat: log_activity failed: {e}");
+    tokio::spawn(async move {
+        match cortex::db::Database::open().await {
+            Ok(db) => {
+                if let Err(e) = db.log_activity(level, "heartbeat", &summary, None).await {
+                    tracing::warn!("heartbeat: log_activity failed: {e}");
+                }
             }
+            Err(e) => tracing::warn!("heartbeat: db open for activity log failed: {e}"),
         }
-        Err(e) => tracing::warn!("heartbeat: db open for activity log failed: {e}"),
     });
 }
 
@@ -444,8 +446,8 @@ pub async fn execute_heartbeat_turn(
     config.llm.cache.ttl = config.llm.cache.ttl.resolve(true);
 
     let user_msg = match source {
-        HeartbeatSource::Scheduled => build_scheduled_heartbeat_prompt(&config),
-        HeartbeatSource::SessionStart => build_session_start_prompt(&config),
+        HeartbeatSource::Scheduled => build_scheduled_heartbeat_prompt(&config).await,
+        HeartbeatSource::SessionStart => build_session_start_prompt(&config).await,
     };
 
     let session_key = format!("heartbeat:{}", source.as_wire());
@@ -513,9 +515,12 @@ pub async fn execute_heartbeat_turn(
         };
     }
 
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(adb) => {
-            if let Err(e) = adb.set_setting("heartbeat.last_fired_at", &now_secs.to_string()) {
+            if let Err(e) = adb
+                .set_setting("heartbeat.last_fired_at", &now_secs.to_string())
+                .await
+            {
                 tracing::warn!("Heartbeat: failed to persist last_fired_at: {e}");
             }
         }
@@ -574,20 +579,21 @@ fn skip_reason_wire(reason: &SkipReason) -> &'static str {
     }
 }
 
-pub(crate) fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
+pub(crate) async fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
     let mut user_msg = "*heartbeat tick*".to_string();
     if let Some(cl) = cortex::memory::load_heartbeat_checklist() {
         user_msg.push_str("\n\n# Heartbeat Checklist\n");
         user_msg.push_str(&cl);
     }
+    let nudge_db = open_heartbeat_db_for_nudges().await;
     append_proactive_nudges(
         &mut user_msg,
-        crate::heartbeat_augmenters::collect(config, open_heartbeat_db_for_nudges().as_ref()),
+        crate::heartbeat_augmenters::collect(config, nudge_db.as_ref()).await,
     );
     user_msg
 }
 
-fn build_session_start_prompt(config: &Config) -> String {
+async fn build_session_start_prompt(config: &Config) -> String {
     use chrono::{TimeZone, Timelike, Utc};
 
     let tz = config.user_timezone();
@@ -597,11 +603,14 @@ fn build_session_start_prompt(config: &Config) -> String {
     let hour = now_local.hour();
     let weekday = now_local.format("%A").to_string();
 
-    let (recent_activity, hours_since_last) = match cortex::db::Database::open() {
+    let (recent_activity, hours_since_last) = match cortex::db::Database::open().await {
         Ok(db) => {
-            let ctx = cortex::daily_summary::gather_daily_context(&db).unwrap_or_default();
+            let ctx = cortex::daily_summary::gather_daily_context(&db)
+                .await
+                .unwrap_or_default();
             let gap = db
                 .sessions_since(0)
+                .await
                 .ok()
                 .and_then(|rows| rows.first().map(|s| s.updated_at))
                 .map(|ts| (now_utc.timestamp() - ts).max(0) / 3600);
@@ -633,12 +642,10 @@ fn build_session_start_prompt(config: &Config) -> String {
          continue. One or two sentences.\n",
     );
     msg.push_str("</instructions>");
+    let nudge_db = open_heartbeat_db_for_nudges().await;
     append_proactive_nudges(
         &mut msg,
-        crate::heartbeat_augmenters::collect_session_start(
-            config,
-            open_heartbeat_db_for_nudges().as_ref(),
-        ),
+        crate::heartbeat_augmenters::collect_session_start(config, nudge_db.as_ref()).await,
     );
     msg
 }
@@ -657,8 +664,8 @@ fn append_proactive_nudges(user_msg: &mut String, nudges: Vec<String>) {
     tracing::debug!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
 }
 
-fn open_heartbeat_db_for_nudges() -> Option<cortex::db::Database> {
-    match cortex::db::Database::open() {
+async fn open_heartbeat_db_for_nudges() -> Option<cortex::db::Database> {
+    match cortex::db::Database::open().await {
         Ok(db) => Some(db),
         Err(e) => {
             tracing::warn!("Heartbeat: failed to open DB for proactive nudges: {e}");
@@ -703,7 +710,7 @@ pub(crate) async fn deliver_to_channels(config: &Config, text: &str) {
 }
 
 async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> Result<()> {
-    let recipients = resolve_recipients(config, channel_name)?;
+    let recipients = resolve_recipients(config, channel_name).await?;
     if recipients.is_empty() {
         return Ok(());
     }
@@ -715,9 +722,9 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> 
     Ok(())
 }
 
-fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {
-    let db = cortex::db::Database::open()?;
-    let approved = db.list_approved_senders(Some(channel_name))?;
+async fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {
+    let db = cortex::db::Database::open().await?;
+    let approved = db.list_approved_senders(Some(channel_name)).await?;
     if approved.is_empty() {
         return Ok(Vec::new());
     }

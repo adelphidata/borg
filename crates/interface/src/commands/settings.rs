@@ -23,17 +23,17 @@ pub(crate) enum SettingsAction {
 }
 
 /// Dispatch for `borg settings ...`.
-pub(crate) fn dispatch_settings(action: Option<SettingsAction>) -> Result<()> {
+pub(crate) async fn dispatch_settings(action: Option<SettingsAction>) -> Result<()> {
     match action {
-        Some(SettingsAction::Set { key, value }) => run_settings_set(&key, &value),
-        Some(SettingsAction::Get { key }) => run_settings_get(&key),
-        Some(SettingsAction::Unset { key }) => run_settings_unset(&key),
-        None => run_settings_show(),
+        Some(SettingsAction::Set { key, value }) => run_settings_set(&key, &value).await,
+        Some(SettingsAction::Get { key }) => run_settings_get(&key).await,
+        Some(SettingsAction::Unset { key }) => run_settings_unset(&key).await,
+        None => run_settings_show().await,
     }
 }
 
 /// Dispatch for `borg logs ...` — activity log vs. conversation history.
-pub(crate) fn dispatch_logs(
+pub(crate) async fn dispatch_logs(
     count: usize,
     verbose: bool,
     activity: bool,
@@ -41,15 +41,15 @@ pub(crate) fn dispatch_logs(
     category: Option<&str>,
 ) -> Result<()> {
     if activity {
-        run_activity_logs(count, level, category)
+        run_activity_logs(count, level, category).await
     } else {
         run_logs(count, verbose)
     }
 }
 
-pub(crate) fn run_settings_show() -> Result<()> {
-    let resolver = cortex::settings::SettingsResolver::load()?;
-    let all = resolver.list_all()?;
+pub(crate) async fn run_settings_show() -> Result<()> {
+    let resolver = cortex::settings::SettingsResolver::load().await?;
+    let all = resolver.list_all().await?;
     println!("Settings:");
     for info in &all {
         println!("  {:40} = {:20} [{}]", info.key, info.value, info.source);
@@ -57,24 +57,24 @@ pub(crate) fn run_settings_show() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_settings_set(key: &str, value: &str) -> Result<()> {
-    let resolver = cortex::settings::SettingsResolver::load()?;
-    let confirmation = resolver.set(key, value)?;
+pub(crate) async fn run_settings_set(key: &str, value: &str) -> Result<()> {
+    let resolver = cortex::settings::SettingsResolver::load().await?;
+    let confirmation = resolver.set(key, value).await?;
     println!("Updated: {confirmation}");
     Ok(())
 }
 
-pub(crate) fn run_settings_get(key: &str) -> Result<()> {
-    let resolver = cortex::settings::SettingsResolver::load()?;
-    let (value, source) = resolver.get_with_source(key)?;
+pub(crate) async fn run_settings_get(key: &str) -> Result<()> {
+    let resolver = cortex::settings::SettingsResolver::load().await?;
+    let (value, source) = resolver.get_with_source(key).await?;
     println!("{key} = {value} [{source}]");
     Ok(())
 }
 
-pub(crate) fn run_settings_unset(key: &str) -> Result<()> {
-    let resolver = cortex::settings::SettingsResolver::load()?;
-    resolver.unset(key)?;
-    let (value, source) = resolver.get_with_source(key)?;
+pub(crate) async fn run_settings_unset(key: &str) -> Result<()> {
+    let resolver = cortex::settings::SettingsResolver::load().await?;
+    resolver.unset(key).await?;
+    let (value, source) = resolver.get_with_source(key).await?;
     println!("Unset {key} — effective value: {value} [{source}]");
     Ok(())
 }
@@ -91,9 +91,13 @@ pub(crate) fn run_logs(count: usize, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_activity_logs(count: usize, level: &str, category: Option<&str>) -> Result<()> {
-    let db = cortex::db::Database::open_readonly()?;
-    let entries = db.query_activity(count, Some(level), category)?;
+pub(crate) async fn run_activity_logs(
+    count: usize,
+    level: &str,
+    category: Option<&str>,
+) -> Result<()> {
+    let db = cortex::db::Database::open_readonly().await?;
+    let entries = db.query_activity(count, Some(level), category).await?;
     if entries.is_empty() {
         println!("No activity log entries.");
     } else {

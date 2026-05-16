@@ -67,7 +67,7 @@ impl DaemonSessionExecutor {
             .unwrap_or_else(|| self.config.clone())
     }
 
-    fn ensure_host(&self, session_key: &str) -> anyhow::Result<SessionHost> {
+    async fn ensure_host(&self, session_key: &str) -> anyhow::Result<SessionHost> {
         // Today the AgentBackend dispatches all tool calls to daemon-side
         // handlers. The CapabilityRouter is wired and tested in
         // capability_routing.rs but its output is not consumed by the agent
@@ -90,7 +90,8 @@ impl DaemonSessionExecutor {
             self.cost_event_sink.clone(),
             None,
             self.goal_bus.clone(),
-        )?;
+        )
+        .await?;
         let host = SessionHost::new(backend);
         self.registry.insert(host.clone());
         Ok(host)
@@ -103,7 +104,7 @@ impl SessionExecutor for DaemonSessionExecutor {
         &self,
         turn: InboundTurn,
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
-        let host = self.ensure_host(&turn.session_key)?;
+        let host = self.ensure_host(&turn.session_key).await?;
 
         // Cancel any in-flight turn on this session before starting a new one.
         // Matches today's gateway semantics: a new inbound replaces a stalled

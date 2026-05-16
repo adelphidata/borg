@@ -41,7 +41,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
     // Seed a due command task (POSIX no-op) — would succeed in ~milliseconds
     // if the dispatcher ever claimed it.
     {
-        let db = Database::open().expect("seed db");
+        let db = Database::open().await.expect("seed db");
         let now = chrono::Utc::now().timestamp();
         db.create_task(&NewTask {
             id: "blocked-by-tick-lock",
@@ -62,6 +62,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create task");
     }
 
@@ -99,8 +100,9 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
 
     // Verify no claim happened while we held the lock.
     let runs_during_hold = {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         db.task_run_history("blocked-by-tick-lock", 5)
+            .await
             .unwrap_or_default()
     };
     assert!(

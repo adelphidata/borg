@@ -73,6 +73,7 @@ impl ReadOnlyToolHandler for MemorySearchTool {
     }
     async fn call(&self, arguments: serde_json::Value) -> Result<serde_json::Value, McpError> {
         let config = Config::load_from_db()
+            .await
             .map_err(|e| McpError::internal(format!("config load failed: {e}")))?;
         let result = cortex::tool_handlers::handle_memory_search(&arguments, &config)
             .await
@@ -108,6 +109,7 @@ impl ReadOnlyToolHandler for ReadMemoryTool {
             .and_then(|v| v.as_str())
             .unwrap_or("global");
         let content = cortex::memory::read_memory_db_or_not_found(name, scope)
+            .await
             .map_err(|e| McpError::internal(format!("read_memory failed: {e}")))?;
         Ok(serde_json::Value::String(content))
     }
@@ -129,6 +131,7 @@ impl ReadOnlyToolHandler for WebFetchTool {
     }
     async fn call(&self, arguments: serde_json::Value) -> Result<serde_json::Value, McpError> {
         let config = Config::load_from_db()
+            .await
             .map_err(|e| McpError::internal(format!("config load failed: {e}")))?;
         let result = cortex::tool_handlers::handle_web_fetch(&arguments, &config)
             .await
@@ -153,6 +156,7 @@ impl ReadOnlyToolHandler for WebSearchTool {
     }
     async fn call(&self, arguments: serde_json::Value) -> Result<serde_json::Value, McpError> {
         let config = Config::load_from_db()
+            .await
             .map_err(|e| McpError::internal(format!("config load failed: {e}")))?;
         let result = cortex::tool_handlers::handle_web_search(&arguments, &config)
             .await
@@ -185,6 +189,7 @@ impl ReadOnlyToolHandler for ListTool {
             .ok_or_else(|| args_error("missing string `kind`"))?;
         let remapped = serde_json::json!({"what": kind});
         let config = Config::load_from_db()
+            .await
             .map_err(|e| McpError::internal(format!("config load failed: {e}")))?;
         // `agent_control = None`: MCP can't list spawned sub-agents
         // without a live agent loop. The core handler returns a clear

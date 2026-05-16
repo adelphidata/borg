@@ -134,8 +134,9 @@ impl Database {
         cert_serial: i64,
     ) -> Result<i64> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO paired_devices
+        self.conn
+            .execute(
+                "INSERT INTO paired_devices
              (fingerprint, device_label, scope_json, paired_at, status, principal_id, cert_serial)
              VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)
              ON CONFLICT(fingerprint) DO UPDATE SET
@@ -144,15 +145,16 @@ impl Database {
                 principal_id = excluded.principal_id,
                 cert_serial  = excluded.cert_serial,
                 status       = 'active'",
-            params!(
-                fingerprint,
-                device_label,
-                scope_json,
-                now,
-                principal_id,
-                cert_serial
-            ),
-        ).await?;
+                params!(
+                    fingerprint,
+                    device_label,
+                    scope_json,
+                    now,
+                    principal_id,
+                    cert_serial
+                ),
+            )
+            .await?;
         let mut rows = self
             .conn
             .query(
@@ -248,7 +250,11 @@ impl Database {
             .execute(
                 "INSERT OR IGNORE INTO revoked_fingerprints (fingerprint, revoked_at, reason)
              VALUES (?1, ?2, ?3)",
-                params!(fingerprint, now, reason.map(|s| s.to_string())),
+                params!(
+                    fingerprint,
+                    now,
+                    reason.map(std::string::ToString::to_string)
+                ),
             )
             .await?;
         Ok(())

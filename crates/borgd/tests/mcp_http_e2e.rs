@@ -19,7 +19,7 @@ mod common;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_http_tools_list_round_trip() {
     let harness = common::boot_gateway(false).await;
-    let token = common::issue_token("e2e-mcp");
+    let token = common::issue_token("e2e-mcp").await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()

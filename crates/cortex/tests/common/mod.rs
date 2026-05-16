@@ -7,13 +7,11 @@
 #![allow(dead_code)]
 
 use cortex::db::Database;
-use rusqlite::Connection;
 use tempfile::TempDir;
 
 /// Create a fresh in-memory database with migrations applied.
-pub fn test_db() -> Database {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    Database::from_connection(conn).expect("init test db")
+pub async fn test_db() -> Database {
+    Database::test_db().await
 }
 
 /// Create a temp directory the integration test can use as a scratch dir.

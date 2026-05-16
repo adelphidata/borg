@@ -24,7 +24,7 @@ mod common;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_compat_chat_completions_round_trip() {
     let harness = common::boot_gateway(true).await;
-    let token = common::issue_token("e2e-openai");
+    let token = common::issue_token("e2e-openai").await;
     // Session key for OpenAI-compat is `<token-label>:` — see
     // `chat_completions` in routes.rs which sets sender_id to the
     // token label and leaves thread_id None.
@@ -111,7 +111,7 @@ async fn openai_compat_streaming_path_emits_done_terminator() {
     // SSE termination is the regression most likely to break clients
     // (ChatBox / Open WebUI hang waiting for `[DONE]` if missing).
     let harness = common::boot_gateway(true).await;
-    let token = common::issue_token("e2e-openai-stream");
+    let token = common::issue_token("e2e-openai-stream").await;
     common::register_stub_for_session(
         "e2e-openai-stream:",
         vec![

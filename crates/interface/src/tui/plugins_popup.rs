@@ -182,28 +182,26 @@ impl PluginsPopup {
         // render the catalog if the WASM subsystem is down, but log so the
         // operator can correlate an empty WASM section with a real error
         // rather than "nothing installed".
-        match cortex::db::Database::open() {
-            Ok(db) => match db.list_wasm_plugins() {
-                Ok(rows) => {
-                    for row in rows {
-                        let quarantined = row.status == "quarantined";
-                        let enabled_now = row.status == "verified";
-                        items.push(PluginItem {
-                            id: row.plugin_id.clone(),
-                            name: row.plugin_id.clone(),
-                            section: Section::Wasm,
-                            kind: ItemKind::WasmPlugin { quarantined },
-                            original_enabled: enabled_now,
-                            toggled: enabled_now,
-                        });
-                    }
+        match crate::async_bridge::block_on(async {
+            let db = cortex::db::Database::open().await?;
+            db.list_wasm_plugins().await
+        }) {
+            Ok(rows) => {
+                for row in rows {
+                    let quarantined = row.status == "quarantined";
+                    let enabled_now = row.status == "verified";
+                    items.push(PluginItem {
+                        id: row.plugin_id.clone(),
+                        name: row.plugin_id.clone(),
+                        section: Section::Wasm,
+                        kind: ItemKind::WasmPlugin { quarantined },
+                        original_enabled: enabled_now,
+                        toggled: enabled_now,
+                    });
                 }
-                Err(e) => {
-                    tracing::warn!("plugins popup: list_wasm_plugins failed: {e}");
-                }
-            },
+            }
             Err(e) => {
-                tracing::warn!("plugins popup: Database::open failed: {e}");
+                tracing::warn!("plugins popup: WASM plugin listing failed: {e}");
             }
         }
 

@@ -6,10 +6,7 @@ use crate::db::Database;
 
 use super::{check_enabled, optional_bool_param, optional_str_param, require_str_param, with_db};
 
-pub async fn handle_manage_scripts(
-    args: &serde_json::Value,
-    config: &Config,
-) -> Result<String> {
+pub async fn handle_manage_scripts(args: &serde_json::Value, config: &Config) -> Result<String> {
     if let Some(msg) = check_enabled(config.scripts.enabled, "scripts") {
         return Ok(msg);
     }
@@ -24,8 +21,7 @@ pub async fn handle_manage_scripts(
             "get" => scripts_get(&args, &db).await,
             "list" => crate::scripts::list_scripts(&db).await,
             other => Ok(format!(
-                "Unknown action: '{}'. Valid actions: create, update, delete, get, list",
-                other
+                "Unknown action: '{other}'. Valid actions: create, update, delete, get, list"
             )),
         }
     })

@@ -92,9 +92,7 @@ pub async fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
 /// `(Default, 0, Some(PostureUndetermined))` so `xp_gain` writes still pass
 /// through `compute_xp_breakdown` and surface the fallback in their
 /// `XpBreakdown` for `borg doctor` escalation.
-pub async fn current_posture_for_xp(
-    db: &Database,
-) -> (PostureState, i64, Option<FallbackReason>) {
+pub async fn current_posture_for_xp(db: &Database) -> (PostureState, i64, Option<FallbackReason>) {
     let row: Option<(String, i64)> = match db
         .conn()
         .query(

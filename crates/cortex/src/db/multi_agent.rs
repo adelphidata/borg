@@ -25,7 +25,7 @@ impl Database {
         let temperature_f64 = temperature.map(|t| t as f64);
         self.conn.execute(
             "INSERT INTO agent_roles (name, description, model, provider, temperature, system_instructions, tools_allowed, max_iterations, is_builtin, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params!(name, description, model.map(|s| s.to_string()), provider.map(|s| s.to_string()), temperature_f64, system_instructions.map(|s| s.to_string()), tools_allowed.map(|s| s.to_string()), max_iterations, is_builtin as i32, now),
+            params!(name, description, model.map(std::string::ToString::to_string), provider.map(std::string::ToString::to_string), temperature_f64, system_instructions.map(std::string::ToString::to_string), tools_allowed.map(std::string::ToString::to_string), max_iterations, is_builtin as i32, now),
         ).await?;
         Ok(())
     }
@@ -46,7 +46,7 @@ impl Database {
         let temperature_f64 = temperature.map(|t| t as f64);
         self.conn.execute(
             "UPDATE agent_roles SET description = COALESCE(?2, description), model = COALESCE(?3, model), provider = COALESCE(?4, provider), temperature = COALESCE(?5, temperature), system_instructions = COALESCE(?6, system_instructions), tools_allowed = COALESCE(?7, tools_allowed), max_iterations = COALESCE(?8, max_iterations), updated_at = ?1 WHERE name = ?9",
-            params!(now, description.map(|s| s.to_string()), model.map(|s| s.to_string()), provider.map(|s| s.to_string()), temperature_f64, system_instructions.map(|s| s.to_string()), tools_allowed.map(|s| s.to_string()), max_iterations, name),
+            params!(now, description.map(std::string::ToString::to_string), model.map(std::string::ToString::to_string), provider.map(std::string::ToString::to_string), temperature_f64, system_instructions.map(std::string::ToString::to_string), tools_allowed.map(std::string::ToString::to_string), max_iterations, name),
         ).await?;
         Ok(())
     }
@@ -117,11 +117,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn update_sub_agent_status(
-        &self,
-        id: &str,
-        status: &SubAgentStatus,
-    ) -> Result<()> {
+    pub async fn update_sub_agent_status(&self, id: &str, status: &SubAgentStatus) -> Result<()> {
         let status_str = status.as_str();
         let result_text = match status {
             SubAgentStatus::Completed { result } => Some(result.clone()),

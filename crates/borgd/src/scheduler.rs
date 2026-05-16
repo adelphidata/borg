@@ -64,11 +64,11 @@ pub async fn run(
     semaphore: Arc<tokio::sync::Semaphore>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let db = cortex::db::Database::open()?;
+    let db = cortex::db::Database::open().await?;
 
     let daemon_pid = std::process::id();
     let now = chrono::Utc::now().timestamp();
-    if !db.acquire_daemon_lock(daemon_pid, now)? {
+    if !db.acquire_daemon_lock(daemon_pid, now).await? {
         anyhow::bail!(
             "Another daemon instance is already running. Only one daemon can run at a time."
         );
@@ -84,7 +84,7 @@ pub async fn run(
     // overdue gets its `next_run` advanced so we don't replay every
     // missed window in a burst. Concentrated into the maintenance
     // module — see `crates/borgd/src/maintenance/sweep.rs`.
-    let boot_report = sweep::boot_recovery(&db);
+    let boot_report = sweep::boot_recovery(&db).await;
     if boot_report.stale_tasks_advanced > 0 {
         tracing::info!(
             advanced = boot_report.stale_tasks_advanced,
@@ -129,7 +129,7 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                if let Err(e) = db.release_daemon_lock(daemon_pid) {
+                if let Err(e) = db.release_daemon_lock(daemon_pid).await {
                     tracing::warn!(error = %e, "release daemon lock on shutdown failed");
                 }
                 return Ok(());
@@ -146,7 +146,7 @@ pub async fn run(
                 "Daemon resumed after {}s pause, re-checking stale tasks",
                 elapsed.as_secs()
             );
-            let drift_report = sweep::drift_recovery(&db);
+            let drift_report = sweep::drift_recovery(&db).await;
             if drift_report.stale_tasks_advanced > 0 {
                 tracing::info!(
                     advanced = drift_report.stale_tasks_advanced,
@@ -157,7 +157,7 @@ pub async fn run(
 
         let now = chrono::Utc::now().timestamp();
 
-        match db.refresh_daemon_lock(daemon_pid, now) {
+        match db.refresh_daemon_lock(daemon_pid, now).await {
             Ok(()) => lock_refresh_failures = 0,
             Err(e) => {
                 lock_refresh_failures += 1;
@@ -174,7 +174,7 @@ pub async fn run(
 
         if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
             last_stalled_scan = std::time::Instant::now();
-            let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS);
+            let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS).await;
             if scan.tasks_healed > 0 || scan.wedged_runs_recovered > 0 {
                 tracing::info!(
                     healed = scan.tasks_healed,
@@ -219,7 +219,7 @@ pub async fn run(
         };
 
         // Claim due tasks.
-        match db.claim_due_tasks(now) {
+        match db.claim_due_tasks(now).await {
             Ok(claimed) => {
                 for ct in claimed {
                     let fut = (hooks.spawn_task)(
@@ -236,10 +236,10 @@ pub async fn run(
         }
 
         // Retries.
-        match db.get_tasks_pending_retry(now) {
+        match db.get_tasks_pending_retry(now).await {
             Ok(retries) => {
                 for task in retries {
-                    let run_id = match db.start_task_run(&task.id, now) {
+                    let run_id = match db.start_task_run(&task.id, now).await {
                         Ok(id) => id,
                         Err(e) => {
                             tracing::warn!("Failed to start task run for '{}': {e}", task.name);
@@ -255,7 +255,7 @@ pub async fn run(
         }
 
         // Celebrations.
-        match db.claim_pending_celebrations() {
+        match db.claim_pending_celebrations().await {
             Ok(celebrations) => {
                 for c in celebrations {
                     let celebration_id = c.id;
@@ -263,15 +263,18 @@ pub async fn run(
                     let deliver = hooks.deliver_celebration.clone();
                     tokio::spawn(async move {
                         let delivered = (deliver)(cfg, c).await;
-                        match cortex::db::Database::open() {
+                        match cortex::db::Database::open().await {
                             Ok(cdb) => {
                                 if delivered {
-                                    if let Err(e) = cdb.mark_celebration_delivered(celebration_id) {
+                                    if let Err(e) =
+                                        cdb.mark_celebration_delivered(celebration_id).await
+                                    {
                                         tracing::warn!(
                                             "Failed to mark celebration {celebration_id} delivered: {e}"
                                         );
                                     }
-                                } else if let Err(e) = cdb.unclaim_celebration(celebration_id) {
+                                } else if let Err(e) = cdb.unclaim_celebration(celebration_id).await
+                                {
                                     tracing::warn!(
                                         "Failed to unclaim celebration {celebration_id}: {e}"
                                     );

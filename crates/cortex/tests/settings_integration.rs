@@ -31,16 +31,16 @@ use cortex::settings::{SettingSource, SettingsResolver, ALL_SETTING_KEYS};
 mod common;
 use common::test_db;
 
-fn test_resolver() -> SettingsResolver {
-    SettingsResolver::new(test_db())
+async fn test_resolver() -> SettingsResolver {
+    SettingsResolver::new(test_db().await)
 }
 
 // ── Test: defaults resolve without DB overrides ──
 
-#[test]
-fn defaults_resolve_without_db() {
-    let resolver = test_resolver();
-    let config = resolver.resolve().expect("resolve");
+#[tokio::test]
+async fn defaults_resolve_without_db() {
+    let resolver = test_resolver().await;
+    let config = resolver.resolve().await.expect("resolve");
     // Default temperature should be set
     assert!(config.llm.temperature > 0.0);
     assert!(config.llm.max_tokens > 0);
@@ -48,16 +48,17 @@ fn defaults_resolve_without_db() {
 
 // ── Test: DB override takes precedence ──
 
-#[test]
-fn db_override_takes_precedence() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn db_override_takes_precedence() {
+    let resolver = test_resolver().await;
 
     // Set temperature via DB
     resolver
         .set("temperature", "0.42")
+        .await
         .expect("set temperature");
 
-    let config = resolver.resolve().expect("resolve");
+    let config = resolver.resolve().await.expect("resolve");
     assert!(
         (config.llm.temperature - 0.42).abs() < f32::EPSILON,
         "DB override should take precedence, got {}",
@@ -67,17 +68,17 @@ fn db_override_takes_precedence() {
 
 // ── Test: unset reverts to default ──
 
-#[test]
-fn unset_reverts_to_default() {
-    let resolver = test_resolver();
-    let default_config = resolver.resolve().expect("resolve default");
+#[tokio::test]
+async fn unset_reverts_to_default() {
+    let resolver = test_resolver().await;
+    let default_config = resolver.resolve().await.expect("resolve default");
     let default_temp = default_config.llm.temperature;
 
     // Override, then unset
-    resolver.set("temperature", "0.1").expect("set");
-    resolver.unset("temperature").expect("unset");
+    resolver.set("temperature", "0.1").await.expect("set");
+    resolver.unset("temperature").await.expect("unset");
 
-    let config = resolver.resolve().expect("resolve after unset");
+    let config = resolver.resolve().await.expect("resolve after unset");
     assert!(
         (config.llm.temperature - default_temp).abs() < f32::EPSILON,
         "Should revert to default after unset"
@@ -86,38 +87,42 @@ fn unset_reverts_to_default() {
 
 // ── Test: get_with_source reports correct source ──
 
-#[test]
-fn get_with_source_reports_correctly() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn get_with_source_reports_correctly() {
+    let resolver = test_resolver().await;
 
     // Default source
     let (_, source) = resolver
         .get_with_source("temperature")
+        .await
         .expect("get default");
     assert_eq!(source, SettingSource::Default);
 
     // DB source after set
-    resolver.set("temperature", "0.5").expect("set");
-    let (val, source) = resolver.get_with_source("temperature").expect("get db");
+    resolver.set("temperature", "0.5").await.expect("set");
+    let (val, source) = resolver
+        .get_with_source("temperature")
+        .await
+        .expect("get db");
     assert_eq!(source, SettingSource::Database);
     assert_eq!(val, "0.5");
 }
 
 // ── Test: invalid key rejected ──
 
-#[test]
-fn invalid_key_rejected() {
-    let resolver = test_resolver();
-    let result = resolver.set("nonexistent_key", "value");
+#[tokio::test]
+async fn invalid_key_rejected() {
+    let resolver = test_resolver().await;
+    let result = resolver.set("nonexistent_key", "value").await;
     assert!(result.is_err(), "Invalid key should be rejected");
 }
 
 // ── Test: invalid value rejected ──
 
-#[test]
-fn invalid_temperature_rejected() {
-    let resolver = test_resolver();
-    let result = resolver.set("temperature", "not_a_number");
+#[tokio::test]
+async fn invalid_temperature_rejected() {
+    let resolver = test_resolver().await;
+    let result = resolver.set("temperature", "not_a_number").await;
     assert!(
         result.is_err(),
         "Non-numeric temperature should be rejected"
@@ -126,10 +131,10 @@ fn invalid_temperature_rejected() {
 
 // ── Test: list_all returns all known keys ──
 
-#[test]
-fn list_all_returns_all_keys() {
-    let resolver = test_resolver();
-    let all = resolver.list_all().expect("list all");
+#[tokio::test]
+async fn list_all_returns_all_keys() {
+    let resolver = test_resolver().await;
+    let all = resolver.list_all().await.expect("list all");
     assert_eq!(
         all.len(),
         ALL_SETTING_KEYS.len(),
@@ -139,43 +144,56 @@ fn list_all_returns_all_keys() {
 
 // ── Test: boolean settings round-trip ──
 
-#[test]
-fn boolean_settings_round_trip() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn boolean_settings_round_trip() {
+    let resolver = test_resolver().await;
 
-    resolver.set("sandbox.enabled", "false").expect("set false");
-    let config = resolver.resolve().expect("resolve");
+    resolver
+        .set("sandbox.enabled", "false")
+        .await
+        .expect("set false");
+    let config = resolver.resolve().await.expect("resolve");
     assert!(!config.sandbox.enabled, "Should be false");
 
-    resolver.set("sandbox.enabled", "true").expect("set true");
-    let config = resolver.resolve().expect("resolve");
+    resolver
+        .set("sandbox.enabled", "true")
+        .await
+        .expect("set true");
+    let config = resolver.resolve().await.expect("resolve");
     assert!(config.sandbox.enabled, "Should be true");
 }
 
 // ── Test: integer settings round-trip ──
 
-#[test]
-fn integer_settings_round_trip() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn integer_settings_round_trip() {
+    let resolver = test_resolver().await;
 
-    resolver.set("max_tokens", "2048").expect("set max_tokens");
-    let config = resolver.resolve().expect("resolve");
+    resolver
+        .set("max_tokens", "2048")
+        .await
+        .expect("set max_tokens");
+    let config = resolver.resolve().await.expect("resolve");
     assert_eq!(config.llm.max_tokens, 2048);
 }
 
 // ── Test: multiple overrides compose correctly ──
 
-#[test]
-fn multiple_overrides_compose() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn multiple_overrides_compose() {
+    let resolver = test_resolver().await;
 
-    resolver.set("temperature", "0.3").expect("set temp");
-    resolver.set("max_tokens", "1024").expect("set tokens");
+    resolver.set("temperature", "0.3").await.expect("set temp");
+    resolver
+        .set("max_tokens", "1024")
+        .await
+        .expect("set tokens");
     resolver
         .set("sandbox.enabled", "false")
+        .await
         .expect("set sandbox");
 
-    let config = resolver.resolve().expect("resolve");
+    let config = resolver.resolve().await.expect("resolve");
     assert!((config.llm.temperature - 0.3).abs() < f32::EPSILON);
     assert_eq!(config.llm.max_tokens, 1024);
     assert!(!config.sandbox.enabled);
@@ -183,17 +201,17 @@ fn multiple_overrides_compose() {
 
 // ── Test: DB persistence across resolver operations ──
 
-#[test]
-fn db_persistence_across_operations() {
-    let resolver = test_resolver();
+#[tokio::test]
+async fn db_persistence_across_operations() {
+    let resolver = test_resolver().await;
 
     // Set, then verify it persists across get calls
-    resolver.set("temperature", "0.99").expect("set");
-    let (val, source) = resolver.get_with_source("temperature").expect("get");
+    resolver.set("temperature", "0.99").await.expect("set");
+    let (val, source) = resolver.get_with_source("temperature").await.expect("get");
     assert_eq!(val, "0.99");
     assert_eq!(source, SettingSource::Database);
 
     // Verify it survives resolve()
-    let config = resolver.resolve().expect("resolve");
+    let config = resolver.resolve().await.expect("resolve");
     assert!((config.llm.temperature - 0.99).abs() < f32::EPSILON);
 }

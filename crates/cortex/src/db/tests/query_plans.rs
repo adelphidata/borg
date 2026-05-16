@@ -12,24 +12,24 @@ use super::*;
 
 /// Run `EXPLAIN QUERY PLAN <sql>` and return the joined `detail` column for
 /// every plan row. The combined string is what we pattern-match in assertions.
-fn explain(db: &Database, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> String {
+async fn explain(db: &Database, sql: &str, params: Vec<turso::Value>) -> String {
     let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut stmt = db.conn.prepare(&explain_sql).unwrap();
-    let rows: Vec<String> = stmt
-        .query_map(params, |row| row.get::<_, String>(3))
-        .unwrap()
-        .map(std::result::Result::unwrap)
-        .collect();
-    rows.join("\n")
+    let mut stmt = db.conn.prepare(&explain_sql).await.unwrap();
+    let mut rows = stmt.query(params).await.unwrap();
+    let mut details: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        details.push(row.get::<String>(3).unwrap());
+    }
+    details.join("\n")
 }
 
-#[test]
-fn get_unindexed_sessions_uses_indexed_anti_join_and_ordering() {
+#[tokio::test]
+async fn get_unindexed_sessions_uses_indexed_anti_join_and_ordering() {
     // Guard: rewriting `LEFT JOIN ... IS NULL` to `NOT EXISTS` plus the new
     // idx_sessions_updated_at index must let SQLite (a) skip a full
     // sessions-table scan for the order-by, and (b) probe
     // session_index_status by primary key, not scan it.
-    let db = test_db();
+    let db = test_db().await;
     let plan = explain(
         &db,
         "SELECT s.id FROM sessions s
@@ -38,8 +38,9 @@ fn get_unindexed_sessions_uses_indexed_anti_join_and_ordering() {
          )
          ORDER BY s.updated_at DESC
          LIMIT ?1",
-        &[&10i64],
-    );
+        vec![turso::Value::Integer(10)],
+    )
+    .await;
     assert!(
         plan.contains("USING INDEX idx_sessions_updated_at")
             || plan.contains("USING COVERING INDEX idx_sessions_updated_at"),
@@ -56,20 +57,21 @@ fn get_unindexed_sessions_uses_indexed_anti_join_and_ordering() {
     );
 }
 
-#[test]
-fn prune_embedding_cache_inner_keeps_set_uses_last_accessed_index() {
+#[tokio::test]
+async fn prune_embedding_cache_inner_keeps_set_uses_last_accessed_index() {
     // Guard: `prune_embedding_cache_by_count` uses NOT IN against an inner
     // `ORDER BY last_accessed_at DESC, id DESC LIMIT N` subquery. The inner
     // sort must be served by idx_embedding_cache_last_accessed so the LIMIT
     // short-circuits — otherwise SQLite would walk the whole table and sort
     // it just to compute the keep-set every prune cycle.
-    let db = test_db();
+    let db = test_db().await;
     let plan = explain(
         &db,
         "SELECT id FROM embedding_cache
          ORDER BY last_accessed_at DESC, id DESC LIMIT ?1",
-        &[&100i64],
-    );
+        vec![turso::Value::Integer(100)],
+    )
+    .await;
     assert!(
         plan.contains("USING INDEX idx_embedding_cache_last_accessed")
             || plan.contains("USING COVERING INDEX idx_embedding_cache_last_accessed"),
@@ -77,21 +79,26 @@ fn prune_embedding_cache_inner_keeps_set_uses_last_accessed_index() {
     );
 }
 
-#[test]
-fn list_memory_entries_for_scopes_uses_scope_index() {
+#[tokio::test]
+async fn list_memory_entries_for_scopes_uses_scope_index() {
     // Guard: the batch helper relies on idx_memory_entries_scope to seek by
     // scope. If that index is dropped or the IN-clause is rewritten in a way
     // that defeats the index (e.g. function on the column), we fall back to
     // a full memory_entries scan — bad for an every-turn query.
-    let db = test_db();
+    let db = test_db().await;
     let plan = explain(
         &db,
         "SELECT id, scope, name, content, content_hash, created_at, updated_at
          FROM memory_entries
          WHERE scope IN (?, ?, ?)
          ORDER BY scope, updated_at DESC",
-        &[&"global", &"project:abc", &"extra"],
-    );
+        vec![
+            turso::Value::Text("global".to_string()),
+            turso::Value::Text("project:abc".to_string()),
+            turso::Value::Text("extra".to_string()),
+        ],
+    )
+    .await;
     assert!(
         plan.contains("USING INDEX idx_memory_entries_scope"),
         "scoped fetch must use idx_memory_entries_scope; plan was:\n{plan}"
@@ -102,20 +109,21 @@ fn list_memory_entries_for_scopes_uses_scope_index() {
     );
 }
 
-#[test]
-fn sessions_since_uses_updated_at_index() {
+#[tokio::test]
+async fn sessions_since_uses_updated_at_index() {
     // Guard: heartbeat calls sessions_since(0) every tick. With
     // idx_sessions_updated_at SQLite walks the index in DESC order and stops
     // at LIMIT, no temp btree, no full scan.
-    let db = test_db();
+    let db = test_db().await;
     let plan = explain(
         &db,
         "SELECT id, created_at, updated_at, total_tokens, model, title,
                 parent_session_id, forked_from_message_id
          FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
          LIMIT ?2",
-        &[&0i64, &10_000i64],
-    );
+        vec![turso::Value::Integer(0), turso::Value::Integer(10_000)],
+    )
+    .await;
     assert!(
         plan.contains("USING INDEX idx_sessions_updated_at")
             || plan.contains("USING COVERING INDEX idx_sessions_updated_at"),

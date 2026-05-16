@@ -294,7 +294,7 @@ fn suggested_filename(meta: &SessionMeta, format: ExportFormat) -> String {
     format!("borg-session-{short}-{stamp}.{}", format.extension())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

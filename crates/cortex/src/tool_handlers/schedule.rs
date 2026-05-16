@@ -601,8 +601,7 @@ async fn manage_cron_list() -> Result<String> {
     with_db(|db| async move {
         match db.list_tasks().await {
             Ok(tasks) => {
-                let cron_jobs: Vec<_> =
-                    tasks.iter().filter(|t| t.task_type == "command").collect();
+                let cron_jobs: Vec<_> = tasks.iter().filter(|t| t.task_type == "command").collect();
                 if cron_jobs.is_empty() {
                     return Ok("No cron jobs configured.".to_string());
                 }

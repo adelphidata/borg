@@ -26,8 +26,6 @@
     clippy::useless_vec
 )]
 
-use rusqlite::Connection;
-
 use cortex::db::{Database, NewTask};
 
 mod common;
@@ -35,17 +33,19 @@ use common::test_db;
 
 // ── Test: session lifecycle ──
 
-#[test]
-fn session_lifecycle() {
-    let db = test_db();
+#[tokio::test]
+async fn session_lifecycle() {
+    let db = test_db().await;
     let now = chrono::Utc::now().timestamp();
 
     // Create session
     db.upsert_session("sess-1", now, now, 0, "gpt-4", "Test session")
+        .await
         .expect("upsert session");
 
     // Insert messages (session_id, role, content, tool_calls_json, tool_call_id, timestamp, content_parts_json)
     db.insert_message("sess-1", "user", Some("Hello"), None, None, None, None)
+        .await
         .expect("insert user msg");
     db.insert_message(
         "sess-1",
@@ -56,21 +56,26 @@ fn session_lifecycle() {
         None,
         None,
     )
+    .await
     .expect("insert assistant msg");
 
     // Update session with token count
     db.upsert_session("sess-1", now, now + 1, 150, "gpt-4", "Test session")
+        .await
         .expect("update session");
 
     // List sessions
-    let sessions = db.list_sessions(10).expect("list sessions");
+    let sessions = db.list_sessions(10).await.expect("list sessions");
     assert!(!sessions.is_empty());
     let sess = sessions.iter().find(|s| s.id == "sess-1").unwrap();
     assert_eq!(sess.total_tokens, 150);
     assert_eq!(sess.model, "gpt-4");
 
     // Query messages
-    let msgs = db.load_session_messages("sess-1").expect("get messages");
+    let msgs = db
+        .load_session_messages("sess-1")
+        .await
+        .expect("get messages");
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].role, "user");
     assert_eq!(msgs[1].role, "assistant");
@@ -78,9 +83,9 @@ fn session_lifecycle() {
 
 // ── Test: task lifecycle with runs ──
 
-#[test]
-fn task_lifecycle_with_runs() {
-    let db = test_db();
+#[tokio::test]
+async fn task_lifecycle_with_runs() {
+    let db = test_db().await;
     let now = chrono::Utc::now().timestamp();
 
     let task = NewTask {
@@ -103,23 +108,28 @@ fn task_lifecycle_with_runs() {
         min_interval_secs: None,
     };
 
-    db.create_task(&task).expect("create task");
+    db.create_task(&task).await.expect("create task");
 
     // Task should be due
-    let due = db.get_due_tasks(now + 1).expect("get due tasks");
+    let due = db.get_due_tasks(now + 1).await.expect("get due tasks");
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].id, "task-1");
 
     // Record a successful run
     db.record_task_run("task-1", now, 1500, Some("All good"), None)
+        .await
         .expect("record success run");
 
     // Record a failed run
     db.record_task_run("task-1", now + 100, 500, None, Some("timeout"))
+        .await
         .expect("record failed run");
 
     // Check run history (most recent first)
-    let runs = db.task_run_history("task-1", 10).expect("task run history");
+    let runs = db
+        .task_run_history("task-1", 10)
+        .await
+        .expect("task run history");
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].started_at, now + 100); // most recent first
     assert!(runs[0].error.is_some());
@@ -128,61 +138,79 @@ fn task_lifecycle_with_runs() {
 
     // Update next_run
     db.update_task_next_run("task-1", Some(now + 3600))
+        .await
         .expect("update next_run");
 
     // Should not be due anymore
     let due = db
         .get_due_tasks(now + 1)
+        .await
         .expect("get due tasks after update");
     assert_eq!(due.len(), 0);
 }
 
 // ── Test: token usage aggregation ──
 
-#[test]
-fn token_usage_aggregation() {
-    let db = test_db();
+#[tokio::test]
+async fn token_usage_aggregation() {
+    let db = test_db().await;
 
     // Log multiple usage entries (prompt, completion, total, provider, model, cost_usd)
     db.log_token_usage(100, 50, 150, "openai", "gpt-4", None)
+        .await
         .expect("log usage 1");
     db.log_token_usage(200, 100, 300, "openai", "gpt-4", None)
+        .await
         .expect("log usage 2");
     db.log_token_usage(50, 25, 75, "anthropic", "claude-3", None)
+        .await
         .expect("log usage 3");
 
-    let total = db.monthly_token_total().expect("monthly total");
+    let total = db.monthly_token_total().await.expect("monthly total");
     assert_eq!(total, 525); // 150 + 300 + 75
 }
 
 // ── Test: concurrent sessions isolated ──
 
-#[test]
-fn concurrent_sessions_isolated() {
-    let db = test_db();
+#[tokio::test]
+async fn concurrent_sessions_isolated() {
+    let db = test_db().await;
     let now = chrono::Utc::now().timestamp();
 
     // Create two sessions
     db.upsert_session("sess-a", now, now, 0, "gpt-4", "Session A")
+        .await
         .expect("create session A");
     db.upsert_session("sess-b", now, now, 0, "claude-3", "Session B")
+        .await
         .expect("create session B");
 
     // Interleave messages
     db.insert_message("sess-a", "user", Some("Hello A"), None, None, None, None)
+        .await
         .expect("msg A1");
     db.insert_message("sess-b", "user", Some("Hello B"), None, None, None, None)
+        .await
         .expect("msg B1");
     db.insert_message("sess-a", "assistant", Some("Hi A!"), None, None, None, None)
+        .await
         .expect("msg A2");
     db.insert_message("sess-b", "assistant", Some("Hi B!"), None, None, None, None)
+        .await
         .expect("msg B2");
     db.insert_message("sess-b", "user", Some("More B"), None, None, None, None)
+        .await
         .expect("msg B3");
 
     // Verify isolation
-    let msgs_a = db.load_session_messages("sess-a").expect("get messages A");
-    let msgs_b = db.load_session_messages("sess-b").expect("get messages B");
+    let msgs_a = db
+        .load_session_messages("sess-a")
+        .await
+        .expect("get messages A");
+    let msgs_b = db
+        .load_session_messages("sess-b")
+        .await
+        .expect("get messages B");
 
     assert_eq!(msgs_a.len(), 2);
     assert_eq!(msgs_b.len(), 3);
@@ -198,27 +226,28 @@ fn concurrent_sessions_isolated() {
 
 // ── Test: migration idempotency ──
 
-#[test]
-fn migration_idempotency() {
+#[tokio::test]
+async fn migration_idempotency() {
     // Use a file-backed temp DB so we can close and reopen the same database
     let tmp = tempfile::NamedTempFile::new().expect("create temp db file");
-    let path = tmp.path().to_str().unwrap().to_string();
+    let path = tmp.path().to_path_buf();
 
     // First open — runs all migrations
     {
-        let conn = Connection::open(&path).expect("open db first time");
-        let db = Database::from_connection(conn).expect("init db first time");
+        let db = Database::open_at(&path).await.expect("open db first time");
         db.upsert_session("sess-x", 1000, 1000, 0, "gpt-4", "Test")
+            .await
             .expect("insert data");
     }
 
     // Second open — migrations must be idempotent (run again on same schema)
     {
-        let conn = Connection::open(&path).expect("open db second time");
-        let db = Database::from_connection(conn).expect("init db second time (migrations rerun)");
+        let db = Database::open_at(&path)
+            .await
+            .expect("init db second time (migrations rerun)");
 
         // Data from first open should survive
-        let sessions = db.list_sessions(10).expect("list");
+        let sessions = db.list_sessions(10).await.expect("list");
         assert!(
             sessions.iter().any(|s| s.id == "sess-x"),
             "Data should persist across reopens"
@@ -226,8 +255,9 @@ fn migration_idempotency() {
 
         // Should be able to insert new data
         db.upsert_session("sess-y", 2000, 2000, 0, "claude-3", "Test 2")
+            .await
             .expect("insert after reopen");
-        let sessions = db.list_sessions(10).expect("list after insert");
+        let sessions = db.list_sessions(10).await.expect("list after insert");
         assert_eq!(sessions.len(), 2);
     }
 }

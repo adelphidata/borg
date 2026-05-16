@@ -168,7 +168,7 @@ fn build_post_install_message(plugin_name: &str, notes: &[String], is_channel: b
 
 async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
     // Try to signal a running daemon's gateway first
-    let config = match Config::load_from_db() {
+    let config = match Config::load_from_db().await {
         Ok(c) => c,
         Err(e) => return format!("Gateway restart failed: could not reload config: {e}"),
     };
@@ -233,7 +233,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // the hardcoded curated list.
     crate::openrouter_catalog::spawn_prefetch();
 
-    let config = Config::load_from_db()?;
+    let config = Config::load_from_db().await?;
 
     // "Update available" prompt — runs before alt-screen / daemon connect so
     // a user choosing "Update now" exits cleanly before we wire up the rest
@@ -1151,7 +1151,7 @@ async fn run_event_loop(
                                             String::new()
                                         } else {
                                             let mut cfg =
-                                                Config::load_from_db().unwrap_or_default();
+                                                Config::load_from_db().await.unwrap_or_default();
                                             for entry in &install_result.credential_entries {
                                                 cfg.credentials.insert(
                                                         entry.key.clone(),
@@ -1218,7 +1218,7 @@ async fn run_event_loop(
                                         }
 
                                         // Reload config to pick up newly saved credentials
-                                        match cortex::config::Config::load_from_db() {
+                                        match cortex::config::Config::load_from_db().await {
                                             Ok(c) => app.config = c,
                                             Err(e) => {
                                                 tracing::warn!(
@@ -1294,14 +1294,16 @@ async fn run_event_loop(
                                         // Also flip the DB row status so a
                                         // restart with no setting reload still
                                         // honors the disable.
-                                        let db_outcome =
-                                            cortex::db::Database::open().and_then(|db| {
+                                        let db_outcome = match cortex::db::Database::open().await {
+                                            Ok(db) => {
                                                 if disabled {
-                                                    db.disable_wasm_plugin(&plugin_id)
+                                                    db.disable_wasm_plugin(&plugin_id).await
                                                 } else {
-                                                    db.enable_wasm_plugin(&plugin_id)
+                                                    db.enable_wasm_plugin(&plugin_id).await
                                                 }
-                                            });
+                                            }
+                                            Err(e) => Err(e),
+                                        };
                                         if let Err(e) = db_outcome {
                                             results.push(format!(
                                                 "{plugin_id}: persist status failed: {e}"
@@ -1320,7 +1322,8 @@ async fn run_event_loop(
                                                 "plugin_id": &plugin_id,
                                                 "scope": "plugin",
                                             }),
-                                        );
+                                        )
+                                        .await;
                                         let verb = if disabled { "disabled" } else { "enabled" };
                                         results.push(format!("{plugin_id}: {verb}"));
                                     }
@@ -1551,6 +1554,7 @@ async fn run_event_loop(
                                 }
                             };
                             match cortex::migrate::apply::apply_plan(&plan, &source_data, &borg_dir)
+                                .await
                             {
                                 Ok(result) => {
                                     let mut msg = String::from("Migration complete:");
@@ -1597,8 +1601,9 @@ async fn run_event_loop(
                                     });
                                     app.push_system_message(msg);
                                     // Reload config to pick up migrated settings
-                                    app.config =
-                                        cortex::config::Config::load_from_db().unwrap_or_default();
+                                    app.config = cortex::config::Config::load_from_db()
+                                        .await
+                                        .unwrap_or_default();
                                 }
                                 Err(e) => {
                                     let msg = format!("Migration failed: {e}");
@@ -1739,25 +1744,31 @@ async fn run_event_loop(
                 let (tx, rx) = tokio::sync::mpsc::channel(32);
                 app.doctor_rx = Some(rx);
                 let config = app.config.clone();
-                tokio::task::spawn_blocking(move || {
+                // Doctor step runner is now async (DB-backed checks). Drive it
+                // on a regular tokio task so the async DB calls have a runtime.
+                tokio::spawn(async move {
                     use cortex::doctor::DiagnosticRunner;
                     let mut runner = DiagnosticRunner::new();
                     let mut all_checks: Vec<cortex::doctor::DiagnosticCheck> = Vec::new();
                     while let Some(label) = runner.peek_label(&config) {
-                        let _ = tx.blocking_send(app::DoctorEvent::Analyzing {
-                            label: label.to_string(),
-                        });
-                        if let Some((_label, checks)) = runner.next_step(&config) {
-                            all_checks.extend(checks.clone());
-                            let _ = tx.blocking_send(app::DoctorEvent::Result {
+                        let _ = tx
+                            .send(app::DoctorEvent::Analyzing {
                                 label: label.to_string(),
-                                checks,
-                            });
+                            })
+                            .await;
+                        if let Some((_label, checks)) = runner.next_step(&config).await {
+                            all_checks.extend(checks.clone());
+                            let _ = tx
+                                .send(app::DoctorEvent::Result {
+                                    label: label.to_string(),
+                                    checks,
+                                })
+                                .await;
                         }
                     }
                     let report = cortex::doctor::DiagnosticReport { checks: all_checks };
                     let (pass, warn, fail) = report.counts();
-                    let _ = tx.blocking_send(app::DoctorEvent::Done { pass, warn, fail });
+                    let _ = tx.send(app::DoctorEvent::Done { pass, warn, fail }).await;
                 });
             }
             AppAction::StartBtw { question, snapshot } => {

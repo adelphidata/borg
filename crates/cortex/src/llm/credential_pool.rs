@@ -15,9 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use rand::prelude::IndexedRandom;
 use rand::Rng;
-use turso::params;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use turso::params;
 
 use crate::db::Database;
 use crate::llm::llm_error::FailoverReason;
@@ -2061,17 +2061,20 @@ fn reconcile_or_new_oauth(
 /// Operations that can be fired-and-forgotten onto the tokio runtime by the
 /// pool's sync API. Each variant carries everything the async helper needs to
 /// open a short-lived turso connection and run the matching SQL.
+#[allow(clippy::large_enum_variant)]
 enum PersistOp {
     Upsert(PooledCredential),
-    Suppress { source: CredentialSource, now_ms: i64 },
-    Unsuppress { source_kind: String, source_value: String },
+    Suppress {
+        source: CredentialSource,
+        now_ms: i64,
+    },
+    Unsuppress {
+        source_kind: String,
+        source_value: String,
+    },
 }
 
-fn spawn_persist_task(
-    db_path: std::path::PathBuf,
-    provider: String,
-    op: PersistOp,
-) {
+fn spawn_persist_task(db_path: std::path::PathBuf, provider: String, op: PersistOp) {
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
         Err(_) => {
@@ -2128,11 +2131,7 @@ async fn open_short_conn(db_path: &std::path::Path) -> Result<turso::Connection>
     Ok(conn)
 }
 
-async fn upsert_row(
-    conn: &turso::Connection,
-    provider: &str,
-    c: &PooledCredential,
-) -> Result<()> {
+async fn upsert_row(conn: &turso::Connection, provider: &str, c: &PooledCredential) -> Result<()> {
     let source_json = serde_json::to_string(&c.source).context("serialize source")?;
     let auth_type_db = match c.auth_type {
         AuthType::ApiKey => "api_key",

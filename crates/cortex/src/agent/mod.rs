@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
@@ -1894,9 +1894,7 @@ impl Agent {
         }
 
         let compaction_config = self.config.with_compaction_overrides();
-        let compaction_llm = self
-            .make_llm_client_from_config(&compaction_config)
-            .await?;
+        let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         let protect_first_n = self.config.conversation.protect_first_n;
 
         if self.previous_summary.is_none() {
@@ -2102,7 +2100,10 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(self.hook_registry.dispatch(&hook_ctx).await, HookAction::Skip) {
+            if matches!(
+                self.hook_registry.dispatch(&hook_ctx).await,
+                HookAction::Skip
+            ) {
                 self.skip_tool_call(&tool_call.id, "[tool call skipped by hook]")
                     .await;
                 continue;
@@ -2255,7 +2256,10 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(self.hook_registry.dispatch(&hook_ctx).await, HookAction::Skip) {
+            if matches!(
+                self.hook_registry.dispatch(&hook_ctx).await,
+                HookAction::Skip
+            ) {
                 slots.push(Slot::Skipped {
                     reason: "[tool call skipped by hook]".into(),
                 });
@@ -2764,9 +2768,9 @@ async fn dispatch_parallel_safe_tool(
             Some(ctx) => crate::tool::read_file::handle_with_context(args, config, ctx),
             None => crate::tool::read_file::handle(args, config),
         },
-        crate::tool::Tool::ReadMemory(args) => {
-            crate::tool::read_memory::handle(args).await.map(ToolOutput::Text)
-        }
+        crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args)
+            .await
+            .map(ToolOutput::Text),
         crate::tool::Tool::MemorySearch(args) => crate::tool::memory_search::handle(args, config)
             .await
             .map(ToolOutput::Text),

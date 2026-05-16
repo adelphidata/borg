@@ -51,7 +51,7 @@ pub async fn spawn_task_execution(
     let task_id = task.id.clone();
     let task_prompt = match task.id.as_str() {
         cortex::daily_summary::DAILY_SUMMARY_TASK_ID => {
-            match cortex::daily_summary::build_daily_summary_prompt() {
+            match cortex::daily_summary::build_daily_summary_prompt().await {
                 Ok(enriched) => enriched,
                 Err(e) => {
                     tracing::warn!("Daily summary data gathering failed: {e}");
@@ -82,7 +82,7 @@ pub async fn spawn_task_execution(
                 return;
             }
         };
-        match cortex::db::Database::open() {
+        match cortex::db::Database::open().await {
             Ok(adb) => {
                 let attempt = if is_retry {
                     format!(" (retry {retry_count})")
@@ -94,7 +94,8 @@ pub async fn spawn_task_execution(
                     "info",
                     "task",
                     &format!("Task '{task_name}' started{attempt}"),
-                );
+                )
+                .await;
             }
             Err(e) => tracing::warn!("Task '{task_name}': activity log DB open failed: {e}"),
         }
@@ -142,15 +143,18 @@ pub async fn spawn_task_execution(
             // Supervisor restarts the task on next tick; downgrade ERROR→WARN
             // (recoverable) and surface task_name as a structured field.
             tracing::warn!(task = %task_name, panic = %panic_msg, "task panicked");
-            match cortex::db::Database::open() {
+            match cortex::db::Database::open().await {
                 Ok(db) => {
                     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-                    if let Err(e) = db.complete_task_run(
-                        run_id,
-                        duration_ms,
-                        None,
-                        Some(&format!("panic: {panic_msg}")),
-                    ) {
+                    if let Err(e) = db
+                        .complete_task_run(
+                            run_id,
+                            duration_ms,
+                            None,
+                            Some(&format!("panic: {panic_msg}")),
+                        )
+                        .await
+                    {
                         tracing::warn!("Task '{task_name}': failed to record panic: {e}");
                     }
                 }
@@ -343,12 +347,17 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     } = ctx;
 
     let config_clone = config.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let db = cortex::db::Database::open()?;
+    // Note: previously this ran under tokio::task::spawn_blocking, which is
+    // incompatible with cortex's now-async DB layer. Run the sweep inline on
+    // the async runtime; panic isolation is preserved by AssertUnwindSafe +
+    // catch_unwind on the surrounding future.
+    let sweep = std::panic::AssertUnwindSafe(async move {
+        let db = cortex::db::Database::open().await?;
         let reg = cortex::process_registry::global();
         cortex::maintenance::run_daily_maintenance_with_registry(&db, &config_clone, reg.as_ref())
-    })
-    .await;
+            .await
+    });
+    let result = futures::FutureExt::catch_unwind(sweep).await;
 
     let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
     let (summary, error_msg) = match result {
@@ -362,21 +371,34 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
             (Some(summary), None)
         }
         Ok(Err(e)) => (None, Some(format!("maintenance sweep failed: {e}"))),
-        Err(e) => (None, Some(format!("maintenance task panicked: {e}"))),
+        Err(panic_err) => {
+            let panic_msg = panic_err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic_err.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            (
+                None,
+                Some(format!("maintenance task panicked: {panic_msg}")),
+            )
+        }
     };
 
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(
-                *run_id,
-                duration_ms,
-                summary.as_deref(),
-                error_msg.as_deref(),
-            ) {
+            if let Err(e) = db
+                .complete_task_run(
+                    *run_id,
+                    duration_ms,
+                    summary.as_deref(),
+                    error_msg.as_deref(),
+                )
+                .await
+            {
                 tracing::warn!("maintenance: failed to finalize task_runs row {run_id}: {e}");
             }
             if error_msg.is_none() {
-                if let Err(e) = db.clear_task_retry(task_id) {
+                if let Err(e) = db.clear_task_retry(task_id).await {
                     tracing::warn!("maintenance: failed to clear task retry for {task_id}: {e}");
                 }
             }
@@ -419,14 +441,15 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             };
 
             if output.status.success() {
-                match cortex::db::Database::open() {
+                match cortex::db::Database::open().await {
                     Ok(db) => {
-                        if let Err(e) =
-                            db.complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                        if let Err(e) = db
+                            .complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                            .await
                         {
                             tracing::warn!("Task '{task_name}': failed to finalize run: {e}");
                         }
-                        if let Err(e) = db.clear_task_retry(task_id) {
+                        if let Err(e) = db.clear_task_retry(task_id).await {
                             tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
                         }
                     }
@@ -440,14 +463,17 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             } else {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let error_msg = format!("exit code {exit_code}");
-                match cortex::db::Database::open() {
+                match cortex::db::Database::open().await {
                     Ok(db) => {
-                        if let Err(e) = db.complete_task_run(
-                            *run_id,
-                            duration_ms,
-                            Some(&combined),
-                            Some(&error_msg),
-                        ) {
+                        if let Err(e) = db
+                            .complete_task_run(
+                                *run_id,
+                                duration_ms,
+                                Some(&combined),
+                                Some(&error_msg),
+                            )
+                            .await
+                        {
                             tracing::warn!(
                                 "Task '{task_name}': failed to record exit-code failure: {e}"
                             );
@@ -537,14 +563,15 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
         Ok(Ok(report)) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             let combined = format_consolidation_report(&report);
-            match cortex::db::Database::open() {
+            match cortex::db::Database::open().await {
                 Ok(db) => {
-                    if let Err(e) =
-                        db.complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                    if let Err(e) = db
+                        .complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                        .await
                     {
                         tracing::warn!("Task '{task_name}': failed to finalize run: {e}");
                     }
-                    if let Err(e) = db.clear_task_retry(task_id) {
+                    if let Err(e) = db.clear_task_retry(task_id).await {
                         tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
                     }
                 }
@@ -613,7 +640,9 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         pre_run_timeout_ms,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
+    let memory = cortex::memory::load_memory_context_db(4000)
+        .await
+        .unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
     let system = format!(
@@ -640,13 +669,16 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         cortex::types::Message::user(&user_msg),
     ];
 
-    let llm = match LlmClient::for_auxiliary(config) {
+    let llm = match LlmClient::for_auxiliary(config).await {
         Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
-            match cortex::db::Database::open() {
+            match cortex::db::Database::open().await {
                 Ok(db) => {
-                    if let Err(e2) = db.complete_task_run(*run_id, 0, None, Some(&format!("{e}"))) {
+                    if let Err(e2) = db
+                        .complete_task_run(*run_id, 0, None, Some(&format!("{e}")))
+                        .await
+                    {
                         tracing::warn!(
                             "Task '{task_name}': failed to record LLM-init failure: {e2}"
                         );
@@ -663,16 +695,17 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         Ok(Ok(response)) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             let result_text = response.text_content().unwrap_or("");
-            match cortex::db::Database::open() {
+            match cortex::db::Database::open().await {
                 Ok(db) => {
-                    if let Err(e) =
-                        db.complete_task_run(*run_id, duration_ms, Some(result_text), None)
+                    if let Err(e) = db
+                        .complete_task_run(*run_id, duration_ms, Some(result_text), None)
+                        .await
                     {
                         tracing::warn!(
                             "Task '{task_name}': failed to finalize prompt-task run: {e}"
                         );
                     }
-                    if let Err(e) = db.clear_task_retry(task_id) {
+                    if let Err(e) = db.clear_task_retry(task_id).await {
                         tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
                     }
                 }
@@ -763,7 +796,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     let now = chrono::Utc::now().timestamp();
 
     if !bypass && crate::heartbeat::is_quiet_hours(config) {
-        record_heartbeat_skip(*run_id, *started_at_ms, "quiet_hours", task_name);
+        record_heartbeat_skip(*run_id, *started_at_ms, "quiet_hours", task_name).await;
         publish_skip_event(started_unix, "quiet_hours");
         return;
     }
@@ -775,8 +808,8 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     // long quiet-hours window suppress the very next legitimate fire.
     if !bypass {
         if let Some(min_interval) = task.min_interval_secs {
-            let last_delivered = match cortex::db::Database::open() {
-                Ok(db) => match db.task_run_history(task_id, 20) {
+            let last_delivered = match cortex::db::Database::open().await {
+                Ok(db) => match db.task_run_history(task_id, 20).await {
                     Ok(rows) => rows
                         .into_iter()
                         .find(|r| {
@@ -803,7 +836,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             };
             if let Some(last) = last_delivered {
                 if now.saturating_sub(last) < min_interval {
-                    record_heartbeat_skip(*run_id, *started_at_ms, "min_interval", task_name);
+                    record_heartbeat_skip(*run_id, *started_at_ms, "min_interval", task_name).await;
                     publish_skip_event(started_unix, "min_interval");
                     return;
                 }
@@ -812,7 +845,9 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     }
 
     let identity = cortex::identity::load_identity().unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
+    let memory = cortex::memory::load_memory_context_db(4000)
+        .await
+        .unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let system = format!(
         "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
@@ -821,7 +856,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
          on its own line to suppress delivery."
     );
 
-    let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(config);
+    let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(config).await;
     if let Some(cmd) = pre_run_command.as_deref() {
         let outcome = run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms).await;
         user_msg = format!("{}{user_msg}", render_pre_run_block(&outcome));
@@ -831,11 +866,11 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         cortex::types::Message::system(system),
         cortex::types::Message::user(&user_msg),
     ];
-    let llm = match LlmClient::for_auxiliary(config) {
+    let llm = match LlmClient::for_auxiliary(config).await {
         Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
         Err(e) => {
             let err_str = format!("{e}");
-            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name);
+            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
             publish_failed_event(started_unix, &err_str);
             return;
         }
@@ -845,12 +880,13 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             let err_str = format!("{e}");
-            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name);
+            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
             publish_failed_event(started_unix, &err_str);
             return;
         }
         Err(_) => {
-            record_heartbeat_failure(*run_id, *started_at_ms, "Heartbeat timed out", task_name);
+            record_heartbeat_failure(*run_id, *started_at_ms, "Heartbeat timed out", task_name)
+                .await;
             publish_failed_event(started_unix, "Heartbeat timed out");
             return;
         }
@@ -860,28 +896,31 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     let result_text = response.text_content().unwrap_or("").trim().to_string();
 
     if is_silent_response(&result_text) {
-        record_heartbeat_silent(*run_id, duration_ms, "silent", task_name);
+        record_heartbeat_silent(*run_id, duration_ms, "silent", task_name).await;
         publish_skip_event(started_unix, "silent");
         return;
     }
     if result_text.is_empty() || crate::heartbeat::is_zero_info_heartbeat(&result_text) {
-        record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name);
+        record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name).await;
         publish_skip_event(started_unix, "zero_info");
         return;
     }
     let new_hash = response_hash(&result_text);
     if task.last_response_hash.as_deref() == Some(new_hash.as_str()) {
-        record_heartbeat_silent(*run_id, duration_ms, "dedup_suppressed", task_name);
+        record_heartbeat_silent(*run_id, duration_ms, "dedup_suppressed", task_name).await;
         publish_skip_event(started_unix, "dedup_suppressed");
         return;
     }
 
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&result_text), None) {
+            if let Err(e) = db
+                .complete_task_run(*run_id, duration_ms, Some(&result_text), None)
+                .await
+            {
                 tracing::warn!("Heartbeat: failed to finalize run: {e}");
             }
-            if let Err(e) = db.update_task_response_hash(task_id, Some(&new_hash)) {
+            if let Err(e) = db.update_task_response_hash(task_id, Some(&new_hash)).await {
                 tracing::warn!("Heartbeat: failed to persist last_response_hash: {e}");
             }
         }
@@ -965,11 +1004,14 @@ fn response_hash(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
+async fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(reason), None) {
+            if let Err(e) = db
+                .complete_task_run(run_id, duration_ms, Some(reason), None)
+                .await
+            {
                 tracing::warn!("Heartbeat '{task_name}': skip-record failed ({reason}): {e}");
             }
         }
@@ -980,10 +1022,13 @@ fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_nam
     tracing::info!(task = %task_name, reason, "heartbeat: skipped tick");
 }
 
-fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
-    match cortex::db::Database::open() {
+async fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(marker), None) {
+            if let Err(e) = db
+                .complete_task_run(run_id, duration_ms, Some(marker), None)
+                .await
+            {
                 tracing::warn!("Heartbeat '{task_name}': silent-record failed: {e}");
             }
         }
@@ -992,11 +1037,14 @@ fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_nam
     tracing::info!(task = %task_name, marker, "heartbeat: suppressed delivery");
 }
 
-fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, task_name: &str) {
+async fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, task_name: &str) {
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
+            if let Err(e) = db
+                .complete_task_run(run_id, duration_ms, None, Some(error))
+                .await
+            {
                 tracing::warn!("Heartbeat '{task_name}': failure-record failed: {e}");
             }
         }
@@ -1019,16 +1067,22 @@ async fn handle_task_failure(
     config: &Config,
     error: &str,
 ) {
-    match cortex::db::Database::open() {
+    match cortex::db::Database::open().await {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
+            if let Err(e) = db
+                .complete_task_run(run_id, duration_ms, None, Some(error))
+                .await
+            {
                 tracing::warn!("Task '{task_name}': failed to record failure: {e}");
             }
             if cortex::tasks::is_transient_error(error) && retry_count < max_retries {
                 let next_attempt = retry_count + 1;
                 let delay = cortex::tasks::retry_delay_secs(next_attempt);
                 let retry_at = chrono::Utc::now().timestamp() + delay;
-                if let Err(e) = db.set_task_retry(task_id, next_attempt, error, retry_at) {
+                if let Err(e) = db
+                    .set_task_retry(task_id, next_attempt, error, retry_at)
+                    .await
+                {
                     tracing::warn!("Task '{task_name}': failed to schedule retry: {e}");
                 }
                 tracing::warn!(
@@ -1036,11 +1090,11 @@ async fn handle_task_failure(
                 );
                 return;
             }
-            if let Err(e) = db.clear_task_retry(task_id) {
+            if let Err(e) = db.clear_task_retry(task_id).await {
                 tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
             }
             if schedule_type == "once" {
-                if let Err(e) = db.update_task_status(task_id, "completed") {
+                if let Err(e) = db.update_task_status(task_id, "completed").await {
                     tracing::warn!("Task '{task_name}': failed to mark completed: {e}");
                 }
             }
@@ -1145,8 +1199,8 @@ pub async fn deliver_celebration_to_channels(
     let mut any_delivered = false;
 
     for channel_name in &config.heartbeat.channels {
-        if let Ok(db) = cortex::db::Database::open() {
-            if let Ok(approved) = db.list_approved_senders(Some(channel_name)) {
+        if let Ok(db) = cortex::db::Database::open().await {
+            if let Ok(approved) = db.list_approved_senders(Some(channel_name)).await {
                 let recipients: Vec<String> = match config.heartbeat.recipients.get(channel_name) {
                     Some(ids) if ids.iter().any(|s| s == "*") => {
                         approved.into_iter().map(|s| s.sender_id).collect()

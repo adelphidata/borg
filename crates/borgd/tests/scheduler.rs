@@ -37,7 +37,7 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
 
     // Seed a due command task.
     {
-        let db = Database::open().expect("seed db");
+        let db = Database::open().await.expect("seed db");
         let now = chrono::Utc::now().timestamp();
         db.create_task(&NewTask {
             id: "due-cmd",
@@ -58,6 +58,7 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create due-cmd");
     }
 
@@ -85,8 +86,8 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(8) {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let db = Database::open().expect("db");
-        let runs = db.task_run_history("due-cmd", 5).unwrap_or_default();
+        let db = Database::open().await.expect("db");
+        let runs = db.task_run_history("due-cmd", 5).await.unwrap_or_default();
         if runs.iter().any(|r| r.status == "success") {
             completed = true;
             break;

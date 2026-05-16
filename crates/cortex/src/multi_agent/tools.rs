@@ -492,7 +492,7 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
 

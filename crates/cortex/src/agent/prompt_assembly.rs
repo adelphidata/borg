@@ -52,11 +52,7 @@ impl Agent {
     /// Collapses the historical `load_memory_recency` / `load_memory_ranked`
     /// pair — the surrounding guard+fallback dance was identical between
     /// them, and a parameter is clearer than two near-duplicate methods.
-    async fn load_memory(
-        &self,
-        max_tokens: usize,
-        strategy: LoadStrategy<'_>,
-    ) -> Result<String> {
+    async fn load_memory(&self, max_tokens: usize, strategy: LoadStrategy<'_>) -> Result<String> {
         let scopes = resolved_memory_scopes(&self.config);
         let guard = self.db_guard().await;
         match strategy {
@@ -120,9 +116,10 @@ impl Agent {
         let rw = recency_weight;
         let scopes = resolved_memory_scopes(&self.config);
 
-        let ranking_result =
-            crate::memory::embeddings::rank_embeddings_by_similarity_scoped(&qe_global, &scopes, rw)
-                .await;
+        let ranking_result = crate::memory::embeddings::rank_embeddings_by_similarity_scoped(
+            &qe_global, &scopes, rw,
+        )
+        .await;
 
         let global_rankings = match ranking_result {
             Ok(r) if !r.is_empty() => r,
@@ -302,10 +299,7 @@ Rules:
         }
     }
 
-    pub(super) async fn build_tool_definitions(
-        &self,
-        user_message: &str,
-    ) -> Vec<ToolDefinition> {
+    pub(super) async fn build_tool_definitions(&self, user_message: &str) -> Vec<ToolDefinition> {
         let mut tools = crate::tool::definitions::core_tool_definitions(&self.config).await;
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(

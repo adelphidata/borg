@@ -327,7 +327,8 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                 "limit_per_minute": per_minute,
                 "burst": burst,
             }),
-        );
+        )
+        .await;
         return Err(anyhow!(
             "MCP server '{server}' is rate-limited; retry in {retry_secs:.1}s",
             server = tool.server
@@ -381,7 +382,8 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                     "duration_ms": start.elapsed().as_millis() as u64,
                     "error": e.to_string(),
                 }),
-            );
+            )
+            .await;
             return Err(e.context(format!("MCP tool '{}' failed", tool.full_name)));
         }
         Ok(Err(_canceled)) => {
@@ -475,7 +477,8 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             "threat_level": threat_label,
             "redaction_hits": redaction_hits,
         }),
-    );
+    )
+    .await;
 
     Ok(Some(wrapped))
 }
@@ -516,7 +519,8 @@ pub async fn initialize(config: &Config) -> Result<()> {
                     "server": server_name,
                     "reason": format!("start_server failed: {e}"),
                 }),
-            );
+            )
+            .await;
         }
     }
     Ok(())
@@ -549,7 +553,7 @@ async fn start_server(
 
     let outcomes =
         reg.replace_server_tools(server_name, &discovered.tools, &manifest.tools, builtin);
-    audit_rejections(server_name, &outcomes);
+    audit_rejections(server_name, &outcomes).await;
 
     record_limits(server_name, server_cfg);
 
@@ -636,7 +640,7 @@ async fn open_transport(
     }
 }
 
-fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
+async fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
     for o in outcomes {
         match o {
             ToolRegistrationOutcome::Rejected { original, reason } => {
@@ -648,7 +652,8 @@ fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
                         "tool": original,
                         "reason": reason.to_string(),
                     }),
-                );
+                )
+                .await;
                 tracing::warn!(
                     server = %server_name,
                     tool = %original,
@@ -668,7 +673,8 @@ fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
                         "tool": original,
                         "reason": format!("collision with {full_name}"),
                     }),
-                );
+                )
+                .await;
                 tracing::warn!(
                     server = %server_name,
                     tool = %original,
@@ -734,7 +740,7 @@ async fn run_session_task(
                                 &filter,
                                 &builtin_refs,
                             );
-                            audit_rejections(&server_name, &outcomes);
+                            audit_rejections(&server_name, &outcomes).await;
                             tracing::debug!(
                                 server = %server_name,
                                 count = discovered.tools.len(),
@@ -835,7 +841,7 @@ pub mod testing {
             &manifest.tools,
             &builtin_refs,
         );
-        audit_rejections(server_name, &outcomes);
+        audit_rejections(server_name, &outcomes).await;
         record_limits(server_name, server_cfg);
 
         let (tx, rx) = mpsc::channel::<SessionCmd>(32);

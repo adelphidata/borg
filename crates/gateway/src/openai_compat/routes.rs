@@ -64,10 +64,7 @@ async fn authenticate(headers: &HeaderMap, state: &OpenAiState) -> Result<Princi
 }
 
 #[allow(clippy::result_large_err)]
-async fn authenticate_with_db(
-    headers: &HeaderMap,
-    db: &Database,
-) -> Result<PrincipalId, Response> {
+async fn authenticate_with_db(headers: &HeaderMap, db: &Database) -> Result<PrincipalId, Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

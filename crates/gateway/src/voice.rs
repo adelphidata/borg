@@ -74,14 +74,14 @@ pub fn voice_reply_unavailable_reason(config: &Config) -> Option<&'static str> {
     }
 }
 
-pub fn resolve_voice_reply_mode(
+pub async fn resolve_voice_reply_mode(
     db: &Database,
     config: &Config,
     channel_name: &str,
     chat_id: &str,
 ) -> Result<VoiceReplyMode> {
     let key = voice_mode_setting_key(channel_name, chat_id);
-    match db.get_setting(&key)? {
+    match db.get_setting(&key).await? {
         Some(value) => {
             if let Ok(mode) = VoiceReplyMode::from_str(&value) {
                 Ok(mode)
@@ -128,7 +128,6 @@ pub fn should_send_voice_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     #[test]
     fn default_mode_uses_tts_auto_mode() {
@@ -171,25 +170,34 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn resolve_voice_reply_mode_reads_override_from_db() {
-        let db = Database::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+    #[tokio::test]
+    async fn resolve_voice_reply_mode_reads_override_from_db() {
+        let db = Database::test_db().await;
         let mut config = Config::default();
         config.tts.auto_mode = true;
         let key = voice_mode_setting_key("telegram", "42");
         db.set_setting(&key, VoiceReplyMode::VoiceOnly.as_str())
+            .await
             .unwrap();
 
-        let mode = resolve_voice_reply_mode(&db, &config, "telegram", "42").unwrap();
+        let mode = resolve_voice_reply_mode(&db, &config, "telegram", "42")
+            .await
+            .unwrap();
         assert_eq!(mode, VoiceReplyMode::VoiceOnly);
     }
 
-    #[test]
-    fn resolve_voice_reply_mode_propagates_setting_lookup_errors() {
-        let db = Database::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        db.conn().execute("DROP TABLE settings", []).unwrap();
+    #[tokio::test]
+    async fn resolve_voice_reply_mode_propagates_setting_lookup_errors() {
+        let db = Database::test_db().await;
+        // Drop the settings table to force a lookup error.
+        db.conn()
+            .execute_batch("DROP TABLE settings")
+            .await
+            .unwrap();
 
-        let err = resolve_voice_reply_mode(&db, &Config::default(), "telegram", "42").unwrap_err();
+        let err = resolve_voice_reply_mode(&db, &Config::default(), "telegram", "42")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("no such table"));
     }
 
