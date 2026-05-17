@@ -276,7 +276,8 @@ mod tests {
         // 1-/2-/3-/4-digit components must each scale to 8-bit per the
         // OSC 10/11 spec, and both BEL (\x07) and ST (\x1b\\) terminators
         // must be accepted (xterm, kitty, vte all vary).
-        let cases: &[(&[u8], (u8, u8, u8))] = &[
+        type Case = (&'static [u8], (u8, u8, u8));
+        let cases: &[Case] = &[
             (b"\x1b]11;rgb:f/0/8\x07", (0xff, 0x00, 0x88)),
             (b"\x1b]11;rgb:ff/00/80\x07", (0xff, 0x00, 0x80)),
             (b"\x1b]11;rgb:fff/000/888\x07", (0xff, 0x00, 0x88)),
