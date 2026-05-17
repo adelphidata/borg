@@ -133,27 +133,9 @@ impl TabManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn active_index_adjusts_on_close() {
-        // Verify the index adjustment logic: if active >= pages.len(),
-        // it should become pages.len() - 1.
-        let mut active = 2_usize;
-        let new_len = 2_usize;
-        if active >= new_len {
-            active = new_len - 1;
-        }
-        assert_eq!(active, 1);
-    }
-
-    #[test]
-    fn active_index_stays_when_not_at_end() {
-        let mut active = 0_usize;
-        let new_len = 2_usize;
-        if active >= new_len {
-            active = new_len - 1;
-        }
-        assert_eq!(active, 0);
-    }
-}
+// `TabManager` mutating operations (`new_tab`, `switch_tab`, `close_tab`,
+// `list_tabs`) all require a live `chromiumoxide::Browser`. The pure index
+// arithmetic in `close_tab` is exercised end-to-end via the browser
+// integration tests; unit-level tests that re-implement the same
+// `if active >= new_len { active = new_len - 1 }` clamp would be
+// tautological — they assert on values the test itself computes.

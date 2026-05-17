@@ -272,44 +272,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_osc11_4digit() {
-        let data = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07";
-        assert_eq!(parse_osc_color_response(data), Some((0x1c, 0x1c, 0x1c)));
+    fn parse_osc11_handles_all_digit_widths_and_both_terminators() {
+        // 1-/2-/3-/4-digit components must each scale to 8-bit per the
+        // OSC 10/11 spec, and both BEL (\x07) and ST (\x1b\\) terminators
+        // must be accepted (xterm, kitty, vte all vary).
+        let cases: &[(&[u8], (u8, u8, u8))] = &[
+            (b"\x1b]11;rgb:f/0/8\x07", (0xff, 0x00, 0x88)),
+            (b"\x1b]11;rgb:ff/00/80\x07", (0xff, 0x00, 0x80)),
+            (b"\x1b]11;rgb:fff/000/888\x07", (0xff, 0x00, 0x88)),
+            (b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07", (0x1c, 0x1c, 0x1c)),
+            (b"\x1b]11;rgb:ffff/0000/0000\x1b\\", (0xff, 0x00, 0x00)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_osc_color_response(input),
+                Some(*expected),
+                "input: {:?}",
+                std::str::from_utf8(input).unwrap_or("<bytes>")
+            );
+        }
     }
 
     #[test]
-    fn parse_osc11_2digit() {
-        let data = b"\x1b]11;rgb:ff/00/80\x07";
-        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x80)));
-    }
-
-    #[test]
-    fn parse_osc11_st_terminated() {
-        let data = b"\x1b]11;rgb:ffff/0000/0000\x1b\\";
-        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x00)));
-    }
-
-    #[test]
-    fn parse_osc11_3digit() {
-        let data = b"\x1b]11;rgb:fff/000/888\x07";
-        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x88)));
-    }
-
-    #[test]
-    fn parse_osc11_1digit() {
-        let data = b"\x1b]11;rgb:f/0/8\x07";
-        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x88)));
-    }
-
-    #[test]
-    fn parse_osc11_malformed() {
+    fn parse_osc11_malformed_returns_none() {
+        // Garbage, truncated (missing third component), and empty inputs must
+        // not be silently coerced to a color.
         assert_eq!(parse_osc_color_response(b"garbage"), None);
         assert_eq!(parse_osc_color_response(b"\x1b]11;rgb:ff/00\x07"), None);
         assert_eq!(parse_osc_color_response(b""), None);
     }
 
     #[test]
-    fn parse_color_component_all_lengths() {
+    fn parse_color_component_scales_widths_and_rejects_invalid() {
         assert_eq!(parse_color_component("f"), Some(0xff));
         assert_eq!(parse_color_component("1c"), Some(0x1c));
         assert_eq!(parse_color_component("fff"), Some(0xff));

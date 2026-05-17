@@ -124,19 +124,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_agent_browser_returns_bool() {
-        let _result = detect_agent_browser();
-    }
-
-    #[test]
-    fn find_chrome_with_no_configured_path() {
-        let detection = find_chrome(None);
-        if let Some(ref exe) = detection.executable {
-            assert!(detection.all_found.contains(exe));
-        }
-    }
-
-    #[test]
     fn find_chrome_with_invalid_configured_path() {
         let detection = find_chrome(Some("/nonexistent/path/to/chrome"));
         assert!(!detection
@@ -154,22 +141,6 @@ mod tests {
         let detection = find_chrome(Some(path));
         assert_eq!(detection.executable, Some(PathBuf::from(path)));
         assert!(detection.all_found.contains(&PathBuf::from(path)));
-    }
-
-    #[test]
-    fn platform_candidates_returns_vec() {
-        let candidates = platform_candidates();
-        // Just verify it doesn't panic and returns a vec
-        let _ = candidates.len();
-    }
-
-    #[test]
-    fn which_candidates_returns_vec() {
-        let candidates = which_candidates();
-        assert!(
-            !candidates.is_empty(),
-            "which_candidates should return at least one name"
-        );
     }
 
     #[cfg(target_os = "windows")]

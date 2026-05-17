@@ -756,12 +756,4 @@ mod tests {
         assert_eq!(normalize_cli_model("haiku-4.5"), "haiku");
     }
 
-    // ── CLI Detection ──
-
-    #[test]
-    fn detect_cli_path_respects_env() {
-        // This test just verifies the function doesn't panic
-        // Actual CLI detection depends on system state
-        let _result = detect_cli_path();
-    }
 }

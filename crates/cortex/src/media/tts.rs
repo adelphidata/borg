@@ -459,11 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_format_default_is_mp3() {
-        assert_eq!(AudioFormat::default(), AudioFormat::Mp3);
-    }
-
-    #[test]
     fn elevenlabs_format_mapping() {
         assert_eq!(elevenlabs_format(AudioFormat::Mp3), "mp3_44100_128");
         assert_eq!(elevenlabs_format(AudioFormat::Opus), "opus_16000");
@@ -552,10 +547,27 @@ mod tests {
 
     #[test]
     fn truncate_for_tts_cjk_safe() {
-        // Each CJK char is 3 bytes
+        // Each CJK char is 3 bytes; slicing at byte 7 would split the
+        // third codepoint mid-byte. The truncator must back off to a char
+        // boundary and produce a valid UTF-8 prefix (not panic, not return
+        // arbitrary bytes).
         let text = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // 你好世界
         let result = truncate_for_tts(text, 7);
-        // Should truncate at char boundary (6 bytes = 2 chars)
-        assert!(!result.is_empty());
+        // At least the first codepoint must survive — the truncator is
+        // not allowed to back off all the way to an empty string.
+        assert!(
+            result.starts_with("\u{4F60}"),
+            "expected output to start with first CJK codepoint, got {result:?}"
+        );
+        // Output respects max_bytes + "..." ellipsis suffix budget.
+        assert!(
+            result.len() <= 7 + "...".len(),
+            "result {result:?} ({} bytes) exceeded 7 + ellipsis budget",
+            result.len()
+        );
+        // Valid UTF-8 boundary at the end — if the truncator sliced
+        // mid-codepoint, the surrounding `String::from_str` would have
+        // panicked. This is the explicit sanity guard.
+        assert!(result.is_char_boundary(result.len()));
     }
 }

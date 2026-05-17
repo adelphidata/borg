@@ -2623,19 +2623,23 @@ mod tests {
             .any(|c| matches!(c, HistoryCell::System { text } if text.contains("cancelled"))));
     }
 
+    /// `/uninstall` is destructive — it must not surface from the autocomplete
+    /// popup either by listing all commands or by typing the prefix, so users
+    /// can't tab-complete into it by accident.
     #[test]
-    fn uninstall_not_in_autocomplete() {
-        let popup = crate::tui::command_popup::CommandPopup::new();
-        let all = popup.filtered();
-        assert!(!all.iter().any(|c| c.name == "/uninstall"));
-    }
+    fn uninstall_hidden_from_autocomplete_in_both_full_list_and_prefix_filter() {
+        let popup_all = crate::tui::command_popup::CommandPopup::new();
+        assert!(
+            !popup_all.filtered().iter().any(|c| c.name == "/uninstall"),
+            "/uninstall must not appear in the unfiltered command list"
+        );
 
-    #[test]
-    fn uninstall_partial_not_in_autocomplete() {
-        let mut popup = crate::tui::command_popup::CommandPopup::new();
-        popup.update_filter("/unins");
-        let matches = popup.filtered();
-        assert!(matches.is_empty());
+        let mut popup_prefix = crate::tui::command_popup::CommandPopup::new();
+        popup_prefix.update_filter("/unins");
+        assert!(
+            popup_prefix.filtered().is_empty(),
+            "typing '/unins' must not surface /uninstall as a fuzzy/prefix match"
+        );
     }
 
     // --- /poke command ---

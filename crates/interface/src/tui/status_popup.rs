@@ -428,132 +428,87 @@ impl PopupHandler for StatusPopup {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_popup_not_visible() {
-        let popup = StatusPopup::new();
-        assert!(!popup.is_visible());
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
+    /// Both Esc and 'q' close the popup — keyboard symmetry users expect
+    /// from a TUI panel.
     #[test]
-    fn default_tab_is_overview() {
-        let popup = StatusPopup::new();
-        assert_eq!(popup.current_tab(), StatusTab::Overview);
+    fn esc_and_q_both_dismiss() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut popup = StatusPopup::new();
+            popup.visible = true;
+            popup.handle_key(k(code));
+            assert!(!popup.is_visible(), "key {code:?} should dismiss");
+        }
     }
 
+    /// Vertical scrolling: Down/Up move one line, PageDown/PageUp move 10,
+    /// and Up at offset 0 must not underflow (regression would saturate the
+    /// `u16` offset to 65535 and the content would never paint).
     #[test]
-    fn dismiss_hides_popup() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        assert!(popup.is_visible());
-        popup.dismiss();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
-    fn esc_dismisses() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        let esc = KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(esc);
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
-    fn q_dismisses() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        let q = KeyEvent::new(KeyCode::Char('q'), crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(q);
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
-    fn scroll_down_increases_offset() {
+    fn vertical_scroll_offset_steps_and_clamps() {
         let mut popup = StatusPopup::new();
         popup.visible = true;
         assert_eq!(popup.scroll_offset, 0);
-        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(down);
-        assert_eq!(popup.scroll_offset, 1);
+
+        popup.handle_key(k(KeyCode::Down));
+        assert_eq!(popup.scroll_offset, 1, "Down should move by one");
+
+        popup.handle_key(k(KeyCode::Up));
+        assert_eq!(popup.scroll_offset, 0, "Up should move by one");
+
+        // Underflow guard.
+        popup.handle_key(k(KeyCode::Up));
+        assert_eq!(popup.scroll_offset, 0, "Up at 0 must clamp");
+
+        popup.handle_key(k(KeyCode::PageDown));
+        assert_eq!(popup.scroll_offset, 10, "PageDown moves by 10");
+
+        popup.handle_key(k(KeyCode::PageUp));
+        assert_eq!(popup.scroll_offset, 0, "PageUp moves back by 10");
     }
 
-    #[test]
-    fn scroll_up_decreases_offset() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        popup.scroll_offset = 5;
-        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(up);
-        assert_eq!(popup.scroll_offset, 4);
-    }
-
-    #[test]
-    fn scroll_up_does_not_underflow() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        popup.scroll_offset = 0;
-        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(up);
-        assert_eq!(popup.scroll_offset, 0);
-    }
-
-    #[test]
-    fn page_down_scrolls_by_ten() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        let pgdn = KeyEvent::new(KeyCode::PageDown, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(pgdn);
-        assert_eq!(popup.scroll_offset, 10);
-    }
-
-    #[test]
-    fn page_up_scrolls_by_ten() {
-        let mut popup = StatusPopup::new();
-        popup.visible = true;
-        popup.scroll_offset = 15;
-        let pgup = KeyEvent::new(KeyCode::PageUp, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(pgup);
-        assert_eq!(popup.scroll_offset, 5);
-    }
-
+    /// Keys are ignored when the popup is not visible — otherwise stray
+    /// arrow keys aimed at the composer would shift a hidden popup's offset.
     #[test]
     fn handle_key_noop_when_not_visible() {
         let mut popup = StatusPopup::new();
-        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(down);
+        popup.handle_key(k(KeyCode::Down));
         assert_eq!(popup.scroll_offset, 0);
+        assert!(!popup.is_visible());
+        // Even Esc on a hidden popup must not toggle it visible.
+        popup.handle_key(k(KeyCode::Esc));
         assert!(!popup.is_visible());
     }
 
+    /// Left/Right cycle tabs with wraparound at both ends, and the
+    /// returned `change` value reports the new tab so the caller can rebuild
+    /// the rendered section. The default tab is Overview and the last tab
+    /// is History.
     #[test]
-    fn right_arrow_cycles_tabs_forward() {
+    fn left_right_arrows_cycle_tabs_with_wrap() {
+        // Right from Overview → Evolution.
         let mut popup = StatusPopup::new();
         popup.visible = true;
         assert_eq!(popup.current_tab(), StatusTab::Overview);
-        let right = KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::NONE);
-        let change = popup.handle_key(right);
+        let change = popup.handle_key(k(KeyCode::Right));
         assert_eq!(change, Some(StatusTab::Evolution));
         assert_eq!(popup.current_tab(), StatusTab::Evolution);
-    }
 
-    #[test]
-    fn left_arrow_cycles_tabs_backward_with_wrap() {
+        // Left from Overview wraps to History.
         let mut popup = StatusPopup::new();
         popup.visible = true;
-        let left = KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE);
-        let change = popup.handle_key(left);
-        // From Overview going left wraps to last tab (History).
+        let change = popup.handle_key(k(KeyCode::Left));
         assert_eq!(change, Some(StatusTab::History));
         assert_eq!(popup.current_tab(), StatusTab::History);
-    }
 
-    #[test]
-    fn right_arrow_wraps_at_end() {
+        // Right from History wraps back to Overview.
         let mut popup = StatusPopup::new();
         popup.visible = true;
         popup.current_tab = StatusTab::History;
-        let right = KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::NONE);
-        popup.handle_key(right);
+        popup.handle_key(k(KeyCode::Right));
         assert_eq!(popup.current_tab(), StatusTab::Overview);
     }
 

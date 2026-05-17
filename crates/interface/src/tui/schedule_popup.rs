@@ -406,21 +406,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_popup_not_visible() {
-        let popup = SchedulePopup::new();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
-    fn dismiss_hides_popup() {
-        let mut popup = SchedulePopup::new();
-        popup.visible = true;
-        assert!(popup.is_visible());
-        popup.dismiss();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
     fn esc_dismisses() {
         let mut popup = SchedulePopup::new();
         popup.visible = true;

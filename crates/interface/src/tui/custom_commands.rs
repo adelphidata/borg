@@ -250,34 +250,30 @@ mod tests {
         assert_eq!(names, vec!["/alpha", "/mid", "/zeta"]);
     }
 
+    /// `$ARGUMENTS` is substituted wherever it appears (including multiple
+    /// times); when the template has no placeholder, the args are appended
+    /// (so the user's words still reach the prompt). Empty args collapse
+    /// the placeholder to "" rather than leaving the literal text.
     #[test]
-    fn expand_substitutes_arguments_placeholder() {
-        let out = expand_template("Review: $ARGUMENTS please", "src/foo.rs");
-        assert_eq!(out, "Review: src/foo.rs please");
-    }
-
-    #[test]
-    fn expand_with_no_placeholder_appends_args() {
-        let out = expand_template("Do the thing.\n", "extra context");
-        assert_eq!(out, "Do the thing.\nextra context");
-    }
-
-    #[test]
-    fn expand_with_no_placeholder_and_no_args_returns_template_verbatim() {
-        let out = expand_template("Just this.", "");
-        assert_eq!(out, "Just this.");
-    }
-
-    #[test]
-    fn expand_substitutes_empty_arguments() {
-        // Placeholder present but args empty → placeholder collapses to "".
-        let out = expand_template("Hi $ARGUMENTS!", "");
-        assert_eq!(out, "Hi !");
-    }
-
-    #[test]
-    fn expand_substitutes_multiple_occurrences() {
-        let out = expand_template("$ARGUMENTS and $ARGUMENTS", "X");
-        assert_eq!(out, "X and X");
+    fn expand_template_substitution_rules() {
+        let cases: &[(&str, &str, &str)] = &[
+            // Placeholder present.
+            ("Review: $ARGUMENTS please", "src/foo.rs", "Review: src/foo.rs please"),
+            // Placeholder absent, args present → appended verbatim.
+            ("Do the thing.\n", "extra context", "Do the thing.\nextra context"),
+            // No placeholder, no args → template returned verbatim.
+            ("Just this.", "", "Just this."),
+            // Placeholder + empty args → placeholder collapses to "".
+            ("Hi $ARGUMENTS!", "", "Hi !"),
+            // Multiple occurrences all substituted.
+            ("$ARGUMENTS and $ARGUMENTS", "X", "X and X"),
+        ];
+        for (tpl, args, expected) in cases {
+            assert_eq!(
+                expand_template(tpl, args),
+                *expected,
+                "template={tpl:?} args={args:?}"
+            );
+        }
     }
 }

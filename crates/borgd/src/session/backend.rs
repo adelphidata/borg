@@ -486,35 +486,34 @@ mod tests {
     /// full `anyhow` context chain, not just the topmost wrap. A previous
     /// version used `e.to_string()` which produced messages like
     /// "Failed to build system prompt" with no underlying cause — leaving
-    /// the user (and the daemon log) with nothing actionable. The production
-    /// path now uses `format!("{e:#}")`; this test pins that contract.
+    /// the user (and the daemon log) with nothing actionable. Source-grep
+    /// guard so a future contributor can't silently revert this to
+    /// `e.to_string()` and lose the context chain again. Pure
+    /// library-behavior tests over `format!("{e:#}")` would pass even
+    /// against a reverted production callsite.
     #[test]
-    fn agent_error_string_includes_full_context_chain() {
-        use anyhow::{anyhow, Context};
-
-        let err: anyhow::Error = Err::<(), _>(anyhow!("inner kaboom"))
-            .context("middle frame")
-            .context("Failed to build system prompt")
-            .unwrap_err();
-
-        let surfaced = format!("{err:#}");
-
+    fn agent_error_callsite_uses_anyhow_alternate_format() {
+        let src = include_str!("backend.rs");
+        // Strip this test's own body before scanning so the patterns inside
+        // string literals don't false-positive on themselves.
+        let marker = "fn agent_error_callsite_uses_anyhow_alternate_format";
+        let scan = match src.find(marker) {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        // The production path must construct the message via `{:#}` so
+        // anyhow walks the `.context()` chain.
         assert!(
-            surfaced.contains("Failed to build system prompt"),
-            "outer wrap missing: {surfaced}"
+            scan.contains("format!(\"{e:#}\")"),
+            "backend.rs lost the anyhow-chained error format — \
+             AgentEvent::Error would surface only the outer wrap"
         );
+        // And it must not regress to a bare `.to_string()` on the error
+        // before sending into the channel. The closest negative pattern
+        // is the exact line shape the pre-fix code used.
         assert!(
-            surfaced.contains("middle frame"),
-            "intermediate context missing: {surfaced}"
+            !scan.contains("AgentEvent::Error(e.to_string()"),
+            "backend.rs reverted to e.to_string() — lose the context chain"
         );
-        assert!(
-            surfaced.contains("inner kaboom"),
-            "root cause missing: {surfaced}"
-        );
-
-        // Sanity: the naive `to_string()` path is what we explicitly moved
-        // away from; document the failure mode it produced.
-        let naive = err.to_string();
-        assert!(!naive.contains("inner kaboom"));
     }
 }

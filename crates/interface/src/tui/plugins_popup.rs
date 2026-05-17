@@ -727,16 +727,16 @@ mod tests {
     }
 
     #[test]
-    fn new_popup_not_visible() {
-        let popup = PluginsPopup::new();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
     fn show_and_dismiss() {
+        // A freshly-constructed popup is invisible; `show` (via the test
+        // helper) makes it visible with a non-empty item list; `dismiss`
+        // hides it again. Folds three behaviors into one check.
+        let popup_fresh = PluginsPopup::new();
+        assert!(!popup_fresh.is_visible(), "fresh popup must start hidden");
+
         let mut popup = make_test_popup();
-        assert!(popup.is_visible());
-        assert!(!popup.items.is_empty());
+        assert!(popup.is_visible(), "show must make popup visible");
+        assert!(!popup.items.is_empty(), "items must be loaded on show");
         popup.dismiss();
         assert!(!popup.is_visible());
     }

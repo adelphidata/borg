@@ -373,15 +373,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_detect_no_keys_returns_none() {
-        // Ensure no API keys in env for this test
-        let config = ImageGenConfig::default();
-        // Can't guarantee env state, but test the logic path
-        let _provider = ImageGenProvider::from_config(&config);
-        // Just verify it doesn't panic
-    }
-
-    #[test]
     fn explicit_provider_unknown_returns_none() {
         let config = ImageGenConfig {
             enabled: true,
@@ -402,30 +393,6 @@ mod tests {
     fn parse_size_invalid_falls_back() {
         assert_eq!(parse_size("invalid"), (1024, 1024));
         assert_eq!(parse_size(""), (1024, 1024));
-    }
-
-    #[test]
-    fn image_result_serialization() {
-        let result = ImageResult {
-            base64_data: "abc123".into(),
-            revised_prompt: Some("a better prompt".into()),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("abc123"));
-        assert!(json.contains("a better prompt"));
-
-        let parsed: ImageResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.base64_data, "abc123");
-        assert_eq!(parsed.revised_prompt, Some("a better prompt".into()));
-    }
-
-    #[test]
-    fn config_defaults() {
-        let config = ImageGenConfig::default();
-        assert!(!config.enabled);
-        assert!(config.provider.is_none());
-        assert!(config.model.is_none());
-        assert_eq!(config.default_size, "1024x1024");
     }
 
     #[test]

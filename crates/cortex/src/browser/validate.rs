@@ -77,154 +77,115 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Every browser action's required-parameter contract in one table. A
+    /// row is `(action, args, expect_err)` — `expect_err = true` means
+    /// `validate_browser_args` must return `Some(msg)` (rejection), `false`
+    /// means `None` (accepted). Adding a new browser action means
+    /// appending one row per acceptance case plus at least one rejection.
     #[test]
-    fn validate_navigate_requires_url() {
-        assert!(validate_browser_args("navigate", &json!({})).is_some());
-        assert!(
-            validate_browser_args("navigate", &json!({"url": "https://example.com"})).is_none()
-        );
-    }
+    fn validate_browser_args_required_parameter_contract() {
+        let cases: &[(&str, serde_json::Value, bool)] = &[
+            // Unknown action — fails regardless of args.
+            ("unknown_action", json!({}), true),
+            // navigate
+            ("navigate", json!({}), true),
+            ("navigate", json!({"url": "https://example.com"}), false),
+            // click / hover share require_str("selector")
+            ("click", json!({}), true),
+            ("click", json!({"selector": "#btn"}), false),
+            ("hover", json!({}), true),
+            ("hover", json!({"selector": ".btn"}), false),
+            // type — needs both selector and text
+            ("type", json!({"selector": "#input"}), true),
+            ("type", json!({"text": "hello"}), true),
+            (
+                "type",
+                json!({"selector": "#input", "text": "hello"}),
+                false,
+            ),
+            // evaluate_js
+            ("evaluate_js", json!({}), true),
+            ("evaluate_js", json!({"expression": "1+1"}), false),
+            // select
+            ("select", json!({}), true),
+            ("select", json!({"selector": "select"}), true),
+            (
+                "select",
+                json!({"selector": "select", "value": "opt1"}),
+                false,
+            ),
+            // press
+            ("press", json!({}), true),
+            ("press", json!({"key": "Enter"}), false),
+            // drag — needs source + target
+            ("drag", json!({}), true),
+            ("drag", json!({"source": "#a"}), true),
+            ("drag", json!({"source": "#a", "target": "#b"}), false),
+            // fill — fields must be a JSON object, not a string
+            ("fill", json!({}), true),
+            ("fill", json!({"fields": "not_object"}), true),
+            ("fill", json!({"fields": {"#email": "a@b.com"}}), false),
+            // wait — condition is required; each condition has its own
+            // value rule.
+            ("wait", json!({}), true),
+            ("wait", json!({"condition": "magic"}), true),
+            ("wait", json!({"condition": "text"}), true),
+            (
+                "wait",
+                json!({"condition": "text", "value": "hello"}),
+                false,
+            ),
+            ("wait", json!({"condition": "element"}), true),
+            (
+                "wait",
+                json!({"condition": "element", "value": "#el"}),
+                false,
+            ),
+            (
+                "wait",
+                json!({"condition": "url", "value": "/page"}),
+                false,
+            ),
+            // `load` is the one wait condition that takes no value.
+            ("wait", json!({"condition": "load"}), false),
+            ("wait", json!({"condition": "js"}), true),
+            (
+                "wait",
+                json!({"condition": "js", "value": "document.ready"}),
+                false,
+            ),
+            // resize — both width and height required as integers
+            ("resize", json!({}), true),
+            ("resize", json!({"width": 800}), true),
+            (
+                "resize",
+                json!({"width": 800, "height": 600}),
+                false,
+            ),
+            // switch_tab
+            ("switch_tab", json!({}), true),
+            ("switch_tab", json!({"tab_index": 0}), false),
+            // Actions with no required params accept empty args.
+            ("screenshot", json!({}), false),
+            ("new_tab", json!({}), false),
+            ("list_tabs", json!({}), false),
+            ("close_tab", json!({}), false),
+            ("get_console_logs", json!({}), false),
+        ];
 
-    #[test]
-    fn validate_click_requires_selector() {
-        assert!(validate_browser_args("click", &json!({})).is_some());
-        assert!(validate_browser_args("click", &json!({"selector": "#btn"})).is_none());
-    }
-
-    #[test]
-    fn validate_type_requires_selector_and_text() {
-        assert!(validate_browser_args("type", &json!({"selector": "#input"})).is_some());
-        assert!(validate_browser_args("type", &json!({"text": "hello"})).is_some());
-        assert!(
-            validate_browser_args("type", &json!({"selector": "#input", "text": "hello"}))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn validate_evaluate_js_requires_expression() {
-        assert!(validate_browser_args("evaluate_js", &json!({})).is_some());
-        assert!(validate_browser_args("evaluate_js", &json!({"expression": "1+1"})).is_none());
-    }
-
-    #[test]
-    fn validate_screenshot_no_required_params() {
-        assert!(validate_browser_args("screenshot", &json!({})).is_none());
-    }
-
-    #[test]
-    fn validate_unknown_action() {
-        assert!(validate_browser_args("unknown_action", &json!({})).is_some());
-    }
-
-    #[test]
-    fn validate_hover_requires_selector() {
-        assert!(validate_browser_args("hover", &json!({})).is_some());
-        assert!(validate_browser_args("hover", &json!({"selector": ".btn"})).is_none());
-    }
-
-    #[test]
-    fn validate_select_requires_selector_and_value() {
-        assert!(validate_browser_args("select", &json!({})).is_some());
-        assert!(validate_browser_args("select", &json!({"selector": "select"})).is_some());
-        assert!(
-            validate_browser_args("select", &json!({"selector": "select", "value": "opt1"}))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn validate_press_requires_key() {
-        assert!(validate_browser_args("press", &json!({})).is_some());
-        assert!(validate_browser_args("press", &json!({"key": "Enter"})).is_none());
-    }
-
-    #[test]
-    fn validate_drag_requires_source_and_target() {
-        assert!(validate_browser_args("drag", &json!({})).is_some());
-        assert!(validate_browser_args("drag", &json!({"source": "#a"})).is_some());
-        assert!(validate_browser_args("drag", &json!({"source": "#a", "target": "#b"})).is_none());
-    }
-
-    #[test]
-    fn validate_fill_requires_fields_object() {
-        assert!(validate_browser_args("fill", &json!({})).is_some());
-        assert!(validate_browser_args("fill", &json!({"fields": "not_object"})).is_some());
-        assert!(validate_browser_args("fill", &json!({"fields": {"#email": "a@b.com"}})).is_none());
-    }
-
-    #[test]
-    fn validate_wait_requires_condition() {
-        assert!(validate_browser_args("wait", &json!({})).is_some());
-    }
-
-    #[test]
-    fn validate_wait_text_requires_value() {
-        assert!(validate_browser_args("wait", &json!({"condition": "text"})).is_some());
-        assert!(
-            validate_browser_args("wait", &json!({"condition": "text", "value": "hello"}))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn validate_wait_element_requires_value() {
-        assert!(validate_browser_args("wait", &json!({"condition": "element"})).is_some());
-        assert!(
-            validate_browser_args("wait", &json!({"condition": "element", "value": "#el"}))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn validate_wait_url_requires_value() {
-        assert!(
-            validate_browser_args("wait", &json!({"condition": "url", "value": "/page"})).is_none()
-        );
-    }
-
-    #[test]
-    fn validate_wait_load_no_value_needed() {
-        assert!(validate_browser_args("wait", &json!({"condition": "load"})).is_none());
-    }
-
-    #[test]
-    fn validate_wait_js_requires_value() {
-        assert!(validate_browser_args("wait", &json!({"condition": "js"})).is_some());
-        assert!(validate_browser_args(
-            "wait",
-            &json!({"condition": "js", "value": "document.ready"})
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn validate_wait_unknown_condition() {
-        assert!(validate_browser_args("wait", &json!({"condition": "magic"})).is_some());
-    }
-
-    #[test]
-    fn validate_resize_requires_width_and_height() {
-        assert!(validate_browser_args("resize", &json!({})).is_some());
-        assert!(validate_browser_args("resize", &json!({"width": 800})).is_some());
-        assert!(validate_browser_args("resize", &json!({"width": 800, "height": 600})).is_none());
-    }
-
-    #[test]
-    fn validate_switch_tab_requires_index() {
-        assert!(validate_browser_args("switch_tab", &json!({})).is_some());
-        assert!(validate_browser_args("switch_tab", &json!({"tab_index": 0})).is_none());
-    }
-
-    #[test]
-    fn validate_tab_actions_no_required_params() {
-        assert!(validate_browser_args("new_tab", &json!({})).is_none());
-        assert!(validate_browser_args("list_tabs", &json!({})).is_none());
-        assert!(validate_browser_args("close_tab", &json!({})).is_none());
-    }
-
-    #[test]
-    fn validate_get_console_logs_no_required_params() {
-        assert!(validate_browser_args("get_console_logs", &json!({})).is_none());
+        for (action, args, expect_err) in cases {
+            let got = validate_browser_args(action, args);
+            if *expect_err {
+                assert!(
+                    got.is_some(),
+                    "validate({action}, {args}) expected Err, got Ok"
+                );
+            } else {
+                assert!(
+                    got.is_none(),
+                    "validate({action}, {args}) expected Ok, got Err: {got:?}"
+                );
+            }
+        }
     }
 }

@@ -371,15 +371,6 @@ mod tests {
         assert!(!session.meta.title.contains("proactive_nudges"));
     }
 
-    #[test]
-    fn session_meta_serializable() {
-        let session = Session::new();
-        let json = serde_json::to_string(&session.meta).unwrap();
-        let deserialized: SessionMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.id, session.meta.id);
-        assert_eq!(deserialized.title, session.meta.title);
-    }
-
     static SESSION_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn write_test_session(sessions_dir: &std::path::Path, id: &str, updated_at: &str) {

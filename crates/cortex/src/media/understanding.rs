@@ -434,9 +434,4 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("too large"));
     }
 
-    #[test]
-    fn parse_whisper_response() {
-        let json: serde_json::Value = serde_json::json!({"text": "Hello there"});
-        assert_eq!(json["text"].as_str().unwrap(), "Hello there");
-    }
 }

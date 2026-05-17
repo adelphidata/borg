@@ -1371,54 +1371,38 @@ mod tests {
     use super::*;
     use ratatui::style::Style;
 
+    /// `@mention` recognition: only `@` at start-of-line or after whitespace
+    /// counts; in-word `@` (emails) doesn't. Bare `@` followed by space is
+    /// not a mention. The mention span gets the `mention` style; everything
+    /// else uses `normal`.
     #[test]
-    fn parse_at_mentions_basic() {
+    fn parse_at_mentions_recognizes_only_word_boundary_at() {
         let normal = Style::default();
         let mention = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
-        let spans = parse_at_mentions("hello @file.rs world", normal, mention);
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].content.as_ref(), "hello ");
-        assert_eq!(spans[1].content.as_ref(), "@file.rs");
-        assert_eq!(spans[2].content.as_ref(), " world");
-        assert_eq!(spans[1].style, mention);
-    }
 
-    #[test]
-    fn parse_at_mentions_no_mention() {
-        let normal = Style::default();
-        let mention = Style::default();
-        let spans = parse_at_mentions("no mentions here", normal, mention);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content.as_ref(), "no mentions here");
-    }
+        // (input, expected span texts, expected mention indices)
+        let cases: &[(&str, &[&str], &[usize])] = &[
+            ("hello @file.rs world", &["hello ", "@file.rs", " world"], &[1]),
+            ("no mentions here", &["no mentions here"], &[]),
+            ("user@example.com", &["user@", "example.com"], &[]),
+            ("@path rest", &["@path", " rest"], &[0]),
+            ("@ alone", &["@", " alone"], &[]),
+        ];
 
-    #[test]
-    fn parse_at_mentions_email_not_mention() {
-        let normal = Style::default();
-        let mention = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
-        let spans = parse_at_mentions("user@example.com", normal, mention);
-        // '@' preceded by non-space, so not a mention
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].content.as_ref(), "user@");
-        assert_eq!(spans[1].content.as_ref(), "example.com");
-    }
-
-    #[test]
-    fn parse_at_mentions_at_start() {
-        let normal = Style::default();
-        let mention = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
-        let spans = parse_at_mentions("@path rest", normal, mention);
-        assert_eq!(spans[0].content.as_ref(), "@path");
-        assert_eq!(spans[0].style, mention);
-    }
-
-    #[test]
-    fn parse_at_mentions_bare_at() {
-        let normal = Style::default();
-        let mention = Style::default();
-        let spans = parse_at_mentions("@ alone", normal, mention);
-        assert_eq!(spans[0].content.as_ref(), "@");
-        assert_eq!(spans[1].content.as_ref(), " alone");
+        for (input, expected_texts, mention_indices) in cases {
+            let spans = parse_at_mentions(input, normal, mention);
+            let actual: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(&actual[..], *expected_texts, "input: {input:?}");
+            for (i, span) in spans.iter().enumerate() {
+                let is_mention = mention_indices.contains(&i);
+                let expected_style = if is_mention { mention } else { normal };
+                assert_eq!(
+                    span.style, expected_style,
+                    "input: {input:?} span {i} ({:?})",
+                    span.content
+                );
+            }
+        }
     }
 
     #[test]
@@ -2049,17 +2033,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_cell_variant_exists() {
-        let cell = HistoryCell::Plan {
-            steps: vec![PlanStep {
-                title: "A".into(),
-                status: PlanStepStatus::Completed,
-            }],
-        };
-        assert!(matches!(cell, HistoryCell::Plan { .. }));
-    }
-
-    #[test]
     fn render_tool_streaming_truncates() {
         let tool_lines: Vec<(String, bool)> = (0..12)
             .map(|i| (format!("output line {i}"), i % 3 == 0))
@@ -2077,46 +2050,64 @@ mod tests {
 
     // -- style_system_line tests --
 
+    /// Branches that emit a single dim span (no header/icon emphasis).
     #[test]
-    fn style_system_line_header() {
-        let line = style_system_line("Borg Doctor");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::header_style());
+    fn style_system_line_dim_only_branches() {
+        let cases = &[
+            "───────────",   // separator
+            "",              // empty
+            "  some body text", // plain indented prose
+        ];
+        for input in cases {
+            let line = style_system_line(input);
+            assert_eq!(line.spans.len(), 1, "input: {input:?}");
+            assert_eq!(line.spans[0].style, theme::dim(), "input: {input:?}");
+        }
     }
 
+    /// Branches that emit a single header-styled span.
     #[test]
-    fn style_system_line_separator() {
-        let line = style_system_line("───────────");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::dim());
+    fn style_system_line_single_header_span_branches() {
+        let cases = &[
+            "Borg Doctor",                  // plain header line
+            "<memory_file name=\"notes.md\">", // XML tag
+            "# My Memory Topic",             // markdown header
+        ];
+        for input in cases {
+            let line = style_system_line(input);
+            assert_eq!(line.spans.len(), 1, "input: {input:?}");
+            assert_eq!(
+                line.spans[0].style,
+                theme::header_style(),
+                "input: {input:?}"
+            );
+        }
     }
 
+    /// Icon-prefixed lines must apply the correct semantic style to the icon
+    /// glyph (success/warning/error), with the prefix indent and trailing
+    /// body kept separate. Regression: a previous render concatenated the
+    /// icon into the body span, losing the colored emphasis.
     #[test]
-    fn style_system_line_check_icon() {
-        let line = style_system_line("  ✓ sandbox enabled");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "✓");
-        assert_eq!(line.spans[1].style, theme::icon_style());
+    fn style_system_line_icon_branches_use_semantic_style_for_glyph() {
+        let cases: &[(&str, &str, Style)] = &[
+            ("  ✓ sandbox enabled", "✓", theme::icon_style()),
+            ("  ⚠ updates available", "⚠", theme::warning_style()),
+            ("  ✗ provider missing", "✗", theme::error_style()),
+        ];
+        for (input, glyph, expected_style) in cases {
+            let line = style_system_line(input);
+            assert_eq!(line.spans.len(), 3, "input: {input:?}");
+            assert_eq!(line.spans[1].content.as_ref(), *glyph, "input: {input:?}");
+            assert_eq!(line.spans[1].style, *expected_style, "input: {input:?}");
+        }
     }
 
+    /// History-prefix lines emit `[timestamp] <Role:> <body>` with the role
+    /// span carrying header emphasis. `You:` keeps a bold modifier; the
+    /// others use the plain header style.
     #[test]
-    fn style_system_line_warning_icon() {
-        let line = style_system_line("  ⚠ updates available");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "⚠");
-        assert_eq!(line.spans[1].style, theme::warning_style());
-    }
-
-    #[test]
-    fn style_system_line_fail_icon() {
-        let line = style_system_line("  ✗ provider missing");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "✗");
-        assert_eq!(line.spans[1].style, theme::error_style());
-    }
-
-    #[test]
-    fn style_system_line_history_you() {
+    fn style_system_line_history_prefix_branches() {
         let line = style_system_line("[13:05] You: hello");
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[0].content.as_ref(), "[13:05] ");
@@ -2125,63 +2116,43 @@ mod tests {
             .style
             .add_modifier
             .contains(ratatui::style::Modifier::BOLD));
+
+        for (input, role) in &[
+            ("[13:05] Assistant: hi there", "Assistant:"),
+            ("[13:13] Tool (toolu_vr): Exit code: 0", "Tool (toolu_vr):"),
+            ("  /help      - Show this help", "/help"),
+        ] {
+            let line = style_system_line(input);
+            assert_eq!(line.spans.len(), 3, "input: {input:?}");
+            assert_eq!(line.spans[1].content.as_ref(), *role, "input: {input:?}");
+            assert_eq!(
+                line.spans[1].style,
+                theme::header_style(),
+                "input: {input:?}"
+            );
+        }
     }
 
+    /// `tracing` log lines have `LEVEL` prefix bolded and the rest dim, so
+    /// the level scans at a glance.
     #[test]
-    fn style_system_line_history_assistant() {
-        let line = style_system_line("[13:05] Assistant: hi there");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "Assistant:");
-        assert_eq!(line.spans[1].style, theme::header_style());
-    }
-
-    #[test]
-    fn style_system_line_history_tool() {
-        let line = style_system_line("[13:13] Tool (toolu_vr): Exit code: 0");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "Tool (toolu_vr):");
-        assert_eq!(line.spans[1].style, theme::header_style());
-    }
-
-    #[test]
-    fn style_system_line_help_command() {
-        let line = style_system_line("  /help      - Show this help");
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].content.as_ref(), "/help");
-        assert_eq!(line.spans[1].style, theme::header_style());
-    }
-
-    #[test]
-    fn style_system_line_empty() {
-        let line = style_system_line("");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::dim());
-    }
-
-    #[test]
-    fn style_system_line_log_warn() {
-        let line =
-            style_system_line("2026-04-03T17:05:25.065853Z  WARN Failed to resolve credential");
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].style, theme::header_style());
-        assert!(line.spans[0].content.contains("WARN "));
-        assert_eq!(line.spans[1].style, theme::dim());
-    }
-
-    #[test]
-    fn style_system_line_log_error() {
-        let line = style_system_line("2026-04-03T17:05:25.096265Z ERROR Gateway exited with error");
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].style, theme::header_style());
-        assert!(line.spans[0].content.contains("ERROR "));
-        assert_eq!(line.spans[1].style, theme::dim());
-    }
-
-    #[test]
-    fn style_system_line_plain_indented() {
-        let line = style_system_line("  some body text");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::dim());
+    fn style_system_line_log_level_branches() {
+        for (input, level) in &[
+            (
+                "2026-04-03T17:05:25.065853Z  WARN Failed to resolve credential",
+                "WARN ",
+            ),
+            (
+                "2026-04-03T17:05:25.096265Z ERROR Gateway exited with error",
+                "ERROR ",
+            ),
+        ] {
+            let line = style_system_line(input);
+            assert_eq!(line.spans.len(), 2, "input: {input:?}");
+            assert_eq!(line.spans[0].style, theme::header_style());
+            assert!(line.spans[0].content.contains(level), "input: {input:?}");
+            assert_eq!(line.spans[1].style, theme::dim());
+        }
     }
 
     #[test]
@@ -2191,20 +2162,6 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "Session:");
         assert_eq!(line.spans[0].style, theme::header_style());
         assert_eq!(line.spans[1].style, theme::dim());
-    }
-
-    #[test]
-    fn style_system_line_xml_tag() {
-        let line = style_system_line("<memory_file name=\"notes.md\">");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::header_style());
-    }
-
-    #[test]
-    fn style_system_line_markdown_header() {
-        let line = style_system_line("# My Memory Topic");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::header_style());
     }
 
     #[test]
@@ -2350,15 +2307,6 @@ mod tests {
         let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!first.contains(theme::BOX_TOP_LEFT));
         assert!(first.contains(theme::TREE_END));
-    }
-
-    #[test]
-    fn style_system_line_prose_is_dim() {
-        let line = style_system_line(
-            "This is a longer line of regular prose text that should remain dim styled",
-        );
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style, theme::dim());
     }
 
     // --- Streaming markdown collector tests (newline-gated cache) ---

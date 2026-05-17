@@ -333,26 +333,26 @@ mod tests {
         assert_eq!(s.selection, Some(UpdateSelection::DontRemind));
     }
 
+    /// Cancel-shaped keys (Esc, Ctrl+C, Ctrl+D) all map to NotNow — the
+    /// "skip this once" choice — so users habituated to any one of them
+    /// don't accidentally persist a dismissal (DontRemind would suppress
+    /// the prompt until the next release).
     #[test]
-    fn esc_skips_without_dismissal() {
-        let mut s = PromptState::new();
-        s.handle_key(key(KeyCode::Esc));
-        // NotNow ≠ DontRemind: Esc must not persist a skipped version.
-        assert_eq!(s.selection, Some(UpdateSelection::NotNow));
-    }
-
-    #[test]
-    fn ctrl_c_skips_without_dismissal() {
-        let mut s = PromptState::new();
-        s.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert_eq!(s.selection, Some(UpdateSelection::NotNow));
-    }
-
-    #[test]
-    fn ctrl_d_skips_without_dismissal() {
-        let mut s = PromptState::new();
-        s.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert_eq!(s.selection, Some(UpdateSelection::NotNow));
+    fn cancel_keys_select_not_now_not_dont_remind() {
+        let cases = &[
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ];
+        for evt in cases {
+            let mut s = PromptState::new();
+            s.handle_key(*evt);
+            assert_eq!(
+                s.selection,
+                Some(UpdateSelection::NotNow),
+                "event {evt:?} must select NotNow, never DontRemind"
+            );
+        }
     }
 
     #[test]
@@ -368,25 +368,25 @@ mod tests {
         assert_eq!(s.selection, Some(UpdateSelection::NotNow));
     }
 
+    /// Highlight wraps at both ends and vim `j`/`k` mirror arrow keys —
+    /// otherwise a single Down from the first item or Up from the last
+    /// would freeze on the row before the boundary.
     #[test]
-    fn up_from_first_wraps_to_last() {
+    fn highlight_wraps_with_arrows_and_vim_keys() {
+        // Up from first → wraps to last.
         let mut s = PromptState::new();
         s.handle_key(key(KeyCode::Up));
         assert_eq!(s.highlighted, UpdateSelection::DontRemind);
-    }
 
-    #[test]
-    fn down_from_last_wraps_to_first() {
+        // Three Downs from first cycles UpdateNow → NotNow → DontRemind → UpdateNow.
         let mut s = PromptState::new();
         s.handle_key(key(KeyCode::Down));
         s.handle_key(key(KeyCode::Down));
         assert_eq!(s.highlighted, UpdateSelection::DontRemind);
         s.handle_key(key(KeyCode::Down));
         assert_eq!(s.highlighted, UpdateSelection::UpdateNow);
-    }
 
-    #[test]
-    fn vim_keys_navigate_like_arrows() {
+        // Vim keys are aliases.
         let mut s = PromptState::new();
         s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(s.highlighted, UpdateSelection::NotNow);
@@ -403,26 +403,29 @@ mod tests {
         assert!(s.selection.is_none(), "Release events must not select");
     }
 
+    /// `should_show` gates the update-prompt overlay. It shows iff `latest`
+    /// is strictly newer than both `current` and any prior `skipped` tag
+    /// (so "Skip until next version" applies only to that exact version).
     #[test]
-    fn should_show_suppresses_when_not_newer() {
-        assert!(!should_show("0.3.0", "0.3.0", ""));
-        assert!(!should_show("0.4.0", "0.3.0", ""));
-    }
-
-    #[test]
-    fn should_show_when_newer_and_no_dismissal() {
-        assert!(should_show("0.2.0", "0.3.0", ""));
-    }
-
-    #[test]
-    fn should_show_suppresses_when_dismissed_matches_latest() {
-        assert!(!should_show("0.2.0", "0.3.0", "0.3.0"));
-    }
-
-    #[test]
-    fn should_show_re_prompts_when_newer_release_lands() {
-        // The whole point of "Skip until next version": once a newer tag
-        // lands, the dismissal no longer applies.
-        assert!(should_show("0.2.0", "0.4.0", "0.3.0"));
+    fn should_show_respects_currency_and_skipped_dismissal() {
+        // (current, latest, skipped, expected)
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // Same or older "latest" — never prompt.
+            ("0.3.0", "0.3.0", "", false),
+            ("0.4.0", "0.3.0", "", false),
+            // Newer latest, no prior dismissal — prompt.
+            ("0.2.0", "0.3.0", "", true),
+            // Newer latest, but user already dismissed this exact tag — suppress.
+            ("0.2.0", "0.3.0", "0.3.0", false),
+            // A still-newer tag landed after the dismissal — prompt again.
+            ("0.2.0", "0.4.0", "0.3.0", true),
+        ];
+        for (current, latest, skipped, expected) in cases {
+            assert_eq!(
+                should_show(current, latest, skipped),
+                *expected,
+                "should_show({current}, {latest}, skipped={skipped:?})"
+            );
+        }
     }
 }

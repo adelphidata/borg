@@ -218,22 +218,9 @@ pub async fn fill(
     .context("Fill timed out")?
 }
 
-#[cfg(test)]
-mod tests {
-    // Actions require a live browser, so integration tests are #[ignore].
-    // Validation of action params is tested in validate.rs.
-
-    #[test]
-    fn escape_selector_single_quotes() {
-        let sel = "input[name='email']";
-        let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
-        assert_eq!(escaped, "input[name=\\'email\\']");
-    }
-
-    #[test]
-    fn escape_selector_backslash() {
-        let sel = r"div\.class";
-        let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
-        assert!(escaped.contains("\\\\"));
-    }
-}
+// Behaviour in this module requires a live Chromium session, so unit tests
+// live alongside the parsing/validation modules (`validate.rs`, `wait.rs`).
+// The selector-escape closures here are inline `.replace('\\', "\\\\")
+// .replace('\'', "\\'")` calls — there is no extracted helper to test, and
+// asserting that an inlined `.replace()` call returns what `.replace()`
+// returns would be tautological.

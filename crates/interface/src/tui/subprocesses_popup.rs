@@ -343,12 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn new_popup_not_visible() {
-        let popup = SubprocessesPopup::new();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
     fn esc_dismisses_popup() {
         let mut popup = make_popup(vec![make_subprocess(1, "echo hi", false)]);
         let action = popup.handle_key(key(KeyCode::Esc));
@@ -356,39 +350,24 @@ mod tests {
         assert!(!popup.is_visible());
     }
 
+    /// Arrow keys + vim `j`/`k` all navigate the same cursor and wrap at both
+    /// ends so the popup never lands on an out-of-range row.
     #[test]
-    fn cursor_wraps_down() {
-        let mut popup = make_popup(vec![
-            make_subprocess(1, "a", false),
-            make_subprocess(2, "b", false),
-        ]);
-        assert_eq!(popup.cursor, 0);
-        popup.handle_key(key(KeyCode::Down));
-        assert_eq!(popup.cursor, 1);
-        popup.handle_key(key(KeyCode::Down));
-        assert_eq!(popup.cursor, 0);
-    }
-
-    #[test]
-    fn cursor_wraps_up() {
-        let mut popup = make_popup(vec![
-            make_subprocess(1, "a", false),
-            make_subprocess(2, "b", false),
-        ]);
-        popup.handle_key(key(KeyCode::Up));
-        assert_eq!(popup.cursor, 1);
-    }
-
-    #[test]
-    fn vim_keys_navigate() {
-        let mut popup = make_popup(vec![
-            make_subprocess(1, "a", false),
-            make_subprocess(2, "b", false),
-        ]);
-        popup.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(popup.cursor, 1);
-        popup.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(popup.cursor, 0);
+    fn navigation_keys_wrap_at_both_ends() {
+        for &(down_key, up_key) in &[(KeyCode::Down, KeyCode::Up), (KeyCode::Char('j'), KeyCode::Char('k'))] {
+            let mut popup = make_popup(vec![
+                make_subprocess(1, "a", false),
+                make_subprocess(2, "b", false),
+            ]);
+            assert_eq!(popup.cursor, 0, "fresh cursor with key {down_key:?}");
+            popup.handle_key(key(down_key));
+            assert_eq!(popup.cursor, 1, "after one {down_key:?}");
+            popup.handle_key(key(down_key));
+            assert_eq!(popup.cursor, 0, "after wrap with {down_key:?}");
+            // Wrap upward: from 0 jumps to the last entry.
+            popup.handle_key(key(up_key));
+            assert_eq!(popup.cursor, 1, "after wrap-up with {up_key:?}");
+        }
     }
 
     #[test]
@@ -449,18 +428,20 @@ mod tests {
         );
     }
 
+    /// `record_pin_*` sets the status line in `popup.status` so the next
+    /// frame surfaces an "ok"/"error" toast under the entry list.
     #[test]
-    fn record_pin_success_sets_status() {
+    fn record_pin_outcome_sets_status_with_success_flag() {
         let mut popup = make_popup(vec![make_subprocess(1, "a", false)]);
         popup.record_pin_success(1, true);
         assert!(matches!(popup.status, Some((_, true))));
-    }
 
-    #[test]
-    fn record_pin_failure_sets_error_status() {
-        let mut popup = make_popup(vec![make_subprocess(1, "a", false)]);
         popup.record_pin_failure("boom");
-        assert!(matches!(popup.status, Some((_, false))));
+        assert!(
+            matches!(&popup.status, Some((msg, false)) if msg.contains("boom")),
+            "failure status must carry the error text, got {:?}",
+            popup.status
+        );
     }
 
     #[test]
@@ -482,17 +463,14 @@ mod tests {
         assert_eq!(format_age(-5), "0s");
     }
 
+    /// The pin marker is the user's only visual cue that a subprocess is
+    /// surviving daemon restart, so the glyph must appear exactly when the
+    /// `pinned` flag is set.
     #[test]
-    fn format_subprocess_line_shows_pin_marker_when_pinned() {
-        let entry = make_subprocess(1, "cargo build", true);
-        let line = format_subprocess_line(&entry, 0, false);
-        assert!(line.contains("📌"), "pin marker missing in: {line}");
-    }
-
-    #[test]
-    fn format_subprocess_line_no_pin_marker_when_unpinned() {
-        let entry = make_subprocess(1, "cargo build", false);
-        let line = format_subprocess_line(&entry, 0, false);
-        assert!(!line.contains("📌"));
+    fn format_subprocess_line_shows_pin_marker_iff_pinned() {
+        let pinned = format_subprocess_line(&make_subprocess(1, "cargo build", true), 0, false);
+        let unpinned = format_subprocess_line(&make_subprocess(1, "cargo build", false), 0, false);
+        assert!(pinned.contains("📌"), "missing pin marker: {pinned}");
+        assert!(!unpinned.contains("📌"), "stray pin marker: {unpinned}");
     }
 }

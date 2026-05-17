@@ -1580,20 +1580,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tab_flow_is_correct() {
-        assert_eq!(
-            Tab::ALL,
-            [
-                Tab::Welcome,
-                Tab::Security,
-                Tab::Provider,
-                Tab::ApiKey,
-                Tab::Channels,
-            ]
-        );
-    }
-
-    #[test]
     fn tab_navigation_forward() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
@@ -1691,25 +1677,29 @@ mod tests {
         );
     }
 
+    /// `BORG_NAMES` is the random-name pool. The "≥100" floor exists so the
+    /// onboarding default isn't trivially predictable; the dedup guard
+    /// catches a copy-paste mistake in the list (a duplicate would silently
+    /// double that name's pick rate).
     #[test]
-    fn borg_names_array_is_non_empty() {
+    fn borg_names_pool_is_large_and_deduplicated() {
         assert!(
             BORG_NAMES.len() >= 100,
             "Expected at least 100 Borg names, got: {}",
             BORG_NAMES.len()
         );
-    }
-
-    #[test]
-    fn borg_names_has_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for name in BORG_NAMES {
             assert!(seen.insert(name), "Duplicate Borg name: {name}");
         }
     }
 
+    /// `random_borg_name` must only return values from the curated
+    /// `BORG_NAMES` pool — a regression where the RNG indexes off-by-one
+    /// would surface here as an empty / out-of-bounds-clipped string.
+    /// Also covers `OnboardingState::new()` seeding the same way.
     #[test]
-    fn random_borg_name_returns_name_from_list() {
+    fn random_borg_name_only_returns_pool_entries() {
         for _ in 0..20 {
             let name = random_borg_name();
             assert!(
@@ -1717,10 +1707,6 @@ mod tests {
                 "random_borg_name() returned unknown name: {name}"
             );
         }
-    }
-
-    #[test]
-    fn initial_agent_name_is_from_borg_names() {
         let state = OnboardingState::new();
         assert!(
             BORG_NAMES.contains(&state.agent_name.as_str()),

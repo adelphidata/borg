@@ -508,6 +508,8 @@ mod tests {
 
     #[test]
     fn wrap_js_simple_expression() {
+        // Sanity: the Promise.race scaffold must wrap the inner expression
+        // verbatim and embed the timeout literal in the rejection path.
         let js = wrap_js_with_timeout("document.title", 5000);
         assert!(js.contains("Promise.race"));
         assert!(js.contains("document.title"));
@@ -515,67 +517,73 @@ mod tests {
     }
 
     #[test]
-    fn wrap_js_with_backticks() {
+    fn wrap_js_escapes_template_literal_specials() {
+        // Backtick and ${...} are the breakouts that would let attacker JS
+        // escape the wrapping template literal. Both must be escaped.
         let js = wrap_js_with_timeout("`hello ${world}`", 3000);
-        assert!(js.contains("\\`hello \\${world}\\`"));
-        assert!(js.contains("3000"));
-    }
-
-    #[test]
-    fn wrap_js_complex_expression() {
-        let js = wrap_js_with_timeout("document.querySelectorAll('div').length", 10000);
-        assert!(js.contains("querySelectorAll"));
-        assert!(js.contains("10000"));
-    }
-
-    #[test]
-    fn wrap_js_timeout_value_embedded() {
+        assert!(
+            js.contains("\\`hello \\${world}\\`"),
+            "backtick/${{}} not escaped; got: {js}"
+        );
+        // Timeout literal embedded twice (rejection message + setTimeout
+        // argument) — both must reflect the requested value.
         let js = wrap_js_with_timeout("1+1", 7500);
-        assert!(js.contains("7500ms"));
-        assert!(js.contains("7500)"));
+        assert!(
+            js.contains("7500ms"),
+            "rejection message missing timeout: {js}"
+        );
+        assert!(
+            js.contains("7500)"),
+            "setTimeout call missing timeout: {js}"
+        );
     }
 
     #[test]
-    fn wrap_js_preserves_quotes() {
+    fn wrap_js_preserves_inner_double_quotes() {
+        // We only escape backslash, backtick, and `${`. Double quotes
+        // inside the user's expression must survive untouched — otherwise
+        // common selectors like `querySelector("div")` would break.
         let js = wrap_js_with_timeout(r#"document.querySelector("div")"#, 5000);
         assert!(js.contains(r#"querySelector("div")"#));
     }
 
     #[test]
-    fn validate_url_scheme_allows_http() {
-        assert!(validate_url_scheme("http://example.com").is_ok());
-    }
-
-    #[test]
-    fn validate_url_scheme_allows_https() {
-        assert!(validate_url_scheme("https://example.com").is_ok());
-    }
-
-    #[test]
-    fn validate_url_scheme_blocks_file() {
-        assert!(validate_url_scheme("file:///etc/passwd").is_err());
-    }
-
-    #[test]
-    fn validate_url_scheme_blocks_javascript() {
-        assert!(validate_url_scheme("javascript:alert(1)").is_err());
-    }
-
-    #[test]
-    fn validate_url_scheme_blocks_data() {
-        assert!(validate_url_scheme("data:text/html,<h1>Hi</h1>").is_err());
-    }
-
-    #[test]
-    fn validate_url_scheme_blocks_chrome() {
-        assert!(validate_url_scheme("chrome://settings").is_err());
-    }
-
-    #[test]
     fn wrap_js_escapes_backslash_before_backtick() {
-        // A raw backslash followed by a backtick should be double-escaped
+        // A raw backslash followed by a backtick was a past escape-order
+        // bug: escaping backticks first then backslashes would re-create
+        // an un-escaped backtick on the second pass.
         let js = wrap_js_with_timeout(r"test\`value", 1000);
         assert!(js.contains(r"test\\\\\\`value") || js.contains(r"test\\\`value"));
+    }
+
+    /// Scheme allowlist for browser navigation. The production caller
+    /// (`UrlPolicy::classify_offline`) blocks anything other than
+    /// http/https; this is the defense-in-depth check inside the browser
+    /// session that fires if a direct caller bypasses url_policy.
+    /// Allowed schemes plus a representative sample of attacker schemes
+    /// (`file://`, `javascript:`, `data:`, `chrome://`) all in one table.
+    #[test]
+    fn validate_url_scheme_allowlist() {
+        let cases: &[(&str, bool)] = &[
+            ("http://example.com", true),
+            ("https://example.com", true),
+            // SSRF / exfil-class schemes — must be blocked.
+            ("file:///etc/passwd", false),
+            ("javascript:alert(1)", false),
+            ("data:text/html,<h1>Hi</h1>", false),
+            ("chrome://settings", false),
+            // Defense-in-depth: an input with no scheme at all must be
+            // rejected rather than silently allowed.
+            ("no-scheme-here", false),
+        ];
+        for (url, expect_ok) in cases {
+            let got = validate_url_scheme(url);
+            assert_eq!(
+                got.is_ok(),
+                *expect_ok,
+                "validate_url_scheme({url}) = {got:?}, expected ok={expect_ok}"
+            );
+        }
     }
 
     #[tokio::test]

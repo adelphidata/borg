@@ -1091,33 +1091,29 @@ mod tests {
         }
     }
 
+    /// `format_class_label` is the source of truth for the agent's
+    /// title-card class line: pre-evolution always shows the "Base Borg"
+    /// placeholder (archetype is hidden until evolved), post-evolution shows
+    /// the chosen name plus archetype-when-set.
     #[test]
-    fn class_label_pre_evolution_hides_archetype() {
-        let s = mk_ambient(None, 1, Mood::Stable, Some(Archetype::Builder));
-        assert_eq!(format_class_label(&s), "Base Borg Lv.1");
-    }
-
-    #[test]
-    fn class_label_pre_evolution_no_archetype() {
-        let s = mk_ambient(None, 1, Mood::Drifting, None);
-        assert_eq!(format_class_label(&s), "Base Borg Lv.1");
-    }
-
-    #[test]
-    fn class_label_post_evolution_with_archetype() {
-        let s = mk_ambient(
-            Some("Oppenborger"),
-            5,
-            Mood::Focused,
-            Some(Archetype::Builder),
-        );
-        assert_eq!(format_class_label(&s), "Oppenborger the Builder Lv.5");
-    }
-
-    #[test]
-    fn class_label_post_evolution_no_archetype() {
-        let s = mk_ambient(Some("Oppenborger"), 5, Mood::Focused, None);
-        assert_eq!(format_class_label(&s), "Oppenborger Lv.5");
+    fn class_label_per_evolution_state() {
+        let cases: &[(Option<&str>, u8, Option<Archetype>, &str)] = &[
+            // pre-evolution: archetype is irrelevant
+            (None, 1, Some(Archetype::Builder), "Base Borg Lv.1"),
+            (None, 1, None, "Base Borg Lv.1"),
+            // post-evolution: archetype appears only when set
+            (
+                Some("Oppenborger"),
+                5,
+                Some(Archetype::Builder),
+                "Oppenborger the Builder Lv.5",
+            ),
+            (Some("Oppenborger"), 5, None, "Oppenborger Lv.5"),
+        ];
+        for (name, level, arch, expected) in cases {
+            let s = mk_ambient(*name, *level, Mood::Stable, *arch);
+            assert_eq!(format_class_label(&s), *expected, "case: name={name:?} arch={arch:?}");
+        }
     }
 
     #[test]

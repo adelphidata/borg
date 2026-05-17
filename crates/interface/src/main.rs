@@ -778,36 +778,20 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Uninstall confirmation is intentionally narrower than a typical y/N
+    /// prompt: only exactly `y` or `Y` proceeds. "yes" / empty / anything
+    /// else is rejected so an accidental return key never wipes the data dir.
     #[test]
-    fn confirm_uninstall_accepts_y() {
-        assert!(commands::misc::confirm_uninstall("y"));
-    }
-
-    #[test]
-    fn confirm_uninstall_accepts_uppercase_y() {
-        assert!(commands::misc::confirm_uninstall("Y"));
-    }
-
-    #[test]
-    fn confirm_uninstall_rejects_empty() {
-        assert!(!commands::misc::confirm_uninstall(""));
-    }
-
-    #[test]
-    fn confirm_uninstall_rejects_no() {
-        assert!(!commands::misc::confirm_uninstall("n"));
-        assert!(!commands::misc::confirm_uninstall("N"));
-    }
-
-    #[test]
-    fn confirm_uninstall_rejects_yes_spelled_out() {
-        assert!(!commands::misc::confirm_uninstall("yes"));
-    }
-
-    #[test]
-    fn confirm_uninstall_rejects_arbitrary_input() {
-        assert!(!commands::misc::confirm_uninstall("maybe"));
-        assert!(!commands::misc::confirm_uninstall("yy"));
+    fn confirm_uninstall_accepts_only_single_y_case_insensitive() {
+        for accept in ["y", "Y"] {
+            assert!(commands::misc::confirm_uninstall(accept), "should accept {accept:?}");
+        }
+        for reject in ["", "n", "N", "yes", "maybe", "yy"] {
+            assert!(
+                !commands::misc::confirm_uninstall(reject),
+                "should reject {reject:?}"
+            );
+        }
     }
 
     // Onboarding-sentinel round-trip is covered in `borgd`'s
@@ -853,39 +837,27 @@ mod tests {
         }
     }
 
+    /// `borg update` flags: each name/alias/short maps to the same field;
+    /// `-pc` must combine; `--dev` is the hidden back-compat alias for
+    /// `--prerelease`.
     #[test]
-    fn parse_update_no_flags_is_default() {
-        let a = parse_update(&[]);
-        assert!(!a.prerelease);
-        assert!(!a.check);
-    }
-
-    #[test]
-    fn parse_update_prerelease_flag() {
-        assert!(parse_update(&["--prerelease"]).prerelease);
-        assert!(parse_update(&["--pre"]).prerelease);
-        assert!(parse_update(&["-p"]).prerelease);
-    }
-
-    #[test]
-    fn parse_update_dev_alias_back_compat() {
-        // --dev must still work for users with old muscle memory.
-        let a = parse_update(&["--dev"]);
-        assert!(a.prerelease);
-        assert!(!a.check);
-    }
-
-    #[test]
-    fn parse_update_check_flag() {
-        assert!(parse_update(&["--check"]).check);
-        assert!(parse_update(&["-c"]).check);
-    }
-
-    #[test]
-    fn parse_update_combined_short_flags() {
-        let a = parse_update(&["-pc"]);
-        assert!(a.prerelease);
-        assert!(a.check);
+    fn parse_update_flag_aliases_and_combinations() {
+        // (argv, expected prerelease, expected check)
+        let cases: &[(&[&str], bool, bool)] = &[
+            (&[], false, false),
+            (&["--prerelease"], true, false),
+            (&["--pre"], true, false),
+            (&["-p"], true, false),
+            (&["--dev"], true, false),
+            (&["--check"], false, true),
+            (&["-c"], false, true),
+            (&["-pc"], true, true),
+        ];
+        for (args, prerelease, check) in cases {
+            let a = parse_update(args);
+            assert_eq!(a.prerelease, *prerelease, "args: {args:?}");
+            assert_eq!(a.check, *check, "args: {args:?}");
+        }
     }
 
     #[test]
@@ -1238,20 +1210,13 @@ mod tests {
 
     // -- Helper tests --
 
+    /// `commands::truncate_str` is pass-through at-or-under the limit, and
+    /// keeps `max - 1` chars + ellipsis when over.
     #[test]
-    fn test_truncate_str_short() {
+    fn truncate_str_passes_through_or_appends_ellipsis() {
         assert_eq!(commands::truncate_str("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_exact() {
-        assert_eq!(commands::truncate_str("hello", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_long() {
-        let result = commands::truncate_str("hello world", 5);
-        assert_eq!(result, "hell…");
+        assert_eq!(commands::truncate_str("hello", 5), "hello"); // exact
+        assert_eq!(commands::truncate_str("hello world", 5), "hell…");
     }
 
     // -- --resume flag parsing --

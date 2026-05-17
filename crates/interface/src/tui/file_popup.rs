@@ -263,12 +263,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_popup_is_not_visible() {
-        let popup = FileSearchPopup::new();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
     fn set_pending_query_makes_visible_and_marks_waiting() {
         let mut popup = FileSearchPopup::new();
         popup.set_pending_query("foo");
@@ -392,43 +386,31 @@ mod tests {
 
     // ------------------- helper fn tests -------------------
 
+    /// `is_path_like` decides whether a token in the composer should trigger
+    /// the file-search popup. It must accept anything that *looks* like a
+    /// path (tilde, absolute, relative dot, embedded separator, Windows
+    /// drive letter) and reject bare identifiers — otherwise typing
+    /// `Cargo.toml` would pop the search popup on every word.
     #[test]
-    fn is_path_like_detects_tilde() {
-        assert!(is_path_like("~"));
-        assert!(is_path_like("~/"));
-        assert!(is_path_like("~/Documents"));
-    }
-
-    #[test]
-    fn is_path_like_detects_absolute() {
-        assert!(is_path_like("/etc"));
-        assert!(is_path_like("/etc/hosts"));
-    }
-
-    #[test]
-    fn is_path_like_detects_relative_dot_prefix() {
-        assert!(is_path_like("./foo"));
-        assert!(is_path_like("../bar"));
-    }
-
-    #[test]
-    fn is_path_like_detects_embedded_separator() {
-        assert!(is_path_like("foo/bar"));
-    }
-
-    #[test]
-    fn is_path_like_detects_windows_drive() {
-        assert!(is_path_like("C:/Users"));
-        assert!(is_path_like("C:\\Users"));
-        assert!(is_path_like("d:/x"));
-    }
-
-    #[test]
-    fn is_path_like_rejects_bare_names() {
-        assert!(!is_path_like("foo"));
-        assert!(!is_path_like("Cargo"));
-        assert!(!is_path_like("my_file.txt"));
-        assert!(!is_path_like(""));
+    fn is_path_like_accepts_path_shapes_and_rejects_bare_names() {
+        for accept in [
+            "~",
+            "~/",
+            "~/Documents",
+            "/etc",
+            "/etc/hosts",
+            "./foo",
+            "../bar",
+            "foo/bar",
+            "C:/Users",
+            "C:\\Users",
+            "d:/x",
+        ] {
+            assert!(is_path_like(accept), "should accept {accept:?}");
+        }
+        for reject in ["foo", "Cargo", "my_file.txt", ""] {
+            assert!(!is_path_like(reject), "should reject {reject:?}");
+        }
     }
 
     #[test]

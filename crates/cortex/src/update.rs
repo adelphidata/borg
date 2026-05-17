@@ -490,11 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_current_version() {
-        assert_eq!(current_version(), env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
     fn test_platform_asset_name() {
         let name = platform_asset_name().unwrap();
         assert!(name.starts_with("borg-"));

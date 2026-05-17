@@ -215,60 +215,43 @@ mod tests {
     }
 
     #[test]
-    fn new_popup_not_visible() {
-        let popup = SessionsPopup::new();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
-    fn dismiss_hides_popup() {
-        let mut popup = SessionsPopup::new();
-        popup.visible = true;
-        popup.dismiss();
-        assert!(!popup.is_visible());
-    }
-
-    #[test]
     fn esc_dismisses() {
         let mut popup = make_popup_with_sessions(2);
         popup.handle_key(key(KeyCode::Esc));
         assert!(!popup.is_visible());
     }
 
+    /// Enter on an empty session list must NOT return a Load action — that
+    /// would attempt to load `session-<panic>`. Enter on a populated list
+    /// loads the highlighted entry (cursor=0 → "session-0").
     #[test]
-    fn enter_on_empty_returns_none() {
-        let mut popup = SessionsPopup::new();
-        popup.visible = true;
-        let result = popup.handle_key(key(KeyCode::Enter));
-        assert!(result.is_none());
-    }
+    fn enter_on_empty_returns_none_and_on_populated_loads_cursor() {
+        let mut empty = SessionsPopup::new();
+        empty.visible = true;
+        assert!(empty.handle_key(key(KeyCode::Enter)).is_none());
 
-    #[test]
-    fn enter_loads_selected_session() {
         let mut popup = make_popup_with_sessions(3);
-        let result = popup.handle_key(key(KeyCode::Enter));
-        match result {
+        match popup.handle_key(key(KeyCode::Enter)) {
             Some(SessionAction::Load { id }) => assert_eq!(id, "session-0"),
             other => panic!("expected Load, got {other:?}"),
         }
     }
 
+    /// Arrow keys wrap at both ends so the user can't strand the cursor
+    /// past the list. Down past the last entry wraps to 0; Up from 0 wraps
+    /// to the last entry.
     #[test]
-    fn cursor_wraps_down() {
+    fn cursor_wraps_at_both_ends() {
         let mut popup = make_popup_with_sessions(2);
         assert_eq!(popup.cursor, 0);
         popup.handle_key(key(KeyCode::Down));
         assert_eq!(popup.cursor, 1);
         popup.handle_key(key(KeyCode::Down));
-        assert_eq!(popup.cursor, 0); // wrapped
-    }
+        assert_eq!(popup.cursor, 0, "Down past last must wrap to 0");
 
-    #[test]
-    fn cursor_wraps_up() {
         let mut popup = make_popup_with_sessions(2);
-        assert_eq!(popup.cursor, 0);
         popup.handle_key(key(KeyCode::Up));
-        assert_eq!(popup.cursor, 1); // wrapped to end
+        assert_eq!(popup.cursor, 1, "Up from 0 must wrap to last");
     }
 
     #[test]

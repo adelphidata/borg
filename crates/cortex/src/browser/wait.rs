@@ -122,121 +122,108 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Every supported `condition` keyword maps to the right
+    /// `WaitCondition` variant. `from_args` is the tool-call entry point —
+    /// each row corresponds to a documented keyword.
     #[test]
-    fn parse_text_condition() {
-        let args = json!({"condition": "text", "value": "hello"});
-        let cond = WaitCondition::from_args(&args).unwrap();
-        assert_eq!(cond, WaitCondition::Text("hello".to_string()));
+    fn from_args_maps_each_keyword_to_its_variant() {
+        let cases: &[(serde_json::Value, WaitCondition)] = &[
+            (
+                json!({"condition": "text", "value": "hello"}),
+                WaitCondition::Text("hello".to_string()),
+            ),
+            (
+                json!({"condition": "element", "value": "#btn"}),
+                WaitCondition::Element("#btn".to_string()),
+            ),
+            (
+                json!({"condition": "url", "value": "/dashboard"}),
+                WaitCondition::Url("/dashboard".to_string()),
+            ),
+            (json!({"condition": "load"}), WaitCondition::LoadState),
+            (
+                json!({"condition": "js", "value": "window.ready"}),
+                WaitCondition::JsFunction("window.ready".to_string()),
+            ),
+        ];
+        for (args, expected) in cases {
+            let got = WaitCondition::from_args(args).expect("parse ok");
+            assert_eq!(&got, expected, "from_args({args}) = {got:?}");
+        }
     }
 
+    /// Malformed payloads must return Err, not silently pick a default —
+    /// the LLM gets the error back as a tool-call failure and can retry.
     #[test]
-    fn parse_element_condition() {
-        let args = json!({"condition": "element", "value": "#btn"});
-        let cond = WaitCondition::from_args(&args).unwrap();
-        assert_eq!(cond, WaitCondition::Element("#btn".to_string()));
+    fn from_args_rejects_malformed_payloads() {
+        let cases: &[serde_json::Value] = &[
+            json!({}),                        // missing condition entirely
+            json!({"condition": "magic"}),    // unknown keyword
+            // conditions that REQUIRE a value but didn't supply one
+            json!({"condition": "text"}),
+            json!({"condition": "element"}),
+            json!({"condition": "url"}),
+            json!({"condition": "js"}),
+        ];
+        for args in cases {
+            assert!(
+                WaitCondition::from_args(args).is_err(),
+                "from_args({args}) must be Err"
+            );
+        }
     }
 
+    /// Each variant's `to_js_check()` must emit a JS expression containing
+    /// the discriminating substring the browser actually evaluates.
+    /// Substring (not full equality) so accidental whitespace tweaks don't
+    /// regress the test for the wrong reason.
     #[test]
-    fn parse_url_condition() {
-        let args = json!({"condition": "url", "value": "/dashboard"});
-        let cond = WaitCondition::from_args(&args).unwrap();
-        assert_eq!(cond, WaitCondition::Url("/dashboard".to_string()));
+    fn to_js_check_emits_variant_specific_expression() {
+        let cases: &[(WaitCondition, &str)] = &[
+            (
+                WaitCondition::Text("hello".into()),
+                "innerText.includes('hello')",
+            ),
+            (
+                WaitCondition::Element("#btn".into()),
+                "querySelector('#btn')",
+            ),
+            (
+                WaitCondition::Url("/page".into()),
+                "location.href.includes('/page')",
+            ),
+            (WaitCondition::LoadState, "readyState === 'complete'"),
+            (
+                WaitCondition::JsFunction("window.ready".into()),
+                "!!(window.ready)",
+            ),
+        ];
+        for (cond, needle) in cases {
+            let js = cond.to_js_check();
+            assert!(
+                js.contains(needle),
+                "to_js_check for {cond:?} missing {needle:?}; got: {js}"
+            );
+        }
     }
 
+    /// Single-quote escaping is the JS-injection equivalent for the
+    /// generated check expression. A user-supplied value containing `'`
+    /// would otherwise break out of the surrounding `'...'` literal and
+    /// run arbitrary JS in the page's main world.
     #[test]
-    fn parse_load_condition() {
-        let args = json!({"condition": "load"});
-        let cond = WaitCondition::from_args(&args).unwrap();
-        assert_eq!(cond, WaitCondition::LoadState);
-    }
-
-    #[test]
-    fn parse_js_condition() {
-        let args = json!({"condition": "js", "value": "window.ready"});
-        let cond = WaitCondition::from_args(&args).unwrap();
-        assert_eq!(cond, WaitCondition::JsFunction("window.ready".to_string()));
-    }
-
-    #[test]
-    fn parse_missing_condition() {
-        let args = json!({});
-        assert!(WaitCondition::from_args(&args).is_err());
-    }
-
-    #[test]
-    fn parse_unknown_condition() {
-        let args = json!({"condition": "magic"});
-        assert!(WaitCondition::from_args(&args).is_err());
-    }
-
-    #[test]
-    fn parse_text_missing_value() {
-        let args = json!({"condition": "text"});
-        assert!(WaitCondition::from_args(&args).is_err());
-    }
-
-    #[test]
-    fn parse_element_missing_value() {
-        let args = json!({"condition": "element"});
-        assert!(WaitCondition::from_args(&args).is_err());
-    }
-
-    #[test]
-    fn js_check_text() {
-        let cond = WaitCondition::Text("hello".to_string());
-        let js = cond.to_js_check();
-        assert!(js.contains("innerText.includes('hello')"));
-    }
-
-    #[test]
-    fn js_check_element() {
-        let cond = WaitCondition::Element("#btn".to_string());
-        let js = cond.to_js_check();
-        assert!(js.contains("querySelector('#btn')"));
-    }
-
-    #[test]
-    fn js_check_url() {
-        let cond = WaitCondition::Url("/page".to_string());
-        let js = cond.to_js_check();
-        assert!(js.contains("location.href.includes('/page')"));
-    }
-
-    #[test]
-    fn js_check_load_state() {
-        let cond = WaitCondition::LoadState;
-        let js = cond.to_js_check();
-        assert!(js.contains("readyState === 'complete'"));
-    }
-
-    #[test]
-    fn js_check_js_function() {
-        let cond = WaitCondition::JsFunction("window.ready".to_string());
-        let js = cond.to_js_check();
-        assert!(js.contains("!!(window.ready)"));
-    }
-
-    #[test]
-    fn js_check_escapes_quotes() {
+    fn to_js_check_escapes_single_quotes_in_value() {
         let cond = WaitCondition::Text("it's a test".to_string());
         let js = cond.to_js_check();
-        assert!(js.contains("it\\'s a test"));
-    }
-
-    #[test]
-    fn description_messages() {
-        assert!(WaitCondition::Text("x".into())
-            .description()
-            .contains("text 'x'"));
-        assert!(WaitCondition::Element("#e".into())
-            .description()
-            .contains("element '#e'"));
-        assert!(WaitCondition::Url("/u".into())
-            .description()
-            .contains("URL"));
-        assert!(WaitCondition::LoadState.description().contains("load"));
-        assert!(WaitCondition::JsFunction("f()".into())
-            .description()
-            .contains("JS expression"));
+        assert!(
+            js.contains("it\\'s a test"),
+            "single quote not escaped; got: {js}"
+        );
+        // Sanity: the unescaped form must not appear — would mean both the
+        // escaped and the raw value leaked.
+        assert!(
+            !js.contains("'it's a test'"),
+            "unescaped single quote leaked into JS; got: {js}"
+        );
     }
 }

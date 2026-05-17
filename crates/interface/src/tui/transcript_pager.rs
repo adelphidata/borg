@@ -434,23 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn new_pager_not_visible() {
-        let p = TranscriptPager::new();
-        assert!(!p.visible);
-        assert_eq!(p.scroll_offset, 0);
-        assert!(p.search.is_none());
-    }
-
-    #[test]
-    fn show_dismiss_toggle_visibility() {
-        let mut p = TranscriptPager::new();
-        p.show();
-        assert!(p.visible);
-        p.dismiss();
-        assert!(!p.visible);
-    }
-
-    #[test]
     fn show_after_dismiss_clears_search() {
         let mut p = TranscriptPager::new();
         p.show();
@@ -597,47 +580,35 @@ mod tests {
         assert!(p.visible, "pager must stay open");
     }
 
+    /// Three independent dismiss keys: `q`, Esc (when not in search edit
+    /// mode), and Ctrl+T (the same chord that opened the pager). All must
+    /// emit `PagerAction::Dismiss` so the parent app can leave the
+    /// alt-screen.
     #[test]
-    fn q_dismisses_pager() {
-        let mut p = TranscriptPager::new();
-        p.show();
-        assert_eq!(p.handle_key(key(KeyCode::Char('q'))), PagerAction::Dismiss);
+    fn q_esc_ctrl_t_all_dismiss_pager() {
+        for k_evt in [
+            key(KeyCode::Char('q')),
+            key(KeyCode::Esc),
+            ctrl(KeyCode::Char('t')),
+        ] {
+            let mut p = TranscriptPager::new();
+            p.show();
+            assert_eq!(p.handle_key(k_evt), PagerAction::Dismiss, "key {k_evt:?}");
+        }
     }
 
+    /// `find_matches` is the in-pager search: case-insensitive substring,
+    /// empty query returns no matches (avoids highlighting every line),
+    /// no-hit query returns empty.
     #[test]
-    fn esc_outside_search_dismisses_pager() {
-        let mut p = TranscriptPager::new();
-        p.show();
-        assert_eq!(p.handle_key(key(KeyCode::Esc)), PagerAction::Dismiss);
-    }
-
-    #[test]
-    fn ctrl_t_dismisses_pager() {
-        let mut p = TranscriptPager::new();
-        p.show();
-        assert_eq!(p.handle_key(ctrl(KeyCode::Char('t'))), PagerAction::Dismiss);
-    }
-
-    #[test]
-    fn find_matches_case_insensitive() {
+    fn find_matches_case_insensitive_with_empty_and_miss_branches() {
         let lines = vec![
             Line::from("Hello World"),
             Line::from("nothing here"),
             Line::from("hello again"),
         ];
-        let m = TranscriptPager::find_matches(&lines, "hello");
-        assert_eq!(m, vec![0, 2]);
-    }
-
-    #[test]
-    fn find_matches_empty_query_returns_empty() {
-        let lines = vec![Line::from("Hello World")];
+        assert_eq!(TranscriptPager::find_matches(&lines, "hello"), vec![0, 2]);
         assert!(TranscriptPager::find_matches(&lines, "").is_empty());
-    }
-
-    #[test]
-    fn find_matches_no_hits() {
-        let lines = vec![Line::from("Hello World")];
         assert!(TranscriptPager::find_matches(&lines, "zzz").is_empty());
     }
 

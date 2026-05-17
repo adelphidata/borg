@@ -949,19 +949,21 @@ openssh-server/stable 9.6 amd64 [upgradable from: 9.5]\n";
     }
 
     #[test]
-    fn run_host_security_checks_produces_entries() {
+    fn run_host_security_checks_all_entries_use_host_security_category() {
+        // Every emitter in this module must tag with `CATEGORY` so the
+        // doctor surface can group host-security findings together. A
+        // stray category leaks the check into another bucket silently.
         let mut checks = Vec::new();
         run_host_security_checks(&mut checks);
-        assert!(!checks.is_empty());
-        assert!(checks.iter().all(|c| c.category == CATEGORY));
-    }
-
-    #[test]
-    fn individual_check_produces_host_security_category() {
-        let mut checks = Vec::new();
-        check_firewall(&mut checks);
-        assert!(!checks.is_empty());
-        assert!(checks.iter().all(|c| c.category == CATEGORY));
+        assert!(
+            !checks.is_empty(),
+            "host security must emit at least one check on every supported platform"
+        );
+        assert!(
+            checks.iter().all(|c| c.category == CATEGORY),
+            "all checks must use the HostSecurity category, got: {:?}",
+            checks.iter().map(|c| &c.category).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1011,13 +1013,4 @@ openssh-server/stable 9.6 amd64 [upgradable from: 9.5]\n";
         );
     }
 
-    #[test]
-    fn host_security_checks_does_not_panic() {
-        let mut checks = Vec::new();
-        run_host_security_checks(&mut checks);
-        // On all platforms, this should complete without panic
-        // On Windows: 1 check (platform warning)
-        // On macOS/Linux: multiple checks
-        assert!(!checks.is_empty());
-    }
 }

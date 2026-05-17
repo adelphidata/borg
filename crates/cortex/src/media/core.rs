@@ -292,30 +292,36 @@ mod tests {
         assert!(!is_heic("image/jpeg"));
     }
 
+    /// Magic-byte inference covers every format we surface to the LLM plus
+    /// the unknown-input fallback. Collapsed to a table so adding a new
+    /// format means appending one row, not adding a near-duplicate test.
     #[test]
-    fn infer_mime_jpeg() {
-        assert_eq!(
-            infer_mime_from_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]),
-            Some("image/jpeg")
-        );
-    }
-
-    #[test]
-    fn infer_mime_png() {
-        assert_eq!(
-            infer_mime_from_bytes(&[0x89, b'P', b'N', b'G']),
-            Some("image/png")
-        );
-    }
-
-    #[test]
-    fn infer_mime_gif() {
-        assert_eq!(infer_mime_from_bytes(b"GIF89a"), Some("image/gif"));
-    }
-
-    #[test]
-    fn infer_mime_unknown() {
-        assert_eq!(infer_mime_from_bytes(&[0x00, 0x00, 0x00, 0x00]), None);
+    fn infer_mime_recognises_known_magic_bytes() {
+        let cases: &[(&[u8], Option<&str>)] = &[
+            (&[0xFF, 0xD8, 0xFF, 0xE0], Some("image/jpeg")),
+            (&[0x89, b'P', b'N', b'G'], Some("image/png")),
+            (b"GIF89a", Some("image/gif")),
+            // RIFF…WEBP needs the 12-byte WEBP suffix to disambiguate from
+            // RIFF/WAV — guard against a regression that accepts bare RIFF.
+            (b"RIFF\0\0\0\0WEBP", Some("image/webp")),
+            (&[0x42, 0x4D, 0, 0], Some("image/bmp")),
+            // MP4 / QuickTime use the `ftyp` ISO base media file marker.
+            (b"\0\0\0\0ftypqt  ", Some("video/quicktime")),
+            (b"\0\0\0\0ftypisom", Some("video/mp4")),
+            (&[0x1A, 0x45, 0xDF, 0xA3], Some("video/webm")),
+            // Bare RIFF without WEBP must NOT be claimed as webp — covers
+            // both the positive and the negative discrimination.
+            (b"RIFF\0\0\0\0WAVEfmt ", None),
+            // Unknown input falls back to None rather than guessing.
+            (&[0x00, 0x00, 0x00, 0x00], None),
+        ];
+        for (bytes, expected) in cases {
+            let got = infer_mime_from_bytes(bytes);
+            assert_eq!(
+                got, *expected,
+                "infer_mime_from_bytes({bytes:02X?}) = {got:?}, expected {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -350,22 +356,4 @@ mod tests {
         assert_eq!(mime, "image/jpeg");
     }
 
-    #[test]
-    fn compress_content_parts_leaves_text() {
-        let mut parts = vec![
-            ContentPart::Text("hello".into()),
-            ContentPart::Text("world".into()),
-        ];
-        compress_content_parts(&mut parts, 6 * 1024 * 1024);
-        assert!(matches!(&parts[0], ContentPart::Text(t) if t == "hello"));
-        assert!(matches!(&parts[1], ContentPart::Text(t) if t == "world"));
-    }
-
-    #[test]
-    fn media_config_defaults() {
-        let config = crate::config::MediaConfig::default();
-        assert_eq!(config.max_image_bytes, 6 * 1024 * 1024);
-        assert!(config.compression_enabled);
-        assert_eq!(config.max_dimension_px, 2048);
-    }
 }

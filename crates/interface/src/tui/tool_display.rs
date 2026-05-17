@@ -335,114 +335,154 @@ mod tests {
 
     // -- extract_basename --
 
+    /// `extract_basename` is plain `rsplit('/').next()` — it must return the
+    /// trailing path segment for relative, absolute, and slashless inputs,
+    /// and intentionally returns "" for a trailing-slash path so the caller
+    /// can distinguish "directory" from "file".
     #[test]
-    fn basename_simple() {
-        assert_eq!(extract_basename("src/main.rs"), "main.rs");
-    }
-
-    #[test]
-    fn basename_absolute() {
-        assert_eq!(extract_basename("/home/user/project/lib.rs"), "lib.rs");
-    }
-
-    #[test]
-    fn basename_no_slash() {
-        assert_eq!(extract_basename("file.txt"), "file.txt");
-    }
-
-    #[test]
-    fn basename_trailing_slash() {
-        assert_eq!(extract_basename("dir/"), "");
+    fn basename_handles_all_path_shapes() {
+        let cases: &[(&str, &str)] = &[
+            ("src/main.rs", "main.rs"),
+            ("/home/user/project/lib.rs", "lib.rs"),
+            ("file.txt", "file.txt"),
+            ("dir/", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(extract_basename(input), *expected, "input: {input:?}");
+        }
     }
 
     // -- extract_patch_filenames --
 
     #[test]
-    fn patch_filenames_mixed() {
+    fn patch_filenames_extracts_add_update_delete_in_order() {
         let patch = "*** Begin Patch\n*** Add File: foo.rs\n+content\n*** Update File: bar.rs\n@@\n*** Delete File: old.rs\n*** End Patch";
         let files = extract_patch_filenames(patch);
         assert_eq!(files, vec!["foo.rs", "bar.rs", "old.rs"]);
     }
 
     #[test]
-    fn patch_filenames_empty() {
-        let patch = "*** Begin Patch\n*** End Patch";
-        let files = extract_patch_filenames(patch);
+    fn patch_filenames_empty_patch_returns_empty() {
+        let files = extract_patch_filenames("*** Begin Patch\n*** End Patch");
         assert!(files.is_empty());
     }
 
     #[test]
-    fn patch_filenames_with_paths() {
+    fn patch_filenames_preserves_full_paths_not_basenames() {
+        // Filenames must keep their directory prefix — they're shown verbatim
+        // in the tool-display, and truncation is later/elsewhere.
         let patch = "*** Add File: tools/my-tool/main.py\n*** Update File: tools/my-tool/tool.toml";
-        let files = extract_patch_filenames(patch);
         assert_eq!(
-            files,
+            extract_patch_filenames(patch),
             vec!["tools/my-tool/main.py", "tools/my-tool/tool.toml"]
         );
     }
 
     // -- classify_tool --
 
+    /// `classify_tool` is the one-stop mapper from `(tool_name, args_json)`
+    /// to the user-facing display category. Each row exercises a distinct
+    /// per-tool branch and the field the renderer keys on.
     #[test]
-    fn classify_read_file() {
-        let cat = classify_tool("read_file", r#"{"path":"src/main.rs"}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Explored {
-                entries: vec![ExploreEntry::Read(vec!["main.rs".to_string()])]
-            }
-        );
-    }
+    fn classify_tool_maps_each_tool_to_its_display_category() {
+        use ToolDisplayCategory::*;
 
-    #[test]
-    fn classify_read_file_absolute() {
-        let cat = classify_tool("read_file", r#"{"path":"/home/user/project/lib.rs"}"#);
-        if let ToolDisplayCategory::Explored { entries } = &cat {
-            if let ExploreEntry::Read(files) = &entries[0] {
-                assert_eq!(files[0], "lib.rs");
-            } else {
-                panic!("expected Read entry");
-            }
-        } else {
-            panic!("expected Explored category");
+        let cases: &[(&str, &str, ToolDisplayCategory)] = &[
+            (
+                "read_file",
+                r#"{"path":"src/main.rs"}"#,
+                Explored {
+                    entries: vec![ExploreEntry::Read(vec!["main.rs".to_string()])],
+                },
+            ),
+            (
+                // Absolute path: basename only is surfaced.
+                "read_file",
+                r#"{"path":"/home/user/project/lib.rs"}"#,
+                Explored {
+                    entries: vec![ExploreEntry::Read(vec!["lib.rs".to_string()])],
+                },
+            ),
+            (
+                "list_dir",
+                r#"{"path":"src"}"#,
+                Explored {
+                    entries: vec![ExploreEntry::List("src".to_string())],
+                },
+            ),
+            (
+                // Default-path branch: absent `path` becomes `.`.
+                "list_dir",
+                r#"{}"#,
+                Explored {
+                    entries: vec![ExploreEntry::List(".".to_string())],
+                },
+            ),
+            (
+                "run_shell",
+                r#"{"command":"ls -la"}"#,
+                Ran {
+                    command: "ls -la".to_string(),
+                },
+            ),
+            (
+                "write_memory",
+                r#"{"filename":"MEMORY.md","content":"stuff"}"#,
+                WroteMemory {
+                    target: "MEMORY.md".to_string(),
+                },
+            ),
+            (
+                "read_memory",
+                r#"{"filename":"notes.md"}"#,
+                ReadMemory {
+                    target: "notes.md".to_string(),
+                },
+            ),
+            (
+                "browser",
+                r#"{"action":"navigate","url":"https://example.com"}"#,
+                Browsed {
+                    action: "navigate".to_string(),
+                    url: Some("https://example.com".to_string()),
+                },
+            ),
+            (
+                "schedule",
+                r#"{"action":"list"}"#,
+                Tasks {
+                    action: "list".to_string(),
+                },
+            ),
+            (
+                "list_skills",
+                r#"{}"#,
+                Listed {
+                    what: "skills".to_string(),
+                },
+            ),
+            (
+                "list_channels",
+                r#"{}"#,
+                Listed {
+                    what: "channels".to_string(),
+                },
+            ),
+        ];
+        for (tool, args, expected) in cases {
+            assert_eq!(
+                classify_tool(tool, args),
+                *expected,
+                "tool={tool} args={args}"
+            );
         }
     }
 
+    /// `apply_patch` is special-cased: the patch DSL is parsed and the
+    /// affected filenames + count are surfaced, so a multi-file patch shows
+    /// "Edited 2 files" not "Ran apply_patch".
     #[test]
-    fn classify_list_dir() {
-        let cat = classify_tool("list_dir", r#"{"path":"src"}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Explored {
-                entries: vec![ExploreEntry::List("src".to_string())]
-            }
-        );
-    }
-
-    #[test]
-    fn classify_list_dir_default() {
-        let cat = classify_tool("list_dir", r#"{}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Explored {
-                entries: vec![ExploreEntry::List(".".to_string())]
-            }
-        );
-    }
-
-    #[test]
-    fn classify_run_shell() {
-        let cat = classify_tool("run_shell", r#"{"command":"ls -la"}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Ran {
-                command: "ls -la".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_apply_patch() {
+    fn classify_apply_patch_extracts_filenames_and_count() {
         let patch = r#"{"patch":"*** Begin Patch\n*** Add File: foo.rs\n+hello\n*** Update File: bar.rs\n@@\n*** End Patch"}"#;
         let cat = classify_tool("apply_patch", patch);
         if let ToolDisplayCategory::Edited { files, count } = &cat {
@@ -451,162 +491,85 @@ mod tests {
         } else {
             panic!("expected Edited category, got {:?}", cat);
         }
-    }
 
-    #[test]
-    fn classify_apply_patch_empty() {
-        let cat = classify_tool(
+        // Empty patch is still classified as Edited (preserving the bullet
+        // header), with count=0 so the renderer can skip the file list.
+        let empty = classify_tool(
             "apply_patch",
             r#"{"patch":"*** Begin Patch\n*** End Patch"}"#,
         );
-        if let ToolDisplayCategory::Edited { count, .. } = &cat {
+        if let ToolDisplayCategory::Edited { count, files } = &empty {
             assert_eq!(*count, 0);
+            assert!(files.is_empty());
         } else {
-            panic!("expected Edited category");
+            panic!("expected Edited category for empty patch");
         }
     }
 
+    /// Unknown tools and malformed JSON both fall through to `Generic` so
+    /// the renderer never crashes on a stranger; the tool name is preserved
+    /// so the user still sees what ran.
     #[test]
-    fn classify_write_memory() {
-        let cat = classify_tool(
-            "write_memory",
-            r#"{"filename":"MEMORY.md","content":"stuff"}"#,
-        );
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::WroteMemory {
-                target: "MEMORY.md".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_read_memory() {
-        let cat = classify_tool("read_memory", r#"{"filename":"notes.md"}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::ReadMemory {
-                target: "notes.md".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_browser() {
-        let cat = classify_tool(
-            "browser",
-            r#"{"action":"navigate","url":"https://example.com"}"#,
-        );
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Browsed {
-                action: "navigate".to_string(),
-                url: Some("https://example.com".to_string())
-            }
-        );
-    }
-
-    #[test]
-    fn classify_schedule() {
-        let cat = classify_tool("schedule", r#"{"action":"list"}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Tasks {
-                action: "list".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_list_skills() {
-        let cat = classify_tool("list_skills", r#"{}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Listed {
-                what: "skills".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_list_channels() {
-        let cat = classify_tool("list_channels", r#"{}"#);
-        assert_eq!(
-            cat,
-            ToolDisplayCategory::Listed {
-                what: "channels".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_unknown() {
-        let cat = classify_tool("my_custom_tool", r#"{"x":1}"#);
-        if let ToolDisplayCategory::Generic { name, .. } = &cat {
+    fn classify_unknown_and_invalid_json_fall_through_to_generic() {
+        let unknown = classify_tool("my_custom_tool", r#"{"x":1}"#);
+        if let ToolDisplayCategory::Generic { name, .. } = &unknown {
             assert_eq!(name, "my_custom_tool");
         } else {
-            panic!("expected Generic category");
+            panic!("expected Generic, got {unknown:?}");
         }
-    }
 
-    #[test]
-    fn classify_invalid_json() {
-        let cat = classify_tool("read_file", "not valid json");
-        assert!(matches!(cat, ToolDisplayCategory::Generic { .. }));
+        // Invalid JSON for a *known* tool also fails over to Generic instead
+        // of panicking — this is the regression-guard for the rendering path.
+        let bad_json = classify_tool("read_file", "not valid json");
+        assert!(matches!(bad_json, ToolDisplayCategory::Generic { .. }));
     }
 
     // -- tool_header_spans --
 
+    /// One-line headers shown on the bullet row. Each category contributes a
+    /// distinct verb/format; this table is the source of truth for the
+    /// rendered string and guards against header drift.
     #[test]
-    fn header_explored() {
-        let cat = ToolDisplayCategory::Explored {
-            entries: vec![ExploreEntry::Read(vec!["main.rs".to_string()])],
-        };
-        let spans = tool_header_spans(&cat);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "Explored");
-    }
-
-    #[test]
-    fn header_ran() {
-        let cat = ToolDisplayCategory::Ran {
-            command: "cargo test".to_string(),
-        };
-        let spans = tool_header_spans(&cat);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "Ran `cargo test`");
-    }
-
-    #[test]
-    fn header_edited() {
-        let cat = ToolDisplayCategory::Edited {
-            files: vec!["a.rs".to_string()],
-            count: 1,
-        };
-        let spans = tool_header_spans(&cat);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "Edited");
-    }
-
-    #[test]
-    fn header_listed() {
-        let cat = ToolDisplayCategory::Listed {
-            what: "tools".to_string(),
-        };
-        let spans = tool_header_spans(&cat);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "Listed tools");
-    }
-
-    #[test]
-    fn header_generic() {
-        let cat = ToolDisplayCategory::Generic {
-            name: "my_tool".to_string(),
-            preview: "args".to_string(),
-        };
-        let spans = tool_header_spans(&cat);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "my_tool args");
+    fn tool_header_spans_render_per_category_verb() {
+        let cases: Vec<(ToolDisplayCategory, &str)> = vec![
+            (
+                ToolDisplayCategory::Explored {
+                    entries: vec![ExploreEntry::Read(vec!["main.rs".to_string()])],
+                },
+                "Explored",
+            ),
+            (
+                ToolDisplayCategory::Ran {
+                    command: "cargo test".to_string(),
+                },
+                "Ran `cargo test`",
+            ),
+            (
+                ToolDisplayCategory::Edited {
+                    files: vec!["a.rs".to_string()],
+                    count: 1,
+                },
+                "Edited",
+            ),
+            (
+                ToolDisplayCategory::Listed {
+                    what: "tools".to_string(),
+                },
+                "Listed tools",
+            ),
+            (
+                ToolDisplayCategory::Generic {
+                    name: "my_tool".to_string(),
+                    preview: "args".to_string(),
+                },
+                "my_tool args",
+            ),
+        ];
+        for (cat, expected) in &cases {
+            let spans = tool_header_spans(cat);
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, *expected, "category: {cat:?}");
+        }
     }
 
     // -- tool_detail_line --
@@ -681,55 +644,53 @@ mod tests {
 
     // -- tool_result_label --
 
+    /// `tool_result_label` is the after-the-fact summary line. Generic falls
+    /// back to "Ran <name>" (note the verb change vs. the live header).
     #[test]
-    fn result_label_explored() {
-        let cat = ToolDisplayCategory::Explored { entries: vec![] };
-        assert_eq!(tool_result_label(&cat), "Explored");
-    }
-
-    #[test]
-    fn result_label_ran() {
-        let cat = ToolDisplayCategory::Ran {
-            command: "cargo build".to_string(),
-        };
-        assert_eq!(tool_result_label(&cat), "Ran `cargo build`");
-    }
-
-    #[test]
-    fn result_label_edited() {
-        let cat = ToolDisplayCategory::Edited {
-            files: vec![],
-            count: 0,
-        };
-        assert_eq!(tool_result_label(&cat), "Edited");
-    }
-
-    #[test]
-    fn result_label_generic() {
-        let cat = ToolDisplayCategory::Generic {
-            name: "custom".to_string(),
-            preview: String::new(),
-        };
-        assert_eq!(tool_result_label(&cat), "Ran custom");
+    fn tool_result_label_per_category() {
+        let cases: Vec<(ToolDisplayCategory, &str)> = vec![
+            (
+                ToolDisplayCategory::Explored { entries: vec![] },
+                "Explored",
+            ),
+            (
+                ToolDisplayCategory::Ran {
+                    command: "cargo build".to_string(),
+                },
+                "Ran `cargo build`",
+            ),
+            (
+                ToolDisplayCategory::Edited {
+                    files: vec![],
+                    count: 0,
+                },
+                "Edited",
+            ),
+            (
+                ToolDisplayCategory::Generic {
+                    name: "custom".to_string(),
+                    preview: String::new(),
+                },
+                "Ran custom",
+            ),
+        ];
+        for (cat, expected) in &cases {
+            assert_eq!(tool_result_label(cat), *expected, "category: {cat:?}");
+        }
     }
 
     // -- truncate --
 
+    /// `truncate` is the under/at-limit pass-through plus the over-limit
+    /// ellipsis case. The char-count cap is non-negotiable — a wider string
+    /// would overflow the bullet line.
     #[test]
-    fn truncate_short() {
+    fn truncate_passes_through_or_ellipsizes() {
         assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_exact() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_long() {
+        assert_eq!(truncate("hello", 5), "hello"); // exact fit
         let result = truncate("a]very long string here", 10);
-        assert!(result.ends_with("..."));
-        assert!(result.chars().count() <= 10);
+        assert!(result.ends_with("..."), "got: {result}");
+        assert!(result.chars().count() <= 10, "got len: {}", result.chars().count());
     }
 
     // -- truncate_path --

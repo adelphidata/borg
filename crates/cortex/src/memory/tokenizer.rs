@@ -29,74 +29,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_token_count() {
-        let count = estimate_tokens("Hello, world!");
-        assert!(count > 0);
-        assert!(count < 10);
-    }
-
-    #[test]
-    fn empty_string() {
+    fn empty_string_returns_zero() {
+        // Documented contract — the cap-enforcement path in
+        // `enforce_memory_size` treats `estimate_tokens("") == 0` as "fits
+        // in any budget".
         assert_eq!(estimate_tokens(""), 0);
     }
 
+    /// Bounded sanity ranges for the BPE encoder. Ranges are deliberately
+    /// wide — the goal is to detect a regression that swaps the encoder
+    /// for the byte fallback (`len / 4`) or returns nonsense, not to
+    /// fingerprint the exact cl100k tokenization (which is `tiktoken-rs`'
+    /// job to test).
     #[test]
-    fn longer_text_reasonable_estimate() {
-        let text = "The quick brown fox jumps over the lazy dog. ".repeat(10);
-        let count = estimate_tokens(&text);
-        // Should be significantly more accurate than len/4
-        assert!(count > 50);
-        assert!(count < 200);
+    fn estimate_within_expected_bounds_for_known_inputs() {
+        let english = "The quick brown fox jumps over the lazy dog. ".repeat(10);
+        let repeated = "hello ".repeat(100);
+        // (input, min_tokens, max_tokens) — a swap to the byte-count
+        // fallback (len/4) would fail at least one of these rows.
+        let cases: &[(&str, usize, usize)] = &[
+            ("Hello, world!", 1, 9),
+            (&english, 50, 200),
+            // Highly repetitive — BPE merges keep this near the word count
+            // (~100), not the byte fallback's ~150.
+            (&repeated, 80, 120),
+        ];
+        for (input, lo, hi) in cases {
+            let n = estimate_tokens(input);
+            assert!(
+                (*lo..=*hi).contains(&n),
+                "estimate_tokens(<input of len {}>) = {n}, expected in {}..={}",
+                input.len(),
+                lo,
+                hi,
+            );
+        }
     }
 
+    /// Production relies on a post-condition: non-empty input must
+    /// tokenize to ≥ 1. The byte-fallback branch would otherwise return 0
+    /// for very short inputs and the cap check would let arbitrarily
+    /// large entries through under the "0 tokens fits any budget" branch.
     #[test]
-    fn unicode_text_estimate() {
-        let text = "你好世界 🌍 こんにちは";
-        let count = estimate_tokens(text);
-        assert!(count > 0);
-    }
-
-    #[test]
-    fn whitespace_only_text() {
-        let text = "   \n\t\n   ";
-        let count = estimate_tokens(text);
-        assert!(count > 0); // Whitespace still has tokens
-    }
-
-    #[test]
-    fn code_text_estimate() {
-        let text = "fn main() {\n    println!(\"Hello, world!\");\n}";
-        let count = estimate_tokens(text);
-        assert!(count > 5);
-        assert!(count < 30);
-    }
-
-    #[test]
-    fn single_character() {
-        let count = estimate_tokens("a");
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn repeated_tokens() {
-        let text = "hello ".repeat(100);
-        let count = estimate_tokens(&text);
-        // Should be roughly 100 tokens (one per "hello ")
-        assert!(count >= 80 && count <= 120);
-    }
-
-    #[test]
-    fn very_long_text() {
-        let text = "word ".repeat(10000);
-        let count = estimate_tokens(&text);
-        assert!(count > 5000);
-        assert!(count < 15000);
-    }
-
-    #[test]
-    fn special_characters() {
-        let text = "!@#$%^&*()_+-=[]{}|;':\",./<>?";
-        let count = estimate_tokens(text);
-        assert!(count > 0);
+    fn nonempty_input_always_tokenizes_to_at_least_one() {
+        for input in ["a", "   ", "你好", "\n", "!@#"] {
+            assert!(
+                estimate_tokens(input) >= 1,
+                "non-empty input {input:?} must produce ≥ 1 token, got 0"
+            );
+        }
     }
 }
