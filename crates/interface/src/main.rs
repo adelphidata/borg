@@ -784,7 +784,10 @@ mod tests {
     #[test]
     fn confirm_uninstall_accepts_only_single_y_case_insensitive() {
         for accept in ["y", "Y"] {
-            assert!(commands::misc::confirm_uninstall(accept), "should accept {accept:?}");
+            assert!(
+                commands::misc::confirm_uninstall(accept),
+                "should accept {accept:?}"
+            );
         }
         for reject in ["", "n", "N", "yes", "maybe", "yy"] {
             assert!(

@@ -80,7 +80,11 @@ fn classify_tool_archetype_table() {
             Some("kubectl apply -f deploy.yaml"),
             Archetype::Ops,
         ),
-        ("run_shell", Some("cargo build --release"), Archetype::Builder),
+        (
+            "run_shell",
+            Some("cargo build --release"),
+            Archetype::Builder,
+        ),
         ("run_shell", Some("npm install express"), Archetype::Builder),
         ("run_shell", Some("ufw status"), Archetype::Guardian),
         (

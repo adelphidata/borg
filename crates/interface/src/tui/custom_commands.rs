@@ -258,9 +258,17 @@ mod tests {
     fn expand_template_substitution_rules() {
         let cases: &[(&str, &str, &str)] = &[
             // Placeholder present.
-            ("Review: $ARGUMENTS please", "src/foo.rs", "Review: src/foo.rs please"),
+            (
+                "Review: $ARGUMENTS please",
+                "src/foo.rs",
+                "Review: src/foo.rs please",
+            ),
             // Placeholder absent, args present → appended verbatim.
-            ("Do the thing.\n", "extra context", "Do the thing.\nextra context"),
+            (
+                "Do the thing.\n",
+                "extra context",
+                "Do the thing.\nextra context",
+            ),
             // No placeholder, no args → template returned verbatim.
             ("Just this.", "", "Just this."),
             // Placeholder + empty args → placeholder collapses to "".

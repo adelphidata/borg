@@ -355,5 +355,4 @@ mod tests {
         assert_eq!(data, b64);
         assert_eq!(mime, "image/jpeg");
     }
-
 }

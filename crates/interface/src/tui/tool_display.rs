@@ -690,7 +690,11 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello"); // exact fit
         let result = truncate("a]very long string here", 10);
         assert!(result.ends_with("..."), "got: {result}");
-        assert!(result.chars().count() <= 10, "got len: {}", result.chars().count());
+        assert!(
+            result.chars().count() <= 10,
+            "got len: {}",
+            result.chars().count()
+        );
     }
 
     // -- truncate_path --

@@ -7,11 +7,7 @@
 //! observable through the public API or that combines multiple block kinds
 //! end-to-end.
 
-#![allow(
-    clippy::approx_constant,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
+#![allow(clippy::approx_constant, clippy::expect_used, clippy::unwrap_used)]
 
 use cortex::memory::chunker::chunk_content;
 

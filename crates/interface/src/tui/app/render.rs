@@ -1112,7 +1112,11 @@ mod tests {
         ];
         for (name, level, arch, expected) in cases {
             let s = mk_ambient(*name, *level, Mood::Stable, *arch);
-            assert_eq!(format_class_label(&s), *expected, "case: name={name:?} arch={arch:?}");
+            assert_eq!(
+                format_class_label(&s),
+                *expected,
+                "case: name={name:?} arch={arch:?}"
+            );
         }
     }
 

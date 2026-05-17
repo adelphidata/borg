@@ -354,7 +354,10 @@ mod tests {
     /// ends so the popup never lands on an out-of-range row.
     #[test]
     fn navigation_keys_wrap_at_both_ends() {
-        for &(down_key, up_key) in &[(KeyCode::Down, KeyCode::Up), (KeyCode::Char('j'), KeyCode::Char('k'))] {
+        for &(down_key, up_key) in &[
+            (KeyCode::Down, KeyCode::Up),
+            (KeyCode::Char('j'), KeyCode::Char('k')),
+        ] {
             let mut popup = make_popup(vec![
                 make_subprocess(1, "a", false),
                 make_subprocess(2, "b", false),

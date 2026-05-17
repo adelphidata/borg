@@ -1382,7 +1382,11 @@ mod tests {
 
         // (input, expected span texts, expected mention indices)
         let cases: &[(&str, &[&str], &[usize])] = &[
-            ("hello @file.rs world", &["hello ", "@file.rs", " world"], &[1]),
+            (
+                "hello @file.rs world",
+                &["hello ", "@file.rs", " world"],
+                &[1],
+            ),
             ("no mentions here", &["no mentions here"], &[]),
             ("user@example.com", &["user@", "example.com"], &[]),
             ("@path rest", &["@path", " rest"], &[0]),
@@ -2054,8 +2058,8 @@ mod tests {
     #[test]
     fn style_system_line_dim_only_branches() {
         let cases = &[
-            "───────────",   // separator
-            "",              // empty
+            "───────────",      // separator
+            "",                 // empty
             "  some body text", // plain indented prose
         ];
         for input in cases {
@@ -2069,9 +2073,9 @@ mod tests {
     #[test]
     fn style_system_line_single_header_span_branches() {
         let cases = &[
-            "Borg Doctor",                  // plain header line
+            "Borg Doctor",                     // plain header line
             "<memory_file name=\"notes.md\">", // XML tag
-            "# My Memory Topic",             // markdown header
+            "# My Memory Topic",               // markdown header
         ];
         for input in cases {
             let line = style_system_line(input);

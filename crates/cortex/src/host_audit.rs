@@ -1012,5 +1012,4 @@ openssh-server/stable 9.6 amd64 [upgradable from: 9.5]\n";
             "expected pfctl at {MACOS_PFCTL}"
         );
     }
-
 }

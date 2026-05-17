@@ -157,8 +157,8 @@ mod tests {
     #[test]
     fn from_args_rejects_malformed_payloads() {
         let cases: &[serde_json::Value] = &[
-            json!({}),                        // missing condition entirely
-            json!({"condition": "magic"}),    // unknown keyword
+            json!({}),                     // missing condition entirely
+            json!({"condition": "magic"}), // unknown keyword
             // conditions that REQUIRE a value but didn't supply one
             json!({"condition": "text"}),
             json!({"condition": "element"}),

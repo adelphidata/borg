@@ -141,11 +141,7 @@ mod tests {
                 json!({"condition": "element", "value": "#el"}),
                 false,
             ),
-            (
-                "wait",
-                json!({"condition": "url", "value": "/page"}),
-                false,
-            ),
+            ("wait", json!({"condition": "url", "value": "/page"}), false),
             // `load` is the one wait condition that takes no value.
             ("wait", json!({"condition": "load"}), false),
             ("wait", json!({"condition": "js"}), true),
@@ -157,11 +153,7 @@ mod tests {
             // resize — both width and height required as integers
             ("resize", json!({}), true),
             ("resize", json!({"width": 800}), true),
-            (
-                "resize",
-                json!({"width": 800, "height": 600}),
-                false,
-            ),
+            ("resize", json!({"width": 800, "height": 600}), false),
             // switch_tab
             ("switch_tab", json!({}), true),
             ("switch_tab", json!({"tab_index": 0}), false),

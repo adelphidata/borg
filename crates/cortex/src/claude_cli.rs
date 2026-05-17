@@ -755,5 +755,4 @@ mod tests {
         assert_eq!(normalize_cli_model("claude-opus-4.6"), "opus");
         assert_eq!(normalize_cli_model("haiku-4.5"), "haiku");
     }
-
 }
