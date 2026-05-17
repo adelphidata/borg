@@ -179,7 +179,7 @@ async fn try_rpc(h: &ServerHandle, tls: ClientTlsConfig) -> Result<(), String> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_rejected_when_no_client_cert_presented() {
     // Real failure mode: if the server config dropped `client_ca_root(...)`,
     // it would degrade to TLS-without-mTLS — any client could connect with no
@@ -198,7 +198,7 @@ async fn rpc_rejected_when_no_client_cert_presented() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_rejected_when_client_cert_signed_by_foreign_ca() {
     // Real failure mode: a regression that swaps `client_ca_root` for
     // `accept_any_client_cert`-style config would let any well-formed cert
@@ -218,7 +218,7 @@ async fn rpc_rejected_when_client_cert_signed_by_foreign_ca() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_succeeds_with_paired_client_cert_and_rpc_is_accepted() {
     // Real failure mode: if `InterceptedService` weren't installed on the
     // tonic services, the call would succeed *without* the verifier running,
@@ -255,7 +255,7 @@ async fn handshake_succeeds_with_paired_client_cert_and_rpc_is_accepted() {
     assert_eq!(resp.outcome, "ok");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoked_cert_passes_tls_but_rpc_is_rejected_unauthenticated() {
     // Real failure mode: if the auth interceptor weren't wired (or weren't
     // calling the verifier), a revoked cert could still execute RPCs as long
