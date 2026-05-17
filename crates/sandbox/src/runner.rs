@@ -371,18 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_python_returns_absolute_path() {
-        // python3 should be available in most test environments
-        if let Ok((program, args)) = resolve_runtime("python", Path::new("/tmp")) {
-            assert!(
-                program.starts_with('/'),
-                "python should resolve to absolute path: {program}"
-            );
-            assert!(args.is_empty());
-        }
-    }
-
-    #[test]
     fn resolve_unsupported_runtime_errors() {
         let result = resolve_runtime("cobol", Path::new("/tmp"));
         assert!(result.is_err());

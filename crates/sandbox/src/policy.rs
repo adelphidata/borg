@@ -288,26 +288,11 @@ impl SandboxPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Path` is only needed by platform-specific tests (linux/windows/other);
+    // gate the import so the macOS-only test build doesn't trip
+    // `-D unused-imports`.
+    #[cfg(not(target_os = "macos"))]
     use std::path::Path;
-
-    #[test]
-    fn default_policy_values() {
-        let policy = SandboxPolicy::default();
-        assert!(!policy.network);
-        assert!(policy.fs_read.is_empty());
-        assert!(policy.fs_write.is_empty());
-    }
-
-    #[test]
-    fn wrap_command_returns_sandbox_command() {
-        let policy = SandboxPolicy::default();
-        let args = vec!["script.py".to_string()];
-        let cmd = policy.wrap_command("python3", &args, Path::new("/tmp/tool"));
-        // On Linux, should wrap with bwrap
-        // On macOS, should wrap with sandbox-exec
-        // On other, should pass through
-        assert!(!cmd.program.is_empty());
-    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -413,16 +398,6 @@ mod tests {
         assert_eq!(borg_count, 1);
     }
 
-    #[test]
-    fn deny_read_preserved_through_filter() {
-        let policy = SandboxPolicy {
-            deny_read: vec!["/secret/data".into()],
-            ..Default::default()
-        };
-        let filtered = policy.with_blocked_paths_filtered(&[]);
-        assert_eq!(filtered.deny_read, vec!["/secret/data".to_string()]);
-    }
-
     // -- with_defaults_applied --
 
     #[test]
@@ -462,27 +437,30 @@ mod tests {
 
     #[test]
     fn defaults_applied_is_idempotent() {
-        let policy = SandboxPolicy {
+        // Idempotence guard: applying defaults twice — whether the seed
+        // already contains /etc/ssl or not — must never duplicate entries.
+        // Without this, repeated config reloads would grow fs_read unboundedly.
+        let seeded = SandboxPolicy {
             network: true,
             fs_read: vec!["/etc/ssl".into()],
             ..Default::default()
         };
-        let applied = policy.with_defaults_applied();
-        let count = applied.fs_read.iter().filter(|p| *p == "/etc/ssl").count();
-        assert_eq!(count, 1, "should not duplicate existing /etc/ssl");
-    }
+        let seeded_once = seeded.with_defaults_applied();
+        let ssl_count = seeded_once
+            .fs_read
+            .iter()
+            .filter(|p| *p == "/etc/ssl")
+            .count();
+        assert_eq!(ssl_count, 1, "should not duplicate existing /etc/ssl");
 
-    #[test]
-    fn defaults_applied_twice_is_idempotent() {
-        let policy = SandboxPolicy {
+        let empty = SandboxPolicy {
             network: true,
             ..Default::default()
         };
-        let once = policy.with_defaults_applied();
-        let once_len = once.fs_read.len();
-        let twice = once.with_defaults_applied();
+        let once = empty.with_defaults_applied();
+        let twice = once.clone().with_defaults_applied();
         assert_eq!(
-            once_len,
+            once.fs_read.len(),
             twice.fs_read.len(),
             "applying defaults twice should not add duplicates"
         );

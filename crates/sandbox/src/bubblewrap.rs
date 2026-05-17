@@ -243,82 +243,73 @@ mod tests {
     }
 
     #[test]
-    fn version_supports_die_with_parent() {
-        let old = BwrapVersion {
-            major: 0,
-            minor: 1,
-            patch: 7,
-        };
-        assert!(!old.supports_die_with_parent());
-
-        let exact = BwrapVersion {
-            major: 0,
-            minor: 1,
-            patch: 8,
-        };
-        assert!(exact.supports_die_with_parent());
-
-        let new = BwrapVersion {
-            major: 0,
-            minor: 4,
-            patch: 0,
-        };
-        assert!(new.supports_die_with_parent());
+    fn version_feature_cutoffs_table() {
+        // Spec: feature predicates fire at the exact cutoff version.
+        // --die-with-parent landed in 0.1.8; --unshare-user landed in 0.2.0.
+        // A regression that shifts a cutoff (e.g. wrong inequality) flips
+        // exactly one row here. Table-driven so a new gate is one row, not
+        // a new test function.
+        let cases: &[(u32, u32, u32, bool, bool)] = &[
+            // major, minor, patch, supports_die_with_parent, supports_unshare_user
+            (0, 1, 5, false, false),
+            (0, 1, 7, false, false),
+            (0, 1, 8, true, false), // die-with-parent cutoff
+            (0, 1, 9, true, false),
+            (0, 2, 0, true, true), // unshare-user cutoff
+            (0, 4, 0, true, true),
+        ];
+        for (major, minor, patch, want_die, want_unshare) in cases.iter().copied() {
+            let v = BwrapVersion {
+                major,
+                minor,
+                patch,
+            };
+            assert_eq!(
+                v.supports_die_with_parent(),
+                want_die,
+                "die_with_parent: {major}.{minor}.{patch}"
+            );
+            assert_eq!(
+                v.supports_unshare_user(),
+                want_unshare,
+                "unshare_user: {major}.{minor}.{patch}"
+            );
+        }
     }
 
     #[test]
-    fn version_supports_unshare_user() {
-        let old = BwrapVersion {
-            major: 0,
-            minor: 1,
-            patch: 9,
-        };
-        assert!(!old.supports_unshare_user());
-
-        let new = BwrapVersion {
-            major: 0,
-            minor: 2,
-            patch: 0,
-        };
-        assert!(new.supports_unshare_user());
-    }
-
-    #[test]
-    fn old_bwrap_skips_die_with_parent() {
+    fn build_args_gates_die_with_parent_by_version() {
+        // Spec: --die-with-parent only emitted when the detected bwrap
+        // supports it. Unknown version (None) is treated as modern.
+        // Other flags (--unshare-pid) must be present regardless so we
+        // don't accidentally drop the rest of the namespace isolation
+        // when the version gate trips.
         let old_version = BwrapVersion {
             major: 0,
             minor: 1,
             patch: 5,
         };
-        let args = build_bwrap_args_versioned(
-            &default_policy(),
-            Path::new("/tmp/tool"),
-            Some(&old_version),
-        );
-        assert!(!args.contains(&"--die-with-parent".to_string()));
-        // Should still have --unshare-pid
-        assert!(args.contains(&"--unshare-pid".to_string()));
-    }
-
-    #[test]
-    fn new_bwrap_includes_die_with_parent() {
         let new_version = BwrapVersion {
             major: 0,
             minor: 4,
             patch: 1,
         };
-        let args = build_bwrap_args_versioned(
-            &default_policy(),
-            Path::new("/tmp/tool"),
-            Some(&new_version),
-        );
-        assert!(args.contains(&"--die-with-parent".to_string()));
-    }
-
-    #[test]
-    fn unknown_version_defaults_to_all_features() {
-        let args = build_bwrap_args_versioned(&default_policy(), Path::new("/tmp/tool"), None);
-        // When version is unknown, assume modern bwrap
-        assert!(args.contains(&"--die-with-parent".to_string()));
+        let cases: &[(Option<&BwrapVersion>, bool)] = &[
+            (Some(&old_version), false),
+            (Some(&new_version), true),
+            (None, true), // unknown → assume modern
+        ];
+        for (ver, want_die_flag) in cases.iter().copied() {
+            let args = build_bwrap_args_versioned(&default_policy(), Path::new("/tmp/tool"), ver);
+            assert_eq!(
+                args.contains(&"--die-with-parent".to_string()),
+                want_die_flag,
+                "die-with-parent presence for {ver:?}"
+            );
+            assert!(
+                args.contains(&"--unshare-pid".to_string()),
+                "--unshare-pid must always be present (ver={ver:?})"
+            );
+        }
     }
 }

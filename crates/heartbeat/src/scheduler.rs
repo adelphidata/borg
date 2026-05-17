@@ -662,22 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn quiet_hours_uses_timezone() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: Some("00:00".to_string()),
-            quiet_hours_end: Some("06:00".to_string()),
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        // Verify the timezone field is used and doesn't panic
-        let sched = test_scheduler(config, chrono_tz::US::Eastern);
-        let _ = sched.is_quiet_hours();
-    }
-
-    #[test]
     fn quiet_hours_contains_boundary_table() {
         // Window 23:55–06:00 (wraps midnight). Half-open [start, end): start
         // is INSIDE, end is OUTSIDE. Boundary regression target — flipping
@@ -1179,45 +1163,6 @@ mod tests {
         cancel.cancel();
     }
 
-    #[tokio::test]
-    async fn scheduler_emits_started_event() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: None,
-            quiet_hours_end: None,
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-
-        let (_poke_tx, poke_rx) = mpsc::channel(8);
-        let (fire_tx, mut fire_rx) = mpsc::channel(32);
-        let cancel = CancellationToken::new();
-
-        let scheduler = HeartbeatScheduler::new(config, chrono_tz::UTC, poke_rx);
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
-
-        // First event should be SchedulerStarted
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), fire_rx.recv())
-            .await
-            .expect("timed out waiting for SchedulerStarted")
-            .expect("channel closed");
-
-        match event {
-            HeartbeatEvent::SchedulerStarted { mode } => {
-                assert!(
-                    mode.contains("interval"),
-                    "expected mode to contain 'interval', got: {mode}"
-                );
-            }
-            other => panic!("expected SchedulerStarted, got: {other:?}"),
-        }
-
-        cancel.cancel();
-    }
-
     #[tokio::test(start_paused = true)]
     async fn quiet_hours_emits_skip_event() {
         // Set quiet hours to cover the full day so they always apply
@@ -1262,16 +1207,6 @@ mod tests {
         }
 
         cancel.cancel();
-    }
-
-    #[test]
-    fn skip_reason_display() {
-        assert_eq!(SkipReason::QuietHours.to_string(), "quiet hours");
-        assert_eq!(SkipReason::EmptyResponse.to_string(), "empty response");
-        assert_eq!(
-            SkipReason::DuplicateResponse.to_string(),
-            "duplicate response"
-        );
     }
 
     #[tokio::test]

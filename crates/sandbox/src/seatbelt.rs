@@ -331,9 +331,21 @@ mod tests {
 
     #[test]
     fn profile_allows_tool_dir_write() {
+        // /tmp may canonicalize to /private/tmp on macOS, so assert on
+        // *either* path-component containing "my-tool". A `subpath "/"`
+        // rule (matching the old weaker assertion) would be a sandbox
+        // bypass, so we also assert the rule is NOT the bare root.
         let profile = generate_profile(&default_policy(), Path::new("/tmp/my-tool"), None).unwrap();
-        // Tool dir (possibly canonicalized) should be writable
-        assert!(profile.contains("(allow file-write* (subpath \"/"));
+        let has_tool_dir_rule = profile.contains("(allow file-write* (subpath \"/tmp/my-tool\"))")
+            || profile.contains("(allow file-write* (subpath \"/private/tmp/my-tool\"))");
+        assert!(
+            has_tool_dir_rule,
+            "expected an explicit tool-dir write rule; profile was: {profile}"
+        );
+        assert!(
+            !profile.contains("(allow file-write* (subpath \"/\"))"),
+            "tool-dir rule must not degenerate to root"
+        );
     }
 
     #[test]
@@ -444,8 +456,23 @@ mod tests {
 
     #[test]
     fn profile_denies_sensitive_home_dirs() {
+        // Defense-in-depth: even with file-read* broadly allowed, each
+        // SENSITIVE_HOME_PATHS entry under $HOME must get an explicit
+        // deny rule. The old assertion `(subpath "/"` matched any deny
+        // rule and would pass even if all sensitive paths were dropped.
+        let Ok(home) = std::env::var("HOME") else {
+            // Production callers always have HOME set; skipping rather
+            // than asserting on a path the function won't emit.
+            eprintln!("skipping: HOME unset in test env");
+            return;
+        };
         let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
-        // Should have deny rules for sensitive directories
-        assert!(profile.contains("(deny file-read* (subpath \"/"));
+        for sensitive in [".ssh", ".aws", ".gnupg"] {
+            let expected = format!("(deny file-read* (subpath \"{home}/{sensitive}\"))");
+            assert!(
+                profile.contains(&expected),
+                "missing deny rule for {sensitive}; profile:\n{profile}"
+            );
+        }
     }
 }
