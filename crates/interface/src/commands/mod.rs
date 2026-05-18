@@ -22,6 +22,9 @@ pub(crate) mod update_args;
 pub(crate) mod wasm_plugin;
 pub(crate) mod webhook;
 
+/// Canonical short timestamp format used across CLI/TUI surfaces.
+pub(crate) const TS_FMT: &str = "%Y-%m-%d %H:%M";
+
 pub(crate) fn format_ts(ts: i64, fmt: &str) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.format(fmt).to_string())

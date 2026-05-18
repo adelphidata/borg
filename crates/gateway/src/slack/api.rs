@@ -841,7 +841,7 @@ impl SlackClient {
         self.check_slack_response("views.publish", resp).await
     }
 
-    /// Helper: POST a JSON body to a Slack API method.
+    /// POST a JSON body to a Slack API method.
     async fn slack_post(
         &self,
         method: &str,
@@ -865,7 +865,7 @@ impl SlackClient {
         .await
     }
 
-    /// Helper: Check a Slack API response for ok/error.
+    /// Check a Slack API response for ok/error.
     async fn check_slack_response(&self, method: &str, resp: reqwest::Response) -> Result<()> {
         let status = resp.status();
         let resp_body: serde_json::Value = resp

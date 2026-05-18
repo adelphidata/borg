@@ -130,7 +130,7 @@ impl SessionsPopup {
 
         for (i, session) in self.sessions.iter().enumerate() {
             let date = chrono::DateTime::from_timestamp(session.updated_unix_ts as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .map(|dt| dt.format(crate::commands::TS_FMT).to_string())
                 .unwrap_or_default();
             let title: String = session.title.chars().take(40).collect();
             let label = format!("  {title:<40} {} messages  {date}", session.message_count);

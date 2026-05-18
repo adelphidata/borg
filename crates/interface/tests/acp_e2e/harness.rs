@@ -60,18 +60,22 @@ fn shared_data_dir() -> &'static Path {
         // without racing migrations. Onboarding flag set so the ACP
         // transport's `require_onboarding` gate passes.
         // OnceLock::get_or_init is sync; the DB API is async post-turso.
-        // `block_in_place` releases the worker thread so the inner block_on
-        // can drive the migrations to completion without deadlocking the
-        // multi-thread runtime this fixture runs on.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let db = cortex::db::Database::open()
-                    .await
-                    .expect("open shared test DB");
-                db.set_setting("onboarded", "true")
-                    .await
-                    .expect("seed onboarded=true");
-            })
+        // Drive the init on a fresh runtime in a worker thread so we don't
+        // care whether the calling test is on `flavor = "current_thread"`
+        // or `flavor = "multi_thread"` (block_in_place would panic on the
+        // former).
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Runtime::new().expect("init runtime");
+                rt.block_on(async {
+                    let db = cortex::db::Database::open()
+                        .await
+                        .expect("open shared test DB");
+                    db.set_setting("onboarded", "true")
+                        .await
+                        .expect("seed onboarded=true");
+                });
+            });
         });
         td
     });

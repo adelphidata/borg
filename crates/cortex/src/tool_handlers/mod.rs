@@ -40,12 +40,6 @@ where
     }
 }
 
-// ── Tool-call argument extraction ──
-//
-// The canonical API for reading tool-call arguments. All handlers use these
-// free functions; a prior `ToolArgs` wrapper struct had no callers and was
-// removed.
-
 /// Return the value of a required string parameter, or an error naming it.
 pub fn require_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Result<&'a str> {
     args[name]

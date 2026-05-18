@@ -2121,8 +2121,6 @@ Old copy from a previous install.
         assert!(line.contains("[—]"));
     }
 
-    // --- OS gating tests ---
-
     #[test]
     fn test_os_gating_empty_means_all() {
         assert!(check_os_requirements(&[]));
@@ -2163,8 +2161,6 @@ Body here.
         let (manifest, _body) = parse_skill_md(content).unwrap();
         assert_eq!(manifest.os, vec!["macos", "darwin"]);
     }
-
-    // --- any_bins tests ---
 
     #[test]
     fn test_any_bins_one_present() {
@@ -2230,8 +2226,6 @@ Body here.
         let (manifest, _body) = parse_skill_md(content).unwrap();
         assert_eq!(manifest.requires.any_bins, vec!["rg", "grep", "ag"]);
     }
-
-    // --- Install spec tests ---
 
     #[test]
     fn test_parse_skill_with_install_specs() {

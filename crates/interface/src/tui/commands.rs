@@ -568,7 +568,7 @@ impl App<'_> {
                     for item in &items {
                         let modified = item
                             .modified_at
-                            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                            .map(|t| t.format(crate::commands::TS_FMT).to_string())
                             .unwrap_or_else(|| "unknown".to_string());
                         text.push_str(&format!(
                             "  [{}:{}] {} ({} bytes, updated: {modified})\n",

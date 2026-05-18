@@ -30,7 +30,7 @@ pub async fn run_list() -> Result<()> {
             "(never)".to_string()
         } else {
             chrono::DateTime::from_timestamp(d.last_seen_at, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .map(|dt| dt.format(super::TS_FMT).to_string())
                 .unwrap_or_else(|| d.last_seen_at.to_string())
         };
         let fp_short = if d.fingerprint.len() > 16 {

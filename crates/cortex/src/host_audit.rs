@@ -55,9 +55,7 @@ const MACOS_PFCTL: &str = "/sbin/pfctl";
 #[cfg(any(target_os = "macos", test))]
 const ALF_DISABLED_HINT: &str = "Next step: enable in System Settings → Network → Firewall, or run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on";
 
-// ---------------------------------------------------------------------------
 // Firewall
-// ---------------------------------------------------------------------------
 
 pub fn check_firewall(checks: &mut Vec<DiagnosticCheck>) {
     check_firewall_with_root(checks, is_effective_root());
@@ -160,9 +158,7 @@ pub fn check_firewall_with_root(checks: &mut Vec<DiagnosticCheck>, is_root: bool
     }
 }
 
-// ---------------------------------------------------------------------------
 // Listening ports
-// ---------------------------------------------------------------------------
 
 /// Ports considered risky when exposed on all interfaces.
 const RISKY_PORTS: &[(u16, &str)] = &[(21, "FTP"), (23, "Telnet"), (3389, "RDP"), (5900, "VNC")];
@@ -202,9 +198,7 @@ pub fn check_listening_ports(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // SSH config
-// ---------------------------------------------------------------------------
 
 pub fn check_ssh_config(checks: &mut Vec<DiagnosticCheck>) {
     let sshd_config = std::path::Path::new("/etc/ssh/sshd_config");
@@ -242,9 +236,7 @@ pub fn check_ssh_config(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Sensitive directory permissions
-// ---------------------------------------------------------------------------
 
 pub fn check_sensitive_permissions(checks: &mut Vec<DiagnosticCheck>) {
     #[cfg(unix)]
@@ -306,9 +298,7 @@ pub fn check_sensitive_permissions(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Disk encryption
-// ---------------------------------------------------------------------------
 
 pub fn check_disk_encryption(checks: &mut Vec<DiagnosticCheck>) {
     #[cfg(target_os = "macos")]
@@ -359,9 +349,7 @@ pub fn check_disk_encryption(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // OS updates
-// ---------------------------------------------------------------------------
 
 pub fn check_os_updates(checks: &mut Vec<DiagnosticCheck>) {
     #[cfg(target_os = "macos")]
@@ -428,9 +416,7 @@ pub fn check_os_updates(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Running services
-// ---------------------------------------------------------------------------
 
 pub fn check_running_services(checks: &mut Vec<DiagnosticCheck>) {
     #[cfg(target_os = "macos")]
@@ -488,9 +474,7 @@ pub fn check_running_services(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-// ===========================================================================
 // Helpers
-// ===========================================================================
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
@@ -540,9 +524,7 @@ fn run_cmd_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<St
     }
 }
 
-// ===========================================================================
 // Pure parsing functions (testable)
-// ===========================================================================
 
 #[cfg(any(target_os = "macos", test))]
 fn parse_macos_firewall(output: &str) -> CheckStatus {
@@ -681,9 +663,7 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s).trim()
 }
 
-// ===========================================================================
 // Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {

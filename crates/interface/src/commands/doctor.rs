@@ -59,7 +59,7 @@ async fn run_list() -> Result<()> {
     println!("{:24} {:32} {:16}  REASON", "CATEGORY", "NAME", "EXPIRES");
     for r in rows {
         let expires = chrono::DateTime::from_timestamp(r.expires_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
         println!(
             "{:24} {:32} {:16}  {}",
@@ -86,7 +86,7 @@ async fn run_squelch(
         .await
         .with_context(|| format!("squelching {category} / {name}"))?;
     let when = chrono::DateTime::from_timestamp(expires_at, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .map(|dt| dt.format(super::TS_FMT).to_string())
         .unwrap_or_else(|| "?".to_string());
     println!("Squelched {category} / {name} until {when}");
     Ok(())

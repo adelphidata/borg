@@ -28,6 +28,8 @@ use cortex::util::unix_ext::set_unix_mode;
 use crate::daemon_client;
 
 const LAUNCHD_LABEL: &str = "com.borg.daemon";
+#[cfg(test)]
+const BORGD_INSTALL_PATH: &str = "/usr/local/bin/borgd";
 
 const LAUNCHD_PLIST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -879,7 +881,7 @@ mod tests {
     fn launchd_template_targets_borgd_binary() {
         let content = LAUNCHD_PLIST_TEMPLATE
             .replace("{{LABEL}}", LAUNCHD_LABEL)
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{LOG_DIR}}", "/tmp/logs")
             .replace("{{HOME}}", "/Users/test");
 
@@ -896,7 +898,7 @@ mod tests {
     #[test]
     fn systemd_template_targets_borgd_binary() {
         let content = SYSTEMD_UNIT_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/home/test");
 
         assert!(content.contains("ExecStart=/usr/local/bin/borgd"));
@@ -915,7 +917,7 @@ mod tests {
     #[test]
     fn systemd_system_template_targets_multi_user_and_root() {
         let content = SYSTEMD_SYSTEM_UNIT_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/root");
         assert!(content.contains("ExecStart=/usr/local/bin/borgd"));
         assert!(content.contains("User=root"));
@@ -930,7 +932,7 @@ mod tests {
     #[test]
     fn systemd_system_secure_template_keeps_dbus_guards_and_targets_root() {
         let content = SYSTEMD_SYSTEM_UNIT_SECURE_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/root");
         assert!(content.contains("User=root"));
         assert!(content.contains("WantedBy=multi-user.target"));
@@ -951,7 +953,7 @@ mod tests {
     #[test]
     fn secure_systemd_template_guards_empty_keyring_pass() {
         let content = SYSTEMD_UNIT_SECURE_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/home/test");
         assert!(
             content.contains("test -n \"$BORG_KEYRING_PASS\""),
@@ -967,7 +969,7 @@ mod tests {
     #[test]
     fn systemd_template_loads_kek_env_file() {
         let content = SYSTEMD_UNIT_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/home/test");
         assert!(
             content.contains("EnvironmentFile=-/home/test/.borg/secrets/kek.env"),
@@ -992,7 +994,7 @@ mod tests {
     #[test]
     fn secure_systemd_template_unlocks_keyring_via_env_file() {
         let content = SYSTEMD_UNIT_SECURE_TEMPLATE
-            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{BINARY_PATH}}", BORGD_INSTALL_PATH)
             .replace("{{HOME}}", "/home/test");
         // No leading `-` on EnvironmentFile: secure mode requires the
         // passphrase file (otherwise `gnome-keyring-daemon --unlock`

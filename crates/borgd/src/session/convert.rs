@@ -91,11 +91,7 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
                     // explicit id field later is non-breaking.
                     id: String::new(),
                     text: s.title,
-                    status: match s.status {
-                        cortex::types::PlanStepStatus::Pending => "pending".into(),
-                        cortex::types::PlanStepStatus::InProgress => "in_progress".into(),
-                        cortex::types::PlanStepStatus::Completed => "completed".into(),
-                    },
+                    status: s.status.as_wire_str().into(),
                 })
                 .collect(),
         }),
@@ -192,11 +188,7 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
                 .into_iter()
                 .map(|s| cortex::types::PlanStep {
                     title: s.text,
-                    status: match s.status.as_str() {
-                        "in_progress" => cortex::types::PlanStepStatus::InProgress,
-                        "completed" => cortex::types::PlanStepStatus::Completed,
-                        _ => cortex::types::PlanStepStatus::Pending,
-                    },
+                    status: cortex::types::PlanStepStatus::from_wire_str(&s.status),
                 })
                 .collect(),
         },

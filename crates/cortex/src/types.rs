@@ -453,6 +453,26 @@ pub enum PlanStepStatus {
     Completed,
 }
 
+impl PlanStepStatus {
+    /// Canonical wire string ("pending" | "in_progress" | "completed").
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            PlanStepStatus::Pending => "pending",
+            PlanStepStatus::InProgress => "in_progress",
+            PlanStepStatus::Completed => "completed",
+        }
+    }
+
+    /// Parse a wire string back into a status. Unknown values fall back to `Pending`.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "in_progress" => PlanStepStatus::InProgress,
+            "completed" => PlanStepStatus::Completed,
+            _ => PlanStepStatus::Pending,
+        }
+    }
+}
+
 /// Output from a tool execution: either plain text or multimodal (text + images).
 #[derive(Debug, Clone)]
 pub enum ToolOutput {

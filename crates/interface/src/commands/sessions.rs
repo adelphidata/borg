@@ -49,7 +49,7 @@ async fn run_list(limit: usize) -> Result<()> {
     println!("{:10} {:>6}  {:16}  TITLE", "ID", "MSGS", "UPDATED");
     for s in list.sessions.iter().take(limit) {
         let updated = chrono::DateTime::from_timestamp(s.updated_unix_ts as i64, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
         let short: String = s.id.chars().take(8).collect();
         println!(

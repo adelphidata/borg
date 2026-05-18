@@ -98,7 +98,7 @@ async fn print_scope_listing(scope: &str) -> Result<()> {
     println!("{:32} {:>8}  UPDATED", "NAME", "BYTES");
     for e in &entries {
         let updated = chrono::DateTime::from_timestamp(e.updated_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
         println!("{:32} {:>8}  {}", e.name, e.content.len(), updated);
     }

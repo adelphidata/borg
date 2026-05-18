@@ -209,9 +209,7 @@ pub async fn web_search(query: &str, config: &WebConfig) -> Result<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Provider implementations
-// ---------------------------------------------------------------------------
 
 /// Search via DuckDuckGo HTML endpoint (no API key needed).
 async fn duckduckgo_search(query: &str) -> Result<String> {
@@ -436,9 +434,7 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
     Ok(format_results(query, &results))
 }
 
-// ---------------------------------------------------------------------------
 // HTML helpers
-// ---------------------------------------------------------------------------
 
 /// Extract readable text from HTML, trying to focus on main content.
 fn html_to_text(html: &str) -> String {

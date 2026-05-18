@@ -1294,13 +1294,11 @@ fn create_task_persists_and_reads_back_pre_run_fields() {
     assert_eq!(task.pre_run_timeout_ms, 15_000);
 }
 
-// ── V52 heartbeat consolidation regression guards ──
-
-/// V52 seeds exactly one heartbeat row keyed by the fixed UUID. Re-opening
+/// Seeds exactly one heartbeat row keyed by the fixed UUID. Re-opening
 /// the DB must not duplicate it (idempotent INSERT OR IGNORE). Fails if the
 /// seed re-runs and creates a second row, or never runs at all.
 #[test]
-fn v52_seeds_exactly_one_heartbeat_row() {
+fn seeds_exactly_one_heartbeat_row() {
     let db = test_db();
     let rows = db.list_tasks().expect("list");
     let hb: Vec<_> = rows.iter().filter(|t| t.task_type == "heartbeat").collect();

@@ -8,9 +8,6 @@
 //! The fallback file exists only to keep onboarding unblocked for users who
 //! cannot or will not grant keychain access — keychain remains the preferred
 //! backend and is always attempted first.
-//!
-//! Precedent: `cortex::scripts::get_or_create_hmac_key` uses the same
-//! keychain-first/file-fallback pattern for the script HMAC signing key.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::keychain;
 
 const CREDENTIALS_FILENAME: &str = ".credentials.json";
+const CREDENTIALS_FILE_MODE: u32 = 0o600;
 
 /// On-disk credentials file: `{ service: { account: value } }`.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -68,7 +66,7 @@ fn save_file(file: &CredentialsFile) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(CREDENTIALS_FILE_MODE))
             .with_context(|| format!("Failed to chmod {}", tmp.display()))?;
     }
     std::fs::rename(&tmp, &path)
@@ -76,8 +74,8 @@ fn save_file(file: &CredentialsFile) -> Result<()> {
     Ok(())
 }
 
-/// Store a credential. Tries the OS keychain first; on failure writes to the
-/// fallback file at `~/.borg/.credentials.json` (mode 0600).
+/// Store a credential, falling back to the on-disk file at mode 0600 if the
+/// keychain is unavailable.
 pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
     if let Err(e) = keychain::store(service, account, value) {
         tracing::warn!(
@@ -263,7 +261,7 @@ mod tests {
         let path = credentials_path().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
+            mode, CREDENTIALS_FILE_MODE,
             "credentials file must be mode 0600, got {mode:o}"
         );
     }
@@ -405,7 +403,7 @@ mod tests {
         {
             let path = credentials_path().unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            assert_eq!(mode, CREDENTIALS_FILE_MODE);
         }
     }
 

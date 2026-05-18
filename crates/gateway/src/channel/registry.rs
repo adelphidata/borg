@@ -5,8 +5,6 @@ use tracing::{debug, warn};
 
 use crate::manifest::ChannelManifest;
 
-// --- Generic ManifestRegistry ---
-
 /// Trait for manifest types that can be used with `ManifestRegistry`.
 pub trait ManifestItem: Sized {
     /// Load and parse a manifest from the given file path.
@@ -90,8 +88,6 @@ impl<M: ManifestItem + Clone> ManifestRegistry<M> {
         self.items.values()
     }
 }
-
-// --- ManifestItem impl for ChannelManifest ---
 
 impl ManifestItem for ChannelManifest {
     fn load(path: &Path) -> Result<Self> {

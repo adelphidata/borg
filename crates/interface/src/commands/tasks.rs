@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use protocols::admin::ScheduledTaskCreate;
 
-use super::{format_ts, short_id, truncate_str};
+use super::{format_ts, short_id, truncate_str, TS_FMT};
 use crate::daemon_client::connect_or_spawn;
 
 #[derive(Subcommand)]
@@ -310,7 +310,7 @@ pub(crate) fn run_tasks_runs(id: &str, count: usize) -> Result<()> {
     println!("{:<20} {:<8} {:<10} Details", "Time", "Status", "Duration");
     println!("{}", "-".repeat(70));
     for run in &runs {
-        let when = format_ts(run.started_at_unix, "%Y-%m-%d %H:%M");
+        let when = format_ts(run.started_at_unix, TS_FMT);
         let status = cortex::tasks::format_run_status(&run.status);
         let duration = format!("{}ms", run.duration_ms);
         let details_src = if !run.error.is_empty() {
@@ -458,7 +458,7 @@ pub(crate) fn run_cron_list() -> Result<()> {
     println!("{}", "-".repeat(90));
     for job in &cron_jobs {
         let next = if job.next_run_unix > 0 {
-            format_ts(job.next_run_unix, "%Y-%m-%d %H:%M")
+            format_ts(job.next_run_unix, TS_FMT)
         } else {
             "—".to_string()
         };
@@ -546,7 +546,7 @@ pub(crate) fn run_cron_add(
     })?;
 
     let next_str = if task.next_run_unix > 0 {
-        format_ts(task.next_run_unix, "%Y-%m-%d %H:%M")
+        format_ts(task.next_run_unix, TS_FMT)
     } else {
         "?".to_string()
     };

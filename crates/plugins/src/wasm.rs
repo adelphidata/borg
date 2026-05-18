@@ -36,6 +36,13 @@ const MAX_HOST_IMPORT_BYTES: usize = 64 * 1024;
 /// invocation, generous enough for debug output, tight enough to bound waste.
 const MAX_LOG_LINES_PER_CALL: u32 = 256;
 
+const CAP_LOG: &str = "log";
+const CAP_HTTP: &str = "http";
+const CAP_STATE: &str = "state";
+const CAP_CREDENTIALS: &str = "credentials";
+
+const SECRETS_DIR_MODE: u32 = 0o700;
+
 /// Manifest for a signed WASM plugin package.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -365,24 +372,24 @@ pub fn validate_manifest(manifest: &WasmPluginManifest) -> Result<()> {
     }
     for cap in &manifest.capabilities {
         match cap.as_str() {
-            "log" | "state" | "http" | "credentials" => {}
+            CAP_LOG | CAP_STATE | CAP_HTTP | CAP_CREDENTIALS => {}
             other => bail!("unknown WASM plugin capability {other}"),
         }
     }
-    if manifest.capabilities.iter().any(|c| c == "http") && manifest.endpoints.is_empty() {
+    let has = |c: &str| manifest.capabilities.iter().any(|x| x == c);
+    if has(CAP_HTTP) && manifest.endpoints.is_empty() {
         bail!("http capability requires at least one endpoint allowlist entry");
     }
-    if !manifest.capabilities.iter().any(|c| c == "http") && !manifest.endpoints.is_empty() {
+    if !has(CAP_HTTP) && !manifest.endpoints.is_empty() {
         bail!("endpoint allowlist entries require http capability");
     }
     for endpoint in &manifest.endpoints {
         validate_endpoint(endpoint)?;
     }
-    if manifest.capabilities.iter().any(|c| c == "credentials") && manifest.credentials.is_empty() {
+    if has(CAP_CREDENTIALS) && manifest.credentials.is_empty() {
         bail!("credentials capability requires at least one credential key");
     }
-    if !manifest.capabilities.iter().any(|c| c == "credentials") && !manifest.credentials.is_empty()
-    {
+    if !has(CAP_CREDENTIALS) && !manifest.credentials.is_empty() {
         bail!("credential keys require credentials capability");
     }
     for key in &manifest.credentials {
@@ -691,7 +698,7 @@ pub fn validate_host_http_request(
     req: &HostHttpRequest<'_>,
     secret_values: &[String],
 ) -> Result<()> {
-    if !manifest.capabilities.iter().any(|c| c == "http") {
+    if !manifest.capabilities.iter().any(|c| c == CAP_HTTP) {
         bail!("plugin does not have http capability");
     }
     let url = url::Url::parse(req.url).context("invalid plugin HTTP URL")?;
@@ -1021,10 +1028,10 @@ fn validate_import(
     }
     let has_cap = |cap: &str| manifest.capabilities.iter().any(|c| c == cap);
     let allowed = match (module, name) {
-        ("borg:log", "log") => has_cap("log"),
-        ("borg:http", "fetch") => has_cap("http"),
-        ("borg:state", "read" | "write") => has_cap("state"),
-        ("borg:credentials", "get") => has_cap("credentials"),
+        ("borg:log", "log") => has_cap(CAP_LOG),
+        ("borg:http", "fetch") => has_cap(CAP_HTTP),
+        ("borg:state", "read" | "write") => has_cap(CAP_STATE),
+        ("borg:credentials", "get") => has_cap(CAP_CREDENTIALS),
         _ => false,
     };
     if !allowed {
@@ -1135,7 +1142,7 @@ fn restrict_install_dir_permissions(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
             .with_context(|| format!("failed to chmod {} to 0700", dir.display()))?;
     }
     let _ = dir;
@@ -1348,7 +1355,7 @@ fn write_guest_response(caller: &mut wasmtime::Caller<'_, HostState>, bytes: &[u
 /// borg:log.log host import: logs a UTF-8 message at info level, gated by the
 /// per-call throttle and the `log` capability.
 fn host_log(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
-    if !has_cap(&caller, "log") {
+    if !has_cap(&caller, CAP_LOG) {
         return -1;
     }
     {
@@ -1378,7 +1385,7 @@ fn host_log(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> 
 /// through `HostServices`, and write the response back as packed (ptr, len)
 /// of a JSON string the guest can parse.
 fn host_http_fetch(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> i64 {
-    if !has_cap(&caller, "http") {
+    if !has_cap(&caller, CAP_HTTP) {
         return -1;
     }
     let req_json = match read_guest_string(&mut caller, ptr, len) {
@@ -1475,7 +1482,7 @@ fn host_http_fetch(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i
 /// borg:state.read host import: returns `packed(ptr, len)` of the stored
 /// value, or `0` (packed all-zero, ptr=0 len=0) when the key is absent.
 fn host_state_read(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> i64 {
-    if !has_cap(&caller, "state") {
+    if !has_cap(&caller, CAP_STATE) {
         return -1;
     }
     let key = match read_guest_string(&mut caller, ptr, len) {
@@ -1499,7 +1506,7 @@ fn host_state_read(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i
 
 /// borg:state.write host import: takes a JSON payload `{key, value_b64}`.
 fn host_state_write(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
-    if !has_cap(&caller, "state") {
+    if !has_cap(&caller, CAP_STATE) {
         return -1;
     }
     let req_json = match read_guest_string(&mut caller, ptr, len) {
@@ -1537,7 +1544,7 @@ fn host_state_write(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: 
 /// borg:credentials.get host import: returns `packed(ptr, len)` of the
 /// credential value, or `0` (packed all-zero) when absent.
 fn host_credentials_get(mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32) -> i64 {
-    if !has_cap(&caller, "credentials") {
+    if !has_cap(&caller, CAP_CREDENTIALS) {
         return -1;
     }
     let key = match read_guest_string(&mut caller, ptr, len) {
@@ -3297,7 +3304,7 @@ mod tests {
             .mode();
         assert_eq!(
             mode & 0o777,
-            0o700,
+            SECRETS_DIR_MODE,
             "install dir {} has mode {:o}, expected 0o700",
             dir.display(),
             mode & 0o777

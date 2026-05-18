@@ -69,7 +69,6 @@ const SMS_VERIFY: &str = include_str!("../templates/messaging/sms/verify.py");
 
 /// Complete catalog of available channel plugins, embedded at compile time.
 pub static CATALOG: &[PluginDef] = &[
-    // ── Channels ──
     // Native integrations (handled in Rust, credential-only)
     PluginDef {
         id: "messaging/telegram",
