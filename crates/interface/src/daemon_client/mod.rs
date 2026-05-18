@@ -36,7 +36,7 @@ use protocols::admin::{
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
     ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SetCredentialStrategyRequest,
     SetSubprocessPinnedRequest, SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot,
-    TriggerHeartbeatRequest, WarningList, WebhookRef,
+    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -549,6 +549,39 @@ impl DaemonClient {
             .await
             .context("Admin.TriggerHeartbeat failed")?;
         Ok(())
+    }
+
+    /// Start (or restart) the daemon's public-internet tunnel using the
+    /// `tunnel.*` settings. Returns the post-apply snapshot, with the
+    /// public URL when the start succeeded and `error` populated otherwise.
+    pub async fn tunnel_start(&mut self) -> Result<TunnelStatusReply> {
+        let reply = self
+            .admin
+            .tunnel_start(AdminEmpty {})
+            .await
+            .context("Admin.TunnelStart failed")?
+            .into_inner();
+        Ok(reply)
+    }
+
+    /// Stop the daemon's tunnel. Idempotent — no error when no tunnel runs.
+    pub async fn tunnel_stop(&mut self) -> Result<()> {
+        self.admin
+            .tunnel_stop(AdminEmpty {})
+            .await
+            .context("Admin.TunnelStop failed")?;
+        Ok(())
+    }
+
+    /// Snapshot of the daemon's tunnel state.
+    pub async fn tunnel_status(&mut self) -> Result<TunnelStatusReply> {
+        let reply = self
+            .admin
+            .tunnel_status(AdminEmpty {})
+            .await
+            .context("Admin.TunnelStatus failed")?
+            .into_inner();
+        Ok(reply)
     }
 
     /// Run a daily-maintenance sweep on the daemon. Same code path as the

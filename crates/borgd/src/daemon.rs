@@ -212,6 +212,26 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let extras = match CoreConfig::load_from_db().await {
         Ok(core_config) => {
+            // Tunnel supervisor — points at the gateway's bind address so
+            // the tunnel forwards traffic to the right local origin. The
+            // initial apply happens here so a daemon configured with a
+            // non-"none" provider stands the tunnel up at startup; the
+            // operator still has `borg tunnel {start,stop,status}` for
+            // manual control after that.
+            let tunnel_sup = crate::tunnel_supervisor::TunnelSupervisor::new(
+                core_config.gateway.host.clone(),
+                core_config.gateway.port,
+            );
+            if !matches!(
+                core_config.tunnel.provider,
+                cortex::config::TunnelProvider::None
+            ) {
+                if let Err(e) = tunnel_sup.apply(&core_config.tunnel).await {
+                    tracing::warn!(
+                        "borgd: initial tunnel start failed ({e}); operator can retry with `borg tunnel start`"
+                    );
+                }
+            }
             let handles = orchestrator::start(
                 registry.clone(),
                 core_config,
@@ -229,6 +249,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 config_notify_tx: Some(config_watcher.notify_sender()),
                 process_registry: Some(process_registry.clone()),
                 goal_bus: Some(handles.goal_bus),
+                tunnel_supervisor: Some(tunnel_sup),
             }
         }
         Err(e) => {
@@ -243,6 +264,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 config_notify_tx: Some(config_watcher.notify_sender()),
                 process_registry: Some(process_registry.clone()),
                 goal_bus: Some(goal_bus.clone()),
+                tunnel_supervisor: None,
             }
         }
     };

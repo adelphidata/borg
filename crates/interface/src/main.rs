@@ -40,6 +40,7 @@ use crate::commands::providers::ProvidersAction;
 use crate::commands::settings::SettingsAction;
 use crate::commands::status::{BondAction, StatusAction};
 use crate::commands::tasks::{CronAction, TasksAction};
+use crate::commands::tunnel::TunnelCliAction;
 
 mod api_key_store;
 mod async_bridge;
@@ -179,6 +180,11 @@ enum Commands {
     },
     /// Run a one-shot self-heal sweep (logs, embeddings, stalled tasks)
     Heal,
+    /// Manage the public-internet tunnel (cloudflared/ngrok/tailscale/custom)
+    Tunnel {
+        #[command(subcommand)]
+        action: TunnelCliAction,
+    },
     /// List or show stored sessions
     Sessions {
         #[command(subcommand)]
@@ -529,6 +535,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Skills { action }) => commands::skills::dispatch_skills(action).await?,
         Some(Commands::Memory { action }) => commands::memory::dispatch_memory(action).await?,
         Some(Commands::Heal) => commands::heal::run_heal().await?,
+        Some(Commands::Tunnel { action }) => commands::tunnel::run_tunnel(action).await?,
         Some(Commands::Sessions { action }) => {
             commands::sessions::dispatch_sessions(action).await?
         }

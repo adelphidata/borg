@@ -25,6 +25,10 @@ pub(crate) enum ServiceAction {
     Uninstall,
     /// Show the daemon service status
     Status,
+    /// Start the daemon service (via the installed unit, or direct spawn).
+    Start,
+    /// Stop the daemon service.
+    Stop,
     /// Restart the daemon service
     Restart,
 }
@@ -49,6 +53,8 @@ pub(crate) async fn dispatch_service(action: ServiceAction) -> Result<()> {
         ServiceAction::Install { secure } => crate::borgd_launcher::install_service(secure),
         ServiceAction::Uninstall => crate::borgd_launcher::uninstall_service(),
         ServiceAction::Status => crate::borgd_launcher::service_status().await,
+        ServiceAction::Start => crate::borgd_launcher::start_service().await,
+        ServiceAction::Stop => crate::borgd_launcher::stop_service().await,
         ServiceAction::Restart => crate::borgd_launcher::restart_service().await,
     }
 }

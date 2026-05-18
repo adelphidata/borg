@@ -11,6 +11,7 @@
 use crate::goal_bus::{now_unix, GoalEventBus};
 use crate::heartbeat::{HeartbeatBus, HeartbeatSource, HeartbeatTrigger};
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
+use crate::tunnel_supervisor::TunnelSupervisor;
 use cortex::db::Database;
 use cortex::process_registry::{ProcessEntry, ProcessRegistry};
 use cortex::settings::SettingsResolver;
@@ -32,7 +33,7 @@ use protocols::admin::{
     ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
     SessionRef, SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest,
     SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, Subprocess as PbSubprocess,
-    SubprocessSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
+    SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -51,6 +52,7 @@ pub struct AdminSvc {
     config_notify_tx: Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
     process_registry: Mutex<Option<ProcessRegistry>>,
     goal_bus: Mutex<Option<GoalEventBus>>,
+    tunnel_supervisor: Mutex<Option<TunnelSupervisor>>,
 }
 
 impl AdminSvc {
@@ -65,7 +67,27 @@ impl AdminSvc {
             config_notify_tx: Mutex::new(None),
             process_registry: Mutex::new(None),
             goal_bus: Mutex::new(None),
+            tunnel_supervisor: Mutex::new(None),
         }
+    }
+
+    /// Wire the daemon-side tunnel supervisor. `TunnelStart`/`TunnelStop`/
+    /// `TunnelStatus` are no-ops with `FailedPrecondition` until this is
+    /// set — the operator should see "tunnel not wired" rather than a
+    /// silent success.
+    pub fn with_tunnel_supervisor(self, sup: TunnelSupervisor) -> Self {
+        *self
+            .tunnel_supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sup);
+        self
+    }
+
+    fn tunnel_supervisor_handle(&self) -> Option<TunnelSupervisor> {
+        self.tunnel_supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Wire the goal-event broadcast bus. `Admin.SubscribeGoalEvents` reads
@@ -1983,6 +2005,54 @@ impl Admin for AdminSvc {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn tunnel_start(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<TunnelStatusReply>, TStatus> {
+        let sup = self
+            .tunnel_supervisor_handle()
+            .ok_or_else(|| TStatus::failed_precondition("tunnel supervisor not wired"))?;
+        let config = cortex::config::Config::load_from_db()
+            .await
+            .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
+        // apply() records the error into the snapshot before returning Err,
+        // so we explicitly read status() on the failure path to surface the
+        // operator-actionable hint (settings key, install URL, etc.).
+        match sup.apply(&config.tunnel).await {
+            Ok(snap) => Ok(Response::new(snapshot_to_reply(snap))),
+            Err(_) => Ok(Response::new(snapshot_to_reply(sup.status().await))),
+        }
+    }
+
+    async fn tunnel_stop(&self, _req: Request<Empty>) -> Result<Response<Empty>, TStatus> {
+        let sup = self
+            .tunnel_supervisor_handle()
+            .ok_or_else(|| TStatus::failed_precondition("tunnel supervisor not wired"))?;
+        sup.stop()
+            .await
+            .map_err(|e| TStatus::internal(format!("tunnel stop failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn tunnel_status(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<TunnelStatusReply>, TStatus> {
+        let sup = self
+            .tunnel_supervisor_handle()
+            .ok_or_else(|| TStatus::failed_precondition("tunnel supervisor not wired"))?;
+        Ok(Response::new(snapshot_to_reply(sup.status().await)))
+    }
+}
+
+fn snapshot_to_reply(snap: crate::tunnel_supervisor::TunnelSnapshot) -> TunnelStatusReply {
+    TunnelStatusReply {
+        provider: snap.provider,
+        running: snap.running,
+        public_url: snap.public_url,
+        error: snap.last_error,
     }
 }
 

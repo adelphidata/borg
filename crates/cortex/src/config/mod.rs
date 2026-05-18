@@ -1,6 +1,8 @@
+pub mod apns;
 pub mod computer_use;
 pub mod consolidation;
 pub mod data;
+pub mod discovery;
 pub mod gateway;
 pub mod goals;
 pub mod llm;
@@ -13,14 +15,17 @@ pub mod security;
 #[macro_use]
 mod settings_macro;
 pub mod settings_table;
+pub mod tunnel;
 pub mod update;
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 
+pub use apns::ApnsConfig;
 pub use computer_use::*;
 pub use consolidation::*;
 pub use data::*;
+pub use discovery::DiscoveryConfig;
 pub use gateway::*;
 pub use goals::*;
 pub use llm::*;
@@ -30,6 +35,10 @@ pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
 pub use process_registry::*;
 pub use security::*;
+pub use tunnel::{
+    CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
+    TunnelConfig, TunnelProvider,
+};
 pub use update::*;
 
 use anyhow::{Context, Result};
@@ -161,6 +170,16 @@ pub struct Config {
     /// Self-update prompt state (skipped-version sentinel).
     #[serde(default)]
     pub update: UpdateConfig,
+    /// LAN mDNS announce + Tailscale peer enumeration.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+    /// Tunneling (cloudflared / ngrok / tailscale / custom) for exposing the
+    /// gateway HTTP port publicly.
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
+    /// APNs push pipeline for waking offline iOS clients.
+    #[serde(default)]
+    pub apns: ApnsConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,

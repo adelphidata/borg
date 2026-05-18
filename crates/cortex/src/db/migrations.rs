@@ -29,6 +29,33 @@ impl Database {
     /// the source table without manual triggers. BM25 ranking moves to Rust
     /// (see `crate::memory::bm25`) because the index method does not expose
     /// a SQL-callable `bm25()`.
+    /// Adds the `apns_device_tokens` table that the APNs push pipeline
+    /// keys off — one row per (device_id, apns_token) registration.
+    /// Provider: Apple Push Notification Service. The App Attest pubkey
+    /// is stored DER-encoded so the verifier (when wired) can re-check
+    /// future assertion signatures without re-running attestation.
+    pub(super) async fn migrate_v3(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS apns_device_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL UNIQUE,
+                    apns_token TEXT NOT NULL,
+                    bundle_id TEXT NOT NULL,
+                    app_attest_key_id TEXT NOT NULL,
+                    app_attest_pub_key_der BLOB NOT NULL,
+                    registered_at INTEGER NOT NULL,
+                    last_push_at INTEGER,
+                    invalidated_at INTEGER,
+                    invalidated_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS apns_device_tokens_active
+                    ON apns_device_tokens (invalidated_at) WHERE invalidated_at IS NULL;",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn migrate_v2(&self) -> Result<()> {
         // messages: drop the FTS5 virtual table and its three sync triggers.
         self.conn

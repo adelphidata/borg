@@ -11,6 +11,7 @@ use crate::goal_bus::GoalEventBus;
 use crate::heartbeat::HeartbeatBus;
 use crate::heartbeat::HeartbeatTrigger;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
+use crate::tunnel_supervisor::TunnelSupervisor;
 use protocols::admin::admin_server::AdminServer;
 use protocols::capability::capability_server::CapabilityServer;
 use protocols::session::session_server::SessionServer;
@@ -69,6 +70,9 @@ pub struct AdminExtras {
     /// handlers publish into. Production wires this through the
     /// orchestrator so the agent loop and the RPC handlers share one bus.
     pub goal_bus: Option<GoalEventBus>,
+    /// Daemon-side owner of the optional public-internet tunnel. The
+    /// `TunnelStart`/`Stop`/`Status` RPCs are unwired without it.
+    pub tunnel_supervisor: Option<TunnelSupervisor>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -101,6 +105,9 @@ pub fn build_services_with_extras(
     }
     if let Some(bus) = extras.goal_bus {
         admin_svc = admin_svc.with_goal_bus(bus);
+    }
+    if let Some(sup) = extras.tunnel_supervisor {
+        admin_svc = admin_svc.with_tunnel_supervisor(sup);
     }
     Services {
         status: StatusServer::new(status::StatusSvc::new()),

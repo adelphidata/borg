@@ -124,6 +124,13 @@ service Admin {
   rpc PauseGoalOnInterrupt(GoalRef) returns (GoalDetail);
   rpc SubscribeGoalEvents(Empty) returns (stream GoalEvent);
 
+  // Public-internet tunnel — start/stop/status. The daemon owns the
+  // long-running provider (cloudflared / ngrok / tailscale / custom) under
+  // `spawn_supervised`; the cli is a thin client over these RPCs.
+  rpc TunnelStart(Empty) returns (TunnelStatusReply);
+  rpc TunnelStop(Empty) returns (Empty);
+  rpc TunnelStatus(Empty) returns (TunnelStatusReply);
+
   // Subprocess registry — daemon-side ProcessRegistry inspection + pinning.
   // `GetSubprocesses` returns a snapshot of running + recently-finished
   // entries; `SetSubprocessPinned` flips the auto-reap pin on a specific
@@ -685,6 +692,25 @@ message GoalMutation {
 // row no longer exists). Subscribers that lag (slow render loop, briefly
 // paused TUI) drop messages — the next event or a fresh GetGoal re-syncs
 // state, so the broadcast bus stays unbounded-free.
+// Tunnel — public-internet exposure ─────────────────────────────────────────
+// Snapshot of the daemon's current tunnel state. `provider="none"` and
+// `public_url=""` together mean "no tunnel configured"; an explicit
+// `error` string means the supervisor's last attempt failed and the
+// operator should look at it (e.g. missing binary, bad token).
+message TunnelStatusReply {
+  // Provider name from `tunnel.provider` (one of "none", "cloudflare",
+  // "ngrok", "tailscale", "custom"). Empty only when config load failed.
+  string provider = 1;
+  // `true` when a tunnel process is alive and serving traffic.
+  bool running = 2;
+  // Public URL when running. Empty if the provider hasn't surfaced one
+  // yet (e.g. cloudflared still booting) or the tunnel is stopped.
+  string public_url = 3;
+  // Human-readable error from the last start attempt, if any. Drained
+  // after a successful start.
+  string error = 4;
+}
+
 message GoalEvent {
   string session_id = 1;
   // "created" | "replaced" | "status_changed" | "budget_limited" |

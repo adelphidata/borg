@@ -274,10 +274,84 @@ pub async fn restart_service() -> Result<()> {
     ensure_running().await
 }
 
-/// Print and return the daemon status string.
-pub async fn service_status() -> Result<()> {
+/// Start the daemon under the platform service manager if a unit is
+/// installed; otherwise spawn it directly via `ensure_running`. Idempotent
+/// when the daemon is already up.
+pub async fn start_service() -> Result<()> {
     if daemon_reachable().await {
-        println!("Service status: running");
+        println!("Service already running.");
+        return Ok(());
+    }
+    // Prefer the platform service manager when a unit/plist is installed —
+    // that way subsequent `borg service status` sees the managed instance
+    // and the daemon survives logout via systemd lingering / launchd auto-load.
+    if platform_unit_installed() {
+        if let Err(e) = platform_start() {
+            tracing::warn!("platform_start failed, falling back to direct spawn: {e}");
+            ensure_running().await?;
+        }
+        if wait_for_daemon(Duration::from_secs(10)).await {
+            println!("Service started.");
+            return Ok(());
+        }
+        anyhow::bail!("started service but its UDS never became reachable");
+    }
+    ensure_running().await?;
+    println!("Service started (direct spawn — no installed unit detected).");
+    Ok(())
+}
+
+/// State of the platform service manager's view of borgd. Combined with
+/// UDS reachability this disambiguates "running normally" / "unit loaded
+/// but the daemon is wedged" / "unit not installed" — three operator
+/// runbooks that previously all looked like "not running".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformManagerState {
+    /// Unit/plist installed AND the service manager reports it active.
+    LoadedActive,
+    /// Unit/plist installed but inactive (failed / stopped / never started).
+    LoadedInactive,
+    /// No unit/plist installed.
+    NotInstalled,
+    /// Platform probe failed (binary missing, command error) — usually a
+    /// signal the service manager itself is unreachable, not borgd.
+    Unknown,
+}
+
+/// Build the human-readable status line from already-gathered facts.
+///
+/// Pure function — no I/O. Tests cover the matrix so the runbook string
+/// each operator sees never silently drifts.
+pub fn format_service_status(uds_reachable: bool, platform: PlatformManagerState) -> String {
+    match (uds_reachable, platform) {
+        (true, PlatformManagerState::LoadedActive) => "Service status: running".into(),
+        (true, PlatformManagerState::LoadedInactive) => {
+            "Service status: running (orphaned — installed unit reports inactive; run `borg service install` to re-link)".into()
+        }
+        (true, PlatformManagerState::NotInstalled) => {
+            "Service status: running (direct spawn — no installed unit; run `borg service install` to manage via systemd/launchd)".into()
+        }
+        (true, PlatformManagerState::Unknown) => "Service status: running".into(),
+        (false, PlatformManagerState::LoadedActive) => {
+            "Service status: loaded but unreachable (manager reports active but UDS down — daemon is wedged; try `borg service restart`)".into()
+        }
+        (false, PlatformManagerState::LoadedInactive) => {
+            "Service status: stopped (unit installed; start with `borg service start`)".into()
+        }
+        (false, PlatformManagerState::NotInstalled) => {
+            "Service status: not installed (install with `borg service install`)".into()
+        }
+        (false, PlatformManagerState::Unknown) => "Service status: not running".into(),
+    }
+}
+
+/// Print the daemon status, combining UDS reachability with the platform
+/// service manager's view.
+pub async fn service_status() -> Result<()> {
+    let uds = daemon_reachable().await;
+    let platform = probe_platform_manager();
+    println!("{}", format_service_status(uds, platform));
+    if uds {
         if let Ok(mut client) = daemon_client::connect(None).await {
             match client.get_daemon_status().await {
                 Ok(status) => {
@@ -300,10 +374,133 @@ pub async fn service_status() -> Result<()> {
                 Err(e) => tracing::warn!("get_daemon_status failed: {e}"),
             }
         }
-    } else {
-        println!("Service status: not running");
     }
     Ok(())
+}
+
+/// True when the relevant platform unit/plist file exists on disk.
+fn platform_unit_installed() -> bool {
+    if cfg!(target_os = "macos") {
+        launchd_plist_path().map(|p| p.exists()).unwrap_or(false)
+    } else if cfg!(target_os = "linux") {
+        for scope in [SystemdScope::System, SystemdScope::User] {
+            if let Ok(path) = scope.unit_path() {
+                if path.exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    } else {
+        false
+    }
+}
+
+/// Probe the platform service manager for borgd's state. Pure I/O wrapper;
+/// the decision matrix lives in [`format_service_status`].
+fn probe_platform_manager() -> PlatformManagerState {
+    if !platform_unit_installed() {
+        return PlatformManagerState::NotInstalled;
+    }
+    if cfg!(target_os = "macos") {
+        probe_launchd()
+    } else if cfg!(target_os = "linux") {
+        probe_systemd()
+    } else {
+        PlatformManagerState::Unknown
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_launchd() -> PlatformManagerState {
+    let Ok(output) = std::process::Command::new("launchctl").arg("list").output() else {
+        return PlatformManagerState::Unknown;
+    };
+    if !output.status.success() {
+        return PlatformManagerState::Unknown;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    // `launchctl list` rows look like:  PID  Status  Label
+    // PID is `-` when loaded but not currently running. A live PID means
+    // the agent IS running (or being relaunched by KeepAlive).
+    for line in listing.lines() {
+        if !line.contains(LAUNCHD_LABEL) {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let pid_col = cols.next().unwrap_or("-");
+        return if pid_col == "-" {
+            PlatformManagerState::LoadedInactive
+        } else {
+            PlatformManagerState::LoadedActive
+        };
+    }
+    PlatformManagerState::LoadedInactive
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_launchd() -> PlatformManagerState {
+    PlatformManagerState::Unknown
+}
+
+#[cfg(target_os = "linux")]
+fn probe_systemd() -> PlatformManagerState {
+    let scope = SystemdScope::detect();
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(scope.ctl_args())
+        .args(["is-active", "borg.service"]);
+    let Ok(output) = cmd.output() else {
+        return PlatformManagerState::Unknown;
+    };
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `is-active` exit codes: 0 = active, 3 = inactive/failed. Read the
+    // stdout token so we treat `activating` and `reloading` as inactive
+    // for the purposes of "should the operator wait or restart?".
+    match state.as_str() {
+        "active" => PlatformManagerState::LoadedActive,
+        "" => PlatformManagerState::Unknown,
+        _ => PlatformManagerState::LoadedInactive,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_systemd() -> PlatformManagerState {
+    PlatformManagerState::Unknown
+}
+
+/// Start the daemon through the platform service manager (no direct spawn).
+/// Returns `Err` if the manager command itself fails; the caller may then
+/// fall back to direct spawn.
+fn platform_start() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist = launchd_plist_path()?;
+        let status = std::process::Command::new("launchctl")
+            .args(["load", &plist.to_string_lossy()])
+            .status()
+            .context("launchctl load")?;
+        if !status.success() {
+            anyhow::bail!("launchctl load exited with {status}");
+        }
+        let status = std::process::Command::new("launchctl")
+            .args(["start", LAUNCHD_LABEL])
+            .status()
+            .context("launchctl start")?;
+        if !status.success() {
+            anyhow::bail!("launchctl start {LAUNCHD_LABEL} exited with {status}");
+        }
+        Ok(())
+    } else if cfg!(target_os = "linux") {
+        let scope = SystemdScope::detect();
+        let mut cmd = std::process::Command::new("systemctl");
+        cmd.args(scope.ctl_args()).args(["start", "borg.service"]);
+        let status = cmd.status().context("systemctl start")?;
+        if !status.success() {
+            anyhow::bail!("systemctl start borg.service exited with {status}");
+        }
+        Ok(())
+    } else {
+        anyhow::bail!("platform_start: unsupported OS")
+    }
 }
 
 /// Install the platform service unit pointing at the `borgd` binary.
@@ -880,6 +1077,103 @@ fn stop_systemd() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status string is the operator's only diagnostic surface for
+    /// "is the daemon healthy?". Each cell of the (uds × platform-state)
+    /// matrix must map to a distinguishable, actionable message. A test
+    /// that just asserts `contains("running")` would let the
+    /// "loaded but unreachable" → "running" regression slip through —
+    /// the exact bug the new platform probe was added to surface.
+    #[test]
+    fn format_service_status_distinguishes_each_cell_of_the_matrix() {
+        // Running normally
+        let s = format_service_status(true, PlatformManagerState::LoadedActive);
+        assert_eq!(s, "Service status: running");
+
+        // Running but the manager doesn't know about it — operator should
+        // be nudged to re-link via `borg service install`.
+        let s = format_service_status(true, PlatformManagerState::NotInstalled);
+        assert!(
+            s.contains("direct spawn") && s.contains("borg service install"),
+            "must nudge re-link: {s}"
+        );
+
+        // Running but the unit reports inactive — drift between disk and
+        // runtime, surface it.
+        let s = format_service_status(true, PlatformManagerState::LoadedInactive);
+        assert!(
+            s.contains("orphaned") && s.contains("inactive"),
+            "must surface drift: {s}"
+        );
+
+        // The critical diagnostic case: manager says active, UDS is dead.
+        // Operator needs to restart, not reinstall.
+        let s = format_service_status(false, PlatformManagerState::LoadedActive);
+        assert!(
+            s.contains("loaded but unreachable") && s.contains("wedged"),
+            "must surface wedged daemon: {s}"
+        );
+        assert!(
+            s.contains("borg service restart"),
+            "must suggest restart, not install: {s}"
+        );
+
+        // Cleanly stopped — operator runs start, not install.
+        let s = format_service_status(false, PlatformManagerState::LoadedInactive);
+        assert!(
+            s.contains("stopped") && s.contains("borg service start"),
+            "must suggest start: {s}"
+        );
+
+        // Never installed — operator runs install.
+        let s = format_service_status(false, PlatformManagerState::NotInstalled);
+        assert!(
+            s.contains("not installed") && s.contains("borg service install"),
+            "must suggest install: {s}"
+        );
+
+        // Probe failed but daemon is up — don't make the operator think
+        // anything is wrong with the daemon when the manager probe is
+        // what actually broke.
+        let s = format_service_status(true, PlatformManagerState::Unknown);
+        assert_eq!(s, "Service status: running");
+        let s = format_service_status(false, PlatformManagerState::Unknown);
+        assert_eq!(s, "Service status: not running");
+    }
+
+    /// All eight cells must yield distinct strings — duplicates mean the
+    /// operator can't disambiguate runbooks, which is the bug this whole
+    /// matrix exists to prevent.
+    #[test]
+    fn format_service_status_produces_distinct_strings_per_cell() {
+        use std::collections::HashSet;
+        let cells = [
+            (true, PlatformManagerState::LoadedActive),
+            (true, PlatformManagerState::LoadedInactive),
+            (true, PlatformManagerState::NotInstalled),
+            (true, PlatformManagerState::Unknown),
+            (false, PlatformManagerState::LoadedActive),
+            (false, PlatformManagerState::LoadedInactive),
+            (false, PlatformManagerState::NotInstalled),
+            (false, PlatformManagerState::Unknown),
+        ];
+        // Unknown collapses with LoadedActive when UDS is up (both render
+        // as "running" — probe failure should not invent diagnostics when
+        // the daemon is observably healthy). When UDS is down, all four
+        // platform states render distinctly so each one points at its own
+        // runbook: "wedged", "stopped", "not installed (install with...)",
+        // and the bare "not running" fallback for an opaque probe. Expected
+        // distinct count is therefore 7, not 8.
+        let unique: HashSet<_> = cells
+            .iter()
+            .map(|(uds, p)| format_service_status(*uds, *p))
+            .collect();
+        assert_eq!(
+            unique.len(),
+            7,
+            "matrix must collapse only (true, Unknown)→(true, LoadedActive); all other cells must point at their own runbook; got: {unique:?}"
+        );
+    }
 
     #[test]
     fn launchd_template_targets_borgd_binary() {

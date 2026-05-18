@@ -68,6 +68,10 @@ pub mod signal;
 pub mod slack;
 pub mod teams;
 pub mod telegram;
+/// Public-internet tunnel providers (cloudflared, ngrok, tailscale, custom, none).
+/// Lets borg's gateway expose itself beyond localhost without the operator
+/// running their own reverse proxy.
+pub mod tunnel;
 pub mod twilio;
 pub(crate) mod typing_keepalive;
 pub mod verify_common;

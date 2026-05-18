@@ -10,6 +10,9 @@
 // production code.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+/// APNs push pipeline — register iOS devices, wake them with silent
+/// pushes. Currently surface + stub verifier; see `apns::attest`.
+pub mod apns;
 pub mod approval_greeting;
 pub mod auth;
 /// Hourly budget reset tick spawned at daemon startup.
@@ -17,6 +20,8 @@ pub mod budget_tick;
 pub mod channel_delivery;
 pub mod cost_events;
 pub mod daemon;
+/// LAN/peer discovery — mDNS announcement and Tailscale peer enumeration.
+pub mod discovery;
 /// Typed `Error` umbrella for the crate's public API.
 pub mod error;
 pub mod goal_bus;
@@ -34,5 +39,8 @@ pub mod session;
 pub mod supervisor;
 pub mod task_runner;
 pub mod tick_lock;
+/// Owner of the optional public-internet tunnel (cloudflared / ngrok /
+/// tailscale / custom). Backs the `Admin.TunnelStart/Stop/Status` RPCs.
+pub mod tunnel_supervisor;
 
 pub use error::{Error, Result};

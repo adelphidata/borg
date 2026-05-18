@@ -59,6 +59,27 @@ sleep_inhibitor;` in `crates/cortex/src/lib.rs`, then add the call
   Revisit if user demand materializes — a `cargo audit` wrapper around
   `Cargo.lock` in the release binary is one safer path.
 
+## APNs push pipeline
+
+The DB schema (`apns_device_tokens`, migration v3), gRPC surface
+(`Apns.IssueChallenge` / `RegisterDevice` / `UnregisterDevice`), push
+trigger, and 410-invalidation paths shipped in 2026-05 as part of the
+networking-bundle PR. The App Attest verifier is the one remaining gap.
+
+- **App Attest verifier.** Today
+  `crates/borgd/src/apns/attest.rs::verify_attestation` returns
+  `AttestError::NotImplemented`, so `Apns.RegisterDevice` rejects every
+  request. Real verifier needs: CBOR decode of the attestation object,
+  x5c chain validation against Apple's App Attest root CA (PEM compiled
+  in), nonce extraction from credCert extension OID
+  `1.2.840.113635.100.8.2`, `sha256(authData || sha256(challenge))`
+  equality check, RP ID (`sha256(bundle_id)`) match against
+  `authData[0..32]`, UP-bit + counter==0 assertion, credentialId equality
+  against `key_id`, and P-256 SPKI extraction. Test harness expectations
+  already in place via the cfg(test) root-CA seam — the verifier just
+  needs to land. The `a2` push client is also stubbed; production wiring
+  is a separate paragraph of the same PR.
+
 ## Telegram voice follow-through
 
 - **Roll out shared voice I/O policy to the rest of the gateway.**

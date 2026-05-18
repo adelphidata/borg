@@ -278,6 +278,30 @@ define_settings! {
         // ── Per-session goals (/goal) ──
         "goals.enabled" => goals.enabled, parsed(bool);
         "goals.default_token_budget" => goals.default_token_budget, opt_parsed(i64);
+
+        // ── Discovery (mDNS + Tailscale peer enumeration) ──
+        "discovery.mdns_enabled" => discovery.mdns_enabled, parsed(bool);
+        "discovery.mdns_instance_name" => discovery.mdns_instance_name, opt_string;
+        "discovery.tailscale_enabled" => discovery.tailscale_enabled, parsed(bool);
+
+        // ── Tunneling ──
+        // tunnel.provider handled in custom_apply (FromStr enum).
+        "tunnel.cloudflare.token" => tunnel.cloudflare.token, string;
+        "tunnel.ngrok.auth_token" => tunnel.ngrok.auth_token, string;
+        "tunnel.ngrok.domain" => tunnel.ngrok.domain, opt_string;
+        "tunnel.tailscale.funnel" => tunnel.tailscale.funnel, parsed(bool);
+        "tunnel.tailscale.hostname" => tunnel.tailscale.hostname, opt_string;
+        "tunnel.custom.start_command" => tunnel.custom.start_command, string;
+        "tunnel.custom.health_url" => tunnel.custom.health_url, opt_string;
+        "tunnel.custom.url_pattern" => tunnel.custom.url_pattern, opt_string;
+
+        // ── APNs ──
+        "apns.enabled" => apns.enabled, parsed(bool);
+        "apns.bundle_id" => apns.bundle_id, opt_string;
+        "apns.team_id" => apns.team_id, opt_string;
+        "apns.key_id" => apns.key_id, opt_string;
+        "apns.use_sandbox" => apns.use_sandbox, parsed(bool);
+        // apns.private_key_p8_path handled in custom_apply (PathBuf, not String).
     }
 
     registry_only {
@@ -489,6 +513,25 @@ define_settings! {
                 Ok(format!("{key} = ({count} providers)"))
             }
         };
+
+        // tunnel.provider: FromStr-validated enum. Empty maps to None so an
+        // unset row clears any prior selection rather than silently
+        // persisting a stale provider.
+        "tunnel.provider" => |s, key, value| {
+            use std::str::FromStr as _;
+            s.tunnel.provider = crate::config::tunnel::TunnelProvider::from_str(value)?;
+            Ok(format!("{key} = {value}"))
+        };
+
+        // apns.private_key_p8_path: PathBuf. Empty clears to None.
+        "apns.private_key_p8_path" => |s, key, value| {
+            s.apns.private_key_p8_path = if value.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(value))
+            };
+            Ok(format!("{key} = {value}"))
+        };
     }
 
     custom_extract {
@@ -550,6 +593,17 @@ define_settings! {
             .as_ref()
             .filter(|a| !a.fallback.is_empty())
             .map(|a| serde_json::to_string(&a.fallback).unwrap_or_default())
+            .unwrap_or_default();
+
+        // tunnel.provider: FromStr-validated enum, round-trip via Display.
+        "tunnel.provider" => |c| format!("{}", c.tunnel.provider);
+
+        // apns.private_key_p8_path: PathBuf, round-trip via display.
+        "apns.private_key_p8_path" => |c| c
+            .apns
+            .private_key_p8_path
+            .as_ref()
+            .map(|p| p.display().to_string())
             .unwrap_or_default();
     }
 
@@ -654,6 +708,13 @@ define_settings! {
         // — Per-session goals (/goal) —
         "goals.enabled" => "Enable /goal", Bool, "Goals";
 
+        // — Networking & deployment —
+        "discovery.mdns_enabled" => "LAN mDNS announce", Bool, "Networking";
+        "discovery.tailscale_enabled" => "Tailscale discovery", Bool, "Networking";
+        "tunnel.provider" => "Tunnel provider", Select, "Networking";
+        "apns.enabled" => "APNs push (iOS wake)", Bool, "Networking";
+        "apns.use_sandbox" => "APNs sandbox endpoint", Bool, "Networking";
+
         // — MCP (Model Context Protocol) — per-server config is JSON-only
         // (edited via the Slice 3 CLI), so only the kill switch surfaces
         // in the TUI popup.
@@ -692,6 +753,10 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         &[
             "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max",
         ],
+    ),
+    (
+        "tunnel.provider",
+        &["none", "cloudflare", "ngrok", "tailscale", "custom"],
     ),
 ];
 

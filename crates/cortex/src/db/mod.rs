@@ -455,7 +455,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 2;
+    const CURRENT_VERSION: u32 = 3;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -523,8 +523,11 @@ impl Database {
         if current < 2 {
             self.migrate_v2().await?;
         }
+        if current < 3 {
+            self.migrate_v3().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 2,
+            Database::CURRENT_VERSION == 3,
             "add the new migrate_vN call above and bump this constant",
         );
 
@@ -562,6 +565,93 @@ impl Database {
                 }
             }
         }
+    }
+}
+
+/// One active row from `apns_device_tokens` — what the push trigger needs.
+#[derive(Debug, Clone)]
+pub struct ApnsTokenRow {
+    /// Auto-increment primary key.
+    pub id: i64,
+    /// Hex APNs device token.
+    pub apns_token: String,
+}
+
+impl Database {
+    /// Active (non-invalidated) APNs device tokens registered for the
+    /// given `device_id` (the paired-device fingerprint). Empty list is
+    /// a normal "nothing to push to" signal, not an error.
+    pub async fn list_active_apns_tokens(&self, device_id: &str) -> Result<Vec<ApnsTokenRow>> {
+        let mut rows = self
+            .conn
+            .prepare(
+                "SELECT id, apns_token FROM apns_device_tokens
+                 WHERE device_id = ?1 AND invalidated_at IS NULL",
+            )
+            .await?
+            .query(turso::params![device_id.to_string()])
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let apns_token: String = row.get(1)?;
+            out.push(ApnsTokenRow { id, apns_token });
+        }
+        Ok(out)
+    }
+
+    /// Mark a single APNs token invalidated (typically because APNs
+    /// returned 410 BadDeviceToken). Idempotent.
+    pub async fn invalidate_apns_token(&self, id: i64, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE apns_device_tokens
+                 SET invalidated_at = ?1, invalidated_reason = ?2
+                 WHERE id = ?3",
+                turso::params![now, reason.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a freshly-registered APNs device token. `device_id` is the
+    /// paired-device fingerprint and is UNIQUE in the table — re-registering
+    /// the same device replaces the row (operator hit "Register" twice).
+    pub async fn upsert_apns_device_token(
+        &self,
+        device_id: &str,
+        apns_token: &str,
+        bundle_id: &str,
+        app_attest_key_id: &str,
+        app_attest_pub_key_der: &[u8],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO apns_device_tokens
+                  (device_id, apns_token, bundle_id, app_attest_key_id,
+                   app_attest_pub_key_der, registered_at)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                  ON CONFLICT(device_id) DO UPDATE SET
+                    apns_token = excluded.apns_token,
+                    bundle_id = excluded.bundle_id,
+                    app_attest_key_id = excluded.app_attest_key_id,
+                    app_attest_pub_key_der = excluded.app_attest_pub_key_der,
+                    registered_at = excluded.registered_at,
+                    invalidated_at = NULL,
+                    invalidated_reason = NULL",
+                turso::params![
+                    device_id.to_string(),
+                    apns_token.to_string(),
+                    bundle_id.to_string(),
+                    app_attest_key_id.to_string(),
+                    app_attest_pub_key_der.to_vec(),
+                    now
+                ],
+            )
+            .await?;
+        Ok(())
     }
 }
 
