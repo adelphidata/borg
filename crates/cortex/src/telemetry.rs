@@ -136,8 +136,12 @@ pub struct BorgMetrics {
     /// Histogram of tool execution durations in seconds.
     pub tool_duration: Histogram<f64>,
     /// Counter for tool calls blocked because they were the Nth+ identical
-    /// consecutive call within a turn (see `MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS`).
+    /// consecutive call within a turn (see `config.loop_guard.identical_call_max`).
     pub tool_repeats_blocked: Counter<u64>,
+    /// Counter for hallucinated tool names refused with a terminal message
+    /// after exceeding `config.loop_guard.unknown_tool_max_per_name` attempts
+    /// in a single turn.
+    pub unknown_tools_refused: Counter<u64>,
     /// Counter for gateway webhook requests.
     pub gateway_requests: Counter<u64>,
     /// Histogram of gateway request processing durations in seconds.
@@ -210,6 +214,12 @@ impl BorgMetrics {
             tool_repeats_blocked: meter
                 .u64_counter("borg.tool.repeats_blocked")
                 .with_description("Tool calls blocked as repeated identical consecutive calls")
+                .build(),
+            unknown_tools_refused: meter
+                .u64_counter("borg.tool.unknown_refused")
+                .with_description(
+                    "Hallucinated tool names refused after exceeding per-name attempt cap",
+                )
                 .build(),
             gateway_requests: meter
                 .u64_counter("borg.gateway.requests")

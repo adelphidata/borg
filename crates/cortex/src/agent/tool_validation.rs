@@ -4,16 +4,37 @@
 //! are methods on `Agent` — they are standalone validators / partitioners
 //! consumed by the agent loop.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use rand::Rng;
 use tracing::warn;
 
+use crate::config::loop_guard::LoopGuardConfig;
 use crate::constants;
 use crate::types::{FunctionCall, Message, ToolCall};
 
+/// Per-call verdict from [`ToolCallRepeatTracker::observe`]. The agent loop
+/// dispatches on this:
+///
+/// - [`RepeatDecision::Allow`] — first emission of a `(name, args)` payload
+///   in the current streak; execute normally.
+/// - [`RepeatDecision::Backoff`] — identical follow-up before the cap; sleep
+///   the returned duration, then execute. Buys the operator an
+///   interrupt-window before the hard block fires.
+/// - [`RepeatDecision::Block`] — at or past `identical_call_max`; skip
+///   execution and substitute a synthetic error tool_result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepeatDecision {
+    Allow,
+    Backoff(Duration),
+    Block,
+}
+
 /// Detects runs of identical `(tool_name, arguments)` tool calls within a
-/// single user turn. Counts strictly-consecutive matches: a differing call
-/// resets the streak. The Nth and any subsequent identical calls (where N
-/// = `MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS`) report `block = true` so the
-/// caller can substitute a synthetic error tool_result instead of executing.
+/// single user turn and escalates the response: pass-through → jittered
+/// exponential backoff → hard block. Counts strictly-consecutive matches: a
+/// differing call resets the streak.
 ///
 /// Equality is byte-exact on the raw `arguments` string — no whitespace or
 /// JSON-key-order normalization. A stuck LLM that emits the same canonical
@@ -24,20 +45,42 @@ use crate::types::{FunctionCall, Message, ToolCall};
 /// Defends against the OpenClaw failure mode: a stuck LLM looping on the
 /// same call burns rate-guard quota and pollutes context until the request
 /// overflows. The 25-iteration ceiling caps damage but doesn't notice
-/// duplication; this guard stops the spam earlier.
-#[derive(Default, Debug)]
+/// duplication; this guard stops the spam earlier and the backoff window
+/// gives an operator time to interrupt before the hard cap.
+#[derive(Debug)]
 pub(crate) struct ToolCallRepeatTracker {
     pub(super) last_signature: Option<u64>,
     pub(super) consecutive_count: u32,
+    identical_call_max: u32,
+    backoff_initial_ms: u64,
+    backoff_max_ms: u64,
+}
+
+impl Default for ToolCallRepeatTracker {
+    fn default() -> Self {
+        Self::new(&LoopGuardConfig::default())
+    }
 }
 
 impl ToolCallRepeatTracker {
-    /// Hash `(name, args)`, update streak state, and return whether the
-    /// current call should be blocked. The signature is stored regardless
-    /// of the block decision so the streak can keep growing across
-    /// already-blocked calls (so test #2 sees indices 2,3,4 blocked, not
-    /// just index 2).
-    pub(super) fn observe(&mut self, name: &str, args: &str) -> bool {
+    pub(crate) fn new(cfg: &LoopGuardConfig) -> Self {
+        Self {
+            last_signature: None,
+            consecutive_count: 0,
+            // Floor at 2: a value of 1 would block the very first call
+            // (count=1 >= cap=1 → Block), bricking the agent. The `nonzero`
+            // setter rejects 0 but lets 1 through; clamp here as a defense.
+            identical_call_max: cfg.identical_call_max.max(2),
+            backoff_initial_ms: cfg.backoff_initial_ms,
+            backoff_max_ms: cfg.backoff_max_ms.max(cfg.backoff_initial_ms),
+        }
+    }
+
+    /// Hash `(name, args)`, update streak state, and return the per-call
+    /// decision. The signature is stored regardless of the decision so the
+    /// streak keeps growing across already-blocked calls (so test #2 sees
+    /// indices 2,3,4 blocked, not just index 2).
+    pub(super) fn observe(&mut self, name: &str, args: &str) -> RepeatDecision {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
@@ -50,7 +93,29 @@ impl ToolCallRepeatTracker {
             self.last_signature = Some(sig);
             self.consecutive_count = 1;
         }
-        self.consecutive_count >= constants::MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
+        self.decision_for(self.consecutive_count)
+    }
+
+    fn decision_for(&self, count: u32) -> RepeatDecision {
+        if count >= self.identical_call_max {
+            return RepeatDecision::Block;
+        }
+        if count <= 1 {
+            return RepeatDecision::Allow;
+        }
+        // count is one of 2..identical_call_max. base doubles each step
+        // starting at backoff_initial_ms; saturating_mul guards against
+        // overflow at large caps; the clamp on backoff_max_ms gives the
+        // operator a predictable ceiling on the un-jittered delay.
+        let steps = count - 2; // 0-based exponent: count=2 → 2^0
+        let multiplier = 1u64.checked_shl(steps.min(63)).unwrap_or(u64::MAX);
+        let base = self
+            .backoff_initial_ms
+            .saturating_mul(multiplier)
+            .min(self.backoff_max_ms);
+        let factor: f64 = rand::rng().random_range(0.75..1.25);
+        let jittered = (base as f64 * factor).round() as u64;
+        RepeatDecision::Backoff(Duration::from_millis(jittered))
     }
 
     pub(super) fn reset(&mut self) {
@@ -66,6 +131,66 @@ pub(super) fn repeated_tool_call_block_message(name: &str, count: u32) -> String
     format!(
         "Error: repeated identical tool call detected ({count} consecutive calls to `{name}` \
          with the same arguments). Vary arguments or stop calling tools and respond to the user."
+    )
+}
+
+/// Tracks how many times each hallucinated tool name has been observed in
+/// the current turn. The first attempt on a given name surfaces the soft
+/// `"Unknown tool: X"` error so a typo can be corrected; after
+/// `unknown_tool_max_per_name` attempts, the agent substitutes a terminal
+/// refusal so the model breaks out of the retry cycle instead of burning
+/// the whole iteration budget on a name that will never resolve.
+#[derive(Debug)]
+pub(crate) struct UnknownToolTracker {
+    seen: HashMap<String, u32>,
+    max_per_name: u32,
+}
+
+impl Default for UnknownToolTracker {
+    fn default() -> Self {
+        Self::new(&LoopGuardConfig::default())
+    }
+}
+
+impl UnknownToolTracker {
+    pub(crate) fn new(cfg: &LoopGuardConfig) -> Self {
+        Self {
+            seen: HashMap::new(),
+            max_per_name: cfg.unknown_tool_max_per_name.max(1),
+        }
+    }
+
+    /// Record one observation of `name` and return the running count
+    /// (1-based). The caller compares against [`Self::should_refuse`] to
+    /// decide between the soft error and the terminal refusal.
+    pub(super) fn observe(&mut self, name: &str) -> u32 {
+        let entry = self.seen.entry(name.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    /// Returns true once a given name's running count has reached the
+    /// configured ceiling. Encodes the policy in one place so the two
+    /// dispatch call sites stay in lockstep.
+    pub(super) fn should_refuse(&self, count: u32) -> bool {
+        count >= self.max_per_name
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.seen.clear();
+    }
+}
+
+/// Synthetic tool_result body for a hallucinated tool name that has been
+/// refused enough times to break the retry cycle. The "does not exist"
+/// phrasing is stable across providers so any future grep / regression
+/// test can detect the terminal-refusal surface without coupling to a
+/// model-specific apology pattern.
+pub(super) fn unknown_tool_refusal_message(name: &str, count: u32) -> String {
+    format!(
+        "Error: tool '{name}' does not exist and has been refused {count} times this turn. \
+         Available tools are listed in the system prompt. Stop calling '{name}' — \
+         either invoke a real tool or respond to the user with text."
     )
 }
 
@@ -469,105 +594,273 @@ mod tests {
         );
     }
 
-    fn run_observe(seq: &[(&str, &str)]) -> Vec<bool> {
-        let mut t = ToolCallRepeatTracker::default();
-        seq.iter().map(|(n, a)| t.observe(n, a)).collect()
+    fn default_tracker() -> ToolCallRepeatTracker {
+        ToolCallRepeatTracker::new(&LoopGuardConfig::default())
+    }
+
+    fn tracker_with(initial: u64, max: u64, cap: u32) -> ToolCallRepeatTracker {
+        ToolCallRepeatTracker::new(&LoopGuardConfig {
+            identical_call_max: cap,
+            backoff_initial_ms: initial,
+            backoff_max_ms: max,
+            unknown_tool_max_per_name: 2,
+        })
+    }
+
+    fn assert_backoff_in_band(d: &RepeatDecision, base_ms: u64) {
+        let RepeatDecision::Backoff(dur) = d else {
+            panic!("expected Backoff, got {d:?}");
+        };
+        let lo = (base_ms as f64 * 0.75).round() as u128;
+        let hi = (base_ms as f64 * 1.25).round() as u128;
+        let actual = dur.as_millis();
+        assert!(
+            (lo..=hi).contains(&actual),
+            "backoff {actual}ms must land in jitter band [{lo}, {hi}] for base {base_ms}ms"
+        );
     }
 
     #[test]
-    fn tool_call_repeat_blocks_on_third_consecutive_identical() {
-        let blocked = run_observe(&[("run_shell", "echo a"); 3]);
-        assert_eq!(blocked, vec![false, false, true]);
+    fn repeat_count_1_returns_allow() {
+        // Spec: first emission of a `(name, args)` payload is never throttled,
+        // regardless of config. The streak only starts climbing from the 2nd
+        // identical call.
+        let mut t = default_tracker();
+        assert_eq!(t.observe("run_shell", "echo a"), RepeatDecision::Allow);
     }
 
     #[test]
-    fn tool_call_repeat_keeps_blocking_after_threshold() {
-        let blocked = run_observe(&[("run_shell", "echo a"); 5]);
-        assert_eq!(blocked, vec![false, false, true, true, true]);
+    fn repeat_count_2_returns_backoff_in_jitter_band() {
+        // Spec: the 2nd identical call is the first one to back off, and the
+        // delay must land in [0.75 * initial, 1.25 * initial]. Asserts the
+        // configured initial value with the jitter band rather than a
+        // hard-coded number so the test survives default tuning changes.
+        let mut t = tracker_with(100, 800, 5);
+        assert_eq!(t.observe("run_shell", "echo a"), RepeatDecision::Allow);
+        assert_backoff_in_band(&t.observe("run_shell", "echo a"), 100);
     }
 
     #[test]
-    fn tool_call_repeat_streak_resets_on_different_args() {
-        let seq = [
-            ("run_shell", "echo a"),
-            ("run_shell", "echo b"),
-            ("run_shell", "echo a"),
-            ("run_shell", "echo a"),
-            ("run_shell", "echo a"),
-        ];
-        let blocked = run_observe(&seq);
-        assert_eq!(blocked, vec![false, false, false, false, true]);
+    fn repeat_backoff_doubles_until_cap_with_jitter() {
+        // Spec: with identical_call_max = 5, initial = 100ms, max = 300ms,
+        // the un-jittered base ladder is 100, 200, 300 (last value clamped),
+        // each within the ±25% jitter band, then Block. Encodes the doubling
+        // + clamp + jitter invariants simultaneously.
+        let mut t = tracker_with(100, 300, 5);
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Allow);
+        assert_backoff_in_band(&t.observe("run_shell", "x"), 100);
+        assert_backoff_in_band(&t.observe("run_shell", "x"), 200);
+        assert_backoff_in_band(&t.observe("run_shell", "x"), 300);
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Block);
     }
 
     #[test]
-    fn tool_call_repeat_interleaved_never_blocks() {
-        let seq = [
-            ("run_shell", "x"),
-            ("read_file", "x"),
-            ("run_shell", "x"),
-            ("read_file", "x"),
-            ("run_shell", "x"),
-            ("read_file", "x"),
-        ];
-        let blocked = run_observe(&seq);
-        assert!(blocked.iter().all(|&b| !b), "got: {blocked:?}");
-    }
-
-    #[test]
-    fn tool_call_repeat_below_threshold_never_blocks() {
-        let mut seq: Vec<(&str, &str)> = vec![("run_shell", "echo a"); 2];
-        for i in 0..100 {
-            seq.push(("read_file", if i % 2 == 0 { "p1" } else { "p2" }));
+    fn repeat_backoff_jitter_is_stochastic() {
+        // Spec: jitter must actually fuzz the delay — a regression where
+        // jitter is wired but always returns the midpoint (or zero) would
+        // leave a synchronized retry pattern. Sample 200 times at count=2
+        // with a fixed config and assert the band is tightly bracketed,
+        // catching the silent-midpoint failure mode.
+        let initial = 1000u64;
+        let mut minimum = u128::MAX;
+        let mut maximum = 0u128;
+        for _ in 0..200 {
+            let mut t = tracker_with(initial, initial * 4, 5);
+            let _ = t.observe("run_shell", "x");
+            if let RepeatDecision::Backoff(d) = t.observe("run_shell", "x") {
+                minimum = minimum.min(d.as_millis());
+                maximum = maximum.max(d.as_millis());
+            } else {
+                panic!("expected Backoff at count=2");
+            }
         }
-        let blocked = run_observe(&seq);
-        assert!(blocked.iter().all(|&b| !b));
+        assert!(
+            minimum <= (initial as f64 * 0.85) as u128,
+            "min jitter {minimum}ms must reach below 0.85x initial {initial}ms — \
+             jitter wiring may be broken (always returning midpoint?)"
+        );
+        assert!(
+            maximum >= (initial as f64 * 1.15) as u128,
+            "max jitter {maximum}ms must reach above 1.15x initial {initial}ms — \
+             jitter wiring may be broken (always returning midpoint?)"
+        );
     }
 
     #[test]
-    fn tool_call_repeat_whitespace_sensitive() {
-        let seq = [
-            ("run_shell", "echo a"),
-            ("run_shell", "echo a "),
-            ("run_shell", "echo a"),
-        ];
-        let blocked = run_observe(&seq);
-        assert_eq!(blocked, vec![false, false, false]);
+    fn repeat_count_max_returns_block() {
+        let mut t = tracker_with(50, 200, 3);
+        let _ = t.observe("run_shell", "x");
+        let _ = t.observe("run_shell", "x");
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Block);
     }
 
     #[test]
-    fn tool_call_repeat_different_names_same_args_not_blocked() {
-        let seq = [
-            ("read_file", "{\"path\":\"x\"}"),
-            ("list_dir", "{\"path\":\"x\"}"),
-            ("read_file", "{\"path\":\"x\"}"),
-        ];
-        let blocked = run_observe(&seq);
-        assert_eq!(blocked, vec![false, false, false]);
+    fn repeat_identical_call_max_one_does_not_brick_agent() {
+        // Regression: a misconfigured `identical_call_max = 1` would, under a
+        // naive `count >= cap` check, block the very first call (count=1 ≥
+        // cap=1 → Block). The constructor must floor the cap at 2 so the
+        // agent always gets to make at least one tool call before backoff.
+        let cfg = LoopGuardConfig {
+            identical_call_max: 1,
+            backoff_initial_ms: 50,
+            backoff_max_ms: 200,
+            unknown_tool_max_per_name: 2,
+        };
+        let mut t = ToolCallRepeatTracker::new(&cfg);
+        assert_eq!(
+            t.observe("run_shell", "x"),
+            RepeatDecision::Allow,
+            "first call must always execute regardless of misconfigured cap"
+        );
     }
 
     #[test]
-    fn tool_call_repeat_reset_clears_streak() {
-        let mut t = ToolCallRepeatTracker::default();
-        for _ in 0..3 {
-            t.observe("run_shell", "echo a");
+    fn repeat_keeps_blocking_after_threshold() {
+        let mut t = tracker_with(50, 200, 3);
+        let _ = t.observe("run_shell", "x");
+        let _ = t.observe("run_shell", "x");
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Block);
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Block);
+    }
+
+    #[test]
+    fn repeat_different_args_reset_ladder() {
+        // Spec: a differing call resets the streak to 1 → Allow. Prevents the
+        // "ladder sticky after divergence" regression where a backoff state
+        // would leak into the next, unrelated tool call.
+        let mut t = tracker_with(100, 800, 4);
+        let _ = t.observe("run_shell", "A");
+        let _ = t.observe("run_shell", "A");
+        // Diverge — fresh streak starts.
+        assert_eq!(t.observe("run_shell", "B"), RepeatDecision::Allow);
+        // And the next identical to B is still only count=2, not count=4.
+        assert_backoff_in_band(&t.observe("run_shell", "B"), 100);
+    }
+
+    #[test]
+    fn repeat_interleaved_never_throttles() {
+        let mut t = tracker_with(100, 800, 3);
+        for _ in 0..10 {
+            assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Allow);
+            assert_eq!(t.observe("read_file", "x"), RepeatDecision::Allow);
         }
-        assert_eq!(t.consecutive_count, 3);
+    }
+
+    #[test]
+    fn repeat_different_names_same_args_not_throttled() {
+        let mut t = tracker_with(100, 800, 3);
+        assert_eq!(
+            t.observe("read_file", "{\"path\":\"x\"}"),
+            RepeatDecision::Allow
+        );
+        assert_eq!(
+            t.observe("list_dir", "{\"path\":\"x\"}"),
+            RepeatDecision::Allow
+        );
+        assert_eq!(
+            t.observe("read_file", "{\"path\":\"x\"}"),
+            RepeatDecision::Allow
+        );
+    }
+
+    #[test]
+    fn repeat_reset_clears_state() {
+        // Spec: reset() must zero the streak so the next identical call returns
+        // Allow, mirroring the per-turn lifecycle: the agent loop resets at the
+        // top of every iteration.
+        let mut t = tracker_with(50, 200, 3);
+        let _ = t.observe("run_shell", "x");
+        let _ = t.observe("run_shell", "x");
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Block);
         t.reset();
         assert_eq!(t.consecutive_count, 0);
         assert_eq!(t.last_signature, None);
-        assert!(!t.observe("run_shell", "echo a"));
-        assert!(!t.observe("run_shell", "echo a"));
-        assert!(t.observe("run_shell", "echo a"));
+        assert_eq!(t.observe("run_shell", "x"), RepeatDecision::Allow);
     }
 
     #[test]
-    fn tool_call_repeat_block_message_mentions_call_and_count() {
+    fn repeat_block_message_mentions_call_and_count() {
         let body = repeated_tool_call_block_message("run_shell", 3);
         assert!(body.contains("run_shell"), "must include tool name: {body}");
         assert!(body.contains("3"), "must include count: {body}");
         assert!(
             body.contains("Vary arguments") || body.contains("vary arguments"),
             "must instruct LLM to vary or stop: {body}"
+        );
+    }
+
+    fn unknown_tracker_with(max_per_name: u32) -> UnknownToolTracker {
+        UnknownToolTracker::new(&LoopGuardConfig {
+            identical_call_max: 3,
+            backoff_initial_ms: 500,
+            backoff_max_ms: 5000,
+            unknown_tool_max_per_name: max_per_name,
+        })
+    }
+
+    #[test]
+    fn unknown_tool_first_attempt_returns_count_1() {
+        // Spec: a typo on a tool name must surface the soft "Unknown tool: X"
+        // error on the first attempt so the LLM can recover. The terminal
+        // refusal only fires after `unknown_tool_max_per_name` strikes.
+        let mut t = unknown_tracker_with(2);
+        assert_eq!(t.observe("fly_to_moon"), 1);
+        assert!(!t.should_refuse(1));
+    }
+
+    #[test]
+    fn unknown_tool_distinct_names_track_independently() {
+        // Spec: a hallucination on one name must not burn the budget for an
+        // unrelated hallucination on a different name. Prevents the
+        // pathological case where a typo on tool A pre-poisons tool B.
+        let mut t = unknown_tracker_with(2);
+        assert_eq!(t.observe("foo"), 1);
+        assert_eq!(t.observe("bar"), 1);
+        assert_eq!(t.observe("foo"), 2);
+        assert_eq!(t.observe("bar"), 2);
+    }
+
+    #[test]
+    fn unknown_tool_repeated_name_increments_to_refusal() {
+        // Spec: at unknown_tool_max_per_name, should_refuse must flip true.
+        // Proves the threshold is reachable and is the gate the dispatch
+        // call site relies on.
+        let mut t = unknown_tracker_with(2);
+        let first = t.observe("fly_to_moon");
+        let second = t.observe("fly_to_moon");
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert!(!t.should_refuse(first));
+        assert!(t.should_refuse(second));
+    }
+
+    #[test]
+    fn unknown_tool_reset_clears_per_name_state() {
+        let mut t = unknown_tracker_with(2);
+        let _ = t.observe("fly_to_moon");
+        let _ = t.observe("fly_to_moon");
+        t.reset();
+        assert_eq!(
+            t.observe("fly_to_moon"),
+            1,
+            "after reset the same name must read as a fresh first attempt"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_refusal_message_includes_name_and_count_and_does_not_exist() {
+        // Spec: the terminal refusal must carry the name, the count, and the
+        // stable phrase "does not exist" so the model sees a hard-stop
+        // signal distinct from the soft "Unknown tool" first-attempt error.
+        // This is the user-visible string that breaks the retry cycle —
+        // changing it shape-shifts behavior across providers.
+        let body = unknown_tool_refusal_message("fly_to_moon", 3);
+        assert!(body.contains("fly_to_moon"));
+        assert!(body.contains("3"));
+        assert!(
+            body.contains("does not exist"),
+            "stable phrase 'does not exist' must remain in the refusal — \
+             it is the signal the model uses to stop retrying: {body}"
         );
     }
 }

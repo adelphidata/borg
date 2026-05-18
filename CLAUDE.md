@@ -180,6 +180,8 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 `core/agent.rs` — streams LLM, parses tool calls, executes, loops until text-only. `<internal>` tags stripped in real-time. Messages persisted to the DB immediately. System prompt assembled per turn from IDENTITY + time + git + mode + memory + project docs + skills.
 
+**Loop safety guards.** Two per-turn trackers in `agent/tool_validation.rs` reset at every `run_agent_loop` start. `ToolCallRepeatTracker` hashes `(name, args)` and escalates identical streaks through `Allow → Backoff(jittered exponential, ±25%) → Block`; the hard cap (`loop_guard.identical_call_max`, default 3) stays the terminal safety net while backoff buys an operator-interrupt window. `UnknownToolTracker` counts per-name hallucinated-tool attempts; the first attempt surfaces the soft "Unknown tool: X" error (typo recovery), `loop_guard.unknown_tool_max_per_name` (default 2) flips to a terminal "does not exist" refusal so the model stops retrying. Together they bound the runaway-model failure mode that would otherwise burn the whole 25-iteration cap.
+
 ### Heartbeat
 
 Proactive check-ins (default 60m or cron, quiet 00:00–06:00). `~/.borg/HEARTBEAT.md` checklist. Honors gateway bindings. Suppresses empty/duplicate/ack-only. Trigger: `borg poke` / `/poke`. `heartbeat.min_interval_secs` (default 60, hard floor 1) is the operator/eval-suite knob for sub-minute firings — leave at 60 in production.

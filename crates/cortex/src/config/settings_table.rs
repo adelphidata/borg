@@ -259,6 +259,12 @@ define_settings! {
         "maintenance.vacuum_interval_days" => maintenance.vacuum_interval_days, parsed(u32);
         "maintenance.heal_action_budget" => maintenance.heal_action_budget, parsed(u32);
 
+        // ── Agent-loop safety (stuck-loop backoff + unknown-tool guard) ──
+        "loop_guard.identical_call_max" => loop_guard.identical_call_max, nonzero(u32);
+        "loop_guard.backoff_initial_ms" => loop_guard.backoff_initial_ms, parsed(u64);
+        "loop_guard.backoff_max_ms" => loop_guard.backoff_max_ms, parsed(u64);
+        "loop_guard.unknown_tool_max_per_name" => loop_guard.unknown_tool_max_per_name, nonzero(u32);
+
         // ── Subprocess process registry ──
         "process_registry.orphan_warn_secs" => process_registry.orphan_warn_secs, parsed(u64);
         "process_registry.orphan_fail_secs" => process_registry.orphan_fail_secs, parsed(u64);
@@ -629,6 +635,12 @@ define_settings! {
         "maintenance.security_squelch_ttl_days" => "Doctor squelch TTL (days)", Uint, "Maintenance";
         "maintenance.vacuum_interval_days" => "VACUUM interval (days)", Uint, "Maintenance";
         "maintenance.heal_action_budget" => "Heal action budget", Uint, "Maintenance";
+
+        // — Reliability — agent-loop safety guards
+        "loop_guard.identical_call_max" => "Identical-call cap", Uint, "Reliability";
+        "loop_guard.backoff_initial_ms" => "Repeat backoff initial (ms)", Uint, "Reliability";
+        "loop_guard.backoff_max_ms" => "Repeat backoff max (ms)", Uint, "Reliability";
+        "loop_guard.unknown_tool_max_per_name" => "Unknown-tool max / name", Uint, "Reliability";
 
         "process_registry.orphan_warn_secs" => "Subprocess warn age (s)", Uint, "Subprocesses";
         "process_registry.orphan_fail_secs" => "Subprocess fail age (s)", Uint, "Subprocesses";

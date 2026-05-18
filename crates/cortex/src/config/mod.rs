@@ -4,6 +4,7 @@ pub mod data;
 pub mod gateway;
 pub mod goals;
 pub mod llm;
+pub mod loop_guard;
 pub mod maintenance;
 pub mod mcp;
 pub mod media;
@@ -23,6 +24,7 @@ pub use data::*;
 pub use gateway::*;
 pub use goals::*;
 pub use llm::*;
+pub use loop_guard::*;
 pub use maintenance::*;
 pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
@@ -140,6 +142,9 @@ pub struct Config {
     /// Daily self-healing maintenance task retention settings.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Agent-loop safety guards: stuck-loop backoff + hallucinated-tool refusal.
+    #[serde(default)]
+    pub loop_guard: LoopGuardConfig,
     /// Per-session goal subsystem tunables.
     #[serde(default)]
     pub goals: GoalsConfig,

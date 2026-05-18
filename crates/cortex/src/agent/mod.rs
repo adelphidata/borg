@@ -226,10 +226,13 @@ fn should_nudge_for_response(
     text_content.trim().is_empty() && needs_response && !already_nudged
 }
 
-use tool_validation::repeated_tool_call_block_message;
 use tool_validation::{
     format_invalid_tool_result, has_unresolved_tool_calls, partition_tool_calls, InvalidToolCall,
     PartialToolCall, ToolCallRepeatTracker,
+};
+use tool_validation::{
+    repeated_tool_call_block_message, unknown_tool_refusal_message, RepeatDecision,
+    UnknownToolTracker,
 };
 
 /// Which LLM chain a particular agent instance routes through.
@@ -298,9 +301,17 @@ pub struct Agent {
     /// ignore the prompt instruction). Reset after the prompt is built and the
     /// tool list is selected.
     pub(super) setup_just_consumed: bool,
-    /// Tracks runs of identical consecutive tool calls within a turn.
-    /// Reset at the start of each `run_agent_loop`.
+    /// Tracks runs of identical consecutive tool calls within a turn —
+    /// drives the exponential-backoff-then-block ladder. Reset at the
+    /// start of each `run_agent_loop`.
     pub(super) tool_call_repeat: ToolCallRepeatTracker,
+    /// Per-turn count of attempts on each hallucinated tool name. The first
+    /// `unknown_tool_max_per_name - 1` attempts surface the soft
+    /// `"Unknown tool"` error so a typo can be corrected; the next strikes
+    /// substitute a terminal refusal so the model breaks out of the retry
+    /// cycle instead of burning iteration budget. Reset at the start of
+    /// each `run_agent_loop`.
+    pub(super) unknown_tool_tracker: UnknownToolTracker,
     /// Which LLM chain this agent's `make_llm_client_from_config` builds.
     /// `Primary` is the default — interactive turns and tool-spawned
     /// sub-agents always run on the user's primary chain. `Auxiliary` is
@@ -447,6 +458,8 @@ impl Agent {
         let git_repo_root = crate::git::find_repo_root(execution_context.workspace_cwd());
         let config_arc = Arc::new(config.clone());
         let session_id = common.session.meta.id.clone();
+        let tool_call_repeat = ToolCallRepeatTracker::new(&config.loop_guard);
+        let unknown_tool_tracker = UnknownToolTracker::new(&config.loop_guard);
         Self {
             config,
             history: Vec::new(),
@@ -477,7 +490,8 @@ impl Agent {
             ),
             previous_summary: None,
             setup_just_consumed: false,
-            tool_call_repeat: ToolCallRepeatTracker::default(),
+            tool_call_repeat,
+            unknown_tool_tracker,
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -1337,10 +1351,11 @@ impl Agent {
         // (always returns context_overflow) from looping forever.
         let mut reactive_compacted_this_turn = false;
 
-        // Reset identical-tool-call streak at the start of each user turn so
-        // a fresh request starting with a previously-blocked call is not
-        // immediately blocked again.
+        // Reset per-turn loop guards at the start of each user turn so a
+        // fresh request starting with a previously-blocked call or a
+        // previously-refused hallucinated name is not immediately blocked.
         self.tool_call_repeat.reset();
+        self.unknown_tool_tracker.reset();
 
         self.prepare_loop().await;
 
@@ -2137,17 +2152,31 @@ impl Agent {
             }
 
             // Identical-tool-call loop guard: must run BEFORE rate-guard so a
-            // blocked repeat does not consume rate-guard budget.
-            if self.tool_call_repeat.observe(name, args) {
-                let count = self.tool_call_repeat.consecutive_count;
-                warn!("Repeated identical tool call blocked: '{name}' x{count}");
-                self.metrics.tool_repeats_blocked.add(1, &[]);
-                self.skip_tool_call(
-                    &tool_call.id,
-                    &repeated_tool_call_block_message(name, count),
-                )
-                .await;
-                continue;
+            // blocked repeat does not consume rate-guard budget. Backoff
+            // delays the would-be-blocked call without surrendering the
+            // execution slot, buying an operator-interrupt window before the
+            // hard block fires.
+            match self.tool_call_repeat.observe(name, args) {
+                RepeatDecision::Allow => {}
+                RepeatDecision::Backoff(delay) => {
+                    let count = self.tool_call_repeat.consecutive_count;
+                    warn!(
+                        "Repeated identical tool call backoff: '{name}' x{count}, sleeping {}ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                RepeatDecision::Block => {
+                    let count = self.tool_call_repeat.consecutive_count;
+                    warn!("Repeated identical tool call blocked: '{name}' x{count}");
+                    self.metrics.tool_repeats_blocked.add(1, &[]);
+                    self.skip_tool_call(
+                        &tool_call.id,
+                        &repeated_tool_call_block_message(name, count),
+                    )
+                    .await;
+                    continue;
+                }
             }
 
             // Rate limiting
@@ -2291,15 +2320,29 @@ impl Agent {
             }
 
             // Identical-tool-call loop guard — must precede rate-guard so a
-            // blocked repeat does not consume rate-guard budget.
-            if self.tool_call_repeat.observe(&name, &args) {
-                let count = self.tool_call_repeat.consecutive_count;
-                warn!("Repeated identical tool call blocked: '{name}' x{count}");
-                self.metrics.tool_repeats_blocked.add(1, &[]);
-                slots.push(Slot::Skipped {
-                    reason: repeated_tool_call_block_message(&name, count),
-                });
-                continue;
+            // blocked repeat does not consume rate-guard budget. The sleep
+            // serializes the planning loop on a backoff hit; that's
+            // intentional — the whole point of the guard is to slow a
+            // runaway batch down before the hard cap fires.
+            match self.tool_call_repeat.observe(&name, &args) {
+                RepeatDecision::Allow => {}
+                RepeatDecision::Backoff(delay) => {
+                    let count = self.tool_call_repeat.consecutive_count;
+                    warn!(
+                        "Repeated identical tool call backoff (parallel): '{name}' x{count}, sleeping {}ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                RepeatDecision::Block => {
+                    let count = self.tool_call_repeat.consecutive_count;
+                    warn!("Repeated identical tool call blocked: '{name}' x{count}");
+                    self.metrics.tool_repeats_blocked.add(1, &[]);
+                    slots.push(Slot::Skipped {
+                        reason: repeated_tool_call_block_message(&name, count),
+                    });
+                    continue;
+                }
             }
 
             let action_type = classify_action(&name);
@@ -2476,9 +2519,17 @@ impl Agent {
                 // WASM plugin execution does async DB + FS + wasmtime compile + run.
                 // The wasmtime portion is CPU-bound; tolerate the in-band await
                 // here for now — the manifest's timeout_ms budget already bounds it.
+                // Plugin lookup runs BEFORE the unknown-tool counter so a
+                // legitimate plugin name never trips the guard.
                 let plugin_result = crate::wasm_plugins::try_execute_tool(&n, &raw_args).await?;
                 if let Some(output) = plugin_result {
                     return Ok(ToolOutput::Text(output));
+                }
+                let count = self.unknown_tool_tracker.observe(&n);
+                if self.unknown_tool_tracker.should_refuse(count) {
+                    warn!("Unknown tool '{n}' refused after {count} attempts this turn");
+                    self.metrics.unknown_tools_refused.add(1, &[]);
+                    return Ok(ToolOutput::Text(unknown_tool_refusal_message(&n, count)));
                 }
                 return Err(anyhow::anyhow!("Unknown tool: {n}"));
             }
@@ -3173,6 +3224,7 @@ mod tests {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            unknown_tool_tracker: UnknownToolTracker::default(),
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -3241,6 +3293,7 @@ mod tests {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            unknown_tool_tracker: UnknownToolTracker::default(),
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -3635,11 +3688,12 @@ mod tests {
     }
 
     #[test]
-    fn run_agent_loop_resets_tool_call_repeat_tracker() {
+    fn run_agent_loop_resets_per_turn_loop_guards() {
         // Source-grep guard: each user turn starts fresh. Without the
-        // reset, a turn that ended with a blocked streak would block the
-        // first identical call of the next turn — which the user may have
-        // explicitly asked for.
+        // reset, a turn that ended with a blocked streak (or a refused
+        // hallucinated tool) would block the first identical call /
+        // refuse the same name on the next turn — which the user may
+        // have explicitly asked for.
         let loop_idx = AGENT_RS_SRC
             .find("pub async fn run_agent_loop(")
             .expect("run_agent_loop must exist");
@@ -3648,6 +3702,10 @@ mod tests {
         assert!(
             body.contains("self.tool_call_repeat.reset()"),
             "run_agent_loop must reset the repeat tracker at start of turn"
+        );
+        assert!(
+            body.contains("self.unknown_tool_tracker.reset()"),
+            "run_agent_loop must reset the unknown-tool tracker at start of turn"
         );
     }
 
@@ -3929,6 +3987,7 @@ mod goal_integration_tests {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            unknown_tool_tracker: UnknownToolTracker::default(),
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
