@@ -117,6 +117,7 @@ impl Tunnel for CustomTunnel {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Failed to capture custom-tunnel stdout"))?;
+        let stderr = child.stderr.take();
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         let mut public_url = String::new();
 
@@ -169,6 +170,17 @@ impl Tunnel for CustomTunnel {
                 tracing::trace!("custom-tunnel: {line}");
             }
         });
+        // Drain stderr too — operator commands that write verbose progress
+        // (caddy, tailscale debug, ngrok-style logs) will fill the ~64 KiB
+        // pipe buffer and wedge the child after some uptime if we don't.
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let mut err_reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = err_reader.next_line().await {
+                    tracing::trace!("custom-tunnel[stderr]: {line}");
+                }
+            });
+        }
         let mut guard = self.proc.lock().await;
         *guard = Some(TunnelProcess {
             child,

@@ -140,7 +140,13 @@ impl Tunnel for NgrokTunnel {
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
                 let mut err_reader = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(_)) = err_reader.next_line().await {}
+                // ngrok emits operational info on stderr (rate-limit
+                // warnings, edge reconnects). Surface at trace so a
+                // RUST_LOG=trace session has the data without spamming
+                // operators by default.
+                while let Ok(Some(line)) = err_reader.next_line().await {
+                    tracing::trace!("ngrok[stderr]: {line}");
+                }
             });
         }
 

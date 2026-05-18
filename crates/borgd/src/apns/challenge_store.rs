@@ -12,7 +12,7 @@
 //! trade vs. persisting a moving table to disk.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
@@ -57,18 +57,19 @@ impl ChallengeStore {
             nonce: nonce.clone(),
             issued_at: Instant::now(),
         };
-        if let Ok(mut g) = self.inner.lock() {
-            g.insert(key.into(), entry);
-        }
+        // Recover from poison instead of dropping the insert: silently
+        // dropping it would return a nonce that subsequent consume() calls
+        // can never find, leaving the iOS client stuck in a "challenge
+        // missing" loop with no log trail explaining why.
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.insert(key.into(), entry);
         nonce
     }
 
     /// Consume the challenge for `key` if present and not expired.
     /// Returns the nonce bytes the App Attest verifier should match.
     pub fn consume(&self, key: &str) -> ConsumeResult {
-        let Ok(mut g) = self.inner.lock() else {
-            return ConsumeResult::Missing;
-        };
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match g.remove(key) {
             Some(entry) if entry.issued_at.elapsed() <= CHALLENGE_TTL => {
                 ConsumeResult::Ok(entry.nonce)
@@ -82,9 +83,8 @@ impl ChallengeStore {
     /// periodically — the store is keyed by paired-device fingerprint,
     /// so the working set stays small.
     pub fn purge_expired(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.retain(|_, e| e.issued_at.elapsed() <= CHALLENGE_TTL);
-        }
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.retain(|_, e| e.issued_at.elapsed() <= CHALLENGE_TTL);
     }
 }
 

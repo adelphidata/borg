@@ -131,16 +131,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wake_invalidates_token_when_client_returns_bad_device_token() {
-        // End-to-end through the DB layer: insert a row, run the trigger
-        // with config that causes the (stub) client to actually attempt,
-        // then verify the row state. Since the stub client returns
-        // Accepted (not BadDeviceToken), this test exercises the
-        // `Accepted` branch — the BadDeviceToken→invalidation path is
-        // covered by the unit-level `record` test. Tracks the real
-        // failure mode: an empty token table + enabled config must not
-        // crash, and an enabled config that successfully pushes must
-        // bump accepted, not skipped.
+    async fn wake_with_enabled_config_routes_through_stub_and_counts_skipped() {
+        // End-to-end through the DB layer with a complete config: the stub
+        // client returns SkippedNotConfigured (it will not lie about Apple
+        // delivery until the a2 client lands), so the wake walks the DB path,
+        // sees one token, "attempts" the push, and tallies it as skipped.
+        // Invariant under test: the trigger never invalidates a row on the
+        // stub path, and never invents an Accepted count.
         let cfg = ApnsConfig {
             enabled: true,
             bundle_id: Some("com.borg.ios".into()),
@@ -160,10 +157,10 @@ mod tests {
         .await
         .unwrap();
         let report = wake_paired_devices(&db, &cfg, "device-abc").await.unwrap();
-        assert_eq!(report.accepted, 1, "stub client must report Accepted");
-        assert_eq!(report.skipped, 0);
+        assert_eq!(report.accepted, 0, "stub client must NOT inflate accepted");
+        assert_eq!(report.skipped, 1, "stub returns SkippedNotConfigured");
         assert_eq!(report.invalidated, 0);
-        // The row must still be active (not invalidated by an Accepted push).
+        // The row must still be active (skipped is not invalidation).
         let active = db.list_active_apns_tokens("device-abc").await.unwrap();
         assert_eq!(active.len(), 1);
     }

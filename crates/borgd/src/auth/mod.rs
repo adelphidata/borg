@@ -21,7 +21,7 @@ use cortex::db::Database;
 
 pub use ca_bootstrap::{ensure_root_ca, ensure_server_cert, CaMaterial};
 pub use interceptor::{auth_interceptor, Principal};
-pub use san::derive_server_san;
+pub use san::{derive_server_san, derive_server_san_with_mdns};
 pub use tailscale_verifier::{
     TailscaleCliSource, TailscaleStatusSource, TailscaleVerifier, STATUS_CACHE_TTL,
 };

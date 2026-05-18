@@ -2,10 +2,11 @@
 
 use crate::auth::kek_factory::build_kek_store;
 use crate::auth::{
-    auth_interceptor, build_server_tls_config, build_verifier, derive_server_san, ensure_root_ca,
-    ensure_server_cert, ServerCertMaterial,
+    auth_interceptor, build_server_tls_config, build_verifier, ensure_root_ca, ensure_server_cert,
+    san::derive_server_san_with_mdns, ServerCertMaterial,
 };
 use crate::cost_events::CostEventBus;
+use crate::discovery::mdns::{default_instance_name, MdnsAnnouncer};
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
 use crate::grpc::session::SessionFactory;
@@ -299,10 +300,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     };
     // Derive the server-cert SAN from the bind address. Loopback (or no
     // `--listen`) gives `["localhost"]`; non-loopback requires the operator
-    // to set `BORG_DAEMON_TLS_SAN`. This replaces the historical hard-coded
-    // `["localhost"]` so binding to `--listen 0.0.0.0:PORT` fails loudly at
-    // startup instead of silently minting an unusable cert.
-    let san_dns = derive_server_san(cfg.listen_tcp.as_deref()).context("derive server cert SAN")?;
+    // to set `BORG_DAEMON_TLS_SAN`. When `discovery.mdns_enabled` is true,
+    // the local hostname + its `.local` form are auto-appended so LAN peers
+    // can pair without operator-side SAN edits.
+    let mdns_enabled = CoreConfig::load_from_db()
+        .await
+        .map(|c| c.discovery.mdns_enabled)
+        .unwrap_or(false);
+    let san_dns = derive_server_san_with_mdns(cfg.listen_tcp.as_deref(), mdns_enabled, || {
+        hostname::get()
+            .ok()
+            .and_then(|os| os.into_string().ok())
+            .map(|h| h.trim_matches('.').to_string())
+            .filter(|h| !h.is_empty())
+    })
+    .context("derive server cert SAN")?;
     let (server_cert_pem, server_key_pem, _server_serial) = {
         let g = pki_db.lock().await;
         ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
@@ -516,6 +528,30 @@ pub async fn run(cfg: Config) -> Result<()> {
 
         tracing::info!(addr = %parsed, "TCP listener with mTLS enabled");
 
+        // mDNS announce — only when enabled AND the bind is non-loopback
+        // (loopback peers can't reach a `.local` advertisement). The
+        // announcer holds an mdns-sd ServiceDaemon that drains on shutdown;
+        // we keep ownership in the function scope so it lives as long as
+        // the listener and we can `shutdown()` it explicitly.
+        let mdns_announcer = if mdns_enabled && !parsed.ip().is_loopback() {
+            match maybe_announce_mdns(
+                server_tls_material.server_cert_pem.as_bytes(),
+                parsed.port(),
+            )
+            .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        "mdns: announce skipped ({e}); LAN discovery disabled for this run"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut uds_rx = shutdown_tx.subscribe();
         let mut tcp_rx = shutdown_tx.subscribe();
         let serve_uds = make_uds_router().serve_with_incoming_shutdown(uds_stream, async move {
@@ -528,6 +564,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         let (uds_res, tcp_res) = tokio::join!(serve_uds, serve_tcp);
         uds_res.context("UDS server")?;
         tcp_res.context("TCP server")?;
+        if let Some(a) = mdns_announcer {
+            a.shutdown();
+        }
     } else {
         let mut rx = shutdown_tx.subscribe();
         make_uds_router()
@@ -540,6 +579,49 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     tracing::info!("borgd shutdown complete");
     Ok(())
+}
+
+/// Resolve hostname + cert fingerprint + bind IPs and publish an mDNS
+/// announcement for `_borgd._tcp.local.`. Returns `None` when the resolver
+/// can't surface a usable hostname (some minimal containers); callers
+/// treat that as a soft failure rather than blocking daemon start.
+async fn maybe_announce_mdns(server_cert_pem: &[u8], port: u16) -> Result<Option<MdnsAnnouncer>> {
+    let hostname_str = match hostname::get()
+        .ok()
+        .and_then(|os| os.into_string().ok())
+        .map(|h| h.trim_matches('.').to_string())
+        .filter(|h| !h.is_empty())
+    {
+        Some(h) => h,
+        None => {
+            tracing::debug!("mdns: hostname lookup returned none — skipping announce");
+            return Ok(None);
+        }
+    };
+    let fingerprint = identity::cert::fingerprint_of_pem(server_cert_pem)
+        .map_err(|e| anyhow::anyhow!("fingerprint server cert: {e}"))?;
+    let instance = default_instance_name(&hostname_str);
+    let ips = local_announce_ips();
+    let node_id = hostname_str.to_ascii_lowercase();
+    let announcer = MdnsAnnouncer::announce(
+        &instance,
+        &format!("{}.local", hostname_str.to_ascii_lowercase()),
+        port,
+        &ips,
+        &fingerprint,
+        &node_id,
+    )?;
+    Ok(Some(announcer))
+}
+
+/// Local IPs published in the announcement. Empty by default: mdns-sd
+/// will still publish the SRV/TXT records, and browsers resolve the
+/// `<host>.local.` A-record via standard mDNS hostname resolution. Adding
+/// explicit IPs would require an additional dep (`if-addrs`/`get_if_addrs`)
+/// and silently expose every NIC the host has — opt-in behavior worth a
+/// follow-up but not required for the SRV-discovery use case today.
+fn local_announce_ips() -> Vec<std::net::IpAddr> {
+    Vec::new()
 }
 
 /// Install SIGTERM and SIGINT handlers; broadcast on either. If a handler

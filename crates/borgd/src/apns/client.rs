@@ -69,11 +69,16 @@ impl ApnsClient {
             );
             return PushOutcome::SkippedNotConfigured;
         }
-        tracing::info!(
-            "apns: would push silent wake to {} (stub — a2 client not wired)",
+        // Stub: the a2 client is not wired yet. Reporting `Accepted` here
+        // would falsely tell operators that pushes are being delivered to
+        // Apple — a violation of the "if we report success it MUST actually
+        // succeed" invariant. Surface as Skipped + a warn-once so the
+        // telemetry counter and operator log line both make the gap visible.
+        tracing::warn!(
+            "apns: stub client — push to {} NOT delivered (a2 client not wired; track APNs follow-up in docs/ROADMAP.md)",
             redact_token(device_token)
         );
-        PushOutcome::Accepted
+        PushOutcome::SkippedNotConfigured
     }
 }
 
@@ -113,14 +118,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_with_complete_config_returns_accepted_in_stub_mode() {
-        // Wired-but-stub path: until the a2 client lands, a complete
-        // config should observe Accepted (rather than Skipped) so test
-        // harnesses exercising the trigger see the expected
-        // "push attempted" telemetry.
+    async fn push_with_complete_config_still_returns_skipped_until_a2_wired() {
+        // Stub-vs-real safety net: even with a complete config, the stub
+        // client MUST NOT report Accepted — that would lie about delivery
+        // to APNs and inflate the operator's "last push" counter. Once the
+        // a2 client lands this test flips to expect Accepted; until then,
+        // SkippedNotConfigured is the only honest answer.
         let client = ApnsClient::new(complete_config());
         let outcome = client.send_silent_push("abcd1234").await;
-        assert_eq!(outcome, PushOutcome::Accepted);
+        assert_eq!(outcome, PushOutcome::SkippedNotConfigured);
     }
 
     #[test]

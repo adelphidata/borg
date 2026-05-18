@@ -83,12 +83,16 @@ impl TunnelSupervisor {
     /// the snapshot's `last_error`, so a UI that only reads `status()`
     /// still sees what went wrong.
     pub async fn apply(&self, config: &TunnelConfig) -> Result<TunnelSnapshot> {
-        let mut inner = self.inner.lock().await;
-
+        // Hold the lock only for cheap state inspection + handle hand-off.
+        // The actual `tunnel.start(...).await` runs unlocked (cloudflared
+        // can take 30s, ngrok ~15s); without this split, a concurrent
+        // `TunnelStatus` RPC would block on the same Mutex for the full
+        // start deadline.
         let tunnel_opt = match create_tunnel(config) {
             Ok(opt) => opt,
             Err(e) => {
                 let msg = format!("{e}");
+                let mut inner = self.inner.lock().await;
                 inner.snapshot = TunnelSnapshot {
                     provider: config.provider.to_string(),
                     running: false,
@@ -101,39 +105,54 @@ impl TunnelSupervisor {
 
         let Some(tunnel) = tunnel_opt else {
             // Provider is "none" — tear down any previously-running tunnel.
-            if let Some(prev) = inner.handle.take() {
+            let prev = {
+                let mut inner = self.inner.lock().await;
+                inner.handle.take()
+            };
+            if let Some(prev) = prev {
                 if let Err(e) = prev.stop().await {
                     tracing::warn!("tunnel stop on provider-change failed: {e}");
                 }
             }
+            let mut inner = self.inner.lock().await;
             inner.snapshot = TunnelSnapshot::unconfigured();
             return Ok(inner.snapshot.clone());
         };
 
-        // If a handle already exists and reports the same provider name,
-        // leave it alone — the operator may have edited an unrelated knob.
-        if let Some(existing) = inner.handle.as_ref() {
-            if existing.name() == tunnel.name() && existing.public_url().is_some() {
-                inner.snapshot = TunnelSnapshot {
-                    provider: existing.name().to_string(),
-                    running: true,
-                    public_url: existing.public_url().unwrap_or_default(),
-                    last_error: String::new(),
-                };
-                return Ok(inner.snapshot.clone());
+        // Same-provider short-circuit + take previous handle out of the
+        // slot, both under one brief lock acquisition.
+        let (prev, local_host, local_port) = {
+            let mut inner = self.inner.lock().await;
+            if let Some(existing) = inner.handle.as_ref() {
+                if existing.name() == tunnel.name() && existing.public_url().is_some() {
+                    inner.snapshot = TunnelSnapshot {
+                        provider: existing.name().to_string(),
+                        running: true,
+                        public_url: existing.public_url().unwrap_or_default(),
+                        last_error: String::new(),
+                    };
+                    return Ok(inner.snapshot.clone());
+                }
             }
-        }
+            (
+                inner.handle.take(),
+                inner.local_host.clone(),
+                inner.local_port,
+            )
+        };
 
-        // Otherwise: stop the old one (if any), start the new one.
-        if let Some(prev) = inner.handle.take() {
+        if let Some(prev) = prev {
             if let Err(e) = prev.stop().await {
                 tracing::warn!("tunnel stop before re-apply failed: {e}");
             }
         }
 
-        let local_host = inner.local_host.clone();
-        let local_port = inner.local_port;
-        match tunnel.start(&local_host, local_port).await {
+        // Unlocked: external subprocess spawn + line-reading deadlines.
+        let start_result = tunnel.start(&local_host, local_port).await;
+
+        // Re-acquire the lock briefly to record outcome.
+        let mut inner = self.inner.lock().await;
+        match start_result {
             Ok(url) => {
                 let provider = tunnel.name().to_string();
                 inner.handle = Some(tunnel);
