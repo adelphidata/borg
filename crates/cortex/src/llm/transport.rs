@@ -157,7 +157,8 @@ pub(crate) fn build_anthropic_request(
     let cache_marker = build_cache_control_marker(cache_cfg.ttl);
     let (cache_system_eff, cache_tools_eff, rolling_eff) = cache_cfg.effective_layout();
 
-    let mut body = if let Some(budget) = request.llm_config.thinking.budget_tokens() {
+    let effective_thinking = request.llm_config.effective_thinking(request.model);
+    let mut body = if let Some(budget) = effective_thinking.anthropic_budget_tokens() {
         let max_tokens = request.llm_config.max_tokens.max(budget + 1024);
         serde_json::json!({
             "model": request.model,
@@ -839,13 +840,13 @@ impl Transport for VertexAnthropicTransport {
     }
 }
 
-fn build_openai_request(
+pub(crate) fn build_openai_request(
     request: &TransportRequest<'_>,
     stream: bool,
 ) -> serde_json::Result<serde_json::Value> {
     let reasoning_effort = request
         .llm_config
-        .thinking
+        .effective_thinking(request.model)
         .openai_reasoning_effort()
         .map(String::from);
     let chat_request = ChatRequest {

@@ -23,6 +23,7 @@ define_settings! {
         "llm.vertex_project" => llm.vertex_project, opt_string;
         "llm.vertex_location" => llm.vertex_location, opt_string;
         "llm.thinking" => llm.thinking, json_quoted("Invalid thinking level");
+        "llm.thinking_overrides" => llm.thinking_overrides, json_count("overrides");
         "llm.fallback" => llm.fallback, json_count("providers");
         "llm.api_keys" => llm.api_keys, json_count("keys");
 
@@ -573,6 +574,7 @@ define_settings! {
 
         // — Conversation — day-to-day tuning
         "max_tokens" => "Response length", Uint, "Conversation";
+        "llm.thinking" => "Thinking level", Select, "Conversation";
         "conversation.show_thinking" => "Show reasoning", Bool, "Conversation";
         "conversation.max_iterations" => "Max agent steps", Uint, "Conversation";
         "conversation.concurrent_tools.enabled" => "Parallel tools", Bool, "Conversation";
@@ -685,6 +687,12 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
     ),
     ("security.verifier", &["tofu", "tailscale"]),
     ("gateway.group_activation", &["mention", "always"]),
+    (
+        "llm.thinking",
+        &[
+            "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max",
+        ],
+    ),
 ];
 
 /// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in

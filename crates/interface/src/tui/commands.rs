@@ -182,6 +182,13 @@ impl App<'_> {
             return Some(self.cmd_goal_dispatch(rest.trim()));
         }
 
+        if trimmed == "/think" {
+            return Some(self.cmd_think_show());
+        }
+        if let Some(rest) = trimmed.strip_prefix("/think ") {
+            return Some(self.cmd_think_set(rest.trim()));
+        }
+
         if let Some(question) = cortex::agent::parse_btw_command(trimmed) {
             if question.is_empty() {
                 self.push_system_message(
@@ -310,7 +317,8 @@ impl App<'_> {
              /settings  - Configure settings\n  \
              /usage [days] - Token spend, model + tool usage over a window (default 30 days)\n  \
              /mode      - Switch collaboration mode (default/execute/plan)\n  \
-             /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n\
+             /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n  \
+             /think [lvl] - Show or set thinking level (off|minimal|low|medium|high|xhigh|adaptive|max)\n\
              \n  \
              /btw <q>   - Ask a side question (ephemeral, not persisted)\n  \
              /compact   - Compact conversation history\n  \
@@ -611,6 +619,81 @@ impl App<'_> {
                 "Usage: /settings <key> <value>\nUse /settings to see current values.".to_string(),
             );
             Ok(AppAction::Continue)
+        }
+    }
+
+    /// `/think` (bare) — show the current global thinking level, any per-
+    /// model overrides, and the effective level resolved for the currently
+    /// selected model.
+    fn cmd_think_show(&mut self) -> Result<AppAction> {
+        let global = serde_json::to_value(&self.config.llm.thinking)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "off".to_string());
+        let model = if self.config.llm.model.is_empty() {
+            "<none>".to_string()
+        } else {
+            self.config.llm.model.clone()
+        };
+        let effective =
+            serde_json::to_value(self.config.llm.effective_thinking(&self.config.llm.model))
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "off".to_string());
+
+        let mut msg = format!("Thinking: global = {global}, effective for {model} = {effective}");
+        if !self.config.llm.thinking_overrides.is_empty() {
+            msg.push_str("\nPer-model overrides:");
+            for (needle, level) in &self.config.llm.thinking_overrides {
+                let level_str = serde_json::to_value(level)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                msg.push_str(&format!("\n  {needle} -> {level_str}"));
+            }
+        }
+        msg.push_str("\nSet with: /think <off|minimal|low|medium|high|xhigh|adaptive|max>");
+        self.push_system_message(msg);
+        Ok(AppAction::Continue)
+    }
+
+    /// `/think <level>` — set the global `llm.thinking` setting, persisting
+    /// to the DB so it survives restart (parity with `/settings llm.thinking
+    /// <level>`). Rejected levels surface the accepted list rather than
+    /// silently succeeding.
+    fn cmd_think_set(&mut self, level: &str) -> Result<AppAction> {
+        const ACCEPTED: &str = "off|minimal|low|medium|high|xhigh|adaptive|max";
+        let level = level.trim().to_ascii_lowercase();
+        if level.is_empty() {
+            self.push_system_message(format!("Usage: /think <{ACCEPTED}>"));
+            return Ok(AppAction::Continue);
+        }
+        match self.config.apply_setting("llm.thinking", &level) {
+            Ok(_) => {
+                // Persist to daemon best-effort; the in-process Config is
+                // already updated. Pattern mirrors cmd_model_set.
+                let level_owned = level.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let client = self.client.clone();
+                    handle.spawn(async move {
+                        let mut c = client.lock().await;
+                        if let Err(e) = c.set_setting("llm.thinking", &level_owned).await {
+                            tracing::warn!("cmd_think_set: failed to persist llm.thinking: {e}");
+                        }
+                    });
+                }
+                self.push_system_message(format!("Updated: llm.thinking = {level}"));
+                Ok(AppAction::UpdateSetting {
+                    key: "llm.thinking".to_string(),
+                    value: level,
+                })
+            }
+            Err(_) => {
+                self.push_system_message(format!(
+                    "Error: '{level}' is not a thinking level.\nAccepted: {ACCEPTED}"
+                ));
+                Ok(AppAction::Continue)
+            }
         }
     }
 

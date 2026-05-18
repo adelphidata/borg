@@ -45,17 +45,14 @@ impl Agent {
         if !self.config.llm.model.is_empty() {
             runtime_parts.push(format!("model={}", self.config.llm.model));
         }
-        let thinking = if self.config.llm.thinking.is_enabled() {
-            match self.config.llm.thinking {
-                crate::config::ThinkingLevel::Low => "low",
-                crate::config::ThinkingLevel::Medium => "medium",
-                crate::config::ThinkingLevel::High => "high",
-                crate::config::ThinkingLevel::Xhigh => "xhigh",
-                crate::config::ThinkingLevel::Off => "off",
-            }
-        } else {
-            "off"
-        };
+        // Render the level via serde so new variants (minimal, adaptive, max)
+        // pick up automatically. `serde_json::to_value` always succeeds for
+        // a simple enum; fall back defensively just in case.
+        let effective = self.config.llm.effective_thinking(&self.config.llm.model);
+        let thinking = serde_json::to_value(&effective)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "off".to_string());
         runtime_parts.push(format!("thinking={thinking}"));
         if let Some(ref tz) = self.config.user.timezone {
             runtime_parts.push(format!("timezone={tz}"));
@@ -181,13 +178,14 @@ impl Agent {
 
     /// Build the reasoning format section (conditional on thinking level).
     pub(super) fn build_reasoning_section(&self) -> String {
-        let level = match self.config.llm.thinking {
-            crate::config::ThinkingLevel::Off => return String::new(),
-            crate::config::ThinkingLevel::Low => "low",
-            crate::config::ThinkingLevel::Medium => "medium",
-            crate::config::ThinkingLevel::High => "high",
-            crate::config::ThinkingLevel::Xhigh => "xhigh",
-        };
+        let effective = self.config.llm.effective_thinking(&self.config.llm.model);
+        if !effective.is_enabled() {
+            return String::new();
+        }
+        let level = serde_json::to_value(&effective)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "off".to_string());
         format!(
             "\n<reasoning_format>\n\
             Extended thinking is enabled (level: {level}). \

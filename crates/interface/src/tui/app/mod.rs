@@ -3460,4 +3460,111 @@ mod tests {
         use super::events::summarize_tool_args;
         assert_eq!(summarize_tool_args("run_shell", ""), "");
     }
+
+    // ── /think slash command ──
+
+    #[test]
+    fn think_bare_shows_current_and_effective_levels() {
+        // `/think` must report both the global setting AND what the active
+        // model actually gets — the resolution path is the whole point of
+        // per-model overrides; reporting only the global value would hide
+        // when the override flipped the effective level.
+        let mut config = Config::default();
+        config.llm.model = "claude-sonnet-4".to_string();
+        config.llm.thinking = cortex::config::ThinkingLevel::Off;
+        config
+            .llm
+            .thinking_overrides
+            .insert("claude".to_string(), cortex::config::ThinkingLevel::High);
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, None, client, None);
+
+        let result = app.try_handle_command("/think").expect("handled").unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("system message printed");
+        assert!(sys.contains("global = off"), "missing global: {sys}");
+        assert!(
+            sys.contains("effective for claude-sonnet-4 = high"),
+            "missing effective resolution: {sys}"
+        );
+        assert!(
+            sys.contains("claude -> high"),
+            "missing per-model override listing: {sys}"
+        );
+    }
+
+    #[test]
+    fn think_set_persists_each_accepted_level() {
+        // Every documented level must round-trip through apply_setting into
+        // the in-process config. A regression in `json_quoted` parsing or
+        // serde rename would silently drop variants here.
+        for level in [
+            "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max",
+        ] {
+            let config = Config::default();
+            let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+            let mut app = App::new(config, None, None, None, client, None);
+
+            let result = app
+                .try_handle_command(&format!("/think {level}"))
+                .expect("handled")
+                .unwrap();
+            match result {
+                AppAction::UpdateSetting { key, value } => {
+                    assert_eq!(key, "llm.thinking", "wrong key for {level}");
+                    assert_eq!(value, level, "wrong value for {level}");
+                }
+                _ => panic!("/think {level} did not return UpdateSetting"),
+            }
+            let parsed: cortex::config::ThinkingLevel =
+                serde_json::from_value(serde_json::json!(level)).unwrap();
+            assert_eq!(
+                app.config.llm.thinking, parsed,
+                "in-process config not updated for {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn think_set_rejects_unknown_level_with_accepted_list() {
+        // Silent success on a typo would mislead the operator — they'd
+        // think they enabled adaptive thinking but actually nothing
+        // changed. The error message MUST surface the accepted list so
+        // the operator can fix the typo without re-reading docs.
+        let config = Config::default();
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, None, client, None);
+
+        let result = app
+            .try_handle_command("/think ultra")
+            .expect("handled")
+            .unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("error message printed");
+        assert!(sys.contains("ultra"), "error should echo bad input: {sys}");
+        assert!(
+            sys.contains("off|minimal|low|medium|high|xhigh|adaptive|max"),
+            "error must list accepted values: {sys}"
+        );
+        assert_eq!(
+            app.config.llm.thinking,
+            cortex::config::ThinkingLevel::Off,
+            "rejected input must NOT mutate config"
+        );
+    }
+
+    #[test]
+    fn think_empty_arg_shows_usage_not_error() {
+        // `/think ` (trailing space, no level) is an obvious near-miss —
+        // surface the usage line instead of pretending the user typed
+        // a bad level.
+        let config = Config::default();
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, None, client, None);
+
+        let result = app.try_handle_command("/think ").expect("handled").unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("usage line printed");
+        assert!(sys.starts_with("Usage: /think"), "got: {sys}");
+    }
 }

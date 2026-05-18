@@ -761,6 +761,12 @@ impl LlmClient {
         // latency tax for nothing. Force `Off` so primary's
         // `thinking="high"` doesn't bleed into nightly cron.
         synthetic.thinking = crate::config::llm::ThinkingLevel::Off;
+        // Per-model thinking overrides target the primary chain; for aux
+        // we want a hard Off across every aux model. Clearing the map
+        // prevents a primary-tuned override (e.g. "gpt-5"→High) from
+        // re-enabling thinking on the aux head when the picker happens to
+        // pick a same-prefix model.
+        synthetic.thinking_overrides.clear();
         // Block re-entry: a synthetic config feeding back through
         // `for_auxiliary` would loop. The aux client only ever has a
         // primary head + its own fallback chain.

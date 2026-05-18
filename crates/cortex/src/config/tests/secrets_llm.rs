@@ -447,28 +447,13 @@ base_url = "https://proxy.example.com/v1/chat/completions"
 fn thinking_level_defaults_to_off() {
     let cfg = Config::default();
     assert_eq!(cfg.llm.thinking, ThinkingLevel::Off);
-    assert!(cfg.llm.thinking.budget_tokens().is_none());
+    assert!(cfg.llm.thinking.anthropic_budget_tokens().is_none());
     assert!(cfg.llm.thinking.openai_reasoning_effort().is_none());
     assert!(!cfg.llm.thinking.is_enabled());
-}
-
-#[test]
-fn thinking_level_budget_tokens() {
-    assert_eq!(ThinkingLevel::Low.budget_tokens(), Some(1024));
-    assert_eq!(ThinkingLevel::Medium.budget_tokens(), Some(4096));
-    assert_eq!(ThinkingLevel::High.budget_tokens(), Some(16384));
-    assert_eq!(ThinkingLevel::Xhigh.budget_tokens(), Some(32768));
-}
-
-#[test]
-fn thinking_level_openai_reasoning_effort() {
-    assert_eq!(ThinkingLevel::Low.openai_reasoning_effort(), Some("low"));
-    assert_eq!(
-        ThinkingLevel::Medium.openai_reasoning_effort(),
-        Some("medium")
+    assert!(
+        cfg.llm.thinking_overrides.is_empty(),
+        "no per-model overrides by default"
     );
-    assert_eq!(ThinkingLevel::High.openai_reasoning_effort(), Some("high"));
-    assert_eq!(ThinkingLevel::Xhigh.openai_reasoning_effort(), Some("high"));
 }
 
 #[test]
@@ -493,7 +478,7 @@ fn parse_thinking_level_in_config_toml() {
 
     let cfg = Config::load_from(&config_path).unwrap();
     assert_eq!(cfg.llm.thinking, ThinkingLevel::Medium);
-    assert_eq!(cfg.llm.thinking.budget_tokens(), Some(4096));
+    assert_eq!(cfg.llm.thinking.anthropic_budget_tokens(), Some(4096));
 }
 
 #[test]

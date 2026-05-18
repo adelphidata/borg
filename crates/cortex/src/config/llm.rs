@@ -8,45 +8,87 @@ use crate::constants::{
 };
 use crate::security::secrets_resolve::SecretRef;
 
-/// Extended thinking level for supported LLM providers.
+/// Extended thinking level. Mapped per-provider at request-build time:
+/// Anthropic `budget_tokens`, OpenAI `reasoning_effort`, Gemini 2.5
+/// `thinkingBudget` (integer; `-1` is the dynamic-thinking sentinel), and
+/// Gemini 3 `thinkingLevel` (`"LOW"`/`"MEDIUM"`/`"HIGH"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     #[default]
     Off,
-    /// 1024 budget tokens (Anthropic) / low effort (OpenAI)
+    /// Smallest enabled budget. OpenAI: `"minimal"` (GPT-5 only).
+    Minimal,
     Low,
-    /// 4096 budget tokens (Anthropic) / medium effort (OpenAI)
     Medium,
-    /// 16384 budget tokens (Anthropic) / high effort (OpenAI)
     High,
-    /// 32768 budget tokens (Anthropic) / high effort (OpenAI)
     Xhigh,
+    /// Let the provider decide. Gemini 2.5: dynamic (`thinkingBudget: -1`).
+    /// Anthropic/OpenAI have no native adaptive mode — mapped to a moderate
+    /// default so the model can still spend tokens if it chooses.
+    Adaptive,
+    /// Provider's practical ceiling.
+    Max,
 }
 
 impl ThinkingLevel {
-    /// Budget tokens for Anthropic's thinking parameter. Returns `None` when thinking is off.
-    pub fn budget_tokens(&self) -> Option<u32> {
+    /// Anthropic `budget_tokens`. `None` when thinking is off. Minimum
+    /// Anthropic accepts is 1024 so Minimal and Low both produce 1024 (they
+    /// differ on OpenAI reasoning effort only). Existing Low/Medium/High/Xhigh
+    /// budgets are unchanged from the pre-eight-level mapping so operator
+    /// config keeps its old meaning.
+    pub fn anthropic_budget_tokens(&self) -> Option<u32> {
         match self {
             Self::Off => None,
+            Self::Minimal => Some(1024),
             Self::Low => Some(1024),
             Self::Medium => Some(4096),
             Self::High => Some(16384),
             Self::Xhigh => Some(32768),
+            Self::Adaptive => Some(8192),
+            Self::Max => Some(64000),
         }
     }
 
-    /// Reasoning effort string for OpenAI o-series models. Returns `None` when thinking is off.
-    pub fn openai_reasoning_effort(&self) -> Option<&str> {
+    /// OpenAI `reasoning_effort` string for o-series / GPT-5 models. `None`
+    /// when thinking is off.
+    pub fn openai_reasoning_effort(&self) -> Option<&'static str> {
         match self {
             Self::Off => None,
+            Self::Minimal => Some("minimal"),
             Self::Low => Some("low"),
-            Self::Medium => Some("medium"),
-            Self::High | Self::Xhigh => Some("high"),
+            Self::Medium | Self::Adaptive => Some("medium"),
+            Self::High | Self::Xhigh | Self::Max => Some("high"),
         }
     }
 
-    /// Returns true if extended thinking is active (any level other than Off).
+    /// Gemini 2.5 `thinkingBudget` (integer). `None` when thinking is off
+    /// (caller omits the entire `thinkingConfig`). `-1` is Gemini's
+    /// dynamic-thinking sentinel — let the model decide how much to spend.
+    pub fn gemini_2_5_budget(&self) -> Option<i32> {
+        match self {
+            Self::Off => None,
+            Self::Minimal => Some(512),
+            Self::Low => Some(2048),
+            Self::Medium => Some(8192),
+            Self::High => Some(16384),
+            Self::Xhigh => Some(24576),
+            Self::Adaptive => Some(-1),
+            Self::Max => Some(24576),
+        }
+    }
+
+    /// Gemini 3 `thinkingLevel` enum. `None` when thinking is off.
+    pub fn gemini_3_level(&self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Minimal | Self::Low => Some("LOW"),
+            Self::Medium | Self::Adaptive => Some("MEDIUM"),
+            Self::High | Self::Xhigh | Self::Max => Some("HIGH"),
+        }
+    }
+
+    /// True for any variant other than `Off`.
     pub fn is_enabled(&self) -> bool {
         *self != Self::Off
     }
@@ -120,10 +162,20 @@ pub struct LlmConfig {
     /// Unset = back-compat: aux callers fall through to the primary chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aux: Option<AuxLlmConfig>,
-    /// Extended thinking level: off, low, medium, high, xhigh.
-    /// Enables native thinking for supported providers (Anthropic, OpenAI o-series).
+    /// Extended thinking level: off / minimal / low / medium / high / xhigh
+    /// / adaptive / max. Enables native thinking for supported providers
+    /// (Anthropic extended thinking, OpenAI reasoning effort, Gemini
+    /// `thinkingConfig`).
     #[serde(default)]
     pub thinking: ThinkingLevel,
+    /// Per-model overrides for `thinking`. Key is a case-insensitive
+    /// substring of the model id (e.g. `"gpt-5"`, `"claude"`, `"gemini-2.5"`).
+    /// Resolution at request time: first matching override wins (deterministic
+    /// BTreeMap ordering) → `llm.thinking` → `Off`. Lets an operator run a
+    /// fast non-thinking default globally while still extracting reasoning
+    /// out of specific models.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thinking_overrides: std::collections::BTreeMap<String, ThinkingLevel>,
     /// Path to the `claude` CLI binary (auto-detected if omitted).
     /// Only used when provider is `claude-cli`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,6 +392,7 @@ impl Default for LlmConfig {
             fallback: Vec::new(),
             aux: None,
             thinking: ThinkingLevel::Off,
+            thinking_overrides: std::collections::BTreeMap::new(),
             claude_cli_path: None,
             cache: PromptCacheConfig::default(),
             credential_strategy: crate::llm::credential_pool::CredentialStrategy::default(),
@@ -348,6 +401,36 @@ impl Default for LlmConfig {
             proactive_rate_limit_threshold_pct: default_proactive_rate_limit_threshold_pct(),
             proactive_rate_limit_min_window_secs: default_proactive_rate_limit_min_window_secs(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// Resolve the thinking level for `model`: most-specific matching
+    /// `thinking_overrides` entry → global `thinking` → `Off`.
+    ///
+    /// Match is case-insensitive substring. When multiple needles match,
+    /// the **longest** one wins (operator intent: a `gemini-3` override is
+    /// more specific than a `gemini` override and should beat it). Ties on
+    /// length fall back to BTreeMap key order so resolution stays
+    /// deterministic.
+    pub fn effective_thinking(&self, model: &str) -> ThinkingLevel {
+        let m = model.to_ascii_lowercase();
+        let mut best: Option<(usize, &ThinkingLevel)> = None;
+        for (needle, level) in &self.thinking_overrides {
+            if needle.is_empty() {
+                continue;
+            }
+            if !m.contains(&needle.to_ascii_lowercase()) {
+                continue;
+            }
+            let len = needle.len();
+            match best {
+                Some((best_len, _)) if best_len >= len => {}
+                _ => best = Some((len, level)),
+            }
+        }
+        best.map(|(_, lvl)| lvl.clone())
+            .unwrap_or_else(|| self.thinking.clone())
     }
 }
 
@@ -582,33 +665,260 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_budget_tokens() {
-        assert_eq!(ThinkingLevel::Off.budget_tokens(), None);
-        assert_eq!(ThinkingLevel::Low.budget_tokens(), Some(1024));
-        assert_eq!(ThinkingLevel::Medium.budget_tokens(), Some(4096));
-        assert_eq!(ThinkingLevel::High.budget_tokens(), Some(16384));
-        assert_eq!(ThinkingLevel::Xhigh.budget_tokens(), Some(32768));
+    fn thinking_level_parses_all_eight_variants() {
+        // Each lowercase serde name MUST round-trip back to the matching
+        // variant. Guards against accidental rename/removal that would
+        // silently downgrade unknown levels to Off via #[default].
+        let cases = [
+            ("off", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("xhigh", ThinkingLevel::Xhigh),
+            ("adaptive", ThinkingLevel::Adaptive),
+            ("max", ThinkingLevel::Max),
+        ];
+        for (s, expected) in cases {
+            let parsed: ThinkingLevel = serde_json::from_value(serde_json::json!(s))
+                .unwrap_or_else(|e| panic!("parse {s}: {e}"));
+            assert_eq!(parsed, expected, "round-trip for {s}");
+        }
     }
 
     #[test]
-    fn thinking_level_openai_reasoning_effort() {
-        assert_eq!(ThinkingLevel::Off.openai_reasoning_effort(), None);
-        assert_eq!(ThinkingLevel::Low.openai_reasoning_effort(), Some("low"));
+    fn thinking_level_rejects_unknown_string() {
+        // A typo in `llm.thinking` must surface as an error rather than
+        // silently parsing to Off (which would hide misconfiguration and
+        // mislead the operator into thinking thinking is enabled when it
+        // is not).
+        let result: Result<ThinkingLevel, _> = serde_json::from_value(serde_json::json!("ultra"));
+        assert!(result.is_err(), "unknown level should not parse");
+    }
+
+    #[test]
+    fn thinking_level_anthropic_budget_non_decreasing() {
+        // Going up the level scale must never *decrease* the Anthropic
+        // budget — an operator who upgrades from Medium to High shouldn't
+        // suddenly get fewer thinking tokens. Minimal and Low both pin to
+        // 1024 because Anthropic's minimum budget_tokens is 1024; they
+        // differ only on OpenAI's reasoning_effort surface. Adaptive is off
+        // this chain (provider-best moderate default) and is asserted
+        // separately.
+        let chain = [
+            (ThinkingLevel::Off, None),
+            (ThinkingLevel::Minimal, Some(1024_u32)),
+            (ThinkingLevel::Low, Some(1024)),
+            (ThinkingLevel::Medium, Some(4096)),
+            (ThinkingLevel::High, Some(16384)),
+            (ThinkingLevel::Xhigh, Some(32768)),
+            (ThinkingLevel::Max, Some(64000)),
+        ];
+        let mut last = 0_u32;
+        for (lvl, expected) in chain {
+            assert_eq!(lvl.anthropic_budget_tokens(), expected, "{lvl:?}");
+            if let Some(b) = expected {
+                assert!(b >= last, "{lvl:?} budget {b} must not regress from {last}");
+                last = b;
+            }
+        }
         assert_eq!(
-            ThinkingLevel::Medium.openai_reasoning_effort(),
+            ThinkingLevel::Adaptive.anthropic_budget_tokens(),
+            Some(8192),
+            "Adaptive is a moderate provider-best default on Anthropic"
+        );
+    }
+
+    #[test]
+    fn thinking_level_openai_minimal_maps_to_minimal_string() {
+        // GPT-5 added a "minimal" reasoning_effort tier; map our Minimal
+        // variant onto it exactly rather than aliasing to "low" "to be safe".
+        // Aliasing would lose the cost/latency win that "minimal" provides.
+        assert_eq!(
+            ThinkingLevel::Minimal.openai_reasoning_effort(),
+            Some("minimal")
+        );
+        assert_eq!(
+            ThinkingLevel::Adaptive.openai_reasoning_effort(),
             Some("medium")
         );
-        assert_eq!(ThinkingLevel::High.openai_reasoning_effort(), Some("high"));
-        assert_eq!(ThinkingLevel::Xhigh.openai_reasoning_effort(), Some("high"));
+        assert_eq!(ThinkingLevel::Max.openai_reasoning_effort(), Some("high"));
+    }
+
+    #[test]
+    fn thinking_level_gemini_2_5_adaptive_is_dynamic_sentinel() {
+        // Gemini 2.5 treats `thinkingBudget: -1` as dynamic thinking (model
+        // decides). Anyone "fixing" the negative number to 0 would silently
+        // disable thinking on Adaptive.
+        assert_eq!(
+            ThinkingLevel::Adaptive.gemini_2_5_budget(),
+            Some(-1),
+            "Adaptive must serialize as Gemini's dynamic-thinking sentinel"
+        );
+        assert_eq!(ThinkingLevel::Off.gemini_2_5_budget(), None);
+        assert_eq!(ThinkingLevel::Max.gemini_2_5_budget(), Some(24576));
+    }
+
+    #[test]
+    fn thinking_level_gemini_3_buckets() {
+        // Gemini 3 only accepts LOW / MEDIUM / HIGH. Our 8 variants collapse
+        // into those three buckets. Boundary moves must be deliberate.
+        let cases = [
+            (ThinkingLevel::Off, None),
+            (ThinkingLevel::Minimal, Some("LOW")),
+            (ThinkingLevel::Low, Some("LOW")),
+            (ThinkingLevel::Medium, Some("MEDIUM")),
+            (ThinkingLevel::Adaptive, Some("MEDIUM")),
+            (ThinkingLevel::High, Some("HIGH")),
+            (ThinkingLevel::Xhigh, Some("HIGH")),
+            (ThinkingLevel::Max, Some("HIGH")),
+        ];
+        for (lvl, expected) in cases {
+            assert_eq!(lvl.gemini_3_level(), expected, "{lvl:?}");
+        }
     }
 
     #[test]
     fn thinking_level_is_enabled() {
         assert!(!ThinkingLevel::Off.is_enabled());
-        assert!(ThinkingLevel::Low.is_enabled());
-        assert!(ThinkingLevel::Medium.is_enabled());
-        assert!(ThinkingLevel::High.is_enabled());
-        assert!(ThinkingLevel::Xhigh.is_enabled());
+        for lvl in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Adaptive,
+            ThinkingLevel::Max,
+        ] {
+            assert!(lvl.is_enabled(), "{lvl:?} must report enabled");
+        }
+    }
+
+    // ── effective_thinking ──
+
+    #[test]
+    fn effective_thinking_per_model_override_wins() {
+        // Per-model substring match beats the global default — the core
+        // promise of `thinking_overrides`. Without this, an operator running
+        // global=Off can't selectively enable thinking on a single model.
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = ThinkingLevel::Off;
+        cfg.thinking_overrides
+            .insert("gpt-5".into(), ThinkingLevel::High);
+        assert_eq!(
+            cfg.effective_thinking("openai/gpt-5-pro"),
+            ThinkingLevel::High
+        );
+    }
+
+    #[test]
+    fn effective_thinking_case_insensitive() {
+        // Operators write model ids in mixed case in TOML; matching MUST
+        // normalize. Otherwise an "Anthropic"-keyed override silently
+        // misses a "anthropic/..." model id.
+        let mut cfg = LlmConfig::default();
+        cfg.thinking_overrides
+            .insert("Claude".into(), ThinkingLevel::Max);
+        assert_eq!(
+            cfg.effective_thinking("claude-sonnet-4"),
+            ThinkingLevel::Max
+        );
+    }
+
+    #[test]
+    fn effective_thinking_falls_back_to_global_when_no_match() {
+        // When no override needle matches the model id, we MUST fall back to
+        // the global `thinking` — not Off — so the global default remains
+        // load-bearing.
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = ThinkingLevel::Medium;
+        cfg.thinking_overrides
+            .insert("gpt".into(), ThinkingLevel::High);
+        assert_eq!(
+            cfg.effective_thinking("claude-sonnet-4"),
+            ThinkingLevel::Medium
+        );
+    }
+
+    #[test]
+    fn effective_thinking_longest_needle_wins() {
+        // Operator pattern: a broad `"gemini"` fallback plus a specific
+        // `"gemini-3"` override. The specific one MUST win for Gemini 3
+        // models, otherwise the operator's intent (set fallback, then
+        // refine) is silently inverted. BTreeMap key order alone would
+        // pick `"gemini"` first (alphabetical), so this test pins the
+        // longest-match contract.
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = ThinkingLevel::Off;
+        cfg.thinking_overrides
+            .insert("gemini".into(), ThinkingLevel::Low);
+        cfg.thinking_overrides
+            .insert("gemini-3".into(), ThinkingLevel::High);
+        assert_eq!(
+            cfg.effective_thinking("gemini-3-flash-preview"),
+            ThinkingLevel::High,
+            "longer needle 'gemini-3' must beat shorter 'gemini'"
+        );
+        // The broader override still applies to other Gemini models.
+        assert_eq!(
+            cfg.effective_thinking("gemini-2.5-pro"),
+            ThinkingLevel::Low,
+            "shorter needle still wins when no longer needle matches"
+        );
+    }
+
+    #[test]
+    fn effective_thinking_ignores_empty_needle() {
+        // An empty-string needle would match every model id (substring of
+        // anything). Skip it so a stray "" entry in TOML doesn't override
+        // every model in the catalog.
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = ThinkingLevel::Off;
+        cfg.thinking_overrides
+            .insert(String::new(), ThinkingLevel::Max);
+        assert_eq!(
+            cfg.effective_thinking("claude-sonnet-4"),
+            ThinkingLevel::Off
+        );
+    }
+
+    // ── thinking_overrides via apply_setting round-trip ──
+
+    /// Apply a well-formed `llm.thinking_overrides` JSON blob and round-trip
+    /// it into `effective_thinking`. Locks the `json_count` setter wiring +
+    /// the override-resolution end-to-end.
+    #[test]
+    fn thinking_overrides_apply_setting_round_trip() {
+        let mut cfg = crate::config::Config::default();
+        cfg.apply_setting(
+            "llm.thinking_overrides",
+            r#"{"gpt-5":"high","claude":"adaptive"}"#,
+        )
+        .expect("valid JSON should apply");
+        assert_eq!(cfg.llm.thinking_overrides.len(), 2);
+        assert_eq!(
+            cfg.llm.effective_thinking("openai/gpt-5-pro"),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            cfg.llm.effective_thinking("claude-sonnet-4"),
+            ThinkingLevel::Adaptive
+        );
+    }
+
+    /// A typo in a level value (e.g. `"ultra"`) MUST surface as an error
+    /// rather than silently no-op the whole map or apply only the valid
+    /// entries. Otherwise a paste-error in `/settings` leaves the operator
+    /// thinking they configured overrides when nothing landed.
+    #[test]
+    fn thinking_overrides_apply_setting_rejects_unknown_level() {
+        let mut cfg = crate::config::Config::default();
+        let result = cfg.apply_setting("llm.thinking_overrides", r#"{"gpt-5":"ultra"}"#);
+        assert!(result.is_err(), "unknown level must reject the whole blob");
+        assert!(
+            cfg.llm.thinking_overrides.is_empty(),
+            "failed apply MUST NOT mutate config"
+        );
     }
 
     // ── LlmConfig defaults ──

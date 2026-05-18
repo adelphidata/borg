@@ -444,6 +444,32 @@ fn generation_config(request: &TransportRequest<'_>) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("temperature".into(), json!(cfg.temperature));
     obj.insert("maxOutputTokens".into(), json!(cfg.max_tokens));
+
+    // Thinking: Gemini 3 takes `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH"),
+    // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic). Other
+    // model families (1.5, etc.) get no thinkingConfig — they don't
+    // support it and Google rejects requests that include it.
+    let level = cfg.effective_thinking(request.model);
+    if level.is_enabled() {
+        let model_lc = request.model.to_ascii_lowercase();
+        let is_gemini_3 = model_lc.contains("gemini-3");
+        let is_gemini_2_5 = model_lc.contains("gemini-2.5");
+        let thinking_cfg: Option<Value> = if is_gemini_3 {
+            level
+                .gemini_3_level()
+                .map(|s| json!({ "thinkingLevel": s }))
+        } else if is_gemini_2_5 {
+            level
+                .gemini_2_5_budget()
+                .map(|b| json!({ "thinkingBudget": b }))
+        } else {
+            None
+        };
+        if let Some(t) = thinking_cfg {
+            obj.insert("thinkingConfig".into(), t);
+        }
+    }
+
     Value::Object(obj)
 }
 
@@ -1071,6 +1097,139 @@ mod tests {
         // serde JSON renders f32 as a number; compare via f64.
         assert!((gc["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
         assert_eq!(gc["maxOutputTokens"], 1234);
+    }
+
+    /// Build a Gemini transport request for an explicit model id (lets the
+    /// thinking-config tests probe both 2.5 and 3 branches without spinning
+    /// up a whole client).
+    fn make_request_for_model<'a>(
+        model: &'a str,
+        messages: &'a [Message],
+        cfg: &'a LlmConfig,
+    ) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::Gemini,
+            model,
+            messages,
+            tools: None,
+            llm_config: cfg,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        }
+    }
+
+    #[test]
+    fn build_request_omits_thinking_config_when_level_off() {
+        // Default config has thinking = Off. The thinkingConfig field MUST
+        // NOT appear — Google rejects requests with `thinkingBudget: 0` on
+        // some 2.5 model variants, and Gemini 1.5 rejects the field
+        // entirely. Off must mean "send nothing".
+        let cfg = default_cfg();
+        assert_eq!(cfg.thinking, crate::config::ThinkingLevel::Off);
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-2.5-pro",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "thinkingConfig must be absent when thinking is Off"
+        );
+    }
+
+    #[test]
+    fn build_request_gemini_2_5_emits_thinking_budget_for_high() {
+        // High on Gemini 2.5 must serialize as `thinkingBudget: 16384` and
+        // MUST NOT leak the Gemini-3-shaped `thinkingLevel` field.
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::High;
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-2.5-pro",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 16384);
+        assert!(
+            tc.get("thinkingLevel").is_none(),
+            "Gemini 2.5 must not receive the Gemini-3 thinkingLevel key"
+        );
+    }
+
+    #[test]
+    fn build_request_gemini_2_5_adaptive_emits_dynamic_sentinel() {
+        // The whole point of the Adaptive level on Gemini 2.5: send
+        // `thinkingBudget: -1` so the model decides at runtime. Anyone who
+        // "fixes" the negative number to 0 silently disables thinking.
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::Adaptive;
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-2.5-flash",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"], -1,
+            "Adaptive must hit Gemini's dynamic-thinking sentinel"
+        );
+    }
+
+    #[test]
+    fn build_request_gemini_3_emits_thinking_level_not_budget() {
+        // Medium on Gemini 3 must serialize as `thinkingLevel: "MEDIUM"`
+        // (the only shape 3.x accepts) and never as a numeric budget.
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::Medium;
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-3-flash-preview",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingLevel"], "MEDIUM");
+        assert!(
+            tc.get("thinkingBudget").is_none(),
+            "Gemini 3 must not receive the 2.5 thinkingBudget key"
+        );
+    }
+
+    #[test]
+    fn build_request_per_model_override_routes_through_to_gemini() {
+        // End-to-end: global thinking = Off but the per-model override
+        // bumps every gemini-* model to High. The Gemini body MUST honor
+        // the override, otherwise per-model defaults are decorative.
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::Off;
+        cfg.thinking_overrides
+            .insert("gemini".into(), crate::config::ThinkingLevel::High);
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-2.5-pro",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 16384,
+            "per-model override must beat global thinking=Off"
+        );
+    }
+
+    #[test]
+    fn build_request_gemini_1_5_omits_thinking_config_even_when_level_set() {
+        // Gemini 1.5 doesn't support `thinkingConfig` at all — sending it
+        // would surface a Google 400. When the operator has thinking
+        // enabled globally but the active model is a non-thinking family,
+        // we silently drop the field rather than failing the request.
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::High;
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-1.5-pro",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "Gemini 1.5 must never receive thinkingConfig"
+        );
     }
 
     #[test]

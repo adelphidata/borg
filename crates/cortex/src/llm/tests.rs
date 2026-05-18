@@ -976,6 +976,136 @@ fn anthropic_request_thinking_enabled_omits_temperature() {
 }
 
 #[test]
+fn anthropic_request_adaptive_emits_8192_budget() {
+    // Adaptive on Anthropic is the moderate provider-best default. If anyone
+    // bumps it to a different number, an operator running `/think adaptive`
+    // suddenly pays a different bill — fail loudly instead.
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
+    config.llm.model = "claude-sonnet-4-20250514".to_string();
+    config.llm.thinking = crate::config::ThinkingLevel::Adaptive;
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    let client = LlmClient::new(&config).expect("should create client");
+
+    let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
+
+    let thinking = body
+        .get("thinking")
+        .expect("thinking field should be present");
+    assert_eq!(thinking["budget_tokens"], 8192, "Adaptive must map to 8192");
+    let max_tokens = body["max_tokens"].as_u64().unwrap();
+    assert!(
+        max_tokens >= 8192 + 1024,
+        "max_tokens must reserve at least budget + 1024 (got {max_tokens})"
+    );
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[test]
+fn anthropic_request_max_emits_64000_budget() {
+    // Max ceiling is load-bearing: it's what users get when they type
+    // `/think max`. Drifting this number silently changes the cost of the
+    // documented "go all-in" mode.
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
+    config.llm.model = "claude-sonnet-4-20250514".to_string();
+    config.llm.thinking = crate::config::ThinkingLevel::Max;
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    let client = LlmClient::new(&config).expect("should create client");
+
+    let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
+
+    assert_eq!(body["thinking"]["budget_tokens"], 64000);
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[test]
+fn anthropic_request_per_model_override_disables_thinking() {
+    // Operator pattern: global thinking = High, but an override pins one
+    // model to Off (e.g. for a fast lane). The override MUST win, otherwise
+    // per-model defaults are decorative.
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
+    config.llm.model = "claude-haiku-4-5".to_string();
+    config.llm.thinking = crate::config::ThinkingLevel::High;
+    config
+        .llm
+        .thinking_overrides
+        .insert("haiku".to_string(), crate::config::ThinkingLevel::Off);
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    let client = LlmClient::new(&config).expect("should create client");
+
+    let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
+
+    assert!(
+        body.get("thinking").is_none(),
+        "per-model Off override must suppress the global High setting"
+    );
+    assert!(
+        body.get("temperature").is_some(),
+        "with thinking suppressed, temperature must return to the body"
+    );
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[test]
+fn openai_build_request_minimal_emits_minimal_effort() {
+    // GPT-5's "minimal" reasoning_effort tier exists for a reason — cost
+    // and latency. If we alias `/think minimal` to "low", we silently
+    // forfeit that win. Builds through the real transport function instead
+    // of constructing ChatRequest by hand to exercise the wired path.
+    use crate::llm::provider::Provider;
+    use crate::llm::transport::TransportRequest;
+
+    let mut cfg = LlmConfig::default();
+    cfg.temperature = 0.7;
+    cfg.max_tokens = 1024;
+    cfg.thinking = crate::config::ThinkingLevel::Minimal;
+    let req = TransportRequest {
+        provider: Provider::OpenAi,
+        model: "gpt-5",
+        messages: &[Message::user("hi")],
+        tools: None,
+        llm_config: &cfg,
+        prompt_cache_key: None,
+        cost_events_enabled: false,
+    };
+
+    let body = crate::llm::transport::build_openai_request(&req, false).expect("should build");
+    assert_eq!(body["reasoning_effort"], "minimal");
+}
+
+#[test]
+fn openai_build_request_per_model_override_applied() {
+    // Same wiring proof for the override map: global Off but override
+    // pins gpt-5 to High -> body must carry reasoning_effort=high.
+    use crate::llm::provider::Provider;
+    use crate::llm::transport::TransportRequest;
+
+    let mut cfg = LlmConfig::default();
+    cfg.temperature = 0.7;
+    cfg.max_tokens = 1024;
+    cfg.thinking = crate::config::ThinkingLevel::Off;
+    cfg.thinking_overrides
+        .insert("gpt-5".to_string(), crate::config::ThinkingLevel::High);
+    let req = TransportRequest {
+        provider: Provider::OpenAi,
+        model: "gpt-5-pro",
+        messages: &[Message::user("hi")],
+        tools: None,
+        llm_config: &cfg,
+        prompt_cache_key: None,
+        cost_events_enabled: false,
+    };
+
+    let body = crate::llm::transport::build_openai_request(&req, false).expect("should build");
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[test]
 fn openai_request_includes_reasoning_effort() {
     let request = ChatRequest {
         model: "o3".to_string(),
@@ -2286,6 +2416,45 @@ fn for_auxiliary_forces_thinking_off() {
         crate::config::llm::ThinkingLevel::Off,
         "primary thinking level must not bleed into aux"
     );
+}
+
+#[test]
+fn for_auxiliary_clears_thinking_overrides_so_picker_choice_stays_off() {
+    // Regression for the failure mode the for_auxiliary doc-comment
+    // describes: an operator pins `"claude"` → High on primary, the aux
+    // picker then chooses `claude-haiku-4-5`, and the substring override
+    // re-enables thinking on the aux head — defeating the whole "aux is
+    // cheap and fast" intent. The fix clears `thinking_overrides`; this
+    // test pins that fix in place.
+    let env_var = "BORG_TEST_AUX_OVERRIDE_CLEAR";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    config.llm.thinking = crate::config::llm::ThinkingLevel::Off;
+    config
+        .llm
+        .thinking_overrides
+        .insert("claude".into(), crate::config::llm::ThinkingLevel::High);
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        api_key_env: env_var.to_string(),
+        ..Default::default()
+    });
+
+    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+    assert!(
+        aux.llm_config.thinking_overrides.is_empty(),
+        "primary overrides must be wiped from aux"
+    );
+    assert_eq!(
+        aux.llm_config.effective_thinking(&aux.llm_config.model),
+        crate::config::llm::ThinkingLevel::Off,
+        "even after picker chose 'claude-haiku-4-5', aux must stay Off"
+    );
+    std::env::remove_var(env_var);
 }
 
 // ── Anthropic SSE error-event classification ──
