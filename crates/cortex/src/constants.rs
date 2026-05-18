@@ -301,6 +301,12 @@ pub const GEMINI_EMBEDDING_DIM: usize = 768;
 /// Max characters sent to embedding API (~8000 tokens).
 pub const MAX_EMBEDDING_INPUT_CHARS: usize = 32_000;
 
+/// Max number of inputs in a single batched embeddings request. OpenAI
+/// caps their own equivalent at 2048; we use a tighter bound because
+/// the dispatcher fans each input out as a separate upstream call and
+/// large batches turn into quota-burning loops on a stolen token.
+pub const MAX_EMBEDDING_BATCH_SIZE: usize = 256;
+
 /// Max characters per message when building session transcripts.
 pub const MAX_SESSION_MESSAGE_CHARS: usize = 2000;
 

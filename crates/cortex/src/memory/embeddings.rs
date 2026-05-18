@@ -11,6 +11,14 @@ use crate::db::{ChunkData, Database};
 /// Shared HTTP client for all embedding API calls (connection pooling + keep-alive).
 static EMBEDDING_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
+/// Accessor for the shared reqwest client used for embedding API calls.
+/// Out-of-crate callers (e.g. `gateway::openai_compat`) reuse this so
+/// they inherit connection pooling and keep-alive instead of allocating
+/// their own client per request.
+pub fn shared_client() -> &'static reqwest::Client {
+    &EMBEDDING_CLIENT
+}
+
 /// Cached provider entry: config fingerprint + resolved provider.
 type CachedProvider = Option<(String, Option<EmbeddingProvider>)>;
 

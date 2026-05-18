@@ -790,6 +790,7 @@ fn build_openai_compat_router(config: &Config) -> Router {
         db_open: db_open_factory(),
         gate: build_ingress_gate(config),
         dispatcher: crate::openai_compat::arc_dispatcher(),
+        embedding_dispatcher: crate::openai_compat::arc_embedding_dispatcher(config),
         model_aliases: Arc::new(vec!["borg-default".into(), "borg-fast".into()]),
     })
 }

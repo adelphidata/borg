@@ -173,6 +173,73 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// `POST /v1/embeddings` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsRequest {
+    /// Model alias. Echoed in the response so clients key cache lines
+    /// on it; provider selection itself is governed by Borg's
+    /// configured embedding provider, not this field.
+    pub model: String,
+    /// Either a single string or an array of strings. OpenAI's API
+    /// also accepts numeric token-id arrays; we reject those with 400
+    /// (see `EmbeddingInput` deserialization).
+    pub input: EmbeddingInput,
+    /// `"float"` (default) — clients send this; we only emit float.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    /// Optional client identifier — accepted for compat, unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Either a single string or a list of strings. Numeric token-id
+/// inputs (which OpenAI's wire format also accepts) are intentionally
+/// not modeled — a numeric input deserializes as `serde_json::Value`
+/// failure and the route returns 400.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    /// One string of text to embed.
+    Single(String),
+    /// Many strings to embed in one request.
+    Batch(Vec<String>),
+}
+
+/// `POST /v1/embeddings` response body. OpenAI shape: `object: "list"`
+/// with one `embedding` entry per input, in input order.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsResponse {
+    /// Always `"list"`.
+    pub object: &'static str,
+    /// One entry per input, in input order.
+    pub data: Vec<EmbeddingData>,
+    /// Echo of the requested model alias.
+    pub model: String,
+    /// Token usage. v1 reports zeros until usage plumbing lands —
+    /// mirrors how `ChatCompletionResponse` reports `Usage::default()`.
+    pub usage: EmbeddingsUsage,
+}
+
+/// One embedding result.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingData {
+    /// Always `"embedding"`.
+    pub object: &'static str,
+    /// Position in the input array — clients index responses by this.
+    pub index: u32,
+    /// f32 vector. Length depends on the upstream provider/model.
+    pub embedding: Vec<f32>,
+}
+
+/// Token usage for an embeddings request.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EmbeddingsUsage {
+    /// Tokens in the prompt. Zero until usage plumbing lands.
+    pub prompt_tokens: u32,
+    /// Same as `prompt_tokens` for embeddings (no completion tokens).
+    pub total_tokens: u32,
+}
+
 /// `GET /v1/models` response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelsList {
@@ -252,6 +319,91 @@ mod tests {
         assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "search");
         assert_eq!(calls[0].function.arguments, r#"{"q":"ferris"}"#);
+    }
+
+    #[test]
+    fn embeddings_request_accepts_single_string_input() {
+        // Cursor's lightweight callers send `input` as a bare string;
+        // narrowing the type to `Vec<String>` would 400 that traffic.
+        let json = r#"{"model":"text-embedding-3-small","input":"hello"}"#;
+        let req: EmbeddingsRequest = serde_json::from_str(json).expect("parse single");
+        match req.input {
+            EmbeddingInput::Single(s) => assert_eq!(s, "hello"),
+            EmbeddingInput::Batch(_) => panic!("expected Single, got Batch"),
+        }
+        assert_eq!(req.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn embeddings_request_accepts_array_input() {
+        // Continue and Open WebUI batch embeddings in one call; the
+        // array form must parse so those flows aren't forced to fan
+        // out into N HTTP requests.
+        let json = r#"{"model":"m","input":["a","b","c"]}"#;
+        let req: EmbeddingsRequest = serde_json::from_str(json).expect("parse batch");
+        match req.input {
+            EmbeddingInput::Batch(v) => assert_eq!(v, vec!["a", "b", "c"]),
+            EmbeddingInput::Single(_) => panic!("expected Batch, got Single"),
+        }
+    }
+
+    #[test]
+    fn embeddings_request_ignores_unknown_fields() {
+        // Open WebUI sends `encoding_format: "float"` unconditionally
+        // and some clients send `dimensions`. `serde(deny_unknown_fields)`
+        // here would 400 those requests; the test guards against a
+        // future regression that adds that attribute.
+        let json = r#"{"model":"m","input":"x","encoding_format":"float",
+                       "dimensions":1536,"user":"alice"}"#;
+        let req: EmbeddingsRequest = serde_json::from_str(json).expect("parse extras");
+        assert_eq!(req.encoding_format.as_deref(), Some("float"));
+        assert_eq!(req.user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn embeddings_request_rejects_numeric_token_input() {
+        // OpenAI's wire format also accepts arrays of token ids
+        // (integers). We model strings-only so a numeric input must
+        // fail to deserialize — the route layer surfaces this as 400,
+        // matching what `openai-py` callers expect to see.
+        let json = r#"{"model":"m","input":[1,2,3]}"#;
+        let err = serde_json::from_str::<EmbeddingsRequest>(json);
+        assert!(
+            err.is_err(),
+            "numeric token-id input must not deserialize, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn embeddings_response_serializes_with_index_per_entry() {
+        // Clients zip `response.data[i].embedding` back against
+        // `request.input[i]` — the `index` field must round-trip and
+        // match insertion order.
+        let resp = EmbeddingsResponse {
+            object: "list",
+            data: vec![
+                EmbeddingData {
+                    object: "embedding",
+                    index: 0,
+                    embedding: vec![0.1, 0.2],
+                },
+                EmbeddingData {
+                    object: "embedding",
+                    index: 1,
+                    embedding: vec![0.3, 0.4],
+                },
+            ],
+            model: "text-embedding-3-small".into(),
+            usage: EmbeddingsUsage::default(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).expect("ser")).expect("de");
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"][0]["index"], 0);
+        assert_eq!(v["data"][1]["index"], 1);
+        assert_eq!(v["data"][0]["embedding"][0], 0.1);
+        assert_eq!(v["data"][1]["embedding"][1], 0.4);
+        assert_eq!(v["model"], "text-embedding-3-small");
     }
 
     #[test]

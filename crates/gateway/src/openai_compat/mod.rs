@@ -19,13 +19,17 @@
 
 mod agent_dispatcher;
 mod dispatcher;
+mod embedding_dispatcher;
 mod routes;
 mod types;
 
 pub use agent_dispatcher::{arc_dispatcher, AgentDispatcher};
-pub use dispatcher::{AgentEventChunk, ChatDispatcher};
+pub use dispatcher::{
+    AgentEventChunk, ChatDispatcher, EmbeddingDispatchError, EmbeddingDispatcher,
+};
+pub use embedding_dispatcher::{arc_embedding_dispatcher, ConfigEmbeddingDispatcher};
 pub use routes::{router, OpenAiState};
 pub use types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ModelInfo,
-    ModelsList,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, EmbeddingData,
+    EmbeddingInput, EmbeddingsRequest, EmbeddingsResponse, EmbeddingsUsage, ModelInfo, ModelsList,
 };
