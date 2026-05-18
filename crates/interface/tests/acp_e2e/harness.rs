@@ -48,6 +48,48 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::Stream;
+
+/// Cloned FDs of accepted server-side UDS streams. `shutdown_now` calls
+/// `shutdown(Both)` on each so hyper's per-connection tasks see EOF and
+/// the client surfaces a transport error instead of hanging forever — an
+/// abort on the serve future alone leaves per-connection tasks alive.
+type TrackedConnections = Arc<StdMutex<Vec<std::os::unix::net::UnixStream>>>;
+
+/// Wraps [`UnixListenerStream`] and stores a duped FD of each accepted
+/// stream into a shared vec so the fixture can force-close them.
+struct TrackedUnixListener {
+    inner: UnixListenerStream,
+    tracked: TrackedConnections,
+}
+
+impl Stream for TrackedUnixListener {
+    type Item = std::io::Result<UnixStream>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(stream))) => {
+                let tracked = self.tracked.clone();
+                let restored = stream.into_std().and_then(|std_s| {
+                    let clone = std_s.try_clone()?;
+                    tracked
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(clone);
+                    UnixStream::from_std(std_s)
+                });
+                Poll::Ready(Some(restored))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 // ── Shared data dir + serial mutex ───────────────────────────────────────
 
@@ -101,6 +143,7 @@ pub struct BorgdFixture {
     factory: Arc<ScriptedFactory>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<()>>,
+    connections: TrackedConnections,
     _serial_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -127,7 +170,11 @@ impl BorgdFixture {
         let services = build_services(registry, factory.clone(), capability_router, cost_event_bus);
 
         let listener = borgd::daemon::bind_uds(&uds_path).expect("bind uds");
-        let stream = UnixListenerStream::new(listener);
+        let connections: TrackedConnections = Arc::new(StdMutex::new(Vec::new()));
+        let stream = TrackedUnixListener {
+            inner: UnixListenerStream::new(listener),
+            tracked: connections.clone(),
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let server_task = tokio::spawn(spawn_server(services, stream, shutdown_rx));
@@ -145,6 +192,7 @@ impl BorgdFixture {
             factory,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
+            connections,
             _serial_guard: serial_guard,
         }
     }
@@ -170,6 +218,18 @@ impl BorgdFixture {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        // Force-close every accepted server-side stream. Aborting the serve
+        // task alone leaves hyper's per-connection tasks running with open
+        // FDs, so the client never observes EOF and `prompt` hangs.
+        {
+            let mut guard = self
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for s in guard.drain(..) {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
         if let Some(handle) = self.server_task.take() {
             handle.abort();
             let _ = handle.await;
@@ -194,7 +254,7 @@ impl Drop for BorgdFixture {
 
 async fn spawn_server(
     services: Services,
-    stream: UnixListenerStream,
+    stream: TrackedUnixListener,
     shutdown_rx: oneshot::Receiver<()>,
 ) {
     let result = tonic::transport::Server::builder()

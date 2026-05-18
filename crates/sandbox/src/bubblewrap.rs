@@ -115,6 +115,8 @@ pub fn build_bwrap_args_versioned(
 mod tests {
     use super::*;
 
+    const TEST_TOOL_DIR: &str = "/tmp/tool";
+
     fn default_policy() -> SandboxPolicy {
         SandboxPolicy::default()
     }
@@ -132,7 +134,7 @@ mod tests {
 
     #[test]
     fn network_isolated_by_default() {
-        let args = build_bwrap_args(&default_policy(), Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
         assert!(args.contains(&"--unshare-net".to_string()));
     }
 
@@ -142,7 +144,7 @@ mod tests {
             network: true,
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
         assert!(!args.contains(&"--unshare-net".to_string()));
     }
 
@@ -152,7 +154,7 @@ mod tests {
             fs_read: vec!["/data/input".to_string()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--ro-bind" && w[1] == "/data/input"));
@@ -164,7 +166,7 @@ mod tests {
             fs_write: vec!["/data/output".to_string()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/data/output"));
@@ -172,7 +174,7 @@ mod tests {
 
     #[test]
     fn always_includes_pid_isolation() {
-        let args = build_bwrap_args(&default_policy(), Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
     }
@@ -184,7 +186,7 @@ mod tests {
             deny_write: vec!["/home/user/.borg".to_string()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new("/tmp/tool"));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
         // Should NOT have a writable --bind for the denied path
         let has_writable = args
             .windows(3)
@@ -194,7 +196,7 @@ mod tests {
 
     #[test]
     fn includes_tmpfs_proc_dev() {
-        let args = build_bwrap_args_versioned(&default_policy(), Path::new("/tmp/tool"), None);
+        let args = build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), None);
         assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp"));
         assert!(args.windows(2).any(|w| w[0] == "--proc" && w[1] == "/proc"));
         assert!(args.windows(2).any(|w| w[0] == "--dev" && w[1] == "/dev"));
@@ -300,7 +302,7 @@ mod tests {
             (None, true), // unknown → assume modern
         ];
         for (ver, want_die_flag) in cases.iter().copied() {
-            let args = build_bwrap_args_versioned(&default_policy(), Path::new("/tmp/tool"), ver);
+            let args = build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), ver);
             assert_eq!(
                 args.contains(&"--die-with-parent".to_string()),
                 want_die_flag,

@@ -6,7 +6,7 @@ repository = "https://github.com/borganization/borg"
 homepage = "https://github.com/borganization/borg"
 readme = "README.md"
 authors = ["Borg Contributors"]
-rust-version = "1.87"
+rust-version = "1.88"
 keywords = ["ai", "assistant", "agent", "llm", "cli"]
 categories = ["command-line-utilities"]
 

@@ -155,13 +155,15 @@ pub fn generate_profile(
 mod tests {
     use super::*;
 
+    const TEST_TOOL_DIR: &str = "/tmp/tool";
+
     fn default_policy() -> SandboxPolicy {
         SandboxPolicy::default()
     }
 
     #[test]
     fn profile_starts_with_deny_default() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(deny default)"));
     }
 
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn profile_no_network_by_default() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(!profile.contains("(allow network*)"));
     }
 
@@ -186,7 +188,7 @@ mod tests {
             network: true,
             ..Default::default()
         };
-        let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow network*)"));
     }
 
@@ -196,7 +198,7 @@ mod tests {
             fs_read: vec!["/data/input".to_string()],
             ..Default::default()
         };
-        let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow file-read* (subpath \"/data/input\"))"));
     }
 
@@ -206,13 +208,13 @@ mod tests {
             fs_write: vec!["/data/output".to_string()],
             ..Default::default()
         };
-        let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow file-write* (subpath \"/data/output\"))"));
     }
 
     #[test]
     fn profile_broad_exec_without_runtime() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow process-exec)"));
         assert!(profile.contains("(allow process-fork)"));
     }
@@ -221,7 +223,7 @@ mod tests {
     fn profile_restricts_exec_to_runtime_binary() {
         let profile = generate_profile(
             &default_policy(),
-            Path::new("/tmp/tool"),
+            Path::new(TEST_TOOL_DIR),
             Some("/usr/bin/python3"),
         )
         .unwrap();
@@ -236,7 +238,7 @@ mod tests {
             fs_read: vec!["\"))\n(allow default)\n(deny file-read* (subpath \"".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -246,7 +248,7 @@ mod tests {
             fs_write: vec!["/foo\"))\n(allow default)".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -256,7 +258,7 @@ mod tests {
             fs_read: vec!["relative/path".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -266,7 +268,7 @@ mod tests {
             fs_read: vec!["/foo(bar)".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -276,7 +278,7 @@ mod tests {
             fs_read: vec!["/foo\nbar".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -303,8 +305,12 @@ mod tests {
 
     #[test]
     fn profile_allows_system_binaries_with_runtime() {
-        let profile =
-            generate_profile(&default_policy(), Path::new("/tmp/tool"), Some("/bin/bash")).unwrap();
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            Some("/bin/bash"),
+        )
+        .unwrap();
         assert!(profile.contains("(allow process-exec (subpath \"/bin\"))"));
         assert!(profile.contains("(allow process-exec (subpath \"/usr/bin\"))"));
         assert!(profile.contains("(allow process-exec (subpath \"/usr/local/bin\"))"));
@@ -312,19 +318,19 @@ mod tests {
 
     #[test]
     fn profile_allows_broad_file_read() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow file-read*)"));
     }
 
     #[test]
     fn profile_allows_dev_write_for_stdio() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow file-write* (subpath \"/dev\"))"));
     }
 
     #[test]
     fn profile_allows_tmp_write() {
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(allow file-write* (subpath \"/private/tmp\"))"));
         assert!(profile.contains("(allow file-write* (subpath \"/tmp\"))"));
     }
@@ -352,7 +358,7 @@ mod tests {
     fn profile_allows_runtime_parent_directory() {
         let profile = generate_profile(
             &default_policy(),
-            Path::new("/tmp/tool"),
+            Path::new(TEST_TOOL_DIR),
             Some("/home/user/.local/bin/python3"),
         )
         .unwrap();
@@ -368,7 +374,7 @@ mod tests {
     fn profile_allows_homebrew_path() {
         let profile = generate_profile(
             &default_policy(),
-            Path::new("/tmp/tool"),
+            Path::new(TEST_TOOL_DIR),
             Some("/usr/bin/python3"),
         )
         .unwrap();
@@ -379,7 +385,7 @@ mod tests {
     fn profile_allows_opt_homebrew_runtime() {
         let profile = generate_profile(
             &default_policy(),
-            Path::new("/tmp/tool"),
+            Path::new(TEST_TOOL_DIR),
             Some("/opt/homebrew/bin/python3"),
         )
         .unwrap();
@@ -389,8 +395,12 @@ mod tests {
 
     #[test]
     fn profile_runtime_parent_skips_root() {
-        let profile =
-            generate_profile(&default_policy(), Path::new("/tmp/tool"), Some("/python3")).unwrap();
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            Some("/python3"),
+        )
+        .unwrap();
         // Should NOT add (subpath "/") — that would be overly broad
         assert!(!profile.contains("(allow process-exec (subpath \"/\"))"));
         // But the literal should still be there
@@ -399,7 +409,7 @@ mod tests {
 
     #[test]
     fn rejects_relative_runtime_binary() {
-        let result = generate_profile(&default_policy(), Path::new("/tmp/tool"), Some("python3"));
+        let result = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), Some("python3"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
     }
@@ -420,7 +430,7 @@ mod tests {
             deny_read: vec!["/secret/data".to_string()],
             ..Default::default()
         };
-        let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(deny file-read* (subpath \"/secret/data\"))"));
     }
 
@@ -430,7 +440,7 @@ mod tests {
             deny_read: vec!["/foo\"))\n(allow default)".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -440,7 +450,7 @@ mod tests {
             deny_write: vec!["relative/path".to_string()],
             ..Default::default()
         };
-        let result = generate_profile(&policy, Path::new("/tmp/tool"), None);
+        let result = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None);
         assert!(result.is_err());
     }
 
@@ -450,7 +460,7 @@ mod tests {
             deny_write: vec!["/home/user/.borg".to_string()],
             ..Default::default()
         };
-        let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
         assert!(profile.contains("(deny file-write* (subpath \"/home/user/.borg\"))"));
     }
 
@@ -466,7 +476,7 @@ mod tests {
             eprintln!("skipping: HOME unset in test env");
             return;
         };
-        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        let profile = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), None).unwrap();
         for sensitive in [".ssh", ".aws", ".gnupg"] {
             let expected = format!("(deny file-read* (subpath \"{home}/{sensitive}\"))");
             assert!(

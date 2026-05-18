@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn build_succeeds_with_valid_material() {
         let root = ca::generate_root_ca("borg-test-ca").expect("ca");
-        let dns = vec!["localhost".to_string()];
+        let dns = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
         let p = ServerCertParams {
             common_name: "borgd",
             san_dns: &dns,

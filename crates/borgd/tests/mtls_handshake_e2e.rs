@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use borgd::auth::san::LOOPBACK_SAN;
 use borgd::auth::{auth_interceptor, build_server_tls_config, build_verifier, ServerCertMaterial};
 use borgd::pki_grpc::PkiSvc;
 use cortex::config::VerifierKind;
@@ -52,7 +53,7 @@ struct ServerHandle {
 /// the same TLS + interceptor wiring `daemon.rs` mounts in production.
 async fn spawn_mtls_server() -> ServerHandle {
     let root = generate_root_ca("borg-test-ca").expect("ca");
-    let san_dns = vec!["localhost".to_string()];
+    let san_dns = vec![LOOPBACK_SAN.to_string()];
     let (server, server_key_pem) = issue_server_cert(
         &root.cert_pem,
         &root.key_pkcs8_pem,
@@ -190,7 +191,7 @@ async fn rpc_rejected_when_no_client_cert_presented() {
     let h = spawn_mtls_server().await;
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(h.ca_cert_pem.as_bytes()))
-        .domain_name("localhost");
+        .domain_name(LOOPBACK_SAN);
     let res = try_rpc(&h, tls).await;
     assert!(
         res.is_err(),
@@ -210,7 +211,7 @@ async fn rpc_rejected_when_client_cert_signed_by_foreign_ca() {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(h.ca_cert_pem.as_bytes()))
         .identity(Identity::from_pem(fcert.as_bytes(), fkey.as_bytes()))
-        .domain_name("localhost");
+        .domain_name(LOOPBACK_SAN);
     let res = try_rpc(&h, tls).await;
     assert!(
         res.is_err(),
@@ -243,7 +244,7 @@ async fn handshake_succeeds_with_paired_client_cert_and_rpc_is_accepted() {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(h.ca_cert_pem.as_bytes()))
         .identity(Identity::from_pem(ccert.as_bytes(), ckey.as_bytes()))
-        .domain_name("localhost");
+        .domain_name(LOOPBACK_SAN);
     let channel = endpoint_for(h.addr, tls).connect().await.expect("connect");
     let mut client = PkiClient::new(channel);
     let resp = client
@@ -280,7 +281,7 @@ async fn revoked_cert_passes_tls_but_rpc_is_rejected_unauthenticated() {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(h.ca_cert_pem.as_bytes()))
         .identity(Identity::from_pem(ccert.as_bytes(), ckey.as_bytes()))
-        .domain_name("localhost");
+        .domain_name(LOOPBACK_SAN);
     let channel = endpoint_for(h.addr, tls)
         .connect()
         .await

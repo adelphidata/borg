@@ -30,24 +30,17 @@ unfinished items stay here so a future contributor can see what's left.
 
 ## Self-healing — Tier 2 / Tier 3
 
-- **Provider failover / degraded mode.** Deferred. Add structured
-  provider error classification plus bounded failover to fallback
-  providers / Claude CLI / Ollama so primary-provider auth, rate-limit,
-  or overload incidents degrade gracefully instead of dead-ending the
-  agent loop.
-- **Browser recovery loops.** Deferred. Attach automatic restart /
-  reconnect behavior to recoverable browser-health failures so stale CDP
-  sessions, crashed tabs, and disconnected browser processes repair
-  themselves without waiting for a manual restart.
 - **Plugin / skill quarantine.** Deferred. Integrity and tamper checks
   currently surface warnings; a future pass should mark compromised
   plugins or user skills untrusted, stop loading them automatically, and
   require explicit re-trust with a visible audit trail.
-- **Backup verification.** Deferred. `borg backup create` produces
-  manual tarballs but the daemon does not periodically verify that older
-  ones still restore cleanly. Add archive verification, manifest/hash
-  checks, and periodic test-restore drills into a temp directory so
-  "backup succeeded" also means "restore is likely to work."
+- **Backup command + verification.** `[I]` Deferred. First-class local
+  backup archives (`borg backup` writing a `~/.borg/` tarball with
+  manifest), plus periodic verification that older archives still
+  restore cleanly: archive verification, manifest/hash checks, and
+  test-restore drills into a temp directory so "backup succeeded" also
+  means "restore is likely to work." Today `borg backup create` produces
+  manual tarballs without verification or first-class CLI ergonomics.
 - **Sleep-inhibitor wire-up.** Deferred. A multi-platform RAII
   `SleepInhibitor` (macOS `caffeinate -i -w <pid>`, Linux
   `systemd-inhibit --what=sleep ... sleep infinity`, no-op elsewhere)
@@ -117,26 +110,30 @@ all warrant follow-up work.
 
 ## Reference-survey backlog
 
-Items pulled from a 2026-04 survey of two adjacent agent codebases.
-Source tags: `[O]` and `[H]` indicate which reference project the
-pattern came from; `[O+H]` = both. Each item is independent — work
+Items pulled from a 2026-04 survey of two adjacent agent codebases,
+plus a 2026-05 survey of two more. Source tags: `[O]`, `[H]`, `[Z]`,
+and `[I]` indicate which reference project the pattern came from;
+`[O+H]` = both of the first two. Each item is independent — work
 top-down by priority, not by section order.
 
 ### Resilience & self-healing
 
-- **`borg doctor` repair modes.** `[O]` Today `borg doctor` is mostly
-  read-only. Add `--repair` / `--fix` / `--force` that actually mutate
-  with backups: legacy config-shape migrations, stale session lock
-  removal, orphan transcript archival, corrupted auth-profile repair.
-  Pairs with the existing daily self-heal task — doctor is the
+- **`borg doctor` — expanded checks + repair modes.** `[O][I]` Today
+  `borg doctor` is mostly read-only and covers a narrow slice. Two
+  axes of growth: (1) broader checks (~16 subsystems — settings
+  validity, LLM credential reachability, DB integrity, embeddings
+  cache, scheduled tasks, gateway bindings, MCP servers, skills load,
+  secrets/keychain, service install state, Docker daemon presence,
+  tunnel binaries); (2) `--repair` / `--fix` / `--force` that actually
+  mutate with backups — legacy config-shape migrations, stale session
+  lock removal (clear orphaned locks when a daemon crashed
+  mid-session), orphan transcript archival, corrupted auth-profile
+  repair. Pairs with the daily self-heal task — doctor is the
   on-demand surface, self-heal is the cron surface.
 - **Session/transcript JSON repair on load.** `[O]` Detect corrupted
   `messages` rows or orphaned attachment blobs at session-open time
   and repair (truncate to last clean turn, archive bad blobs) instead
   of crashing the agent loop on the next launch.
-- **Stale session lock detection.** `[O]` If a daemon crashes
-  mid-session, the next launch should detect and clear the orphaned
-  lock rather than dead-ending. Folds into `borg doctor`.
 - **`run.attempt` metadata in logs.** `[O]` Tag each line in
   `~/.borg/logs/{date}.jsonl` with the retry attempt number so
   duplicated tool calls or agent turns are correlatable when grepping.
@@ -149,11 +146,13 @@ top-down by priority, not by section order.
   / Responses / Bedrock / Gemini) would normalize those paths so adding a
   new provider is roughly a ten-line job instead of a full module. Slots
   in under the credential-pool work already in flight.
-- **Live model discovery manifest.** `[H]` Deferred. Fetch a remote model
-  catalog (price, context window, capabilities) at startup instead of
-  carrying compiled-in lists. Operators see new Claude / GPT / Gemini
-  models in the picker without waiting for a Borg release. Pairs with the
-  cost-emission roadmap items below.
+- **Live model discovery manifest.** `[H][I]` Deferred.
+  Manifest-backed model catalog fetched at startup (price, context
+  window, capabilities, aliases, suppressions) instead of carrying
+  compiled-in lists, with a cold installed-index fast path and
+  pricing-catalog stale-cache fallback for offline installs. Operators
+  see new Claude / GPT / Gemini models in the picker without waiting
+  for a Borg release. Pairs with the cost-emission roadmap items below.
 - **Per-turn auxiliary model override.** `[H]` Deferred. Pick a different
   model for a single tool call or turn — vision-capable for one
   screenshot analysis, cheap default for the rest. Today Borg switches
@@ -179,6 +178,17 @@ top-down by priority, not by section order.
        (Llama/Qwen/DeepSeek). Either covers the "I want OSS without
        self-hosting" lane; pick one.
 
+- **CLI-delegate providers: `codex_cli`, `gemini_cli`, `opencode_cli`.**
+  `[Z]` Deferred. New providers that piggyback on the user's locally-
+  installed Codex / Gemini / OpenCode CLIs the way the existing
+  `Provider::ClaudeCode` piggybacks on the Claude Code CLI — auth,
+  rate limits, and quota come from the CLI's existing session rather
+  than Borg-managed API keys. Lowers per-provider onboarding to zero
+  for users who already have those tools installed, and gives Borg a
+  cheap path to whatever models those vendors gate behind subscription
+  rather than API access. Provider-shaped (one credential type each),
+  not tools.
+
     Shipped (no further work):
     - **xAI (Grok)** — `Provider::XAi` direct integration with the OpenAI-
       compatible chat-completions surface, Bearer auth via `XAI_API_KEY`,
@@ -189,10 +199,11 @@ top-down by priority, not by section order.
 
 ### Streaming & channel delivery
 
-- **Block streaming with coalescing.** `[O]` Stream completed semantic
-  blocks (paragraph → newline → sentence) to channels rather than raw
-  token deltas. Honors code-fence safety + min/max char windows.
-  Reduces Telegram/Slack edit thrash (currently every token is an
+- **Block + tool-level streaming with coalescing.** `[O][I]` Stream
+  completed semantic blocks (paragraph → newline → sentence) and
+  tool-result chunks incrementally to channels rather than raw token
+  deltas. Honors code-fence safety + min/max char windows. Reduces
+  Telegram/Slack edit thrash (currently every token is an
   `editMessage` call).
 - **Preview-edit streaming per channel.** `[O]` Telegram/Slack/Discord
   show a single edited preview message while generating, then finalize.
@@ -219,10 +230,20 @@ top-down by priority, not by section order.
   for low-value high-frequency payloads (uptime pings, log alerts, CI
   notifications). Cost/latency win for monitoring-style use; adds a
   formatter config surface.
-- **WhatsApp Business native channel.** `[H]` Deferred. Today Borg
-  reaches WhatsApp via the Twilio bridge. A direct WhatsApp Business
-  integration would skip Twilio's per-message markup and unlock
-  first-class threading, reactions, and media.
+- **WhatsApp native channel.** `[H][Z]` Deferred. Today Borg reaches
+  WhatsApp via the Twilio bridge, which adds per-message markup and
+  loses first-class threading / reactions / media. Three concrete
+  transports beyond Twilio, pick by deployment context: Meta's
+  WhatsApp Cloud API (official business surface), WATI (BSP for
+  regions where the cloud API isn't viable), and WhatsApp Web
+  (unofficial, no business-account approval — fine for personal-use
+  installs).
+- **Email channel (SMTP/IMAP + Gmail push).** `[Z]` Deferred. Native
+  email channel: SMTP outbound, IMAP IDLE inbound, with optional Gmail
+  Pub/Sub push as a low-latency alternative to IMAP polling. Today Borg
+  has no email path — users wanting inbound triage or outbound digests
+  have to bridge via webhook plus their own MTA. Highest-reach channel
+  gap in the current native set.
 
 ### Context & memory
 
@@ -278,13 +299,10 @@ top-down by priority, not by section order.
 
 ## Cost emission: additional providers
 
-- **Groq.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
-- **Together.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
-- **Fireworks.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
-- **Bedrock.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
-- **Vertex.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
-- **xAI.** Emit `cost_usd_present = false` until Grok pricing is wired into the static table path.
-- **Local models.** Emit `cost_usd_present = false` until a local-pricing policy exists.
+Each of these providers currently emits `cost_usd_present = false`
+until pricing is wired into the static table path: **Groq**, **Together**,
+**Fireworks**, **Bedrock**, **Vertex**, **xAI** (Grok). **Local models** stay
+at `cost_usd_present = false` until a local-pricing policy exists.
 
 ### Tools & sub-agents
 
@@ -301,14 +319,47 @@ top-down by priority, not by section order.
   library exposing only safe tools (web_search, read/write_file,
   search_files, patch, terminal). Resource caps on stdout/stderr/
   timeout/tool-calls. Useful for ad-hoc data crunching.
+- **Cross-channel `send_message` tool.** `[H]` Deferred.
+  Agent-callable tool for pushing a message to any configured
+  channel (`{channel, recipient, body, thread?}`), independent of
+  the channel the current turn came in on. Distinct from the
+  rule-based "Channel mirror/relay" item under Streaming & channel
+  delivery — that's config-driven forwarding; this is intentional,
+  per-turn fan-out ("digest this to my email, ping the Slack
+  channel, leave the Telegram thread quiet"). Today an agent can
+  only respond on the channel that invoked it. Enforced by the
+  existing `gateway.bindings` + `dm_policy` allowlists so the agent
+  cannot reach senders the operator hasn't authorized.
+- **Standalone `transcribe_audio` tool.** `[H]` Deferred.
+  Agent-callable speech-to-text on arbitrary audio (file path, URL,
+  or base64) via the existing `llm.aux` client (Whisper / Gemini
+  STT). Distinct from the per-channel inbound voice transcription
+  tracked under "Telegram voice follow-through" and from the Voice
+  Call channel's realtime STT — those are channel-scoped; this is a
+  general-purpose tool for voice memos, meeting recordings, and
+  user-supplied audio attachments. Multimodal-in is currently
+  asymmetric vs `text_to_speech` on the output side.
 
 ### MCP & external integrations
 
-- **MCP server mode (`borgd serve-mcp`).** `[H]` Deferred. Expose
-  sessions, messages, events, and permissions as MCP tools so external
-  IDEs (Claude Code, Cursor, Codex) can read and write Borg
-  conversations. Same surface as the existing ACP transport but
-  IDE-facing. Useful for "view my Borg state from my editor" workflows.
+- **ACP — Agent Client Protocol (IDE backend).** `[Z]` Deferred.
+  JSON-RPC 2.0 over stdio so Zed / VS Code / Cursor can use the agent
+  as a coding-assistant backend. `cortex/codex_app_server` and
+  `cortex/claude_cli.rs` exist as outbound CLI providers, but Borg
+  does not expose an _inbound_ ACP server — no editor can drive Borg.
+  Adding this turns Borg into a usable in-editor assistant alongside
+  Claude Code / Codex without giving up its background daemon role.
+  Complement to the MCP server mode below (ACP is coding-backend
+  surface; MCP server is state-introspection surface).
+- **MCP support — both directions, native.** `[H][O]` Deferred. Adopt
+  MCP (Model Context Protocol) as a first-class extensibility surface
+  in addition to today's WASM plugins, both directions:
+  Borg-as-server (`borgd serve-mcp`) so external IDEs / desktop
+  clients (Claude Code, Cursor, Codex) drive Borg over JSON-RPC and
+  can read/write sessions, messages, events, and permissions; and
+  Borg-as-client so it consumes external MCP servers as
+  agent-callable tools. Sibling of the ACP IDE-backend surface
+  above (ACP is coding-backend, MCP server is state-introspection).
 - **MCP OAuth client.** `[H]` Deferred. Borg as MCP **client** with an
   OAuth flow for servers that require it. Most enterprise MCP servers
   do — without OAuth, a meaningful slice of the existing MCP ecosystem
@@ -354,6 +405,14 @@ top-down by priority, not by section order.
   verifies signatures before invoking. Extends `skill_audit`
   (tamper-only) toward a full supply-chain story. Useful once skills
   can be agent-installed from a hub.
+- **In-agent skill authoring workflow.** `[O]` Deferred. Today operators
+  write `SKILL.md` files by hand at `~/.borg/skills/<name>/`. Add a
+  guided flow that lets the agent itself scaffold a new skill: prompt
+  for name + description, generate the YAML frontmatter, draft the body
+  from a stated goal, validate required bins/env, and write the result
+  under `~/.borg/skills/`. Complements the deferred `[I]`-tagged "Skill
+  Workshop" (which captures _corrections_ into skills) — this is the
+  _bootstrap-from-scratch_ surface, distinct from learning-from-feedback.
 
 ### Onboarding & migration
 
@@ -361,10 +420,14 @@ top-down by priority, not by section order.
   model picker → terminal/sandbox backend → channels → tools →
   credentials. Each section idempotent, invokable alone via
   `borg setup <section>`. Today onboarding is one linear flow.
-- **Cross-tool migration importer.** `[H]` `borg import claude-code` /
-  `borg import codex` that pulls `AGENTS.md` / `CLAUDE.md` / hooks /
-  approved-command lists / persona files into Borg's memory + config.
-  Dry-run + overwrite presets. Lowers switching cost from other agents.
+- **Cross-tool migration importer (`borg migrate` / `borg import`).**
+  `[H][I]` Bundled importers for Claude Code, Claude Desktop, Codex,
+  and similar — pulls `AGENTS.md` / `CLAUDE.md` / hooks /
+  approved-command lists / persona files / MCP servers / skills /
+  command prompts / model providers / credentials into Borg's memory
+    - config. Dry-run + overwrite presets. Removes the "redo your whole
+      setup" tax for new users and lowers switching cost from other
+      agents.
 
 ### Security & sandboxing
 
@@ -394,7 +457,7 @@ top-down by priority, not by section order.
 - **Windows sandbox — replace argv-policy transport.** Deferred.
   Today the trampoline carries the policy JSON on its own argv,
   observable to any same-session local process via WMI / `tasklist
-  /v`. The policy is not a credential, but `deny_read` /
+/v`. The policy is not a credential, but `deny_read` /
   `deny_write` paths form a useful map for a different-vector
   attacker. Replace with an inheritable anonymous-pipe handle the
   trampoline reads on startup, or a transient HMAC-sealed file at
@@ -426,18 +489,28 @@ top-down by priority, not by section order.
   response runbook with critical/high/medium/low tiers, coordinated
   disclosure rules, CVE issuance criteria. `SECURITY.md` exists; this
   is the operational complement.
-- **Browser anti-detection + supervisor.** `[H]` Drop-in
-  browser provider with anti-bot stealth headers, dialog auto-handling,
-  and a supervisor that restarts crashed sessions. Borg's `browser`
-  exists but anti-detection posture is unverified, and the deferred
-  Tier 2 browser-recovery work should adopt the same supervisor.
+- **Browser tool — supervisor, anti-detection, persistent profiles.**
+  `[H][O]` Deferred. Three related gaps in the current one-shot-fetch
+  `browser` tool, sharing one supervisor: (1) automatic restart /
+  reconnect on stale CDP sessions, crashed tabs, and disconnected
+  browser processes so failures repair themselves without a manual
+  restart; (2) anti-bot stealth headers + dialog auto-handling
+  (current anti-detection posture is unverified); (3) persistent
+  operator-scoped profiles (auth state, cookies, storage survive
+  across calls), per-session tab management, and an "open this in my
+  logged-in profile" action so multi-step authenticated workflows
+  (book a flight, fill a form on a private dashboard) become
+  possible.
 
 ### Observability
 
-- **Optional OpenTelemetry export.** `[O]` `[telemetry] otel_endpoint`
-  setting; emit traces/metrics/logs for model calls, tool calls,
-  webhook processing. Off by default. Targets power users running
-  Borg as a long-lived service.
+- **OpenTelemetry export pipeline.** `[O][I]` `[telemetry] otel_endpoint`
+  setting; emit traces/metrics/logs for model calls, tool calls, exec,
+  outbound HTTP, webhook processing, context-assembly, memory-pressure,
+  and harness-lifecycle spans/metrics, with W3C traceparent propagation.
+  Off by default. Today borg only exports OTel metrics for WASM plugins
+  — this expands coverage across the agent loop. Targets power users
+  running Borg as a long-lived service.
 - **`borg health --json`.** `[O]` Machine-readable component status
   (DB / KEK / channels / sandbox / LLM provider). Distinct from
   `borg doctor` (fix-oriented) and `borg status` (vitals-only) —
@@ -452,17 +525,6 @@ top-down by priority, not by section order.
 - **Heartbeat active-hours per binding.** `[O]` Per-channel active
   hours, separate from the global 00:00–06:00 quiet window. Lets a
   user receive nightly digests on email but not on Telegram.
-
-### Batch / RL infrastructure
-
-- **Trajectory export for training.** `[H]` `borg export trajectories`
-  writes from/value pairs in HuggingFace-dataset schema, with
-  checkpointing for resume. Useful if we ever fine-tune small local
-  models on Borg's tool-call patterns.
-- **RL environment harness.** `[H]` Atropos-compatible gym
-  environments (web research, terminal test, SWE tasks) for sampling
-  and evaluation. Listed for completeness — likely defer until there's
-  a concrete training initiative.
 
 ### Potential features (not committed)
 
@@ -520,3 +582,103 @@ live` for smoke tests that hit real APIs. Gated, off by default.
   `interface` doesn't reach into `cortex`'s private modules, gateway
   crates don't depend on TUI, etc. Could be `cargo-deny` rules or a
   custom lint.
+
+## Reference-survey `[I]` additions
+
+Items from the 2026-05 survey of the fourth reference codebase. Ordered
+roughly by ROI — each is independent.
+
+### Gateway & ergonomics
+
+- **OpenAI-compatible HTTP API.** `[I]` Expose `/v1/chat/completions`,
+  `/v1/models`, `/v1/embeddings` on `borgd` so borg is a drop-in
+  backend for any OpenAI client (Cursor, Continue, custom apps). Cheap
+  to layer on top of the existing LLM stack; massive ecosystem reach.
+- **Self-update command.** `[I]` `borg update` with a
+  `BORG_NO_AUTO_UPDATE=1` kill switch for locked-down installs.
+
+### Agent loop safety
+
+- **Stuck-loop detection / unknown-tool guard.** `[I]` Default-on
+  exponential backoff when the agent enters a tight tool-call loop,
+  plus a guard that refuses hallucinated tool names instead of
+  surfacing them as errors that the model then retries. Today a runaway
+  model can burn an entire goal budget in seconds with no safety net.
+
+### Voice & media
+
+- **Voice Call channel.** `[I]` Twilio/Telnyx/Plivo realtime voice
+  with streaming STT/TTS (Deepgram, ElevenLabs, OpenAI/xAI realtime).
+  Borg has Twilio SMS but no voice path.
+- **TTS/STT provider matrix.** `[I]` Grow beyond the single
+  `text_to_speech` tool to a provider matrix — TTS: Edge,
+  OpenAI, ElevenLabs v3, Gemini, Azure, Inworld, Volcengine, xAI,
+  DeepInfra, MiniMax, local CLI, MLX; STT: Deepgram, ElevenLabs
+  Scribe, Mistral, Whisper-local. Provider routing per channel/agent.
+
+### Networking & deployment
+
+- **Tailscale + mDNS/Bonjour discovery.** `[I]` Networked multi-device
+  setup without manual cert + hostname wrangling. Pairs naturally with
+  borg's mTLS-but-loopback-only constraint.
+- **launchd / systemd integration.** `[I]` Full service lifecycle —
+  install / uninstall / status / restart. Today `borg service install
+--secure` only covers KEK setup.
+- **APNs push pipeline.** `[I]` Wake disconnected iOS clients via a
+  push relay with App Attest verification.
+- **Tunneling.** `[I]` Bundled cloudflared/ngrok integration so users
+  can expose the gateway without manual port-forwarding or reverse
+  proxy setup.
+
+### Observability
+
+- **Prometheus exporter.** `[I]` Protected `/metrics` scrape route on
+  `borgd` for operators running Prometheus stacks.
+- **Stability snapshots / event-loop liveness.** `[I]` `/readyz` reports
+  event-loop delay (p99/max), CPU ratio, and a `degraded` flag.
+  Stability snapshots travel with diagnostic bundles.
+- **Diagnostics export bundle.** `[I]` `borg diagnostics export`
+  produces a sanitized logs / status / health / config bundle for
+  support requests. Redacts secrets and absolute paths.
+
+### Agent loop & LLM polish
+
+- **Thinking modes.** `[I]` First-class `/think` surface with levels
+  off / minimal / low / medium / high / xhigh / adaptive / max, mapped
+  per provider (Gemini dynamic thinking, Anthropic adaptive, OpenAI
+  flex). Per-model defaults overridable in config.
+- **1M-context + `/fast` mode.** `[I]` Wire Anthropic `service_tier`,
+  OpenAI fast variants, and Codex 1M context normalization through a
+  user-visible `/fast` toggle with per-model defaults.
+- **Multi-provider failover orchestrator.** `[I]` Sequential-on-retryable
+  provider chain with per-provider cooldown — formalize the existing
+  `llm.fallback` config into a documented orchestrator with structured
+  error classification + per-provider cooldown so primary-provider
+  auth, rate-limit, or overload incidents degrade gracefully to
+  fallback providers / Claude CLI / Ollama instead of dead-ending the
+  agent loop (verify current `llm.rs` first; some of this may already
+  exist in the credential pool).
+- **Compaction model override + mid-turn precheck + post-compaction
+  workspace re-injection.** `[I]` Use a cheaper aux model for
+  summarization, run compaction before the next tool call instead of
+  end-of-turn, and re-inject workspace rules / project docs after
+  compaction so the agent doesn't lose context discipline.
+- **`models scan` free-model fallback.** `[I]` Discover OpenRouter
+  free-tier models without an `OPENROUTER_API_KEY`.
+- **`prompt_cache_key` opt-in + replay normalization.** `[I]` Per-provider
+  opt-in for prompt cache keys, plus repair of orphaned reasoning,
+  displaced tool results, and Anthropic/Bedrock thinking-signature
+  stripping during replay.
+- **URL allowlist for `web_search` / `web_fetch`.** `[I]` First-class
+  HTTP egress restriction at the tool layer, matching
+  `[security] blocked_paths` for files.
+- **Session-management CLI.** `[I]` `borg agents`, `borg sessions`,
+  `sessions export-trajectory`, `/subagents spawn` from chat.
+- **Inferred follow-up commitments.** `[I]` Opt-in batched extraction
+  of implicit user commitments ("I'll check in Friday") delivered via
+  heartbeat. Per-agent / per-channel scoping.
+- **Active Memory plugin.** `[I]` Dedicated memory sub-agent runs
+  right before main reply, with configurable depth (message / recent /
+  full) and partial-recall on timeout.
+- **Skill Workshop.** `[I]` Captures reusable workflow corrections as
+  pending or auto-applied workspace skills, threshold-based reviewer.

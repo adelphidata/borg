@@ -723,11 +723,15 @@ fn install_systemd(
     Ok(())
 }
 
+fn secrets_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".borg").join("secrets")
+}
+
 /// Provision `~/.borg/secrets/kek.env` with `BORG_KEK_PASSPHRASE=<random>`,
 /// 0600. Idempotent: existing file is left alone so the encrypted blob
 /// keeps decrypting across reinstalls.
 fn provision_kek_env_file(home: &std::path::Path) -> Result<()> {
-    let secrets = home.join(".borg").join("secrets");
+    let secrets = secrets_dir(home);
     std::fs::create_dir_all(&secrets).with_context(|| format!("create {}", secrets.display()))?;
     #[cfg(unix)]
     set_unix_mode(&secrets, 0o700)?;
@@ -749,7 +753,7 @@ fn provision_kek_env_file(home: &std::path::Path) -> Result<()> {
 /// interactive password prompt. Idempotent: regenerating would invalidate
 /// existing keyring contents.
 fn provision_keyring_env_file(home: &std::path::Path) -> Result<()> {
-    let secrets = home.join(".borg").join("secrets");
+    let secrets = secrets_dir(home);
     std::fs::create_dir_all(&secrets).with_context(|| format!("create {}", secrets.display()))?;
     #[cfg(unix)]
     set_unix_mode(&secrets, 0o700)?;

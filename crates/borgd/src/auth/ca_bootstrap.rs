@@ -227,7 +227,7 @@ mod tests {
         let kek = MemoryKekStore::new();
         let d = db().await;
         let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
-        let san = vec!["localhost".to_string()];
+        let san = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
         let (s1, _, serial1) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
             .await
             .expect("first");
@@ -278,7 +278,7 @@ mod tests {
         let kek = MemoryKekStore::new();
         let d = db().await;
         let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
-        let san = vec!["localhost".to_string()];
+        let san = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
         let (orig_server, _, orig_serial) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
             .await
             .expect("server");
@@ -302,7 +302,7 @@ mod tests {
         let kek = MemoryKekStore::new();
         let d = db().await;
         let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
-        let san = vec!["localhost".to_string()];
+        let san = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
         let (orig, _, orig_serial) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
             .await
             .expect("first");

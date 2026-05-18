@@ -294,12 +294,15 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     use std::path::Path;
 
+    #[cfg(not(target_os = "macos"))]
+    const TEST_TOOL_DIR: &str = "/tmp/tool";
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_wraps_with_bwrap() {
         let policy = SandboxPolicy::default();
         let args = vec!["script.py".to_string()];
-        let cmd = policy.wrap_command("python3", &args, Path::new("/tmp/tool"));
+        let cmd = policy.wrap_command("python3", &args, Path::new(TEST_TOOL_DIR));
         if which::which("bwrap").is_ok() {
             assert_eq!(cmd.program, "bwrap");
         } else {
@@ -313,7 +316,7 @@ mod tests {
     fn linux_preserves_original_args_order() {
         let policy = SandboxPolicy::default();
         let args = vec!["arg1".to_string(), "arg2".to_string()];
-        let cmd = policy.wrap_command("node", &args, Path::new("/tmp/tool"));
+        let cmd = policy.wrap_command("node", &args, Path::new(TEST_TOOL_DIR));
         if which::which("bwrap").is_err() {
             assert_eq!(cmd.program, "node");
             assert_eq!(cmd.args, vec!["arg1", "arg2"]);
@@ -613,7 +616,7 @@ mod tests {
             ..Default::default()
         };
         let args = vec!["arg1".to_string()];
-        let cmd = policy.wrap_command("node", &args, Path::new("/tmp/tool"));
+        let cmd = policy.wrap_command("node", &args, Path::new(TEST_TOOL_DIR));
         // Should pass through without modification
         assert_eq!(cmd.program, "node");
         assert_eq!(cmd.args, vec!["arg1"]);

@@ -7,6 +7,10 @@ use rcgen::{
 };
 use time::{Duration, OffsetDateTime};
 
+/// Clock-skew tolerance applied to every issued cert's `notBefore`.
+/// Five minutes covers typical NTP drift between issuer and verifier.
+const CA_CLOCK_SKEW: Duration = Duration::minutes(5);
+
 /// A self-signed root CA — PEM cert + Ed25519 keypair.
 #[derive(Debug)]
 pub struct RootCa {
@@ -72,7 +76,7 @@ pub fn generate_root_ca(common_name: &str) -> Result<RootCa, PkiError> {
         KeyUsagePurpose::DigitalSignature,
     ];
     let now = OffsetDateTime::now_utc();
-    params.not_before = now - Duration::minutes(5);
+    params.not_before = now - CA_CLOCK_SKEW;
     params.not_after = now + Duration::days(365 * 5);
 
     let key =
@@ -116,7 +120,7 @@ pub fn issue_server_cert(
         rcgen::ExtendedKeyUsagePurpose::ClientAuth,
     ];
     let now = OffsetDateTime::now_utc();
-    params.not_before = now - Duration::minutes(5);
+    params.not_before = now - CA_CLOCK_SKEW;
     params.not_after = now + Duration::days(i64::from(params_in.validity_days));
 
     let key =
@@ -160,7 +164,7 @@ pub fn issue_client_cert(
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let now = OffsetDateTime::now_utc();
-    params.not_before = now - Duration::minutes(5);
+    params.not_before = now - CA_CLOCK_SKEW;
     params.not_after = now + Duration::days(i64::from(params_in.validity_days));
 
     let not_before = params.not_before.unix_timestamp();

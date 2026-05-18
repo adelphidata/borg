@@ -4,6 +4,8 @@ use crate::error::PkiError;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 
+const SECONDS_PER_DAY: i64 = 86_400;
+
 /// Compute a SHA-256 fingerprint over a DER-encoded certificate.
 ///
 /// Returns a lowercase hex string (no colons) — matches `openssl x509 -fingerprint -sha256`
@@ -82,7 +84,7 @@ pub fn fingerprint_of_pem(cert_pem: &[u8]) -> Result<String, PkiError> {
 
 /// True iff the cert expires within `days` from `now`.
 pub fn expires_within(meta: &CertMetadata, now_unix: i64, days: u32) -> bool {
-    let cutoff = now_unix.saturating_add(i64::from(days) * 86_400);
+    let cutoff = now_unix.saturating_add(i64::from(days) * SECONDS_PER_DAY);
     meta.not_after <= cutoff
 }
 
@@ -108,7 +110,7 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic_64_lowercase_hex() {
-        let der = issue_test_cert(-60, 86_400);
+        let der = issue_test_cert(-60, SECONDS_PER_DAY);
         let a = fingerprint_sha256(&der);
         let b = fingerprint_sha256(&der);
         assert_eq!(a, b);
@@ -120,7 +122,7 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_on_byte_flip() {
-        let der = issue_test_cert(-60, 86_400);
+        let der = issue_test_cert(-60, SECONDS_PER_DAY);
         let mut tampered = der.clone();
         tampered[0] ^= 0x01;
         assert_ne!(fingerprint_sha256(&der), fingerprint_sha256(&tampered));
@@ -128,7 +130,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_extracts_cn_and_validity() {
-        let der = issue_test_cert(-60, 86_400 * 90);
+        let der = issue_test_cert(-60, SECONDS_PER_DAY * 90);
         let meta = parse_cert_metadata(&der).expect("parse");
         assert_eq!(meta.subject_cn.as_deref(), Some("test-device"));
         assert!(meta.not_after > meta.not_before);
@@ -141,8 +143,8 @@ mod tests {
         let meta = CertMetadata {
             subject_cn: None,
             san_uri: None,
-            not_before: now - 86_400,
-            not_after: now + 13 * 86_400,
+            not_before: now - SECONDS_PER_DAY,
+            not_after: now + 13 * SECONDS_PER_DAY,
             fingerprint: "x".into(),
         };
         assert!(expires_within(&meta, now, 14));

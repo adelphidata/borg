@@ -394,8 +394,6 @@ mod tests {
         }
     }
 
-    // ── FileKekStore ────────────────────────────────────────────────
-
     fn tmp_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("secrets").join("kek.enc");
@@ -502,10 +500,10 @@ mod tests {
         assert!(matches!(s.get("k"), Err(PkiError::NotFound(_))));
     }
 
-    /// B1 regression: atomic flush. Simulate a crash mid-write by
-    /// dropping a leftover `kek.enc.tmp` next to a healthy `kek.enc` and
-    /// asserting reopen still succeeds. A non-atomic flush would have
-    /// already truncated the real file at this point.
+    /// Atomic flush: a crash mid-write must not corrupt the real file.
+    /// Simulate by dropping a leftover `kek.enc.tmp` next to a healthy
+    /// `kek.enc` and asserting reopen still succeeds. A non-atomic flush
+    /// would have already truncated the real file at this point.
     #[test]
     fn file_kek_leftover_tmp_does_not_corrupt_real_file() {
         let (_dir, path) = tmp_path();
@@ -544,10 +542,9 @@ mod tests {
 
     #[test]
     fn file_kek_debug_redacts_passphrase_and_inner_map() {
-        // Regression for N1: a future refactor that switches to
-        // `#[derive(Debug)]` would echo the passphrase bytes to any
-        // `dbg!()` / `tracing::debug!("{:?}", store)` call. The custom
-        // Debug impl must keep both fields off the output.
+        // A future refactor that switches to `#[derive(Debug)]` would
+        // echo the passphrase bytes to any `dbg!()` / `tracing::debug!`
+        // call. The custom Debug impl must keep both fields off the output.
         let (_dir, path) = tmp_path();
         let store = FileKekStore::open(&path, b"super-secret-pass-123".to_vec()).expect("open");
         store.put("ca-key", b"PRIVATE_PEM").expect("put");
