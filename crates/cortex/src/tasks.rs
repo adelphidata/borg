@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
-use std::str::FromStr;
 use libsql::params;
+use std::str::FromStr;
 
 use crate::constants::{SECS_PER_DAY, SECS_PER_HOUR};
 use crate::db::{Database, ScheduledTaskRow};
@@ -53,7 +53,10 @@ pub fn format_run_status(status: &str) -> &str {
 
 /// Advance a task's next_run using raw SQL on a connection (for use within transactions).
 /// Returns Ok(()) on success.
-pub async fn advance_next_run_raw(conn: &libsql::Connection, task: &ScheduledTaskRow) -> Result<()> {
+pub async fn advance_next_run_raw(
+    conn: &libsql::Connection,
+    task: &ScheduledTaskRow,
+) -> Result<()> {
     match task.schedule_type.as_str() {
         SCHEDULE_TYPE_ONCE => {
             conn.execute(

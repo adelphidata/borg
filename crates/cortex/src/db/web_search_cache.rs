@@ -6,8 +6,8 @@
 //! hit is byte-identical to a live call.
 
 use anyhow::Result;
-use sha2::{Digest, Sha256};
 use libsql::params;
+use sha2::{Digest, Sha256};
 
 use super::Database;
 use crate::util::hex::hex_encode;

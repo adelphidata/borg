@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Datelike;
-use tracing::instrument;
 use libsql::params;
+use tracing::instrument;
 
 use super::models::{ModelUsageRow, TokenSummary};
 use super::Database;

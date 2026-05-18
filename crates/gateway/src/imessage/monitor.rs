@@ -430,7 +430,10 @@ async fn poll_new_messages_with_conn(
 
 /// Fetch attachment metadata for a single message. Returns empty on error so
 /// one malformed attachment row never drops the message itself.
-async fn load_attachment_meta(conn: &libsql::Connection, message_rowid: i64) -> Vec<AttachmentMeta> {
+async fn load_attachment_meta(
+    conn: &libsql::Connection,
+    message_rowid: i64,
+) -> Vec<AttachmentMeta> {
     let sql = "SELECT a.filename, a.transfer_name, a.mime_type \
                FROM attachment a \
                JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID \

@@ -1,7 +1,7 @@
 use anyhow::Result;
+use libsql::params;
 use std::collections::HashMap;
 use tracing::{instrument, warn};
-use libsql::params;
 
 use super::models::{ChannelActivityRow, MessageRow, SessionRow};
 use super::Database;

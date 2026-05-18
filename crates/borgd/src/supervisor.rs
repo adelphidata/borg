@@ -520,7 +520,7 @@ mod tests {
 
         // Issue state row exists with status fail.
         let row: Option<(String, String)> = {
-            let mut stmt = db
+            let stmt = db
                 .conn()
                 .prepare(
                     "SELECT issue_key, last_status FROM maintenance_issue_state WHERE issue_key = ?1",

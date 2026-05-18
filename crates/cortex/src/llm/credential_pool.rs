@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use libsql::params;
 use rand::prelude::IndexedRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use libsql::params;
 
 use crate::db::Database;
 use crate::llm::llm_error::FailoverReason;

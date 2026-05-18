@@ -658,7 +658,7 @@ async fn verify_audit_chain_grpc_reports_tampered_seq() {
     // Tamper with a non-final row. Pick a non-tombstoned row deterministically.
     let target_seq: i64 = {
         let g = state.db.lock().await;
-        let mut stmt = g
+        let stmt = g
             .conn()
             .prepare("SELECT seq FROM audit_log_chain ORDER BY seq ASC LIMIT 1")
             .await
