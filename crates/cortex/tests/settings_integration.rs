@@ -199,6 +199,72 @@ async fn multiple_overrides_compose() {
     assert!(!config.sandbox.enabled);
 }
 
+// ── Test: data_version() runs against real Turso and shifts on writes ──
+//
+// Regression guard for the `PRAGMA data_version` failure: Turso's parser
+// rejects `PRAGMA data_version`, so the config-watcher's poll loop logged
+// "Not a valid pragma name" every 3 seconds on a real install. The previous
+// unit test for this lived under a disabled `#[cfg(feature =
+// "phase9-tests-disabled")]` block AND used `rusqlite::Connection::open_in_memory`,
+// which silently accepts the pragma — so it would never have caught the bug
+// against the real backend. This test runs against the real Turso engine
+// (`Database::test_db`) so a future regression to an unsupported pragma will
+// surface as a hard failure instead of a runtime warn-spam.
+#[tokio::test]
+async fn data_version_runs_against_real_turso_backend() {
+    let db = test_db().await;
+    let v = db.data_version().await.expect("data_version must succeed");
+    // The exact value isn't meaningful — the contract is that the call
+    // doesn't error out against the real Turso parser.
+    assert!(v >= 0, "version indicator must be non-negative, got {v}");
+}
+
+#[tokio::test]
+async fn data_version_shifts_after_setting_write() {
+    let db = test_db().await;
+    let before = db.data_version().await.expect("read before");
+
+    // Use the public set_setting API so the test exercises the real write
+    // path the watcher is supposed to detect, not just a raw INSERT.
+    db.set_setting("temperature", "0.42")
+        .await
+        .expect("set temperature");
+
+    // updated_at is at second granularity; sleep just past 1s so the
+    // MAX(updated_at) folded into the indicator visibly shifts. Without
+    // this, an update inside the same wall-clock second wouldn't be
+    // detected — a real watcher race in production, not just a test
+    // artifact. Documenting it here is the point.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    db.set_setting("temperature", "0.43")
+        .await
+        .expect("second set");
+
+    let after = db.data_version().await.expect("read after");
+    assert_ne!(
+        before, after,
+        "data_version must change after a settings write (before={before}, after={after})"
+    );
+}
+
+#[tokio::test]
+async fn data_version_shifts_after_setting_delete() {
+    let db = test_db().await;
+    db.set_setting("temperature", "0.42")
+        .await
+        .expect("seed setting");
+    let before = db.data_version().await.expect("read before");
+
+    let removed = db.delete_setting("temperature").await.expect("delete");
+    assert!(removed, "delete should remove the row");
+
+    let after = db.data_version().await.expect("read after");
+    assert_ne!(
+        before, after,
+        "data_version must change after a settings delete (count shifted)"
+    );
+}
+
 // ── Test: DB persistence across resolver operations ──
 
 #[tokio::test]

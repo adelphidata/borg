@@ -47,21 +47,33 @@ impl Database {
         }
     }
 
-    /// Returns SQLite's `data_version` counter, which increments whenever any
-    /// connection (including other processes) modifies the database.
-    /// This is an in-memory check — no disk I/O.
+    /// Returns a change-indicator value that shifts whenever rows in the
+    /// `settings` table are inserted, updated, or deleted. Used by the config
+    /// watcher to detect cross-process settings changes without reloading the
+    /// full table every poll.
     ///
-    /// Note: in WAL mode, `data_version` only reflects changes visible to this
-    /// connection. A long-lived read transaction (snapshot) will not see bumps
-    /// from other writers. The config watcher poll loop does not hold read
-    /// transactions between polls, so this works correctly there.
+    /// Turso 0.6's parser rejects `PRAGMA data_version`, so we derive the
+    /// indicator from `(COUNT(*), MAX(updated_at))` on the settings table.
+    /// Inserts/deletes shift COUNT; any UPDATE bumps `updated_at` (set by
+    /// `set_setting`). The two are folded into a single i64 so callers only
+    /// need an equality check.
     pub async fn data_version(&self) -> Result<i64> {
-        let mut rows = self.conn.query("PRAGMA data_version", ()).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM settings",
+                (),
+            )
+            .await?;
         let row = rows
             .next()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("data_version returned no rows"))?;
-        Ok(row.get::<i64>(0)?)
+            .ok_or_else(|| anyhow::anyhow!("settings aggregate returned no rows"))?;
+        let count = row.get::<i64>(0)?;
+        let max_updated_at = row.get::<i64>(1)?;
+        // Fold both fields into one i64 — callers only compare for inequality.
+        // Multiplier comfortably exceeds plausible settings-row counts.
+        Ok(max_updated_at.wrapping_mul(1_000_000).wrapping_add(count))
     }
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
