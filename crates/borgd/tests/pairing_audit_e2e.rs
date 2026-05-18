@@ -140,7 +140,7 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
         g.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = '{\"tampered\":true}' WHERE seq = ?1",
-                turso::params!(target_seq),
+                libsql::params!(target_seq),
             )
             .await
             .expect("tamper");
@@ -672,7 +672,7 @@ async fn verify_audit_chain_grpc_reports_tampered_seq() {
         g.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = '{\"hacked\":true}' WHERE seq = ?1",
-                turso::params!(target_seq),
+                libsql::params!(target_seq),
             )
             .await
             .expect("tamper");

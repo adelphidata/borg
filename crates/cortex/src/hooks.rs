@@ -107,7 +107,7 @@ pub enum HookAction {
 /// Trait for implementing lifecycle hooks on the agent loop.
 ///
 /// `execute` is async because hooks routinely persist state to the
-/// turso-backed `Database`, whose entire surface is async.
+/// libsql-backed `Database`, whose entire surface is async.
 /// The trait stays object-safe via `#[async_trait]`.
 #[async_trait]
 pub trait Hook: Send + Sync {

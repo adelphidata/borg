@@ -7,7 +7,7 @@
 //! safe to share. See [`crate::output_redaction`].
 
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 use crate::security::secrets::RedactionHit;
@@ -58,7 +58,7 @@ impl Database {
     /// Most-recent rows, newest first. Read path for a future `/redactions`
     /// viewer or doctor surface.
     pub async fn recent_redactions(&self, limit: usize) -> Result<Vec<RedactionAuditRow>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT id, ts, sink, label, hit_count, context_key

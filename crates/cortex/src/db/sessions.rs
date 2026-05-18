@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use tracing::{instrument, warn};
-use turso::params;
+use libsql::params;
 
 use super::models::{ChannelActivityRow, MessageRow, SessionRow};
 use super::Database;
@@ -548,15 +548,14 @@ impl Database {
     }
 
     /// Full-text candidate search over past session messages. Returns rows
-    /// matching the sanitized query with `score = 0.0` — Turso's `USING fts`
-    /// index method does not expose a SQL-callable `bm25()`, so ranking is
-    /// computed in Rust by the caller via [`crate::memory::bm25`].
+    /// matching the sanitized query with `score = 0.0` — BM25 ranking is
+    /// computed in Rust by the caller via [`crate::memory::bm25`] so the
+    /// vector + lexical fusion stays in one place rather than being split
+    /// across SQL and Rust.
     ///
     /// `limit` is the *final* result count the caller intends to surface;
     /// this method oversamples by 4× (capped at 200) so the BM25 re-rank has
-    /// enough breadth to be meaningful. Pre-port the SQL `LIMIT 50` was
-    /// applied *after* BM25 ranking inside SQLite; with ranking moved out we
-    /// must widen the candidate set to compensate.
+    /// enough breadth to be meaningful.
     pub async fn messages_fts_search(
         &self,
         query: &str,
@@ -570,10 +569,11 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, session_id, role, content, created_at
-             FROM messages
-             WHERE content MATCH ?1
-             LIMIT ?2",
+                "SELECT m.id, m.session_id, m.role, m.content, m.created_at
+                 FROM messages m
+                 JOIN messages_fts f ON m.id = f.rowid
+                 WHERE messages_fts MATCH ?1
+                 LIMIT ?2",
                 params!(sanitized, candidate_limit as i64),
             )
             .await?;

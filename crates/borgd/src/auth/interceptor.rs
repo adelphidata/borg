@@ -46,7 +46,7 @@ pub fn auth_interceptor(
             .as_ref()
             .and_then(|cs| cs.first().map(|c| c.as_ref().to_vec()))
             .ok_or_else(|| {
-                // Interceptor closure is sync; audit emit is async post-turso
+                // Interceptor closure is sync; audit emit is async post-libsql
                 // migration. Schedule the write on the current runtime so the
                 // auth-failure row still lands in the hash chain. Failing the
                 // request itself stays synchronous.

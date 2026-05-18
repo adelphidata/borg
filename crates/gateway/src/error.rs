@@ -43,8 +43,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<turso::Error> for Error {
-    fn from(err: turso::Error) -> Self {
+impl From<libsql::Error> for Error {
+    fn from(err: libsql::Error) -> Self {
         Error::Other(anyhow::anyhow!("db: {err}"))
     }
 }

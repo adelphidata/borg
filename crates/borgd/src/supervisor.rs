@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// `Database` is now `Send + Sync` (turso connection is internally `Arc`'d),
+/// `Database` is now `Send + Sync` (libsql connection is internally `Arc`'d),
 /// so subsystems share access through a plain `Arc`. The legacy
 /// `Arc<Mutex<Database>>` wrapper became dead weight once the SQL layer
 /// went async.
@@ -400,7 +400,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     async fn test_db() -> DbHandle {
-        // The DbHandle is now a plain `Arc<Database>` — turso's connection is
+        // The DbHandle is now a plain `Arc<Database>` — libsql's connection is
         // internally Arc'd, so the Mutex wrapper that pre-dated the async DB
         // is no longer needed.
         Arc::new(Database::test_db().await)
@@ -528,7 +528,7 @@ mod tests {
                 .await
                 .expect("prepare issue_state lookup");
             let mut rows = stmt
-                .query([turso::Value::from("Subsystem:degrade-test")])
+                .query([libsql::Value::from("Subsystem:degrade-test")])
                 .await
                 .expect("query issue_state");
             rows.next().await.expect("fetch row").map(|r| {

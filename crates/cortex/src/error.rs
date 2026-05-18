@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Top-level error type for the cortex crate.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Database / turso / migration failure.
+    /// Database / libsql / migration failure.
     #[error("db: {0}")]
     Db(String),
 
@@ -50,8 +50,8 @@ pub enum Error {
 /// Convenient `Result` alias for crate-public functions.
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<turso::Error> for Error {
-    fn from(err: turso::Error) -> Self {
+impl From<libsql::Error> for Error {
+    fn from(err: libsql::Error) -> Self {
         Error::Db(err.to_string())
     }
 }

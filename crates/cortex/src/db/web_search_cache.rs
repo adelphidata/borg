@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use turso::params;
+use libsql::params;
 
 use super::Database;
 use crate::util::hex::hex_encode;

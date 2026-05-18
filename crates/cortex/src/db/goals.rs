@@ -6,7 +6,7 @@
 //! from `active` without an explicit user action.
 
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 use crate::goals::Goal;
@@ -51,7 +51,7 @@ const SELECT_COLS: &str = "session_id, goal_id, objective, status, token_budget,
 
 /// Map a row from `SELECT_COLS` to a [`Goal`]. Returns an error when the
 /// row holds an unknown status string.
-fn map_row(row: &turso::Row) -> Result<Goal> {
+fn map_row(row: &libsql::Row) -> Result<Goal> {
     let status_raw: String = row.get::<String>(3)?;
     let status = GoalStatus::from_str(&status_raw)
         .ok_or_else(|| anyhow::anyhow!("unknown goal status in DB: {status_raw}"))?;

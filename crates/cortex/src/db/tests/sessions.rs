@@ -1,5 +1,5 @@
 use super::*;
-use turso::params;
+use libsql::params;
 
 #[test]
 fn upsert_session_metadata() {

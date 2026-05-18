@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{ChunkData, ChunkRow, EmbeddingRow, MemoryEntryRow};
 use super::Database;
@@ -404,10 +404,10 @@ impl Database {
 
     /// Full-text candidate search over chunk content within a scope.
     /// Returns `(ChunkRow, 0.0)` pairs for every row matching the sanitized
-    /// query — Turso's `USING fts` index method does not expose a
-    /// SQL-callable `bm25()`, so BM25 ranking moves to the caller (see
-    /// [`crate::memory::bm25`]). The `f32` slot is preserved for API
-    /// symmetry; the caller is expected to overwrite it.
+    /// query — BM25 ranking lives in the caller (see
+    /// [`crate::memory::bm25`]) so the vector + lexical fusion stays in one
+    /// place. The `f32` slot is preserved for API symmetry; the caller is
+    /// expected to overwrite it.
     ///
     /// `limit` is the final post-rank result count; this method oversamples
     /// by 4× (capped at 200) so the BM25 re-rank has enough breadth.
@@ -425,12 +425,13 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, scope, filename, chunk_index, start_line, end_line,
-                    content, content_hash, embedding, created_at
-             FROM memory_chunks
-             WHERE content MATCH ?1
-               AND scope = ?2
-             LIMIT ?3",
+                "SELECT c.id, c.scope, c.filename, c.chunk_index, c.start_line, c.end_line,
+                        c.content, c.content_hash, c.embedding, c.created_at
+                 FROM memory_chunks c
+                 JOIN memory_chunks_fts f ON c.id = f.rowid
+                 WHERE memory_chunks_fts MATCH ?1
+                   AND c.scope = ?2
+                 LIMIT ?3",
                 params!(sanitized, scope, candidate_limit as i64),
             )
             .await?;
@@ -704,9 +705,9 @@ impl Database {
              WHERE scope IN ({placeholders})
              ORDER BY scope, updated_at DESC"
         );
-        let bound: Vec<turso::Value> = scopes
+        let bound: Vec<libsql::Value> = scopes
             .iter()
-            .map(|s| turso::Value::Text(s.clone()))
+            .map(|s| libsql::Value::Text(s.clone()))
             .collect();
         let mut rows = self.conn.query(&sql, bound).await?;
         let mut out = Vec::new();
@@ -739,9 +740,9 @@ impl Database {
             "SELECT scope, name, estimated_tokens FROM memory_entries
              WHERE scope IN ({placeholders}) AND estimated_tokens IS NOT NULL"
         );
-        let bound: Vec<turso::Value> = scopes
+        let bound: Vec<libsql::Value> = scopes
             .iter()
-            .map(|s| turso::Value::Text(s.clone()))
+            .map(|s| libsql::Value::Text(s.clone()))
             .collect();
         let mut rows = self.conn.query(&sql, bound).await?;
         let mut out = std::collections::HashMap::new();

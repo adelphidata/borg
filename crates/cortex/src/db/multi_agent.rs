@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{AgentRoleRow, SubAgentRunRow};
 use super::Database;
@@ -65,7 +65,7 @@ impl Database {
             params!(name),
         ).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::agent_role_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::agent_role_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -77,12 +77,12 @@ impl Database {
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::agent_role_row_from_turso(&row)?);
+            out.push(Self::agent_role_row_from_row(&row)?);
         }
         Ok(out)
     }
 
-    fn agent_role_row_from_turso(row: &turso::Row) -> Result<AgentRoleRow> {
+    fn agent_role_row_from_row(row: &libsql::Row) -> Result<AgentRoleRow> {
         Ok(AgentRoleRow {
             name: row.get::<String>(0)?,
             description: row.get::<String>(1)?,
@@ -149,7 +149,7 @@ impl Database {
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::sub_agent_run_row_from_turso(&row)?);
+            out.push(Self::sub_agent_run_row_from_row(&row)?);
         }
         Ok(out)
     }
@@ -160,12 +160,12 @@ impl Database {
             params!(id),
         ).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::sub_agent_run_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::sub_agent_run_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
 
-    fn sub_agent_run_row_from_turso(row: &turso::Row) -> Result<SubAgentRunRow> {
+    fn sub_agent_run_row_from_row(row: &libsql::Row) -> Result<SubAgentRunRow> {
         Ok(SubAgentRunRow {
             id: row.get::<String>(0)?,
             nickname: row.get::<String>(1)?,

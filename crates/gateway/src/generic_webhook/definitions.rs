@@ -6,7 +6,7 @@ use base64::Engine as _;
 use cortex::db::Database;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use turso::params;
+use libsql::params;
 
 /// One row in `webhook_definitions`.
 #[derive(Debug, Clone)]

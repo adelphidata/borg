@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{ApprovedSenderRow, PairingRequestRow};
 use super::Database;
@@ -29,7 +29,7 @@ impl Database {
         Ok(id)
     }
 
-    fn pairing_row_from_turso(row: &turso::Row) -> Result<PairingRequestRow> {
+    fn pairing_row_from_row(row: &libsql::Row) -> Result<PairingRequestRow> {
         Ok(PairingRequestRow {
             id: row.get::<String>(0)?,
             channel_name: row.get::<String>(1)?,
@@ -43,7 +43,7 @@ impl Database {
         })
     }
 
-    fn approved_sender_row_from_turso(row: &turso::Row) -> Result<ApprovedSenderRow> {
+    fn approved_sender_row_from_row(row: &libsql::Row) -> Result<ApprovedSenderRow> {
         Ok(ApprovedSenderRow {
             id: row.get::<i64>(0)?,
             channel_name: row.get::<String>(1)?,
@@ -67,7 +67,7 @@ impl Database {
             params!(channel_name, code, now),
         ).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::pairing_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::pairing_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -86,7 +86,7 @@ impl Database {
             params!(channel_name, sender_id, now),
         ).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::pairing_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::pairing_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -113,7 +113,7 @@ impl Database {
                     params!(channel_name, code.clone(), now),
                 ).await?;
                 match rows.next().await? {
-                    Some(row) => Self::pairing_row_from_turso(&row)?,
+                    Some(row) => Self::pairing_row_from_row(&row)?,
                     None => {
                         anyhow::bail!(
                             "No pending pairing request found for channel '{channel_name}' with code '{code}'"
@@ -235,7 +235,7 @@ impl Database {
             params!(code, now),
         ).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::pairing_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::pairing_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -266,7 +266,7 @@ impl Database {
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::pairing_row_from_turso(&row)?);
+            out.push(Self::pairing_row_from_row(&row)?);
         }
         Ok(out)
     }
@@ -281,7 +281,7 @@ impl Database {
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::pairing_row_from_turso(&row)?);
+            out.push(Self::pairing_row_from_row(&row)?);
         }
         Ok(out)
     }
@@ -308,7 +308,7 @@ impl Database {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::approved_sender_row_from_turso(&row)?);
+            out.push(Self::approved_sender_row_from_row(&row)?);
         }
         Ok(out)
     }
@@ -324,7 +324,7 @@ impl Database {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::approved_sender_row_from_turso(&row)?);
+            out.push(Self::approved_sender_row_from_row(&row)?);
         }
         Ok(out)
     }

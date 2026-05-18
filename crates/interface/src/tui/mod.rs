@@ -116,7 +116,7 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
     if let Ok(data_dir) = Config::data_dir() {
         let imessage_dir = data_dir.join("channels/imessage");
         if imessage_dir.join("channel.toml").exists() {
-            // probe_imessage is async (turso open + query), so the probe-and-spawn
+            // probe_imessage is async (libsql open + query), so the probe-and-spawn
             // sequence runs inside a single tokio task.
             let im_config = config.clone();
             let im_shutdown = shutdown;

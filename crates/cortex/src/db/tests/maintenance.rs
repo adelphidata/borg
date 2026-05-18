@@ -8,7 +8,7 @@ use crate::tasks::{
     calculate_next_run, heal_stalled_tasks, recover_wedged_runs, RUN_STATUS_FAILED,
     RUN_STATUS_MISSED, RUN_STATUS_RUNNING, RUN_STATUS_SUCCESS,
 };
-use turso::params;
+use libsql::params;
 
 #[test]
 fn maintenance_task_is_seeded_by_v37() {

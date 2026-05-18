@@ -33,7 +33,8 @@ which = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-util = { workspace = true }
 rand = { workspace = true }
-turso = { workspace = true }
+libsql = { workspace = true }
+bytes = "1"
 scraper = { workspace = true }
 cron = { workspace = true }
 regex = { workspace = true }
@@ -80,10 +81,12 @@ live-llm = []
 # artifacts. Enable explicitly when running integration tests that need the
 # fixture binary.
 test-support = []
-# Gate for legacy sync-DB unit tests that haven't been ported to the async
-# turso API yet. Off by default — these tests are tracked work, not regressions.
-# Removing every `#[cfg(feature = "phase9-tests-disabled")]` site also lets this
-# feature go away.
+# Gate for legacy sync-DB unit tests that still call the pre-async rusqlite
+# `Connection::open_in_memory()` + sync `db.execute(...)` style and haven't
+# been ported to the libsql async API yet. Off by default — these tests are
+# tracked work, not regressions. The bulk port is a follow-up to the
+# turso→libsql backend swap; ungating each site is mechanical but volume-heavy
+# (16+ DB test submodules, ~50 unit tests in `settings.rs`).
 phase9-tests-disabled = []
 
 # Test fixture: hermetic stand-in for `codex app-server`. Gated behind
@@ -101,5 +104,5 @@ workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 libc = { workspace = true }
 wiremock = "0.5"
-turso = { workspace = true }
+libsql = { workspace = true }
 wasm-encoder = "0.244"

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{
     NewWasmPlugin, PluginRow, WasmPluginRow, WasmToolDefinitionRow, WasmToolRuntimeRow,

@@ -370,7 +370,7 @@ async fn poll_new_messages(db_path: &str, last_rowid: i64) -> Result<Vec<IMessag
 /// Same as `poll_new_messages` but uses a caller-supplied connection. Split
 /// out so tests can drive the SQL against an in-memory fixture chat.db.
 async fn poll_new_messages_with_conn(
-    conn: &turso::Connection,
+    conn: &libsql::Connection,
     last_rowid: i64,
 ) -> Result<Vec<IMessagePayload>> {
     let mut rows = conn
@@ -389,7 +389,7 @@ async fn poll_new_messages_with_conn(
          )) \
          ORDER BY m.ROWID ASC \
          LIMIT 50",
-            turso::params!(last_rowid),
+            libsql::params!(last_rowid),
         )
         .await?;
 
@@ -430,12 +430,12 @@ async fn poll_new_messages_with_conn(
 
 /// Fetch attachment metadata for a single message. Returns empty on error so
 /// one malformed attachment row never drops the message itself.
-async fn load_attachment_meta(conn: &turso::Connection, message_rowid: i64) -> Vec<AttachmentMeta> {
+async fn load_attachment_meta(conn: &libsql::Connection, message_rowid: i64) -> Vec<AttachmentMeta> {
     let sql = "SELECT a.filename, a.transfer_name, a.mime_type \
                FROM attachment a \
                JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID \
                WHERE maj.message_id = ?1";
-    let mut rows = match conn.query(sql, turso::params!(message_rowid)).await {
+    let mut rows = match conn.query(sql, libsql::params!(message_rowid)).await {
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to query attachments for rowid {message_rowid}: {e}");
@@ -475,10 +475,10 @@ async fn load_attachment_meta(conn: &turso::Connection, message_rowid: i64) -> V
     out
 }
 
-async fn open_chatdb(db_path: &str) -> Result<turso::Connection> {
-    // Turso has no SQLITE_OPEN_READ_ONLY flag. Read-only is enforced at the
+async fn open_chatdb(db_path: &str) -> Result<libsql::Connection> {
+    // libsql has no SQLITE_OPEN_READ_ONLY flag. Read-only is enforced at the
     // application layer: this module only issues SELECTs against chat.db.
-    let db = turso::Builder::new_local(db_path)
+    let db = libsql::Builder::new_local(db_path)
         .build()
         .await
         .context("Failed to open chat.db (check Full Disk Access)")?;
@@ -888,11 +888,11 @@ mod tests {
 
     /// Build a minimal chat.db schema sufficient to exercise poll_new_messages.
     /// Mirrors the columns Borg actually reads — not a full chat.db replica.
-    async fn build_fixture_db() -> turso::Connection {
-        let db = turso::Builder::new_local(":memory:")
+    async fn build_fixture_db() -> libsql::Connection {
+        let db = libsql::Builder::new_local(":memory:")
             .build()
             .await
-            .expect("open in-memory turso db");
+            .expect("open in-memory libsql db");
         let conn = db.connect().expect("connect to in-memory db");
         conn.execute_batch(
             r#"
@@ -936,7 +936,7 @@ mod tests {
         conn
     }
 
-    async fn exec(conn: &turso::Connection, sql: &str) {
+    async fn exec(conn: &libsql::Connection, sql: &str) {
         conn.execute(sql, ()).await.expect("fixture exec");
     }
 

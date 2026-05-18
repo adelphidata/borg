@@ -1,6 +1,8 @@
-//! BM25 scoring computed in Rust over a candidate set returned by an FTS
-//! MATCH. Turso's `USING fts` index method doesn't expose a SQL-callable
-//! `bm25()`, so ranking moves to the application layer.
+//! BM25 scoring computed in Rust over a candidate set returned by an FTS5
+//! MATCH. libsql's FTS5 does expose a SQL-callable `bm25()`, but ranking
+//! lives in Rust so the vector + lexical fusion (70/30 hybrid) stays in
+//! one place — splitting it across SQL and Rust would mean two sources of
+//! truth for the score.
 //!
 //! The corpus statistics (`avgdl`, `doc_freq`) are derived from the
 //! post-MATCH candidate set, *not* the full index. This is a deliberate

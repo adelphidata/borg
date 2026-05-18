@@ -1,5 +1,5 @@
 use super::*;
-use turso::params;
+use libsql::params;
 
 #[test]
 fn log_and_query_token_usage() {

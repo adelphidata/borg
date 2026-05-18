@@ -17,7 +17,7 @@ use rand::prelude::IndexedRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use turso::params;
+use libsql::params;
 
 use crate::db::Database;
 use crate::llm::llm_error::FailoverReason;
@@ -929,7 +929,7 @@ impl CredentialPool {
     /// operators see read-only-mount / locked-db / corrupted-DB errors instead
     /// of silently losing pool state across restart.
     ///
-    /// turso's connection API is async — we fire-and-forget the write onto the
+    /// libsql's connection API is async — we fire-and-forget the write onto the
     /// current tokio runtime so the sync caller (e.g. `report_success`) keeps
     /// its non-blocking contract. If no runtime is current (rare; only the
     /// startup `borg auth` CLI today), the persist is logged and skipped.
@@ -2060,7 +2060,7 @@ fn reconcile_or_new_oauth(
 
 /// Operations that can be fired-and-forgotten onto the tokio runtime by the
 /// pool's sync API. Each variant carries everything the async helper needs to
-/// open a short-lived turso connection and run the matching SQL.
+/// open a short-lived libsql connection and run the matching SQL.
 #[allow(clippy::large_enum_variant)]
 enum PersistOp {
     Upsert(PooledCredential),
@@ -2112,26 +2112,23 @@ fn spawn_persist_task(db_path: std::path::PathBuf, provider: String, op: Persist
     });
 }
 
-async fn open_short_conn(db_path: &std::path::Path) -> Result<turso::Connection> {
+async fn open_short_conn(db_path: &std::path::Path) -> Result<libsql::Connection> {
     let path_str = db_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 db path: {}", db_path.display()))?;
-    let db = turso::Builder::new_local(path_str)
-        .experimental_encryption(true)
-        .experimental_vacuum(true)
-        .experimental_index_method(true)
+    let db = libsql::Builder::new_local(path_str)
         .build()
         .await
-        .with_context(|| format!("turso build at {}", db_path.display()))?;
+        .with_context(|| format!("libsql build at {}", db_path.display()))?;
     let conn = db
         .connect()
-        .with_context(|| format!("turso connect at {}", db_path.display()))?;
+        .with_context(|| format!("libsql connect at {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))
         .context("set busy_timeout")?;
     Ok(conn)
 }
 
-async fn upsert_row(conn: &turso::Connection, provider: &str, c: &PooledCredential) -> Result<()> {
+async fn upsert_row(conn: &libsql::Connection, provider: &str, c: &PooledCredential) -> Result<()> {
     let source_json = serde_json::to_string(&c.source).context("serialize source")?;
     let auth_type_db = match c.auth_type {
         AuthType::ApiKey => "api_key",

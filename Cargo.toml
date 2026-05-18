@@ -68,7 +68,7 @@ textwrap = "0.16"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 regex = "1"
-turso = "0.6"
+libsql = { version = "0.9", default-features = false, features = ["core", "encryption"] }
 # Pinned to keep MSRV at 1.88 — roaring 0.11.3+ requires rustc 1.90.
 # Revisit when the workspace rust-toolchain bumps past 1.90.
 roaring = "=0.11.2"

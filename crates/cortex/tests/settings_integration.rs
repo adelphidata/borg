@@ -199,70 +199,119 @@ async fn multiple_overrides_compose() {
     assert!(!config.sandbox.enabled);
 }
 
-// ── Test: data_version() runs against real Turso and shifts on writes ──
+// ── Test: data_version() runs against real backend and shifts on writes ──
 //
-// Regression guard for the `PRAGMA data_version` failure: Turso's parser
-// rejects `PRAGMA data_version`, so the config-watcher's poll loop logged
-// "Not a valid pragma name" every 3 seconds on a real install. The previous
-// unit test for this lived under a disabled `#[cfg(feature =
-// "phase9-tests-disabled")]` block AND used `rusqlite::Connection::open_in_memory`,
-// which silently accepts the pragma — so it would never have caught the bug
-// against the real backend. This test runs against the real Turso engine
-// (`Database::test_db`) so a future regression to an unsupported pragma will
-// surface as a hard failure instead of a runtime warn-spam.
+// Regression guard for the `PRAGMA data_version` failure. The original bug
+// shipped on the turso backend: turso's parser rejected `PRAGMA data_version`,
+// so the config-watcher's poll loop logged "Not a valid pragma name" every
+// 3 seconds on a real install. The pre-existing unit test was useless
+// because it lived under a disabled `#[cfg(feature = "phase9-tests-disabled")]`
+// block AND opened `rusqlite::Connection::open_in_memory`, which silently
+// accepts the pragma. It would never have caught the bug against the real
+// backend. libsql's fixed the parser (PRAGMA data_version works), but the
+// regression guard stays — exercising the real backend is the whole point.
 #[tokio::test]
-async fn data_version_runs_against_real_turso_backend() {
+async fn data_version_runs_against_real_sqlite_backend() {
     let db = test_db().await;
     let v = db.data_version().await.expect("data_version must succeed");
     // The exact value isn't meaningful — the contract is that the call
-    // doesn't error out against the real Turso parser.
+    // doesn't error out against the real SQLite parser.
     assert!(v >= 0, "version indicator must be non-negative, got {v}");
 }
 
-#[tokio::test]
-async fn data_version_shifts_after_setting_write() {
-    let db = test_db().await;
-    let before = db.data_version().await.expect("read before");
+/// SQLite's `PRAGMA data_version` is connection-local: it only shifts when
+/// *another* connection commits a write to the same database. Same-connection
+/// writes do not bump it. That semantics is what the config-watcher needs —
+/// the watcher's whole point is detecting writes from the daemon while the
+/// CLI is polling, or vice versa. The regression guard must therefore use
+/// two connections to a real file-backed DB; a single in-memory handle can't
+/// observe the cross-connection shift.
+async fn open_two_handles_to_same_file() -> (
+    tempfile::TempDir,
+    cortex::db::Database,
+    cortex::db::Database,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("borg-test.db");
+    let writer = cortex::db::Database::open_at(&path)
+        .await
+        .expect("open writer");
+    let reader = cortex::db::Database::open_at(&path)
+        .await
+        .expect("open reader");
+    (tmp, writer, reader)
+}
 
-    // Use the public set_setting API so the test exercises the real write
-    // path the watcher is supposed to detect, not just a raw INSERT.
-    db.set_setting("temperature", "0.42")
+#[tokio::test]
+async fn data_version_shifts_after_cross_connection_write() {
+    let (_tmp, writer, reader) = open_two_handles_to_same_file().await;
+    let before = reader.data_version().await.expect("read before");
+
+    writer
+        .set_setting("temperature", "0.42")
         .await
         .expect("set temperature");
 
-    // updated_at is at second granularity; sleep just past 1s so the
-    // MAX(updated_at) folded into the indicator visibly shifts. Without
-    // this, an update inside the same wall-clock second wouldn't be
-    // detected — a real watcher race in production, not just a test
-    // artifact. Documenting it here is the point.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    db.set_setting("temperature", "0.43")
-        .await
-        .expect("second set");
-
-    let after = db.data_version().await.expect("read after");
+    let after = reader.data_version().await.expect("read after");
     assert_ne!(
         before, after,
-        "data_version must change after a settings write (before={before}, after={after})"
+        "data_version must change after a cross-connection write (before={before}, after={after})"
     );
 }
 
 #[tokio::test]
-async fn data_version_shifts_after_setting_delete() {
-    let db = test_db().await;
-    db.set_setting("temperature", "0.42")
+async fn data_version_shifts_after_cross_connection_delete() {
+    let (_tmp, writer, reader) = open_two_handles_to_same_file().await;
+    writer
+        .set_setting("temperature", "0.42")
         .await
         .expect("seed setting");
-    let before = db.data_version().await.expect("read before");
+    let before = reader.data_version().await.expect("read before");
 
-    let removed = db.delete_setting("temperature").await.expect("delete");
+    let removed = writer.delete_setting("temperature").await.expect("delete");
     assert!(removed, "delete should remove the row");
 
-    let after = db.data_version().await.expect("read after");
+    let after = reader.data_version().await.expect("read after");
     assert_ne!(
         before, after,
-        "data_version must change after a settings delete (count shifted)"
+        "data_version must change after a cross-connection delete (before={before}, after={after})"
     );
+}
+
+// ── Test: WAL multi-process — the backend swap's primary motivation ──
+//
+// The bug that drove the turso→libsql swap: the prior backend's WAL
+// implementation took an exclusive lock on `borg.db-wal`, so a second
+// process opening the same DB hit a fatal `Locking error`. That broke the
+// design assumption that the standalone CLI could coexist with `borgd`.
+// libsql's WAL is multi-process, real-sqlite behaviour — two writers and
+// any number of readers can share one file. This guard locks that down:
+// any future regression that re-introduces exclusive WAL locking surfaces
+// here instead of as a runtime crash in `borg --listen` startup.
+#[tokio::test]
+async fn two_handles_to_same_file_can_both_write() {
+    let (_tmp, writer_a, writer_b) = open_two_handles_to_same_file().await;
+    writer_a
+        .set_setting("temperature", "0.10")
+        .await
+        .expect("writer A: set temperature");
+    writer_b
+        .set_setting("max_tokens", "2048")
+        .await
+        .expect("writer B: set max_tokens — would fail on a single-writer WAL backend");
+
+    let temp = writer_b
+        .get_setting("temperature")
+        .await
+        .expect("read temperature from writer B")
+        .expect("temperature row present");
+    let max_tokens = writer_a
+        .get_setting("max_tokens")
+        .await
+        .expect("read max_tokens from writer A")
+        .expect("max_tokens row present");
+    assert_eq!(temp, "0.10");
+    assert_eq!(max_tokens, "2048");
 }
 
 // ── Test: DB persistence across resolver operations ──

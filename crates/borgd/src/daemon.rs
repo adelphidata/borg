@@ -343,7 +343,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // daemon restart.
     // `output_redaction::RedactionPolicy::from_db` expects an
     // `Arc<std::sync::Mutex<Database>>` (its audit closure briefly snapshots
-    // the turso `Connection` under the sync lock and drops the guard before
+    // the libsql `Connection` under the sync lock and drops the guard before
     // awaiting). Open a dedicated handle so we don't have to thread the
     // wider `tokio::sync::Mutex<Database>` through that closure signature.
     let redaction_db = Database::open()

@@ -6,7 +6,7 @@
 //! same rate.
 
 use anyhow::{Context, Result};
-use turso::params;
+use libsql::params;
 
 use crate::db::Database;
 

@@ -426,7 +426,7 @@ mod tests {
 
     // Redundant with `crates/borgd/tests/pairing_audit_e2e.rs`'s
     // `full_pair_then_revoke_then_audit_verify_round_trip`, which exercises
-    // the full SPAKE2 → CERT_ISSUED → PAIRING_APPROVED path under turso and
+    // the full SPAKE2 → CERT_ISSUED → PAIRING_APPROVED path under libsql and
     // passes. This in-module variant's fixture wiring drifted during the
     // port (server closes the connection before writing Frame 5); the prod
     // path itself is covered by the e2e test.

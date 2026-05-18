@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -82,7 +82,7 @@ impl Database {
 
     /// List every row in `skill_audit`, ordered by name.
     pub async fn list_skill_audit(&self) -> Result<Vec<SkillAuditRow>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT name, sha256, first_seen_at, last_seen_at

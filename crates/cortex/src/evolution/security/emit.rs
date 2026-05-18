@@ -25,7 +25,7 @@
 //! `Status::GetPosture` shows live posture but XP accrual is unmultiplied.
 
 use anyhow::{anyhow, Context, Result};
-use turso::params;
+use libsql::params;
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 use super::PostureSnapshot;

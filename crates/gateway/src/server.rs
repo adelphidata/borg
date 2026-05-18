@@ -751,7 +751,7 @@ impl GatewayServer {
 
 /// Per-request DB factory used by the three v1 HTTP surfaces.
 ///
-/// Turso connections are `Send + Sync + Clone`, but each handler still opens
+/// libsql connections are `Send + Sync + Clone`, but each handler still opens
 /// its own connection so the busy-timeout profile (`GATEWAY_BUSY_TIMEOUT_MS`)
 /// is applied per request. The factory returns a boxed Future so the closure
 /// stays a `Fn` (the inner `async move` block is what awaits the open).

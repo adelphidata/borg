@@ -101,7 +101,7 @@ fn shared_data_dir() -> &'static Path {
         // Initialise the DB once so subsequent fixtures can write to it
         // without racing migrations. Onboarding flag set so the ACP
         // transport's `require_onboarding` gate passes.
-        // OnceLock::get_or_init is sync; the DB API is async post-turso.
+        // OnceLock::get_or_init is sync; the DB API is async post-libsql.
         // Drive the init on a fresh runtime in a worker thread so we don't
         // care whether the calling test is on `flavor = "current_thread"`
         // or `flavor = "multi_thread"` (block_in_place would panic on the

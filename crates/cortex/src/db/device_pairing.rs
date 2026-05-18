@@ -1,7 +1,7 @@
 //! PAKE pairing-code lifecycle for gRPC client devices.
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use turso::params;
+use libsql::params;
 
 use super::Database;
 

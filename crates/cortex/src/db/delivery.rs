@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{DeliveryRow, NewDelivery};
 use super::Database;
@@ -21,7 +21,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<Vec<DeliveryRow>> = async {
-            let mut stmt = self.conn.prepare(
+            let stmt = self.conn.prepare(
                 "SELECT id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, next_retry_at, created_at, updated_at, error
              FROM delivery_queue
              WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)

@@ -8,7 +8,7 @@ pub type PostInstallFuture =
 /// Optional post-install hook run after templates and credentials are in
 /// place. Returns a list of notes (e.g. OS-permission prompts) shown to the
 /// user on completion. The hook is async so it can perform I/O (e.g. read
-/// the macOS Messages DB via turso) without blocking the installer task.
+/// the macOS Messages DB via libsql) without blocking the installer task.
 pub type PostInstallHook = fn(std::path::PathBuf) -> PostInstallFuture;
 
 /// A static plugin definition — embedded in the binary.

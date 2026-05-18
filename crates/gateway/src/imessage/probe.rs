@@ -63,7 +63,7 @@ mod tests {
 
 /// Probe whether chat.db is accessible and return status + max ROWID.
 ///
-/// Opens chat.db via turso. Turso has no read-only open flag — we rely on
+/// Opens chat.db via libsql. libsql has no read-only open flag — we rely on
 /// only issuing SELECT statements to enforce the read-only contract at the
 /// application boundary (per the migration plan).
 pub async fn probe_imessage() -> ProbeResult {
@@ -84,10 +84,7 @@ pub async fn probe_imessage() -> ProbeResult {
         };
     }
 
-    let db = match turso::Builder::new_local(&db_path.to_string_lossy())
-        .build()
-        .await
-    {
+    let db = match libsql::Builder::new_local(&db_path).build().await {
         Ok(db) => db,
         Err(_) => {
             return ProbeResult {

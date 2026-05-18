@@ -649,7 +649,7 @@ async fn is_onboarded_async() -> bool {
     }
     // Daemon unreachable (crash loop, never started, or just slow). The DB
     // is encrypted at rest, so we can't peek at the `onboarded` settings
-    // row without going through the full Turso open path (KEK + migrations)
+    // row without going through the full libsql open path (KEK + migrations)
     // — which races the daemon's writer. The conservative call when a DB
     // file exists is to assume onboarded; re-prompting the wizard during a
     // transient daemon outage would clobber existing state, which is worse

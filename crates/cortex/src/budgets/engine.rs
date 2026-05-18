@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
-use turso::params;
+use libsql::params;
 
 use crate::db::Database;
 
@@ -448,7 +448,7 @@ impl BudgetEngine {
         }
     }
 
-    fn row_from_db(row: &turso::Row) -> Result<BudgetRow> {
+    fn row_from_db(row: &libsql::Row) -> Result<BudgetRow> {
         let _id: String = row.get::<String>(0)?;
         let scope: String = row.get::<String>(1)?;
         let reset_period_str: String = row.get::<String>(2)?;

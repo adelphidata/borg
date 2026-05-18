@@ -12,7 +12,7 @@ use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
 /// Lifecycle hook that records agent events to the activity log.
 /// `tokio::Mutex` lets the hook hold the DB lock across an `.await` —
-/// turso's connection is `Send + Sync` and cheaply cloneable, so we
+/// libsql's connection is `Send + Sync` and cheaply cloneable, so we
 /// only serialize the single-write-per-event critical section.
 pub struct ActivityHook {
     db: AsyncMutex<Database>,
@@ -145,7 +145,7 @@ mod tests {
 
     // TODO: needs async DB harness
     // Original asserted log_activity → query_activity behavior; the helpers
-    // are now async and Database::from_connection needs a turso connection.
+    // are now async and Database::from_connection needs a libsql connection.
 
     #[test]
     fn test_level_priority() {

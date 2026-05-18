@@ -89,7 +89,7 @@ pub type DbOpenFuture = std::pin::Pin<
 >;
 
 /// Per-request async DB factory used by the v1 HTTP surfaces (OpenAI-compat,
-/// generic webhook, MCP). Turso connections are `Send + Sync + Clone`, so this
+/// generic webhook, MCP). libsql connections are `Send + Sync + Clone`, so this
 /// is no longer strictly required for sharing — but keeping per-handler opens
 /// matches the existing structure and aligns with `Database::open_with_timeout`
 /// (which is the right entry point for the gateway busy-timeout profile).

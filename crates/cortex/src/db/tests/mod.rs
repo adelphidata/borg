@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::multi_agent::SubAgentStatus;
-use turso::params;
+use libsql::params;
 
 pub(super) async fn test_db() -> Database {
     Database::test_db().await

@@ -75,7 +75,7 @@ impl RedactionPolicy {
     /// Production constructor: redaction governed by `enabled`, hits
     /// persisted to the shared `redaction_audit` table.
     ///
-    /// `record_redactions` is async (turso DB), and `apply()` is invoked
+    /// `record_redactions` is async (libsql DB), and `apply()` is invoked
     /// from sync sinks, so the audit closure spawns the write onto the
     /// ambient tokio runtime. The DB connection is extracted inside the
     /// (sync) std::sync::Mutex and the guard dropped *before* any await,
@@ -88,7 +88,7 @@ impl RedactionPolicy {
             let sink = sink.to_string();
             let ctx = ctx.map(std::string::ToString::to_string);
             let hits = hits.to_vec();
-            // Snapshot the turso `Connection` under the sync mutex, drop
+            // Snapshot the libsql `Connection` under the sync mutex, drop
             // the guard, then perform the async inserts. The connection
             // is internally Arc'd so the clone is cheap.
             let conn = {
@@ -114,7 +114,7 @@ impl RedactionPolicy {
                         .execute(
                             "INSERT INTO redaction_audit (ts, sink, label, hit_count, context_key)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
-                            turso::params!(
+                            libsql::params!(
                                 now,
                                 sink.clone(),
                                 hit.label.to_string(),

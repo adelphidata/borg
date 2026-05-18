@@ -1,6 +1,6 @@
 //! Persistence for the daemon's internal CA, paired devices, and revocation list.
 use anyhow::{anyhow, Result};
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -184,7 +184,7 @@ impl Database {
             )
             .await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(paired_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(paired_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -201,7 +201,7 @@ impl Database {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(paired_row_from_turso(&row)?);
+            out.push(paired_row_from_row(&row)?);
         }
         Ok(out)
     }
@@ -300,7 +300,7 @@ impl Database {
     }
 }
 
-fn paired_row_from_turso(r: &turso::Row) -> Result<PairedDeviceRow> {
+fn paired_row_from_row(r: &libsql::Row) -> Result<PairedDeviceRow> {
     Ok(PairedDeviceRow {
         id: r.get::<i64>(0)?,
         fingerprint: r.get::<String>(1)?,

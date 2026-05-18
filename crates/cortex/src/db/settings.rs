@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -19,7 +19,7 @@ impl Database {
 
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = async {
-            let mut stmt = self
+            let stmt = self
                 .conn
                 .prepare(
                     "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
@@ -47,33 +47,21 @@ impl Database {
         }
     }
 
-    /// Returns a change-indicator value that shifts whenever rows in the
-    /// `settings` table are inserted, updated, or deleted. Used by the config
-    /// watcher to detect cross-process settings changes without reloading the
-    /// full table every poll.
+    /// Returns SQLite's `PRAGMA data_version` — a connection-local counter
+    /// that bumps whenever another connection commits a write to the
+    /// database. Used by the config watcher to detect cross-process settings
+    /// changes without reloading the full table every poll.
     ///
-    /// Turso 0.6's parser rejects `PRAGMA data_version`, so we derive the
-    /// indicator from `(COUNT(*), MAX(updated_at))` on the settings table.
-    /// Inserts/deletes shift COUNT; any UPDATE bumps `updated_at` (set by
-    /// `set_setting`). The two are folded into a single i64 so callers only
-    /// need an equality check.
+    /// `data_version` is per-database, not per-table — any write to `borg.db`
+    /// from another connection will shift the counter, which is fine for the
+    /// watcher (a wasted poll is cheaper than missing a real settings change).
     pub async fn data_version(&self) -> Result<i64> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM settings",
-                (),
-            )
-            .await?;
+        let mut rows = self.conn.query("PRAGMA data_version", ()).await?;
         let row = rows
             .next()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("settings aggregate returned no rows"))?;
-        let count = row.get::<i64>(0)?;
-        let max_updated_at = row.get::<i64>(1)?;
-        // Fold both fields into one i64 — callers only compare for inequality.
-        // Multiplier comfortably exceeds plausible settings-row counts.
-        Ok(max_updated_at.wrapping_mul(1_000_000).wrapping_add(count))
+            .ok_or_else(|| anyhow::anyhow!("PRAGMA data_version returned no rows"))?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -108,7 +96,7 @@ impl Database {
     }
 
     pub async fn list_settings(&self) -> Result<Vec<(String, String, i64)>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare("SELECT key, value, updated_at FROM settings ORDER BY key")
             .await?;

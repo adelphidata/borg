@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 use crate::constants::{
@@ -22,13 +22,6 @@ impl Database {
         Ok(())
     }
 
-    /// Replace the SQLite FTS5 virtual tables (and their sync triggers) with
-    /// Turso's `USING fts` index method. The FTS5 virtual-table syntax was
-    /// inherited from rusqlite and is not supported by Turso 0.6; the index
-    /// method is the supported equivalent and keeps the index in sync with
-    /// the source table without manual triggers. BM25 ranking moves to Rust
-    /// (see `crate::memory::bm25`) because the index method does not expose
-    /// a SQL-callable `bm25()`.
     /// Adds the `apns_device_tokens` table that the APNs push pipeline
     /// keys off — one row per (device_id, apns_token) registration.
     /// Provider: Apple Push Notification Service. The App Attest pubkey
@@ -56,34 +49,19 @@ impl Database {
         Ok(())
     }
 
+    /// No-op on libsql. The turso fork briefly replaced the SQLite FTS5
+    /// virtual tables with a `USING fts` index method (turso-only syntax);
+    /// the backend swap back to libsql reverts to standard FTS5 virtual
+    /// tables, which are emitted directly in `SCHEMA_SQL`. Kept as a
+    /// placeholder so `CURRENT_VERSION` stays at 3 and existing
+    /// (fresh-install) DBs skip this migration cleanly.
     pub(super) async fn migrate_v2(&self) -> Result<()> {
-        // messages: drop the FTS5 virtual table and its three sync triggers.
-        self.conn
-            .execute_batch(
-                "DROP TRIGGER IF EXISTS messages_ai;
-                 DROP TRIGGER IF EXISTS messages_ad;
-                 DROP TRIGGER IF EXISTS messages_au;
-                 DROP TABLE IF EXISTS messages_fts;
-                 CREATE INDEX IF NOT EXISTS messages_fts ON messages USING fts (content);",
-            )
-            .await?;
-
-        // memory_chunks: same shape.
-        self.conn
-            .execute_batch(
-                "DROP TRIGGER IF EXISTS memory_chunks_ai;
-                 DROP TRIGGER IF EXISTS memory_chunks_ad;
-                 DROP TRIGGER IF EXISTS memory_chunks_au;
-                 DROP TABLE IF EXISTS memory_chunks_fts;
-                 CREATE INDEX IF NOT EXISTS memory_chunks_fts ON memory_chunks USING fts (content);",
-            )
-            .await?;
         Ok(())
     }
 
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
         const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "INSERT OR IGNORE INTO provider_rate_cards
@@ -297,10 +275,27 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
--- FTS lives on a turso `USING fts` index method (see `migrate_v2` for the
--- historical context — Borg has no released DBs so we emit the final shape
--- directly here). BM25 ranking is computed in Rust (`crate::memory::bm25`).
-CREATE INDEX IF NOT EXISTS messages_fts ON messages USING fts (content);
+-- FTS lives on a standard FTS5 virtual table with `messages` as the
+-- external content source. Sync triggers below keep the index aligned with
+-- inserts/updates/deletes on the source table. BM25 ranking is computed
+-- in Rust (`crate::memory::bm25`) for parity with the hybrid-search
+-- pipeline; libsql does expose a SQL-callable `bm25()`, but routing
+-- through Rust keeps vector + BM25 fusion in one place.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
 
 -- Per-session goals --------------------------------------------------------
 CREATE TABLE IF NOT EXISTS goals (
@@ -610,8 +605,22 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope_file ON memory_chunks(scope, filename);
 
--- See messages_fts above: turso `USING fts` index method, BM25 in Rust.
-CREATE INDEX IF NOT EXISTS memory_chunks_fts ON memory_chunks USING fts (content);
+-- See messages_fts above: standard FTS5 virtual table, BM25 in Rust.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
+    content,
+    content='memory_chunks',
+    content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ai AFTER INSERT ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ad AFTER DELETE ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_chunks_au AFTER UPDATE ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO memory_chunks_fts(rowid, content) VALUES (new.id, new.content);
+END;
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

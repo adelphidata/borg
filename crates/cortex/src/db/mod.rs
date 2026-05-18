@@ -28,11 +28,12 @@ pub mod wal;
 pub mod web_search_cache;
 
 // Gated on `phase9-tests-disabled` because the split-out `db::tests::*`
-// submodules still call the pre-turso sync helper signatures (`test_db()`
-// without `.await`, `db.conn().execute(..., [], ...)`-style rusqlite calls).
-// Tracked work, not a regression — matches the precedent set by the 17
-// other modules behind this feature. The shared async helper at
-// `db::tests::mod` is already turso-shaped; only the per-topic test bodies
+// submodules still call the pre-async rusqlite-style sync helper signatures
+// (`test_db()` without `.await`, `db.conn().execute(..., [], ...)`-style
+// rusqlite calls). The libsql migration unblocked the *backend* gripe (real
+// WAL, real `PRAGMA data_version`); the sync→async port is independent
+// follow-up work tracked behind the same flag. The shared async helper at
+// `db::tests::mod` is already libsql-shaped; only the per-topic test bodies
 // remain to port.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
@@ -51,20 +52,21 @@ pub use vitals::PendingCelebration;
 pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use libsql::{Builder, Cipher, Connection, EncryptionConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::instrument;
-use turso::{Builder, Connection, EncryptionOpts};
 
 use crate::config::Config;
 
-/// SQLite-compatible database (Turso 0.6) for structured borg state.
+/// SQLite database (libsql, SQLite-C fork) for structured borg state.
 ///
-/// Holds an internally-`Arc`'d `turso::Connection`, which is `Send + Sync +
+/// Holds an internally-`Arc`'d `libsql::Connection`, which is `Send + Sync +
 /// Clone`. We deliberately do NOT wrap it in a further `Arc` — cloning the
 /// connection is already shallow, and an outer `Arc` would just hide the
-/// fact that turso owns its own pool.
+/// fact that libsql owns its own pool.
 pub struct Database {
     conn: Connection,
     /// Per-installation HMAC salt for event chain keys.
@@ -82,15 +84,15 @@ pub struct Database {
     /// in-memory store so they don't touch the real OS keychain.
     evolution_keystore_override: Mutex<Option<Box<dyn crate::evolution::keychain::KeyStore>>>,
     /// True when this handle was opened via [`open_readonly`]. A debug-only
-    /// guard catches accidental writes through a read-only handle; Turso
-    /// itself has no `SQLITE_OPEN_READ_ONLY` equivalent, so the daemon
-    /// remains the single writer by convention.
+    /// guard catches accidental writes through a read-only handle; libsql's
+    /// high-level builder doesn't expose `SQLITE_OPEN_READ_ONLY`, so the
+    /// daemon remains the single writer by convention.
     read_only: bool,
 }
 
 impl Database {
     /// Get a reference to the underlying connection. Cheap to clone if the
-    /// caller needs an owned handle for an async task — turso's `Connection`
+    /// caller needs an owned handle for an async task — libsql's `Connection`
     /// is internally `Arc`'d.
     pub fn conn(&self) -> &Connection {
         debug_assert!(
@@ -125,16 +127,17 @@ impl Database {
         Self::open_at_inner(&path, busy_timeout_ms, None, false).await
     }
 
-    /// Open (or create) the database with a KEK-derived hex encryption key.
-    /// `hex_key` must be 64 ASCII hex chars (32 bytes of AES-256 material) —
-    /// produced by [`encryption::derive_db_hexkey`].
+    /// Open (or create) the database with a KEK-derived AES-256 key.
+    /// `key` must be exactly 32 bytes — produced by
+    /// [`encryption::derive_db_key_bytes`]. libsql uses SQLCipher framing
+    /// (AES-256-CBC) for at-rest encryption.
     #[instrument(skip_all)]
-    pub async fn open_encrypted(hex_key: &str) -> Result<Self> {
+    pub async fn open_encrypted(key: &[u8]) -> Result<Self> {
         let path = Self::db_path()?;
-        Self::open_at_inner(&path, Self::DEFAULT_BUSY_TIMEOUT_MS, Some(hex_key), false).await
+        Self::open_at_inner(&path, Self::DEFAULT_BUSY_TIMEOUT_MS, Some(key), false).await
     }
 
-    /// Create a Database from an existing turso connection. Runs migrations.
+    /// Create a Database from an existing libsql connection. Runs migrations.
     /// Used by [`test_db`](Self::test_db) and any caller that already owns a
     /// connection (e.g. backup inspection over a custom path).
     pub async fn from_connection(conn: Connection) -> Result<Self> {
@@ -151,8 +154,9 @@ impl Database {
 
     /// Open the database read-only. Skips writes — intended for read-only
     /// consumers (e.g. the CLI reading config/settings) that must not race
-    /// the daemon's writer. Turso 0.6 has no `SQLITE_OPEN_READ_ONLY`
-    /// equivalent, so the read-only contract is enforced by:
+    /// the daemon's writer. libsql has no `SQLITE_OPEN_READ_ONLY` opt
+    /// exposed on its high-level builder, so the read-only contract is
+    /// enforced by:
     ///   1. Skipping migrations + settings seeding + HMAC-salt init (all
     ///      writes that the daemon already performed).
     ///   2. A `read_only` flag carried on the handle that fires a
@@ -162,7 +166,7 @@ impl Database {
     #[instrument(skip_all)]
     pub async fn open_readonly() -> Result<Self> {
         let path = Self::db_path()?;
-        // Turso's `Builder::new_local` creates the file if missing, which
+        // libsql's `Builder::new_local` creates the file if missing, which
         // breaks `load_from_db`'s expectation that a missing DB fails here
         // and falls through to the writer path (which runs migrations).
         // Mirror the legacy SQLITE_OPEN_READ_ONLY behaviour by erroring out
@@ -185,17 +189,10 @@ impl Database {
         })
     }
 
-    /// Build a fresh `turso::Connection`. Always enables the experimental
-    /// flags borg depends on (encryption, vacuum, custom index methods);
-    /// `hex_key` opts into AES-256-GCM at rest.
-    /// True if `path` refers to an in-memory turso database. Used to skip
-    /// journal-mode pragmas that turso 0.6 errors on for in-memory connections
-    /// (WAL has no meaning when there's no file to persist).
-    fn is_memory_path(path: &Path) -> bool {
-        matches!(path.to_str(), Some(":memory:"))
-    }
-
-    async fn build_connection(path: &Path, hex_key: Option<&str>) -> Result<Connection> {
+    /// Build a fresh `libsql::Connection`. `key` opts into SQLCipher
+    /// (AES-256-CBC) at-rest encryption — pass `None` for an unencrypted
+    /// database.
+    async fn build_connection(path: &Path, key: Option<&[u8]>) -> Result<Connection> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -206,35 +203,31 @@ impl Database {
             .to_str()
             .with_context(|| format!("non-UTF-8 db path: {}", path.display()))?;
 
-        let mut builder = Builder::new_local(path_str)
-            .experimental_encryption(true)
-            .experimental_vacuum(true)
-            .experimental_index_method(true);
-        if let Some(hex) = hex_key {
-            builder = builder.with_encryption(EncryptionOpts {
-                cipher: "aes256gcm".into(),
-                hexkey: hex.into(),
-            });
+        let mut builder = Builder::new_local(path_str);
+        if let Some(k) = key {
+            builder = builder.encryption_config(EncryptionConfig::new(
+                Cipher::Aes256Cbc,
+                Bytes::copy_from_slice(k),
+            ));
         }
 
         let db = builder
             .build()
             .await
-            .with_context(|| format!("turso build at {}", path.display()))?;
+            .with_context(|| format!("libsql build at {}", path.display()))?;
         Self::set_file_permissions(path);
         db.connect()
-            .with_context(|| format!("turso connect at {}", path.display()))
+            .with_context(|| format!("libsql connect at {}", path.display()))
     }
 
     async fn open_at_inner(
         path: &Path,
         busy_timeout_ms: u64,
-        hex_key: Option<&str>,
+        key: Option<&[u8]>,
         read_only: bool,
     ) -> Result<Self> {
-        let conn = Self::build_connection(path, hex_key).await?;
-        Self::init_connection_inner(conn, busy_timeout_ms, read_only, Self::is_memory_path(path))
-            .await
+        let conn = Self::build_connection(path, key).await?;
+        Self::init_connection_inner(conn, busy_timeout_ms, read_only).await
     }
 
     /// Restrict DB file to owner-only access on Unix.
@@ -252,32 +245,30 @@ impl Database {
     }
 
     /// Connection initialization for callers that already own a Connection
-    /// and don't know (or don't care about) its backing path. Treats the
-    /// connection as file-backed — pragmas are applied unconditionally.
+    /// and don't know (or don't care about) its backing path. Pragmas are
+    /// applied unconditionally; libsql tolerates `journal_mode=WAL` on
+    /// `:memory:` connections (it's a no-op there).
     pub(crate) async fn init_connection(
         conn: Connection,
         busy_timeout_ms: u64,
         read_only: bool,
     ) -> Result<Self> {
-        Self::init_connection_inner(conn, busy_timeout_ms, read_only, false).await
+        Self::init_connection_inner(conn, busy_timeout_ms, read_only).await
     }
 
-    /// Connection initialization: pragmas + migrations. `in_memory=true`
-    /// skips journal-mode pragmas that turso 0.6 errors on for `:memory:`
-    /// connections (WAL is meaningless without a backing file).
+    /// Connection initialization: pragmas + migrations.
     async fn init_connection_inner(
         conn: Connection,
         busy_timeout_ms: u64,
         read_only: bool,
-        in_memory: bool,
     ) -> Result<Self> {
-        // Serialize init across the process. Turso (like sqlite) has a
-        // cold-start race where multiple connections opening a fresh DB
-        // file all try to switch to WAL and one loses the writer lock.
-        // borgd hits this on every start (daemon.rs, budget_tick,
-        // config_watcher, PKI bootstrap each open their own handle).
-        // Holding INIT_LOCK for the ~tens-of-ms init window is free in
-        // production and deterministically eliminates the race.
+        // Serialize init across the process. SQLite has a cold-start race
+        // where multiple connections opening a fresh DB file all try to
+        // switch to WAL and one loses the writer lock. borgd hits this on
+        // every start (daemon.rs, budget_tick, config_watcher, PKI
+        // bootstrap each open their own handle). Holding INIT_LOCK for the
+        // ~tens-of-ms init window is free in production and deterministically
+        // eliminates the race.
         static INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _init_guard = INIT_LOCK.lock().await;
 
@@ -286,30 +277,20 @@ impl Database {
         // connection is mid-init on the same file.
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
             .context("set busy_timeout")?;
-        if !in_memory {
-            // Best-effort: turso 0.6 already uses WAL natively (it's the
-            // default underlying journal mode and not really configurable
-            // via PRAGMA at the parser level for all paths). Older daemon
-            // startup paths still set it explicitly so a future migration
-            // back to rusqlite-style sqlite would behave identically; if
-            // turso rejects the pragma, log and continue rather than abort
-            // — WAL is on regardless.
-            if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;").await {
-                tracing::debug!(
-                    error = %e,
-                    "PRAGMA journal_mode=WAL not accepted (turso is WAL by default); continuing",
-                );
-            }
-        }
+        // WAL is the whole point of the libsql migration — real multi-
+        // process WAL means borgd + a second CLI handle can share the DB.
+        // Failure here is fatal; we never want to silently fall back to
+        // rollback-journal mode and resurrect the locking-error class of
+        // bugs that drove this migration.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .await
+            .context("set journal_mode=WAL")?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .await
             .context("set synchronous=NORMAL")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .await
             .context("set foreign_keys=ON")?;
-        // NOTE: auto_vacuum / incremental_vacuum are unsupported in Turso
-        // 0.6 — the equivalent reclamation lives in the maintenance
-        // sweep's conditional full VACUUM.
         let mut db = Self {
             conn,
             hmac_salt: Vec::new(),
@@ -378,7 +359,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM device_keys WHERE public_key = ?1 LIMIT 1",
-                turso::params![pubkey_blob.clone()],
+                libsql::params![pubkey_blob.clone()],
             )
             .await?;
         let existing: Option<i64> = match rows.next().await? {
@@ -392,7 +373,7 @@ impl Database {
                 self.conn
                     .execute(
                         "INSERT INTO device_keys (public_key, created_at) VALUES (?1, ?2)",
-                        turso::params![pubkey_blob, now],
+                        libsql::params![pubkey_blob, now],
                     )
                     .await?;
                 self.conn.last_insert_rowid()
@@ -474,7 +455,7 @@ impl Database {
             return Ok(());
         }
 
-        // Acquire the writer lock explicitly. Turso's `Transaction` API is
+        // Acquire the writer lock explicitly. libsql's `Transaction` API is
         // built around `&mut Connection`, but our submodules hold the
         // connection behind `&self`; opening the writer via raw BEGIN
         // IMMEDIATE + an explicit COMMIT/ROLLBACK guard sidesteps that
@@ -589,7 +570,7 @@ impl Database {
                  WHERE device_id = ?1 AND invalidated_at IS NULL",
             )
             .await?
-            .query(turso::params![device_id.to_string()])
+            .query(libsql::params![device_id.to_string()])
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -609,7 +590,7 @@ impl Database {
                 "UPDATE apns_device_tokens
                  SET invalidated_at = ?1, invalidated_reason = ?2
                  WHERE id = ?3",
-                turso::params![now, reason.to_string(), id],
+                libsql::params![now, reason.to_string(), id],
             )
             .await?;
         Ok(())
@@ -641,7 +622,7 @@ impl Database {
                     registered_at = excluded.registered_at,
                     invalidated_at = NULL,
                     invalidated_reason = NULL",
-                turso::params![
+                libsql::params![
                     device_id.to_string(),
                     apns_token.to_string(),
                     bundle_id.to_string(),
@@ -658,8 +639,8 @@ impl Database {
 impl Database {
     /// Create an in-memory database for tests. Runs all migrations and
     /// installs an in-memory keystore so the evolution signing path never
-    /// touches the real OS keychain during tests. Skips `with_encryption()`
-    /// — in-memory DBs don't need a real KEK round-trip.
+    /// touches the real OS keychain during tests. Skips the encryption
+    /// config — in-memory DBs don't need a real KEK round-trip.
     ///
     /// Visible across crates so downstream test suites (gateway, borgd,
     /// interface) can share the same fixture without re-implementing it.
@@ -668,7 +649,7 @@ impl Database {
         let conn = Self::build_connection(Path::new(":memory:"), None)
             .await
             .expect("open in-memory db");
-        let db = Self::init_connection_inner(conn, Self::DEFAULT_BUSY_TIMEOUT_MS, false, true)
+        let db = Self::init_connection_inner(conn, Self::DEFAULT_BUSY_TIMEOUT_MS, false)
             .await
             .expect("init test db");
         db.set_evolution_keystore(Box::new(crate::evolution::keychain::InMemoryKeyStore::new()));

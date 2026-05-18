@@ -36,7 +36,7 @@
 //! otherwise.
 use anyhow::Result;
 use blake3::Hasher;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -223,7 +223,7 @@ impl Database {
     }
 
     pub async fn verify_audit_chain(&self) -> Result<AuditChainOutcome> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT seq, prev_hash, hash, event_type, event_json, ts, event_purged
@@ -293,7 +293,7 @@ impl Database {
         cutoff: i64,
         purged_at: i64,
     ) -> Result<usize> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT seq FROM audit_log_chain
@@ -334,7 +334,7 @@ impl Database {
     }
 
     pub async fn list_audit_events(&self) -> Result<Vec<AuditChainRow>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT seq, prev_hash, hash, event_type, event_json, ts, principal_id, event_purged

@@ -5,7 +5,7 @@
 //! enum variants and don't have a row.
 
 use anyhow::{Context, Result};
-use turso::params;
+use libsql::params;
 
 use super::category::ProviderCategory;
 use crate::db::Database;
@@ -104,7 +104,7 @@ impl ProviderRow {
         Ok(out)
     }
 
-    fn from_row(row: &turso::Row) -> Result<Self> {
+    fn from_row(row: &libsql::Row) -> Result<Self> {
         let id: String = row.get::<String>(0)?;
         let category_str: String = row.get::<String>(1)?;
         let category = ProviderCategory::from_db_str(&category_str)

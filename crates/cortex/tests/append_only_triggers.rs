@@ -6,13 +6,13 @@
 //! that the evolution / vitals / bond replays verify against. A successful
 //! `UPDATE` or `DELETE` would silently break tamper detection.
 //!
-//! Turso 0.6 fires `RAISE(ABORT, ...)` on `CREATE TRIGGER … BEFORE UPDATE …
+//! libsql fires `RAISE(ABORT, ...)` on `CREATE TRIGGER … BEFORE UPDATE …
 //! SELECT RAISE(ABORT, …)` without any flag — this test pins that behavior.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cortex::db::Database;
-use turso::params;
+use libsql::params;
 
 /// Each row is (table_name, message-substring-the-trigger-must-mention).
 /// Table-driven so adding a new append-only table is a one-line change.
@@ -54,10 +54,10 @@ async fn seed_one(db: &Database, table: &str) {
 }
 
 /// Assert the error message carries the trigger's `RAISE(ABORT, …)`
-/// string or at least the word `ABORT` — the spike showed Turso surfaces
+/// string or at least the word `ABORT` — the spike showed libsql surfaces
 /// `RAISE` payloads verbatim, but we accept the bare word as a fallback in
-/// case a future Turso release reformats them.
-fn assert_trigger_fired(table: &str, expected_msg: &str, err: turso::Error) {
+/// case a future libsql release reformats them.
+fn assert_trigger_fired(table: &str, expected_msg: &str, err: libsql::Error) {
     let msg = err.to_string();
     assert!(
         msg.contains(expected_msg) || msg.contains("ABORT"),

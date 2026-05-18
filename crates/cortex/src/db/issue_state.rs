@@ -1,7 +1,7 @@
 //! Persistence for doctor/maintenance issue lifecycle state.
 
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -174,7 +174,7 @@ impl Database {
 
     /// Return all issues that are still open and have persisted for 2+ runs.
     pub async fn list_persistent_open_issues(&self) -> Result<Vec<IssueStateRow>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT issue_key, first_seen_at, last_seen_at, consecutive_count,

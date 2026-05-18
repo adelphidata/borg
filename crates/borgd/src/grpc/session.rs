@@ -35,7 +35,7 @@ pub trait SessionFactory: Send + Sync + 'static {
     /// agent failed to initialize (bad config, missing API key, etc.).
     ///
     /// Async because constructing an `Agent` now opens the SQLite handle and
-    /// hooks via the turso async layer. Returned future borrows `self` so the
+    /// hooks via the libsql async layer. Returned future borrows `self` so the
     /// implementor can stash references without cloning.
     fn open<'a>(
         &'a self,

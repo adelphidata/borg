@@ -84,7 +84,7 @@ async fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
                  OR json_extract(metadata_json, '$.session_id') = ?1
                )
          )",
-            turso::params![session_id],
+            libsql::params![session_id],
         )
         .await?;
     let existing: i64 = match rows.next().await? {

@@ -7,7 +7,7 @@
 //! the daily sweep prunes expired rows and the warning re-surfaces.
 
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::Database;
 
@@ -63,7 +63,7 @@ impl Database {
     /// All squelches whose `expires_at > now`. Callers filter their
     /// diagnostic checks against this list before surfacing.
     pub async fn doctor_squelch_list_active(&self, now: i64) -> Result<Vec<DoctorSquelchRow>> {
-        let mut stmt = self
+        let stmt = self
             .conn
             .prepare(
                 "SELECT category, name, squelched_at, expires_at, reason

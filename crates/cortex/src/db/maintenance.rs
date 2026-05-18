@@ -5,7 +5,7 @@
 
 use super::Database;
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use crate::maintenance::MaintenanceReport;
 

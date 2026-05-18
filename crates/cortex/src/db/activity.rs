@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::ActivityEntry;
 use super::Database;
@@ -52,15 +52,15 @@ impl Database {
         let placeholders: Vec<String> = (1..=levels.len()).map(|i| format!("?{i}")).collect();
         let level_clause = format!("level IN ({})", placeholders.join(", "));
 
-        let mut values: Vec<turso::Value> = levels
+        let mut values: Vec<libsql::Value> = levels
             .iter()
-            .map(|l| turso::Value::Text((*l).to_string()))
+            .map(|l| libsql::Value::Text((*l).to_string()))
             .collect();
         let sql = if let Some(cat) = category {
             let param_idx = levels.len() + 1;
             let count_idx = levels.len() + 2;
-            values.push(turso::Value::Text(cat.to_string()));
-            values.push(turso::Value::Integer(count as i64));
+            values.push(libsql::Value::Text(cat.to_string()));
+            values.push(libsql::Value::Integer(count as i64));
             format!(
                 "SELECT id, level, category, message, detail, created_at
                  FROM activity_log
@@ -70,7 +70,7 @@ impl Database {
             )
         } else {
             let count_idx = levels.len() + 1;
-            values.push(turso::Value::Integer(count as i64));
+            values.push(libsql::Value::Integer(count as i64));
             format!(
                 "SELECT id, level, category, message, detail, created_at
                  FROM activity_log
@@ -80,7 +80,7 @@ impl Database {
             )
         };
 
-        let mut stmt = self.conn.prepare(&sql).await?;
+        let stmt = self.conn.prepare(&sql).await?;
         let mut rows = stmt.query(values).await?;
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {

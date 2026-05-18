@@ -3,12 +3,12 @@ use super::models::{
 };
 use super::Database;
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 /// Column list shared by all scheduled-task SELECT queries.
 const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash";
 
-fn map_task_row(row: &turso::Row) -> Result<ScheduledTaskRow> {
+fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
     Ok(ScheduledTaskRow {
         id: row.get::<String>(0)?,
         name: row.get::<String>(1)?,

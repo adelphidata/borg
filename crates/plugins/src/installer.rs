@@ -265,10 +265,10 @@ fn remove_credential(service: &str, key: &str) {
 /// Post-install hook for iMessage: initialize state.json with current max ROWID
 /// so only future messages are processed. Returns user-facing notes.
 ///
-/// Reads the macOS Messages database (`~/Library/Messages/chat.db`) via turso
+/// Reads the macOS Messages database (`~/Library/Messages/chat.db`) via libsql
 /// in unencrypted-open mode. We never write to chat.db — the SELECTs below are
 /// the only statements issued, which is the application-boundary read-only
-/// enforcement called out in the migration plan (Turso has no
+/// enforcement called out in the migration plan (libsql has no
 /// `SQLITE_OPEN_READ_ONLY` open-flag equivalent).
 pub(crate) fn imessage_post_install(
     data_dir: std::path::PathBuf,
@@ -325,7 +325,7 @@ pub(crate) fn imessage_post_install(
                 );
             }
             Err(e) => {
-                tracing::debug!("turso open of chat.db failed: {e}");
+                tracing::debug!("libsql open of chat.db failed: {e}");
                 notes.push("Full Disk Access required:".to_string());
                 notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
                 notes.push("  Add your terminal app, then restart Borg".to_string());
@@ -336,15 +336,13 @@ pub(crate) fn imessage_post_install(
     })
 }
 
-async fn open_messages_db(db_path: &std::path::Path) -> anyhow::Result<turso::Connection> {
-    let db = turso::Builder::new_local(&db_path.to_string_lossy())
-        .build()
-        .await?;
+async fn open_messages_db(db_path: &std::path::Path) -> anyhow::Result<libsql::Connection> {
+    let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
     Ok(conn)
 }
 
-async fn read_max_rowid(conn: &turso::Connection) -> anyhow::Result<Option<i64>> {
+async fn read_max_rowid(conn: &libsql::Connection) -> anyhow::Result<Option<i64>> {
     let mut rows = conn.query("SELECT MAX(ROWID) FROM message", ()).await?;
     if let Some(row) = rows.next().await? {
         Ok(row.get::<Option<i64>>(0)?)
@@ -353,7 +351,7 @@ async fn read_max_rowid(conn: &turso::Connection) -> anyhow::Result<Option<i64>>
     }
 }
 
-async fn read_self_handle(conn: &turso::Connection) -> anyhow::Result<Option<String>> {
+async fn read_self_handle(conn: &libsql::Connection) -> anyhow::Result<Option<String>> {
     let mut rows = conn
         .query(
             "SELECT DISTINCT h.id FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE m.is_from_me = 1 LIMIT 1",

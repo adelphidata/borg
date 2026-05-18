@@ -1,5 +1,5 @@
 use anyhow::Result;
-use turso::params;
+use libsql::params;
 
 use super::models::{NewScript, ScriptRow};
 use super::Database;
@@ -39,7 +39,7 @@ impl Database {
                 created_at, updated_at, last_run_at, run_count
          FROM scripts";
 
-    fn script_row_from_turso(row: &turso::Row) -> Result<ScriptRow> {
+    fn script_row_from_row(row: &libsql::Row) -> Result<ScriptRow> {
         Ok(ScriptRow {
             id: row.get::<String>(0)?,
             name: row.get::<String>(1)?,
@@ -63,7 +63,7 @@ impl Database {
         let sql = format!("{} WHERE name = ?1", Self::SCRIPTS_SELECT);
         let mut rows = self.conn.query(&sql, params!(name)).await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(Self::script_row_from_turso(&row)?)),
+            Some(row) => Ok(Some(Self::script_row_from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -73,7 +73,7 @@ impl Database {
         let mut rows = self.conn.query(&sql, ()).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(Self::script_row_from_turso(&row)?);
+            out.push(Self::script_row_from_row(&row)?);
         }
         Ok(out)
     }

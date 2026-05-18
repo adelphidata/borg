@@ -12,7 +12,7 @@ use super::*;
 
 /// Run `EXPLAIN QUERY PLAN <sql>` and return the joined `detail` column for
 /// every plan row. The combined string is what we pattern-match in assertions.
-async fn explain(db: &Database, sql: &str, params: Vec<turso::Value>) -> String {
+async fn explain(db: &Database, sql: &str, params: Vec<libsql::Value>) -> String {
     let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
     let mut stmt = db.conn.prepare(&explain_sql).await.unwrap();
     let mut rows = stmt.query(params).await.unwrap();
@@ -38,7 +38,7 @@ async fn get_unindexed_sessions_uses_indexed_anti_join_and_ordering() {
          )
          ORDER BY s.updated_at DESC
          LIMIT ?1",
-        vec![turso::Value::Integer(10)],
+        vec![libsql::Value::Integer(10)],
     )
     .await;
     assert!(
@@ -69,7 +69,7 @@ async fn prune_embedding_cache_inner_keeps_set_uses_last_accessed_index() {
         &db,
         "SELECT id FROM embedding_cache
          ORDER BY last_accessed_at DESC, id DESC LIMIT ?1",
-        vec![turso::Value::Integer(100)],
+        vec![libsql::Value::Integer(100)],
     )
     .await;
     assert!(
@@ -93,9 +93,9 @@ async fn list_memory_entries_for_scopes_uses_scope_index() {
          WHERE scope IN (?, ?, ?)
          ORDER BY scope, updated_at DESC",
         vec![
-            turso::Value::Text("global".to_string()),
-            turso::Value::Text("project:abc".to_string()),
-            turso::Value::Text("extra".to_string()),
+            libsql::Value::Text("global".to_string()),
+            libsql::Value::Text("project:abc".to_string()),
+            libsql::Value::Text("extra".to_string()),
         ],
     )
     .await;
@@ -121,7 +121,7 @@ async fn sessions_since_uses_updated_at_index() {
                 parent_session_id, forked_from_message_id
          FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
          LIMIT ?2",
-        vec![turso::Value::Integer(0), turso::Value::Integer(10_000)],
+        vec![libsql::Value::Integer(0), libsql::Value::Integer(10_000)],
     )
     .await;
     assert!(

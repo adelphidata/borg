@@ -190,7 +190,9 @@ Proactive check-ins (default 60m or cron, quiet 00:00–06:00). `~/.borg/HEARTBE
 
 ### Database
 
-Turso (SQLite-compatible, `turso` crate — not `rusqlite`/`libsql`) at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.
+libsql (SQLite-C fork, `libsql` crate — not `rusqlite`/`turso`) at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.
+
+Multi-process WAL is real: borgd holds the writer; standalone `borg` CLI processes can open the same DB concurrently without hitting a locking error. Encryption-at-rest is SQLCipher (AES-256-CBC) via `Database::open_encrypted`; the DB key is HKDF-derived from the KEK and never persisted. Existing DBs that were encrypted under the prior turso backend (AES-256-GCM, hex-string key) are not readable post-migration — the codebase is treated as fresh-install acceptable.
 
 ### Sandboxing
 
