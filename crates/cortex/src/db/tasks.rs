@@ -8,6 +8,28 @@ use libsql::params;
 /// Column list shared by all scheduled-task SELECT queries.
 const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash";
 
+/// Returns true if `pid` is alive on this host. `kill(pid, 0)` only probes —
+/// 0 means alive; ESRCH means dead; any other errno (e.g. EPERM) is treated
+/// as alive (conservative: never starve a live daemon).
+///
+/// Assumes a single PID namespace (borgd is a single-host agent, DB lives at
+/// `~/.borg/borg.db`). Inside a sandboxed PID-namespace container the probe
+/// would see only namespace-local processes, which is still correct because
+/// the recorded PID was also written from that namespace.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 never delivers a signal; the call only validates that
+    // the kernel can find a process with this PID.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ESRCH
+}
+
 fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
     Ok(ScheduledTaskRow {
         id: row.get::<String>(0)?,
@@ -622,8 +644,24 @@ impl Database {
                         )
                         .await?;
                     Ok(true)
+                } else if !pid_alive(existing_pid as u32) {
+                    // Prior daemon died (SIGKILL / crash) — PID gone from this
+                    // host. Couples the kernel-managed PID flock to the DB
+                    // lock: a SIGKILLed borgd would otherwise block restart
+                    // for up to 300s waiting on heartbeat staleness.
+                    tracing::info!(
+                        stale_pid = existing_pid,
+                        new_pid = pid,
+                        "daemon_lock: previous borgd PID is gone, taking over immediately",
+                    );
+                    self.conn.execute(
+                        "UPDATE daemon_lock SET pid = ?1, started_at = ?2, heartbeat_at = ?2 WHERE id = 1",
+                        params!(pid as i64, now),
+                    ).await?;
+                    Ok(true)
                 } else if now - heartbeat_at > 300 {
-                    // Stale lock — take over
+                    // Stale lock fallback (PID recycled to unrelated live
+                    // process, or DB shared across hosts) — take over
                     self.conn.execute(
                         "UPDATE daemon_lock SET pid = ?1, started_at = ?2, heartbeat_at = ?2 WHERE id = 1",
                         params!(pid as i64, now),
@@ -754,5 +792,134 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        Database::test_db().await
+    }
+
+    /// Spawn a child, wait for it to exit, and return its PID. The kernel
+    /// reaps on `wait()`, so the returned PID is reliably dead at the moment
+    /// of return. Used to exercise the dead-PID takeover path without flaky
+    /// "guess a free PID" heuristics.
+    ///
+    /// Theoretical PID-recycle race: on a saturated CI host the kernel could
+    /// hand this PID to a brand-new process between `wait()` and the probe.
+    /// Window is microseconds and we've not observed it; if it ever flakes,
+    /// switch to a sentinel value or a held-but-unreaped child.
+    fn reaped_child_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        let _ = child.wait().expect("wait on /usr/bin/true");
+        pid
+    }
+
+    #[test]
+    fn pid_alive_true_for_self() {
+        // Real failure mode: a broken probe that returns false for live PIDs
+        // would let any new daemon steal the lock from a running one.
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn pid_alive_false_for_reaped_child() {
+        // Real failure mode: a probe that can't detect death keeps SIGKILL
+        // recovery stuck on the 300s heartbeat fallback (the bug this fix
+        // exists for).
+        assert!(!pid_alive(reaped_child_pid()));
+    }
+
+    #[test]
+    fn pid_alive_false_for_zero() {
+        // PID 0 isn't a process — must never be treated as alive (would
+        // otherwise let a zero-PID stale row block restart forever).
+        assert!(!pid_alive(0));
+    }
+
+    #[tokio::test]
+    async fn dead_pid_takeover_skips_heartbeat_wait() {
+        // Couples the PID flock and DB daemon_lock: when the prior borgd is
+        // SIGKILLed, its PID is gone and the new borgd must take over
+        // immediately rather than waiting up to 300s for heartbeat staleness.
+        let db = test_db().await;
+        let dead_pid = reaped_child_pid();
+        let now = 1_000;
+
+        assert!(
+            db.acquire_daemon_lock(dead_pid, now).await.unwrap(),
+            "initial acquire as the soon-to-be-dead PID must succeed",
+        );
+
+        // Only 10s later — well inside the 300s heartbeat staleness window
+        // — but the recorded PID is already dead. Liveness probe must
+        // short-circuit the heartbeat fallback.
+        let new_pid = std::process::id();
+        assert_ne!(new_pid, dead_pid);
+        assert!(
+            db.acquire_daemon_lock(new_pid, now + 10).await.unwrap(),
+            "new daemon must take over immediately when prior PID is dead, \
+             not wait the 300s heartbeat window",
+        );
+    }
+
+    #[tokio::test]
+    async fn live_foreign_pid_within_heartbeat_blocks_acquire() {
+        // Symmetric guard: a *live* foreign PID inside the heartbeat window
+        // must still block. Without this, the liveness branch could be
+        // mistakenly applied to live processes and starve the real daemon.
+        let db = test_db().await;
+        let live_pid = std::process::id();
+        let now = 1_000;
+
+        assert!(db.acquire_daemon_lock(live_pid, now).await.unwrap());
+
+        // A different PID that we know is alive (this test process itself,
+        // re-used as the "incumbent"): the new caller pretends to be a
+        // sibling pid that the kernel will also report as alive. We pick
+        // PID 1 (init/launchd) which is guaranteed-alive on any Unix host.
+        let incumbent = 1u32;
+        // Overwrite the row to record an alive foreign PID.
+        db.conn
+            .execute(
+                "UPDATE daemon_lock SET pid = ?1 WHERE id = 1",
+                params!(incumbent as i64),
+            )
+            .await
+            .unwrap();
+
+        // 10s later, still fresh heartbeat, incumbent is alive → must reject.
+        assert!(
+            !db.acquire_daemon_lock(live_pid + 1, now + 10)
+                .await
+                .unwrap(),
+            "live incumbent PID inside heartbeat window must block takeover",
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stale_takeover_still_works() {
+        // Defense-in-depth fallback: even if the PID number happens to be
+        // recycled to a live unrelated process, the 300s heartbeat staleness
+        // path must still allow takeover.
+        let db = test_db().await;
+        let incumbent = 1u32; // launchd / init — reliably alive.
+        let now = 1_000;
+
+        assert!(db.acquire_daemon_lock(incumbent, now).await.unwrap());
+
+        // 400s later: heartbeat is stale even though PID 1 is alive.
+        assert!(
+            db.acquire_daemon_lock(std::process::id(), now + 400)
+                .await
+                .unwrap(),
+            "stale heartbeat must permit takeover even when recorded PID is alive",
+        );
     }
 }
