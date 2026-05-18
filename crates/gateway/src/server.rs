@@ -50,7 +50,6 @@ struct AppState {
     health: Arc<RwLock<ChannelHealthRegistry>>,
     rate_limiter: Option<Arc<Mutex<SlidingWindowLimiter>>>,
     metrics: BorgMetrics,
-    // Slack fields (still used by slack_command_handler)
     slack_client: Option<Arc<SlackClient>>,
     slack_signing_secret: Option<String>,
     /// Slack bot user ID for group mention activation (e.g. "U123ABC").
@@ -1220,9 +1219,6 @@ fn service_unavailable_response() -> WebhookResponse {
         axum::Json(serde_json::json!({ "error": "Server at capacity, try again later" })),
     )
 }
-
-// Old per-channel webhook handler functions removed — native channels now use
-// NativeChannelRegistry + dispatch_webhook from channel_trait.rs.
 
 /// Slack slash-command handler (separate route from webhook_handler).
 async fn slack_command_handler(

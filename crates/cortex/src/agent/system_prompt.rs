@@ -292,8 +292,8 @@ impl Agent {
     /// are dropped (no steering value).
     ///
     /// Empty string when no goal is set, the DB is unavailable, or the goal
-    /// is Complete. Lookups are best-effort and `tracing::warn!` on error —
-    /// per CLAUDE.md, prompt assembly must never break the agent.
+    /// is Complete. Lookups are best-effort and `tracing::warn!` on error;
+    /// prompt assembly must never break the agent.
     pub(super) async fn build_goal_context_section(&self) -> String {
         if !self.config.goals.enabled {
             return String::new();
@@ -404,7 +404,6 @@ impl Agent {
     }
 }
 
-// PHASE 9 TODO: rusqlite-based in-memory fixtures; needs turso async harness.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod scheduled_tasks_snapshot_tests {
     //! Tests for the `<scheduled_tasks>` system-prompt snapshot.

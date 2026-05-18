@@ -12,5 +12,4 @@ crate::dedup_wrapper!(
 
 // Dedup semantics (first-seen / repeat-seen / LRU eviction) are covered
 // by `BoundedDedup<K>` tests in `message_processing::dedup`. The macro
-// substitution here is a passthrough `&str -> String`, so per-channel
-// re-tests would be near-duplicate fluff per CLAUDE.md.
+// substitution here is a passthrough `&str -> String`.

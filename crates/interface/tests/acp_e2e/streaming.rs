@@ -98,10 +98,9 @@ async fn internal_tags_are_stripped_from_text_deltas() {
 
 #[tokio::test]
 async fn tool_lifecycle_preserves_stable_tool_call_id() {
-    // Real failure mode (regression for Phase 0): if `tool_call_id` were
-    // re-allocated per event, the IDE would render three distinct
-    // tool-call cards instead of one with a status progression. The
-    // plan calls this out as the single biggest source of UX bugs.
+    // Real failure mode: if `tool_call_id` were re-allocated per event, the
+    // IDE would render three distinct tool-call cards instead of one with a
+    // status progression — the single biggest source of ACP UX bugs.
     let outcome = run_with_events(vec![
         AgentEvent::ToolExecuting {
             tool_call_id: "call-abc".into(),

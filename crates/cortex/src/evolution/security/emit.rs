@@ -174,7 +174,7 @@ fn posture_source_str(s: PostureSource) -> &'static str {
     }
 }
 
-// PHASE 9 TODO: emit tests disabled pending async DB test harness.
+// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

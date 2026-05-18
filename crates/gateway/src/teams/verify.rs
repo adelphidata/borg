@@ -2,6 +2,8 @@ use anyhow::Result;
 use axum::http::HeaderMap;
 use base64::Engine;
 
+use crate::verify_common::headers as hdr;
+
 /// Verify a Microsoft Teams webhook request signature using HMAC-SHA256.
 ///
 /// Teams signs requests with an HMAC-SHA256 over the raw body bytes, using a
@@ -9,7 +11,7 @@ use base64::Engine;
 /// header as `HMAC <base64-signature>`.
 pub fn verify_teams_signature(headers: &HeaderMap, body: &[u8], secret: &str) -> Result<()> {
     let auth_header =
-        crate::verify_common::required_header(headers, "authorization", "Authorization")?;
+        crate::verify_common::required_header(headers, hdr::AUTHORIZATION, "Authorization")?;
 
     let signature_b64 = auth_header
         .strip_prefix("HMAC ")
@@ -52,7 +54,7 @@ mod tests {
     fn make_headers(signature_b64: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let value = format!("HMAC {signature_b64}");
-        headers.insert("authorization", HeaderValue::from_str(&value).unwrap());
+        headers.insert(hdr::AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
         headers
     }
 
@@ -108,7 +110,10 @@ mod tests {
     #[test]
     fn wrong_auth_prefix_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer token123"));
+        headers.insert(
+            hdr::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token123"),
+        );
         let result = verify_teams_signature(&headers, b"body", &make_secret());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("HMAC"));
@@ -118,7 +123,7 @@ mod tests {
     fn invalid_base64_signature_fails() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "authorization",
+            hdr::AUTHORIZATION,
             HeaderValue::from_static("HMAC !!!not-base64!!!"),
         );
         let result = verify_teams_signature(&headers, b"body", &make_secret());

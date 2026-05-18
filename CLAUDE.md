@@ -150,7 +150,7 @@ Model-visible tools: `get_goal` (read-only, Plan-mode OK), `create_goal`, `updat
 
 ### Config
 
-DB-only — `crates/cortex/src/config/`. All settings in SQLite `settings` table. Two-tier: DB → compiled defaults. `Config::load_from_db()` builds runtime; `SettingsResolver` for set/get/unset. No config.toml.
+DB-only — `crates/cortex/src/config/`. All settings in the `settings` table. Two-tier: DB → compiled defaults. `Config::load_from_db()` builds runtime; `SettingsResolver` for set/get/unset. No config.toml.
 
 ### Memory
 
@@ -178,7 +178,7 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 ### Agent Loop
 
-`core/agent.rs` — streams LLM, parses tool calls, executes, loops until text-only. `<internal>` tags stripped in real-time. Messages persisted to SQLite immediately. System prompt assembled per turn from IDENTITY + time + git + mode + memory + project docs + skills.
+`core/agent.rs` — streams LLM, parses tool calls, executes, loops until text-only. `<internal>` tags stripped in real-time. Messages persisted to the DB immediately. System prompt assembled per turn from IDENTITY + time + git + mode + memory + project docs + skills.
 
 ### Heartbeat
 
@@ -188,7 +188,7 @@ Proactive check-ins (default 60m or cron, quiet 00:00–06:00). `~/.borg/HEARTBE
 
 ### Database
 
-SQLite at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.
+Turso (SQLite-compatible, `turso` crate — not `rusqlite`/`libsql`) at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.
 
 ### Sandboxing
 

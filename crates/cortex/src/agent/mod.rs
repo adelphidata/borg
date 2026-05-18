@@ -1007,12 +1007,11 @@ impl Agent {
         let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
 
-        // === STABLE PREFIX (cache-friendly) ===
-        // Ordered so the largest byte-stable content comes first, enabling
-        // implicit prefix caching on providers that hash the prompt (OpenAI,
-        // Gemini) and maximizing cache hits on providers with explicit markers
-        // (Anthropic). Anything that changes turn-to-turn is pushed to the
-        // dynamic suffix below.
+        // Stable prefix: ordered so the largest byte-stable content comes
+        // first, enabling implicit prefix caching on providers that hash the
+        // prompt (OpenAI, Gemini) and maximizing cache hits on providers with
+        // explicit markers (Anthropic). Anything that changes turn-to-turn is
+        // pushed to the dynamic suffix below.
         system.push_str("<system_instructions>\n");
         system.push_str(&identity);
         system.push_str("\n</system_instructions>\n\n");
@@ -1105,7 +1104,7 @@ impl Agent {
             );
         }
 
-        // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
+        // Dynamic suffix (per-turn, cache-invalidating) starts here.
 
         // Active memory: per-turn hybrid search of memory + past sessions
         // keyed off the latest user message. Placed at the start of the
@@ -3063,7 +3062,7 @@ mod tests {
         assert!(tool_handlers::require_str_param(&args, "name").is_err());
     }
 
-    // PHASE 9 TODO: `update_task_status` is now async; tests need tokio runtime.
+    // TODO: update_task_status is async; tests need tokio runtime
     #[cfg(feature = "phase9-tests-disabled")]
     #[test]
     fn update_task_status_not_found() {}
@@ -3865,7 +3864,7 @@ mod tests {
     }
 }
 
-// PHASE 9 TODO: integration tests rely on sync rusqlite `Database` fixtures.
+// TODO: port integration tests to async Database fixtures
 // Re-enable once an async test harness lands.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod goal_integration_tests {

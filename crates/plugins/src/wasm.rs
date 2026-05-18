@@ -27,6 +27,9 @@ const MAX_OUTPUT_BYTES_DEFAULT: u64 = 64 * 1024;
 const MAX_MEMORY_PAGES_DEFAULT: u64 = 16;
 const FUEL_DEFAULT: u64 = 10_000_000;
 const MAX_FUEL_LIMIT: u64 = 50_000_000;
+const MAX_TIMEOUT_MS_LIMIT: u64 = 60_000;
+const MAX_MEMORY_PAGES_LIMIT: u64 = 256;
+const MAX_OUTPUT_BYTES_LIMIT: u64 = 1_048_576;
 const MAX_HOST_IMPORT_BYTES: usize = 64 * 1024;
 /// Cap on `borg:log.log` lines per call. A noisy plugin could otherwise fill
 /// the agent's tracing pipeline without ever doing useful work; the cap is per
@@ -388,14 +391,18 @@ pub fn validate_manifest(manifest: &WasmPluginManifest) -> Result<()> {
     if manifest.limits.fuel == 0 || manifest.limits.fuel > MAX_FUEL_LIMIT {
         bail!("fuel must be between 1 and {MAX_FUEL_LIMIT}");
     }
-    if manifest.limits.timeout_ms == 0 || manifest.limits.timeout_ms > 60_000 {
-        bail!("timeout_ms must be between 1 and 60000");
+    if manifest.limits.timeout_ms == 0 || manifest.limits.timeout_ms > MAX_TIMEOUT_MS_LIMIT {
+        bail!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS_LIMIT}");
     }
-    if manifest.limits.max_memory_pages == 0 || manifest.limits.max_memory_pages > 256 {
-        bail!("max_memory_pages must be between 1 and 256");
+    if manifest.limits.max_memory_pages == 0
+        || manifest.limits.max_memory_pages > MAX_MEMORY_PAGES_LIMIT
+    {
+        bail!("max_memory_pages must be between 1 and {MAX_MEMORY_PAGES_LIMIT}");
     }
-    if manifest.limits.max_output_bytes == 0 || manifest.limits.max_output_bytes > 1_048_576 {
-        bail!("max_output_bytes must be between 1 and 1048576");
+    if manifest.limits.max_output_bytes == 0
+        || manifest.limits.max_output_bytes > MAX_OUTPUT_BYTES_LIMIT
+    {
+        bail!("max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES_LIMIT}");
     }
     Ok(())
 }

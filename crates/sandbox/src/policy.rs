@@ -303,10 +303,8 @@ mod tests {
         if which::which("bwrap").is_ok() {
             assert_eq!(cmd.program, "bwrap");
         } else {
-            // Falls back to unsandboxed when bwrap is not installed
             assert_eq!(cmd.program, "python3");
         }
-        // The original program and args should be present
         assert!(cmd.args.contains(&"script.py".to_string()));
     }
 
@@ -317,12 +315,10 @@ mod tests {
         let args = vec!["arg1".to_string(), "arg2".to_string()];
         let cmd = policy.wrap_command("node", &args, Path::new("/tmp/tool"));
         if which::which("bwrap").is_err() {
-            // Fallback: program is node, args are passed through directly
             assert_eq!(cmd.program, "node");
             assert_eq!(cmd.args, vec!["arg1", "arg2"]);
             return;
         }
-        // Original program and args should appear at the end after bwrap flags
         let node_pos = cmd.args.iter().position(|a| a == "node").unwrap();
         let arg1_pos = cmd.args.iter().position(|a| a == "arg1").unwrap();
         let arg2_pos = cmd.args.iter().position(|a| a == "arg2").unwrap();
@@ -397,8 +393,6 @@ mod tests {
             .count();
         assert_eq!(borg_count, 1);
     }
-
-    // -- with_defaults_applied --
 
     #[test]
     fn defaults_applied_adds_tls_for_network() {
@@ -537,11 +531,9 @@ mod tests {
     #[test]
     fn special_chars_in_path_not_falsely_blocked() {
         let blocked = vec![".ssh".into(), ".env".into()];
-        // Paths with spaces and unicode should not be falsely matched
         assert!(!is_path_blocked("/home/user/my project/data", &blocked));
         assert!(!is_path_blocked("/home/user/données/fichier", &blocked));
         assert!(!is_path_blocked("/home/user/.env_backup", &blocked));
-        // But actual blocked paths still match
         assert!(is_path_blocked("/home/user/.ssh/id_rsa", &blocked));
         assert!(is_path_blocked("/home/user/.env", &blocked));
     }
@@ -563,22 +555,18 @@ mod tests {
         let blocked = vec![".ssh".into()];
         let result = policy.configured(&blocked);
 
-        // Borg dir should be in deny_write
         assert!(
             result.deny_write.iter().any(|p| p.ends_with("/.borg")),
             "borg dir should be protected"
         );
-        // Tildes should be expanded
         assert!(
             result.fs_read.iter().any(|p| p.starts_with(&*home_str)),
             "tildes should be expanded"
         );
-        // TLS paths should be added (network=true)
         assert!(
             result.fs_read.contains(&"/etc/ssl".to_string()),
             "TLS paths should be added for network"
         );
-        // Blocked path (.ssh) should be filtered out
         assert!(
             !result.fs_read.iter().any(|p| p.contains(".ssh")),
             ".ssh paths should be filtered"

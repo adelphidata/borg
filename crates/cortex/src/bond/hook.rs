@@ -167,7 +167,7 @@ impl fmt::Debug for BondHook {
     }
 }
 
-// PHASE 9 TODO: bond hook tests disabled pending async DB test harness.
+// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

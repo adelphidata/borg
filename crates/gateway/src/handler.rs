@@ -94,7 +94,6 @@ pub async fn handle_webhook(
     let executor = ChannelExecutor::new(&channel.manifest, &channel.dir);
     let blocked_paths = &config.security.blocked_paths;
 
-    // Step 1: Verify webhook signature (if secret_env configured)
     if let Some(secret_env) = &channel.manifest.auth.secret_env {
         if channel.manifest.scripts.verify.is_none() {
             bail!(
@@ -128,7 +127,6 @@ pub async fn handle_webhook(
         }
     }
 
-    // Step 2: Parse inbound message
     let inbound_input = serde_json::json!({
         "headers": headers_json,
         "body": body,
@@ -151,7 +149,6 @@ pub async fn handle_webhook(
     let inbound: InboundMessage =
         serde_json::from_value(parsed).context("Invalid inbound message structure")?;
 
-    // Steps 3-5: shared processing
     process_message(channel, inbound, config, health).await
 }
 
@@ -936,7 +933,6 @@ async fn invoke_agent_inner(
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
     progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
-    // Phase 1: Activity logging
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         cortex::activity_log::log_activity(
             &adb,
@@ -947,7 +943,6 @@ async fn invoke_agent_inner(
         .await;
     }
 
-    // Phase 2: Route resolution + activation check
     let route = crate::channel::routing::resolve_route(
         config,
         channel_name,
@@ -967,7 +962,6 @@ async fn invoke_agent_inner(
         return Ok((String::new(), String::new()));
     }
 
-    // Phase 3: Auto-reply check
     if let Some(ar_state) = auto_reply_state {
         if let Some(reply) =
             crate::auto_reply::check_auto_reply(ar_state, &config.gateway.auto_reply).await
@@ -985,7 +979,6 @@ async fn invoke_agent_inner(
         channel_name, inbound.sender_id, route.matched_by
     );
 
-    // Phase 4: Access control / pairing check
     if let Some(early) = enforce_access_control(config, channel_name, &inbound.sender_id).await? {
         return Ok(early);
     }
@@ -994,7 +987,6 @@ async fn invoke_agent_inner(
         h.write().await.record_inbound(channel_name);
     }
 
-    // Phase 5: Session resolution + slash commands
     let resolution = resolve_session_and_commands(channel_name, inbound, config, &route).await?;
     let db = resolution.db;
     let session_id = resolution.session_id;
@@ -1014,13 +1006,10 @@ async fn invoke_agent_inner(
         }
     };
 
-    // Phase 6: Hand the turn to the daemon's SessionExecutor.
-    // NOTE: per-session config overrides that used to live here (gw mode,
-    // gateway action_limits, adaptive cache TTL) now belong on the daemon
-    // side — `DaemonSessionExecutor` owns the AgentBackend's Config.
-
-    // Suppress unused-variable warnings for fields the executor will consume
-    // post-Stage-D.
+    // Hand the turn to the daemon's SessionExecutor. Per-session config
+    // overrides (gw mode, gateway action_limits, adaptive cache TTL) live
+    // on the daemon side — `DaemonSessionExecutor` owns the AgentBackend's
+    // Config.
     let _ = db;
 
     let executor = match crate::session_executor::global() {
@@ -1734,12 +1723,10 @@ mod tests {
         let route = default_route();
         let config = Config::default(); // default dm_policy = Pairing
 
-        // Step 1: DM activation check should pass
         let (should_respond, _cleaned) =
             check_activation("/start", Some("direct"), &route, &config, Some("@bot"));
         assert!(should_respond, "DMs must always activate");
 
-        // Step 2: Pairing check should return a non-empty challenge
         let db = cortex::db::Database::test_db().await;
         let result =
             cortex::pairing::check_sender_access(&db, &config, "telegram", "starter_user", None)

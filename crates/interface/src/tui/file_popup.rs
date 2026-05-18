@@ -384,8 +384,6 @@ mod tests {
         assert!(found, "expected 'Searching' row to render while waiting");
     }
 
-    // ------------------- helper fn tests -------------------
-
     /// `is_path_like` decides whether a token in the composer should trigger
     /// the file-search popup. It must accept anything that *looks* like a
     /// path (tilde, absolute, relative dot, embedded separator, Windows

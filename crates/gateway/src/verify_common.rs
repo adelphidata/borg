@@ -11,6 +11,19 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Canonical HTTP header names used for webhook signature / token verification.
+///
+/// Centralized so production extraction paths and test fixtures cannot drift —
+/// a typo in either side would silently break signature verification.
+pub mod headers {
+    pub const SLACK_TIMESTAMP: &str = "x-slack-request-timestamp";
+    pub const SLACK_SIGNATURE: &str = "x-slack-signature";
+    pub const DISCORD_SIGNATURE: &str = "x-signature-ed25519";
+    pub const DISCORD_TIMESTAMP: &str = "x-signature-timestamp";
+    pub const TELEGRAM_SECRET: &str = "x-telegram-bot-api-secret-token";
+    pub const AUTHORIZATION: &str = "authorization";
+}
+
 /// Compute HMAC-SHA256 over `data` keyed by `key` and constant-time compare
 /// against the expected raw signature bytes. Used by Slack (hex-encoded
 /// expected) and Teams (base64-encoded expected); each caller decodes its

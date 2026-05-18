@@ -336,8 +336,7 @@ mod tests {
         // Real failure mode: someone adds a new `data.foo` retention knob
         // without realizing `is_security_relevant_setting` is the gate
         // for SETTINGS_CHANGED emission. Table-driven so adding a new
-        // category surfaces as a single failing row, not a fluff per-key
-        // test (per CLAUDE.md test-quality rules).
+        // category surfaces as a single failing row.
         let cases: &[(&str, bool)] = &[
             ("security.blocked_paths", true),
             ("security.secret_detection", true),

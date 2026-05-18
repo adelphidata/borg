@@ -266,7 +266,7 @@ impl SessionRateGuard {
         }
     }
 
-    /// Update the action limits in place (used by config hot reload).
+    /// Update the action limits in place.
     pub fn update_limits(&mut self, new_limits: ActionLimits) {
         self.limits = new_limits;
     }

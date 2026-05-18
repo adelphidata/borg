@@ -158,7 +158,7 @@ impl Admin for AdminSvc {
         // /poke routes through the in-process trigger channel so the heartbeat
         // turn runs on the existing `DaemonSessionExecutor` (with hooks, vitals,
         // evolution wiring). The unified dispatcher (`task_type="heartbeat"`)
-        // owns *scheduled* firings only — the legacy timer was removed in V52.
+        // owns *scheduled* firings only.
         let tx = {
             let g = self
                 .heartbeat_trigger_tx

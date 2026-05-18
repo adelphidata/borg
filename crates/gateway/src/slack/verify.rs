@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 use axum::http::HeaderMap;
 
+use crate::verify_common::headers as hdr;
+
 const TIMESTAMP_REPLAY_WINDOW_SECS: u64 = crate::constants::SLACK_REPLAY_WINDOW_SECS;
 
 /// Verify a Slack request signature using HMAC-SHA256.
@@ -11,7 +13,7 @@ const TIMESTAMP_REPLAY_WINDOW_SECS: u64 = crate::constants::SLACK_REPLAY_WINDOW_
 pub fn verify_slack_signature(headers: &HeaderMap, body: &str, signing_secret: &str) -> Result<()> {
     let timestamp = crate::verify_common::required_header(
         headers,
-        "x-slack-request-timestamp",
+        hdr::SLACK_TIMESTAMP,
         "X-Slack-Request-Timestamp",
     )?;
 
@@ -25,7 +27,7 @@ pub fn verify_slack_signature(headers: &HeaderMap, body: &str, signing_secret: &
     }
 
     let expected_sig =
-        crate::verify_common::required_header(headers, "x-slack-signature", "X-Slack-Signature")?;
+        crate::verify_common::required_header(headers, hdr::SLACK_SIGNATURE, "X-Slack-Signature")?;
 
     // Slack format: `v0={hex(HMAC-SHA256(secret, "v0:{ts}:{body}"))}`
     let expected_hex = expected_sig
@@ -62,11 +64,11 @@ mod tests {
     fn make_headers(timestamp: &str, signature: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-slack-request-timestamp",
+            hdr::SLACK_TIMESTAMP,
             HeaderValue::from_str(timestamp).unwrap(),
         );
         headers.insert(
-            "x-slack-signature",
+            hdr::SLACK_SIGNATURE,
             HeaderValue::from_str(signature).unwrap(),
         );
         headers
@@ -124,7 +126,7 @@ mod tests {
     #[test]
     fn missing_timestamp_header_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-slack-signature", HeaderValue::from_static("v0=abc123"));
+        headers.insert(hdr::SLACK_SIGNATURE, HeaderValue::from_static("v0=abc123"));
 
         assert!(verify_slack_signature(&headers, "body", "secret").is_err());
     }
@@ -132,10 +134,7 @@ mod tests {
     #[test]
     fn missing_signature_header_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-slack-request-timestamp",
-            HeaderValue::from_static("1234567890"),
-        );
+        headers.insert(hdr::SLACK_TIMESTAMP, HeaderValue::from_static("1234567890"));
 
         assert!(verify_slack_signature(&headers, "body", "secret").is_err());
     }
@@ -144,10 +143,10 @@ mod tests {
     fn non_numeric_timestamp_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-slack-request-timestamp",
+            hdr::SLACK_TIMESTAMP,
             HeaderValue::from_static("not-a-number"),
         );
-        headers.insert("x-slack-signature", HeaderValue::from_static("v0=abc"));
+        headers.insert(hdr::SLACK_SIGNATURE, HeaderValue::from_static("v0=abc"));
 
         let result = verify_slack_signature(&headers, "body", "secret");
         assert!(result.is_err());

@@ -635,9 +635,6 @@ impl AgentControl {
         tools_blocklist: Option<&[&str]>,
         timeout_secs: u64,
     ) -> Result<Vec<SubAgentCompletion>> {
-        // Phase 1: spawn each task, remembering which index produced which
-        // agent_id (or a synthetic error completion if the spawn itself
-        // failed — e.g. the child limit was already saturated).
         let mut agent_ids: Vec<std::result::Result<String, SubAgentCompletion>> =
             Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
@@ -672,9 +669,8 @@ impl AgentControl {
             }
         }
 
-        // Phase 2: wait for each spawned child in turn. `wait_for_agent`
-        // drains completions from the shared channel and buffers
-        // out-of-order arrivals so iterating in spawn-order is correct.
+        // `wait_for_agent` drains completions from the shared channel and
+        // buffers out-of-order arrivals so iterating in spawn-order is correct.
         let mut completions: Vec<SubAgentCompletion> = Vec::with_capacity(agent_ids.len());
         for entry in agent_ids {
             match entry {

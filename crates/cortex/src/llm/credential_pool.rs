@@ -2429,7 +2429,7 @@ pub async fn try_build_from_keys(
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
-// PHASE 9 TODO: credential pool tests disabled pending async DB test harness.
+// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

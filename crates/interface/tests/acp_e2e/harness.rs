@@ -551,7 +551,11 @@ impl AcpClient {
             .send(bytes)
             .await
             .map_err(|_| anyhow!("subprocess stdin closed"))?;
-        let envelope = tokio::time::timeout(Duration::from_secs(5), rx)
+        // 5s was tight under heavy CI/parallel-build load — `initialize`
+        // includes borgd's first DB open + skill catalog scan, which can
+        // exceed 5s when the build is still hot. 30s is well above any
+        // real handshake while still catching genuine deadlocks.
+        let envelope = tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .map_err(|_| anyhow!("timeout waiting for response to {method} (id={id})"))??;
         Ok(envelope)

@@ -13,7 +13,7 @@ pub mod hook;
 pub mod rate_card;
 pub mod usd;
 
-// PHASE 9 TODO: budgets::tests disabled pending async DB test harness.
+// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 

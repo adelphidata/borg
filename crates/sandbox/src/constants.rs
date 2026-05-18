@@ -34,8 +34,7 @@ pub const SAFE_ENV_VARS: &[&str] = &[
     // whatever planting surface the parent's PATH has. The sandbox
     // limits filesystem reach but does NOT clean the DLL search path —
     // any Tier-2 elevation should also normalize PATH to a known-good
-    // value (System32 + the runtime's bin dir) before spawning the
-    // child. Tracked for Step 3.
+    // value (System32 + the runtime's bin dir) before spawning the child.
     "PATH",
     // Process essentials — DLL loader bootstrap + working dir + temp.
     "SYSTEMROOT",

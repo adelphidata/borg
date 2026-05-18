@@ -82,9 +82,9 @@ impl GoalRuntimeState {
 
     /// Lock the inner state, transparently recovering from a poisoned mutex.
     ///
-    /// Per CLAUDE.md, panicking from prompt-assembly or accounting paths would
-    /// take the agent down. Recover and continue with the inner value rather
-    /// than letting a prior panic cascade.
+    /// Panicking from prompt-assembly or accounting paths would take the agent
+    /// down. Recover and continue with the inner value rather than letting a
+    /// prior panic cascade.
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         match self.inner.lock() {
             Ok(g) => g,

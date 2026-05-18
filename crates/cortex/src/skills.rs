@@ -794,7 +794,6 @@ pub fn load_skills_context(
             .then_with(|| a.manifest.name.cmp(&b.manifest.name))
     });
 
-    // Phase 1: Include metadata for as many skills as fit; track omissions.
     let mut metadata_parts: Vec<Option<String>> = Vec::with_capacity(sorted_skills.len());
     let mut estimated_tokens: usize = 0;
 
@@ -814,7 +813,6 @@ pub fn load_skills_context(
         metadata_parts.push(Some(meta));
     }
 
-    // Phase 2: With remaining budget, upgrade available skills to full body.
     let mut full_overrides: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
 
@@ -1527,7 +1525,7 @@ Short body.
     #[test]
     fn budget_report_tracks_omitted_entirely() {
         // Budget too small to even fit metadata for every skill — some entries
-        // must be omitted entirely (previously a silent loss path).
+        // must be omitted entirely.
         let (_rendered, report) = load_skills_context(
             50,
             &std::collections::HashMap::new(),
@@ -1952,8 +1950,6 @@ Old copy from a previous install.
         assert_eq!(browser_skills[0].source, SkillSource::BuiltIn);
     }
 
-    // --- Per-skill enable/disable tests ---
-
     #[test]
     fn test_disabled_skill_excluded_from_context() {
         let mut entries = std::collections::HashMap::new();
@@ -2283,8 +2279,6 @@ Use docker commands.
         let (manifest, _body) = parse_skill_md(SAMPLE_SKILL).unwrap();
         assert!(manifest.install.is_empty());
     }
-
-    // --- Per-skill env collection test ---
 
     #[test]
     fn test_collect_skill_env() {

@@ -198,7 +198,6 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
-// PHASE 9 TODO: usage tests disabled pending async DB test harness.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

@@ -130,7 +130,7 @@ pub enum HeartbeatSource {
 }
 
 impl HeartbeatSource {
-    /// Wire-format string used by the proto event.
+    /// Serialize to the proto wire string.
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Scheduled => "scheduled",
@@ -138,7 +138,7 @@ impl HeartbeatSource {
         }
     }
 
-    /// Parse the wire-format string used by the proto event / admin RPC.
+    /// Parse from the proto wire string.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "scheduled" => Some(Self::Scheduled),
@@ -218,7 +218,7 @@ impl HeartbeatBus {
 /// (`task_runner::execute_heartbeat_task`) can publish events into the same
 /// bus that `Admin.SubscribeHeartbeatEvents` reads from — without plumbing
 /// the bus through `TaskExecContext`. Without this, scheduled heartbeat
-/// firings would be invisible to TUI status views post-V52.
+/// firings would be invisible to TUI status views.
 static GLOBAL_BUS: OnceLock<HeartbeatBus> = OnceLock::new();
 
 /// Publish a heartbeat event into the process-global bus, if one has been
@@ -248,12 +248,11 @@ pub fn spawn(
     mpsc::Sender<HeartbeatTrigger>,
     mpsc::Sender<()>,
 ) {
-    // V52 consolidation: scheduled heartbeat firings now flow through the
-    // unified scheduled-task dispatcher (`task_type="heartbeat"` row in
-    // `scheduled_tasks`). The legacy in-process `HeartbeatScheduler` timer
-    // is no longer spawned — leaving it running would double-fire on every
-    // tick. The trigger-channel loop below is preserved so TUI-initiated
-    // SessionStart greetings (which still need executor context) work.
+    // Scheduled heartbeat firings flow through the unified scheduled-task
+    // dispatcher (`task_type="heartbeat"` row in `scheduled_tasks`); spawning
+    // a parallel in-process timer here would double-fire on every tick. The
+    // trigger-channel loop below is preserved so TUI-initiated SessionStart
+    // greetings (which still need executor context) work.
     let _ = config; // signature preserved for callers
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
     let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
@@ -750,13 +749,13 @@ async fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<S
 mod tests {
     use super::*;
 
-    /// V52 invariant: `heartbeat::spawn` MUST NOT spawn the legacy
-    /// `HeartbeatScheduler::run` timer. Scheduled heartbeat firings now flow
+    /// `heartbeat::spawn` MUST NOT spawn an in-process
+    /// `HeartbeatScheduler::run` timer. Scheduled heartbeat firings flow
     /// through the unified scheduled-task dispatcher
-    /// (`task_type="heartbeat"`); leaving the legacy timer running would
-    /// double-fire on every tick. Source-grep guard so a future refactor
-    /// can't silently re-introduce the parallel loop. Pairs with the TUI
-    /// mouse-capture invariant guards.
+    /// (`task_type="heartbeat"`); a parallel timer would double-fire on every
+    /// tick. Source-grep guard so a future refactor can't silently
+    /// re-introduce the parallel loop. Pairs with the TUI mouse-capture
+    /// invariant guards.
     #[test]
     fn heartbeat_spawn_does_not_run_legacy_scheduler() {
         // Build the forbidden patterns at runtime so this guard test's own
@@ -773,14 +772,14 @@ mod tests {
         };
         assert!(
             !scan.contains(&scheduler_run),
-            "heartbeat::spawn must not invoke the legacy timer — V52 routes \
-             scheduled firings through the task dispatcher; the parallel loop \
+            "heartbeat::spawn must not invoke the legacy timer — scheduled \
+             firings route through the task dispatcher; a parallel loop \
              would double-fire on every tick"
         );
         assert!(
             !scan.contains(&scheduler_new),
             "heartbeat::spawn must not construct the legacy scheduler — the \
-             seeded heartbeat row owns the schedule under V52"
+             seeded heartbeat row owns the schedule"
         );
     }
 

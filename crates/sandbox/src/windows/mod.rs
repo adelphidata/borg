@@ -20,11 +20,10 @@
 //!
 //! # SECURITY — provisional wire format
 //!
-//! **Step 1/5 of the Windows sandbox feature.** The current
-//! argv-based policy transport is INTENDED FOR DEVELOPMENT ONLY and
-//! must be replaced before release:
+//! The current argv-based policy transport is INTENDED FOR DEVELOPMENT
+//! ONLY and must be replaced before release:
 //!
-//! - **TODO (Step 2):** Move the policy JSON off the trampoline's argv.
+//! - **TODO:** Move the policy JSON off the trampoline's argv.
 //!   Windows command lines are observable to any same-session process
 //!   via `Win32_Process.CommandLine` (WMI, `tasklist /v`,
 //!   `Get-CimInstance`). The policy itself is not a credential, but
@@ -36,7 +35,7 @@
 //!   with a DACL restricted to the spawning user, referenced on argv
 //!   by path + one-shot nonce only.
 //!
-//! - **TODO (Step 2):** Add caller authentication to the
+//! - **TODO:** Add caller authentication to the
 //!   `__windows-sandbox-spawn` subcommand dispatcher. Today the name
 //!   alone (with the documentation convention that double underscore
 //!   means "internal") is a soft check, not a security boundary. Any

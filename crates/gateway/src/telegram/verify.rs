@@ -1,11 +1,13 @@
 use anyhow::{bail, Result};
 use axum::http::HeaderMap;
 
+use crate::verify_common::headers as hdr;
+
 use super::types::Update;
 
 /// Verify the `X-Telegram-Bot-Api-Secret-Token` header using constant-time comparison.
 pub fn verify_secret_token(headers: &HeaderMap, secret: &str) -> bool {
-    let header_val = match headers.get("x-telegram-bot-api-secret-token") {
+    let header_val = match headers.get(hdr::TELEGRAM_SECRET) {
         Some(v) => match v.to_str() {
             Ok(s) => s,
             Err(_) => return false,
@@ -36,10 +38,7 @@ mod tests {
     fn make_headers(secret: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(s) = secret {
-            headers.insert(
-                "x-telegram-bot-api-secret-token",
-                HeaderValue::from_str(s).unwrap(),
-            );
+            headers.insert(hdr::TELEGRAM_SECRET, HeaderValue::from_str(s).unwrap());
         }
         headers
     }

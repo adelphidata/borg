@@ -43,7 +43,6 @@ use super::custom_terminal::Terminal as CustomTerminal;
 const DISABLE_KEYBOARD_ENHANCEMENT_ENV_VAR: &str = "BORG_TUI_DISABLE_KEYBOARD_ENHANCEMENT";
 
 /// Type alias used by the TUI entry points and signal handlers.
-#[allow(dead_code)]
 pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 
 // ============================================================================
@@ -198,7 +197,6 @@ fn read_windows_term_program() -> Option<String> {
 
 /// Apply borg's input modes (raw mode, bracketed paste, focus change, optional kitty
 /// keyboard enhancement) to the terminal. Inverse of [`restore`].
-#[allow(dead_code)]
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
 
@@ -234,33 +232,8 @@ fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
 }
 
 /// Restore the terminal to its original state. Inverse of [`set_modes`].
-#[allow(dead_code)]
 pub fn restore() -> Result<()> {
     restore_common(true)
-}
-
-/// Restore the terminal but keep raw mode enabled (used when bouncing through
-/// an external interactive program that expects raw stdin).
-#[allow(dead_code)]
-pub fn restore_keep_raw() -> Result<()> {
-    restore_common(false)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum RestoreMode {
-    Full,
-    KeepRaw,
-}
-
-impl RestoreMode {
-    #[allow(dead_code)]
-    pub fn restore(self) -> Result<()> {
-        match self {
-            RestoreMode::Full => restore(),
-            RestoreMode::KeepRaw => restore_keep_raw(),
-        }
-    }
 }
 
 /// Inline-viewport TUI wrapper.
@@ -268,7 +241,6 @@ impl RestoreMode {
 /// Owns the [`custom_terminal::Terminal`] plus the bookkeeping needed to insert
 /// finalized history rows into terminal scrollback and to bounce in/out of an
 /// alt-screen surface for full-screen popups.
-#[allow(dead_code)]
 pub struct Tui {
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
@@ -286,7 +258,6 @@ pub struct Tui {
     is_tmux: bool,
 }
 
-#[allow(dead_code)]
 impl Tui {
     pub fn new(terminal: Terminal) -> Result<Self> {
         let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
@@ -319,12 +290,6 @@ impl Tui {
     /// Buffer `lines` to be flushed above the viewport on the next [`Tui::draw`].
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
         self.pending_history_lines.extend(lines);
-    }
-
-    /// Drop any history lines queued but not yet written. Used when the caller
-    /// rebuilds scrollback from source and wants to discard a stale buffer.
-    pub fn clear_pending_history_lines(&mut self) {
-        self.pending_history_lines.clear();
     }
 
     /// Enter alternate screen and expand the viewport to full terminal size,
@@ -365,11 +330,6 @@ impl Tui {
         self.terminal.invalidate_viewport();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// Clear both scrollback and the visible screen via ANSI sequences.
-    pub fn clear_scrollback_and_visible_screen(&mut self) -> Result<()> {
-        self.terminal.clear_scrollback_and_visible_screen_ansi()
     }
 
     fn alt_screen_viewport(size: Size) -> Rect {

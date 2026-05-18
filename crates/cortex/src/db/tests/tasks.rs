@@ -26,7 +26,7 @@ fn create_and_list_tasks() {
     let tasks = db.list_tasks().expect("list");
     // +6 for seeded tasks: Monthly Security Audit, Daily Summary, Nightly
     // Consolidation, Weekly Maintenance, Daily Self-Healing Maintenance,
-    // and the V52 Heartbeat row.
+    // and the Heartbeat row.
     assert_eq!(tasks.len(), 8);
 }
 

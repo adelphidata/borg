@@ -334,8 +334,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    // -- ScriptOutput --
-
     #[test]
     fn script_output_success_only_for_exit_zero() {
         // success() is true iff the process exited normally with code 0.
@@ -357,8 +355,6 @@ mod tests {
             assert_eq!(output.success(), expected, "exit_code={exit_code:?}");
         }
     }
-
-    // -- resolve_runtime --
 
     #[test]
     fn resolve_bash_returns_absolute_path() {
@@ -385,8 +381,6 @@ mod tests {
         let result = resolve_runtime("", Path::new("/tmp"));
         assert!(result.is_err());
     }
-
-    // -- ScriptRunner::run --
 
     #[tokio::test]
     async fn run_missing_script_errors() {
@@ -574,8 +568,6 @@ mod tests {
             "expected timeout error, got: {err}"
         );
     }
-
-    // -- ScriptRunner::run_streaming --
 
     #[tokio::test]
     async fn run_streaming_captures_lines() {

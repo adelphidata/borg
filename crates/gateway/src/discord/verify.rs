@@ -2,6 +2,8 @@ use anyhow::Result;
 use axum::http::HeaderMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+use crate::verify_common::headers as hdr;
+
 /// Verify a Discord interaction request using Ed25519 signature verification.
 ///
 /// Discord signs each interaction request with Ed25519. The signature and timestamp
@@ -27,13 +29,13 @@ pub fn verify_discord_signature(
     // Extract headers
     let signature_hex = crate::verify_common::required_header(
         headers,
-        "x-signature-ed25519",
+        hdr::DISCORD_SIGNATURE,
         "X-Signature-Ed25519",
     )?;
 
     let timestamp = crate::verify_common::required_header(
         headers,
-        "x-signature-timestamp",
+        hdr::DISCORD_TIMESTAMP,
         "X-Signature-Timestamp",
     )?;
 
@@ -71,11 +73,11 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-signature-ed25519",
+            hdr::DISCORD_SIGNATURE,
             HeaderValue::from_str(&sig_hex).unwrap(),
         );
         headers.insert(
-            "x-signature-timestamp",
+            hdr::DISCORD_TIMESTAMP,
             HeaderValue::from_str(timestamp).unwrap(),
         );
 
@@ -120,7 +122,7 @@ mod tests {
     fn missing_signature_header_fails() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-signature-timestamp",
+            hdr::DISCORD_TIMESTAMP,
             HeaderValue::from_static("1234567890"),
         );
 
@@ -137,7 +139,7 @@ mod tests {
     #[test]
     fn missing_timestamp_header_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-signature-ed25519", HeaderValue::from_static("aabbccdd"));
+        headers.insert(hdr::DISCORD_SIGNATURE, HeaderValue::from_static("aabbccdd"));
 
         let key = SigningKey::from_bytes(&[1u8; 32]);
         let pub_hex = hex::encode(key.verifying_key().to_bytes());
@@ -152,8 +154,8 @@ mod tests {
     #[test]
     fn invalid_public_key_hex_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-signature-ed25519", HeaderValue::from_static("aabb"));
-        headers.insert("x-signature-timestamp", HeaderValue::from_static("12345"));
+        headers.insert(hdr::DISCORD_SIGNATURE, HeaderValue::from_static("aabb"));
+        headers.insert(hdr::DISCORD_TIMESTAMP, HeaderValue::from_static("12345"));
 
         let result = verify_discord_signature(&headers, "body", "not-hex!");
         assert!(result.is_err());
@@ -162,8 +164,8 @@ mod tests {
     #[test]
     fn invalid_public_key_length_fails() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-signature-ed25519", HeaderValue::from_static("aabb"));
-        headers.insert("x-signature-timestamp", HeaderValue::from_static("12345"));
+        headers.insert(hdr::DISCORD_SIGNATURE, HeaderValue::from_static("aabb"));
+        headers.insert(hdr::DISCORD_TIMESTAMP, HeaderValue::from_static("12345"));
 
         // Valid hex but wrong length (16 bytes instead of 32)
         let result = verify_discord_signature(&headers, "body", "aabbccddaabbccddaabbccddaabbccdd");
@@ -179,7 +181,7 @@ mod tests {
         let (mut headers, public_key_hex) = make_signed_request(&signing_key, "1234567890", body);
         // Replace timestamp with a different value — signature won't match
         headers.insert(
-            "x-signature-timestamp",
+            hdr::DISCORD_TIMESTAMP,
             HeaderValue::from_static("9999999999"),
         );
 

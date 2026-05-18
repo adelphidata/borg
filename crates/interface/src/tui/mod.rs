@@ -208,8 +208,8 @@ async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> St
 /// Guard that restores terminal state on drop (both normal exit and early error return).
 ///
 /// Inline-viewport mode never enters the alternate screen at startup, so the
-/// guard only needs to pop input modes (raw mode, bracketed paste, focus) —
-/// hence `restore_keep_raw`-style cleanup mirroring `tui_lifecycle::restore`.
+/// guard only needs to pop input modes (raw mode, bracketed paste, focus) via
+/// `tui_lifecycle::restore`.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -1851,14 +1851,6 @@ mod tests {
     /// Forbidden escape-sequence modes. Presence of ANY of these in the code
     /// paths that emit ANSI to the terminal will break native text selection.
     const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
-
-    // ------------------------------------------------------------------------
-    // Escape-sequence correctness
-    // ------------------------------------------------------------------------
-
-    // ------------------------------------------------------------------------
-    // Session-start greeting throttle gate
-    // ------------------------------------------------------------------------
 
     // ------------------------------------------------------------------------
     // Post-install message composition

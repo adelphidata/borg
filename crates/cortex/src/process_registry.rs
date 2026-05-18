@@ -600,8 +600,6 @@ impl Drop for ProcessGuard {
     }
 }
 
-// --- internal helpers ---
-
 fn push_finished(queue: &mut VecDeque<ProcessEntry>, entry: ProcessEntry) {
     queue.push_back(entry);
 }

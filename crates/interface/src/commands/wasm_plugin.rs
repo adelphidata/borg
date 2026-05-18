@@ -253,7 +253,7 @@ async fn enable_publisher(publisher_key: &str) -> Result<()> {
 }
 
 async fn list() -> Result<()> {
-    let db = Database::open().await.context("open db")?;
+    let db = Database::open_readonly().await.context("open db")?;
     let rows = db.list_wasm_plugins().await.context("list wasm plugins")?;
     if rows.is_empty() {
         println!("(no WASM plugins installed)");
@@ -308,7 +308,7 @@ async fn list() -> Result<()> {
 }
 
 async fn show(plugin_id: &str) -> Result<()> {
-    let db = Database::open().await.context("open db")?;
+    let db = Database::open_readonly().await.context("open db")?;
     let row = db
         .get_wasm_plugin(plugin_id)
         .await?
@@ -348,7 +348,7 @@ async fn show(plugin_id: &str) -> Result<()> {
 }
 
 async fn verify(plugin_id: &str) -> Result<()> {
-    let db = Database::open().await.context("open db")?;
+    let db = Database::open_readonly().await.context("open db")?;
     let row = db
         .get_wasm_plugin(plugin_id)
         .await?

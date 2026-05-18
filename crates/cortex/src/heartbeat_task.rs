@@ -1,9 +1,7 @@
 //! Constants and helpers for the seeded `task_type="heartbeat"` row.
 //!
-//! Heartbeat used to live as a parallel scheduler in the `heartbeat` crate
-//! with in-process state. After the V52 unification it's a single seeded row
-//! in `scheduled_tasks`; this module owns the row's fixed identifier and
-//! whatever cortex-side helpers the consolidation needs.
+//! Heartbeat is a single seeded row in `scheduled_tasks`; this module owns
+//! the row's fixed identifier and the cortex-side helpers around it.
 
 pub use crate::task_ids::HEARTBEAT_TASK_ID;
 

@@ -159,7 +159,6 @@ mod tests {
         assert!(transcript.len() < 2100);
     }
 
-    // PHASE 9 TODO: rusqlite-based fixture; needs turso async equivalent.
     #[cfg(feature = "phase9-tests-disabled")]
     #[test]
     fn session_indexing_db_methods() {}
@@ -193,7 +192,6 @@ mod tests {
         assert!(transcript.trim().is_empty());
     }
 
-    // PHASE 9 TODO: rusqlite-based fixture; needs turso async equivalent.
     #[cfg(feature = "phase9-tests-disabled")]
     #[test]
     fn get_unindexed_sessions_works() {}

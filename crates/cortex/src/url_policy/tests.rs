@@ -6,6 +6,13 @@
 use super::*;
 use crate::config::{ThrottleRule, TransformAction, TransformRule, UrlPolicyConfig};
 
+// Throttle tests share the global `throttle::LAST_SEEN` map and reset it
+// between runs. Cargo runs tests in parallel by default, so two throttle
+// tests calling `reset_for_tests()` between each other's `classify()`
+// calls would wipe the bucket the other test just populated, flaking the
+// `Throttle` assertion. Serialize them with a process-wide mutex.
+static THROTTLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn cfg_default() -> UrlPolicyConfig {
     UrlPolicyConfig::default()
 }
@@ -445,6 +452,7 @@ async fn transform_to_metadata_host_still_blocked_by_ssrf() {
 
 #[tokio::test]
 async fn throttle_blocks_second_request_within_window_then_allows_after() {
+    let _guard = THROTTLE_LOCK.lock().await;
     throttle::reset_for_tests();
     let cfg = UrlPolicyConfig {
         enabled: true,
@@ -482,6 +490,7 @@ async fn throttle_blocks_second_request_within_window_then_allows_after() {
 
 #[tokio::test]
 async fn throttle_is_per_host_not_global() {
+    let _guard = THROTTLE_LOCK.lock().await;
     throttle::reset_for_tests();
     let cfg = UrlPolicyConfig {
         enabled: true,
@@ -504,6 +513,7 @@ async fn throttle_buckets_isolate_by_port() {
     // Regression: throttle was keyed on host-only, so two services on
     // the same host (or two wiremock servers in integration tests) would
     // collide. Key now includes the port.
+    let _guard = THROTTLE_LOCK.lock().await;
     throttle::reset_for_tests();
     let cfg = UrlPolicyConfig {
         enabled: true,
@@ -529,6 +539,7 @@ async fn throttle_buckets_isolate_by_port() {
 
 #[tokio::test]
 async fn throttle_not_applied_when_no_rule_matches() {
+    let _guard = THROTTLE_LOCK.lock().await;
     throttle::reset_for_tests();
     let cfg = UrlPolicyConfig {
         enabled: true,

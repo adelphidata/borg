@@ -154,8 +154,6 @@ async fn poll_loop(
     }
 }
 
-// PHASE 9 TODO: rusqlite-backed test helpers (`load_config_from_db`,
-// `load_config_from_db_ignores_invalid_settings`) need an async/turso fixture.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

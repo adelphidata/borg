@@ -1,14 +1,9 @@
 //! Shared `/evolution` · `/xp` · `/card` command dispatcher.
 //!
-//! Single source of truth for the V2 status surfaces so the TUI and channel
+//! Single source of truth for the status surfaces so the TUI and channel
 //! gateways render identical output. The TUI wraps [`CommandOutput::text`]
 //! in a popup; the gateway interceptor relays it as a plain-text reply and
 //! attaches [`CommandOutput::image_png`] if the channel supports media.
-//!
-//! Phase 1 lays down the dispatcher skeleton with minimal stub output so
-//! Phase 2 streams (A/B/E) can fill in the formatting without changing
-//! signatures. The stubs render the raw state so Phase 1 is still callable
-//! end-to-end.
 
 use std::path::PathBuf;
 

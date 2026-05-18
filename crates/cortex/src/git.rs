@@ -159,18 +159,14 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         .map(PathBuf::from)
         .collect();
 
-    // Step 1: Read current HEAD into temp index (if HEAD exists)
     if has_head {
         run_git_with_index(&tmp_path, &["read-tree", "HEAD"], repo_root).await?;
     }
 
-    // Step 2: Add all files to temp index
     run_git_with_index(&tmp_path, &["add", "--all"], repo_root).await?;
 
-    // Step 3: Write tree from temp index
     let tree_id = run_git_with_index(&tmp_path, &["write-tree"], repo_root).await?;
 
-    // Step 4: Create commit-tree (orphan if no HEAD)
     let parent_id = if has_head {
         Some(run_git(&["rev-parse", "HEAD"], repo_root).await?)
     } else {

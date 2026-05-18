@@ -18,10 +18,6 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .map_err(Into::into)
 }
 
-// ---------------------------------------------------------------------------
-// Search result + provider abstraction
-// ---------------------------------------------------------------------------
-
 /// A single search result from any provider.
 pub struct SearchResult {
     pub title: String,
@@ -78,10 +74,6 @@ pub fn resolve_provider_id(config: &WebConfig) -> &str {
 
     "duckduckgo"
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Fetch a URL and return its text content. HTML is stripped to plain text.
 ///

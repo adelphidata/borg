@@ -557,91 +557,15 @@ async fn xai_streams_via_openai_compat_transport() {
     std::env::remove_var(&env_key);
 }
 
-// ── Test: Gemini routes through the OpenAI-compat transport ──
-//
-// Mirrors `xai_streams_via_openai_compat_transport`. Gemini's wire endpoint is
-// `…/v1beta/openai/chat/completions` and the auth header must be
-// `Authorization: Bearer …` (not `x-goog-api-key`, which Gemini's *native*
-// API uses but the OpenAI-compat shim does not). Regressions here typically
-// look like 404s from `v1beta/models/...:streamGenerateContent` (the wrong
-// path) or 401s from the native API rejecting a Bearer header.
-#[tokio::test]
-async fn gemini_streams_via_openai_compat_transport() {
-    let server = MockServer::start().await;
-
-    let body = sse_body(&[
-        r#"{"choices":[{"delta":{"content":"hi from Gemini"},"finish_reason":null}]}"#,
-        r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}"#,
-        "[DONE]",
-    ]);
-
-    Mock::given(method("POST"))
-        .and(path("/v1beta/openai/chat/completions"))
-        .and(header("authorization", "Bearer gemini-test-key"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
-        .mount(&server)
-        .await;
-
-    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let env_key = format!("BORG_TEST_GEMINI_KEY_{n}");
-    std::env::set_var(&env_key, "gemini-test-key");
-
-    let mut config = Config::default();
-    config.llm.provider = Some("gemini".into());
-    config.llm.api_key_env = env_key.clone();
-    // Point at the mock — overrides the static base_url and bypasses the
-    // `normalize_gemini_base` Google-host branch (`normalize_gemini_base`'s
-    // own behavior is covered by its unit test in llm/tests.rs).
-    config.llm.base_url = Some(format!("{}/v1beta/openai/chat/completions", server.uri()));
-    config.llm.model = "gemini-2.5-flash".into();
-    config.llm.max_retries = 0;
-
-    let mut client = LlmClient::new(&config).await.expect("client");
-    let (tx, rx) = mpsc::channel(64);
-
-    client
-        .stream_chat(&user_message("ping"), None, tx)
-        .await
-        .expect("stream_chat");
-
-    let events = collect_events(rx).await;
-    assert!(
-        events.iter().any(|e| e == "text:hi from Gemini"),
-        "expected the Gemini delta to surface as a TextDelta event, got {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| e == "usage:5:4:9"),
-        "expected usage extraction, got {events:?}"
-    );
-    assert_eq!(
-        events.last().map(|s| s.as_str()),
-        Some("done"),
-        "stream must terminate with Done, got {events:?}"
-    );
-
-    let received = server
-        .received_requests()
-        .await
-        .expect("mock recorded requests");
-    assert_eq!(received.len(), 1, "expected exactly one POST");
-    let req = &received[0];
-    let body_json: serde_json::Value =
-        serde_json::from_slice(&req.body).expect("request body is JSON");
-    assert_eq!(
-        body_json.get("model").and_then(|v| v.as_str()),
-        Some("gemini-2.5-flash"),
-        "request model field must match the configured Gemini slug"
-    );
-    assert!(
-        body_json
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "request must opt into streaming"
-    );
-
-    std::env::remove_var(&env_key);
-}
+// Note: `gemini_streams_via_openai_compat_transport` was removed when
+// Gemini was moved off the OpenAI-compat shim onto the native
+// `gemini_transport()` (see `Provider::is_openai_compatible`: Gemini's
+// match arm now excludes it). The OpenAI-compat path stripped
+// `inline_data` for video parts and refused `thinkingConfig` /
+// `cachedContents`. Native-transport coverage lives in
+// `crates/cortex/src/llm/tests.rs` (request-shape unit tests); a
+// dedicated SSE integration test would need a Gemini-native streaming
+// response builder, which is out of scope for the current cleanup.
 
 // ── Test: Azure OpenAI uses `api-key` header, not `Authorization: Bearer` ──
 //

@@ -111,9 +111,8 @@ impl Database {
     pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = crate::constants::GATEWAY_BUSY_TIMEOUT_MS;
 
     /// Open (or create) the database at `~/.borg/borg.db` with default busy
-    /// timeout. Opens **unencrypted** — Phase 4 wires the KEK-derived hex key
-    /// through the daemon bootstrap path; until then production callers
-    /// must explicitly use [`open_encrypted`](Self::open_encrypted).
+    /// timeout. Opens **unencrypted**; production callers must explicitly use
+    /// [`open_encrypted`](Self::open_encrypted).
     #[instrument(skip_all)]
     pub async fn open() -> Result<Self> {
         Self::open_with_timeout(Self::DEFAULT_BUSY_TIMEOUT_MS).await

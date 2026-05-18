@@ -6,10 +6,8 @@
 //! that the evolution / vitals / bond replays verify against. A successful
 //! `UPDATE` or `DELETE` would silently break tamper detection.
 //!
-//! Pre-port this guard lived inside the SQLite parser; Phase 5 of the
-//! rusqlite→Turso port keeps the same `CREATE TRIGGER … BEFORE UPDATE …
-//! SELECT RAISE(ABORT, …)` shape. A spike confirmed Turso 0.6 fires
-//! `RAISE(ABORT, ...)` without any flag — this test pins that behavior.
+//! Turso 0.6 fires `RAISE(ABORT, ...)` on `CREATE TRIGGER … BEFORE UPDATE …
+//! SELECT RAISE(ABORT, …)` without any flag — this test pins that behavior.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

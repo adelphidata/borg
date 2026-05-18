@@ -132,7 +132,8 @@ impl SessionExecutor for StubExecutor {
     }
 }
 
-/// Regression guard for `issues/empty-state-heartbeat-poke-yields-zero-*.md`.
+/// Regression guard: when the heartbeat agent emits a `UserInputRequest`,
+/// the bus MUST see a terminal event within budget.
 ///
 /// Pre-fix: when the heartbeat agent emitted a `UserInputRequest`, the wire
 /// proto event was silently dropped by `convert::from_proto`, the executor

@@ -8,5 +8,4 @@ crate::dedup_wrapper!(
 
 // First-seen / repeat-seen / LRU eviction is exercised on
 // `BoundedDedup<K>` in `message_processing::dedup`. The macro substitution
-// here is `update_id: i64 => update_id` — a passthrough — so re-testing
-// the same invariants per channel would be near-duplicate fluff per CLAUDE.md.
+// here is `update_id: i64 => update_id` — a passthrough.

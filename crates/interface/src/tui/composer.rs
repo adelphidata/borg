@@ -454,8 +454,6 @@ impl<'a> Composer<'a> {
         }
     }
 
-    // ----- Reverse-incremental history search -----
-
     fn begin_history_search(&mut self) {
         let original_draft = self.text();
         let match_index = self.history.newest_index();
@@ -899,8 +897,6 @@ mod tests {
         c.handle_paste(large_text);
         assert_eq!(c.text(), large_text);
     }
-
-    // -------------- Reverse-incremental history search --------------
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

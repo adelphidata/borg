@@ -109,8 +109,6 @@ impl KekStore for MemoryKekStore {
     }
 }
 
-// ── FileKekStore ─────────────────────────────────────────────────────────
-//
 // Passphrase-encrypted file backend for headless servers. The whole secret
 // map is encrypted as a single ChaCha20Poly1305 ciphertext keyed by
 // HKDF-SHA256(passphrase, salt). Salt is per-file (random at first put);

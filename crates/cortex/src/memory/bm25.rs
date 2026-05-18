@@ -1,6 +1,5 @@
 //! BM25 scoring computed in Rust over a candidate set returned by an FTS
-//! MATCH. Turso's `USING fts` index method (Phase 5 migration) replaced the
-//! SQLite FTS5 virtual table; the new method doesn't expose a SQL-callable
+//! MATCH. Turso's `USING fts` index method doesn't expose a SQL-callable
 //! `bm25()`, so ranking moves to the application layer.
 //!
 //! The corpus statistics (`avgdl`, `doc_freq`) are derived from the

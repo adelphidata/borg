@@ -104,45 +104,31 @@ fn air_gap_refuses_byo_unless_marked_local() {
 }
 
 #[test]
-fn check_builtin_air_gap_refuses_public_cloud() {
+fn check_builtin_air_gap_refuses_public_cloud_providers() {
+    // Every PublicCloud built-in must be refused when outbound is disallowed.
+    // A regression that flipped any of these to BYOEndpoint or Local would
+    // let an air-gapped deployment silently dial out (e.g. `*.openai.azure.com`,
+    // Vertex endpoints, OpenAI directly).
     use crate::llm::provider::Provider;
-    let err = ProviderRegistry::check_builtin_air_gap(Provider::OpenAi, false).unwrap_err();
-    match err {
-        ResolveError::AirGapPolicyViolation { id, category } => {
-            assert_eq!(id, "openai");
-            assert_eq!(category, ProviderCategory::PublicCloud);
+    for (provider, expected_id) in [
+        (Provider::OpenAi, "openai"),
+        (Provider::AzureOpenAi, "azure-openai"),
+        (Provider::VertexAi, "vertex-ai"),
+    ] {
+        let err = ProviderRegistry::check_builtin_air_gap(provider, false)
+            .err()
+            .unwrap_or_else(|| panic!("{expected_id}: expected refusal, got Ok"));
+        match err {
+            ResolveError::AirGapPolicyViolation { id, category } => {
+                assert_eq!(id, expected_id, "wrong id for {provider:?}");
+                assert_eq!(
+                    category,
+                    ProviderCategory::PublicCloud,
+                    "{provider:?} must be classified PublicCloud"
+                );
+            }
+            other => panic!("{expected_id}: expected AirGapPolicyViolation, got {other:?}"),
         }
-        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
-    }
-}
-
-#[test]
-fn check_builtin_air_gap_refuses_azure_openai() {
-    // Azure must be classified PublicCloud — same enterprise rationale as
-    // Bedrock and OpenAI. A regression that flipped this to BYOEndpoint or
-    // Local would let an air-gapped deployment silently dial out to
-    // `*.openai.azure.com`.
-    use crate::llm::provider::Provider;
-    let err = ProviderRegistry::check_builtin_air_gap(Provider::AzureOpenAi, false).unwrap_err();
-    match err {
-        ResolveError::AirGapPolicyViolation { id, category } => {
-            assert_eq!(id, "azure-openai");
-            assert_eq!(category, ProviderCategory::PublicCloud);
-        }
-        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
-    }
-}
-
-#[test]
-fn check_builtin_air_gap_refuses_vertex_ai() {
-    use crate::llm::provider::Provider;
-    let err = ProviderRegistry::check_builtin_air_gap(Provider::VertexAi, false).unwrap_err();
-    match err {
-        ResolveError::AirGapPolicyViolation { id, category } => {
-            assert_eq!(id, "vertex-ai");
-            assert_eq!(category, ProviderCategory::PublicCloud);
-        }
-        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
     }
 }
 

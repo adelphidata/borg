@@ -1119,11 +1119,12 @@ mod tests {
 
     #[test]
     fn chunking_integration() {
-        let long_text: String = "a".repeat(8500);
-        let chunks = chunker::chunk_text(&long_text, 4000);
+        const CHUNK: usize = crate::constants::DEFAULT_MESSAGE_CHUNK_SIZE;
+        let long_text: String = "a".repeat(CHUNK * 2 + 500);
+        let chunks = chunker::chunk_text(&long_text, CHUNK);
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].len(), 4000);
-        assert_eq!(chunks[1].len(), 4000);
+        assert_eq!(chunks[0].len(), CHUNK);
+        assert_eq!(chunks[1].len(), CHUNK);
         assert_eq!(chunks[2].len(), 500);
     }
 }

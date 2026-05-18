@@ -43,7 +43,7 @@ pub async fn compute_preference_learning_count(db: &Database) -> u32 {
         .unwrap_or(0)
 }
 
-// PHASE 9 TODO: bond::metrics tests disabled pending async DB test harness;
+// TODO: needs async DB harness
 // they relied on `rusqlite::params!` in direct SQL inserts plus sync helpers.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {

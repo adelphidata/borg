@@ -183,7 +183,7 @@ impl PluginsPopup {
         // operator can correlate an empty WASM section with a real error
         // rather than "nothing installed".
         match crate::async_bridge::block_on(async {
-            let db = cortex::db::Database::open().await?;
+            let db = cortex::db::Database::open_readonly().await?;
             db.list_wasm_plugins().await
         }) {
             Ok(rows) => {

@@ -46,8 +46,6 @@ impl PluginDef {
     }
 }
 
-// ── Embedded templates via include_str! ──
-
 // WhatsApp
 const WHATSAPP_CHANNEL_TOML: &str = include_str!("../templates/messaging/whatsapp/channel.toml");
 const WHATSAPP_PARSE_INBOUND: &str =
@@ -68,8 +66,6 @@ const SMS_CHANNEL_TOML: &str = include_str!("../templates/messaging/sms/channel.
 const SMS_PARSE_INBOUND: &str = include_str!("../templates/messaging/sms/parse_inbound.py");
 const SMS_SEND_OUTBOUND: &str = include_str!("../templates/messaging/sms/send_outbound.py");
 const SMS_VERIFY: &str = include_str!("../templates/messaging/sms/verify.py");
-
-// ── Catalog entries ──
 
 /// Complete catalog of available channel plugins, embedded at compile time.
 pub static CATALOG: &[PluginDef] = &[

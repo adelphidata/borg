@@ -297,12 +297,10 @@ mod tests {
 
     #[test]
     fn borg_home_takes_precedence_over_borg_data_dir() {
-        // Regression guard for the user-observable behavior change introduced
-        // when `Config::data_dir()` was unified onto `resolve_borg_home_*`:
-        // previously only `BORG_DATA_DIR` was honored. New rule: `BORG_HOME`
-        // wins. If this ordering reverts, processes started by `borgd --listen`
-        // (which sets `BORG_HOME` via clap-env) would silently fall through to
-        // `BORG_DATA_DIR` from a parent shell, splitting state across two dirs.
+        // `BORG_HOME` must win over `BORG_DATA_DIR`. If this ordering reverts,
+        // processes started by `borgd --listen` (which sets `BORG_HOME` via
+        // clap-env) would silently fall through to `BORG_DATA_DIR` from a
+        // parent shell, splitting state across two dirs.
         let home_env = tempfile::tempdir().unwrap();
         let data_env = tempfile::tempdir().unwrap();
         assert_ne!(home_env.path(), data_env.path());
