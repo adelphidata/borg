@@ -341,8 +341,16 @@ struct AgentCommon {
 }
 
 /// Build the shared initialization state used by both `Agent::new` and `Agent::new_sub_agent`.
+///
+/// Credential resolution is deliberately deferred to first-turn
+/// `make_llm_client_from_config`. Validating at session-open made the TUI
+/// unreachable when no API key was configured (Session.Open fails →
+/// `/settings` lives inside the TUI → catch-22). The per-turn construction
+/// path bubbles missing-credential errors via `?` up to `run_agent_loop`,
+/// where `AgentBackend::run_turn` (in `borgd::session::backend`) catches
+/// them and emits an `AgentEvent::Error(chained)` that the TUI renders
+/// inline — same channel as any other turn-time failure.
 async fn build_common(config: &Config) -> Result<AgentCommon> {
-    let _ = LlmClient::new(config).await?;
     let policy = config.policy.clone();
     let session = Session::new();
     let db = match Database::open().await {
@@ -3920,6 +3928,62 @@ mod tests {
                  Approved mutators: {approved_mutators:?}"
             );
         }
+    }
+
+    // ── Credential resolution must be deferred to first turn ──
+    //
+    // The TUI's `/settings` popup is the user's way to enter an API key.
+    // It lives inside the TUI, so the TUI must boot successfully even when
+    // no provider/key is configured. If `Agent::new` regresses to a
+    // preflight that fails on missing credentials, `Session.Open` errors,
+    // the TUI never paints, and users hit a catch-22 (the error tells them
+    // to use `/settings`, but they can't reach it). See the comment on
+    // `build_common`.
+
+    #[tokio::test]
+    async fn agent_new_succeeds_without_provider_configured() {
+        // Real failure mode: a regression that re-introduces an LlmClient
+        // preflight inside `build_common` would make `Agent::new` return
+        // Err here. The credential check must move to first-turn
+        // `make_llm_client_from_config`, not block session construction.
+        let config = Config::default();
+        assert!(
+            config.llm.provider.is_none(),
+            "test premise: default config must have no provider so the \
+             credential resolver would have nothing to find",
+        );
+
+        let agent = Agent::new(config, BorgMetrics::default()).await;
+        assert!(
+            agent.is_ok(),
+            "Agent::new must succeed without credentials so the TUI \
+             can open and surface `/settings`. Got: {:?}",
+            agent.err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn make_llm_client_still_rejects_missing_provider_on_turn() {
+        // Symmetric guard: deferring the check is only safe because the
+        // per-turn LLM-client construction still rejects missing
+        // credentials. If this stops failing, the deferred path would
+        // silently let a keyless agent reach the LLM transport and explode
+        // with a less-actionable error.
+        let agent = Agent::new(Config::default(), BorgMetrics::default())
+            .await
+            .expect("Agent::new must succeed without credentials");
+
+        let result = agent.make_llm_client_from_config(&agent.config).await;
+        let err = match result {
+            Ok(_) => panic!("turn-time LLM construction must reject missing provider"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("No LLM provider selected") || msg.contains("No API key found"),
+            "credential error must remain user-actionable so the TUI can \
+             render a `/settings` hint; got: {msg}",
+        );
     }
 }
 
