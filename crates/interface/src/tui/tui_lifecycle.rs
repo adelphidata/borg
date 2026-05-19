@@ -292,6 +292,19 @@ impl Tui {
         self.pending_history_lines.extend(lines);
     }
 
+    /// Purge terminal scrollback + visible screen and snap the inline viewport
+    /// back to row 0. Used by `/clear` and `Ctrl+L`: in inline-viewport mode
+    /// the terminal — not the app — owns finalized history, so clearing
+    /// `app.cells` alone leaves the prior transcript visible in scrollback.
+    pub fn clear_terminal_scrollback(&mut self) -> Result<()> {
+        self.pending_history_lines.clear();
+        self.terminal.clear_scrollback_and_visible_screen_ansi()?;
+        let area = self.terminal.viewport_area;
+        self.terminal
+            .set_viewport_area(Rect::new(0, 0, area.width, area.height));
+        Ok(())
+    }
+
     /// Enter alternate screen and expand the viewport to full terminal size,
     /// saving the current inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {

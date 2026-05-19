@@ -381,6 +381,9 @@ pub enum AppAction {
     /// the DB-level copy, and then dispatches a `LoadSession` for the fork.
     ForkSession,
     ClearHistory,
+    /// Purge terminal scrollback + visible screen without touching daemon
+    /// conversation state. Used by Ctrl+L.
+    ClearTranscript,
     UndoLastTurn,
     /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
     RewindTo {
@@ -2684,6 +2687,63 @@ mod tests {
         assert!(matches!(action, AppAction::Continue));
         let sys = last_system_text(&app).unwrap();
         assert!(sys.contains("already pending"));
+    }
+
+    // --- /clear and Ctrl+L clear pre-flush state so terminal scrollback
+    // ---  purge isn't re-polluted by stale `pending_scrollback` lines on the
+    // ---  next draw. Regression guard: a prior implementation cleared `cells`
+    // ---  + `queued_messages` only, leaving `pending_scrollback` and
+    // ---  `banner_emitted` set, so the freshly-purged scrollback was
+    // ---  immediately repainted with the branded header + stale tail.
+    #[test]
+    fn slash_clear_drains_pending_scrollback_and_banner_state() {
+        let mut app = make_app();
+        app.pending_scrollback
+            .push(ratatui::text::Line::from("stale-history"));
+        app.banner_emitted = true;
+        app.cells_emitted = 5;
+        app.queued_messages.push_back(qm("queued"));
+        // Also seed a cell so we can verify cells get cleared too.
+        app.push_system_message("about to be cleared".to_string());
+
+        let action = app
+            .try_handle_command("/clear")
+            .expect("/clear is handled")
+            .expect("no error");
+        assert!(matches!(action, AppAction::ClearHistory));
+
+        assert!(app.cells.is_empty(), "cells not drained by /clear");
+        assert_eq!(app.cells_emitted, 0, "cells_emitted not reset by /clear");
+        assert!(
+            app.pending_scrollback.is_empty(),
+            "pending_scrollback must be drained — otherwise the next \
+             draw repaints stale history into the freshly-purged terminal scrollback"
+        );
+        assert!(
+            !app.banner_emitted,
+            "banner_emitted must reset so the next session re-emits the header \
+             into the now-empty scrollback"
+        );
+        assert!(
+            app.queued_messages.is_empty(),
+            "queued_messages not drained by /clear"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_emits_clear_transcript_action() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        app.pending_scrollback
+            .push(ratatui::text::Line::from("stale"));
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let action = app.handle_key(key).expect("ctrl+l handled");
+        // The event-loop handler for `ClearTranscript` calls
+        // `tui.clear_terminal_scrollback()` — without this variant Ctrl+L
+        // would silently leave the terminal's native scrollback intact,
+        // which is the same bug `/clear` had.
+        assert!(matches!(action, AppAction::ClearTranscript));
+        assert!(app.pending_scrollback.is_empty());
     }
 
     // --- Popup vs Streaming: paste/key must never leak to composer ---

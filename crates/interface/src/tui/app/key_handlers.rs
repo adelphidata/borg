@@ -632,7 +632,7 @@ impl<'a> super::App<'a> {
             self.pending_scrollback.clear();
             self.banner_emitted = false;
             self.toast_info("Transcript cleared");
-            return Ok(AppAction::Continue);
+            return Ok(AppAction::ClearTranscript);
         }
 
         // Ctrl+T — open full-screen transcript pager (scrollable + searchable)

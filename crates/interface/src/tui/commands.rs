@@ -97,6 +97,9 @@ impl App<'_> {
             "/compact" => return Some(Ok(AppAction::CompactHistory)),
             "/clear" => {
                 self.cells.clear();
+                self.cells_emitted = 0;
+                self.pending_scrollback.clear();
+                self.banner_emitted = false;
                 self.queued_messages.clear();
                 return Some(Ok(AppAction::ClearHistory));
             }

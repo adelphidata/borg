@@ -964,10 +964,18 @@ async fn run_event_loop(
             },
             AppAction::ClearHistory => match client.clear_history(session_id).await {
                 Ok(()) => {
+                    if let Err(e) = tui.clear_terminal_scrollback() {
+                        tracing::warn!(error = %e, "clear terminal scrollback failed");
+                    }
                     app.push_system_message("Conversation cleared.".to_string());
                 }
                 Err(e) => app.push_system_message(format!("Clear failed: {e}")),
             },
+            AppAction::ClearTranscript => {
+                if let Err(e) = tui.clear_terminal_scrollback() {
+                    tracing::warn!(error = %e, "clear terminal scrollback failed");
+                }
+            }
             AppAction::UndoLastTurn => match client.undo(session_id).await {
                 Ok(r) => {
                     let removed = r.removed as usize;
