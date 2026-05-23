@@ -531,12 +531,19 @@ impl GatewayServer {
                             .send_typing(Some(&recipient), group_id.as_deref())
                             .await;
 
+                        // Bot mention identifier for group activation. Signal's
+                        // resolve_mentions renders the bot's mention as
+                        // `@<account>` (phone number) or `@<uuid>` — pass the
+                        // phone form so `check_activation` can require an
+                        // explicit @bot in group chats when
+                        // `gateway.group_activation = Mention` (the default).
+                        let bot_id = format!("@{}", client.account());
                         match handler::invoke_agent(
                             "signal",
                             &inbound,
                             &config,
                             Some(&health),
-                            None,
+                            Some(&bot_id),
                         )
                         .await
                         {

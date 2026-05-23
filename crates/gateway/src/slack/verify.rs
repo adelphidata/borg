@@ -140,6 +140,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_signing_secret_rejected() {
+        // Regression: a misconfigured empty signing secret used to let
+        // verification proceed under HMAC("", …) — so a caller who signed
+        // under the same empty key would successfully authenticate.
+        let body = r#"{"type":"event_callback"}"#;
+        let timestamp = &chrono::Utc::now().timestamp().to_string();
+        let sig = compute_signature("", timestamp, body);
+        let headers = make_headers(timestamp, &sig);
+        let err = verify_slack_signature(&headers, body, "").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("empty"));
+    }
+
+    #[test]
     fn non_numeric_timestamp_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(

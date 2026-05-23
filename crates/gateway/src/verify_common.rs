@@ -34,6 +34,12 @@ pub fn hmac_sha256_verify(
     expected: &[u8],
     label: &'static str,
 ) -> Result<()> {
+    // Reject empty signing secrets up-front. HMAC over an empty key is
+    // mathematically well-defined, so a request signed with `""` would
+    // verify against a misconfigured (empty) secret — a silent auth bypass.
+    if key.is_empty() {
+        bail!("{label} signing secret is empty — refusing to verify");
+    }
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
     mac.update(data);
@@ -78,6 +84,13 @@ mod tests {
         let headers = HeaderMap::new();
         let err = required_header(&headers, "x-test", "X-Test").unwrap_err();
         assert!(err.to_string().contains("Missing X-Test header"));
+    }
+
+    #[test]
+    fn hmac_rejects_empty_key() {
+        // Regression: empty secret used to verify against any signature.
+        let err = hmac_sha256_verify(b"", b"data", b"sig", "Test").unwrap_err();
+        assert!(err.to_string().contains("empty"));
     }
 
     #[test]

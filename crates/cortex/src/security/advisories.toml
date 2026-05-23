@@ -1,0 +1,25 @@
+# Borg supply-chain advisory list.
+#
+# Curated subset of cargo dependencies known to be yanked, compromised, or
+# carrying an unfixed CVE that affects Borg. Refreshed manually; not a
+# replacement for `cargo audit` in CI.
+#
+# To add an entry:
+#   [[advisories]]
+#   crate    = "<crate-name>"
+#   versions = "<exact version OR range, e.g. '=1.2.3' or '<1.2.4'>"
+#   id       = "<advisory id — e.g. RUSTSEC-XXXX-YYYY, CVE-XXXX-YYYYY, BORG-XXXX-NNN>"
+#   severity = "low" | "medium" | "high" | "critical"
+#   summary  = "<one-line description shown in `borg doctor`>"
+#   fix      = "<one-line remediation, usually a Cargo command>"
+#
+# Severity → diagnostic:
+#   low/medium → warning
+#   high/critical → failure
+#
+# `versions` syntax: exact (`=1.2.3`), range (`<1.2.4`, `>=1.0, <1.3`), or
+# wildcard (`1.2.*`). Matched per-row against every package in the embedded
+# Cargo.lock. A package matching multiple advisories triggers one diagnostic
+# per match.
+
+advisories = []

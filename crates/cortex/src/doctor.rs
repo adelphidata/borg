@@ -192,7 +192,7 @@ pub struct DiagnosticRunner {
     step: usize,
 }
 
-const STEP_COUNT: usize = 16;
+const STEP_COUNT: usize = 17;
 
 /// Max acceptable gap between memory entries and indexed embeddings before
 /// the doctor escalates to a warning. Below this threshold the gap is the
@@ -223,8 +223,9 @@ impl DiagnosticRunner {
             12 => Some("Browser"),
             13 => Some("Agents"),
             14 => Some("Security"),
-            15 if config.security.host_audit => Some("Host Audit"),
-            15 => None,
+            15 => Some("Supply Chain"),
+            16 if config.security.host_audit => Some("Host Audit"),
+            16 => None,
             _ => None,
         }
     }
@@ -300,6 +301,10 @@ impl DiagnosticRunner {
                 "Security"
             }
             15 => {
+                check_supply_chain(&mut checks);
+                "Supply Chain"
+            }
+            16 => {
                 if config.security.host_audit {
                     crate::host_audit::run_host_security_checks(&mut checks);
                     self.step += 1;
@@ -387,6 +392,37 @@ fn check_subprocesses(
     }
 }
 
+/// Compare each shipped dependency against the bundled advisory list. A
+/// single check row per advisory hit, so operators can squelch noisy entries
+/// one at a time. No I/O — both the lockfile and the advisory list are
+/// `include_str!`-embedded at compile time.
+fn check_supply_chain(checks: &mut Vec<DiagnosticCheck>) {
+    let hits = crate::security::advisory::scan_embedded();
+    if hits.is_empty() {
+        checks.push(DiagnosticCheck::pass(
+            "Supply Chain",
+            "Dependency advisories",
+        ));
+        return;
+    }
+    for hit in hits {
+        let name = format!(
+            "{} {} ({})",
+            hit.advisory.crate_name, hit.installed_version, hit.advisory.id
+        );
+        let msg = hit.advisory.summary.clone();
+        let mut check = if hit.advisory.severity.is_failing() {
+            DiagnosticCheck::fail("Supply Chain", name, msg)
+        } else {
+            DiagnosticCheck::warn("Supply Chain", name, msg)
+        };
+        check.user_hint = Some(hit.advisory.fix.clone());
+        check.remediation_kind = RemediationKind::Manual;
+        check.remediation_key = Some("supply_chain.advisory");
+        checks.push(check);
+    }
+}
+
 /// Render up to 3 offenders by descending age; collapse the rest into
 /// "… and N more" so a runaway registry doesn't produce a wall-of-text
 /// warning in `borg doctor` or persistent warnings.
@@ -465,6 +501,7 @@ fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                 "Provider",
                 format!("Provider: {provider}"),
             ));
+            check_model_deprecation(provider, &config.llm.model, checks);
         }
         Err(e) => {
             checks.push(DiagnosticCheck::fail(
@@ -489,6 +526,28 @@ fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             "Claude CLI available (alternative provider)",
         ));
     }
+}
+
+/// If the active `(provider, model)` is in the deprecation table, emit a
+/// warning that names the retirement date and recommended replacement so
+/// operators can migrate before the upstream provider starts rejecting
+/// requests.
+fn check_model_deprecation(provider: Provider, model: &str, checks: &mut Vec<DiagnosticCheck>) {
+    let Some(entry) = crate::llm::deprecations::lookup(provider, model) else {
+        return;
+    };
+    let msg = format!(
+        "{} retires on {} — switch to `{}` before that date",
+        entry.model, entry.retires_on, entry.replacement,
+    );
+    let mut check = DiagnosticCheck::warn("Provider", "Model retirement", msg);
+    check.user_hint = Some(format!(
+        "Set `llm.model` to `{}`. Provider advisory: {}",
+        entry.replacement, entry.advisory_url
+    ));
+    check.remediation_kind = RemediationKind::Manual;
+    check.remediation_key = Some("provider.model_retirement");
+    checks.push(check);
 }
 
 fn check_secrets(config: &Config, checks: &mut Vec<DiagnosticCheck>) {

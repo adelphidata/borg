@@ -28,7 +28,8 @@ use protocols::admin::{
     CredentialEntry, CredentialList, DaemonStatus, DoctorSquelchClearRequest,
     DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty, ExportSessionRequest,
     ExportSessionResponse, GetScheduledTaskRunsRequest, GoalDetail, GoalEvent as PbGoalEvent,
-    GoalMutation, GoalRef, HealReport, HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest,
+    GoalMutation, GoalRef, HandoffFailRequest, HandoffRequest as AdminHandoffRequest,
+    HandoffStatusReply, HealReport, HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest,
     IssueClientTokenResponse, ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal,
     MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
     PluginInstallRequest, PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest,
@@ -925,6 +926,54 @@ impl DaemonClient {
             })
             .await
             .context("Admin.ListPairingRequests failed")?
+            .into_inner())
+    }
+
+    /// Mark `session_id` as pending handoff to `target_platform`. The
+    /// destination gateway picks the row up on its next claim sweep.
+    pub async fn request_handoff(&mut self, session_id: &str, target_platform: &str) -> Result<()> {
+        self.admin
+            .request_handoff(AdminHandoffRequest {
+                session_id: session_id.to_string(),
+                target_platform: target_platform.to_string(),
+            })
+            .await
+            .context("Admin.RequestHandoff failed")?;
+        Ok(())
+    }
+
+    /// Mark a running handoff as completed.
+    pub async fn complete_handoff(&mut self, session_id: &str) -> Result<()> {
+        self.admin
+            .complete_handoff(SessionRef {
+                id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.CompleteHandoff failed")?;
+        Ok(())
+    }
+
+    /// Mark a pending/running handoff as failed with a human-readable reason.
+    pub async fn fail_handoff(&mut self, session_id: &str, reason: &str) -> Result<()> {
+        self.admin
+            .fail_handoff(HandoffFailRequest {
+                session_id: session_id.to_string(),
+                reason: reason.to_string(),
+            })
+            .await
+            .context("Admin.FailHandoff failed")?;
+        Ok(())
+    }
+
+    /// Fetch the current handoff status for a session.
+    pub async fn get_handoff_status(&mut self, session_id: &str) -> Result<HandoffStatusReply> {
+        Ok(self
+            .admin
+            .get_handoff_status(SessionRef {
+                id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.GetHandoffStatus failed")?
             .into_inner())
     }
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use libsql::params;
 
+use super::device_pairing::hash_pairing_code;
 use super::models::{ApprovedSenderRow, PairingRequestRow};
 use super::Database;
 
@@ -18,13 +19,13 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let expires_at = now + ttl_secs;
-        // Lowercase on insert so the column is the canonical form regardless
-        // of how the caller assembled it.
-        let code = code.to_lowercase();
+        // Hash before insert — DB must never contain the plaintext code.
+        // Lowercase first so lookups normalize identically.
+        let code_hash = hash_pairing_code(&code.to_lowercase());
         self.conn.execute(
-            "INSERT INTO pairing_requests (id, channel_name, sender_id, code, status, display_name, created_at, expires_at)
+            "INSERT INTO pairing_requests (id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
-            params!(id.clone(), channel_name, sender_id, code, display_name.map(std::string::ToString::to_string), now, expires_at),
+            params!(id.clone(), channel_name, sender_id, code_hash, display_name.map(std::string::ToString::to_string), now, expires_at),
         ).await?;
         Ok(id)
     }
@@ -59,12 +60,12 @@ impl Database {
         code: &str,
     ) -> Result<Option<PairingRequestRow>> {
         let now = chrono::Utc::now().timestamp();
-        let code = code.to_lowercase();
+        let code_hash = hash_pairing_code(&code.to_lowercase());
         let mut rows = self.conn.query(
-            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+            "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
-             WHERE channel_name = ?1 AND code = ?2 AND status = 'pending' AND expires_at > ?3",
-            params!(channel_name, code, now),
+             WHERE channel_name = ?1 AND code_hash = ?2 AND status = 'pending' AND expires_at > ?3",
+            params!(channel_name, code_hash, now),
         ).await?;
         match rows.next().await? {
             Some(row) => Ok(Some(Self::pairing_row_from_row(&row)?)),
@@ -79,7 +80,7 @@ impl Database {
     ) -> Result<Option<PairingRequestRow>> {
         let now = chrono::Utc::now().timestamp();
         let mut rows = self.conn.query(
-            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+            "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
              WHERE channel_name = ?1 AND sender_id = ?2 AND status = 'pending' AND expires_at > ?3
              ORDER BY created_at DESC LIMIT 1",
@@ -98,8 +99,9 @@ impl Database {
     ) -> Result<PairingRequestRow> {
         // Pairing codes are now lowercase BIP-39 phrases (e.g.
         // `tg/voyage-kitten-orbit-marble-cinder-pluto`); normalize to
-        // lowercase so the lookup matches whatever the user typed.
+        // lowercase before hashing so lookups match whatever the user typed.
         let code = code.to_lowercase();
+        let code_hash = hash_pairing_code(&code);
         let now = chrono::Utc::now().timestamp();
 
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
@@ -107,16 +109,16 @@ impl Database {
             // Find the pending request within the transaction
             let request = {
                 let mut rows = self.conn.query(
-                    "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+                    "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
                  FROM pairing_requests
-                 WHERE channel_name = ?1 AND code = ?2 AND status = 'pending' AND expires_at > ?3",
-                    params!(channel_name, code.clone(), now),
+                 WHERE channel_name = ?1 AND code_hash = ?2 AND status = 'pending' AND expires_at > ?3",
+                    params!(channel_name, code_hash.clone(), now),
                 ).await?;
                 match rows.next().await? {
                     Some(row) => Self::pairing_row_from_row(&row)?,
                     None => {
                         anyhow::bail!(
-                            "No pending pairing request found for channel '{channel_name}' with code '{code}'"
+                            "No pending pairing request found for channel '{channel_name}' with the supplied code"
                         );
                     }
                 }
@@ -160,6 +162,27 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Mark every pending pairing request for `(channel, sender)` as
+    /// `expired`. Used by the gateway when a sender re-asks for a code —
+    /// the old hashed row can no longer be re-displayed, so it's invalidated
+    /// before a fresh code is minted.
+    pub async fn expire_pending_for_sender(
+        &self,
+        channel_name: &str,
+        sender_id: &str,
+    ) -> Result<usize> {
+        let changes = self
+            .conn
+            .execute(
+                "UPDATE pairing_requests
+                    SET status = 'expired'
+                    WHERE channel_name = ?1 AND sender_id = ?2 AND status = 'pending'",
+                params!(channel_name, sender_id),
+            )
+            .await?;
+        Ok(changes as usize)
     }
 
     /// Remove expired pending pairing requests.
@@ -222,17 +245,16 @@ impl Database {
 
     /// Find a pending pairing request by code alone (across all channels).
     pub async fn find_pending_by_code(&self, code: &str) -> Result<Option<PairingRequestRow>> {
-        // Pairing codes are now lowercase BIP-39 phrases (e.g.
-        // `tg/voyage-kitten-orbit-marble-cinder-pluto`); normalize to
-        // lowercase so the lookup matches whatever the user typed.
-        let code = code.to_lowercase();
+        // Pairing codes are lowercase BIP-39 phrases; normalize and hash
+        // before lookup so the DB never sees the plaintext code.
+        let code_hash = hash_pairing_code(&code.to_lowercase());
         let now = chrono::Utc::now().timestamp();
         let mut rows = self.conn.query(
-            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+            "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
-             WHERE code = ?1 AND status = 'pending' AND expires_at > ?2
+             WHERE code_hash = ?1 AND status = 'pending' AND expires_at > ?2
              ORDER BY created_at DESC LIMIT 1",
-            params!(code, now),
+            params!(code_hash, now),
         ).await?;
         match rows.next().await? {
             Some(row) => Ok(Some(Self::pairing_row_from_row(&row)?)),
@@ -258,7 +280,7 @@ impl Database {
         now: i64,
     ) -> Result<Vec<PairingRequestRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+            "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
              WHERE channel_name = ?1 AND status = 'pending' AND expires_at > ?2
              ORDER BY created_at DESC",
@@ -273,7 +295,7 @@ impl Database {
 
     async fn list_pairings_all(&self, now: i64) -> Result<Vec<PairingRequestRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+            "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
              WHERE status = 'pending' AND expires_at > ?1
              ORDER BY created_at DESC",
@@ -352,10 +374,37 @@ mod tests {
         let req = found.unwrap();
         assert_eq!(req.channel_name, "telegram");
         assert_eq!(req.sender_id, "user1");
-        // Codes are stored lowercase (BIP-39 phrase format).
-        assert_eq!(req.code, "abc123");
+        // Codes are stored as SHA-256(lowercase plaintext) — never raw plaintext.
+        assert_eq!(req.code, hash_pairing_code("abc123"));
+        assert_ne!(req.code, "abc123");
         assert_eq!(req.status, "pending");
         assert_eq!(req.display_name.as_deref(), Some("Alice"));
+    }
+
+    /// Regression guard: the `pairing_requests.code_hash` column must never
+    /// contain the plaintext pairing code. Pre-fix the column held the raw
+    /// 6-word BIP-39 phrase, so a DB-read leak meant attacker-replayable codes.
+    #[tokio::test]
+    async fn pairing_requests_never_store_plaintext_code() {
+        let db = test_db().await;
+        let plaintext = "voyage-kitten-orbit-marble-cinder-pluto";
+        db.create_pairing_request("telegram", "alice", plaintext, None, 3600)
+            .await
+            .unwrap();
+        let mut rows = db
+            .conn
+            .query("SELECT code_hash FROM pairing_requests", ())
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("row inserted by create_pairing_request");
+        let stored: String = row.get(0).unwrap();
+        assert_ne!(stored, plaintext, "DB stored plaintext pairing code");
+        assert_eq!(stored, hash_pairing_code(plaintext));
+        assert_eq!(stored.len(), 64, "expected hex-encoded SHA-256");
     }
 
     #[tokio::test]
@@ -385,7 +434,7 @@ mod tests {
             .await
             .unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().code, "code1");
+        assert_eq!(found.unwrap().code, hash_pairing_code("code1"));
 
         // Different sender returns None
         let other = db

@@ -238,13 +238,18 @@ async fn check_pairing(
         });
     }
 
-    // Check for existing non-expired pending request (reuse code)
-    if let Some(existing) = db.find_pending_for_sender(channel_name, sender_id).await? {
-        let message = format_challenge(name, sender_id, &existing.code, ttl);
-        return Ok(AccessCheckResult::Challenge {
-            code: existing.code,
-            message,
-        });
+    // The DB stores only the SHA-256 hash of pairing codes, so we cannot
+    // recover the plaintext of an existing pending request to re-display it.
+    // Expire any stale pending request and mint a fresh code — the rate
+    // limit above already bounds how often this can happen, and a sender
+    // who re-asks usually didn't receive the first code anyway.
+    if db
+        .find_pending_for_sender(channel_name, sender_id)
+        .await?
+        .is_some()
+    {
+        db.expire_pending_for_sender(channel_name, sender_id)
+            .await?;
     }
 
     // Generate new pairing code and create request

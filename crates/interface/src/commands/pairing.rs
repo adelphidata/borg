@@ -59,16 +59,22 @@ pub(crate) fn run_pairing_list(channel: Option<&str>) -> Result<()> {
         println!("No pending pairing requests.");
         return Ok(());
     }
+    // `Code` column shows the SHA-256 hash truncated to a short prefix.
+    // The DB no longer holds plaintext codes, so this column is only useful
+    // as a stable identifier — operators identify pending requests by
+    // sender_id / channel, and approve by typing the plaintext code the
+    // sender presented.
     println!(
         "{:<12} {:<20} {:<10} {:<20}",
-        "Channel", "Sender ID", "Code", "Expires"
+        "Channel", "Sender ID", "Hash", "Expires"
     );
     println!("{}", "─".repeat(64));
     for r in &requests {
         let expires = format_ts(r.expires_at as i64, "%Y-%m-%d %H:%M UTC");
+        let hash_prefix = r.code.chars().take(8).collect::<String>();
         println!(
             "{:<12} {:<20} {:<10} {:<20}",
-            r.channel_name, r.sender_id, r.code, expires
+            r.channel_name, r.sender_id, hash_prefix, expires
         );
     }
     println!();
@@ -85,11 +91,14 @@ pub(crate) fn run_pairing_approve(code: &str) -> Result<()> {
         let channel_name = if let Some((channel, _)) = cortex::pairing::parse_prefixed_code(code) {
             channel.to_string()
         } else {
+            // `r.code` is the SHA-256 hash of the lowercased pairing code;
+            // hash the input the same way for the lookup.
+            let target_hash = cortex::db::hash_pairing_code(&code.to_lowercase());
             let resp = client.list_pairing_requests(None).await?;
             let row = resp
                 .requests
                 .into_iter()
-                .find(|r| r.code == code && r.status == "pending")
+                .find(|r| r.code == target_hash && r.status == "pending")
                 .ok_or_else(|| {
                     anyhow::anyhow!("No pending pairing request found for code '{code}'")
                 })?;

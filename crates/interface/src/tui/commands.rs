@@ -185,6 +185,13 @@ impl App<'_> {
             return Some(self.cmd_goal_dispatch(rest.trim()));
         }
 
+        if trimmed == "/handoff" {
+            return Some(self.cmd_handoff_show());
+        }
+        if let Some(rest) = trimmed.strip_prefix("/handoff ") {
+            return Some(self.cmd_handoff_request(rest.trim()));
+        }
+
         if trimmed == "/think" {
             return Some(self.cmd_think_show());
         }
@@ -431,41 +438,46 @@ impl App<'_> {
 
     fn cmd_pairing_approve(&mut self, code: &str) -> Result<AppAction> {
         let client = self.client.clone();
-        let result: std::result::Result<String, String> =
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let mut c = client.lock().await;
+        let result: std::result::Result<String, String> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
 
-                    // Extract channel from prefix, or fall back to cross-channel lookup
-                    let channel_name =
-                        if let Some((channel, _)) = cortex::pairing::parse_prefixed_code(code) {
-                            channel.to_string()
-                        } else {
-                            let list = c
-                                .list_pairing_requests(None)
-                                .await
-                                .map_err(|e| format!("Error looking up code: {e}"))?;
-                            match list.requests.iter().find(|r| {
-                                r.code.eq_ignore_ascii_case(code) && r.status == "pending"
-                            }) {
-                                Some(r) => r.channel_name.clone(),
-                                None => {
-                                    return Err(format!(
-                                        "No pending pairing request found for code '{}'",
-                                        code.to_uppercase()
-                                    ));
-                                }
+                // Extract channel from prefix, or fall back to cross-channel lookup
+                let channel_name =
+                    if let Some((channel, _)) = cortex::pairing::parse_prefixed_code(code) {
+                        channel.to_string()
+                    } else {
+                        let list = c
+                            .list_pairing_requests(None)
+                            .await
+                            .map_err(|e| format!("Error looking up code: {e}"))?;
+                        // `r.code` is the SHA-256 hash of the lowercased
+                        // pairing code. Hash the user input the same way
+                        // before comparing.
+                        let target_hash = cortex::db::hash_pairing_code(&code.to_lowercase());
+                        match list
+                            .requests
+                            .iter()
+                            .find(|r| r.code == target_hash && r.status == "pending")
+                        {
+                            Some(r) => r.channel_name.clone(),
+                            None => {
+                                return Err(format!(
+                                    "No pending pairing request found for code '{}'",
+                                    code.to_uppercase()
+                                ));
                             }
-                        };
+                        }
+                    };
 
-                    c.approve_pairing(&channel_name, code)
-                        .await
-                        .map_err(|e| format!("Failed to approve: {e}"))?;
+                c.approve_pairing(&channel_name, code)
+                    .await
+                    .map_err(|e| format!("Failed to approve: {e}"))?;
 
-                    let display = cortex::pairing::channel_display_name(&channel_name);
-                    Ok(format!("Approved: {code} on {display}"))
-                })
-            });
+                let display = cortex::pairing::channel_display_name(&channel_name);
+                Ok(format!("Approved: {code} on {display}"))
+            })
+        });
 
         match result {
             Ok(msg) => self.push_system_message(msg),
@@ -1077,6 +1089,61 @@ impl App<'_> {
         }
     }
 
+    /// `/handoff` — show the current session's handoff state.
+    fn cmd_handoff_show(&mut self) -> Result<AppAction> {
+        let report = match self.rpc_handoff_status() {
+            Ok(s) if s.state.is_empty() => {
+                "No handoff in progress for this session.\nUse `/handoff <platform>` to start one (e.g. `/handoff telegram`).".to_string()
+            }
+            Ok(s) => format_handoff_status(&s),
+            Err(e) => format!("/handoff: status lookup failed — {e}"),
+        };
+        self.push_system_message(report);
+        Ok(AppAction::Continue)
+    }
+
+    /// `/handoff <platform>` — mark this session as pending handoff to the
+    /// destination channel. The destination gateway claims the row on its
+    /// next sweep.
+    fn cmd_handoff_request(&mut self, args: &str) -> Result<AppAction> {
+        let platform = args.trim();
+        if platform.is_empty() {
+            self.push_system_message(
+                "/handoff: missing platform.\nUsage: /handoff <telegram|slack|discord|signal|imessage|...>".to_string(),
+            );
+            return Ok(AppAction::Continue);
+        }
+        let report = match self.rpc_request_handoff(platform) {
+            Ok(()) => format!(
+                "/handoff: pending → {platform}. The destination will pick it up on its next sweep."
+            ),
+            Err(e) => format!("/handoff: failed — {e}"),
+        };
+        self.push_system_message(report);
+        Ok(AppAction::Continue)
+    }
+
+    fn rpc_handoff_status(&self) -> Result<protocols::admin::HandoffStatusReply> {
+        let client = self.client.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.get_handoff_status("").await
+            })
+        })
+    }
+
+    fn rpc_request_handoff(&self, platform: &str) -> Result<()> {
+        let client = self.client.clone();
+        let platform = platform.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.request_handoff("", &platform).await
+            })
+        })
+    }
+
     fn rpc_clear_goal(&self) -> Result<()> {
         let client = self.client.clone();
         tokio::task::block_in_place(|| {
@@ -1112,6 +1179,27 @@ impl App<'_> {
             })
         })
     }
+}
+
+/// Render a `HandoffStatusReply` as a 3–5 line summary card body.
+fn format_handoff_status(reply: &protocols::admin::HandoffStatusReply) -> String {
+    let mut out = String::from("Handoff\n───────\n");
+    out.push_str(&format!("state:    {}\n", reply.state));
+    if !reply.target_platform.is_empty() {
+        out.push_str(&format!("target:   {}\n", reply.target_platform));
+    }
+    if reply.requested_at_unix > 0 {
+        out.push_str(&format!(
+            "requested: {}\n",
+            chrono::DateTime::from_timestamp(reply.requested_at_unix, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| reply.requested_at_unix.to_string())
+        ));
+    }
+    if !reply.error.is_empty() {
+        out.push_str(&format!("error:    {}\n", reply.error));
+    }
+    out
 }
 
 /// Render a [`protocols::admin::GoalDetail`] as a 5-7 line summary card body.

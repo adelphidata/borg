@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
-use super::blocked::is_blocked_path;
+use super::blocked::{is_blocked_path, is_control_plane_write_denied};
 use super::default_execution_context;
 use crate::tool_handlers::{optional_str_param, require_str_param};
 
@@ -90,6 +90,11 @@ pub fn handle_apply_patch_with_context(
             &config.security.allowed_paths,
         ) {
             return Ok(format!("Access denied: {raw_path} is in a blocked path"));
+        }
+        if is_control_plane_write_denied(&resolved) {
+            return Ok(format!(
+                "Access denied: {raw_path} is a Borg control-plane file"
+            ));
         }
     }
 
@@ -268,6 +273,11 @@ fn handle_apply_patch_via_text_bridge(
             &config.security.allowed_paths,
         ) {
             return Ok(format!("Access denied: {raw_path} is in a blocked path"));
+        }
+        if is_control_plane_write_denied(&resolved) {
+            return Ok(format!(
+                "Access denied: {raw_path} is a Borg control-plane file"
+            ));
         }
         let rel = resolved
             .strip_prefix(ctx.workspace_root())

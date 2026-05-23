@@ -398,7 +398,9 @@ pub struct PairingRequestRow {
     pub channel_name: String,
     /// Sender identifier requesting access.
     pub sender_id: String,
-    /// Pairing code the sender must present for approval.
+    /// Hex-encoded SHA-256 of the lowercased pairing code. Plaintext is
+    /// never persisted; admin surfaces should display sender_id / display_name
+    /// to identify pending pairings, not this hash.
     pub code: String,
     /// Request status (e.g. "pending", "approved", "expired").
     pub status: String,

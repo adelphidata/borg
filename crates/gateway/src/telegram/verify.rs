@@ -6,7 +6,15 @@ use crate::verify_common::headers as hdr;
 use super::types::Update;
 
 /// Verify the `X-Telegram-Bot-Api-Secret-Token` header using constant-time comparison.
+///
+/// Returns false if the configured `secret` is empty — an empty secret would
+/// silently match any caller supplying an empty header (or none at all on the
+/// header-empty path), turning the verifier into a no-op.
 pub fn verify_secret_token(headers: &HeaderMap, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+
     let header_val = match headers.get(hdr::TELEGRAM_SECRET) {
         Some(v) => match v.to_str() {
             Ok(s) => s,
@@ -62,9 +70,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_secret_matches_empty_header() {
-        let headers = make_headers(Some(""));
-        assert!(verify_secret_token(&headers, ""));
+    fn empty_secret_rejects_any_header() {
+        // Regression: an empty configured secret used to verify against an
+        // empty header — silent auth bypass for any caller who omitted the
+        // header. Empty secret must refuse outright.
+        assert!(!verify_secret_token(&make_headers(Some("")), ""));
+        assert!(!verify_secret_token(&make_headers(None), ""));
+        assert!(!verify_secret_token(&make_headers(Some("anything")), ""));
     }
 
     #[test]

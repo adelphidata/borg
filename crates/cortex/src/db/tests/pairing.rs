@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::hash_pairing_code;
 
 // ── Pairing tests ──
 
@@ -31,8 +32,10 @@ fn create_and_find_pairing_request() {
         .expect("should exist");
     assert_eq!(found.channel_name, "telegram");
     assert_eq!(found.sender_id, "user123");
-    // Codes are normalized to lowercase on insert (BIP-39 phrase format).
-    assert_eq!(found.code, "abcd1234");
+    // Codes are normalized to lowercase then SHA-256 hashed on insert; the
+    // row exposes the hash, never the plaintext.
+    assert_eq!(found.code, hash_pairing_code("abcd1234"));
+    assert_ne!(found.code, "abcd1234");
     assert_eq!(found.status, "pending");
 
     // Not found for wrong channel
@@ -52,7 +55,7 @@ fn find_pending_for_sender_reuses_code() {
         .find_pending_for_sender("telegram", "user123")
         .expect("find")
         .expect("should exist");
-    assert_eq!(found.code, "code1111");
+    assert_eq!(found.code, hash_pairing_code("code1111"));
 }
 
 #[test]

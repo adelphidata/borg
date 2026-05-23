@@ -137,6 +137,16 @@ service Admin {
   // running entry (the TUI subprocess view drives both).
   rpc GetSubprocesses(Empty) returns (SubprocessSnapshot);
   rpc SetSubprocessPinned(SetSubprocessPinnedRequest) returns (Empty);
+
+  // Cross-platform session handoff. The state machine lives on the
+  // `sessions` row (None → pending → running → completed | failed). CLI /
+  // TUI initiates via RequestHandoff; the destination gateway claims with
+  // ClaimHandoff and finalizes with CompleteHandoff or FailHandoff.
+  rpc RequestHandoff(HandoffRequest) returns (Empty);
+  rpc ClaimHandoff(HandoffClaimRequest) returns (HandoffClaimResponse);
+  rpc CompleteHandoff(SessionRef) returns (Empty);
+  rpc FailHandoff(HandoffFailRequest) returns (Empty);
+  rpc GetHandoffStatus(SessionRef) returns (HandoffStatusReply);
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }
@@ -718,4 +728,39 @@ message GoalEvent {
   string kind = 2;
   GoalDetail goal = 3;
   int64 emitted_at_unix = 4;
+}
+
+// /handoff cross-platform session transfer ----------------------------------
+
+message HandoffRequest {
+  // Session being transferred.
+  string session_id = 1;
+  // Destination channel name ("telegram", "slack", "discord", ...).
+  string target_platform = 2;
+}
+
+message HandoffClaimRequest {
+  // Channel asking to pick up the next pending handoff targeting it.
+  string platform = 1;
+}
+
+message HandoffClaimResponse {
+  // ID of the claimed session, if any. Empty `session_id` means "nothing
+  // pending for this platform" — the caller should poll again later.
+  string session_id = 1;
+  bool claimed = 2;
+}
+
+message HandoffFailRequest {
+  string session_id = 1;
+  // Human-readable reason — surfaced to the originator via GetHandoffStatus.
+  string reason = 2;
+}
+
+message HandoffStatusReply {
+  // Empty when the session has no handoff history.
+  string state = 1;
+  string target_platform = 2;
+  string error = 3;
+  int64 requested_at_unix = 4;
 }

@@ -1580,6 +1580,39 @@ mod tests {
     }
 
     #[test]
+    fn signal_phone_bot_id_required_in_groups_with_mention_mode() {
+        // Regression: the Signal SSE callback used to pass `bot_identifier=None`,
+        // which made `check_activation` fall through to "always" in groups and
+        // the bot would answer every group message. Once the callback wires
+        // `@<account>` through, Mention-mode groups must drop messages that
+        // don't reference the bot's phone number.
+        let route = default_route();
+        let mut config = Config::default();
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
+        let bot = "@+15555550101";
+
+        // Group message without mention → dropped.
+        let (activate, _) =
+            check_activation("hey channel", Some("group"), &route, &config, Some(bot));
+        assert!(!activate);
+
+        // Group message with mention → activates, strips the @bot.
+        let (activate, cleaned) = check_activation(
+            "@+15555550101 ping",
+            Some("group"),
+            &route,
+            &config,
+            Some(bot),
+        );
+        assert!(activate);
+        assert_eq!(cleaned, "ping");
+
+        // DM still always activates regardless of mention.
+        let (activate, _) = check_activation("ping", Some("direct"), &route, &config, Some(bot));
+        assert!(activate);
+    }
+
+    #[test]
     fn mention_only_text_still_activates() {
         let route = default_route();
         let mut config = Config::default();

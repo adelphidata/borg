@@ -21,6 +21,8 @@ pub enum HmacError {
     Replay { skew_seconds: i64 },
     /// HMAC computed locally did not match the presented signature.
     Mismatch,
+    /// Configured signing secret was empty — refused to verify.
+    EmptySecret,
 }
 
 impl std::fmt::Display for HmacError {
@@ -33,6 +35,7 @@ impl std::fmt::Display for HmacError {
                 "timestamp outside ±{REPLAY_WINDOW_SECONDS}s replay window (skew {skew_seconds}s)"
             ),
             HmacError::Mismatch => f.write_str("HMAC signature mismatch"),
+            HmacError::EmptySecret => f.write_str("signing secret is empty — refusing to verify"),
         }
     }
 }
@@ -52,6 +55,11 @@ pub fn verify_signature(
     timestamp_header: Option<&str>,
     now_unix: i64,
 ) -> Result<(), HmacError> {
+    // Empty secret is misconfiguration — refuse rather than computing an HMAC
+    // under `""` that any caller could forge.
+    if secret.is_empty() {
+        return Err(HmacError::EmptySecret);
+    }
     let signature = signature_header.ok_or(HmacError::MissingHeader("X-Borg-Signature"))?;
     let timestamp = timestamp_header.ok_or(HmacError::MissingHeader("X-Borg-Timestamp"))?;
 
@@ -302,6 +310,19 @@ mod tests {
         let err =
             verify_signature("s", b"x", Some("v1=zzzz"), Some(&now.to_string()), now).unwrap_err();
         assert_eq!(err, HmacError::MalformedHeader("X-Borg-Signature"));
+    }
+
+    #[test]
+    fn empty_secret_refused() {
+        // Regression: an empty secret used to mean "verify this request
+        // under HMAC(\"\", body)" — any caller who knew the (zero-effort)
+        // algorithm could forge a signature. `EmptySecret` is a distinct
+        // error so the audit chain captures the cause.
+        let now: i64 = 1_700_000_000;
+        let sig = make_signature("", now, b"body");
+        let err =
+            verify_signature("", b"body", Some(&sig), Some(&now.to_string()), now).unwrap_err();
+        assert_eq!(err, HmacError::EmptySecret);
     }
 
     #[test]

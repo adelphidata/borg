@@ -106,7 +106,9 @@ async fn webhook_handler(
     if let Err(e) = verify_signature(&secret_for_hmac, &body, sig_header, ts_header, now) {
         let status = match e {
             HmacError::MissingHeader(_) | HmacError::MalformedHeader(_) => StatusCode::BAD_REQUEST,
-            HmacError::Replay { .. } | HmacError::Mismatch => StatusCode::UNAUTHORIZED,
+            HmacError::Replay { .. } | HmacError::Mismatch | HmacError::EmptySecret => {
+                StatusCode::UNAUTHORIZED
+            }
         };
         return error_response(status, &e.to_string());
     }

@@ -41,6 +41,11 @@ pub fn verify_twilio_signature(
 /// Compute the expected Twilio signature for a request.
 /// Returns an error if HMAC key construction fails or body parsing fails.
 pub fn compute_signature(url: &str, body: &str, auth_token: &str) -> Result<String> {
+    // Empty auth token is a misconfiguration: a signature computed under `""`
+    // would silently verify any inbound request. Refuse outright.
+    if auth_token.is_empty() {
+        anyhow::bail!("Twilio auth token is empty — refusing to compute signature");
+    }
     let mut data_string = url.to_string();
 
     // Parse form-urlencoded params and sort alphabetically.
@@ -176,6 +181,22 @@ mod tests {
         assert_ne!(
             sig_with_params, sig_empty,
             "signatures must differ when params are present vs absent"
+        );
+    }
+
+    #[test]
+    fn empty_auth_token_refuses() {
+        // Regression: empty auth token must not produce a usable signature
+        // — otherwise inbound requests verify under the operator's missing
+        // config.
+        let err = compute_signature("https://example.com/wh", "Body=Hi", "").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("empty"));
+
+        // And verification refuses too, regardless of what header arrives.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-twilio-signature", HeaderValue::from_static("anything"));
+        assert!(
+            verify_twilio_signature(&headers, "https://example.com/wh", "Body=Hi", "").is_err()
         );
     }
 }

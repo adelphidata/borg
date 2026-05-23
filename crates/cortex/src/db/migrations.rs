@@ -59,6 +59,78 @@ impl Database {
         Ok(())
     }
 
+    /// Hash gateway pairing codes at rest.
+    ///
+    /// `pairing_requests.code` previously held the plaintext 6-word BIP-39
+    /// phrase a sender had to present for approval. Anyone with read access
+    /// to the DB file could replay the code before approval expiry. Rename
+    /// the column to `code_hash` and expire all pending rows — we cannot
+    /// re-hash plaintext we no longer have, but pairings are short-lived so
+    /// the operator just creates new ones.
+    /// Add /handoff state-machine columns to `sessions`. Idempotent — only
+    /// adds the columns that the current schema is missing, so fresh installs
+    /// (which already get the full shape from `SCHEMA_SQL`) skip the ALTERs.
+    pub(super) async fn migrate_v5(&self) -> Result<()> {
+        let mut rows = self.conn.query("PRAGMA table_info(sessions)", ()).await?;
+        let mut existing = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            existing.insert(row.get::<String>(1)?);
+        }
+        for (col, ddl) in [
+            (
+                "handoff_state",
+                "ALTER TABLE sessions ADD COLUMN handoff_state TEXT",
+            ),
+            (
+                "handoff_target",
+                "ALTER TABLE sessions ADD COLUMN handoff_target TEXT",
+            ),
+            (
+                "handoff_error",
+                "ALTER TABLE sessions ADD COLUMN handoff_error TEXT",
+            ),
+            (
+                "handoff_requested_at",
+                "ALTER TABLE sessions ADD COLUMN handoff_requested_at INTEGER",
+            ),
+        ] {
+            if !existing.contains(col) {
+                self.conn.execute_batch(ddl).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn migrate_v4(&self) -> Result<()> {
+        // Fresh installs already emit the final shape via `SCHEMA_SQL`
+        // (which defines `code_hash`). Only DBs that ran through the v3
+        // schema (plaintext `code` column) still need the rename — probe
+        // pragma_table_info to make the rename idempotent.
+        let mut rows = self
+            .conn
+            .query("PRAGMA table_info(pairing_requests)", ())
+            .await?;
+        let mut has_plaintext_column = false;
+        while let Some(row) = rows.next().await? {
+            let col: String = row.get(1)?;
+            if col == "code" {
+                has_plaintext_column = true;
+                break;
+            }
+        }
+        if has_plaintext_column {
+            self.conn
+                .execute_batch(
+                    "ALTER TABLE pairing_requests RENAME COLUMN code TO code_hash;
+                     UPDATE pairing_requests
+                        SET status = 'expired'
+                        WHERE status = 'pending';",
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
         const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
         let stmt = self
@@ -257,7 +329,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
     parent_session_id TEXT,
-    forked_from_message_id INTEGER
+    forked_from_message_id INTEGER,
+    -- /handoff state machine: NULL → 'pending' → 'running' → ('completed' | 'failed').
+    -- `handoff_target` is the destination channel name (e.g. "telegram"); the
+    -- destination gateway claims by `UPDATE … SET handoff_state='running'`
+    -- where state='pending'. `handoff_error` carries the failure reason when
+    -- a claim/run fails.
+    handoff_state TEXT,
+    handoff_target TEXT,
+    handoff_error TEXT,
+    handoff_requested_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
@@ -403,13 +484,14 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
     id TEXT PRIMARY KEY,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
-    code TEXT NOT NULL,
+    -- Hex-encoded SHA-256 of the lowercased pairing code. Never store plaintext.
+    code_hash TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     display_name TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     approved_at INTEGER,
-    UNIQUE(channel_name, code)
+    UNIQUE(channel_name, code_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_pairing_channel_sender
     ON pairing_requests(channel_name, sender_id, status);

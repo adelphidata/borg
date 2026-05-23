@@ -2,10 +2,11 @@ mod activity;
 mod audit_chain;
 mod audit_writer;
 mod delivery;
-mod device_pairing;
+pub(crate) mod device_pairing;
 pub mod doctor_squelch;
 pub(crate) mod encryption;
 mod goals;
+mod handoff;
 mod issue_state;
 mod maintenance;
 mod memory;
@@ -436,7 +437,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 3;
+    const CURRENT_VERSION: u32 = 5;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -507,8 +508,14 @@ impl Database {
         if current < 3 {
             self.migrate_v3().await?;
         }
+        if current < 4 {
+            self.migrate_v4().await?;
+        }
+        if current < 5 {
+            self.migrate_v5().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 3,
+            Database::CURRENT_VERSION == 5,
             "add the new migrate_vN call above and bump this constant",
         );
 

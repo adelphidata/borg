@@ -2215,7 +2215,11 @@ impl Agent {
                 .execute_tool(name, args, event_tx, &tool_call.id)
                 .instrument(info_span!("tool.execute", tool.name = %name))
                 .await
-                .unwrap_or_else(|e| ToolOutput::Text(format!("Error: {e}")));
+                .unwrap_or_else(|e| {
+                    ToolOutput::Text(crate::security::sanitize::sanitize_tool_error(
+                        &e.to_string(),
+                    ))
+                });
             let tool_elapsed = tool_start.elapsed().as_secs_f64();
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(tool_elapsed, &[]);
@@ -2444,7 +2448,11 @@ impl Agent {
                 })
                 .await;
 
-            let tool_output = result.unwrap_or_else(|e| ToolOutput::Text(format!("Error: {e}")));
+            let tool_output = result.unwrap_or_else(|e| {
+                ToolOutput::Text(crate::security::sanitize::sanitize_tool_error(
+                    &e.to_string(),
+                ))
+            });
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(elapsed, &[]);
 
