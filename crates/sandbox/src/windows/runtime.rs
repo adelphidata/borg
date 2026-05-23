@@ -21,6 +21,7 @@
 //! non-zero — the wrapped command never runs unsandboxed.
 
 use std::io;
+use std::time::Instant;
 
 use super::acl::apply_for_paths;
 use super::policy_resolve::resolve;
@@ -32,6 +33,61 @@ use super::TrampolineInvocation;
 /// Run the trampoline body, returning the wrapped child's exit code on
 /// success.
 pub fn run(invocation: &TrampolineInvocation) -> io::Result<u32> {
+    let started = Instant::now();
+    let policy_hash = policy_fingerprint(&invocation.policy);
+    tracing::info!(
+        event = "sandbox_spawn_started",
+        target = "borg.sandbox.audit",
+        policy_hash = %policy_hash,
+        program = %invocation.program,
+        // arg_count + tool_dir give an operator-readable handle on
+        // *which* sandbox call this was without exposing arg contents
+        // (which may contain inline secrets like
+        // `--password=...`).
+        arg_count = invocation.args.len(),
+        tool_dir = %invocation.tool_dir.display(),
+    );
+    let result = run_inner(invocation);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(code) => tracing::info!(
+            event = "sandbox_spawn_completed",
+            target = "borg.sandbox.audit",
+            policy_hash = %policy_hash,
+            program = %invocation.program,
+            exit_code = code,
+            duration_ms,
+        ),
+        Err(e) => tracing::warn!(
+            event = "sandbox_spawn_failed",
+            target = "borg.sandbox.audit",
+            policy_hash = %policy_hash,
+            program = %invocation.program,
+            duration_ms,
+            error = %e,
+        ),
+    }
+    result
+}
+
+/// Cheap fingerprint of a SandboxPolicy for audit-trail correlation.
+/// Same policy → same hash; different policy → different hash with
+/// overwhelming probability. Truncated to 16 hex chars so audit logs
+/// stay readable; this is not a cryptographic commitment, so the
+/// SHA-256 truncation is fine.
+fn policy_fingerprint(policy: &crate::policy::SandboxPolicy) -> String {
+    use sha2::{Digest, Sha256};
+    let body = serde_json::to_vec(policy).unwrap_or_default();
+    let digest = Sha256::digest(&body);
+    let mut out = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn run_inner(invocation: &TrampolineInvocation) -> io::Result<u32> {
     // 1. Cap SID.
     let cap_sid_str = generate_random_cap_sid_string();
     let cap_sid = LocalSid::from_str_sid(&cap_sid_str)
