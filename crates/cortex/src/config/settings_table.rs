@@ -111,6 +111,7 @@ define_settings! {
         // ── Browser ──
         "browser.enabled" => browser.enabled, parsed(bool);
         "browser.headless" => browser.headless, parsed(bool);
+        "browser.snapshot_max_elements" => browser.snapshot_max_elements, parsed(usize);
 
         // ── TTS ──
         "tts.enabled" => tts.enabled, parsed(bool);

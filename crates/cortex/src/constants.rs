@@ -574,6 +574,10 @@ pub const BROWSER_NETWORK_BUFFER_SIZE: usize = 500;
 /// Default Chrome DevTools Protocol port.
 pub const BROWSER_DEFAULT_CDP_PORT: u16 = 9222;
 
+/// Default cap on elements returned by `browser.snapshot`. Mirrors hermes'
+/// `max_elements=100` default — dense pages otherwise blow LLM context.
+pub const BROWSER_SNAPSHOT_MAX_ELEMENTS: usize = 100;
+
 // ── Gateway defaults ──────────────────────────────────────────────
 
 /// Per-sender error notification cooldown (ms). Default: 4 hours.

@@ -112,17 +112,18 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
             tool_names::BROWSER,
-            "Control a headless Chrome browser. Actions: navigate, click, type, screenshot, get_text, evaluate_js, hover, select, press, drag, fill, wait, resize, new_tab, list_tabs, switch_tab, close_tab, get_console_logs, close.",
+            "Control a headless Chrome browser. Actions: navigate, click, type, screenshot, snapshot, get_text, get_images, evaluate_js, hover, select, press, drag, fill, upload, scroll, back, forward, wait, resize, new_tab, list_tabs, switch_tab, close_tab, get_console_logs, close. Use 'snapshot' first to enumerate interactive elements as `@e<N>` refs, then pass `ref: \"@e5\"` to click/type instead of inventing a CSS selector.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "click", "type", "screenshot", "get_text", "evaluate_js", "hover", "select", "press", "drag", "fill", "wait", "resize", "new_tab", "list_tabs", "switch_tab", "close_tab", "get_console_logs", "close"],
+                        "enum": ["navigate", "click", "type", "screenshot", "snapshot", "get_text", "get_images", "evaluate_js", "hover", "select", "press", "drag", "fill", "upload", "scroll", "back", "forward", "wait", "resize", "new_tab", "list_tabs", "switch_tab", "close_tab", "get_console_logs", "close"],
                         "description": "Browser action to perform"
                     },
                     "url": { "type": "string", "description": "URL (for navigate, new_tab)" },
-                    "selector": { "type": "string", "description": "CSS selector (for click, type, hover, select, get_text, screenshot)" },
+                    "selector": { "type": "string", "description": "CSS selector (for click, type, hover, select, get_text, screenshot, upload)" },
+                    "ref": { "type": "string", "description": "Snapshot ref like '@e5' (for click, type) — pairs with a prior 'snapshot' call. Use instead of 'selector' when the model can't reliably write CSS." },
                     "text": { "type": "string", "description": "Text to type (for type action)" },
                     "expression": { "type": "string", "description": "JavaScript expression (for evaluate_js)" },
                     "value": { "type": "string", "description": "Value to select or wait for (for select, wait)" },
@@ -130,10 +131,16 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     "source": { "type": "string", "description": "Source CSS selector (for drag)" },
                     "target": { "type": "string", "description": "Target CSS selector (for drag)" },
                     "fields": { "type": "object", "description": "Map of CSS selector to value (for fill)" },
+                    "files": { "type": "array", "items": {"type": "string"}, "description": "Absolute file paths to upload to an <input type=\"file\"> (for upload)" },
                     "condition": { "type": "string", "enum": ["text", "element", "url", "load", "js"], "description": "Wait condition type (for wait)" },
                     "width": { "type": "integer", "description": "Viewport width (for resize)" },
                     "height": { "type": "integer", "description": "Viewport height (for resize)" },
-                    "tab_index": { "type": "integer", "description": "Tab index (for switch_tab)" }
+                    "tab_index": { "type": "integer", "description": "Tab index (for switch_tab)" },
+                    "x": { "type": "integer", "description": "Wheel x-coordinate (for scroll). Defaults to 0." },
+                    "y": { "type": "integer", "description": "Wheel y-coordinate (for scroll). Defaults to 0." },
+                    "delta_x": { "type": "integer", "description": "Horizontal scroll delta in CSS pixels (for scroll)." },
+                    "delta_y": { "type": "integer", "description": "Vertical scroll delta in CSS pixels (for scroll). Positive scrolls down." },
+                    "max_elements": { "type": "integer", "description": "Cap on elements returned by snapshot (default: browser.snapshot_max_elements)." }
                 },
                 "required": ["action"]
             }),
@@ -212,7 +219,7 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     if config.computer_use.enabled {
         defs.push(ToolDefinition::new(
             tool_names::COMPUTER_USE,
-            "Drive the host macOS GUI via cua-driver. Readonly: `capture` returns a screenshot inline as a multimodal image part; `list_apps` returns running applications with pids; `wait` blocks for duration_ms. Mutating: `click`/`double_click`/`right_click`/`middle_click` at (x,y); `drag` from (x,y) to (to_x,to_y); `scroll` by (delta_x,delta_y) at (x,y); `type` literal text; `key` a single hotkey (e.g. 'cmd+c') or a sequence via `keys`; `set_value` writes directly to a focused AX text field (preferred for forms — bypasses typing entirely); `focus_app` brings a target app to front (or routes input without raising via raise_window=false). Denylist refuses logout/lock/force-quit hotkeys and the loginwindow / Security settings focus targets before touching the driver.",
+            "Drive the host macOS GUI via cua-driver. Readonly: `capture` returns a screenshot inline as a multimodal image part — pass `mode: \"som\"` for a numbered overlay (then target with `element_index`), `mode: \"ax\"` for the text-only accessibility tree, default `vision` for plain pixels; `list_apps` returns running applications with pids; `wait` blocks for duration_ms. Mutating: `click`/`double_click`/`right_click`/`middle_click` at (x,y) OR by `element_index` from a prior SOM capture; `drag` from (x,y) to (to_x,to_y); `scroll` by (delta_x,delta_y) at (x,y) or on `element_index`; `type` literal text; `key` a single hotkey (e.g. 'cmd+c') or a sequence via `keys`; `set_value` writes directly to a focused AX text field (preferred for forms — bypasses typing entirely); `focus_app` brings a target app to front (or routes input without raising via raise_window=false). Pass `capture_after: true` on a mutating action to receive a follow-up screenshot in the same envelope. Denylist refuses logout/lock/force-quit hotkeys and the loginwindow / Security settings focus targets before touching the driver.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -237,10 +244,12 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     "text": {"type": "string", "description": "Type only."},
                     "key": {"type": "string", "description": "Key only. e.g. 'cmd+c'."},
                     "keys": {"type": "array", "items": {"type": "string"}},
-                    "element_index": {"type": "integer", "description": "Set_value only."},
+                    "element_index": {"type": "integer", "description": "Set_value + click family + scroll. The index a SOM-mode capture assigned the element."},
                     "value": {"type": "string", "description": "Set_value only."},
                     "target": {"type": "string", "description": "Focus_app only. App name or bundle id."},
-                    "raise_window": {"type": "boolean"}
+                    "raise_window": {"type": "boolean"},
+                    "mode": {"type": "string", "enum": ["vision", "som", "ax"], "description": "Capture only. `vision` = PNG inline (default); `som` = PNG + numbered overlay (target follow-ups with element_index); `ax` = text-only accessibility tree, no image bytes."},
+                    "capture_after": {"type": "boolean", "description": "Mutating actions only. When true, after the action the handler appends a fresh capture to the multimodal envelope so the model can verify state without a second tool call."}
                 },
                 "required": ["action"]
             }),

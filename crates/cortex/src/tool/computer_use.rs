@@ -90,6 +90,24 @@ impl ComputerUseAction {
     }
 }
 
+/// Capture mode — hermes parity. `Vision` keeps the current behaviour (raw
+/// PNG inline). `Som` (Set-of-Marks) overlays numbered boxes the model can
+/// reference by `element_index` on the next turn. `Ax` returns the
+/// accessibility tree as text only — for non-vision models or when the
+/// operator wants to keep image bytes out of LLM context.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CaptureMode {
+    /// Plain screenshot. The historical default — bytes go straight to the LLM.
+    #[default]
+    Vision,
+    /// Screenshot plus a JSON overlay of `{index, role, name, bounds}`.
+    /// Pair with `element_index` on a follow-up click/drag.
+    Som,
+    /// Accessibility tree only — no image bytes. Useful with text-only models.
+    Ax,
+}
+
 /// Args for `computer_use`. The schema fans out per-action — `duration_ms`
 /// is only meaningful for `Wait`, `x`/`y` for click family, etc. We leave
 /// them all optional and validate per-action so the LLM gets a single
@@ -158,6 +176,21 @@ pub(crate) struct ComputerUseArgs {
     /// the user's frontmost app. Default `true` (safe — raises and activates).
     #[serde(default)]
     pub raise_window: Option<bool>,
+
+    /// `capture` only — selects between `vision` (default, PNG inline),
+    /// `som` (image + numbered overlay), and `ax` (text-only). Mirrors
+    /// hermes' `capture(mode=...)` parity. Optional everywhere else.
+    #[serde(default)]
+    pub mode: Option<CaptureMode>,
+
+    /// Mutating actions only (click family + drag + scroll). When `true`,
+    /// after the action succeeds the handler issues a follow-up driver
+    /// `screenshot` and appends it to the multimodal envelope. Lets the
+    /// model verify state without burning a second tool-call turn.
+    /// Refused for `capture` itself (would be redundant) and never fires
+    /// when the action is denied by the hardcoded denylist.
+    #[serde(default)]
+    pub capture_after: Option<bool>,
 }
 
 /// JSON-RPC response envelope from cua-driver.
@@ -334,16 +367,24 @@ pub(crate) async fn handle_with_driver(
     args: &ComputerUseArgs,
     driver: &dyn Driver,
 ) -> Result<ToolOutput> {
+    // Pre-driver argument sanity. `capture_after` on `capture` is
+    // structurally meaningless — refuse here rather than silently take a
+    // second screenshot. Equally, `capture_after` with `mode = ax` would
+    // be paradoxical (no image to capture).
+    if let Some(reason) = check_arg_coherence(args) {
+        return Ok(ToolOutput::Text(format!("Error: {reason}")));
+    }
     // Hard denylist — runs BEFORE we touch the driver so a malicious or
     // confused LLM can't burn its budget probing the denylist via real
-    // keystrokes. Mirrors `policy::HARDCODED_DENY` in spirit.
+    // keystrokes. Mirrors `policy::HARDCODED_DENY` in spirit. When this
+    // fires, `capture_after` is never honoured.
     if let Some(reason) = check_denylist(args) {
         return Ok(ToolOutput::Text(format!("Error: {reason}")));
     }
-    match args.action {
-        ComputerUseAction::Capture => capture(args, driver).await,
-        ComputerUseAction::ListApps => list_apps(driver).await,
-        ComputerUseAction::Wait => wait(args).await,
+    let result = match args.action {
+        ComputerUseAction::Capture => return capture(args, driver).await,
+        ComputerUseAction::ListApps => return list_apps(driver).await,
+        ComputerUseAction::Wait => return wait(args).await,
         ComputerUseAction::Click => click(args, "click", driver).await,
         ComputerUseAction::DoubleClick => click(args, "double_click", driver).await,
         ComputerUseAction::RightClick => click(args, "right_click", driver).await,
@@ -354,7 +395,138 @@ pub(crate) async fn handle_with_driver(
         ComputerUseAction::Key => key(args, driver).await,
         ComputerUseAction::SetValue => set_value(args, driver).await,
         ComputerUseAction::FocusApp => focus_app(args, driver).await,
+    };
+    let primary = result?;
+    if args.capture_after.unwrap_or(false) {
+        // Tack on a fresh capture. We never fail the original action on
+        // a follow-up capture error — the action did succeed, the model
+        // just doesn't get pixels this turn. Log + continue per the
+        // No-Silent-Swallowing invariant.
+        let follow = capture_internal(args, driver).await;
+        Ok(append_capture(primary, follow))
+    } else {
+        Ok(primary)
     }
+}
+
+/// Returns `Some(reason)` when arg combinations are structurally invalid
+/// — caught pre-driver so the model gets a deterministic message rather
+/// than discovering it from an opaque driver error.
+fn check_arg_coherence(args: &ComputerUseArgs) -> Option<String> {
+    // `capture_after` only applies to mutating actions that produce a
+    // screen change worth verifying.
+    if args.capture_after.unwrap_or(false) {
+        match args.action {
+            ComputerUseAction::Capture
+            | ComputerUseAction::ListApps
+            | ComputerUseAction::Wait => {
+                return Some(format!(
+                    "capture_after is not valid for action '{:?}' — only mutating actions take a follow-up capture",
+                    args.action
+                ));
+            }
+            _ => {}
+        }
+    }
+    // `mode = ax` returns no image, so a follow-up capture wouldn't have
+    // pixels either — but capture_after dispatches `screenshot` which is
+    // always vision-shaped; the contradiction is only when the *initial*
+    // action is `capture` with `mode = ax` AND capture_after is true, and
+    // that already failed the check above.
+
+    // Click family with element_index AND coordinates: ambiguous target.
+    let has_coords = args.x.is_some() || args.y.is_some();
+    let has_index = args.element_index.is_some();
+    if has_coords && has_index {
+        match args.action {
+            ComputerUseAction::Click
+            | ComputerUseAction::DoubleClick
+            | ComputerUseAction::RightClick
+            | ComputerUseAction::MiddleClick
+            | ComputerUseAction::Drag
+            | ComputerUseAction::Scroll => {
+                return Some(format!(
+                    "{:?}: provide either pixel `x`/`y` or `element_index`, not both",
+                    args.action
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Merge a follow-up capture into the primary action's output. The merge
+/// always returns a Multimodal envelope when the capture produced an image,
+/// so the model sees pixels alongside the action's summary.
+fn append_capture(primary: ToolOutput, follow: Result<ToolOutput>) -> ToolOutput {
+    let follow_out = match follow {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("capture_after follow-up failed: {e}");
+            return match primary {
+                ToolOutput::Text(t) => {
+                    ToolOutput::Text(format!("{t}\n[capture_after failed: {e}]"))
+                }
+                ToolOutput::Multimodal { text, parts } => ToolOutput::Multimodal {
+                    text: format!("{text}\n[capture_after failed: {e}]"),
+                    parts,
+                },
+            };
+        }
+    };
+    let (primary_text, mut primary_parts) = match primary {
+        ToolOutput::Text(t) => (t, Vec::new()),
+        ToolOutput::Multimodal { text, parts } => (text, parts),
+    };
+    let (follow_text, follow_parts) = match follow_out {
+        ToolOutput::Text(t) => (t, Vec::new()),
+        ToolOutput::Multimodal { text, parts } => (text, parts),
+    };
+    let merged_text = if follow_text.is_empty() {
+        primary_text
+    } else {
+        format!("{primary_text}\n--- capture_after ---\n{follow_text}")
+    };
+    primary_parts.extend(follow_parts);
+    if primary_parts.is_empty() {
+        ToolOutput::Text(merged_text)
+    } else {
+        ToolOutput::Multimodal {
+            text: merged_text,
+            parts: primary_parts,
+        }
+    }
+}
+
+/// Internal capture used by `capture_after`. Always runs in `vision` mode
+/// so the operator's chosen primary-action mode (if any) doesn't surprise
+/// the follow-up shape.
+async fn capture_internal(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let mut probe = ComputerUseArgs {
+        action: ComputerUseAction::Capture,
+        pid: args.pid,
+        window_id: args.window_id,
+        duration_ms: None,
+        x: None,
+        y: None,
+        to_x: None,
+        to_y: None,
+        delta_x: None,
+        delta_y: None,
+        text: None,
+        key: None,
+        keys: None,
+        element_index: None,
+        value: None,
+        target: None,
+        raise_window: None,
+        mode: Some(CaptureMode::Vision),
+        capture_after: None,
+    };
+    // Defensive: never recurse capture_after.
+    probe.capture_after = None;
+    capture(&probe, driver).await
 }
 
 fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
@@ -372,14 +544,23 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
 }
 
 async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
-    let mut params = json!({});
+    let mode = args.mode.unwrap_or_default();
+    let mut params = json!({"mode": mode_str(mode)});
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
     if let Some(window_id) = args.window_id {
         params["window_id"] = json!(window_id);
     }
-    let resp = driver.call("screenshot", params).await?;
+    let method = match mode {
+        // `ax` returns the AX tree as text — cua-driver exposes it under
+        // `accessibility` per the SOM/AX split documented in the skill.
+        CaptureMode::Ax => "accessibility",
+        // SOM and Vision both come back from `screenshot`; SOM additionally
+        // emits a text part with the numbered overlay JSON.
+        CaptureMode::Som | CaptureMode::Vision => "screenshot",
+    };
+    let resp = driver.call(method, params).await?;
 
     let mut text_parts = Vec::new();
     let mut image: Option<(String, String)> = None;
@@ -396,9 +577,18 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
         text_parts.join("\n")
     };
 
+    // `ax` mode: text-only by contract. If the driver also sent an image
+    // (some builds do), drop it on the floor — the mode's whole purpose
+    // is keeping bytes out of LLM context.
+    if mode == CaptureMode::Ax {
+        return Ok(ToolOutput::Text(summary));
+    }
+
     let Some((mime_type, data)) = image else {
+        // Vision/SOM mode promised pixels; surfacing this loudly preserves
+        // the "if we report success it must succeed" invariant.
         return Ok(ToolOutput::Text(format!(
-            "Error: cua-driver returned no image for capture. Detail: {summary}"
+            "Error: cua-driver returned no image for capture (mode={mode:?}). Detail: {summary}"
         )));
     };
 
@@ -415,6 +605,14 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
             },
         ],
     })
+}
+
+fn mode_str(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Vision => "vision",
+        CaptureMode::Som => "som",
+        CaptureMode::Ax => "ax",
+    }
 }
 
 async fn list_apps(driver: &dyn Driver) -> Result<ToolOutput> {
@@ -628,18 +826,32 @@ fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
 }
 
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
-    let x = args
-        .x
-        .ok_or_else(|| anyhow::anyhow!("computer_use.{method} requires `x` and `y`"))?;
-    let y = args
-        .y
-        .ok_or_else(|| anyhow::anyhow!("computer_use.{method} requires `x` and `y`"))?;
-    let mut params = json!({"x": x, "y": y});
+    let mut params = json!({});
+    let summary;
+    if let Some(idx) = args.element_index {
+        // SOM-targeted click: address the element by index, the way the
+        // model saw it in the last capture(mode=som). Pixel coords are
+        // omitted entirely so the driver can't fall back to them.
+        params["element_index"] = json!(idx);
+        summary = format!("{method} on element [{idx}]");
+    } else {
+        let x = args.x.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.{method} requires `x`/`y` (pixel coords) or `element_index` (from capture mode=som)"
+            )
+        })?;
+        let y = args.y.ok_or_else(|| {
+            anyhow::anyhow!("computer_use.{method} requires `x`/`y` or `element_index`")
+        })?;
+        params["x"] = json!(x);
+        params["y"] = json!(y);
+        summary = format!("{method} at ({x}, {y})");
+    }
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
     let resp = driver.call(method, params).await?;
-    Ok(merge_driver_text(format!("{method} at ({x}, {y})"), resp))
+    Ok(merge_driver_text(summary, resp))
 }
 
 async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -667,8 +879,6 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
 }
 
 async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
-    let x = args.x.unwrap_or(0);
-    let y = args.y.unwrap_or(0);
     let dx = args.delta_x.unwrap_or(0);
     let dy = args.delta_y.unwrap_or(0);
     if dx == 0 && dy == 0 {
@@ -676,9 +886,18 @@ async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutpu
             "Error: computer_use.scroll requires non-zero `delta_x` or `delta_y`".into(),
         ));
     }
-    let params = json!({"x": x, "y": y, "delta_x": dx, "delta_y": dy});
+    let mut params = json!({"delta_x": dx, "delta_y": dy});
+    let summary;
+    if let Some(idx) = args.element_index {
+        params["element_index"] = json!(idx);
+        summary = format!("scroll element [{idx}] by ({dx},{dy})");
+    } else {
+        params["x"] = json!(args.x.unwrap_or(0));
+        params["y"] = json!(args.y.unwrap_or(0));
+        summary = format!("scroll ({dx},{dy})");
+    }
     let resp = driver.call("scroll", params).await?;
-    Ok(merge_driver_text(format!("scroll ({dx},{dy})"), resp))
+    Ok(merge_driver_text(summary, resp))
 }
 
 async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -1042,6 +1261,8 @@ mod tests {
             value: None,
             target: None,
             raise_window: None,
+            mode: None,
+            capture_after: None,
         }
     }
 
@@ -1275,6 +1496,275 @@ mod tests {
             other => panic!("expected text, got {other:?}"),
         };
         assert_eq!(text, "click at (1, 2)");
+    }
+
+    // ── Capture mode tests (hermes parity) ──────────────────────────
+
+    /// AX mode is text-only by contract — pixels would defeat the whole
+    /// "keep bytes out of LLM context" purpose. The driver method must
+    /// route to `accessibility` and the response must NOT include an
+    /// ImageBase64 part even if the driver accidentally returned one.
+    #[tokio::test]
+    async fn capture_ax_mode_is_text_only_and_calls_accessibility() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![
+                DriverContent::Text("AXWindow > AXButton \"Submit\"".into()),
+                // Even if a driver build returns an image, AX mode must
+                // strip it — the regression we're guarding against is the
+                // tree silently getting padded with image bytes.
+                DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: one_by_one_png_b64(),
+                },
+            ],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Ax);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("AXButton"));
+                assert!(!t.contains("base64"), "image leaked into AX text: {t}");
+            }
+            other => panic!("expected text-only output for AX mode, got {other:?}"),
+        }
+        assert_eq!(driver.calls.lock().unwrap()[0].0, "accessibility");
+        assert_eq!(driver.calls.lock().unwrap()[0].1["mode"], "ax");
+    }
+
+    /// SOM mode keeps the image AND surfaces the overlay text from the
+    /// driver. The mode string is what the driver branches on for the
+    /// numbered-overlay render.
+    #[tokio::test]
+    async fn capture_som_mode_returns_image_plus_overlay_text() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![
+                DriverContent::Text("[{\"index\":0,\"role\":\"button\"}]".into()),
+                DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: one_by_one_png_b64(),
+                },
+            ],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Som);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let (text, parts) = match out {
+            ToolOutput::Multimodal { text, parts } => (text, parts),
+            other => panic!("SOM mode must return Multimodal, got {other:?}"),
+        };
+        assert!(text.contains("\"role\":\"button\""), "overlay missing: {text}");
+        assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
+        assert_eq!(driver.calls.lock().unwrap()[0].0, "screenshot");
+        assert_eq!(driver.calls.lock().unwrap()[0].1["mode"], "som");
+    }
+
+    /// Default mode keeps backward compatibility — no `mode` set must behave
+    /// exactly like the pre-parity tool: `screenshot`, `vision`, image inline.
+    #[tokio::test]
+    async fn capture_default_mode_is_vision() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Image {
+                mime_type: "image/png".into(),
+                base64: one_by_one_png_b64(),
+            }],
+        }]);
+        let args = args_with_action(ComputerUseAction::Capture);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "screenshot");
+        assert_eq!(params["mode"], "vision");
+    }
+
+    /// Vision/SOM promised pixels — if the driver doesn't return any,
+    /// the No-Silent-Swallowing invariant says we surface a clear error
+    /// rather than emit an empty multimodal envelope the model would treat
+    /// as a success.
+    #[tokio::test]
+    async fn capture_vision_no_image_surfaces_error() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("screenshot denied".into())],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Vision);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.starts_with("Error:"), "expected error prefix: {t}");
+                assert!(t.contains("no image"));
+                assert!(t.contains("screenshot denied"));
+            }
+            other => panic!("expected text error, got {other:?}"),
+        }
+    }
+
+    // ── element_index targeting ────────────────────────────────────
+
+    /// SOM follow-up: model captures with mode=som, sees `[3] button`, then
+    /// clicks via `element_index: 3`. Coordinates must NOT appear in the
+    /// driver call — otherwise the driver could pick whichever is set,
+    /// silently turning a SOM click into a stale pixel click.
+    #[tokio::test]
+    async fn click_by_element_index_omits_coordinates() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.element_index = Some(7);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "click");
+        assert_eq!(params["element_index"], 7);
+        assert!(params.get("x").is_none(), "stray x in element_index click: {params}");
+        assert!(params.get("y").is_none(), "stray y in element_index click: {params}");
+    }
+
+    /// Ambiguous target: model sets both pixel coords and element_index.
+    /// Reject pre-driver — either could be "right" and silently picking
+    /// one means the failure mode is undebuggable.
+    #[tokio::test]
+    async fn click_rejects_coords_and_element_index_together() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(10);
+        args.y = Some(20);
+        args.element_index = Some(3);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => assert!(
+                t.contains("not both"),
+                "expected 'not both' rejection, got: {t}"
+            ),
+            other => panic!("expected text error, got {other:?}"),
+        }
+        assert!(
+            driver.calls.lock().unwrap().is_empty(),
+            "ambiguous click reached driver"
+        );
+    }
+
+    /// Scroll by element_index is the SOM equivalent of "scroll inside the
+    /// list with overlay box [N]". Driver must see the index and the
+    /// deltas; pixel coords are omitted entirely.
+    #[tokio::test]
+    async fn scroll_by_element_index_passes_index_and_deltas() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Scroll);
+        args.element_index = Some(2);
+        args.delta_y = Some(-50);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(params["element_index"], 2);
+        assert_eq!(params["delta_y"], -50);
+        assert!(params.get("x").is_none());
+        assert!(params.get("y").is_none());
+    }
+
+    // ── capture_after ──────────────────────────────────────────────
+
+    /// `capture_after: true` on a successful click must produce two driver
+    /// calls (the click, then a screenshot) and merge their outputs into a
+    /// Multimodal envelope so the model sees pixels for verification.
+    #[tokio::test]
+    async fn click_with_capture_after_appends_screenshot() {
+        let driver = FakeDriver::new(vec![
+            ok_response(),
+            DriverResponse {
+                content: vec![DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: one_by_one_png_b64(),
+                }],
+            },
+        ]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(1);
+        args.y = Some(2);
+        args.capture_after = Some(true);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let (text, parts) = match out {
+            ToolOutput::Multimodal { text, parts } => (text, parts),
+            other => panic!("expected Multimodal with capture, got {other:?}"),
+        };
+        assert!(text.contains("click at (1, 2)"));
+        assert!(text.contains("capture_after"));
+        assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "click");
+        assert_eq!(calls[1].0, "screenshot");
+    }
+
+    /// Denylist short-circuits the action entirely — capture_after must
+    /// NOT fire either, otherwise denying a hotkey would still poke the
+    /// driver via the follow-up screenshot.
+    #[tokio::test]
+    async fn capture_after_does_not_fire_when_denylist_rejects() {
+        let driver = FakeDriver::new(vec![]);
+        let mut args = args_with_action(ComputerUseAction::Key);
+        args.keys = Some(vec!["cmd".into(), "shift".into(), "q".into()]);
+        args.capture_after = Some(true);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        assert!(
+            driver.calls.lock().unwrap().is_empty(),
+            "denied hotkey still reached driver"
+        );
+    }
+
+    /// `capture_after` is structurally meaningless for `capture` itself —
+    /// refuse rather than silently take a second redundant screenshot.
+    #[tokio::test]
+    async fn capture_with_capture_after_is_rejected_pre_driver() {
+        let driver = FakeDriver::new(vec![]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.capture_after = Some(true);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => assert!(t.contains("capture_after is not valid")),
+            other => panic!("expected text error, got {other:?}"),
+        }
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    /// capture_after fail-safe: when the follow-up capture itself errors
+    /// out, the primary action's success must NOT regress to a failure.
+    /// The error is appended to the text so the model knows verification
+    /// didn't happen, but the action stands.
+    #[tokio::test]
+    async fn capture_after_failure_does_not_fail_primary_action() {
+        let driver = FakeDriver::new(vec![
+            ok_response(),
+            // No second response queued — capture_internal will error.
+        ]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(5);
+        args.y = Some(6);
+        args.capture_after = Some(true);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("click at (5, 6)"));
+                assert!(t.contains("capture_after failed"));
+            }
+            ToolOutput::Multimodal { text, .. } => {
+                assert!(text.contains("capture_after failed"));
+            }
+        }
+    }
+
+    // ── Plan-mode allowlist still covers everything ─────────────────
+
+    /// Adding `mode` and `capture_after` must not have accidentally
+    /// changed the plan-mode allowlist. This re-asserts the table on
+    /// every new variant pairing — including the new modes.
+    #[test]
+    fn plan_mode_table_covers_all_capture_modes() {
+        for mode in [CaptureMode::Vision, CaptureMode::Som, CaptureMode::Ax] {
+            // Capture is read-only regardless of mode.
+            let mut args = args_with_action(ComputerUseAction::Capture);
+            args.mode = Some(mode);
+            assert!(
+                action_allowed_in_plan_mode(&args.action),
+                "capture must stay plan-mode-safe (mode={mode:?})"
+            );
+        }
     }
 
     #[test]

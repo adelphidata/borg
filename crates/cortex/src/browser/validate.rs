@@ -7,6 +7,29 @@ fn require_str(action: &str, args: &serde_json::Value, key: &str) -> Option<Stri
     }
 }
 
+/// Click/type targeting accepts either `selector` (CSS) or `ref` (`@e<N>`
+/// from a prior `snapshot`). Exactly one must be set — both means the model
+/// is ambiguous, neither means we have nothing to act on.
+fn require_selector_or_ref(action: &str, args: &serde_json::Value) -> Option<String> {
+    let sel = args.get("selector").and_then(serde_json::Value::as_str);
+    let r = args.get("ref").and_then(serde_json::Value::as_str);
+    match (sel, r) {
+        (Some(_), Some(_)) => Some(format!(
+            "{action}: provide either 'selector' or 'ref' (@e<N>), not both"
+        )),
+        (None, None) => Some(format!(
+            "{action} requires 'selector' (CSS) or 'ref' (e.g. '@e5' from snapshot)"
+        )),
+        (Some(s), None) if s.is_empty() => {
+            Some(format!("{action}: 'selector' must be non-empty"))
+        }
+        (None, Some(r)) if !r.starts_with("@e") => Some(format!(
+            "{action}: 'ref' must look like '@e<N>' (from snapshot); got '{r}'"
+        )),
+        _ => None,
+    }
+}
+
 /// Check that `args[key]` is a non-null integer, returning an error message if missing.
 fn require_u64(action: &str, args: &serde_json::Value, key: &str) -> Option<String> {
     if args.get(key).and_then(serde_json::Value::as_u64).is_some() {
@@ -20,9 +43,11 @@ fn require_u64(action: &str, args: &serde_json::Value, key: &str) -> Option<Stri
 pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<String> {
     match action {
         "navigate" => require_str(action, args, "url"),
-        "click" | "hover" => require_str(action, args, "selector"),
+        // click/hover accept either a CSS `selector` or an `@e<N>` snapshot
+        // ref. Reject when both are set so we don't silently pick one.
+        "click" | "hover" => require_selector_or_ref(action, args),
         "type" => {
-            require_str(action, args, "selector").or_else(|| require_str(action, args, "text"))
+            require_selector_or_ref(action, args).or_else(|| require_str(action, args, "text"))
         }
         "evaluate_js" => require_str(action, args, "expression"),
         "select" => {
@@ -38,6 +63,45 @@ pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<S
             }
             None
         }
+        "scroll" => {
+            let dx = args.get("delta_x").and_then(serde_json::Value::as_i64);
+            let dy = args.get("delta_y").and_then(serde_json::Value::as_i64);
+            match (dx, dy) {
+                (None, None) => Some(
+                    "scroll requires 'delta_x' or 'delta_y' (signed integer)".to_string(),
+                ),
+                _ => None,
+            }
+        }
+        "snapshot" => {
+            // Optional max_elements; when present it must be a positive int.
+            // (Zero is a no-op snapshot — refuse it rather than silently
+            // returning an empty tree.)
+            if let Some(v) = args.get("max_elements") {
+                match v.as_u64() {
+                    Some(0) | None => {
+                        return Some(
+                            "snapshot 'max_elements' must be a positive integer".to_string(),
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+            None
+        }
+        "upload" => {
+            if require_str(action, args, "selector").is_some() {
+                return Some("upload requires 'selector' parameter".to_string());
+            }
+            let files = args.get("files").and_then(|v| v.as_array());
+            match files {
+                Some(arr) if !arr.is_empty() && arr.iter().all(|v| v.is_string()) => None,
+                _ => Some(
+                    "upload requires 'files' parameter (non-empty array of paths)".to_string(),
+                ),
+            }
+        }
+        "back" | "forward" | "get_images" => None,
         "wait" => {
             let condition = args.get("condition").and_then(serde_json::Value::as_str);
             match condition {
@@ -163,6 +227,54 @@ mod tests {
             ("list_tabs", json!({}), false),
             ("close_tab", json!({}), false),
             ("get_console_logs", json!({}), false),
+            // back / forward / get_images take no params.
+            ("back", json!({}), false),
+            ("forward", json!({}), false),
+            ("get_images", json!({}), false),
+            // scroll — at least one of delta_x / delta_y required.
+            ("scroll", json!({}), true),
+            ("scroll", json!({"delta_y": 200}), false),
+            ("scroll", json!({"delta_x": -100}), false),
+            ("scroll", json!({"delta_x": 0, "delta_y": 0}), false), // both zero is allowed at validate; runtime rejects
+            // snapshot — optional max_elements, but 0 is rejected.
+            ("snapshot", json!({}), false),
+            ("snapshot", json!({"max_elements": 50}), false),
+            ("snapshot", json!({"max_elements": 0}), true),
+            ("snapshot", json!({"max_elements": "lots"}), true),
+            // upload — selector required, files must be non-empty string array.
+            ("upload", json!({}), true),
+            ("upload", json!({"selector": "input"}), true),
+            ("upload", json!({"selector": "input", "files": []}), true),
+            (
+                "upload",
+                json!({"selector": "input", "files": [42]}),
+                true,
+            ),
+            (
+                "upload",
+                json!({"selector": "input", "files": ["/tmp/a.png"]}),
+                false,
+            ),
+            // click — selector OR ref, not both, not neither.
+            ("click", json!({"ref": "@e5"}), false),
+            (
+                "click",
+                json!({"selector": "#btn", "ref": "@e5"}),
+                true,
+            ),
+            ("click", json!({"ref": "e5"}), true),
+            ("click", json!({"selector": ""}), true),
+            // type — same selector-or-ref rule + text required.
+            (
+                "type",
+                json!({"ref": "@e1", "text": "hi"}),
+                false,
+            ),
+            (
+                "type",
+                json!({"ref": "@e1"}),
+                true,
+            ),
         ];
 
         for (action, args, expect_err) in cases {

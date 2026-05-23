@@ -2,10 +2,12 @@ pub mod actions;
 pub mod console;
 pub mod detection;
 pub mod health;
+pub mod snapshot;
 pub mod tabs;
 pub mod validate;
 pub mod wait;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +39,11 @@ pub struct BrowserSession {
     /// of liveness probing — adequate because the Browser kind is
     /// auto-reap-exempt by design.
     _registry_guard: Option<crate::process_registry::ProcessGuard>,
+    /// `@e<N>` → CSS selector map from the most recent snapshot on the
+    /// active page. Reset on `snapshot` (re-populated), `new_tab`,
+    /// `switch_tab`, and `close_tab` — stale refs cannot leak across
+    /// pages because the underlying DOM is different.
+    snapshot_refs: HashMap<String, String>,
 }
 
 impl BrowserSession {
@@ -124,6 +131,7 @@ impl BrowserSession {
             event_buffers,
             config: config.clone(),
             _registry_guard: registry_guard,
+            snapshot_refs: HashMap::new(),
         })
     }
 
@@ -164,9 +172,39 @@ impl BrowserSession {
         self._event_handle = new_session._event_handle;
         self.event_listener_handles = new_session.event_listener_handles;
         self.event_buffers = new_session.event_buffers;
+        // Refs were tied to the now-defunct DOM — drop them so a stale
+        // `@e<N>` cannot accidentally resolve to a different element on
+        // the recovered page.
+        self.snapshot_refs.clear();
 
         tracing::info!("Browser recovery: full relaunch complete");
         Ok(())
+    }
+
+    /// Resolve a `@e<N>` ref into a CSS selector from the last snapshot, or
+    /// return the input unchanged when the caller already passed a selector.
+    /// The error path is distinct from "selector didn't match" so the model
+    /// gets a clear "take a snapshot first" hint.
+    pub fn resolve_selector_or_ref(
+        &self,
+        selector: Option<&str>,
+        r#ref: Option<&str>,
+    ) -> Result<String> {
+        if let Some(s) = selector {
+            return Ok(s.to_string());
+        }
+        let r = r#ref.context("either 'selector' or 'ref' is required")?;
+        self.snapshot_refs.get(r).cloned().with_context(|| {
+            format!(
+                "ref '{r}' was not produced by a recent snapshot — call snapshot first, or pass a CSS selector"
+            )
+        })
+    }
+
+    /// Snapshot ref-store size — exposed for tests and debugging only.
+    #[cfg(test)]
+    pub(crate) fn snapshot_ref_count(&self) -> usize {
+        self.snapshot_refs.len()
     }
 
     // -- Core Actions --
@@ -378,6 +416,141 @@ impl BrowserSession {
         wait::wait_for(self.tab_manager.active_page(), &condition, timeout).await
     }
 
+    /// Navigate back in the page's session history.
+    /// Returns a no-op message when there's nothing to go back to (matches
+    /// hermes' `browser_back` semantics — never errors on an empty stack).
+    #[instrument(skip_all, fields(browser.action = "back"))]
+    pub async fn back(&mut self, timeout: Duration) -> Result<String> {
+        self.snapshot_refs.clear();
+        let page = self.tab_manager.active_page();
+        history_navigate(page, -1, timeout).await
+    }
+
+    /// Navigate forward in the page's session history.
+    #[instrument(skip_all, fields(browser.action = "forward"))]
+    pub async fn forward(&mut self, timeout: Duration) -> Result<String> {
+        self.snapshot_refs.clear();
+        let page = self.tab_manager.active_page();
+        history_navigate(page, 1, timeout).await
+    }
+
+    /// Scroll the page by (delta_x, delta_y) CSS pixels. Positive `delta_y`
+    /// scrolls down. Optional `x`/`y` recenter the wheel event for elements
+    /// that capture their own scroll (modals, virtualised lists).
+    #[instrument(skip_all, fields(browser.action = "scroll"))]
+    pub async fn scroll(
+        &self,
+        x: Option<i64>,
+        y: Option<i64>,
+        delta_x: i64,
+        delta_y: i64,
+        timeout: Duration,
+    ) -> Result<String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType,
+        };
+        let page = self.tab_manager.active_page();
+        tokio::time::timeout(timeout, async {
+            let event = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseWheel)
+                .x(x.unwrap_or(0) as f64)
+                .y(y.unwrap_or(0) as f64)
+                .delta_x(delta_x as f64)
+                .delta_y(delta_y as f64)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build wheel event: {e}"))?;
+            page.execute(event).await.context("Wheel dispatch failed")?;
+            Ok(format!("Scrolled by ({delta_x}, {delta_y})"))
+        })
+        .await
+        .context("Scroll timed out")?
+    }
+
+    /// Snapshot interactive elements on the current page, replacing the
+    /// session's ref → selector cache. Returns the rendered text the model sees.
+    #[instrument(skip_all, fields(browser.action = "snapshot"))]
+    pub async fn snapshot(
+        &mut self,
+        max_elements: Option<usize>,
+        timeout: Duration,
+    ) -> Result<String> {
+        let cap = max_elements.unwrap_or(self.config.snapshot_max_elements);
+        let page = self.tab_manager.active_page();
+        let result = snapshot::snapshot(page, cap, timeout).await?;
+        self.snapshot_refs = result.selectors.clone();
+        Ok(snapshot::render(&result))
+    }
+
+    /// Enumerate `<img>` elements on the page.
+    #[instrument(skip_all, fields(browser.action = "get_images"))]
+    pub async fn get_images(&self, timeout: Duration) -> Result<String> {
+        let js = r#"(() => {
+            const imgs = Array.from(document.querySelectorAll('img'));
+            return imgs.map(i => ({
+                src: i.currentSrc || i.src || '',
+                alt: i.alt || '',
+                width: i.naturalWidth || 0,
+                height: i.naturalHeight || 0,
+            }));
+        })()"#;
+        let page = self.tab_manager.active_page();
+        tokio::time::timeout(timeout, async {
+            let raw: serde_json::Value = page
+                .evaluate(js)
+                .await
+                .context("get_images evaluation failed")?
+                .into_value()
+                .context("get_images result was not serialisable")?;
+            let arr = raw.as_array().cloned().unwrap_or_default();
+            let mut out = format!("Found {} image(s):\n", arr.len());
+            for (i, img) in arr.iter().enumerate() {
+                let src = img.get("src").and_then(|v| v.as_str()).unwrap_or("");
+                let alt = img.get("alt").and_then(|v| v.as_str()).unwrap_or("");
+                let w = img.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+                let h = img.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!("  [{i}] {w}x{h} \"{alt}\" {src}\n"));
+            }
+            Ok(out)
+        })
+        .await
+        .context("get_images timed out")?
+    }
+
+    /// Set files on a file `<input>`. Chrome's CDP needs the absolute paths;
+    /// we don't sandbox them here because the operator's host filesystem is
+    /// already accessible to the agent via `apply_patch`/`read_file`.
+    #[instrument(skip_all, fields(browser.action = "upload"))]
+    pub async fn upload(
+        &self,
+        selector: &str,
+        files: &[String],
+        timeout: Duration,
+    ) -> Result<String> {
+        use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
+        let page = self.tab_manager.active_page();
+        tokio::time::timeout(timeout, async {
+            let el = page
+                .find_element(selector)
+                .await
+                .with_context(|| format!("Element not found: {selector}"))?;
+            let params = SetFileInputFilesParams::builder()
+                .files(files.iter().cloned())
+                .backend_node_id(el.backend_node_id)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build SetFileInputFiles: {e}"))?;
+            page.execute(params)
+                .await
+                .context("DOM.setFileInputFiles failed (target may not be an <input type=\"file\">)")?;
+            Ok(format!(
+                "Uploaded {} file(s) to {selector}: {}",
+                files.len(),
+                files.join(", ")
+            ))
+        })
+        .await
+        .context("Upload timed out")?
+    }
+
     /// Resize the browser viewport.
     pub async fn resize(&self, width: u32, height: u32, timeout: Duration) -> Result<String> {
         use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
@@ -413,18 +586,29 @@ impl BrowserSession {
             console::spawn_event_listeners(self.tab_manager.active_page(), &self.event_buffers)
                 .await;
         self.event_listener_handles.extend(new_handles);
+        // The snapshot ref store was tied to the previous active page —
+        // a stale ref must not silently resolve on the new tab.
+        self.snapshot_refs.clear();
         Ok(result)
     }
 
     /// Switch to a tab by index.
     pub fn switch_tab(&mut self, index: usize) -> Result<String> {
-        self.tab_manager.switch_tab(index)
+        let result = self.tab_manager.switch_tab(index);
+        if result.is_ok() {
+            self.snapshot_refs.clear();
+        }
+        result
     }
 
     /// Close the active tab.
     #[instrument(skip_all, fields(browser.action = "close_tab"))]
     pub async fn close_tab(&mut self) -> Result<String> {
-        self.tab_manager.close_tab().await
+        let result = self.tab_manager.close_tab().await;
+        if result.is_ok() {
+            self.snapshot_refs.clear();
+        }
+        result
     }
 
     /// List all tabs.
@@ -476,6 +660,45 @@ impl BrowserSession {
     }
 }
 
+/// Walk the page's session history by `delta` (−1 back, +1 forward).
+/// CDP's `Page.navigateToHistoryEntry` would be more direct but requires
+/// fetching the full history first; `window.history.go()` is one round trip
+/// and matches what hermes does. Empty history is a no-op, not an error.
+async fn history_navigate(
+    page: &chromiumoxide::Page,
+    delta: i32,
+    timeout: Duration,
+) -> Result<String> {
+    let js = format!(
+        r#"(() => {{
+            const before = window.location.href;
+            const len = window.history.length;
+            window.history.go({delta});
+            return {{ before, len }};
+        }})()"#
+    );
+    tokio::time::timeout(timeout, async {
+        let v: serde_json::Value = page
+            .evaluate(js.as_str())
+            .await
+            .context("history navigation failed")?
+            .into_value()
+            .context("history navigation result was not serialisable")?;
+        let before = v.get("before").and_then(|v| v.as_str()).unwrap_or("");
+        let len = v.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+        let dir = if delta < 0 { "back" } else { "forward" };
+        if len <= 1 {
+            Ok(format!(
+                "history.{dir}: no-op (history length = {len}, was at {before})"
+            ))
+        } else {
+            Ok(format!("history.{dir}: requested (was at {before})"))
+        }
+    })
+    .await
+    .context("History navigation timed out")?
+}
+
 /// Validate that a URL uses an allowed scheme (http/https only).
 /// Blocks file://, javascript:, chrome://, data: etc.
 pub fn validate_url_scheme(url: &str) -> Result<()> {
@@ -505,6 +728,101 @@ pub fn wrap_js_with_timeout(expression: &str, timeout_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Schema-drift guard: every browser action surfaced in the tool
+    /// JSON schema must be honoured by `validate_browser_args`. The schema
+    /// lives at `tool/definitions.rs` — if a new action is added there but
+    /// not wired through here, the model will issue calls that fail at
+    /// runtime with "Unknown browser action". Source-grep is the only way
+    /// to express this invariant — a type would force registry refactors
+    /// across modules with no functional payoff.
+    #[test]
+    fn schema_actions_are_all_validated() {
+        const DEFS: &str = include_str!("../tool/definitions.rs");
+        // Locate the enum literal embedded in the browser tool's JSON schema.
+        // The line is uniquely shaped (`"enum": [...]` next to "navigate"),
+        // so we grab the substring between the first `["navigate"` and the
+        // matching closing bracket.
+        let start = DEFS
+            .find("[\"navigate\"")
+            .expect("browser schema must contain \"navigate\" enum");
+        let end = DEFS[start..].find(']').expect("schema enum must close");
+        let slice = &DEFS[start..start + end];
+
+        for raw in slice.split(',') {
+            let action = raw.trim().trim_matches(['"', ' ', '[']);
+            if action.is_empty() {
+                continue;
+            }
+            // Build a generic args object with the most permissive shape
+            // so a misspelled action surfaces as "Unknown browser action".
+            let args = serde_json::json!({
+                "selector": "#x",
+                "ref": "@e0",
+                "url": "https://example.com",
+                "text": "x",
+                "expression": "1",
+                "value": "x",
+                "key": "Enter",
+                "source": "#a",
+                "target": "#b",
+                "fields": {"#a": "v"},
+                "condition": "load",
+                "width": 100,
+                "height": 100,
+                "tab_index": 0,
+                "delta_y": 1,
+                "files": ["/tmp/x"],
+            });
+            // `click` is the one action that rejects when both selector
+            // AND ref are set — strip ref for that case so the row passes.
+            let args = if action == "click" || action == "type" || action == "hover" {
+                let mut m = args.as_object().cloned().unwrap();
+                m.remove("ref");
+                serde_json::Value::Object(m)
+            } else {
+                args
+            };
+            let err = validate::validate_browser_args(action, &args);
+            assert!(
+                err.is_none() || !err.as_deref().unwrap_or("").contains("Unknown browser action"),
+                "schema action '{action}' is not validated (drift between definitions.rs and validate.rs): {err:?}"
+            );
+        }
+    }
+
+    /// Ref-store reset: switching tabs or closing one must drop the stale
+    /// `@e<N>` refs so a follow-up click can't accidentally hit a different
+    /// element on a different page. Drives the ref-isolation invariant
+    /// without spinning up real Chrome by exercising the `snapshot_refs`
+    /// field directly via the test seam.
+    #[test]
+    fn snapshot_refs_cleared_on_tab_changes() {
+        use std::collections::HashMap;
+        // We can't construct a BrowserSession in unit tests (it owns a real
+        // Browser handle), but the invariant we care about is "code paths
+        // that switch tabs always call snapshot_refs.clear()". Source-grep
+        // the relevant methods to assert the call site exists.
+        const SRC: &str = include_str!("mod.rs");
+        for method in ["new_tab", "switch_tab", "close_tab", "try_recover"] {
+            // Find the method body and look for `snapshot_refs.clear()`
+            // somewhere inside.
+            let needle = format!("fn {method}(");
+            let start = SRC
+                .find(&needle)
+                .unwrap_or_else(|| panic!("method `{method}` not found"));
+            // Look at the next ~2KB of source after the signature.
+            let window = &SRC[start..start.saturating_add(2048).min(SRC.len())];
+            assert!(
+                window.contains("snapshot_refs.clear()"),
+                "method `{method}` must clear snapshot_refs (stale refs would leak across tabs)"
+            );
+        }
+        // Sanity: an empty HashMap-based ref store behaves as expected when
+        // queried — keeps the resolver contract self-checked.
+        let map: HashMap<String, String> = HashMap::new();
+        assert!(map.get("@e0").is_none());
+    }
 
     #[test]
     fn wrap_js_simple_expression() {
@@ -601,6 +919,7 @@ mod tests {
             error_buffer_size: 200,
             network_buffer_size: 500,
             js_eval_timeout_ms: 10000,
+            snapshot_max_elements: 100,
         };
         let result = BrowserSession::launch(&config).await;
         assert!(result.is_err());

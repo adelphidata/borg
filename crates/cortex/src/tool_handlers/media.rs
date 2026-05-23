@@ -193,16 +193,26 @@ pub async fn handle_browser(
             )
         }
         "click" => {
-            let selector = require_str_param(args, "selector")?;
-            browser_action_with_recovery!(browser, "click", browser.click(selector, timeout).await)
+            let selector_opt = args.get("selector").and_then(|v| v.as_str());
+            let ref_opt = args.get("ref").and_then(|v| v.as_str());
+            let resolved = match browser.resolve_selector_or_ref(selector_opt, ref_opt) {
+                Ok(s) => s,
+                Err(e) => return Ok(ToolOutput::Text(format!("Error: {e}"))),
+            };
+            browser_action_with_recovery!(browser, "click", browser.click(&resolved, timeout).await)
         }
         "type" => {
-            let selector = require_str_param(args, "selector")?;
+            let selector_opt = args.get("selector").and_then(|v| v.as_str());
+            let ref_opt = args.get("ref").and_then(|v| v.as_str());
+            let resolved = match browser.resolve_selector_or_ref(selector_opt, ref_opt) {
+                Ok(s) => s,
+                Err(e) => return Ok(ToolOutput::Text(format!("Error: {e}"))),
+            };
             let text = require_str_param(args, "text")?;
             browser_action_with_recovery!(
                 browser,
                 "type",
-                browser.type_text(selector, text, timeout).await
+                browser.type_text(&resolved, text, timeout).await
             )
         }
         "screenshot" => {
@@ -336,6 +346,62 @@ pub async fn handle_browser(
         }
         "close_tab" => browser_result(browser.close_tab().await),
         "get_console_logs" => Ok(ToolOutput::Text(browser.get_console_logs())),
+        "back" => browser_result(browser.back(timeout).await),
+        "forward" => browser_result(browser.forward(timeout).await),
+        "scroll" => {
+            let x = args.get("x").and_then(serde_json::Value::as_i64);
+            let y = args.get("y").and_then(serde_json::Value::as_i64);
+            let dx = args
+                .get("delta_x")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let dy = args
+                .get("delta_y")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if dx == 0 && dy == 0 {
+                return Ok(ToolOutput::Text(
+                    "Error: scroll requires non-zero 'delta_x' or 'delta_y'".to_string(),
+                ));
+            }
+            browser_action_with_recovery!(
+                browser,
+                "scroll",
+                browser.scroll(x, y, dx, dy, timeout).await
+            )
+        }
+        "snapshot" => {
+            let cap = args
+                .get("max_elements")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize);
+            browser_result(browser.snapshot(cap, timeout).await)
+        }
+        "get_images" => {
+            browser_action_with_recovery!(browser, "get_images", browser.get_images(timeout).await)
+        }
+        "upload" => {
+            let selector = require_str_param(args, "selector")?;
+            let files: Vec<String> = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Ok(ToolOutput::Text(
+                    "Error: upload requires non-empty 'files' (string paths)".to_string(),
+                ));
+            }
+            browser_action_with_recovery!(
+                browser,
+                "upload",
+                browser.upload(selector, &files, timeout).await
+            )
+        }
         _ => Ok(ToolOutput::Text(format!(
             "Unknown browser action: {action}"
         ))),
@@ -423,6 +489,91 @@ mod tests {
             assert!(msg.contains("No browser session"), "got: {msg}");
         } else {
             panic!("expected text output for close-without-session");
+        }
+    }
+
+    /// Scroll without a delta is a no-op the model wouldn't notice. Reject
+    /// pre-launch so a confused agent can't spin its wheels (literally)
+    /// without ever leaving the page.
+    #[tokio::test]
+    async fn handle_browser_scroll_requires_delta() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(&json!({"action": "scroll"}), &config, &mut session)
+            .await
+            .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("Error"), "expected validation error, got: {msg}");
+            assert!(msg.contains("delta"), "missing delta hint: {msg}");
+        } else {
+            panic!("expected text output");
+        }
+    }
+
+    /// Upload without files is a silent no-op at the CDP layer — surface
+    /// it as an explicit validation error before Chrome is launched.
+    #[tokio::test]
+    async fn handle_browser_upload_requires_non_empty_files() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(
+            &json!({"action": "upload", "selector": "input[type=file]", "files": []}),
+            &config,
+            &mut session,
+        )
+        .await
+        .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("Error"));
+            assert!(msg.contains("files"));
+        } else {
+            panic!("expected text output");
+        }
+    }
+
+    /// Snapshot with `max_elements: 0` is a degenerate request (returns
+    /// nothing useful). Bail at validation rather than letting the JS walk
+    /// run for zero results and the model be confused by the empty list.
+    #[tokio::test]
+    async fn handle_browser_snapshot_rejects_zero_max_elements() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(
+            &json!({"action": "snapshot", "max_elements": 0}),
+            &config,
+            &mut session,
+        )
+        .await
+        .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("positive"), "expected validation msg: {msg}");
+        } else {
+            panic!("expected text output");
+        }
+    }
+
+    /// click + both `selector` and `ref` is an ambiguous target — fail
+    /// before launching Chrome, same reason ambiguous element_index on
+    /// computer_use fails.
+    #[tokio::test]
+    async fn handle_browser_click_rejects_selector_and_ref_together() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(
+            &json!({"action": "click", "selector": "#a", "ref": "@e0"}),
+            &config,
+            &mut session,
+        )
+        .await
+        .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("not both"), "got: {msg}");
+        } else {
+            panic!("expected text output");
         }
     }
 
