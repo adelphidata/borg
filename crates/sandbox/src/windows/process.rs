@@ -18,15 +18,29 @@ use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, TRUE, WAIT_OBJE
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
-    INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
-/// Owning handle to a spawned process + its main thread.
+/// Owning handle to a spawned process + its main thread + the
+/// containing job object. Dropping closes all three handles. With
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set on the job (see
+/// [`spawn_with_token`]), the kernel terminates every process inside
+/// the job the moment the parent's last handle to the job closes —
+/// so a crash of the trampoline reliably kills the wrapped child
+/// instead of leaving an orphan running under a restricted token
+/// that no longer has a supervisor.
 pub struct SpawnedChild {
     process: HANDLE,
     thread: HANDLE,
+    job: HANDLE,
     pid: u32,
 }
 
@@ -66,16 +80,23 @@ impl SpawnedChild {
 
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
-        // SAFETY: We own both handles. CloseHandle on a process
-        // handle does NOT terminate the process; it only releases
-        // our reference. The kernel reaps the process record after
-        // every handle goes away.
+        // SAFETY: we own all three handles. Drop order matters when
+        // KILL_ON_JOB_CLOSE is in effect: closing the job handle
+        // terminates the child. The trampoline reaches Drop only
+        // after wait_for_exit returns, by which point the child has
+        // already exited — so closing the job handle is the
+        // unambiguous "done" signal to the kernel. Closing process /
+        // thread handles does NOT terminate the child; it releases
+        // our reference and lets the kernel reap the records.
         unsafe {
             if !self.process.is_null() {
                 CloseHandle(self.process);
             }
             if !self.thread.is_null() {
                 CloseHandle(self.thread);
+            }
+            if !self.job.is_null() {
+                CloseHandle(self.job);
             }
         }
     }
@@ -180,11 +201,14 @@ pub unsafe fn spawn_with_token(
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    let creation_flags = if env_block.is_some() {
-        CREATE_UNICODE_ENVIRONMENT
-    } else {
-        0
-    };
+    // CREATE_SUSPENDED so we can AssignProcessToJobObject *before* the
+    // child runs any code. A child that escapes the job before
+    // assignment defeats KILL_ON_JOB_CLOSE — the assignment must
+    // race-freely precede ResumeThread.
+    let mut creation_flags = CREATE_SUSPENDED;
+    if env_block.is_some() {
+        creation_flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
     let env_ptr = match env_block {
         Some(b) => b.as_ptr() as *const core::ffi::c_void,
         None => ptr::null(),
@@ -217,11 +241,124 @@ pub unsafe fn spawn_with_token(
         return Err(io::Error::last_os_error());
     }
 
+    // From here we must clean up the suspended child on any error path
+    // — leaving a suspended child behind would defeat the sandbox.
+    let job = match create_kill_on_close_job() {
+        Ok(j) => j,
+        Err(e) => {
+            // SAFETY: pi handles are valid; the suspended child is
+            // explicitly torn down via TerminateProcess in the helper.
+            unsafe {
+                terminate_and_close_suspended_child(pi.hProcess, pi.hThread);
+            }
+            return Err(e);
+        }
+    };
+    // SAFETY: job and pi.hProcess are both valid handles owned by us.
+    let ok = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
+    if ok == FALSE {
+        let err = io::Error::last_os_error();
+        // SAFETY: same as the previous teardown.
+        unsafe {
+            CloseHandle(job);
+            terminate_and_close_suspended_child(pi.hProcess, pi.hThread);
+        }
+        return Err(err);
+    }
+    // Now safe to resume — the kernel will enforce job containment.
+    // SAFETY: thread handle is valid and the child is in the job.
+    let resume_rc = unsafe { ResumeThread(pi.hThread) };
+    if resume_rc == u32::MAX {
+        let err = io::Error::last_os_error();
+        // SAFETY: same as above.
+        unsafe {
+            CloseHandle(job);
+            terminate_and_close_suspended_child(pi.hProcess, pi.hThread);
+        }
+        return Err(err);
+    }
+
     Ok(SpawnedChild {
         process: pi.hProcess,
         thread: pi.hThread,
+        job,
         pid: pi.dwProcessId,
     })
+}
+
+/// Create a kill-on-job-close job object. The job is anonymous (no
+/// name) and not inheritable (no SA), so only the trampoline holds a
+/// handle to it.
+///
+/// `BREAKAWAY_OK` and `SILENT_BREAKAWAY_OK` are NOT set: children
+/// inside the job cannot escape it via `CREATE_BREAKAWAY_FROM_JOB`.
+/// Together with the restricted token (which prevents many escape
+/// vectors), this is the load-bearing part of "the trampoline crashing
+/// reliably kills the wrapped child."
+fn create_kill_on_close_job() -> io::Result<HANDLE> {
+    // SAFETY: name pointer is null (anonymous job), SA pointer is null
+    // (default DACL, not inheritable). CreateJobObjectW returns NULL on
+    // failure with GetLastError set.
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        ..unsafe { std::mem::zeroed() }
+    };
+    // Verify at compile time that the two breakaway flags are NOT in
+    // our LimitFlags — if a future refactor accidentally OR's them in,
+    // this assertion will trip on the very first sandbox spawn.
+    debug_assert_eq!(
+        info.BasicLimitInformation.LimitFlags
+            & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK),
+        0,
+        "breakaway flags must not be set — they let children escape the job",
+    );
+    // SAFETY: info is a stack-local fully-initialized struct; size is
+    // the actual struct size.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == FALSE {
+        let err = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(err);
+    }
+    Ok(job)
+}
+
+/// Helper to tear down a suspended child when an error happens between
+/// `CreateProcessAsUserW` and `ResumeThread`. We must NOT leave the
+/// suspended process behind — its restricted token + inherited handles
+/// would be a small but real resource leak per failed spawn.
+///
+/// # Safety
+///
+/// Caller must own both handles. TerminateProcess on a suspended child
+/// is well-defined; the child never ran any code.
+unsafe fn terminate_and_close_suspended_child(process: HANDLE, thread: HANDLE) {
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    if !process.is_null() {
+        unsafe {
+            TerminateProcess(process, 1);
+            CloseHandle(process);
+        }
+    }
+    if !thread.is_null() {
+        unsafe {
+            CloseHandle(thread);
+        }
+    }
 }
 
 #[cfg(test)]
