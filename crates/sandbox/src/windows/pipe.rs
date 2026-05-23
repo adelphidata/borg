@@ -129,6 +129,10 @@ pub fn send(request: &SpawnRequest) -> io::Result<PipeSession> {
     let session = PipeSession {
         read_handle: read_h,
     };
+    // write_h must be closed on every exit path — including early
+    // errors — or we leak one HANDLE per failed spawn. WriteHandleGuard
+    // closes on Drop unless explicitly disarmed on the success path.
+    let mut write_guard = WriteHandleGuard { h: write_h };
     // The write-end must NOT be inheritable — only the child should
     // hold a reference to it, and only because we're about to close
     // it in the parent before spawn. Set the flag explicitly.
@@ -136,10 +140,36 @@ pub fn send(request: &SpawnRequest) -> io::Result<PipeSession> {
     set_inherit(read_h, true)?;
 
     write_all(write_h, &bytes)?;
+    write_guard.disarm();
     close(write_h);
     // session keeps read_h alive; caller embeds handle_decimal() on
     // argv and stashes session in SandboxCommand::_resources.
     Ok(session)
+}
+
+/// RAII guard that closes a write-end HANDLE on Drop unless explicitly
+/// disarmed. Used in `send` so that early-error paths between
+/// CreatePipe and the final write_all don't leak the write-end.
+struct WriteHandleGuard {
+    h: HANDLE,
+}
+
+impl WriteHandleGuard {
+    fn disarm(&mut self) {
+        self.h = ptr::null_mut();
+    }
+}
+
+impl Drop for WriteHandleGuard {
+    fn drop(&mut self) {
+        if !self.h.is_null() && self.h != INVALID_HANDLE_VALUE {
+            // SAFETY: we own this handle (CreatePipe returned it; the
+            // success path zeroes self.h before this Drop runs).
+            unsafe {
+                CloseHandle(self.h);
+            }
+        }
+    }
 }
 
 /// Read a `SpawnRequest` from the inherited pipe read-end. Called by

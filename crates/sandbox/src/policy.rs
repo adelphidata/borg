@@ -305,6 +305,7 @@ impl SandboxPolicy {
             return SandboxCommand {
                 program: program.to_string(),
                 args: args.to_vec(),
+                _resources: None,
             };
         }
         use crate::bubblewrap::build_bwrap_args;
@@ -315,6 +316,7 @@ impl SandboxPolicy {
         SandboxCommand {
             program: "bwrap".to_string(),
             args: bwrap_args,
+            _resources: None,
         }
     }
 

@@ -34,9 +34,12 @@
 //! and the auto-promote detection logic. The operational paths
 //! (`NetUserAdd` to create accounts, `LogonUserW` to obtain a sandbox-
 //! account primary token, `CreateProcessAsUserW` with that token) are
-//! marked TODO. Until they land, `mode::detect()` returns `Tier1`
-//! unconditionally on every host — Tier 2 is unreachable, which is
-//! the safe state.
+//! marked TODO. `mode::detect()` *will* return `Tier::Tier2` whenever
+//! a valid `setup.json` is present — but until the operational FFI
+//! lands, the spawn path itself (via `wfp::install_offline_outbound_block`
+//! and the named-pipe runner client) returns `ErrorKind::Unsupported`
+//! and the trampoline falls back to Tier 1 anyway. The safe state is
+//! preserved by the spawn path, not by the detector.
 
 pub mod account;
 pub mod mode;
