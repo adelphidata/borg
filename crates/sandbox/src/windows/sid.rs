@@ -14,6 +14,7 @@
 #[cfg(target_os = "windows")]
 pub use win::{
     generate_random_cap_sid_string, load_or_generate_seed, workspace_cap_sid_string, LocalSid,
+    SEED_LEN,
 };
 
 #[cfg(target_os = "windows")]
@@ -123,7 +124,7 @@ mod win {
     const HKDF_INFO: &[u8] = b"borg-cap-sid-v1";
     /// Seed length in bytes. 32 = 256-bit secret; HKDF output stays at
     /// 16 bytes (the four `u32` subauthorities).
-    const SEED_LEN: usize = 32;
+    pub const SEED_LEN: usize = 32;
 
     /// Load `seed` from `~/.borg/sandbox-windows/cap-sid-seed`,
     /// creating it on first use. The seed is read-only-by-default so a

@@ -170,5 +170,11 @@ jobs:
         run: cargo fmt -p sandbox --check
       - name: cargo clippy -p sandbox
         run: cargo clippy -p sandbox --all-targets -- -D warnings
-      - name: cargo test -p sandbox
-        run: cargo test -p sandbox --lib
+      - name: cargo test -p sandbox (lib + bins)
+        run: cargo test -p sandbox --lib --bins
+      - name: cargo test -p sandbox (real-FFI smoke)
+        # Phase 12 partial-coverage lane: drives real CreatePipe /
+        # CreateDesktopW / CryptProtectData / CreatePseudoConsole on
+        # the runner. See `crates/sandbox/tests/windows_ffi_smoke.rs`
+        # for the carve-out vs full-VM validation.
+        run: cargo test -p sandbox --test windows_ffi_smoke

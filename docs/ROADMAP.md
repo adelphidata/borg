@@ -458,42 +458,78 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   `KILL_ON_JOB_CLOSE` containment, `ProcThreadAttributeList`
   mitigation policies, per-spawn isolated desktop, HKDF-derived
   stable per-workspace cap SIDs, and structured audit events) ports
-  cleanly to the Windows target and now compiles in a new
-  `windows-sandbox` CI job. The FFI paths still need to run on real
-  hardware — spin up a Windows VM, run `cargo test -p sandbox --lib
---target x86_64-pc-windows-msvc`, then exercise the trampoline
-  end-to-end: set `sandbox.enabled = true`, ask the agent to
-  `run_shell` something that reads `~\.ssh\fake_file` (assert
-  `Access is denied`) and that writes to the workspace (assert
-  success). Until this is done, treat the sandbox as in-development
-  and recommend operators run with `sandbox.enabled = false` if they
-  hit issues.
+  cleanly to the Windows target and the `windows-sandbox` CI job
+  now runs the `windows_ffi_smoke` integration test (real
+  `CreatePipe` / `CreateDesktopW` / `CryptProtectData` /
+  `CreatePseudoConsole`) on every PR. The remaining gap is the
+  full end-to-end policy-enforcement check: spin up a Windows VM,
+  set `sandbox.enabled = true`, ask the agent to `run_shell`
+  something that reads `~\.ssh\fake_file` (assert `Access is
+  denied`) and that writes to the workspace (assert success). This
+  requires HKCU + admin context the GH-actions Windows runners
+  don't provide. Until that pass happens, treat the sandbox as
+  in-development and recommend operators run with
+  `sandbox.enabled = false` if they hit issues.
 - **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users +
-  DPAPI + caller-authenticating named-pipe IPC).** Scaffolding shipped,
-  operational FFI pending. The module structure
-  (`crates/sandbox/src/windows/elevated/`) defines the
-  `BorgSandboxOffline` / `BorgSandboxOnline` account names and account
-  selection logic, the `setup.json` schema with version detection, the
-  Tier 1↔Tier 2 mode-detection auto-promote check, and the named-pipe
-  naming convention with owner-only SDDL. DPAPI seal/unseal
-  (`windows/dpapi.rs`) is fully implemented. WFP install/uninstall
-  (`windows/wfp.rs`) returns `Unsupported` until the operational pass
-  lands. The operational chunk that remains: `borg service install
-  --windows-sandbox` UAC subcommand, `NetUserAdd` for account
-  provisioning, `LogonUserW` + `CreateProcessAsUserW` under the
-  sandbox account in an elevated runner binary, and `FwpmFilterAdd0`
-  for the offline-account network block (full transactional install in
-  `wfp.rs::install_offline_outbound_block`). Auto-fallback to Tier 1
-  is already wired: with no `setup.json`, `mode::detect()` returns
-  `Tier1`, mirroring the `security.kek_backend = auto` pattern.
-- **Windows sandbox — ConPTY for stdio.** Deferred. The trampoline
-  currently inherits the parent's stdio handles directly. Wrapping
-  the wrapped command in a pseudo-console
-  (`CreatePseudoConsole`/`ResizePseudoConsole`) gives the sandboxed
-  child a real terminal interface without exposing the parent's
-  console handles, and is required for any future "interactive
-  sandboxed shell" use case (e.g. `borg shell`). Pumps PTY bytes →
-  parent stdout/stderr in a tokio task.
+  DPAPI + caller-authenticating named-pipe IPC).** Scaffolding
+  shipped, operational FFI pending. What is in place:
+  - `crates/sandbox/src/windows/elevated/` — module structure,
+    `BorgSandboxOffline` / `BorgSandboxOnline` account names +
+    selection logic, `setup.json` schema with version detection,
+    Tier 1↔Tier 2 `mode::detect()` auto-promote, named-pipe naming +
+    owner-only SDDL constants.
+  - `crates/sandbox/src/windows/dpapi.rs` — full `CryptProtectData` /
+    `CryptUnprotectData` seal/unseal with `CRYPTPROTECT_LOCAL_MACHINE`.
+  - `crates/sandbox/src/windows/wfp.rs` — provider/sublayer GUIDs,
+    install/uninstall function signatures. Body returns
+    `io::ErrorKind::Unsupported`.
+  - Auto-fallback: with no `setup.json`, `mode::detect()` returns
+    `Tier1`. Tier 2 is strictly additive.
+
+  What remains:
+  - `borg service install --windows-sandbox` clap subcommand (UAC
+    prompt, account creation, WFP install, setup.json write).
+  - `NetUserAdd` / `NetLocalGroupAddMembers` / privilege grants
+    (`SeBatchLogonRight`; `SeDenyInteractiveLogonRight` /
+    `SeDenyNetworkLogonRight`).
+  - Elevated runner binary (new `borgd-sandbox-runner` bin or
+    sub-bin of `borgd`): `LogonUserW(LOGON32_LOGON_BATCH)` →
+    `CreateProcessAsUserW` under the sandbox account, brokering
+    `SpawnRequest`s over the SDDL-authenticated named pipe.
+  - Operational body for
+    `wfp::install_offline_outbound_block` /
+    `wfp::uninstall_offline_outbound_block` —
+    `FwpmEngineOpen0` + transactional `FwpmProviderAdd0` /
+    `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2 (V4 + V6) with
+    `FWPM_CONDITION_ALE_USER_ID == offline_sid` + `BLOCK` action +
+    `PERSISTENT | BOOTTIME` flags.
+  - Trampoline routing: in `build_trampoline_command`, call
+    `elevated::mode::detect()` and dispatch to the runner over the
+    named pipe when `Tier2`; keep the current anonymous-pipe path
+    as the Tier 1 fallback.
+- **Windows sandbox — ConPTY wire-up.** Scaffolding shipped,
+  spawn integration pending.
+  `crates/sandbox/src/windows/conpty.rs` provides
+  `OwnedPseudoConsole` (RAII `CreatePseudoConsole` +
+  `ClosePseudoConsole`, with input/output pipe parent-side handles
+  exposed). What remains: replace `STARTF_USESTDHANDLES` in
+  `process::spawn_with_token` with the
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute, spawn a tokio
+  task that pumps bytes between the PTY's parent-side pipes and the
+  trampoline's stdin/stdout/stderr, and handle SIGWINCH-style resize
+  (`ResizePseudoConsole` on terminal-size change). Defer until a
+  Windows VM is available — the change touches every sandboxed-tool
+  invocation, and a regression here breaks `run_shell` on Windows.
+- **Windows sandbox — full real-host validation pass.** Once the
+  three preceding bullets land, the remaining work is a
+  documented hands-on validation on a real Windows VM with admin
+  rights: run `borg service install --windows-sandbox`, exercise
+  the trampoline end-to-end against both `BorgSandboxOnline` and
+  `BorgSandboxOffline`, assert WFP enforcement (`curl example.com`
+  fails under Offline, succeeds under Online), assert cap-SID DACL
+  enforcement (read of a deny-path returns `Access is denied`).
+  Then strike the "in-development" caveat from this section and
+  recommend `sandbox.enabled = true` as the default.
 - **Docker / SSH sandbox backends.** `[O]` In addition to Seatbelt
   and bwrap, allow agent-issued shell to run inside a Docker container
   or over SSH to a remote VM. Makes Linux desktop installs (where
