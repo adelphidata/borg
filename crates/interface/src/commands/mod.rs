@@ -8,6 +8,7 @@ pub(crate) mod doctor;
 pub(crate) mod export;
 pub(crate) mod heal;
 pub(crate) mod mcp;
+pub(crate) mod mcp_client;
 pub(crate) mod memory;
 pub(crate) mod misc;
 pub(crate) mod pairing;

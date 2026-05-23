@@ -14,6 +14,7 @@ path = "src/main.rs"
 cortex = { path = "../cortex" }
 heartbeat = { path = "../heartbeat" }
 gateway = { path = "../gateway" }
+mcp = { path = "../mcp" }
 plugins = { path = "../plugins" }
 protocols = { path = "../protocols" }
 borgd = { path = "../borgd" }

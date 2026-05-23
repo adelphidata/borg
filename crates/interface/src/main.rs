@@ -242,7 +242,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::webhook::WebhookAction>,
     },
-    /// Run Borg as a Model Context Protocol (MCP) server
+    /// Manage MCP (Model Context Protocol) — add/list/test external MCP servers, or run Borg as one over stdio
     Mcp {
         #[command(subcommand)]
         action: Option<commands::mcp::McpAction>,

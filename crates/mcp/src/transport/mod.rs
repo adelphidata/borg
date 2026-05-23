@@ -12,13 +12,77 @@
 //! request/response correlation, timeouts, and reconnection.
 
 use crate::errors::Result;
+use crate::manifest::{HttpAuth, ServerManifest, Transport as TransportSpec};
 use crate::protocol::Message;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub mod http;
 pub mod sse;
 pub mod stdio;
+
+/// Open the transport described by `manifest` under `policy`.
+///
+/// This is the one place that knows how to translate a `ServerManifest` into
+/// a live `Box<dyn Transport>`. Borgd's session loop calls it on initial
+/// connect and on reconnect, and operator tooling (`borg mcp test`) calls it
+/// for a one-shot probe. Keeping the construction here means a future
+/// transport addition lights up both code paths automatically.
+///
+/// Stderr from stdio children is forwarded to the `tracing` `debug` stream
+/// rather than being routed to the LLM (the latter would be a credential
+/// exfiltration vector — server stack traces routinely echo tokens).
+pub async fn open(
+    manifest: &ServerManifest,
+    policy: http::HttpPolicy,
+) -> Result<Box<dyn Transport>> {
+    match &manifest.transport {
+        TransportSpec::Stdio { command, args, env } => {
+            let cfg = stdio::StdioConfig {
+                server_name: manifest.name.clone(),
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+            };
+            let sink: stdio::StderrSink = Arc::new(|srv: &str, line: &str| {
+                tracing::debug!(server = %srv, line = %line, "mcp stderr");
+            });
+            let t = stdio::spawn(cfg, sink).await?;
+            Ok(Box::new(t))
+        }
+        TransportSpec::Http { url, headers, auth } => {
+            let mut headers = headers.clone();
+            if let HttpAuth::Bearer { token } = auth {
+                headers.insert("Authorization".into(), format!("Bearer {token}"));
+            }
+            let cfg = http::HttpConfig {
+                server_name: manifest.name.clone(),
+                url: url.clone(),
+                headers,
+                timeout: manifest.call_timeout,
+                policy,
+            };
+            let t = http::open(cfg).await?;
+            Ok(Box::new(t))
+        }
+        TransportSpec::Sse { url, headers, auth } => {
+            let mut headers = headers.clone();
+            if let HttpAuth::Bearer { token } = auth {
+                headers.insert("Authorization".into(), format!("Bearer {token}"));
+            }
+            let cfg = sse::SseConfig {
+                server_name: manifest.name.clone(),
+                url: url.clone(),
+                headers,
+                timeout: manifest.call_timeout,
+                policy,
+            };
+            let t = sse::open(cfg, manifest.connect_timeout).await?;
+            Ok(Box::new(t))
+        }
+    }
+}
 
 /// One end of a duplex JSON-RPC stream.
 ///

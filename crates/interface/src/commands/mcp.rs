@@ -14,14 +14,37 @@ use gateway::mcp::{stdio, McpError, McpServer, McpToolDescriptor, ReadOnlyToolHa
 
 #[derive(Subcommand)]
 pub(crate) enum McpAction {
-    /// Run the MCP server over stdio (Content-Length-framed JSON-RPC).
+    /// Run Borg as an MCP server over stdio (Content-Length-framed JSON-RPC).
+    /// Pre-existing surface used by Claude Desktop / MCP Inspector.
     Stdio,
+    /// List configured MCP servers and their live status.
+    List,
+    /// Add a configured MCP server (writes a `mcp.servers` entry).
+    Add(super::mcp_client::AddArgs),
+    /// Add a configured MCP server from a built-in preset (time / filesystem / github / notion).
+    AddPreset(super::mcp_client::AddPresetArgs),
+    /// Remove a configured MCP server.
+    Remove(super::mcp_client::IdArgs),
+    /// Mark a server enabled (default) — connects on next daemon start.
+    Enable(super::mcp_client::IdArgs),
+    /// Mark a server disabled — its tools disappear from the agent catalog.
+    Disable(super::mcp_client::IdArgs),
+    /// Connect to a configured server one-shot, list its tools, disconnect.
+    /// Standalone — does not require borgd to be running.
+    Test(super::mcp_client::IdArgs),
 }
 
 /// Dispatch for `borg mcp …`.
 pub(crate) async fn dispatch_mcp(action: Option<McpAction>) -> Result<()> {
     match action.unwrap_or(McpAction::Stdio) {
         McpAction::Stdio => run_stdio().await,
+        McpAction::List => super::mcp_client::list().await,
+        McpAction::Add(a) => super::mcp_client::add(a).await,
+        McpAction::AddPreset(a) => super::mcp_client::add_preset(a).await,
+        McpAction::Remove(a) => super::mcp_client::remove(a).await,
+        McpAction::Enable(a) => super::mcp_client::enable(a, true).await,
+        McpAction::Disable(a) => super::mcp_client::enable(a, false).await,
+        McpAction::Test(a) => super::mcp_client::test(a).await,
     }
 }
 

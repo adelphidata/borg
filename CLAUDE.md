@@ -138,7 +138,7 @@ Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreig
 
 ### Tools
 
-`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`.
+`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`. Dynamic tools from MCP servers (`mcp_<server>_<tool>`) and WASM plugins are merged at the same call site; see `docs/mcp.md` and the **MCP Client** section below.
 
 `schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs — silent preamble failures lose user trust. Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
 
@@ -197,6 +197,16 @@ Multi-process WAL is real: borgd holds the writer; standalone `borg` CLI process
 ### Sandboxing
 
 macOS: `sandbox-exec` Seatbelt (deny-all default). Linux: `bwrap` namespace isolation. Policy from `[sandbox]` per script/channel. Blocked paths filtered before profile generation.
+
+### MCP Client
+
+Borg consumes external MCP servers — it does **not** expose itself as an MCP server from the agent runtime. Four transports work: **stdio**, **streamable-http**, **http+sse** (legacy), and **HTTP/2** (negotiated via TLS ALPN on either HTTP transport). The protocol layer lives in `crates/mcp/`; the cortex adapter (`crates/cortex/src/mcp_clients.rs`) owns init, trust wrapping, rate limiting, and dispatch.
+
+**Trust model.** MCP servers are *untrusted code at arm's length*. Stdio children get only the env allowlist in `crates/mcp/src/transport/mod.rs::ENV_ALLOWLIST` — every `*_API_KEY`, `BORG_KEK_PASSPHRASE`, and OAuth token is stripped before spawn; credentials reach a server only via `${SECRET:NAME}` placeholders the operator explicitly declares. HTTP URLs are `https://`-only by default and refuse loopback/RFC1918 unless `mcp.allow_local_network` flips. Every tool result is wrapped `<mcp_tool_result trust="untrusted">…</mcp_tool_result>` after passing the existing secret-redaction pipeline. Per-server token-bucket rate limiting fails closed.
+
+**Plan mode trust gate.** MCP tools default to blocked in Plan mode; only tools the operator has explicitly named in per-server `tools.read_only` config are admitted. Server-advertised `annotations.readOnlyHint` is **not** trusted for this — it informs Execute-mode parallel-fanout batching only.
+
+**Operator surface.** `borg mcp {list,add,add-preset,remove,enable,disable,test}`. The `test` verb is standalone — it connects, runs `tools/list`, prints diagnostics, and exits without touching `borgd`. Built-in presets: `time`, `filesystem`, `github`, `notion` (Hermes parity). Kill switches: `mcp.enabled`, `mcp.disabled_servers`, `mcp.max_tools_total`. See `docs/mcp.md`.
 
 ### WASM Plugin Sandbox
 
