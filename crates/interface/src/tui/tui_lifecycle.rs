@@ -195,15 +195,49 @@ fn read_windows_term_program() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Emit the bytes `set_modes` would write to stdout into a caller-supplied
+/// writer. Pulled out so tests can capture the byte stream and assert the
+/// "no mouse-tracking escape sequence" invariant at the bytes level — the
+/// `include_str!` source-grep guards in `mod.rs` / `app.rs` only catch the
+/// literal token in our own source, not a future crossterm version whose
+/// `EnableBracketedPaste` / `EnableFocusChange` byte encoding regresses.
+///
+/// Skips the terminal ioctl (`enable_raw_mode`) since it emits no bytes.
+/// Test-only: `set_modes` itself interleaves these emissions with the
+/// raw-mode ioctl in a specific historical order, so it does not share this
+/// helper — but the *bytes* emitted are identical, which is all the guard
+/// needs to verify.
+#[cfg(test)]
+pub(crate) fn write_set_modes_sequence(
+    out: &mut impl std::io::Write,
+    suppress_keyboard_enhancement: bool,
+) -> Result<()> {
+    execute!(out, EnableBracketedPaste)?;
+    if !suppress_keyboard_enhancement {
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        );
+    }
+    let _ = execute!(out, EnableFocusChange);
+    Ok(())
+}
+
 /// Apply borg's input modes (raw mode, bracketed paste, focus change, optional kitty
 /// keyboard enhancement) to the terminal. Inverse of [`restore`].
+///
+/// Order matters: bracketed paste before raw mode, matching the historical
+/// sequence. The two are independent in practice (CSI vs tty ioctl) but
+/// preserving the original interleave avoids subtle terminal-quirk regressions.
+/// The bytes-level mouse-tracking guard in tests uses
+/// [`write_set_modes_sequence`] to cover both branches without needing a tty.
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
-
     enable_raw_mode()?;
-    // Enable kitty keyboard enhancement so modifiers for keys like Enter are
-    // disambiguated. Some terminals (legacy Windows consoles) do not support
-    // the push; ignore failures and continue with default key reporting.
     if !keyboard_enhancement_disabled() {
         let _ = execute!(
             stdout(),
@@ -214,8 +248,15 @@ pub fn set_modes() -> Result<()> {
             )
         );
     }
-
     let _ = execute!(stdout(), EnableFocusChange);
+    Ok(())
+}
+
+/// Emit the bytes `enter_alt_screen` would write to stdout into a writer.
+/// See [`write_set_modes_sequence`] for the testability rationale.
+pub(crate) fn write_enter_alt_screen_sequence(out: &mut impl std::io::Write) -> Result<()> {
+    let _ = execute!(out, EnterAlternateScreen);
+    let _ = execute!(out, EnableAlternateScroll);
     Ok(())
 }
 
@@ -311,8 +352,7 @@ impl Tui {
         if !self.alt_screen_enabled {
             return Ok(());
         }
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
-        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        let _ = write_enter_alt_screen_sequence(self.terminal.backend_mut());
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);
             self.terminal
@@ -530,6 +570,54 @@ mod tests {
         assert!(!vscode_terminal_detected(
             /*linux_term_program*/ None, /*windows_term_program*/ None,
         ));
+    }
+
+    /// Regression guard for the "Mouse Interaction — Hard Invariant" in
+    /// CLAUDE.md: the byte stream emitted by our terminal-init lifecycle
+    /// (set_modes + enter_alt_screen) must contain ZERO mouse-tracking mode
+    /// switches. The existing `include_str!` source-grep guards in
+    /// `tui/mod.rs` only catch literal occurrences in our own .rs files;
+    /// they cannot catch a future crossterm version whose
+    /// `EnableBracketedPaste` / `EnableFocusChange` / `EnterAlternateScreen`
+    /// emits a different byte sequence — including one that turns on mouse
+    /// tracking. This test exercises the actual byte stream.
+    ///
+    /// If this test fires, native click+drag selection in the terminal will
+    /// break. Do not weaken the assertion — investigate why the byte stream
+    /// changed.
+    #[test]
+    fn terminal_init_byte_stream_contains_no_mouse_tracking_modes() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_set_modes_sequence(&mut buf, /*suppress_keyboard_enhancement=*/ false)
+            .expect("set_modes sequence writes to in-memory buffer");
+        write_enter_alt_screen_sequence(&mut buf)
+            .expect("enter_alt_screen sequence writes to in-memory buffer");
+        // Also exercise the kitty-keyboard-suppressed path so the guard
+        // covers both branches of set_modes.
+        write_set_modes_sequence(&mut buf, /*suppress_keyboard_enhancement=*/ true)
+            .expect("set_modes (suppressed) sequence writes to in-memory buffer");
+
+        // The byte sequences are stable ASCII; lossy-decode for substring
+        // search. Forbidden tokens are CSI private-mode SETs that, once on,
+        // make the terminal capture mouse events instead of letting the
+        // user select text.
+        let s = String::from_utf8_lossy(&buf);
+        for forbidden in ["?1000h", "?1002h", "?1003h", "?1006h"] {
+            assert!(
+                !s.contains(forbidden),
+                "terminal init byte stream contains forbidden mouse-tracking \
+                 escape `{forbidden}` — this will regress click+drag text \
+                 selection. Captured bytes: {s:?}"
+            );
+        }
+        // Positive assertion: the alt-screen path MUST emit ?1007h
+        // (Alternate Scroll Mode). If a future refactor drops it, wheel
+        // events stop being translated to arrow keys in transcript pager.
+        assert!(
+            s.contains("?1007h"),
+            "alt-screen entry must enable xterm Alternate Scroll Mode \
+             (?1007h); captured bytes: {s:?}"
+        );
     }
 
     #[test]

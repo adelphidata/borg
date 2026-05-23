@@ -141,7 +141,14 @@ impl Verifier for TofuVerifier {
                     .map_err(|e| VerifierError::Db(e.to_string()))?;
                 match row {
                     Some(d) => {
-                        let _ = guard.touch_paired_device(&fp).await;
+                        if let Err(e) = guard.touch_paired_device(&fp).await {
+                            tracing::warn!(
+                                fingerprint = %fp,
+                                error = %e,
+                                "Failed to update paired_device last_seen — \
+                                 stale-pruning will use outdated timestamps"
+                            );
+                        }
                         Ok(d.principal_id)
                     }
                     None => Err(VerifierError::UnknownDevice(fp)),

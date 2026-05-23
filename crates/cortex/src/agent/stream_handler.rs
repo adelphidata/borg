@@ -25,7 +25,7 @@ use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::StreamEvent;
 use crate::types::Message;
 
-use super::tool_validation::PartialToolCall;
+use super::tool_validation::{apply_tool_call_delta, PartialToolCall};
 use super::{should_nudge_for_response, Agent, AgentEvent, MAX_TOOL_CALLS};
 
 /// Control-flow outcome when `run_agent_loop` encounters a text-only LLM
@@ -73,20 +73,14 @@ impl Agent {
                 name,
                 arguments_delta,
             } => {
-                if index >= MAX_TOOL_CALLS {
-                    warn!("Tool call index {index} exceeds limit {MAX_TOOL_CALLS}, ignoring");
-                } else {
-                    while tool_calls.len() <= index {
-                        tool_calls.push(PartialToolCall::default());
-                    }
-                    if let Some(id) = id {
-                        tool_calls[index].id = id;
-                    }
-                    if let Some(name) = name {
-                        tool_calls[index].name = name;
-                    }
-                    tool_calls[index].arguments.push_str(&arguments_delta);
-                }
+                apply_tool_call_delta(
+                    tool_calls,
+                    index,
+                    id,
+                    name,
+                    &arguments_delta,
+                    MAX_TOOL_CALLS,
+                );
             }
             StreamEvent::Usage(usage) => {
                 self.record_usage(&usage).await;

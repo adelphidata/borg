@@ -361,9 +361,20 @@ pub async fn dispatch_webhook(
                         // Persist to delivery queue for at-least-once guarantee.
                         // A single DB connection is reused for enqueue + status update.
                         let delivery_id = uuid::Uuid::new_v4().to_string();
-                        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
-                            .await
-                            .ok();
+                        let db = match Database::open_with_timeout(
+                            Database::GATEWAY_BUSY_TIMEOUT_MS,
+                        )
+                        .await
+                        {
+                            Ok(db) => Some(db),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to open DB for {channel_name} delivery queue \
+                                     (at-least-once guarantee disabled for this message): {e}"
+                                );
+                                None
+                            }
+                        };
 
                         if let Err(e) = channel
                             .prepare_response_context(&mut response_context, db.as_ref(), &config)

@@ -337,6 +337,40 @@ pub(super) struct PartialToolCall {
     pub(super) arguments: String,
 }
 
+/// Merge one `ToolCallDelta` into the index-keyed accumulator. Keying by
+/// `index` (not `id`) is load-bearing: providers that emit parallel tool calls
+/// (OpenAI `parallel_tool_calls`, Kimi-for-coding, etc.) send `id` and `name`
+/// only on the first delta of each call; subsequent deltas carry only
+/// `arguments` fragments tagged with their `index`. An `id`-keyed aggregator
+/// collapses later argument fragments into the wrong call or spawns phantoms.
+///
+/// Returns `false` and emits a `tracing::warn!` when `index >= max_tool_calls`;
+/// caller discards the delta.
+pub(super) fn apply_tool_call_delta(
+    tool_calls: &mut Vec<PartialToolCall>,
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments_delta: &str,
+    max_tool_calls: usize,
+) -> bool {
+    if index >= max_tool_calls {
+        warn!("Tool call index {index} exceeds limit {max_tool_calls}, ignoring");
+        return false;
+    }
+    while tool_calls.len() <= index {
+        tool_calls.push(PartialToolCall::default());
+    }
+    if let Some(id) = id {
+        tool_calls[index].id = id;
+    }
+    if let Some(name) = name {
+        tool_calls[index].name = name;
+    }
+    tool_calls[index].arguments.push_str(arguments_delta);
+    true
+}
+
 /// Detect whether the latest assistant turn issued tool_calls that haven't
 /// all been answered yet. Used by [`super::Agent::append_assistant_message`] to
 /// avoid splitting a tool_use/tool_result pair, which both Anthropic and
@@ -391,6 +425,93 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
         }
+    }
+
+    #[test]
+    fn parallel_tool_call_deltas_aggregate_by_index_not_id() {
+        // Regression guard: when a provider streams two parallel tool calls,
+        // `id` and `name` arrive only on the first delta of each call;
+        // subsequent argument fragments carry only `index`. If the aggregator
+        // ever keyed by `id` instead of `index`, the later argument fragments
+        // (which arrive with `id = None`) would collapse into call 0 or spawn
+        // a phantom third entry. Interleave indices 0 and 1 to force the
+        // failure if that regression returns.
+        let mut tool_calls: Vec<PartialToolCall> = Vec::new();
+
+        // First chunk: both calls announce themselves with id+name+arg-start.
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            0,
+            Some("call_a".into()),
+            Some("fs_read".into()),
+            "{\"path\":",
+            64,
+        ));
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            1,
+            Some("call_b".into()),
+            Some("run_shell".into()),
+            "{\"cmd\":",
+            64,
+        ));
+
+        // Subsequent chunks: only index + argument fragment. Interleave the
+        // order so an id-keyed aggregator can't accidentally pass by luck.
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            1,
+            None,
+            None,
+            "\"ls\"",
+            64
+        ));
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            0,
+            None,
+            None,
+            "\"/etc\"",
+            64
+        ));
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            0,
+            None,
+            None,
+            "}",
+            64
+        ));
+        assert!(apply_tool_call_delta(
+            &mut tool_calls,
+            1,
+            None,
+            None,
+            "}",
+            64
+        ));
+
+        assert_eq!(tool_calls.len(), 2, "must produce exactly two calls");
+        assert_eq!(tool_calls[0].id, "call_a");
+        assert_eq!(tool_calls[0].name, "fs_read");
+        assert_eq!(tool_calls[0].arguments, "{\"path\":\"/etc\"}");
+        assert_eq!(tool_calls[1].id, "call_b");
+        assert_eq!(tool_calls[1].name, "run_shell");
+        assert_eq!(tool_calls[1].arguments, "{\"cmd\":\"ls\"}");
+    }
+
+    #[test]
+    fn apply_tool_call_delta_discards_above_cap() {
+        let mut tool_calls: Vec<PartialToolCall> = Vec::new();
+        assert!(!apply_tool_call_delta(
+            &mut tool_calls,
+            64,
+            Some("x".into()),
+            Some("y".into()),
+            "{}",
+            64,
+        ));
+        assert!(tool_calls.is_empty(), "over-cap delta must not grow vec");
     }
 
     #[test]

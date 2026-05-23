@@ -511,7 +511,11 @@ impl GatewayServer {
                                 // Send read receipt for the original message
                                 if let Some(ref mid) = inbound.message_id {
                                     if let Ok(ts) = mid.parse::<i64>() {
-                                        let _ = client.send_read_receipt(&recipient, &[ts]).await;
+                                        if let Err(e) =
+                                            client.send_read_receipt(&recipient, &[ts]).await
+                                        {
+                                            warn!("Failed to send Signal read receipt: {e}");
+                                        }
                                     }
                                 }
                             }
