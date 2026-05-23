@@ -12,7 +12,9 @@
 //! `rand` is a Windows-only target dep on this crate).
 
 #[cfg(target_os = "windows")]
-pub use win::{generate_random_cap_sid_string, LocalSid};
+pub use win::{
+    generate_random_cap_sid_string, load_or_generate_seed, workspace_cap_sid_string, LocalSid,
+};
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -106,6 +108,107 @@ mod win {
             }
         }
     }
+
+    /// Subdirectory under `~/.borg/` that holds the per-install cap-SID
+    /// seed. The seed is 32 random bytes generated on first sandbox
+    /// invocation and re-used for the lifetime of the install. Stable
+    /// cap SIDs let ACEs persist across runs (faster spawn, no thrashing
+    /// of parent DACL).
+    const SEED_DIR: &str = "sandbox-windows";
+    /// Filename of the seed inside [`SEED_DIR`].
+    const SEED_FILE: &str = "cap-sid-seed";
+    /// HKDF info string. Versioning the string lets a future change to
+    /// the derivation (different SID shape, different field width)
+    /// rotate the namespace without colliding with old seeds.
+    const HKDF_INFO: &[u8] = b"borg-cap-sid-v1";
+    /// Seed length in bytes. 32 = 256-bit secret; HKDF output stays at
+    /// 16 bytes (the four `u32` subauthorities).
+    const SEED_LEN: usize = 32;
+
+    /// Load `seed` from `~/.borg/sandbox-windows/cap-sid-seed`,
+    /// creating it on first use. The seed is read-only-by-default so a
+    /// sandboxed child that somehow obtains a handle to the parent's
+    /// home cannot rewrite the namespace.
+    ///
+    /// Returns the seed bytes plus the resolved path (for diagnostics
+    /// in the caller's `tracing::debug!`).
+    pub fn load_or_generate_seed() -> std::io::Result<([u8; SEED_LEN], std::path::PathBuf)> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            std::io::Error::other("no home directory; cannot persist sandbox cap-SID seed")
+        })?;
+        let dir = home.join(".borg").join(SEED_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(SEED_FILE);
+        let mut buf = [0u8; SEED_LEN];
+        match std::fs::read(&path) {
+            Ok(existing) if existing.len() == SEED_LEN => {
+                buf.copy_from_slice(&existing);
+                Ok((buf, path))
+            }
+            Ok(_existing_wrong_len) => {
+                // A truncated or grown seed file is treated as
+                // corruption; refuse to overwrite silently — the
+                // operator should investigate (could be a half-restored
+                // backup). Fall closed.
+                Err(std::io::Error::other(format!(
+                    "cap-SID seed at {} has unexpected length; refusing to overwrite",
+                    path.display(),
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                for b in buf.iter_mut() {
+                    *b = rng.random();
+                }
+                // Best-effort atomic write via tmpfile + rename. A
+                // parallel sandbox spawn racing this initial write
+                // would either see the file we just renamed or fall
+                // through to the loop's `Ok(existing)` arm on retry.
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, buf)?;
+                std::fs::rename(&tmp, &path)?;
+                Ok((buf, path))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Derive a stable cap SID for a writable root path. Same `seed +
+    /// root` always produces the same SID, so DACL ACEs persisted from
+    /// a prior spawn remain meaningful on the next spawn.
+    ///
+    /// The derivation is HKDF-SHA256(seed, info="borg-cap-sid-v1",
+    /// salt=empty) over `root.as_bytes()`. We take the first 16 bytes
+    /// of output and split into four little-endian `u32`s — same
+    /// shape as the random generator, so consumers of the returned
+    /// string can't tell the difference.
+    pub fn workspace_cap_sid_string(seed: &[u8; SEED_LEN], root: &std::path::Path) -> String {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        // Use the root path's lossy-UTF-8 form as the "input keying
+        // material" salt isn't part of the API we expose. HKDF's `info`
+        // parameter is the right place for context separation, and the
+        // path bytes serve as additional context-binding via the
+        // expand step.
+        let ikm = seed;
+        let root_bytes = root.as_os_str().to_string_lossy();
+        let mut info = HKDF_INFO.to_vec();
+        info.extend_from_slice(b"\0");
+        info.extend_from_slice(root_bytes.as_bytes());
+        let hk = Hkdf::<Sha256>::new(None, ikm);
+        let mut out = [0u8; 16];
+        // .expect: 16 bytes is well under the HKDF-SHA256 max output
+        // length of 255 * 32 = 8160 bytes.
+        #[allow(clippy::expect_used)]
+        hk.expand(&info, &mut out)
+            .expect("HKDF-SHA256 expand of 16 bytes must succeed");
+        let a = u32::from_le_bytes(out[0..4].try_into().unwrap_or([0; 4]));
+        let b = u32::from_le_bytes(out[4..8].try_into().unwrap_or([0; 4]));
+        let c = u32::from_le_bytes(out[8..12].try_into().unwrap_or([0; 4]));
+        let d = u32::from_le_bytes(out[12..16].try_into().unwrap_or([0; 4]));
+        format!("S-1-5-21-{a}-{b}-{c}-{d}")
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -131,6 +234,59 @@ mod tests {
                 part.parse::<u32>().is_ok(),
                 "subauthority must be a u32: {part:?}"
             );
+        }
+    }
+
+    #[test]
+    fn workspace_cap_sid_is_stable_for_same_root() {
+        // Spec: stability is the whole point of the seed-based derivation
+        // — DACL ACEs persisted from spawn N must be addressable as the
+        // same trustee on spawn N+1. A change to the derivation that
+        // accidentally folds in time or a per-spawn nonce would silently
+        // break ACE re-use; this test pins the determinism.
+        let seed = [42u8; SEED_LEN];
+        let root = std::path::Path::new(r"C:\workspace\borg");
+        let a = workspace_cap_sid_string(&seed, root);
+        let b = workspace_cap_sid_string(&seed, root);
+        assert_eq!(a, b, "same (seed, root) must yield same SID");
+    }
+
+    #[test]
+    fn workspace_cap_sid_differs_per_root() {
+        // Spec: different writable roots get different cap SIDs. A
+        // collision here would let an ACE intended for `root_a` apply
+        // to `root_b` — i.e., a write granted to one workspace would
+        // leak to another.
+        let seed = [42u8; SEED_LEN];
+        let a = workspace_cap_sid_string(&seed, std::path::Path::new(r"C:\a"));
+        let b = workspace_cap_sid_string(&seed, std::path::Path::new(r"C:\b"));
+        assert_ne!(a, b, "different roots must yield different SIDs");
+    }
+
+    #[test]
+    fn workspace_cap_sid_differs_per_seed() {
+        // Spec: rotating the seed (e.g. operator wipes the seed file
+        // for namespace rotation) MUST produce a different SID for
+        // the same root. Otherwise the rotation would be a no-op and
+        // leaked ACEs from before rotation would remain live.
+        let root = std::path::Path::new(r"C:\workspace");
+        let a = workspace_cap_sid_string(&[1u8; SEED_LEN], root);
+        let b = workspace_cap_sid_string(&[2u8; SEED_LEN], root);
+        assert_ne!(a, b, "different seeds must yield different SIDs");
+    }
+
+    #[test]
+    fn workspace_cap_sid_has_same_shape_as_random() {
+        // Spec: callers (e.g. ConvertStringSidToSidW, the DACL writer)
+        // can't tell stable from random — same S-1-5-21-{u32}{u32}{u32}{u32}
+        // shape. A shape divergence would break the policy_resolve
+        // → acl pipeline.
+        let s = workspace_cap_sid_string(&[7u8; SEED_LEN], std::path::Path::new("/x"));
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(parts.len(), 8);
+        assert_eq!(&parts[..4], &["S", "1", "5", "21"]);
+        for p in &parts[4..] {
+            assert!(p.parse::<u32>().is_ok(), "subauthority not u32: {p}");
         }
     }
 

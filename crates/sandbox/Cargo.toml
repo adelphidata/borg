@@ -24,6 +24,8 @@ tempfile = { workspace = true }
 # Unix builds keep their existing dep set.
 [target.'cfg(target_os = "windows")'.dependencies]
 rand = { workspace = true }
+sha2 = "0.10"
+hkdf = "0.12"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
