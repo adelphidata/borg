@@ -452,45 +452,49 @@ at `cost_usd_present = false` until a local-pricing policy exists.
 
 ### Security & sandboxing
 
-- **Windows sandbox — validate Tier 1 on a real host.** Tier 1
-  (restricted token + DACL ACEs + `CreateProcessAsUserW`) was ported
-  in 2026-05 and cross-compiles cleanly against the Windows target,
-  but the FFI paths have never run. Spin up a Windows VM, run
-  `cargo test -p sandbox --lib --target x86_64-pc-windows-msvc` (the
-  `cfg(target_os = "windows")` tests in `sid::tests`,
-  `process::tests`, and any new ones added during validation), then
-  exercise the trampoline end-to-end: set `sandbox.enabled = true`,
-  ask the agent to `run_shell` something that reads
-  `~\.ssh\fake_file` (assert `Access is denied`) and that writes to
-  the workspace (assert success). Until this is done, treat Tier 1
-  as in-development and recommend operators run with
-  `sandbox.enabled = false` if they hit issues.
-- **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users).**
-  Deferred. Real network isolation (WFP kernel filter rules) and a
-  separate user identity for the child require admin to set up.
-  Design: `borg service install --windows-sandbox` triggers a UAC
-  prompt, creates `BorgSandboxOffline` + `BorgSandboxOnline` users,
-  registers WFP rules denying outbound for the offline SID, and
-  persists state to `~/.borg/sandbox-windows/setup.json`. The
-  trampoline auto-promotes when setup.json is present and version-
-  current; auto-falls-back to Tier 1 otherwise. Mirrors the
-  `security.kek_backend = auto` pattern.
-- **Windows sandbox — caller authentication on the trampoline
-  subcommand.** Deferred. The argv-policy transport has been replaced
-  with an inheritable anonymous-pipe handoff (Phase 1 of the Codex
-  parity work — see `crates/sandbox/src/windows/pipe.rs`), which kills
-  the passive WMI / `tasklist /v` scrape path. The handoff still does
-  not authenticate an *active* same-session same-integrity attacker
-  who can `OpenProcess(PROCESS_DUP_HANDLE)` on the parent and grab a
-  copy of the read-end. The Phase 7 elevated-runner named-pipe
-  transport closes that gap by authenticating the caller via the
-  pipe's security descriptor; until then, parent-PID validation or
-  an inheritable shared-memory nonce would be incremental wins.
-- **Windows sandbox — CI runner.** Deferred. Tests under
-  `crates/sandbox/src/windows/` are gated `cfg(target_os =
-"windows")` and only execute when developers run them on a Windows
-  box. Add a `windows-latest` job to `.github/workflows/ci.yml`
-  matrix once Tier 1 has been validated manually.
+- **Windows sandbox — validate Tier 1 on a real host.** Tier 1+
+  (restricted token + DACL ACEs + `CreateProcessAsUserW`, plus
+  anonymous-pipe `SpawnRequest` IPC, job-object
+  `KILL_ON_JOB_CLOSE` containment, `ProcThreadAttributeList`
+  mitigation policies, per-spawn isolated desktop, HKDF-derived
+  stable per-workspace cap SIDs, and structured audit events) ports
+  cleanly to the Windows target and now compiles in a new
+  `windows-sandbox` CI job. The FFI paths still need to run on real
+  hardware — spin up a Windows VM, run `cargo test -p sandbox --lib
+--target x86_64-pc-windows-msvc`, then exercise the trampoline
+  end-to-end: set `sandbox.enabled = true`, ask the agent to
+  `run_shell` something that reads `~\.ssh\fake_file` (assert
+  `Access is denied`) and that writes to the workspace (assert
+  success). Until this is done, treat the sandbox as in-development
+  and recommend operators run with `sandbox.enabled = false` if they
+  hit issues.
+- **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users +
+  DPAPI + caller-authenticating named-pipe IPC).** Deferred. Real
+  network isolation (WFP kernel filter rules), a separate user
+  identity for the child, DPAPI-sealed sandbox credentials, and a
+  named-pipe `SpawnRequest` transport with an SDDL that
+  authenticates the parent all require admin to set up. Design:
+  `borg service install --windows-sandbox` triggers a UAC prompt,
+  creates `BorgSandboxOffline` + `BorgSandboxOnline` users via
+  `NetUserAdd`, registers WFP rules denying outbound for the
+  offline SID, seals the sandbox-account passwords with
+  `CryptProtectData(CRYPTPROTECT_LOCAL_MACHINE)`, and persists state
+  to `~/.borg/sandbox-windows/setup.json`. The trampoline
+  auto-promotes when `setup.json` is present and version-current;
+  auto-falls-back to Tier 1 otherwise. Mirrors the
+  `security.kek_backend = auto` pattern. Replaces the current
+  anonymous-pipe-with-argv-handle transport (which defeats passive
+  command-line scraping but is still vulnerable to an active
+  `PROCESS_DUP_HANDLE` same-session attacker) with named-pipe
+  SDDL-authenticated IPC.
+- **Windows sandbox — ConPTY for stdio.** Deferred. The trampoline
+  currently inherits the parent's stdio handles directly. Wrapping
+  the wrapped command in a pseudo-console
+  (`CreatePseudoConsole`/`ResizePseudoConsole`) gives the sandboxed
+  child a real terminal interface without exposing the parent's
+  console handles, and is required for any future "interactive
+  sandboxed shell" use case (e.g. `borg shell`). Pumps PTY bytes →
+  parent stdout/stderr in a tokio task.
 - **Docker / SSH sandbox backends.** `[O]` In addition to Seatbelt
   and bwrap, allow agent-issued shell to run inside a Docker container
   or over SSH to a remote VM. Makes Linux desktop installs (where
