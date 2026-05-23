@@ -136,3 +136,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2
+
+  # Windows-only sandbox surface (CreateRestrictedToken, anonymous-pipe
+  # SpawnRequest IPC, job objects, mitigation policies, isolated desktop,
+  # stable cap SIDs) lives entirely under `crates/sandbox/src/windows/`
+  # behind `#[cfg(target_os = "windows")]`. We compile + run the
+  # sandbox crate's tests on a Windows runner per-PR so a Windows-only
+  # regression surfaces before merge, not on the release lane.
+  #
+  # Scoped to `-p sandbox` deliberately: the full workspace has C
+  # dependencies (ring, etc.) that need a Windows VC++ toolchain we
+  # don't otherwise need. The Windows-only sandbox tests are the
+  # high-value lane; full-workspace Windows builds remain in
+  # `release.yml`.
+  windows-sandbox:
+    name: Windows Sandbox
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+          components: clippy, rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-windows-sandbox-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-windows-sandbox-
+      - name: cargo fmt --check (sandbox)
+        run: cargo fmt -p sandbox --check
+      - name: cargo clippy -p sandbox
+        run: cargo clippy -p sandbox --all-targets -- -D warnings
+      - name: cargo test -p sandbox
+        run: cargo test -p sandbox --lib
