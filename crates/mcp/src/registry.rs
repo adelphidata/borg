@@ -76,10 +76,19 @@ pub struct RegisteredTool {
     pub description: Option<String>,
     /// Validated JSON schema for `inputSchema`.
     pub input_schema: Value,
-    /// True iff the operator marked this tool safe to call in Plan mode.
-    /// External servers cannot self-declare this — it comes from
-    /// per-server config only.
+    /// True when the tool is parallel-safe to fan out with other read-only
+    /// calls. Set by the operator via per-server `tools.read_only` config,
+    /// OR — additively — by the server itself via
+    /// `annotations.readOnlyHint: true`. Use this for batching decisions
+    /// only. Plan-mode gating MUST use [`Self::operator_read_only`]
+    /// because the hint is untrusted and Plan mode is a hard trust
+    /// boundary.
     pub read_only: bool,
+    /// True only when the operator explicitly opted this tool in via
+    /// per-server `tools.read_only` config. Used as the Plan-mode trust
+    /// gate so a malicious server cannot promote its mutating tool into
+    /// Plan-mode visibility by self-reporting `readOnlyHint`.
+    pub operator_read_only: bool,
 }
 
 /// Registry status for `borg mcp status`.
@@ -238,13 +247,29 @@ impl McpRegistry {
                 continue;
             }
 
+            // Read-only is true when either the operator opted in
+            // (`tools.read_only`) OR the server advertised
+            // `annotations.readOnlyHint: true`. The latter is untrusted,
+            // but it only widens parallel-safe + Plan-mode-visible sets —
+            // it never grants additional privileges, so trusting the
+            // server's self-report here is acceptable. Operator config
+            // remains the canonical opt-in for ambient tools that don't
+            // ship the hint.
+            let operator_read_only = filter.is_read_only(&tool.name);
+            let advertised_read_only = tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false);
+            let read_only = operator_read_only || advertised_read_only;
             let registered = RegisteredTool {
                 full_name: full_name.clone(),
                 server: server.to_string(),
                 original_name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
-                read_only: filter.is_read_only(&tool.name),
+                read_only,
+                operator_read_only,
             };
             inner.tools.insert(full_name.clone(), registered);
             registered_names.push(full_name.clone());
@@ -573,11 +598,13 @@ mod tests {
                 name: "search".into(),
                 description: Some("search".into()),
                 input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                annotations: None,
             },
             McpToolSchema {
                 name: "delete".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             },
         ];
         let filter = ToolFilter {
@@ -605,6 +632,7 @@ mod tests {
             name: "fetch".into(),
             description: None,
             input_schema: json!({"type": "object"}),
+            annotations: None,
         }];
         let outcomes =
             reg.replace_server_tools("web", &tools, &ToolFilter::default(), &["mcp_web_fetch"]);
@@ -625,6 +653,7 @@ mod tests {
                 name: "a".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }],
             &ToolFilter::default(),
             &[],
@@ -635,6 +664,7 @@ mod tests {
                 name: "b".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }],
             &ToolFilter::default(),
             &[],
@@ -651,6 +681,7 @@ mod tests {
                 name: format!("t{i}"),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             })
             .collect();
         let filter = ToolFilter {
@@ -689,6 +720,7 @@ mod tests {
                 name: "t".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             }],
             &ToolFilter::default(),
             &[],
@@ -696,5 +728,78 @@ mod tests {
         assert_eq!(reg.tools().len(), 1);
         reg.set_health("x", ServerHealth::Reconnecting { attempts: 1 });
         assert!(reg.tools().is_empty());
+    }
+
+    #[test]
+    fn server_advertised_read_only_hint_widens_parallel_only_not_plan_mode() {
+        // Spec: a server's `readOnlyHint: true` flips `read_only` (the
+        // batching-safe flag) but MUST NOT flip `operator_read_only` (the
+        // Plan-mode gate). The hint is untrusted; Plan mode requires
+        // explicit operator opt-in via per-server `tools.read_only`.
+        use crate::protocol::ToolAnnotations;
+        let reg = McpRegistry::new();
+        let tools = vec![McpToolSchema {
+            name: "search".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            annotations: Some(ToolAnnotations {
+                read_only_hint: Some(true),
+            }),
+        }];
+        reg.replace_server_tools("srv", &tools, &ToolFilter::default(), &[]);
+        let entry = reg.lookup("mcp_srv_search").unwrap();
+        assert!(
+            entry.read_only,
+            "server-advertised readOnlyHint must widen parallel-safe set"
+        );
+        assert!(
+            !entry.operator_read_only,
+            "untrusted hint must NOT widen the Plan-mode trust boundary"
+        );
+    }
+
+    #[test]
+    fn operator_opt_in_sets_both_read_only_flags() {
+        // Inverse spec: explicit operator config flips both flags so the
+        // tool is parallel-safe AND Plan-mode-visible.
+        let reg = McpRegistry::new();
+        let tools = vec![McpToolSchema {
+            name: "search".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        }];
+        let filter = ToolFilter {
+            read_only: vec!["search".into()],
+            ..Default::default()
+        };
+        reg.replace_server_tools("srv", &tools, &filter, &[]);
+        let entry = reg.lookup("mcp_srv_search").unwrap();
+        assert!(entry.read_only, "operator opt-in must set read_only");
+        assert!(
+            entry.operator_read_only,
+            "operator opt-in must set operator_read_only"
+        );
+    }
+
+    #[test]
+    fn missing_read_only_hint_does_not_flip_read_only() {
+        // Negative guard: an unannotated tool stays mutating-by-default.
+        // Without this, the planner would batch unknown MCP calls and a
+        // misbehaving server's mutating tool would run concurrently with
+        // peers.
+        let reg = McpRegistry::new();
+        let tools = vec![McpToolSchema {
+            name: "delete".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        }];
+        reg.replace_server_tools("srv", &tools, &ToolFilter::default(), &[]);
+        let entry = reg.lookup("mcp_srv_delete").unwrap();
+        assert!(
+            !entry.read_only,
+            "tool without readOnlyHint must remain mutating-by-default"
+        );
     }
 }

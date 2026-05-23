@@ -40,6 +40,18 @@ pub enum ToolEffect {
 /// yield `ToolEffect::Unknown` from the planner via an earlier gate; this
 /// function assumes `args` has already deserialized cleanly.
 pub fn classify(name: &str, args: &Value) -> ToolEffect {
+    // MCP tools live outside the typed `Tool` enum. The registry tracks per-
+    // tool read-only state (operator opt-in OR server-advertised
+    // `readOnlyHint`), so consult it before falling through to the
+    // hardcoded match — an MCP tool name will never hit any of the literal
+    // arms below.
+    if name.starts_with("mcp_") {
+        return if crate::mcp_clients::is_read_only_mcp_tool(name) {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::Unknown
+        };
+    }
     match name {
         // Read-only tools — safe to fan out in parallel.
         //

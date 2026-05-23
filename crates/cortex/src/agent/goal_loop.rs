@@ -291,11 +291,12 @@ impl Agent {
         self.emit_goal_lifecycle(event_kind::CREATED, Some(&goal));
     }
 
-    /// Post-handler hook for `Tool::UpdateGoal`. Today the tool only accepts
-    /// `status="complete"`, so on `ok: true` (and *not* `already_complete`)
-    /// we treat it as a completion: emit `goal_completed` + lifecycle and
-    /// clear the runtime cache so a fresh objective can be adopted next
-    /// turn without a stale baseline.
+    /// Post-handler hook for `Tool::UpdateGoal`. On `ok: true` (and not an
+    /// idempotent no-op like `already_complete` / `already_blocked`), inspect
+    /// the freshly-read row and emit the matching telemetry + lifecycle event
+    /// for the terminal status the model just set (`complete` or `blocked`).
+    /// Completion clears the runtime cache; `blocked` keeps it so the user can
+    /// resume without losing the per-turn accounting baseline.
     pub(super) async fn on_goal_updated_via_tool(&mut self, handler_text: &str) {
         let Some(v) = serde_json::from_str::<serde_json::Value>(handler_text).ok() else {
             return;
@@ -306,18 +307,27 @@ impl Agent {
         if v.get("already_complete")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
+            || v.get("already_blocked")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
         {
             return;
         }
         let Some(goal) = self.fetch_current_goal().await else {
             return;
         };
-        if goal.status != GoalStatus::Complete {
-            return;
+        match goal.status {
+            GoalStatus::Complete => {
+                self.emit_goal_vitals_event("goal_completed", &goal).await;
+                self.emit_goal_lifecycle(event_kind::COMPLETED, Some(&goal));
+                self.goal_runtime.forget();
+            }
+            GoalStatus::Blocked => {
+                self.emit_goal_vitals_event("goal_blocked", &goal).await;
+                self.emit_goal_lifecycle(event_kind::BLOCKED, Some(&goal));
+            }
+            _ => {}
         }
-        self.emit_goal_vitals_event("goal_completed", &goal).await;
-        self.emit_goal_lifecycle(event_kind::COMPLETED, Some(&goal));
-        self.goal_runtime.forget();
     }
 
     /// Re-read the active goal row for this session. Used after a tool

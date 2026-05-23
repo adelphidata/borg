@@ -356,11 +356,11 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     ));
         defs.push(ToolDefinition::new(
         tool_names::UPDATE_GOAL,
-        "Mark the existing goal as achieved. The only accepted value for `status` is \"complete\". Pause, resume, budget edits, and objective replacement are user-controlled and not reachable through this tool. Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work. When marking a budgeted goal complete, report the final token usage from the tool result to the user.",
+        "Mark the existing goal as achieved (\"complete\") or report a repeated impasse (\"blocked\"). Pause, resume, budget edits, and objective replacement are user-controlled and not reachable through this tool. Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work. Use \"blocked\" only after at least three attempts past the same wall (denied permission, missing external resource, persistent tool failure) — it stops auto-continuation until the user resumes, so reserve it for true impasses. When marking a budgeted goal complete, report the final token usage from the tool result to the user.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "status": {"type": "string", "enum": ["complete"], "description": "Required. Set to complete only when the objective is achieved and no required work remains."}
+                "status": {"type": "string", "enum": ["complete", "blocked"], "description": "Required. Use \"complete\" only when every requirement is verified; use \"blocked\" only after ≥3 failed attempts at the same impasse."}
             },
             "required": ["status"],
             "additionalProperties": false

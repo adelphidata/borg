@@ -35,6 +35,13 @@ static GOAL_BUDGET_LIMITED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+static GOAL_BLOCKED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("borg.goal.blocked")
+        .with_description("Per-session goals the agent self-reported as blocked.")
+        .build()
+});
+
 static GOAL_TOKEN_COUNT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("borg.goal.token_count")
@@ -80,6 +87,19 @@ pub fn record_completed(goal: &Goal) {
 pub fn record_budget_limited(goal: &Goal) {
     let attrs = [KeyValue::new("outcome", "budget_limited")];
     GOAL_BUDGET_LIMITED.add(1, &[]);
+    GOAL_TOKEN_COUNT.record(goal.tokens_used.max(0) as u64, &attrs);
+    GOAL_DURATION_SECONDS.record(goal.time_used_seconds.max(0) as u64, &attrs);
+}
+
+/// Increment `borg.goal.blocked` and record terminal token / duration
+/// histograms. Called from the `update_goal` tool when the model self-
+/// reports a repeated impasse via `status="blocked"`.
+pub fn record_blocked(goal: &Goal) {
+    let attrs = [KeyValue::new("outcome", "blocked")];
+    // Counter name already encodes the outcome; match the existing
+    // `record_completed` / `record_budget_limited` convention of
+    // attaching the `outcome` attr only to the shared cohort histograms.
+    GOAL_BLOCKED.add(1, &[]);
     GOAL_TOKEN_COUNT.record(goal.tokens_used.max(0) as u64, &attrs);
     GOAL_DURATION_SECONDS.record(goal.time_used_seconds.max(0) as u64, &attrs);
 }

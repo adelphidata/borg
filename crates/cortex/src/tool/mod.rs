@@ -30,6 +30,7 @@ pub mod definitions;
 pub mod effects;
 pub mod names;
 pub mod policy;
+pub mod schema_compact;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;

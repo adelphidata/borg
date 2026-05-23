@@ -29,6 +29,8 @@ pub mod event_kind {
     pub const BUDGET_CHANGED: &str = "budget_changed";
     /// Accounting flipped status to `budget_limited`.
     pub const BUDGET_LIMITED: &str = "budget_limited";
+    /// Agent reported a repeated impasse via `update_goal` (status="blocked").
+    pub const BLOCKED: &str = "blocked";
     /// Goal completed via `update_goal`.
     pub const COMPLETED: &str = "completed";
     /// Goal row was deleted (`ClearGoal`).
@@ -63,6 +65,11 @@ pub enum GoalStatus {
     Paused,
     /// Token budget reached; agent should wrap up.
     BudgetLimited,
+    /// Agent hit a repeated impasse (permission denial, missing external
+    /// resource, persistent tool failure) and called `update_goal` with
+    /// `status="blocked"` after ≥3 attempts past the same wall. Auto-
+    /// continuation stops until the user resumes.
+    Blocked,
     /// Objective achieved.
     Complete,
 }
@@ -74,6 +81,7 @@ impl GoalStatus {
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::BudgetLimited => "budget_limited",
+            GoalStatus::Blocked => "blocked",
             GoalStatus::Complete => "complete",
         }
     }
@@ -85,6 +93,7 @@ impl GoalStatus {
             "active" => GoalStatus::Active,
             "paused" => GoalStatus::Paused,
             "budget_limited" => GoalStatus::BudgetLimited,
+            "blocked" => GoalStatus::Blocked,
             "complete" => GoalStatus::Complete,
             _ => return None,
         })
@@ -96,6 +105,7 @@ impl GoalStatus {
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::BudgetLimited => "limited by budget",
+            GoalStatus::Blocked => "blocked",
             GoalStatus::Complete => "complete",
         }
     }
@@ -164,6 +174,7 @@ mod tests {
             GoalStatus::Active,
             GoalStatus::Paused,
             GoalStatus::BudgetLimited,
+            GoalStatus::Blocked,
             GoalStatus::Complete,
         ] {
             assert_eq!(GoalStatus::from_str(status.as_str()), Some(status));

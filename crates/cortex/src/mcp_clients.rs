@@ -260,15 +260,32 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// True iff `name` belongs to an MCP tool the operator has marked
-/// read-only via per-server `tools.read_only`. Default-on-miss is
-/// `false`, so an uninitialized registry or unknown tool is treated as
-/// mutating — Plan mode blocks it.
+/// True iff `name` belongs to an MCP tool that is safe to fan out in
+/// parallel with other read-only calls. Combines operator opt-in
+/// (`tools.read_only`) with server-advertised `annotations.readOnlyHint`.
+/// Default-on-miss is `false`, so an uninitialized registry or unknown
+/// tool is treated as mutating.
+///
+/// **Do not use this for Plan-mode gating** — the hint is untrusted. Use
+/// [`is_operator_read_only_mcp_tool`] for trust-boundary decisions.
 pub fn is_read_only_mcp_tool(name: &str) -> bool {
     REGISTRY
         .get()
         .and_then(|reg| reg.lookup(name))
         .map(|t| t.read_only)
+        .unwrap_or(false)
+}
+
+/// True iff the operator explicitly opted `name` into per-server
+/// `tools.read_only`. Untrusted server annotations are NOT considered
+/// here, so this is the correct gate for Plan mode and any other path
+/// that treats "read-only" as a trust assertion rather than a batching
+/// hint. Default-on-miss is `false`.
+pub fn is_operator_read_only_mcp_tool(name: &str) -> bool {
+    REGISTRY
+        .get()
+        .and_then(|reg| reg.lookup(name))
+        .map(|t| t.operator_read_only)
         .unwrap_or(false)
 }
 

@@ -196,6 +196,26 @@ pub struct McpToolSchema {
     /// JSON Schema for the tool's input. Must be `{"type":"object", …}`.
     #[serde(rename = "inputSchema", default)]
     pub input_schema: Value,
+    /// Optional behavior hints advertised by the server. Borg only consumes
+    /// `readOnlyHint` today (to flag the tool as parallel-safe with other
+    /// read-only tools); other hints are accepted but currently ignored.
+    /// The hint never widens Plan-mode visibility — that remains gated on
+    /// explicit operator opt-in via per-server `tools.read_only`.
+    #[serde(default)]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// Subset of MCP tool annotations Borg consumes. Untrusted — a malicious
+/// server can claim `read_only_hint: true` on a tool that mutates. The
+/// hint only widens the parallel-safe set (a non-privilege-granting
+/// batching decision); Plan-mode visibility still requires explicit
+/// operator opt-in via per-server `tools.read_only`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolAnnotations {
+    /// Server's claim that this tool does not mutate its environment.
+    /// Maps to the MCP `readOnlyHint` field.
+    #[serde(rename = "readOnlyHint", default)]
+    pub read_only_hint: Option<bool>,
 }
 
 /// `tools/call` response, normalized to the agent-loop-relevant fields.

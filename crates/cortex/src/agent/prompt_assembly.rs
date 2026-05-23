@@ -338,11 +338,27 @@ Rules:
             );
         }
 
-        // Compact tool schemas: strip redundant metadata to reduce token overhead.
+        // Compact tool schemas: strip redundant metadata to reduce token
+        // overhead, then run the waterfall compactor that only kicks in
+        // when the post-strip schema is still pathologically large (MCP /
+        // WASM plugins with deep `$defs` or verbose descriptions). The
+        // second pass is best-effort and no-ops on ordinary schemas, so
+        // we always run both — gating only the cheap first pass on the
+        // operator setting preserves the legacy escape hatch.
         if self.config.tools.compact_schemas {
             for tool in &mut tools {
                 crate::tool::definitions::compact_tool_schema(&mut tool.function.parameters);
             }
+        }
+        // Known sharp edge: an MCP server whose schema oscillates around
+        // the compactor's byte threshold (e.g. a description toggles each
+        // turn) will alternate between compacted and uncompacted forms,
+        // perturbing the Anthropic prompt-cache breakpoint on the tools
+        // array. Acceptable for now — real MCP schemas don't churn that
+        // way in practice. If it becomes a problem, add hysteresis
+        // (compact at >budget, stay compacted until well under).
+        for tool in &mut tools {
+            crate::tool::schema_compact::compact_large_tool_schema(&mut tool.function.parameters);
         }
 
         // Sort deterministically so the tools block is byte-identical across turns,

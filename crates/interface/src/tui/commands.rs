@@ -1143,6 +1143,9 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
         Some(cortex::goals::GoalStatus::Paused) => {
             "Commands: /goal <new text>, /goal resume, /goal clear"
         }
+        Some(cortex::goals::GoalStatus::Blocked) => {
+            "Commands: /goal <new text>, /goal resume, /goal clear"
+        }
         Some(cortex::goals::GoalStatus::BudgetLimited)
         | Some(cortex::goals::GoalStatus::Complete) => "Commands: /goal <new text>, /goal clear",
         None => "Commands: /goal <new text>, /goal clear",

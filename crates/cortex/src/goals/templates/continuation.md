@@ -32,3 +32,7 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
 Do not rely on intent, partial progress, or a plausible final answer as proof of completion. Only mark the goal achieved when current evidence proves every requirement has been satisfied and no required work remains. If the objective is achieved, call update_goal with status "complete" so usage accounting is preserved.
 
 Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
+
+Impasses:
+- If you have made at least three distinct attempts to get past the same wall (denied permission, missing external resource, persistent tool failure) and cannot make further progress without user intervention, call update_goal with status "blocked". This stops auto-continuation until the user resumes.
+- Do not use "blocked" for a single failure, for a problem you have not actually tried to work around, or as a way to pause without finishing.

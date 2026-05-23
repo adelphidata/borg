@@ -1,8 +1,6 @@
-//! `update_goal` tool: model-side hook to mark the goal complete.
-//!
-//! The schema exposes a single accepted value (`status="complete"`). Pause,
-//! resume, budget edits, and objective replacement are user-driven and never
-//! reachable through this tool.
+//! `update_goal` tool: model-side hook to mark the goal complete or report a
+//! repeated impasse via `status="blocked"`. Pause, resume, budget edits, and
+//! objective replacement remain user-driven and never reachable from here.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -22,12 +20,18 @@ pub(crate) async fn handle(
     db: &Database,
     session_id: &str,
 ) -> Result<String> {
-    if args.status != "complete" {
-        return Ok(json!({
-            "error": format!("status must be \"complete\" (got {:?}); pause/resume are user-controlled", args.status)
-        })
-        .to_string());
-    }
+    let target = match args.status.as_str() {
+        "complete" => GoalStatus::Complete,
+        "blocked" => GoalStatus::Blocked,
+        other => {
+            return Ok(json!({
+                "error": format!(
+                    "status must be \"complete\" or \"blocked\" (got {other:?}); pause/resume are user-controlled"
+                )
+            })
+            .to_string());
+        }
+    };
     let current = match db.get_goal(session_id).await? {
         Some(g) => g,
         None => {
@@ -38,9 +42,18 @@ pub(crate) async fn handle(
         }
     };
     if current.status == GoalStatus::Complete {
+        // Complete is terminal — never silently overwrite with `blocked`.
         return Ok(json!({
             "ok": true,
             "already_complete": true,
+            "goal_id": current.goal_id,
+        })
+        .to_string());
+    }
+    if target == GoalStatus::Blocked && current.status == GoalStatus::Blocked {
+        return Ok(json!({
+            "ok": true,
+            "already_blocked": true,
             "goal_id": current.goal_id,
         })
         .to_string());
@@ -49,7 +62,7 @@ pub(crate) async fn handle(
         .update_goal(
             session_id,
             GoalUpdate {
-                status: Some(GoalStatus::Complete),
+                status: Some(target),
                 expected_goal_id: Some(current.goal_id),
                 ..Default::default()
             },
@@ -57,7 +70,11 @@ pub(crate) async fn handle(
         .await?;
     match updated {
         Some(g) => {
-            crate::goals::metrics::record_completed(&g);
+            match g.status {
+                GoalStatus::Complete => crate::goals::metrics::record_completed(&g),
+                GoalStatus::Blocked => crate::goals::metrics::record_blocked(&g),
+                _ => {}
+            }
             Ok(json!({
                 "ok": true,
                 "goal_id": g.goal_id,
@@ -69,9 +86,72 @@ pub(crate) async fn handle(
             .to_string())
         }
         None => Ok(json!({
-            "error": "goal changed concurrently; refusing to mark complete"
+            "error": format!("goal changed concurrently; refusing to set {}", target.as_str())
         })
         .to_string()),
+    }
+}
+
+#[cfg(test)]
+mod accept_status_tests {
+    //! Argument-shape spec for the `update_goal` tool: only `"complete"` and
+    //! `"blocked"` may be passed; everything else returns an error with no
+    //! DB write attempted. Guards the contract documented in the tool JSON
+    //! schema so a future schema change can't silently widen the surface.
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct ErrShape {
+        error: String,
+    }
+
+    fn parse_err(s: &str) -> Option<String> {
+        serde_json::from_str::<ErrShape>(s).ok().map(|e| e.error)
+    }
+
+    #[test]
+    fn unknown_status_rejected_without_mutating_goal_row() {
+        // Spec: any status string outside the {"complete","blocked"} set
+        // returns an error and leaves the underlying goal row untouched.
+        // The error body must name both accepted values so the model can
+        // self-correct without a follow-up tool call.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = crate::db::Database::test_db().await;
+            // Seed an Active goal so we can verify it is NOT mutated.
+            db.upsert_session("s", 0, 0, 0, "m", "t").await.unwrap();
+            db.insert_goal("s", "obj", GoalStatus::Active, None)
+                .await
+                .unwrap();
+            let before = db.get_goal("s").await.unwrap().unwrap();
+            for bad in ["paused", "active", "budget_limited", "garbage", ""] {
+                let out = handle(
+                    &UpdateGoalArgs {
+                        status: bad.to_string(),
+                    },
+                    &db,
+                    "s",
+                )
+                .await
+                .expect("handle returns Ok with JSON error body");
+                let err = parse_err(&out).unwrap_or_else(|| {
+                    panic!("status={bad:?} did not return an error body: {out}")
+                });
+                assert!(
+                    err.contains("complete") && err.contains("blocked"),
+                    "error for status={bad:?} should name the two accepted values; got {err:?}"
+                );
+            }
+            // Production-path assertion: row is byte-for-byte unchanged.
+            let after = db.get_goal("s").await.unwrap().unwrap();
+            assert_eq!(
+                before, after,
+                "rejected status must not mutate the goal row"
+            );
+        });
     }
 }
 

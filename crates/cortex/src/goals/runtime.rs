@@ -190,7 +190,7 @@ impl GoalRuntimeState {
 /// Decide whether the agent loop should self-continue after a turn ends.
 ///
 /// Returns `true` only when *all* of:
-/// - the goal is Active (not Paused, BudgetLimited, or Complete);
+/// - the goal is Active (not Paused, BudgetLimited, Blocked, or Complete);
 /// - user input is not pending;
 /// - we are not in Plan mode.
 pub fn should_continue(
@@ -342,10 +342,11 @@ mod tests {
         assert!(!should_continue(GoalStatus::Active, true, false));
         // Active + plan mode => stop
         assert!(!should_continue(GoalStatus::Active, false, true));
-        // Paused / BudgetLimited / Complete => stop
+        // Paused / BudgetLimited / Blocked / Complete => stop
         for s in [
             GoalStatus::Paused,
             GoalStatus::BudgetLimited,
+            GoalStatus::Blocked,
             GoalStatus::Complete,
         ] {
             assert!(!should_continue(s, false, false), "status={s:?}");

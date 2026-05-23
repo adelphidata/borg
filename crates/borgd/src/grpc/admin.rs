@@ -1804,12 +1804,17 @@ impl Admin for AdminSvc {
                     let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
                         .ok_or_else(|| {
                             SetGoalError::Invalid(format!(
-                                "status must be one of active|paused|complete (got {status_raw:?})"
+                                "status must be one of active|paused|complete (got {status_raw:?}); blocked and budget_limited are system-only"
                             ))
                         })?;
                     if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
                         return Err(SetGoalError::Invalid(
                             "budget_limited is system-only; cannot be set via RPC".into(),
+                        ));
+                    }
+                    if matches!(new_status, cortex::goals::GoalStatus::Blocked) {
+                        return Err(SetGoalError::Invalid(
+                            "blocked is agent-only; cannot be set via RPC".into(),
                         ));
                     }
                     let current = db
@@ -1827,6 +1832,10 @@ impl Admin for AdminSvc {
                             | (S::Active, S::Complete)
                             | (S::Paused, S::Complete)
                             | (S::BudgetLimited, S::Complete)
+                            // Blocked is set by the agent; the user resumes
+                            // it back to Active or marks it Complete.
+                            | (S::Blocked, S::Active)
+                            | (S::Blocked, S::Complete)
                     );
                     if !allowed {
                         return Err(SetGoalError::Invalid(format!(

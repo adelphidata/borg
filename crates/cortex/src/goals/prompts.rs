@@ -134,6 +134,15 @@ mod tests {
     }
 
     #[test]
+    fn continuation_describes_blocked_with_attempt_threshold() {
+        let out = continuation_prompt(&sample_goal());
+        assert!(out.contains("status \"blocked\""));
+        // The ≥3 attempts threshold is the load-bearing constraint that
+        // prevents misuse of `blocked` as a generic pause button.
+        assert!(out.contains("three"));
+    }
+
+    #[test]
     fn budget_limit_says_wrap_up_not_pause() {
         let out = budget_limit_prompt(&sample_goal());
         assert!(out.contains("Wrap up this turn soon"));
