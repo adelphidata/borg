@@ -475,23 +475,17 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   trampoline auto-promotes when setup.json is present and version-
   current; auto-falls-back to Tier 1 otherwise. Mirrors the
   `security.kek_backend = auto` pattern.
-- **Windows sandbox — replace argv-policy transport.** Deferred.
-  Today the trampoline carries the policy JSON on its own argv,
-  observable to any same-session local process via WMI / `tasklist
-/v`. The policy is not a credential, but `deny_read` /
-  `deny_write` paths form a useful map for a different-vector
-  attacker. Replace with an inheritable anonymous-pipe handle the
-  trampoline reads on startup, or a transient HMAC-sealed file at
-  `~/.borg/run/sandbox-<nonce>.json` referenced on argv by path +
-  one-shot nonce only. SECURITY note in
-  `crates/sandbox/src/windows/mod.rs`.
 - **Windows sandbox — caller authentication on the trampoline
-  subcommand.** Deferred. The `__windows-sandbox-spawn` token alone
-  is a soft check, not a security boundary: any process that can
-  invoke `borg.exe` can hand-craft a `--policy` invocation. Add
-  parent-PID validation (same `borg.exe` path, same logon session)
-  or an inheritable shared-memory nonce only the spawning parent
-  could have written.
+  subcommand.** Deferred. The argv-policy transport has been replaced
+  with an inheritable anonymous-pipe handoff (Phase 1 of the Codex
+  parity work — see `crates/sandbox/src/windows/pipe.rs`), which kills
+  the passive WMI / `tasklist /v` scrape path. The handoff still does
+  not authenticate an *active* same-session same-integrity attacker
+  who can `OpenProcess(PROCESS_DUP_HANDLE)` on the parent and grab a
+  copy of the read-end. The Phase 7 elevated-runner named-pipe
+  transport closes that gap by authenticating the caller via the
+  pipe's security descriptor; until then, parent-PID validation or
+  an inheritable shared-memory nonce would be incremental wins.
 - **Windows sandbox — CI runner.** Deferred. Tests under
   `crates/sandbox/src/windows/` are gated `cfg(target_os =
 "windows")` and only execute when developers run them on a Windows

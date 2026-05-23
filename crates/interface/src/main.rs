@@ -360,12 +360,51 @@ enum BackupCmd {
 const RUNTIME_STACK_SIZE: usize = 4 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // Windows sandbox trampoline. Intercepted before tokio + clap so a
+    // policy violation that re-execs `borg.exe __windows-sandbox-spawn ...`
+    // cannot accidentally spin up the agent, open the audit DB, or honor
+    // a misbehaving `--resume` flag. The dispatcher exits via
+    // `process::exit` so no Drop on later resources runs against an
+    // unexpected state.
+    #[cfg(target_os = "windows")]
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some(sandbox::windows::SPAWN_SUBCOMMAND) {
+            let exit_code = run_windows_sandbox_trampoline(&argv[2..]);
+            std::process::exit(exit_code as i32);
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(RUNTIME_STACK_SIZE)
         .thread_name("borg-worker")
         .build()?;
     runtime.block_on(async_main())
+}
+
+/// Body of the `__windows-sandbox-spawn` subcommand. Parses argv,
+/// reads the framed `SpawnRequest` from the inherited pipe, applies
+/// the policy via the Tier 1 runtime, and returns the wrapped child's
+/// exit code. Any failure path emits a stderr diagnostic and returns
+/// a non-zero exit — never falls through to running the wrapped
+/// command without sandboxing.
+#[cfg(target_os = "windows")]
+fn run_windows_sandbox_trampoline(argv_after_subcommand: &[String]) -> u32 {
+    let invocation = match sandbox::windows::parse_trampoline_args(argv_after_subcommand) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("borg sandbox trampoline: {e}");
+            return 1;
+        }
+    };
+    match sandbox::windows::runtime::run(&invocation) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("borg sandbox trampoline: {e}");
+            1
+        }
+    }
 }
 
 async fn async_main() -> Result<()> {

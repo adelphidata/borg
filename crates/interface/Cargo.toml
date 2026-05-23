@@ -68,6 +68,14 @@ tracing-opentelemetry = { workspace = true }
 qrcodegen = { workspace = true }
 libsql = { workspace = true }
 
+# Windows sandbox trampoline. main.rs short-circuits to
+# `sandbox::windows::runtime::run` when invoked with the hidden
+# `__windows-sandbox-spawn` subcommand. Windows-only because the rest
+# of the sandbox crate's Windows surface (CreateRestrictedToken,
+# CreateProcessAsUserW) only compiles there.
+[target.'cfg(target_os = "windows")'.dependencies]
+sandbox = { path = "../sandbox" }
+
 [features]
 # Exposes test-only constructors (e.g. `DaemonClient::lazy_for_tests`) outside
 # of `cargo test`. Off by default so production binaries cannot accidentally

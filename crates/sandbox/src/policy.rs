@@ -25,12 +25,49 @@ pub struct SandboxPolicy {
 }
 
 /// A command with its arguments, ready for execution (possibly sandbox-wrapped).
-#[derive(Debug, Clone)]
+///
+/// The optional `_resources` field carries OS handles or other RAII
+/// guards whose lifetime must outlive `Command::spawn()`. The current
+/// user is the Windows trampoline (Phase 1): `wrap_windows` allocates
+/// an anonymous pipe, writes the framed `SpawnRequest` into it, marks
+/// the read-end inheritable, embeds that handle's value on the
+/// trampoline argv, and stashes the parent's copy here. The Drop
+/// impl on the contained guard closes the parent's handle table entry
+/// once the caller is done spawning. On non-Windows platforms the
+/// field is always `None`.
+///
+/// Type-erasing via `Arc<dyn Any + Send + Sync>` keeps `SandboxCommand`
+/// platform-neutral (no Win32 types leak into the cross-platform API)
+/// and `Clone`-able (Arc clone shares the same drop guard, so the
+/// handle stays open until the last clone drops).
+#[derive(Default)]
 pub struct SandboxCommand {
     /// The program to execute.
     pub program: String,
     /// Command-line arguments.
     pub args: Vec<String>,
+    /// OS-side resources held for the lifetime of this command. See
+    /// the type-level docs for the Phase 1 pipe-IPC use case.
+    pub(crate) _resources: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SandboxCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+impl Clone for SandboxCommand {
+    fn clone(&self) -> Self {
+        Self {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            _resources: self._resources.clone(),
+        }
+    }
 }
 
 /// Check if a path matches any blocked path pattern.
@@ -73,6 +110,11 @@ fn filter_blocked(paths: &[String], blocked_paths: &[String]) -> Vec<String> {
 /// `wrap_command` dispatches via the runtime `cfg!()` macro (not
 /// `#[cfg]`), so the helper must compile on every target even though
 /// it's only ever called when the running OS is Windows.
+#[cfg(target_os = "windows")]
+pub(crate) fn fail_closed_windows_public(context: &str, detail: &str) -> SandboxCommand {
+    fail_closed_windows(context, detail)
+}
+
 fn fail_closed_windows(context: &str, detail: &str) -> SandboxCommand {
     tracing::error!("Windows sandbox refused to run unsandboxed: {context}: {detail}");
     SandboxCommand {
@@ -81,6 +123,7 @@ fn fail_closed_windows(context: &str, detail: &str) -> SandboxCommand {
             "/c".to_string(),
             format!("echo Borg sandbox setup failed: {context}: {detail} 1>&2 && exit 1"),
         ],
+        _resources: None,
     }
 }
 
@@ -167,6 +210,7 @@ impl SandboxPolicy {
             SandboxCommand {
                 program: program.to_string(),
                 args: args.to_vec(),
+                _resources: None,
             }
         }
     }
@@ -219,6 +263,7 @@ impl SandboxPolicy {
                         "-c".to_string(),
                         format!("echo 'Sandbox profile generation failed: {e}' >&2; exit 1"),
                     ],
+                    _resources: None,
                 };
             }
         };
@@ -229,6 +274,7 @@ impl SandboxPolicy {
         SandboxCommand {
             program: "sandbox-exec".to_string(),
             args: sandbox_args,
+            _resources: None,
         }
     }
 
@@ -242,6 +288,7 @@ impl SandboxPolicy {
         SandboxCommand {
             program: program.to_string(),
             args: args.to_vec(),
+            _resources: None,
         }
     }
 
@@ -281,6 +328,7 @@ impl SandboxPolicy {
         SandboxCommand {
             program: program.to_string(),
             args: args.to_vec(),
+            _resources: None,
         }
     }
 }
