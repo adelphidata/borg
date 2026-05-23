@@ -1,5 +1,5 @@
 use anyhow::Result;
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -8,12 +8,38 @@ use tracing_subscriber::Registry;
 
 use crate::config::TelemetryConfig;
 
+/// Single source of truth for every `borg.*` metric name. CLAUDE.md, dashboards,
+/// and emission sites all reference these constants — typos fail the build, not
+/// silently produce a second metric series.
+pub mod names {
+    pub const AGENT_TURNS: &str = "borg.agent.turns";
+    pub const AGENT_ITERATIONS: &str = "borg.agent.iterations";
+    pub const LLM_REQUESTS: &str = "borg.llm.requests";
+    pub const LLM_DURATION: &str = "borg.llm.duration";
+    pub const LLM_TOKENS: &str = "borg.llm.tokens";
+    pub const TOOL_EXECUTIONS: &str = "borg.tool.executions";
+    pub const TOOL_DURATION: &str = "borg.tool.duration";
+    pub const TOOL_REPEATS_BLOCKED: &str = "borg.tool.repeats_blocked";
+    pub const UNKNOWN_TOOLS_REFUSED: &str = "borg.tool.unknown_refused";
+    pub const GATEWAY_REQUESTS: &str = "borg.gateway.requests";
+    pub const GATEWAY_DURATION: &str = "borg.gateway.duration";
+    pub const COST_EVENTS_DROPPED: &str = "borg.telemetry.cost_events_dropped";
+
+    pub const WASM_INSTALLS: &str = "borg.wasm.installs_total";
+    pub const WASM_EXECUTES: &str = "borg.wasm.executes_total";
+    pub const WASM_EXECUTE_DURATION_MS: &str = "borg.wasm.execute_duration_ms";
+    pub const WASM_QUARANTINES: &str = "borg.wasm.quarantines_total";
+    pub const WASM_CACHE_HITS: &str = "borg.wasm.cache_hits_total";
+    pub const WASM_CACHE_MISSES: &str = "borg.wasm.cache_misses_total";
+    pub const WASM_RATE_LIMITED: &str = "borg.wasm.rate_limited_total";
+    pub const WASM_RESOURCE_EXHAUSTED: &str = "borg.wasm.resource_exhausted_total";
+    pub const WASM_RESEALED: &str = "borg.wasm.resealed_total";
+}
+
 /// Guard that shuts down OpenTelemetry providers on drop.
 /// Must live for the program's duration.
 pub struct TelemetryGuard {
-    /// Active tracing provider, shut down on drop.
     tracer_provider: Option<SdkTracerProvider>,
-    /// Active metrics provider, shut down on drop.
     meter_provider: Option<SdkMeterProvider>,
 }
 
@@ -49,13 +75,7 @@ pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>
 /// and a guard that must be held for the program's lifetime.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, TelemetryGuard)> {
     if !config.tracing_enabled && !config.metrics_enabled {
-        return Ok((
-            None,
-            TelemetryGuard {
-                tracer_provider: None,
-                meter_provider: None,
-            },
-        ));
+        return Ok((None, TelemetryGuard::noop()));
     }
 
     let mut tracer_provider = None;
@@ -118,35 +138,33 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, T
     ))
 }
 
+/// A meter provider with no readers — instruments are real but data never
+/// reaches an exporter. Used by [`BorgMetrics::noop`] so that disabling metrics
+/// is genuinely free of side effects regardless of what the global provider is
+/// (`global::meter("borg")` returns SDK instruments under an installed provider,
+/// so it cannot stand in as a noop here).
+fn noop_meter_provider() -> SdkMeterProvider {
+    SdkMeterProvider::builder().build()
+}
+
 /// Metrics instruments for Borg. Clone-friendly (all instruments are Arc-backed).
 #[derive(Clone)]
 pub struct BorgMetrics {
-    /// Counter for completed agent turns.
     pub agent_turns: Counter<u64>,
-    /// Counter for agent loop iterations.
     pub agent_iterations: Counter<u64>,
-    /// Counter for LLM API requests.
     pub llm_requests: Counter<u64>,
-    /// Histogram of LLM request durations in seconds.
     pub llm_duration: Histogram<f64>,
-    /// Counter for total LLM tokens consumed.
     pub llm_tokens: Counter<u64>,
-    /// Counter for tool executions.
     pub tool_executions: Counter<u64>,
-    /// Histogram of tool execution durations in seconds.
     pub tool_duration: Histogram<f64>,
     /// Counter for tool calls blocked because they were the Nth+ identical
-    /// consecutive call within a turn (see `config.loop_guard.identical_call_max`).
+    /// consecutive call within a turn (`loop_guard.identical_call_max`).
     pub tool_repeats_blocked: Counter<u64>,
-    /// Counter for hallucinated tool names refused with a terminal message
-    /// after exceeding `config.loop_guard.unknown_tool_max_per_name` attempts
-    /// in a single turn.
+    /// Counter for hallucinated tool names refused after exceeding
+    /// `loop_guard.unknown_tool_max_per_name` per-turn attempts.
     pub unknown_tools_refused: Counter<u64>,
-    /// Counter for gateway webhook requests.
     pub gateway_requests: Counter<u64>,
-    /// Histogram of gateway request processing durations in seconds.
     pub gateway_duration: Histogram<f64>,
-    /// Counter for dropped cost events due to lagged stream consumers.
     pub cost_events_dropped: Counter<u64>,
 }
 
@@ -157,13 +175,13 @@ impl Default for BorgMetrics {
 }
 
 impl BorgMetrics {
-    /// Create instruments from the global meter provider.
+    /// Build against the globally installed meter provider.
     pub fn new() -> Self {
-        let meter = opentelemetry::global::meter("borg");
-        Self::from_meter(&meter)
+        Self::from_meter(&opentelemetry::global::meter("borg"))
     }
 
-    /// Create metrics based on config: real instruments if enabled, noop otherwise.
+    /// Real instruments when metrics are enabled in `config`, otherwise a true
+    /// noop instance unaffected by global provider state.
     pub fn from_config(config: &crate::config::Config) -> Self {
         if config.telemetry.metrics_enabled {
             Self::new()
@@ -172,66 +190,69 @@ impl BorgMetrics {
         }
     }
 
-    /// Create no-op instruments (zero overhead when metrics are disabled).
+    /// Self-contained noop: each instrument is bound to a private
+    /// reader-less meter provider, so emissions allocate aggregation state
+    /// nowhere of consequence and never reach any exporter.
     pub fn noop() -> Self {
-        // Use the global meter before any provider is installed — it returns noop instruments.
-        let meter = opentelemetry::global::meter("borg-noop");
-        Self::from_meter(&meter)
+        let provider = noop_meter_provider();
+        Self::from_meter(&provider.meter("borg-noop"))
     }
 
-    fn from_meter(meter: &Meter) -> Self {
+    /// Public so tests (and any caller wanting provider isolation) can build a
+    /// metrics handle bound to a specific meter rather than the global one.
+    pub fn from_meter(meter: &Meter) -> Self {
         Self {
             agent_turns: meter
-                .u64_counter("borg.agent.turns")
+                .u64_counter(names::AGENT_TURNS)
                 .with_description("Number of agent turns completed")
                 .build(),
             agent_iterations: meter
-                .u64_counter("borg.agent.iterations")
+                .u64_counter(names::AGENT_ITERATIONS)
                 .with_description("Number of agent loop iterations")
                 .build(),
             llm_requests: meter
-                .u64_counter("borg.llm.requests")
+                .u64_counter(names::LLM_REQUESTS)
                 .with_description("Number of LLM API requests")
                 .build(),
             llm_duration: meter
-                .f64_histogram("borg.llm.duration")
+                .f64_histogram(names::LLM_DURATION)
                 .with_description("LLM request duration in seconds")
                 .with_unit("s")
                 .build(),
             llm_tokens: meter
-                .u64_counter("borg.llm.tokens")
+                .u64_counter(names::LLM_TOKENS)
                 .with_description("Total LLM tokens used")
                 .build(),
             tool_executions: meter
-                .u64_counter("borg.tool.executions")
+                .u64_counter(names::TOOL_EXECUTIONS)
                 .with_description("Number of tool executions")
                 .build(),
             tool_duration: meter
-                .f64_histogram("borg.tool.duration")
+                .f64_histogram(names::TOOL_DURATION)
                 .with_description("Tool execution duration in seconds")
                 .with_unit("s")
                 .build(),
             tool_repeats_blocked: meter
-                .u64_counter("borg.tool.repeats_blocked")
+                .u64_counter(names::TOOL_REPEATS_BLOCKED)
                 .with_description("Tool calls blocked as repeated identical consecutive calls")
                 .build(),
             unknown_tools_refused: meter
-                .u64_counter("borg.tool.unknown_refused")
+                .u64_counter(names::UNKNOWN_TOOLS_REFUSED)
                 .with_description(
                     "Hallucinated tool names refused after exceeding per-name attempt cap",
                 )
                 .build(),
             gateway_requests: meter
-                .u64_counter("borg.gateway.requests")
+                .u64_counter(names::GATEWAY_REQUESTS)
                 .with_description("Number of gateway webhook requests")
                 .build(),
             gateway_duration: meter
-                .f64_histogram("borg.gateway.duration")
+                .f64_histogram(names::GATEWAY_DURATION)
                 .with_description("Gateway request processing duration in seconds")
                 .with_unit("s")
                 .build(),
             cost_events_dropped: meter
-                .u64_counter("borg.telemetry.cost_events_dropped")
+                .u64_counter(names::COST_EVENTS_DROPPED)
                 .with_description("Number of dropped cost events due to lagged consumers")
                 .build(),
         }
@@ -240,28 +261,31 @@ impl BorgMetrics {
 
 /// WASM-plugin metric instruments and emission helpers.
 ///
-/// These are global so the runtime dispatch path (`crate::wasm_plugins`) can
-/// emit without threading a `BorgMetrics` through every call site. The
-/// instruments are lazily constructed against `opentelemetry::global::meter`
-/// — before a meter provider is installed they are no-ops, so it is safe to
-/// call the `record_*` helpers from anywhere including tests.
+/// Public emission helpers (`record_*`) go through a global [`Instruments`]
+/// constructed against `opentelemetry::global::meter("borg")` on first call.
+/// Tests construct their own [`Instruments`] against a private meter to avoid
+/// global pollution — the helper functions delegate to `Instruments` so the
+/// emission logic itself is shared between prod and test paths.
 pub mod wasm_metrics {
     use std::sync::OnceLock;
 
-    use opentelemetry::metrics::{Counter, Histogram};
+    use opentelemetry::metrics::{Counter, Histogram, Meter};
     use opentelemetry::KeyValue;
 
     use plugins::wasm::WasmExecuteErrorKind;
 
-    /// Discriminated outcome reported by `wasm_plugins::compiled_cache`. Re-
-    /// declared here to avoid a circular telemetry → wasm_plugins import.
+    use super::names;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WasmCacheOutcome {
         Hit,
         Miss,
     }
 
-    struct Instruments {
+    /// All WASM-plugin instruments bound to a single meter. Construct one per
+    /// meter; `record_*` helpers on this struct contain the actual emission
+    /// logic that the module-level functions reuse via the global instance.
+    pub struct Instruments {
         installs: Counter<u64>,
         executes: Counter<u64>,
         execute_duration_ms: Histogram<u64>,
@@ -273,189 +297,565 @@ pub mod wasm_metrics {
         resealed: Counter<u64>,
     }
 
-    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
-
-    fn instruments() -> &'static Instruments {
-        INSTRUMENTS.get_or_init(|| {
-            let m = opentelemetry::global::meter("borg");
-            Instruments {
+    impl Instruments {
+        pub fn from_meter(m: &Meter) -> Self {
+            Self {
                 installs: m
-                    .u64_counter("borg.wasm.installs_total")
+                    .u64_counter(names::WASM_INSTALLS)
                     .with_description("Successful WASM plugin installs")
                     .build(),
                 executes: m
-                    .u64_counter("borg.wasm.executes_total")
+                    .u64_counter(names::WASM_EXECUTES)
                     .with_description("WASM plugin tool dispatches (labelled by outcome)")
                     .build(),
                 execute_duration_ms: m
-                    .u64_histogram("borg.wasm.execute_duration_ms")
+                    .u64_histogram(names::WASM_EXECUTE_DURATION_MS)
                     .with_description("WASM plugin tool execution duration in milliseconds")
                     .with_unit("ms")
                     .build(),
                 quarantines: m
-                    .u64_counter("borg.wasm.quarantines_total")
+                    .u64_counter(names::WASM_QUARANTINES)
                     .with_description("Plugins moved into quarantine (labelled by reason)")
                     .build(),
                 cache_hits: m
-                    .u64_counter("borg.wasm.cache_hits_total")
+                    .u64_counter(names::WASM_CACHE_HITS)
                     .with_description("Compiled-module cache hits")
                     .build(),
                 cache_misses: m
-                    .u64_counter("borg.wasm.cache_misses_total")
+                    .u64_counter(names::WASM_CACHE_MISSES)
                     .with_description("Compiled-module cache misses (JIT compile)")
                     .build(),
                 rate_limited: m
-                    .u64_counter("borg.wasm.rate_limited_total")
+                    .u64_counter(names::WASM_RATE_LIMITED)
                     .with_description("Plugin dispatches refused by the per-plugin token bucket")
                     .build(),
                 resource_exhausted: m
-                    .u64_counter("borg.wasm.resource_exhausted_total")
+                    .u64_counter(names::WASM_RESOURCE_EXHAUSTED)
                     .with_description("Plugin executions stopped by a resource ceiling")
                     .build(),
                 resealed: m
-                    .u64_counter("borg.wasm.resealed_total")
+                    .u64_counter(names::WASM_RESEALED)
                     .with_description("Plugins whose local HMAC was upgraded to the current scheme")
                     .build(),
             }
-        })
+        }
+
+        pub fn record_install(&self, publisher_key: &str) {
+            self.installs.add(
+                1,
+                &[KeyValue::new("publisher_key", publisher_key.to_string())],
+            );
+        }
+
+        pub fn record_execute(
+            &self,
+            plugin_id: &str,
+            tool_name: &str,
+            duration_ms: u64,
+            error_category: Option<WasmExecuteErrorKind>,
+        ) {
+            let outcome = error_category
+                .map(WasmExecuteErrorKind::as_str)
+                .unwrap_or("ok");
+            let attrs = [
+                KeyValue::new("plugin_id", plugin_id.to_string()),
+                KeyValue::new("tool_name", tool_name.to_string()),
+                KeyValue::new("outcome", outcome),
+            ];
+            self.executes.add(1, &attrs);
+            self.execute_duration_ms.record(duration_ms, &attrs);
+            if let Some(kind) = error_category {
+                if is_resource_exhaustion(kind) {
+                    self.resource_exhausted.add(
+                        1,
+                        &[
+                            KeyValue::new("plugin_id", plugin_id.to_string()),
+                            KeyValue::new("kind", kind.as_str()),
+                        ],
+                    );
+                }
+            }
+        }
+
+        pub fn record_quarantine(&self, plugin_id: &str, reason_category: &str) {
+            self.quarantines.add(
+                1,
+                &[
+                    KeyValue::new("plugin_id", plugin_id.to_string()),
+                    KeyValue::new("reason_category", reason_category.to_string()),
+                ],
+            );
+        }
+
+        pub fn record_cache(&self, outcome: WasmCacheOutcome) {
+            match outcome {
+                WasmCacheOutcome::Hit => self.cache_hits.add(1, &[]),
+                WasmCacheOutcome::Miss => self.cache_misses.add(1, &[]),
+            }
+        }
+
+        pub fn record_rate_limited(&self, plugin_id: &str) {
+            self.rate_limited
+                .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+        }
+
+        pub fn record_reseal(&self, plugin_id: &str) {
+            self.resealed
+                .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+        }
     }
 
-    /// Record an install. Caller passes the publisher key fingerprint so
-    /// dashboards can attribute install volume per signer.
+    /// The five buckets we explicitly surface on the resource-exhausted counter.
+    /// Kept as a free function so both prod emission and tests assert against
+    /// the same predicate.
+    pub(crate) fn is_resource_exhaustion(kind: WasmExecuteErrorKind) -> bool {
+        matches!(
+            kind,
+            WasmExecuteErrorKind::FuelExhausted
+                | WasmExecuteErrorKind::Timeout
+                | WasmExecuteErrorKind::MemoryExceeded
+                | WasmExecuteErrorKind::OutputTooLarge
+                | WasmExecuteErrorKind::LogBytesExceeded
+        )
+    }
+
+    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+
+    fn global() -> &'static Instruments {
+        INSTRUMENTS.get_or_init(|| Instruments::from_meter(&opentelemetry::global::meter("borg")))
+    }
+
     pub fn record_install(publisher_key: &str) {
-        instruments().installs.add(
-            1,
-            &[KeyValue::new("publisher_key", publisher_key.to_string())],
-        );
+        global().record_install(publisher_key);
     }
 
-    /// Record one tool dispatch. `error_category` is `None` on success.
     pub fn record_execute(
         plugin_id: &str,
         tool_name: &str,
         duration_ms: u64,
         error_category: Option<WasmExecuteErrorKind>,
     ) {
-        let outcome = error_category
-            .map(WasmExecuteErrorKind::as_str)
-            .unwrap_or("ok");
-        let attrs = [
-            KeyValue::new("plugin_id", plugin_id.to_string()),
-            KeyValue::new("tool_name", tool_name.to_string()),
-            KeyValue::new("outcome", outcome),
-        ];
-        instruments().executes.add(1, &attrs);
-        instruments()
-            .execute_duration_ms
-            .record(duration_ms, &attrs);
-        // Surface resource-exhaustion explicitly so operators can spot
-        // misconfigured fuel/memory budgets without slicing the executes
-        // counter by every error category.
-        if let Some(kind) = error_category {
-            if matches!(
-                kind,
-                WasmExecuteErrorKind::FuelExhausted
-                    | WasmExecuteErrorKind::Timeout
-                    | WasmExecuteErrorKind::MemoryExceeded
-                    | WasmExecuteErrorKind::OutputTooLarge
-                    | WasmExecuteErrorKind::LogBytesExceeded
-            ) {
-                instruments().resource_exhausted.add(
-                    1,
-                    &[
-                        KeyValue::new("plugin_id", plugin_id.to_string()),
-                        KeyValue::new("kind", kind.as_str()),
-                    ],
-                );
-            }
-        }
+        global().record_execute(plugin_id, tool_name, duration_ms, error_category);
     }
 
-    /// Record a quarantine event. `reason_category` is a free-form short
-    /// label (e.g. `integrity_failure`, `reseal_failed`).
     pub fn record_quarantine(plugin_id: &str, reason_category: &str) {
-        instruments().quarantines.add(
-            1,
-            &[
-                KeyValue::new("plugin_id", plugin_id.to_string()),
-                KeyValue::new("reason_category", reason_category.to_string()),
-            ],
-        );
+        global().record_quarantine(plugin_id, reason_category);
     }
 
-    /// Record one cache lookup.
     pub fn record_cache(outcome: WasmCacheOutcome) {
-        match outcome {
-            WasmCacheOutcome::Hit => instruments().cache_hits.add(1, &[]),
-            WasmCacheOutcome::Miss => instruments().cache_misses.add(1, &[]),
-        }
+        global().record_cache(outcome);
     }
 
-    /// Record a rate-limited refusal.
     pub fn record_rate_limited(plugin_id: &str) {
-        instruments()
-            .rate_limited
-            .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+        global().record_rate_limited(plugin_id);
     }
 
-    /// Record a legacy-seal → current-seal HMAC rewrite.
     pub fn record_reseal(plugin_id: &str) {
-        instruments()
-            .resealed
-            .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+        global().record_reseal(plugin_id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::Resource;
+    use plugins::wasm::WasmExecuteErrorKind;
+    use wasm_metrics::{is_resource_exhaustion, Instruments, WasmCacheOutcome};
+
+    /// Stand up an isolated meter provider whose exports are captured by an
+    /// in-memory exporter.
+    fn test_metrics() -> (
+        SdkMeterProvider,
+        opentelemetry::metrics::Meter,
+        InMemoryMetricExporter,
+    ) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(std::time::Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(Resource::builder().with_service_name("test").build())
+            .build();
+        let meter = provider.meter("borg-test");
+        (provider, meter, exporter)
+    }
+
+    /// Force-flush the provider and return the exported `ResourceMetrics`.
+    fn collect(
+        provider: &SdkMeterProvider,
+        exporter: &InMemoryMetricExporter,
+    ) -> Vec<ResourceMetrics> {
+        provider.force_flush().expect("flush succeeds");
+        exporter
+            .get_finished_metrics()
+            .expect("exporter returns metrics")
+    }
+
+    /// Walks every metric across every scope and invokes `f` once per match.
+    fn with_metric<F: FnMut(&AggregatedMetrics)>(
+        rms: &[ResourceMetrics],
+        name: &str,
+        mut f: F,
+    ) -> usize {
+        let mut hits = 0;
+        for rm in rms {
+            for sm in rm.scope_metrics() {
+                for m in sm.metrics() {
+                    if m.name() == name {
+                        hits += 1;
+                        f(m.data());
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    fn has_metric(rms: &[ResourceMetrics], name: &str) -> bool {
+        with_metric(rms, name, |_| {}) > 0
+    }
+
+    fn u64_sum_for(rms: &[ResourceMetrics], name: &str) -> u64 {
+        let mut total = 0u64;
+        let hits = with_metric(rms, name, |data| match data {
+            AggregatedMetrics::U64(MetricData::Sum(s)) => {
+                total += s.data_points().map(|dp| dp.value()).sum::<u64>();
+            }
+            other => panic!("{name}: expected u64 sum, got {other:?}"),
+        });
+        assert!(hits > 0, "missing metric: {name}");
+        total
+    }
+
+    fn u64_hist_sum_for(rms: &[ResourceMetrics], name: &str) -> u64 {
+        let mut total = 0u64;
+        let hits = with_metric(rms, name, |data| match data {
+            AggregatedMetrics::U64(MetricData::Histogram(h)) => {
+                total += h.data_points().map(|dp| dp.sum()).sum::<u64>();
+            }
+            other => panic!("{name}: expected u64 histogram, got {other:?}"),
+        });
+        assert!(hits > 0, "missing histogram: {name}");
+        total
+    }
+
+    fn f64_hist_count_for(rms: &[ResourceMetrics], name: &str) -> u64 {
+        let mut total = 0u64;
+        let hits = with_metric(rms, name, |data| match data {
+            AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                total += h.data_points().map(|dp| dp.count()).sum::<u64>();
+            }
+            other => panic!("{name}: expected f64 histogram, got {other:?}"),
+        });
+        assert!(hits > 0, "missing histogram: {name}");
+        total
+    }
+
+    fn attr_value(attrs: &[KeyValue], key: &str) -> Option<String> {
+        attrs
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    /// Collect the attributes of the single data point of a u64 Sum metric.
+    /// Panics if the metric is missing, has the wrong shape, or has != 1 dp.
+    fn sole_sum_attrs(rms: &[ResourceMetrics], name: &str) -> Vec<KeyValue> {
+        let mut found: Option<Vec<KeyValue>> = None;
+        with_metric(rms, name, |data| match data {
+            AggregatedMetrics::U64(MetricData::Sum(s)) => {
+                let dps: Vec<_> = s.data_points().collect();
+                assert_eq!(
+                    dps.len(),
+                    1,
+                    "{name}: expected 1 data point, got {}",
+                    dps.len()
+                );
+                found = Some(dps[0].attributes().cloned().collect());
+            }
+            other => panic!("{name}: expected u64 sum, got {other:?}"),
+        });
+        found.unwrap_or_else(|| panic!("missing metric: {name}"))
+    }
+
+    // ---------------- init_telemetry ----------------
 
     #[test]
-    fn test_default_config_disabled() {
+    fn init_telemetry_off_yields_no_layer_and_no_export() {
+        // Spec: with both flags off, init returns no tracing layer AND
+        // BorgMetrics::noop() emits nothing observable via any exporter.
         let config = TelemetryConfig::default();
         assert!(!config.tracing_enabled);
         assert!(!config.metrics_enabled);
+
+        let (layer, _guard) = init_telemetry(&config).expect("init succeeds when disabled");
+        assert!(layer.is_none(), "no layer when tracing disabled");
+
+        // Sanity: a noop BorgMetrics emits without panicking AND aggregates
+        // nowhere observable. We can't easily inspect the private noop
+        // provider, but the noop_metrics_isolated_from_global test below
+        // covers the cross-provider isolation property.
+        let m = BorgMetrics::noop();
+        m.agent_turns.add(1, &[]);
+        m.gateway_duration.record(0.42, &[]);
+    }
+
+    // ---------------- BorgMetrics ----------------
+
+    #[test]
+    fn borg_metrics_emit_under_centralized_names() {
+        // Spec: every instrument BorgMetrics owns must export under the
+        // canonical name from `names::*`. If a future rename forgets to
+        // update both the const and the builder, the resulting series
+        // won't appear in the exporter and this test fails.
+        let (provider, meter, exporter) = test_metrics();
+        let m = BorgMetrics::from_meter(&meter);
+
+        m.agent_turns.add(2, &[]);
+        m.agent_iterations.add(3, &[]);
+        m.llm_requests.add(1, &[]);
+        m.llm_duration.record(0.5, &[]);
+        m.llm_tokens.add(123, &[]);
+        m.tool_executions.add(4, &[]);
+        m.tool_duration.record(0.1, &[]);
+        m.tool_repeats_blocked.add(1, &[]);
+        m.unknown_tools_refused.add(1, &[]);
+        m.gateway_requests.add(7, &[]);
+        m.gateway_duration.record(0.2, &[]);
+        m.cost_events_dropped.add(1, &[]);
+
+        let rms = collect(&provider, &exporter);
+
+        let counter_expectations: &[(&str, u64)] = &[
+            (names::AGENT_TURNS, 2),
+            (names::AGENT_ITERATIONS, 3),
+            (names::LLM_REQUESTS, 1),
+            (names::LLM_TOKENS, 123),
+            (names::TOOL_EXECUTIONS, 4),
+            (names::TOOL_REPEATS_BLOCKED, 1),
+            (names::UNKNOWN_TOOLS_REFUSED, 1),
+            (names::GATEWAY_REQUESTS, 7),
+            (names::COST_EVENTS_DROPPED, 1),
+        ];
+        for (name, expected_sum) in counter_expectations {
+            assert_eq!(
+                u64_sum_for(&rms, name),
+                *expected_sum,
+                "{name} sum mismatch"
+            );
+        }
+
+        for name in [
+            names::LLM_DURATION,
+            names::TOOL_DURATION,
+            names::GATEWAY_DURATION,
+        ] {
+            assert_eq!(
+                f64_hist_count_for(&rms, name),
+                1,
+                "{name} should have exactly 1 observation"
+            );
+        }
     }
 
     #[test]
-    fn test_init_noop_when_disabled() {
-        let config = TelemetryConfig::default();
-        let (layer, _guard) = init_telemetry(&config).expect("init should succeed");
-        assert!(layer.is_none());
+    fn noop_metrics_isolated_from_global_provider() {
+        // Spec: BorgMetrics::noop() must NOT export through whatever provider
+        // is currently global. This is the regression guard for the prior
+        // `global::meter("borg-noop")` hack, which returned real SDK
+        // instruments under any installed provider.
+        let (provider, _meter, exporter) = test_metrics();
+        opentelemetry::global::set_meter_provider(provider.clone());
+
+        let noop = BorgMetrics::noop();
+        noop.agent_turns.add(999, &[]);
+        noop.llm_duration.record(1.0, &[]);
+        noop.gateway_requests.add(7, &[]);
+
+        let rms = collect(&provider, &exporter);
+        let any = rms
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .any(|_| true);
+        assert!(!any, "noop metrics leaked into global provider");
+    }
+
+    // ---------------- wasm_metrics ----------------
+
+    #[test]
+    fn wasm_record_execute_success_emits_executes_and_duration_only() {
+        let (provider, meter, exporter) = test_metrics();
+        let inst = Instruments::from_meter(&meter);
+
+        inst.record_execute("plug-a", "tool-x", 42, None);
+
+        let rms = collect(&provider, &exporter);
+
+        assert_eq!(u64_sum_for(&rms, names::WASM_EXECUTES), 1);
+        let attrs = sole_sum_attrs(&rms, names::WASM_EXECUTES);
+        assert_eq!(attr_value(&attrs, "outcome").as_deref(), Some("ok"));
+        assert_eq!(attr_value(&attrs, "plugin_id").as_deref(), Some("plug-a"));
+        assert_eq!(attr_value(&attrs, "tool_name").as_deref(), Some("tool-x"));
+
+        assert_eq!(u64_hist_sum_for(&rms, names::WASM_EXECUTE_DURATION_MS), 42);
+
+        assert!(
+            !has_metric(&rms, names::WASM_RESOURCE_EXHAUSTED),
+            "resource_exhausted leaked on success"
+        );
     }
 
     #[test]
-    fn noop_instruments_and_guard_do_not_panic() {
-        // The noop path is the production default (telemetry off). If any
-        // instrument.add / record call panicked, every user would hit it. This
-        // exercises the full set in one shot; if a new metric is added to
-        // BorgMetrics, it should be exercised here too.
-        let metrics = BorgMetrics::noop();
-        metrics.agent_turns.add(1, &[]);
-        metrics.agent_iterations.add(1, &[]);
-        metrics.llm_requests.add(1, &[]);
-        metrics.llm_duration.record(0.5, &[]);
-        metrics.llm_tokens.add(100, &[]);
-        metrics.tool_executions.add(1, &[]);
-        metrics.tool_duration.record(0.1, &[]);
-        metrics.gateway_requests.add(1, &[]);
-        metrics.gateway_duration.record(0.2, &[]);
-        metrics.cost_events_dropped.add(1, &[]);
+    fn wasm_record_execute_exhaustion_kinds_bump_both_counters() {
+        // Spec: the 5 exhaustion kinds bump executes AND resource_exhausted.
+        // Non-exhaustion kinds bump only executes. A widening of the
+        // `matches!` arm or a regression that drops a kind from the bucket
+        // fails this table.
+        let exhaustion = [
+            WasmExecuteErrorKind::FuelExhausted,
+            WasmExecuteErrorKind::Timeout,
+            WasmExecuteErrorKind::MemoryExceeded,
+            WasmExecuteErrorKind::OutputTooLarge,
+            WasmExecuteErrorKind::LogBytesExceeded,
+        ];
+        let non_exhaustion = [
+            WasmExecuteErrorKind::HostHttpDenied,
+            WasmExecuteErrorKind::HostHttpSecretLeak,
+            WasmExecuteErrorKind::HostHttpUpstream,
+            WasmExecuteErrorKind::CredentialDenied,
+            WasmExecuteErrorKind::InvalidGuestOutput,
+            WasmExecuteErrorKind::GuestTrap,
+        ];
 
-        // Dropping a noop guard must not panic or print.
-        drop(TelemetryGuard::noop());
+        for kind in exhaustion {
+            assert!(
+                is_resource_exhaustion(kind),
+                "{kind:?} should classify as exhaustion"
+            );
+            let (provider, meter, exporter) = test_metrics();
+            let inst = Instruments::from_meter(&meter);
+            inst.record_execute("p", "t", 1, Some(kind));
+            let rms = collect(&provider, &exporter);
+
+            assert_eq!(
+                u64_sum_for(&rms, names::WASM_EXECUTES),
+                1,
+                "{kind:?}: executes wrong"
+            );
+            assert_eq!(
+                u64_sum_for(&rms, names::WASM_RESOURCE_EXHAUSTED),
+                1,
+                "{kind:?}: resource_exhausted wrong"
+            );
+
+            let attrs = sole_sum_attrs(&rms, names::WASM_RESOURCE_EXHAUSTED);
+            assert_eq!(
+                attr_value(&attrs, "kind").as_deref(),
+                Some(kind.as_str()),
+                "{kind:?}: wrong kind label"
+            );
+        }
+
+        for kind in non_exhaustion {
+            assert!(
+                !is_resource_exhaustion(kind),
+                "{kind:?} must NOT classify as exhaustion"
+            );
+            let (provider, meter, exporter) = test_metrics();
+            let inst = Instruments::from_meter(&meter);
+            inst.record_execute("p", "t", 1, Some(kind));
+            let rms = collect(&provider, &exporter);
+
+            assert!(
+                has_metric(&rms, names::WASM_EXECUTES),
+                "{kind:?}: executes missing"
+            );
+            assert!(
+                !has_metric(&rms, names::WASM_RESOURCE_EXHAUSTED),
+                "{kind:?}: resource_exhausted leaked"
+            );
+        }
     }
 
     #[test]
-    fn borg_metrics_from_config_respects_metrics_flag() {
-        // Real branch: when metrics_enabled=false, from_config must return a
-        // noop (no exporter) rather than attempting to stand up an OTLP meter.
-        use crate::config::Config;
-        let mut config = Config::default();
-        config.telemetry.metrics_enabled = false;
-        let noop = BorgMetrics::from_config(&config);
-        noop.llm_requests.add(5, &[]);
-        noop.gateway_duration.record(0.01, &[]);
-        noop.cost_events_dropped.add(1, &[]);
+    fn wasm_helpers_each_emit_under_canonical_name() {
+        // One test, table-driven, exercises every remaining helper and asserts
+        // the metric name + key label. Collapses what would otherwise be 5
+        // near-duplicate per-helper tests.
+        let (provider, meter, exporter) = test_metrics();
+        let inst = Instruments::from_meter(&meter);
+
+        inst.record_install("pubkey-1");
+        inst.record_quarantine("plug-q", "integrity_failure");
+        inst.record_cache(WasmCacheOutcome::Hit);
+        inst.record_cache(WasmCacheOutcome::Miss);
+        inst.record_rate_limited("plug-r");
+        inst.record_reseal("plug-s");
+
+        let rms = collect(&provider, &exporter);
+
+        struct Expect {
+            name: &'static str,
+            sum: u64,
+            label: Option<(&'static str, &'static str)>,
+        }
+        let expectations = [
+            Expect {
+                name: names::WASM_INSTALLS,
+                sum: 1,
+                label: Some(("publisher_key", "pubkey-1")),
+            },
+            Expect {
+                name: names::WASM_QUARANTINES,
+                sum: 1,
+                label: Some(("reason_category", "integrity_failure")),
+            },
+            Expect {
+                name: names::WASM_CACHE_HITS,
+                sum: 1,
+                label: None,
+            },
+            Expect {
+                name: names::WASM_CACHE_MISSES,
+                sum: 1,
+                label: None,
+            },
+            Expect {
+                name: names::WASM_RATE_LIMITED,
+                sum: 1,
+                label: Some(("plugin_id", "plug-r")),
+            },
+            Expect {
+                name: names::WASM_RESEALED,
+                sum: 1,
+                label: Some(("plugin_id", "plug-s")),
+            },
+        ];
+
+        for Expect {
+            name,
+            sum: expected_sum,
+            label,
+        } in &expectations
+        {
+            assert_eq!(
+                u64_sum_for(&rms, name),
+                *expected_sum,
+                "{name} sum mismatch"
+            );
+            if let Some((lk, lv)) = label {
+                let attrs = sole_sum_attrs(&rms, name);
+                assert_eq!(
+                    attr_value(&attrs, lk).as_deref(),
+                    Some(*lv),
+                    "{name}: label {lk} mismatch"
+                );
+            }
+        }
     }
 }

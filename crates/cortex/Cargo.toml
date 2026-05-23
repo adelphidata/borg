@@ -106,3 +106,5 @@ libc = { workspace = true }
 wiremock = "0.5"
 libsql = { workspace = true }
 wasm-encoder = "0.244"
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+opentelemetry = { workspace = true, features = ["testing"] }

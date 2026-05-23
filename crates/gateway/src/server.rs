@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use opentelemetry::metrics::Histogram;
 
 use anyhow::Result;
 use axum::extract::DefaultBodyLimit;
@@ -75,6 +77,29 @@ fn resolve_webhook_target<'a>(
         .get(name)
         .map(WebhookTarget::Native)
         .or_else(|| registry.get(name).map(WebhookTarget::Script))
+}
+
+/// RAII timer that records elapsed seconds into a histogram on drop.
+/// Covers every early-return path through a webhook handler without per-branch
+/// instrumentation.
+struct GatewayTimer<'a> {
+    start: Instant,
+    hist: &'a Histogram<f64>,
+}
+
+impl<'a> GatewayTimer<'a> {
+    fn new(hist: &'a Histogram<f64>) -> Self {
+        Self {
+            start: Instant::now(),
+            hist,
+        }
+    }
+}
+
+impl Drop for GatewayTimer<'_> {
+    fn drop(&mut self) {
+        self.hist.record(self.start.elapsed().as_secs_f64(), &[]);
+    }
 }
 
 /// HTTP webhook server for messaging channel integrations.
@@ -1110,6 +1135,7 @@ async fn webhook_handler(
     headers: HeaderMap,
     body: String,
 ) -> WebhookResponse {
+    let _timer = GatewayTimer::new(&state.metrics.gateway_duration);
     state.metrics.gateway_requests.add(1, &[]);
 
     let target = match resolve_webhook_target(&state.native_channels, &state.registry, &name) {
@@ -1250,6 +1276,7 @@ async fn slack_command_handler(
     headers: HeaderMap,
     body: String,
 ) -> WebhookResponse {
+    let _timer = GatewayTimer::new(&state.metrics.gateway_duration);
     state.metrics.gateway_requests.add(1, &[]);
 
     // Verify signature
@@ -1367,6 +1394,79 @@ async fn slack_command_handler(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use cortex::telemetry::names;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    #[test]
+    fn gateway_timer_records_one_histogram_observation_on_drop() {
+        // Spec: GatewayTimer must record exactly one duration observation on
+        // drop, regardless of where in a handler an early return happens.
+        // This is the regression guard for the `gateway_duration` histogram
+        // that was declared but never recorded for the entire pre-fix
+        // lifetime of the instrument.
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(std::time::Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter("borg-test");
+        let metrics = BorgMetrics::from_meter(&meter);
+
+        {
+            let _timer = GatewayTimer::new(&metrics.gateway_duration);
+            // simulated handler body, including an early return
+        }
+
+        provider.force_flush().expect("flush");
+        let resource_metrics = exporter.get_finished_metrics().expect("metrics present");
+        let mut count = 0u64;
+        for rm in resource_metrics {
+            for sm in rm.scope_metrics() {
+                for m in sm.metrics() {
+                    if m.name() == names::GATEWAY_DURATION {
+                        if let AggregatedMetrics::F64(MetricData::Histogram(h)) = m.data() {
+                            count += h.data_points().map(|dp| dp.count()).sum::<u64>();
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "GatewayTimer must record exactly one observation on drop"
+        );
+    }
+
+    #[test]
+    fn webhook_handlers_install_gateway_timer() {
+        // Source-grep guard: both webhook entry points must instantiate a
+        // GatewayTimer at the top so all early-return paths are timed. If a
+        // future edit removes one, the gateway_duration histogram silently
+        // becomes a partial sample of webhook traffic — exactly the bug this
+        // change fixed. Acceptable per CLAUDE.md's source-grep allowance:
+        // the invariant ("every webhook entry point starts a timer") is not
+        // type-expressible.
+        let src = include_str!("server.rs");
+        let webhook_idx = src
+            .find("async fn webhook_handler")
+            .expect("webhook_handler exists");
+        let slack_idx = src
+            .find("async fn slack_command_handler")
+            .expect("slack_command_handler exists");
+        for (name, idx) in [
+            ("webhook_handler", webhook_idx),
+            ("slack_command_handler", slack_idx),
+        ] {
+            // Search the next 400 chars for the timer construction.
+            let window = &src[idx..idx + 400.min(src.len() - idx)];
+            assert!(
+                window.contains("GatewayTimer::new(&state.metrics.gateway_duration)"),
+                "{name} must install GatewayTimer at entry — gateway_duration won't record otherwise"
+            );
+        }
+    }
 
     fn loopback_connect_info() -> ConnectInfo<std::net::SocketAddr> {
         ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345)))

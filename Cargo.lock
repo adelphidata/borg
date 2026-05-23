@@ -2361,6 +2361,8 @@ dependencies = [
  "hex",
  "hmac",
  "libsql",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "plugins",
  "rand 0.9.4",
  "regex",
