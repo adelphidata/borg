@@ -18,7 +18,7 @@ use cortex::db::Database;
 use cortex::telemetry::BorgMetrics;
 
 use crate::channel::channel_trait::{self, NativeChannelRegistry, WebhookContext};
-use crate::channel::registry::ChannelRegistry;
+use crate::channel::registry::{ChannelRegistry, RegisteredChannel};
 use crate::constants::{POLL_INITIAL_BACKOFF, POLL_MAX_BACKOFF, POLL_MAX_CONSECUTIVE_ERRORS};
 use crate::discord::channel::DiscordChannel;
 use crate::google_chat::channel::GoogleChatChannel;
@@ -59,6 +59,22 @@ struct AppState {
     auto_reply_state: crate::auto_reply::SharedAutoReplyState,
     /// Shutdown token — used by /internal/restart to trigger graceful restart.
     shutdown: CancellationToken,
+}
+
+enum WebhookTarget<'a> {
+    Native(&'a Arc<dyn channel_trait::NativeChannel>),
+    Script(&'a RegisteredChannel),
+}
+
+fn resolve_webhook_target<'a>(
+    native_channels: &'a NativeChannelRegistry,
+    registry: &'a ChannelRegistry,
+    name: &str,
+) -> Option<WebhookTarget<'a>> {
+    native_channels
+        .get(name)
+        .map(WebhookTarget::Native)
+        .or_else(|| registry.get(name).map(WebhookTarget::Script))
 }
 
 /// HTTP webhook server for messaging channel integrations.
@@ -1096,8 +1112,8 @@ async fn webhook_handler(
 ) -> WebhookResponse {
     state.metrics.gateway_requests.add(1, &[]);
 
-    let channel = match state.registry.get(&name) {
-        Some(c) => c,
+    let target = match resolve_webhook_target(&state.native_channels, &state.registry, &name) {
+        Some(target) => target,
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1127,21 +1143,24 @@ async fn webhook_handler(
 
     // Native channel handling via unified dispatch — messages are enqueued to the
     // SessionQueue for per-session sequential processing with global concurrency control.
-    if let Some(channel) = state.native_channels.get(&name) {
-        let ctx = WebhookContext {
-            config: &state.config,
-            health: &state.health,
-        };
-        return channel_trait::dispatch_webhook(
-            channel,
-            &headers,
-            &body,
-            &ctx,
-            &state.session_queue,
-            state.request_timeout,
-        )
-        .await;
-    }
+    let channel = match target {
+        WebhookTarget::Native(channel) => {
+            let ctx = WebhookContext {
+                config: &state.config,
+                health: &state.health,
+            };
+            return channel_trait::dispatch_webhook(
+                channel,
+                &headers,
+                &body,
+                &ctx,
+                &state.session_queue,
+                state.request_timeout,
+            )
+            .await;
+        }
+        WebhookTarget::Script(channel) => channel,
+    };
 
     // Convert headers to JSON
     let mut headers_map = serde_json::Map::new();
@@ -1491,6 +1510,97 @@ mod tests {
         assert_eq!(channels.len(), 1);
         assert!(channels[0].contains("telegram"));
         assert!(channels[0].contains("native integration"));
+    }
+
+    #[test]
+    fn native_webhook_resolves_without_script_manifest() {
+        use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+
+        struct TestChannel(&'static str);
+
+        #[async_trait::async_trait]
+        impl NativeChannel for TestChannel {
+            fn names(&self) -> Vec<&str> {
+                vec![self.0]
+            }
+            async fn handle_webhook(
+                &self,
+                _h: &HeaderMap,
+                _b: &str,
+                _c: &WebhookContext<'_>,
+            ) -> anyhow::Result<WebhookOutcome> {
+                Ok(WebhookOutcome::Skip)
+            }
+            async fn send_response(
+                &self,
+                _t: &str,
+                _c: &serde_json::Value,
+                _h: &std::sync::Arc<tokio::sync::RwLock<crate::health::ChannelHealthRegistry>>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut native = NativeChannelRegistry::new();
+        native.register(std::sync::Arc::new(TestChannel("telegram")));
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+
+        match resolve_webhook_target(&native, &scripts, "telegram") {
+            Some(WebhookTarget::Native(channel)) => assert_eq!(channel.names()[0], "telegram"),
+            _ => panic!("native webhook must resolve without a matching script channel"),
+        }
+    }
+
+    #[test]
+    fn native_webhook_takes_precedence_over_same_name_script_channel() {
+        use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+
+        struct TestChannel(&'static str);
+
+        #[async_trait::async_trait]
+        impl NativeChannel for TestChannel {
+            fn names(&self) -> Vec<&str> {
+                vec![self.0]
+            }
+            async fn handle_webhook(
+                &self,
+                _h: &HeaderMap,
+                _b: &str,
+                _c: &WebhookContext<'_>,
+            ) -> anyhow::Result<WebhookOutcome> {
+                Ok(WebhookOutcome::Skip)
+            }
+            async fn send_response(
+                &self,
+                _t: &str,
+                _c: &serde_json::Value,
+                _h: &std::sync::Arc<tokio::sync::RwLock<crate::health::ChannelHealthRegistry>>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let channel_dir = dir.path().join("telegram-script");
+        std::fs::create_dir_all(&channel_dir).unwrap();
+        std::fs::write(
+            channel_dir.join("channel.toml"),
+            r#"
+name = "telegram"
+description = "Script fallback"
+"#,
+        )
+        .unwrap();
+
+        let mut native = NativeChannelRegistry::new();
+        native.register(std::sync::Arc::new(TestChannel("telegram")));
+        let scripts = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+
+        match resolve_webhook_target(&native, &scripts, "telegram") {
+            Some(WebhookTarget::Native(channel)) => assert_eq!(channel.names()[0], "telegram"),
+            _ => panic!("native channel must win when script and native names collide"),
+        }
     }
 
     #[test]

@@ -27,6 +27,7 @@ fn spawn_gateway(
     config: &Config,
     shutdown: CancellationToken,
     poke_tx: Option<mpsc::Sender<()>>,
+    executor: Arc<DaemonSessionExecutor>,
 ) -> tokio::task::JoinHandle<()> {
     let gw_config = config.clone();
     tokio::spawn(async move {
@@ -35,7 +36,7 @@ fn spawn_gateway(
             shutdown,
             cortex::telemetry::BorgMetrics::noop(),
             poke_tx,
-            None,
+            Some(executor),
         ) {
             Ok(gateway) => {
                 if let Err(e) = gateway.run().await {
@@ -174,6 +175,7 @@ pub async fn start(
     let gw_poke_tx = poke_tx.clone();
     let gw_outer_shutdown = shutdown.clone();
     let gw_config = config.clone();
+    let gw_executor = executor.clone();
     spawn_supervised(
         gw_cfg,
         gw_outer_shutdown.clone(),
@@ -181,12 +183,14 @@ pub async fn start(
         move || {
             let gw_config = gw_config.clone();
             let gw_poke_tx = gw_poke_tx.clone();
+            let gw_executor = gw_executor.clone();
             // Per-iteration child token — cancels when the outer
             // shutdown does AND when this iteration's future drops, so
             // we don't leak a long-lived bridge task across respawns.
             let inner_shutdown = gw_outer_shutdown.child_token();
             async move {
-                let handle = spawn_gateway(&gw_config, inner_shutdown, Some(gw_poke_tx));
+                let handle =
+                    spawn_gateway(&gw_config, inner_shutdown, Some(gw_poke_tx), gw_executor);
                 // Treat any inner error or panic as a supervisor-level
                 // restart; convert into a Result so the supervisor's
                 // restart logic kicks in.

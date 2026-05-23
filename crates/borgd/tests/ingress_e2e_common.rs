@@ -88,6 +88,11 @@ pub async fn boot_gateway(with_executor: bool) -> GatewayHarness {
     // Generous rate limit so multiple test cases in the same process
     // don't trip per-principal throttling.
     config.gateway.rate_limit_per_minute = 1_000;
+    // Keep ingress e2e tests hermetic even when the developer shell has
+    // OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY set. The
+    // embeddings e2e intentionally asserts the mounted route's
+    // ProviderUnavailable -> 503 mapping.
+    config.memory.embeddings.enabled = false;
 
     if with_executor {
         install_global_executor();
