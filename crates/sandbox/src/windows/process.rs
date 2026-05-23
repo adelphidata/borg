@@ -26,8 +26,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, GetExitCodeProcess, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
+
+use super::mitigation::{default_mitigation_flags, install_default_mitigations, AttributeList};
 
 /// Owning handle to a spawned process + its main thread + the
 /// containing job object. Dropping closes all three handles. With
@@ -192,12 +195,26 @@ pub unsafe fn spawn_with_token(
         )
     };
 
-    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = stdin_h;
-    si.hStdOutput = stdout_h;
-    si.hStdError = stderr_h;
+    // Build the extended startup info, with a one-entry attribute list
+    // carrying the mitigation policy. The attribute list and the
+    // flags_storage `u64` MUST stay on this stack frame until
+    // CreateProcessAsUserW returns — UpdateProcThreadAttribute stores
+    // pointers into them, not copies.
+    let mut attr_list = AttributeList::new(1)?;
+    let mitigation_flags: u64 = default_mitigation_flags();
+    // SAFETY: mitigation_flags lives on this stack frame until after
+    // the CreateProcessAsUserW call below; attr_list outlives it for
+    // the same reason. install_default_mitigations stashes the
+    // pointer into the kernel-managed attribute list.
+    unsafe { install_default_mitigations(&mut attr_list, &mitigation_flags) }?;
+
+    let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    siex.StartupInfo.hStdInput = stdin_h;
+    siex.StartupInfo.hStdOutput = stdout_h;
+    siex.StartupInfo.hStdError = stderr_h;
+    siex.lpAttributeList = attr_list.as_ptr();
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -205,7 +222,11 @@ pub unsafe fn spawn_with_token(
     // child runs any code. A child that escapes the job before
     // assignment defeats KILL_ON_JOB_CLOSE — the assignment must
     // race-freely precede ResumeThread.
-    let mut creation_flags = CREATE_SUSPENDED;
+    //
+    // EXTENDED_STARTUPINFO_PRESENT is required for the kernel to
+    // honor the attribute list we built above — without it, mitigation
+    // policies are silently ignored.
+    let mut creation_flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
     if env_block.is_some() {
         creation_flags |= CREATE_UNICODE_ENVIRONMENT;
     }
@@ -221,7 +242,9 @@ pub unsafe fn spawn_with_token(
     // SAFETY: All pointers refer to local stack data that outlives the
     // call. cmdline is mutable per Win32 docs (the function may
     // tokenize in place). bInheritHandles=TRUE is required to share
-    // the std handles with the child.
+    // the std handles with the child. The siex.StartupInfo cast is the
+    // documented pattern — STARTUPINFOEXW is layout-compatible at its
+    // head with STARTUPINFOW because the latter is the first field.
     let ok = unsafe {
         CreateProcessAsUserW(
             token,
@@ -233,7 +256,7 @@ pub unsafe fn spawn_with_token(
             creation_flags,
             env_ptr,
             cwd_ptr,
-            &si,
+            &siex.StartupInfo as *const STARTUPINFOW,
             &mut pi,
         )
     };
