@@ -469,24 +469,23 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   and recommend operators run with `sandbox.enabled = false` if they
   hit issues.
 - **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users +
-  DPAPI + caller-authenticating named-pipe IPC).** Deferred. Real
-  network isolation (WFP kernel filter rules), a separate user
-  identity for the child, DPAPI-sealed sandbox credentials, and a
-  named-pipe `SpawnRequest` transport with an SDDL that
-  authenticates the parent all require admin to set up. Design:
-  `borg service install --windows-sandbox` triggers a UAC prompt,
-  creates `BorgSandboxOffline` + `BorgSandboxOnline` users via
-  `NetUserAdd`, registers WFP rules denying outbound for the
-  offline SID, seals the sandbox-account passwords with
-  `CryptProtectData(CRYPTPROTECT_LOCAL_MACHINE)`, and persists state
-  to `~/.borg/sandbox-windows/setup.json`. The trampoline
-  auto-promotes when `setup.json` is present and version-current;
-  auto-falls-back to Tier 1 otherwise. Mirrors the
-  `security.kek_backend = auto` pattern. Replaces the current
-  anonymous-pipe-with-argv-handle transport (which defeats passive
-  command-line scraping but is still vulnerable to an active
-  `PROCESS_DUP_HANDLE` same-session attacker) with named-pipe
-  SDDL-authenticated IPC.
+  DPAPI + caller-authenticating named-pipe IPC).** Scaffolding shipped,
+  operational FFI pending. The module structure
+  (`crates/sandbox/src/windows/elevated/`) defines the
+  `BorgSandboxOffline` / `BorgSandboxOnline` account names and account
+  selection logic, the `setup.json` schema with version detection, the
+  Tier 1↔Tier 2 mode-detection auto-promote check, and the named-pipe
+  naming convention with owner-only SDDL. DPAPI seal/unseal
+  (`windows/dpapi.rs`) is fully implemented. WFP install/uninstall
+  (`windows/wfp.rs`) returns `Unsupported` until the operational pass
+  lands. The operational chunk that remains: `borg service install
+  --windows-sandbox` UAC subcommand, `NetUserAdd` for account
+  provisioning, `LogonUserW` + `CreateProcessAsUserW` under the
+  sandbox account in an elevated runner binary, and `FwpmFilterAdd0`
+  for the offline-account network block (full transactional install in
+  `wfp.rs::install_offline_outbound_block`). Auto-fallback to Tier 1
+  is already wired: with no `setup.json`, `mode::detect()` returns
+  `Tier1`, mirroring the `security.kek_backend = auto` pattern.
 - **Windows sandbox — ConPTY for stdio.** Deferred. The trampoline
   currently inherits the parent's stdio handles directly. Wrapping
   the wrapped command in a pseudo-console
