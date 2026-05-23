@@ -48,6 +48,7 @@
 use crate::policy::{SandboxCommand, SandboxPolicy};
 
 pub mod ace;
+pub mod elevated;
 pub mod ipc;
 pub mod policy_resolve;
 pub mod sid;

@@ -15,6 +15,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 which = { workspace = true }
+# Cross-platform-tested helpers (desktop-name suffix, named-pipe nonce,
+# stable cap-SID seed, RNG-based unit tests). Windows is where these
+# actually run; macOS/Linux builds compile the same code paths through
+# the test suite.
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -23,7 +28,6 @@ tempfile = { workspace = true }
 # CreateProcessAsUserW). Pulled in only when targeting Windows so the
 # Unix builds keep their existing dep set.
 [target.'cfg(target_os = "windows")'.dependencies]
-rand = { workspace = true }
 sha2 = "0.10"
 hkdf = "0.12"
 windows-sys = { version = "0.59", features = [
