@@ -30,6 +30,7 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
+use super::desktop::{create_isolated as create_isolated_desktop, OwnedDesktop};
 use super::mitigation::{default_mitigation_flags, install_default_mitigations, AttributeList};
 
 /// Owning handle to a spawned process + its main thread + the
@@ -44,6 +45,14 @@ pub struct SpawnedChild {
     process: HANDLE,
     thread: HANDLE,
     job: HANDLE,
+    /// Isolated desktop the child runs on. Held so it outlives the
+    /// child — `CloseDesktop` would fail on a desktop still in use.
+    /// Drop order is process/thread/job first, then desktop, which
+    /// matches the kernel's lifetime requirements (handles to the
+    /// dead process can close any time; the desktop closes after the
+    /// last thread bound to it exits).
+    #[allow(dead_code)]
+    desktop: OwnedDesktop,
     pid: u32,
 }
 
@@ -208,12 +217,18 @@ pub unsafe fn spawn_with_token(
     // pointer into the kernel-managed attribute list.
     unsafe { install_default_mitigations(&mut attr_list, &mitigation_flags) }?;
 
+    // Isolated desktop. Holds its UTF-16 name buffer alive for the
+    // duration of CreateProcessAsUserW (kernel reads STARTUPINFO
+    // synchronously, but defensive lifetime-on-stack is the easy win).
+    let desktop = create_isolated_desktop()?;
+
     let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     siex.StartupInfo.hStdInput = stdin_h;
     siex.StartupInfo.hStdOutput = stdout_h;
     siex.StartupInfo.hStdError = stderr_h;
+    siex.StartupInfo.lpDesktop = desktop.lp_desktop();
     siex.lpAttributeList = attr_list.as_ptr();
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -305,6 +320,7 @@ pub unsafe fn spawn_with_token(
         process: pi.hProcess,
         thread: pi.hThread,
         job,
+        desktop,
         pid: pi.dwProcessId,
     })
 }

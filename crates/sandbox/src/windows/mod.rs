@@ -55,6 +55,8 @@ pub mod sid;
 #[cfg(target_os = "windows")]
 pub mod acl;
 #[cfg(target_os = "windows")]
+pub mod desktop;
+#[cfg(target_os = "windows")]
 pub mod mitigation;
 #[cfg(target_os = "windows")]
 pub mod pipe;
