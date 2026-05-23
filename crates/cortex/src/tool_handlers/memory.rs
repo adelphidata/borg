@@ -51,10 +51,10 @@ async fn search_scope(
     vector_weight: f32,
     bm25_weight: f32,
 ) -> Vec<embeddings::SearchResult> {
-    // FTS search returns candidates with a stub `0.0` score (Phase 5 removed
-    // the SQL `bm25()` accessor along with the FTS5 virtual table). Re-rank
-    // the candidate set in Rust using `bm25::score_candidates` so the BM25
-    // component of the hybrid mix carries actual signal instead of zeroes.
+    // FTS search returns candidates with a stub `0.0` score because the FTS5
+    // virtual table no longer exposes SQL `bm25()`. Re-rank the candidate set
+    // in Rust using `bm25::score_candidates` so the BM25 component of the
+    // hybrid mix carries actual signal instead of zeroes.
     let fts_rows = match db.fts_search(scope, query, max_results * 4).await {
         Ok(rows) => rows,
         Err(e) => {

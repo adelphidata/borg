@@ -710,7 +710,6 @@ mod tests {
     fn test_tool_definitions_at_depth_0_count() {
         let defs = tool_definitions(0, 1);
         // manage_roles + spawn_agent + wait_for_agent + close_agent = 4
-        // (send_to_agent removed)
         assert_eq!(
             defs.len(),
             4,

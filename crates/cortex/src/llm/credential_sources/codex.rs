@@ -1,9 +1,9 @@
-//! ChatGPT Codex OAuth credential discovery.
+//! OpenAI ChatGPT OAuth credential discovery via `~/.codex/auth.json`.
 //!
-//! Looks at `~/.codex/auth.json`. The file is also written by the upstream
-//! Codex CLI / VS Code extension and refresh tokens are single-use, so two
-//! consumers sharing the file will race on refresh. The refresh path locks
-//! the entry to mitigate; the discoverer just reads.
+//! The file is also written by the upstream OAuth CLI / VS Code extension and
+//! refresh tokens are single-use, so two consumers sharing the file will race
+//! on refresh. The refresh path locks the entry to mitigate; the discoverer
+//! just reads.
 //!
 //! File shape:
 //! ```json
@@ -31,8 +31,8 @@ pub struct CodexSource;
 struct CodexAuthFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<Tokens>,
-    /// Round-trip unknown top-level fields verbatim so write-back doesn't drop
-    /// data the upstream CLI writes (e.g. `last_refresh`).
+    /// Round-trip unknown top-level fields verbatim so write-back doesn't
+    /// drop data the upstream CLI writes (e.g. `last_refresh`).
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -43,9 +43,9 @@ struct Tokens {
     access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
-    /// Codex doesn't write an explicit expires_at; the refresh path computes
-    /// it from token TTL. `None` is correct — the refresh path schedules a
-    /// probe-refresh when expires_at is missing.
+    /// The on-disk file doesn't include an explicit expires_at; the refresh
+    /// path computes it from token TTL. `None` is correct — the refresh path
+    /// schedules a probe-refresh when expires_at is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at_ms: Option<i64>,
     #[serde(flatten)]
@@ -74,7 +74,7 @@ impl CredentialSource for CodexSource {
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: CodexAuthFile = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {} as Codex auth", path.display()))?;
+            .with_context(|| format!("parse {} as OpenAI OAuth auth", path.display()))?;
         let Some(tokens) = parsed.tokens else {
             return Ok(vec![]);
         };
@@ -90,7 +90,7 @@ impl CredentialSource for CodexSource {
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token.filter(|t| !t.is_empty()),
             expires_at_ms: tokens.expires_at_ms,
-            // Codex requests target the ChatGPT backend, not api.openai.com.
+            // OAuth requests target the ChatGPT backend, not api.openai.com.
             // Storing the override here keeps Provider::CodexOAuth's static
             // base_url as the api.openai.com fallback for any post-paired
             // hand-edited credentials.
@@ -121,7 +121,7 @@ impl CredentialSource for CodexSource {
         block.refresh_token = Some(refresh_token.to_string());
         block.expires_at_ms = Some(expires_at_ms);
         let serialized =
-            serde_json::to_string_pretty(&parsed).context("serialize rotated Codex credentials")?;
+            serde_json::to_string_pretty(&parsed).context("serialize rotated OAuth credentials")?;
         super::write_atomically(&path, &serialized)
     }
 }

@@ -50,7 +50,7 @@ pub trait Transport: Send {
 /// Servers that need credentials receive them via the explicit `env` block
 /// in their config, which is resolved through `SecretRef` upstream.
 ///
-/// The shape mirrors hermes-agent's allowlist; deliberately conservative.
+/// Deliberately conservative — anything not listed here gets stripped.
 pub const ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",

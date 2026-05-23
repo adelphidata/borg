@@ -183,8 +183,8 @@ impl Database {
     /// `cost_present` distinguishes "no rate-card data for any row" (false →
     /// the cost section is hidden) from "real $0.00" (true). Without this
     /// flag, a regression that returned `Some(0.0)` on no-cost rows would
-    /// silently render "$0.00 estimated" — exactly the misleading number
-    /// the hermes implementation flagged as "pricing unreliable."
+    /// silently render "$0.00 estimated" — a misleading "pricing unreliable"
+    /// number we want to avoid showing the user.
     #[instrument(skip_all)]
     pub async fn token_summary_since(&self, since_ts: i64) -> Result<TokenSummary> {
         let mut rows = self

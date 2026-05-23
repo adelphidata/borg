@@ -414,12 +414,10 @@ pub const DEFAULT_LLM_INITIAL_RETRY_DELAY_MS: u64 = 200;
 
 /// Default total request timeout (ms) for LLM requests (2 minutes).
 ///
-/// Matches Hermes' `HERMES_STREAM_READ_TIMEOUT` cloud default (120s) and openclaw's
-/// LLM idle window — intentionally generous so slow thinking-mode requests
-/// reach first token. Callers that operate under a shorter external deadline
-/// (e.g. gRPC `Send` with a client deadline) should derive a tighter per-call
-/// timeout via [`LLM_DEADLINE_SAFETY_MARGIN_MS`] rather than lowering this
-/// default.
+/// Intentionally generous (120s) so slow thinking-mode requests reach first
+/// token. Callers that operate under a shorter external deadline (e.g. gRPC
+/// `Send` with a client deadline) should derive a tighter per-call timeout
+/// via [`LLM_DEADLINE_SAFETY_MARGIN_MS`] rather than lowering this default.
 pub const DEFAULT_LLM_REQUEST_TIMEOUT_MS: u64 = 120_000;
 
 /// Headroom (ms) reserved for translating a deadline-cancel into an

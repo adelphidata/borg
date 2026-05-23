@@ -42,8 +42,8 @@ pub(crate) enum RepeatDecision {
 /// will not. Trade-off accepted to keep the guard cheap and avoid
 /// hashing-vs-parsing correctness questions.
 ///
-/// Defends against the OpenClaw failure mode: a stuck LLM looping on the
-/// same call burns rate-guard quota and pollutes context until the request
+/// Defends against the stuck-LLM failure mode: an agent looping on the same
+/// call burns rate-guard quota and pollutes context until the request
 /// overflows. The 25-iteration ceiling caps damage but doesn't notice
 /// duplication; this guard stops the spam earlier and the backoff window
 /// gives an operator time to interrupt before the hard cap.

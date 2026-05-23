@@ -38,7 +38,7 @@ use crate::db::Database;
 /// staying at 2 — relaxing the limit re-opens the flip-flop attack.
 pub const POSTURE_RATE_LIMIT_PER_HOUR: i64 = 2;
 
-const RATE_WINDOW_SECS: i64 = 3600;
+use crate::constants::SECS_PER_HOUR as RATE_WINDOW_SECS;
 
 /// Outcome of a [`maybe_emit_posture_change`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]

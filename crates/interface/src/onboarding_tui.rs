@@ -1254,10 +1254,9 @@ fn render_api_key(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
             theme::dim(),
         )));
         // OAuth-pairing hint shown only when the selected provider has a
-        // matching upstream CLI account (Claude Code for Anthropic, ChatGPT
-        // Codex for OpenAI). Surfaced here rather than as a separate tab to
-        // keep the wizard linear — power users wire backups via `borg auth …`
-        // post-onboarding.
+        // matching CLI account that ships an OAuth token on disk. Surfaced
+        // here rather than as a separate tab to keep the wizard linear —
+        // power users wire backups via `borg auth …` post-onboarding.
         let (provider_id, _, _) = PROVIDERS[state.provider_index];
         let oauth_hint = match provider_id {
             "anthropic" => Some(("claude-code", "Claude Code")),

@@ -147,8 +147,8 @@ pub enum TransportSpec {
     },
 }
 
-/// HTTP auth flavour. Phase 1: None (use `headers` directly) or Bearer.
-/// OAuth 2.1 is Phase 2.
+/// HTTP auth flavour. Today: `None` (use `headers` directly) or `Bearer`.
+/// OAuth 2.1 is deferred until a concrete server requires it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HttpAuthSpec {

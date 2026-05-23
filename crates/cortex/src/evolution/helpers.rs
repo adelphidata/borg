@@ -15,7 +15,7 @@ use crate::bond::BondState;
 use crate::vitals::VitalsState;
 
 /// 7-day window used for momentum computation.
-const WINDOW_7D_SECS: i64 = 7 * 86_400;
+const WINDOW_7D_SECS: i64 = 7 * crate::constants::SECS_PER_DAY;
 
 /// Minimum XP delta (last window − prior window) for an archetype to be
 /// marked Rising or Falling. Below this, the archetype is considered Stable.

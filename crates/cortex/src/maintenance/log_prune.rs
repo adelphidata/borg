@@ -174,6 +174,8 @@ mod tests {
         assert_eq!(prune_log_files(&missing, 0).unwrap(), 0);
     }
 
+    const MB: u64 = 1024 * 1024;
+
     /// Writes a file with predictable line content and returns `(path, size)`.
     /// Each line is `"line N\n"` — predictable length makes assertions easy.
     fn write_sample_log(dir: &Path, name: &str, approx_bytes: usize) -> (std::path::PathBuf, u64) {
@@ -198,17 +200,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         // 8 MB file, cap 5 MB, keep 1 MB.
-        let (path, original) = write_sample_log(dir, "daemon.log", 8 * 1024 * 1024);
-        assert!(original > 5 * 1024 * 1024);
+        let (path, original) = write_sample_log(dir, "daemon.log", 8 * MB as usize);
+        assert!(original > 5 * MB);
 
-        let freed =
-            truncate_oversized_logs(dir, &["daemon.log"], 5 * 1024 * 1024, 1024 * 1024).unwrap();
+        let freed = truncate_oversized_logs(dir, &["daemon.log"], 5 * MB, MB).unwrap();
 
         let new_size = fs::metadata(&path).unwrap().len();
         // Must be close to keep_bytes and strictly smaller than original.
         assert!(new_size < original, "file should shrink");
         assert!(
-            new_size <= 1024 * 1024,
+            new_size <= MB,
             "new size {new_size} must not exceed keep_bytes"
         );
         // Freed count must reflect bytes actually removed.
@@ -229,10 +230,9 @@ mod tests {
     fn truncate_oversized_logs_noop_under_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let (path, original) = write_sample_log(dir, "tui.log", 2 * 1024 * 1024);
+        let (path, original) = write_sample_log(dir, "tui.log", 2 * MB as usize);
 
-        let freed =
-            truncate_oversized_logs(dir, &["tui.log"], 5 * 1024 * 1024, 1024 * 1024).unwrap();
+        let freed = truncate_oversized_logs(dir, &["tui.log"], 5 * MB, MB).unwrap();
 
         assert_eq!(freed, 0);
         let new_size = fs::metadata(&path).unwrap().len();
@@ -256,7 +256,7 @@ mod tests {
         }
         writer.flush().unwrap();
 
-        let freed = truncate_oversized_logs(dir, &["daemon.log"], 1024 * 1024, 256 * 1024).unwrap();
+        let freed = truncate_oversized_logs(dir, &["daemon.log"], MB, 256 * 1024).unwrap();
         assert!(freed > 0, "oversized log should have been truncated");
 
         writeln!(writer, "tail after truncation").unwrap();
@@ -274,13 +274,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         // Nothing written; list references files that don't exist.
-        let freed = truncate_oversized_logs(
-            dir,
-            &["daemon.log", "tui.log", "daemon.err"],
-            5 * 1024 * 1024,
-            1024 * 1024,
-        )
-        .unwrap();
+        let freed =
+            truncate_oversized_logs(dir, &["daemon.log", "tui.log", "daemon.err"], 5 * MB, MB)
+                .unwrap();
         assert_eq!(freed, 0);
     }
 }

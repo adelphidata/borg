@@ -104,7 +104,7 @@ impl CredentialStatus {
 /// re-seeding from env/config doesn't undo the removal on next start.
 ///
 /// `OAuth` and `Custom` capture the provenance for accounts discovered on
-/// disk (Claude Code, ChatGPT Codex, etc.) and user-defined OpenAI-compatible
+/// disk (Claude Code, OpenAI OAuth, etc.) and user-defined OpenAI-compatible
 /// endpoints. Discovery itself lives in `crates/cortex/src/llm/credential_sources/`;
 /// this enum only records the source so suppression and `borg auth list` can
 /// distinguish "operator added a key" from "discovered on disk".
@@ -795,8 +795,7 @@ impl CredentialPool {
     /// `wiremock` server). Production code never sets this.
     ///
     /// The override applies only to whichever refresh branch matches this
-    /// pool's `provider` (ClaudeCodeOAuth → anthropic refresh, CodexOAuth →
-    /// codex refresh). A single pool can't have two providers, so the
+    /// pool's `provider`. A single pool can't have two providers, so the
     /// override is unambiguously scoped — but the body/payload shape sent
     /// to the wiremock URL still matches the pool's provider.
     #[doc(hidden)]

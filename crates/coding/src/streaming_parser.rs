@@ -565,9 +565,9 @@ mod tests {
 
     #[test]
     fn large_patch_split_per_character_emits_monotonically() {
-        // Codex-equivalent stress test: feed the parser one char at a time and
-        // verify the visible hunk count never decreases. Catches state-machine
-        // regressions where partial input would throw away progress.
+        // Stress test: feed the parser one char at a time and verify the visible
+        // hunk count never decreases. Catches state-machine regressions where
+        // partial input would throw away progress.
         let patch = "\
 *** Begin Patch
 *** Add File: a.md

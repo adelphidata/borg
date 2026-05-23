@@ -5,8 +5,8 @@
 //! rotate on every successful refresh — callers must persist the new value
 //! or the next refresh will fail with `invalid_grant`.
 //!
-//! Endpoints, client IDs, and payload shapes are mirrored from the upstream
-//! CLIs (Claude Code, Codex). Changing them silently breaks operator pairings.
+//! Endpoints, client IDs, and payload shapes match the upstream OAuth CLIs we
+//! pair with. Changing them silently breaks operator pairings.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -94,8 +94,8 @@ pub async fn refresh_anthropic_against(
     })
 }
 
-/// ChatGPT Codex refresh. Endpoint is `auth.openai.com/oauth/token`; the
-/// client_id is the public Codex CLI id.
+/// OpenAI ChatGPT OAuth refresh. Endpoint is `auth.openai.com/oauth/token`;
+/// `client_id` is the public CLI id baked into the spec.
 pub async fn refresh_codex(refresh_token: &str) -> Result<RefreshedTokens> {
     refresh_codex_against(refresh_token, "https://auth.openai.com/oauth/token").await
 }
@@ -136,8 +136,8 @@ pub async fn refresh_codex_against(refresh_token: &str, endpoint: &str) -> Resul
         .refresh_token
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| refresh_token.to_string());
-    // Codex doesn't always return `expires_in`; ChatGPT access tokens are
-    // ~7 days, so default to that when missing.
+    // The provider doesn't always return `expires_in`; ChatGPT access tokens
+    // are ~7 days, so default to that when missing.
     let expires_in = parsed.expires_in.unwrap_or(7 * 24 * 3600);
     Ok(RefreshedTokens {
         access_token: parsed.access_token,

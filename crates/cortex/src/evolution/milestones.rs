@@ -37,7 +37,7 @@ pub struct PostureContext {
 const ALIGNED_STREAK_DAYS: i64 = 7;
 
 /// Archetype stability threshold (seconds) for `archetype_stabilized`.
-const ARCHETYPE_STABILITY_SECS: i64 = 7 * 86_400;
+const ARCHETYPE_STABILITY_SECS: i64 = 7 * crate::constants::SECS_PER_DAY;
 
 /// Bond score threshold for `first_strong_bond`.
 const FIRST_STRONG_BOND_THRESHOLD: u8 = 55;

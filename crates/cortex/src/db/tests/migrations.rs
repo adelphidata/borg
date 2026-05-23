@@ -130,7 +130,7 @@ async fn append_only_triggers_present_on_chain_tables() {
     }
 }
 
-// scheduled_tasks must expose the pre_run preamble columns (Hermes-style script
+// scheduled_tasks must expose the pre_run preamble columns (script
 // preprocessing) and the legacy workflow/project tables must not exist.
 #[tokio::test]
 async fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {

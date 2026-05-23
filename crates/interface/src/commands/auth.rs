@@ -50,9 +50,9 @@ pub(crate) enum AuthAction {
         strategy: String,
     },
     /// Pair an OAuth-capable account into the credential pool. Discovers
-    /// credentials from the matching on-disk store (Claude Code, ChatGPT
-    /// Codex, Qwen-CLI) and seeds them under the corresponding provider's
-    /// pool.
+    /// credentials from the matching on-disk store (Claude Code, Qwen-CLI,
+    /// or the OpenAI OAuth CLI) and seeds them under the corresponding
+    /// provider's pool.
     Pair {
         /// One of `claude-code | codex | qwen`.
         kind: String,

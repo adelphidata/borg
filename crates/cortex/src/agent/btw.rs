@@ -166,9 +166,6 @@ pub async fn run_btw(
 /// allowing leading whitespace). Returns the trimmed question text on match — an
 /// empty string when the user typed `/btw` with no follow-up so callers can show
 /// a usage hint rather than silently routing to the main agent.
-///
-/// Pattern mirrors openclaw's `^\s*/btw(?::|\s|$)` so users moving between the
-/// two agents see the same trigger.
 pub fn parse_btw_command(text: &str) -> Option<&str> {
     let trimmed = text.trim_start();
     let rest = trimmed.strip_prefix('/')?;

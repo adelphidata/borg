@@ -6,8 +6,7 @@
 //!     `<preprocessed_context source="pre_run" exit_code="N">` block ahead
 //!     of the user prompt.
 //!   - Non-zero exit / timeout / spawn failure surface as `status="failed"`
-//!     and the LLM still runs (Hermes-style — silent preamble failures lose
-//!     user trust).
+//!     and the LLM still runs — silent preamble failures lose user trust.
 //!   - Captured stdout/stderr cap at 64 KiB.
 //!
 //! Unit tests in `crates/borgd/src/task_runner.rs::pre_run_tests` already
@@ -275,9 +274,9 @@ async fn success_preamble_injects_preprocessed_context_block() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_preamble_still_invokes_llm_with_failed_status() {
-    // Hermes invariant: a failing preamble MUST NOT abort the task. The LLM
-    // still runs so the agent can surface the failure to the user. A silent
-    // skip would leave the user wondering why their scheduled prompt produced
+    // Invariant: a failing preamble MUST NOT abort the task. The LLM still
+    // runs so the agent can surface the failure to the user. A silent skip
+    // would leave the user wondering why their scheduled prompt produced
     // nothing.
     let _g = SERIAL
         .lock()

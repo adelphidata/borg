@@ -910,9 +910,9 @@ async fn handle_request<D: AcpDaemon>(
                 // serializes turns server-side, but the transport's
                 // `cancel_requested` flag is per-session, not per-prompt — a
                 // racing second prompt would clobber the first prompt's
-                // pending cancel state. Rather than queueing (hermes-style)
-                // or replacing (openclaw-style), reject with a structured
-                // busy error so the IDE can surface it to the user.
+                // pending cancel state. Reject with a structured busy error
+                // so the IDE can surface it to the user (rather than queueing
+                // or replacing, which both have observability downsides).
                 if session.runtime.prompt_in_flight {
                     return Err(anyhow!(AcpRequestError::prompt_in_flight(
                         &params.session_id
@@ -1099,11 +1099,11 @@ fn validate_workspace_cwd(cwd: &str) -> Result<PathBuf> {
 }
 
 /// Upper bound on a single ACP prompt's combined text + decoded image bytes.
-/// Aligned with openclaw's `MAX_PROMPT_BYTES`. A misbehaving or malicious IDE
-/// can otherwise stream arbitrarily large prompts into the transport before
-/// the daemon ever sees them — this short-circuits during accumulation so we
-/// never materialise more than the cap. 2 MiB is well above any realistic
-/// IDE prompt (typical screenshots fit comfortably).
+/// A misbehaving or malicious IDE can otherwise stream arbitrarily large
+/// prompts into the transport before the daemon ever sees them — this
+/// short-circuits during accumulation so we never materialise more than the
+/// cap. 2 MiB is well above any realistic IDE prompt (typical screenshots
+/// fit comfortably).
 const MAX_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Convert ACP prompt blocks into the daemon's `(text, images)` shape.
@@ -2094,10 +2094,10 @@ mod tests {
 
     /// Regression: `AgentEvent::ThinkingDelta` (Claude-CLI extended thinking,
     /// OpenAI-style reasoning streams) used to fall through `event_to_update`
-    /// and never reach the IDE. Both reference ACP implementations
-    /// (openclaw, hermes-agent) surface reasoning as `agent_thought_chunk`.
-    /// `<internal>` stripping must apply to thoughts the same way it does to
-    /// `TextDelta` so a reasoning stream can't smuggle hidden scratchpad.
+    /// and never reach the IDE. ACP surfaces reasoning as
+    /// `agent_thought_chunk`. `<internal>` stripping must apply to thoughts
+    /// the same way it does to `TextDelta` so a reasoning stream can't
+    /// smuggle hidden scratchpad.
     #[test]
     fn thinking_delta_emits_agent_thought_chunk() {
         let event =

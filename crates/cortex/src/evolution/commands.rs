@@ -36,8 +36,8 @@ pub enum EvolutionCommand {
 
 /// Rendered output of a dispatched command.
 ///
-/// `image_png` stays in the struct so Phase-2 / later-iteration PNG share
-/// cards can land without a signature change. Unused today.
+/// `image_png` stays in the struct so PNG share cards can land later without a
+/// signature change. Unused today.
 #[derive(Debug, Clone, Default)]
 pub struct CommandOutput {
     /// Plain-text rendering suitable for TUI popups and channel replies.
@@ -79,9 +79,9 @@ pub fn parse(msg: &str) -> Option<EvolutionCommand> {
 /// Dispatch a parsed command against the given database, returning rendered
 /// output.
 ///
-/// Phase 1 emits minimal but coherent text so the surfaces are exercised
-/// end-to-end. Streams A/B/E replace each branch's body with the real
-/// renderer from `evolution/format.rs` / `evolution/share_card.rs`.
+/// Emits minimal but coherent text so the surfaces are exercised end-to-end;
+/// branches will be replaced with the real renderer from `evolution/format.rs`
+/// / `evolution/share_card.rs`.
 pub async fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
     let state = db.get_evolution_state().await?;
 

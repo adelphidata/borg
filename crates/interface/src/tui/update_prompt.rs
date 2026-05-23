@@ -1,6 +1,5 @@
 //! "Update available" modal shown on TUI start when a newer release is on
-//! GitHub. Modeled on Codex's `update_prompt.rs`, trimmed to Borg's existing
-//! TUI primitives (synchronous ratatui draw loop, no `FrameRequester`).
+//! GitHub.
 //!
 //! The modal owns its own raw-mode + alt-screen lifecycle so the caller can
 //! invoke it before the main TUI is wired up. On user choice:
@@ -10,8 +9,8 @@
 //! - `DontRemind` → persists `update.skipped_version = <latest>` so the modal
 //!   suppresses itself until a newer release lands.
 //!
-//! In debug builds the entry point short-circuits to `Continue` — matches
-//! Codex parity and keeps `cargo run` from gating on every dev iteration.
+//! In debug builds the entry point short-circuits to `Continue` so `cargo run`
+//! doesn't gate on every dev iteration.
 //!
 //! Network / RPC failures never propagate: the agent always boots.
 

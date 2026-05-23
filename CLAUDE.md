@@ -140,7 +140,7 @@ Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreig
 
 `write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`.
 
-`schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs (Hermes-style — silent preamble failures lose user trust). Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
+`schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs — silent preamble failures lose user trust. Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
 
 ### Goals
 
@@ -220,7 +220,7 @@ One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src
 
 ### LLM Resilience
 
-Three-layer recovery: credential pool (per-provider keys with cooldown TTL + strategy), `llm.fallback` provider chain, and the `llm.aux` background client. The pool replaces FIFO key rotation — per-key cooldown via `Retry-After` (header → body hint → configured default), permanent removal on 401/403, persistence across restart, 402 disambiguation (transient usage-limit vs hard exhaustion). OAuth sources (Claude Code, ChatGPT Codex, Copilot, Qwen-CLI) and custom OpenAI-compatible endpoints are first-class credentials in the pool; access tokens auto-refresh, and provider fallback defers while the pool can still recover from a transient rate-limit. Knobs: `llm.credential_strategy`, `llm.credential_cooldown_secs`, `llm.max_concurrent_per_credential`. State tables: `credential_pool`, `credential_suppressions`. Full surface in `docs/llm-resilience.md`.
+Three-layer recovery: credential pool (per-provider keys with cooldown TTL + strategy), `llm.fallback` provider chain, and the `llm.aux` background client. The pool replaces FIFO key rotation — per-key cooldown via `Retry-After` (header → body hint → configured default), permanent removal on 401/403, persistence across restart, 402 disambiguation (transient usage-limit vs hard exhaustion). OAuth sources (Claude Code, OpenAI OAuth, Copilot, Qwen-CLI) and custom OpenAI-compatible endpoints are first-class credentials in the pool; access tokens auto-refresh, and provider fallback defers while the pool can still recover from a transient rate-limit. Knobs: `llm.credential_strategy`, `llm.credential_cooldown_secs`, `llm.max_concurrent_per_credential`. State tables: `credential_pool`, `credential_suppressions`. Full surface in `docs/llm-resilience.md`.
 
 ### Self-Healing
 

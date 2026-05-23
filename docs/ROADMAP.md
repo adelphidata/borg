@@ -201,7 +201,7 @@ top-down by priority, not by section order.
 
 - **CLI-delegate providers: `codex_cli`, `gemini_cli`, `opencode_cli`.**
   `[Z]` Deferred. New providers that piggyback on the user's locally-
-  installed Codex / Gemini / OpenCode CLIs the way the existing
+  installed OpenAI / Gemini / OpenCode coding CLIs the way the existing
   `Provider::ClaudeCode` piggybacks on the Claude Code CLI — auth,
   rate limits, and quota come from the CLI's existing session rather
   than Borg-managed API keys. Lowers per-provider onboarding to zero
@@ -369,14 +369,14 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   `cortex/claude_cli.rs` exist as outbound CLI providers, but Borg
   does not expose an _inbound_ ACP server — no editor can drive Borg.
   Adding this turns Borg into a usable in-editor assistant alongside
-  Claude Code / Codex without giving up its background daemon role.
+  other coding-agent backends without giving up its background daemon role.
   Complement to the MCP server mode below (ACP is coding-backend
   surface; MCP server is state-introspection surface).
 - **MCP support — both directions, native.** `[H][O]` Deferred. Adopt
   MCP (Model Context Protocol) as a first-class extensibility surface
   in addition to today's WASM plugins, both directions:
   Borg-as-server (`borgd serve-mcp`) so external IDEs / desktop
-  clients (Claude Code, Cursor, Codex) drive Borg over JSON-RPC and
+  clients (Claude Code, Cursor, and similar editors) drive Borg over JSON-RPC and
   can read/write sessions, messages, events, and permissions; and
   Borg-as-client so it consumes external MCP servers as
   agent-callable tools. Sibling of the ACP IDE-backend surface
@@ -442,8 +442,8 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   credentials. Each section idempotent, invokable alone via
   `borg setup <section>`. Today onboarding is one linear flow.
 - **Cross-tool migration importer (`borg migrate` / `borg import`).**
-  `[H][I]` Bundled importers for Claude Code, Claude Desktop, Codex,
-  and similar — pulls `AGENTS.md` / `CLAUDE.md` / hooks /
+  `[H][I]` Bundled importers for Claude Code, Claude Desktop, and similar
+  coding agents — pulls `AGENTS.md` / `CLAUDE.md` / hooks /
   approved-command lists / persona files / MCP servers / skills /
   command prompts / model providers / credentials into Borg's memory
     - config. Dry-run + overwrite presets. Removes the "redo your whole
@@ -669,8 +669,8 @@ roughly by ROI — each is independent.
   per provider (Gemini dynamic thinking, Anthropic adaptive, OpenAI
   flex). Per-model defaults overridable in config.
 - **1M-context + `/fast` mode.** `[I]` Wire Anthropic `service_tier`,
-  OpenAI fast variants, and Codex 1M context normalization through a
-  user-visible `/fast` toggle with per-model defaults.
+  OpenAI fast variants, and the OpenAI 1M-context normalization through
+  a user-visible `/fast` toggle with per-model defaults.
 - **Multi-provider failover orchestrator.** `[I]` Sequential-on-retryable
   provider chain with per-provider cooldown — formalize the existing
   `llm.fallback` config into a documented orchestrator with structured

@@ -241,8 +241,8 @@ fn token_summary_since_cost_present_false_when_no_cost_rows() {
     let now = chrono::Utc::now().timestamp();
     // Two rows, neither with a cost — `cost_present` MUST be false so the
     // formatter hides the Cost section. A regression returning `Some(0.0)`
-    // with `cost_present = true` would render "$0.00 estimated" — exactly
-    // the misleading value the hermes folks flagged as "pricing unreliable."
+    // with `cost_present = true` would render "$0.00 estimated", which is
+    // the "pricing unreliable" failure mode this test guards against.
     db.conn
         .execute(
             "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,

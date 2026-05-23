@@ -1182,20 +1182,19 @@ Body here.
 
     #[test]
     fn parse_agentskills_io_frontmatter_round_trips_and_normalizes_prerequisites() {
-        // Hermes-shaped frontmatter (agentskills.io standard): `platforms`
-        // alias for os, `prerequisites.commands`/`env_vars` folded into
-        // requires, vendor `metadata.*` round-trips, version/author/license
-        // preserved.
+        // agentskills.io-shaped frontmatter: `platforms` alias for os,
+        // `prerequisites.commands`/`env_vars` folded into requires, vendor
+        // `metadata.*` round-trips, version/author/license preserved.
         let src = r#"---
 name: apple-reminders
 description: "Apple Reminders via remindctl: add, list, complete."
 version: 1.0.0
-author: Hermes Agent
+author: Acme
 license: MIT
 compatibility: macOS 13+
 platforms: [macos]
 metadata:
-  hermes:
+  vendor:
     tags: [Reminders, tasks, todo]
 prerequisites:
   commands: [remindctl]
@@ -1209,7 +1208,7 @@ body
         let (m, _body) = parse_skill_md(src).unwrap();
         assert_eq!(m.name, "apple-reminders");
         assert_eq!(m.version.as_deref(), Some("1.0.0"));
-        assert_eq!(m.author.as_deref(), Some("Hermes Agent"));
+        assert_eq!(m.author.as_deref(), Some("Acme"));
         assert_eq!(m.license.as_deref(), Some("MIT"));
         assert_eq!(m.compatibility.as_deref(), Some("macOS 13+"));
         assert_eq!(m.os, vec!["macos".to_string()]);
@@ -1220,7 +1219,7 @@ body
         // metadata round-trips for downstream consumers
         let meta = m.metadata.as_ref().expect("metadata preserved");
         let tag = meta
-            .get("hermes")
+            .get("vendor")
             .and_then(|h| h.get("tags"))
             .and_then(|t| t.as_sequence())
             .and_then(|s| s.first())

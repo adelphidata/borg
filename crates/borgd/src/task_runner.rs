@@ -1,6 +1,5 @@
-//! Scheduled-task execution. Lifted from `crates/cli/src/service/mod.rs`
-//! so the daemon binary can run jobs without shelling out to the cli's
-//! in-process helpers.
+//! Scheduled-task execution. Runs in the daemon binary so jobs don't have to
+//! shell out to the cli's in-process helpers.
 
 use cortex::config::Config;
 use cortex::llm::{CostEventContext, CostEventSink, LlmClient};
@@ -8,17 +7,21 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// Maximum bytes of `pre_run_command` stdout/stderr captured into the
-/// preprocessed-context block before truncation. Hermes uses a similar cap
-/// (`reference/hermes-agent/cron/scheduler.py`); 64 KiB is a comfortable
-/// fit for any reasonable diff/log/JSON payload while preventing a runaway
-/// command from blowing up the prompt.
+/// preprocessed-context block before truncation. 64 KiB is a comfortable fit
+/// for any reasonable diff/log/JSON payload while preventing a runaway command
+/// from blowing up the prompt.
 const PRE_RUN_OUTPUT_CAP: usize = 64 * 1024;
 
+/// Token budget for the memory-context block injected into the system prompt
+/// of scheduled-task and heartbeat agent turns. The memory loader truncates to
+/// this budget by recency, leaving the rest of the context window for the
+/// task prompt and pre-run preamble.
+const SCHEDULED_TURN_MEMORY_TOKENS: usize = 4000;
+
 /// Sentinel string the LLM may return on its first non-empty line to
-/// suppress channel delivery for a scheduled-task run. Mirrors Hermes'
-/// `[SILENT]` wake-gate (`_parse_wake_gate`). Used for "ping me only when
-/// something changed"-style automations where the agent inspects the
-/// preprocessed context and decides nothing's worth saying.
+/// suppress channel delivery for a scheduled-task run. Used for "ping me
+/// only when something changed"-style automations where the agent inspects
+/// the preprocessed context and decides nothing's worth saying.
 pub const SILENT_SENTINEL: &str = "[SILENT]";
 
 /// Returns true if the LLM's response should suppress delivery — i.e. its
@@ -193,10 +196,9 @@ pub(crate) fn build_filtered_sh_command(command: &str) -> tokio::process::Comman
 /// `PRE_RUN_OUTPUT_CAP` bytes with a `[truncated]` marker so a runaway
 /// command can't blow up the prompt.
 ///
-/// Failures (non-zero exit, timeout, spawn error) do NOT abort the task
-/// — Hermes' design choice: the model still gets a turn and surfaces the
-/// problem to the user. Silent failures are how a personal-assistant
-/// agent loses trust.
+/// Failures (non-zero exit, timeout, spawn error) do NOT abort the task —
+/// the model still gets a turn and surfaces the problem to the user. Silent
+/// failures are how a personal-assistant agent loses trust.
 pub(crate) async fn run_pre_run_command(
     command: &str,
     cwd: Option<&str>,
@@ -640,7 +642,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         pre_run_timeout_ms,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(4000)
+    let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
         .await
         .unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -845,7 +847,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     }
 
     let identity = cortex::identity::load_identity().unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(4000)
+    let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
         .await
         .unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -1251,7 +1253,7 @@ mod pre_run_tests {
 
     #[test]
     fn silent_sentinel_first_line_match_suppresses() {
-        // Hermes-style: leading sentinel with trailing notes still suppresses.
+        // Leading sentinel with trailing notes still suppresses.
         assert!(is_silent_response("[SILENT]\nbackground notes go here"));
         assert!(is_silent_response("\n\n[SILENT]\nlater context"));
     }

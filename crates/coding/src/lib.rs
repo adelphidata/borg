@@ -140,9 +140,8 @@ mod tests {
 
     #[test]
     fn apply_patch_to_dir_default_is_lenient_unwraps_eof_heredoc() {
-        // Codex parity: LLMs that target a `local_shell`-shaped tool sometimes
-        // wrap the patch in a `<<EOF`-family heredoc. The default entry point
-        // must tolerate this (was previously rejected under Strict default).
+        // LLMs that target a `local_shell`-shaped tool sometimes wrap the patch
+        // in a `<<EOF`-family heredoc. The default entry point must tolerate this.
         let dir = tempfile::tempdir().unwrap();
         let inner = "*** Begin Patch\n*** Add File: hi.txt\n+hi\n*** End Patch";
         for opener in ["<<EOF", "<<'EOF'", "<<\"EOF\""] {
@@ -174,9 +173,9 @@ mod tests {
 
     #[test]
     fn apply_patch_to_dir_empty_patch_is_rejected() {
-        // Codex parity: an empty patch (sentinels only, zero hunks) is a no-op
-        // that wastes a turn and signals an LLM error. Reject at parse time
-        // so the agent gets a clear message and retries.
+        // An empty patch (sentinels only, zero hunks) is a no-op that wastes a
+        // turn and signals an LLM error. Reject at parse time so the agent gets
+        // a clear message and retries.
         let dir = tempfile::tempdir().unwrap();
         let empty = "*** Begin Patch\n*** End Patch\n";
         let err = apply_patch_to_dir(empty, dir.path()).expect_err("empty patch must be rejected");

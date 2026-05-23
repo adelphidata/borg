@@ -258,9 +258,9 @@ mod tests {
         insert_token_row(&db, now(), 100, 50, 150, 0, 0, "ollama", "llama3", None);
         let out = format_usage_text(&db, 30).unwrap();
         // The literal section header "Cost:" must not appear when no row has
-        // a non-null cost_usd. Failure mode: regression rendering "$0.00"
-        // when the rate card is silent — exactly what hermes flagged as
-        // "pricing unreliable."
+        // a non-null cost_usd. Failure mode being guarded: a regression that
+        // renders "$0.00" when no rate card is loaded ships a misleading
+        // "pricing unreliable" number to the user.
         assert!(
             !out.contains("Cost:"),
             "Cost section should be hidden when cost_present is false. Got:\n{out}"

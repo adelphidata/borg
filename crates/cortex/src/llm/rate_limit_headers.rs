@@ -8,7 +8,7 @@
 //! Two flavors are supported here:
 //!
 //! - **OpenAI-style** (OpenAI, OpenRouter, Azure, Groq, xAI, Gemini-via-compat,
-//!   DeepSeek, Codex/Copilot OAuth, user-defined Custom endpoints): the
+//!   DeepSeek, OpenAI/Copilot OAuth, user-defined Custom endpoints): the
 //!   `x-ratelimit-{limit,remaining,reset}-{requests,tokens}` family.
 //!   Reset values arrive either as a Unix-epoch timestamp (OpenRouter) or
 //!   as a compound duration string like `6m0s` / `1h30m` (OpenAI).

@@ -1,7 +1,7 @@
 //! OAuth credential discovery sources.
 //!
 //! Each module here looks at a well-known on-disk location for an existing
-//! OAuth account (Claude Code, ChatGPT Codex, Qwen-CLI, GitHub Copilot) and
+//! OAuth account (Claude Code, OpenAI OAuth, Qwen-CLI, GitHub Copilot) and
 //! returns a [`DiscoveredCredential`] the pool can seed. This is the
 //! file-discovery path — interactive OAuth flows (PKCE, device-code) are
 //! deliberately out of scope for now; they live behind `borg auth pair`.
@@ -29,8 +29,8 @@ pub struct DiscoveredCredential {
     pub refresh_token: Option<String>,
     /// Wall-clock millis at which the access token expires.
     pub expires_at_ms: Option<i64>,
-    /// Per-credential `base_url` override (Codex uses ChatGPT's backend URL,
-    /// Qwen has a per-account custom endpoint).
+    /// Per-credential `base_url` override (the OpenAI OAuth flavor targets
+    /// the ChatGPT backend URL; Qwen has a per-account custom endpoint).
     pub base_url: Option<String>,
     /// Opaque per-source metadata (PKCE verifier, OAuth client_id, etc.).
     /// Used by the OAuth-refresh flow.

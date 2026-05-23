@@ -11,8 +11,7 @@ use std::collections::HashMap;
 
 use super::{Archetype, EvolutionEvent};
 
-/// One day in seconds.
-const DAY_SECS: i64 = 86_400;
+use crate::constants::SECS_PER_DAY as DAY_SECS;
 
 /// Aggregate XP totals and breakdowns over the last 24h / 7d.
 #[derive(Debug, Clone, Default)]

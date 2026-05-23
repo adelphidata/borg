@@ -1977,7 +1977,7 @@ impl Agent {
             // context-overflow error. Surface an actionable message *now* so
             // the user sees the cause rather than just the generic
             // `[stream interrupted: context_length_exceeded]` marker that
-            // follows. See OpenClaw failure mode for context.
+            // follows.
             warn!("reactive_compact_history: nothing dropped, retry will likely re-fail");
             let after_tokens = history_tokens(&self.history);
             let _ = event_tx
@@ -3749,8 +3749,8 @@ mod tests {
     fn reactive_compact_zero_drop_emits_error_event() {
         // Source-grep guard: the dropped==0 branch must emit
         // AgentEvent::Error so the TUI surfaces an actionable message.
-        // Replacing the warn! with only a log regresses to OpenClaw's
-        // "silent degradation" failure mode.
+        // Replacing the warn! with only a log regresses to a silent-
+        // degradation failure mode where the user sees no error.
         let body = extract_reactive_compact_body();
         // The dropped==0 else branch must contain BOTH the warn! and a
         // user-visible AgentEvent::Error send.
@@ -3816,12 +3816,12 @@ mod tests {
 
     // ── No-user-message-replay regression guards (Gap 3) ──────────────
     //
-    // The OpenClaw failure mode: on context-overflow retry, the tool
-    // re-injected the user's last message, so the agent answered the
-    // same prompt over and over. Borg must not regress to that. These
-    // are source-grep guards because the invariant ("the retry path
-    // does not synthesize Message::user") is structural — types can't
-    // express it. Precedent: the TUI mouse-capture and prompt-cache
+    // Failure mode being guarded against: on context-overflow retry, an
+    // earlier implementation re-injected the user's last message, so the
+    // agent answered the same prompt over and over. Borg must not regress
+    // to that. These are source-grep guards because the invariant ("the
+    // retry path does not synthesize Message::user") is structural — types
+    // can't express it. Precedent: the TUI mouse-capture and prompt-cache
     // guards.
 
     fn extract_run_agent_loop_stream_error_block() -> &'static str {
@@ -3848,17 +3848,17 @@ mod tests {
 
     #[test]
     fn reactive_compact_history_must_not_replay_user_messages() {
-        // OpenClaw regression guard: the compaction path reads the
-        // user's history but must never *write* a new user message.
-        // If a future change adds (e.g.) "preserve last user msg by
-        // re-pushing it after summarization", it will trip this test.
+        // Regression guard: the compaction path reads the user's history
+        // but must never *write* a new user message. If a future change
+        // adds (e.g.) "preserve last user msg by re-pushing it after
+        // summarization", it will trip this test.
         let body = extract_reactive_compact_body();
         for token in FORBIDDEN_USER_REPLAY_TOKENS {
             assert!(
                 !body.contains(token),
                 "reactive_compact_history must not contain `{token}` \
-                 (OpenClaw failure mode: re-injecting user message on retry \
-                 causes agent to answer the same prompt repeatedly)"
+                 (re-injecting a user message on retry causes the agent to \
+                 answer the same prompt repeatedly)"
             );
         }
     }
@@ -3872,8 +3872,9 @@ mod tests {
         for token in FORBIDDEN_USER_REPLAY_TOKENS {
             assert!(
                 !body.contains(token),
-                "run_agent_loop stream-error retry block must not contain `{token}`: \
-                 see OpenClaw failure mode"
+                "run_agent_loop stream-error retry block must not contain `{token}` \
+                 (synthesizing a fresh user message on retry would re-answer \
+                 the same prompt)"
             );
         }
     }

@@ -2142,9 +2142,9 @@ fn openrouter_claude_request_carries_cache_control_markers() {
 
 #[test]
 fn openrouter_skips_cache_control_on_tool_role() {
-    // Hermes silent-hang guard: OpenRouter rejects `cache_control` on a
-    // role:tool message by hanging the request indefinitely. The rolling
-    // window must skip past tool messages without consuming a breakpoint.
+    // Silent-hang guard: OpenRouter rejects `cache_control` on a role:tool
+    // message by hanging the request indefinitely. The rolling window must
+    // skip past tool messages without consuming a breakpoint.
     let mut body = build_test_openai_body(true);
     let cfg = crate::config::PromptCacheConfig::default();
     super::apply_openai_cache_markers(&mut body, &cfg);

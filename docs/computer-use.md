@@ -92,8 +92,8 @@ block at dispatch time.
 ## Why no approval prompts
 
 Borg's "agent just executes" invariant (`CLAUDE.md` → UX — No Approval
-Prompts) applies here. Unlike Hermes' per-call callback, `computer_use`
-has no UI dialog — including for mutating actions. Safety comes from:
+Prompts) applies here. `computer_use` has no UI dialog — including for
+mutating actions. Safety comes from:
 
 1. The static denylist (logout/lock/force-quit/fork-bomb/security-surface
    refusal before driver dispatch).

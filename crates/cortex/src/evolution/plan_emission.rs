@@ -1,8 +1,8 @@
 //! Plan-mode emission XP rewards.
 //!
-//! Plan mode previously earned ~⅓ the XP rate of Execute mode because the
-//! creation events that drive the +2/+3 awards (apply_patch, write_memory)
-//! are blocked. This module awards a per-session creation-tier XP grant when
+//! Plan mode blocks the creation events that drive the +2/+3 awards
+//! (apply_patch, write_memory), so without this module it would earn ~⅓ the XP
+//! rate of Execute mode. This awards a per-session creation-tier XP grant when
 //! the agent emits a `<proposed_plan>` block in Plan mode, classifying the
 //! plan text against the archetype keyword tables.
 //!

@@ -65,7 +65,7 @@ Set via `llm.credential_strategy` (`/settings` → Resilience).
 Each `pick` / `acquire_lease(None)` holds a per-credential lease counter,
 bounded by `llm.max_concurrent_per_credential` (default 1). Concurrent
 requests fan out across keys until every key is at the cap; the
-least-leased key then wins ties (Hermes parity — degraded but never blocked).
+least-leased key then wins ties — degraded but never blocked.
 
 ### Proactive rate-limit avoidance
 
@@ -77,7 +77,7 @@ otherwise costs one wasted 429 round-trip per key.
 Headers parsed (see `crates/cortex/src/llm/rate_limit_headers.rs`):
 
 - **OpenAI-compatible** (OpenAI, OpenRouter, Azure, Groq, xAI, DeepSeek,
-  Codex/Copilot OAuth, Custom endpoints): `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`.
+  OpenAI/Copilot OAuth, Custom endpoints): `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`.
   Reset accepts duration suffix strings (`6m0s`, `1h30m`, `250ms`) or
   epoch s/ms integers. Gemini is intentionally NOT in this list since
   M4 — it runs on the native transport with Gemini-specific quota

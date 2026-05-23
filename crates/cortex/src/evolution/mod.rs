@@ -1175,9 +1175,9 @@ impl Hook for EvolutionHook {
     }
 
     fn points(&self) -> &[HookPoint] {
-        // Per-turn `<evolution_context>` injection on BeforeAgentStart /
-        // BeforeLlmCall was removed: archetype claims at request time miscast
-        // the agent on cross-domain tasks, and the surfaces that actually
+        // We deliberately do NOT inject `<evolution_context>` per-turn on
+        // BeforeAgentStart / BeforeLlmCall: archetype claims at request time
+        // miscast the agent on cross-domain tasks. The surfaces that actually
         // benefit from archetype context (heartbeat seeds, memory
         // consolidation, skill priority) read evolution state directly.
         // `format_evolution_context` is still used by status surfaces.
@@ -1195,7 +1195,7 @@ impl Hook for EvolutionHook {
                     .await;
             }
             HookData::AgentStart { .. } | HookData::LlmCall { .. } => {
-                // No-op: see `points()` for why per-turn injection was removed.
+                // No-op: see `points()` for why per-turn injection is omitted.
             }
             HookData::ToolResult {
                 name,

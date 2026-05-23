@@ -89,10 +89,9 @@ pub enum HttpAuth {
 
 /// Per-server tool filter.
 ///
-/// `include` wins over `exclude` (matches hermes precedent). `read_only`
-/// flips plan-mode classification — only tools the operator has explicitly
-/// vetted are callable in Plan mode. `max` caps how many tools a single
-/// server can register.
+/// `include` wins over `exclude`. `read_only` flips plan-mode classification —
+/// only tools the operator has explicitly vetted are callable in Plan mode.
+/// `max` caps how many tools a single server can register.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolFilter {
     /// If non-empty, only tools whose original (pre-sanitization) MCP name

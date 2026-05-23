@@ -28,8 +28,8 @@ pub enum Provider {
     /// Anthropic API with a Claude Code OAuth access token (Bearer auth).
     /// Same wire format as `Anthropic`, swapped auth header.
     ClaudeCodeOAuth,
-    /// OpenAI ChatGPT-Codex OAuth — OpenAI wire format with Bearer auth from
-    /// the Codex CLI's stored token.
+    /// OpenAI ChatGPT OAuth — OpenAI wire format with Bearer auth from the
+    /// CLI's stored token at `~/.codex/auth.json`.
     CodexOAuth,
     /// GitHub Copilot — OpenAI-compatible wire format with the Copilot
     /// integration headers attached. Token sourced from `gh auth token`.
@@ -644,8 +644,7 @@ mod tests {
         assert!(!Provider::Bedrock.supports_credential_pool());
     }
 
-    // detect_from_env / from_env_var_name were removed along with provider auto-detection.
-    // Provider is now strictly sourced from `Config.llm.provider` (set via onboarding,
+    // Provider is sourced strictly from `Config.llm.provider` (set via onboarding,
     // `/settings`, or `borg settings set llm.provider <name>`). See config::resolve_provider.
 
     #[test]

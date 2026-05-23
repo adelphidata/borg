@@ -436,10 +436,8 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
 
                     // Reject `@@` followed by no diff lines (e.g. immediate
                     // `*** End Patch`, lone `*** End of File`, or the next
-                    // `***` operation). Codex parity (parser.rs:360-403) and
-                    // streaming-parser parity (streaming_parser.rs:383-392):
-                    // silently accepting this would let malformed patches
-                    // report "applied" with zero file changes.
+                    // `***` operation). Silently accepting this would let
+                    // malformed patches report "applied" with zero file changes.
                     if search_lines.is_empty() && replace_lines.is_empty() {
                         return Err(ParseError::InvalidHunk {
                             message: "Update hunk does not contain any lines".to_string(),
@@ -1237,13 +1235,12 @@ mod tests {
         }
     }
 
-    // ── Empty `@@` chunk-body rejection (codex / streaming-parser parity) ──
+    // ── Empty `@@` chunk-body rejection ──
     //
     // Spec: a chunk header (`@@` or `@@ ctx`) MUST be followed by at least one
     // diff line (` `, `+`, or `-`). An empty body is malformed input — silently
     // accepting it would let a broken LLM patch report success with zero file
-    // changes. Codex and the streaming parser already enforce this; the batch
-    // parser used to be the outlier.
+    // changes. The streaming parser enforces the same invariant.
 
     #[test]
     fn parse_chunk_header_followed_by_end_patch_rejected() {

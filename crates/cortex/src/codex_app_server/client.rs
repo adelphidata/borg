@@ -76,9 +76,8 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///
 /// The spawn boundary scrubs library-injection vectors (`LD_PRELOAD`,
 /// `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`)
-/// from both the inherited env and the `env` overlay. Stage 5's settings layer
-/// is expected to layer a stricter allowlist on top, but the deny-list here
-/// makes Stage 1 safe-by-default.
+/// from both the inherited env and the `env` overlay. A stricter allowlist may
+/// layer on top later; this deny-list is the safe-by-default floor.
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
     /// Path or name of the codex CLI binary (default `"codex"`).
@@ -605,14 +604,14 @@ async fn read_stdout_loop(
                             // so we surface the dropped frame to diagnostics
                             // and warn loudly.
                             //
-                            // TODO(stage 2): server-initiated requests expect
-                            // a reply. Dropping one stalls the codex
-                            // subprocess waiting on its oneshot — not just the
-                            // single call. Stage 2's projector MUST either
-                            // auto-respond with `respond_error(-32603,
-                            // "consumer overloaded")` via a queued-writer path
-                            // or size SERVER_REQUEST_BUFFER for the maximum
-                            // burst codex emits. Do not soften this comment.
+                            // TODO: server-initiated requests expect a reply.
+                            // Dropping one stalls the codex subprocess waiting
+                            // on its oneshot — not just the single call. The
+                            // projector MUST either auto-respond with
+                            // `respond_error(-32603, "consumer overloaded")`
+                            // via a queued-writer path, or size
+                            // SERVER_REQUEST_BUFFER for the maximum burst codex
+                            // emits. Do not soften this comment.
                             warn!(
                                 method = %req.method,
                                 buffer = SERVER_REQUEST_BUFFER,

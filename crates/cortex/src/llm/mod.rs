@@ -543,8 +543,8 @@ impl LlmClient {
         // Precedence: per-credential override (from the active lease) →
         // config override → provider static default. The per-credential
         // override exists for `Provider::Custom` and OAuth flavors whose
-        // wire endpoint differs from the static default (e.g. Codex's
-        // ChatGPT-backend URL).
+        // wire endpoint differs from the static default (e.g. the OpenAI
+        // OAuth flavor targets the ChatGPT backend, not api.openai.com).
         let raw = self
             .active_credential_base_url
             .as_deref()
@@ -1264,9 +1264,11 @@ impl LlmClient {
                         if let Some(k) = lease.key() {
                             self.api_key = k;
                         }
-                        // Pick up any per-credential base_url override
-                        // (Custom endpoints / Codex backend URL). `None`
-                        // means the lease uses the provider's default URL.
+                        // Pick up any per-credential base_url override (used
+                        // for Custom endpoints and OAuth flavors whose wire
+                        // endpoint differs from the provider's static
+                        // default). `None` means the lease uses the
+                        // provider's default URL.
                         self.active_credential_base_url = lease.base_url();
                         let id = lease.id().to_string();
                         // Park the lease on `self` so its Drop fires after the

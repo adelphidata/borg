@@ -755,8 +755,9 @@ fn parse_unit_value(text: &str, markers: &[&str]) -> Option<Duration> {
         } else if tail.starts_with("min") || tail.starts_with('m') {
             60_000.0
         } else {
-            // Default to seconds for "sec"/"s"/missing unit and any unrecognized
-            // unit suffix — matches Hermes' parser's permissive fallback.
+            // Default to seconds for "sec"/"s"/missing unit and any
+            // unrecognized unit suffix — permissive fallback so we never reject
+            // a `Retry-After` we could plausibly interpret.
             1000.0
         };
         return Some(Duration::from_millis((n * mult_ms) as u64));
@@ -769,8 +770,8 @@ fn parse_unit_value(text: &str, markers: &[&str]) -> Option<Duration> {
 /// Transient-style 402s are classified as `RateLimit` so the credential pool
 /// cools them; permanent-style 402s are classified as `Billing`.
 ///
-/// Heuristic mirrors Hermes: usage/quota markers AND a transient signal
-/// (try-again / window / reset) → RateLimit; otherwise Billing.
+/// Heuristic: usage/quota markers AND a transient signal (try-again /
+/// window / reset) → RateLimit; otherwise Billing.
 pub fn classify_402(error_msg: &str) -> FailoverReason {
     let lower = error_msg.to_ascii_lowercase();
     const USAGE_LIMIT_PATTERNS: &[&str] = &[

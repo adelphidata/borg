@@ -1,7 +1,4 @@
 //! Reusable line/span utilities for the TUI.
-//!
-//! Gathers the prefix/truncation helpers that were previously inlined across
-//! `history.rs` and popups.
 
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
