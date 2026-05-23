@@ -69,6 +69,8 @@ pub mod process;
 pub mod runtime;
 #[cfg(target_os = "windows")]
 pub mod token;
+#[cfg(target_os = "windows")]
+pub mod wfp;
 
 /// Hidden subcommand name dispatched by `crates/interface/src/main.rs`
 /// before clap sees argv. Two leading underscores mark this as an
