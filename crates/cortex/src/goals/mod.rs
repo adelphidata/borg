@@ -65,6 +65,12 @@ pub enum GoalStatus {
     Paused,
     /// Token budget reached; agent should wrap up.
     BudgetLimited,
+    /// LLM provider usage limit reached (rate-limit / quota / 429). Auto-
+    /// continuation stops until the operator resumes — distinct from
+    /// [`GoalStatus::BudgetLimited`] (per-goal token budget) so the operator
+    /// can tell "you spent the budget you set" from "the provider cut us off."
+    /// Mirrors codex's `ThreadGoalStatus::UsageLimited`.
+    UsageLimited,
     /// Agent hit a repeated impasse (permission denial, missing external
     /// resource, persistent tool failure) and called `update_goal` with
     /// `status="blocked"` after ≥3 attempts past the same wall. Auto-
@@ -81,6 +87,7 @@ impl GoalStatus {
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::BudgetLimited => "budget_limited",
+            GoalStatus::UsageLimited => "usage_limited",
             GoalStatus::Blocked => "blocked",
             GoalStatus::Complete => "complete",
         }
@@ -93,6 +100,7 @@ impl GoalStatus {
             "active" => GoalStatus::Active,
             "paused" => GoalStatus::Paused,
             "budget_limited" => GoalStatus::BudgetLimited,
+            "usage_limited" => GoalStatus::UsageLimited,
             "blocked" => GoalStatus::Blocked,
             "complete" => GoalStatus::Complete,
             _ => return None,
@@ -105,6 +113,7 @@ impl GoalStatus {
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::BudgetLimited => "limited by budget",
+            GoalStatus::UsageLimited => "usage limited",
             GoalStatus::Blocked => "blocked",
             GoalStatus::Complete => "complete",
         }
@@ -135,6 +144,10 @@ pub struct Goal {
     pub updated_at: i64,
 }
 
+/// Hint appended to the over-limit error so the operator knows the supported
+/// workaround. Mirrors codex's `GOAL_TOO_LONG_FILE_HINT`.
+pub const OBJECTIVE_TOO_LONG_FILE_HINT: &str = "Put longer instructions in a file and refer to that file in the goal, for example: /goal follow the instructions in docs/goal.md.";
+
 /// Validate a user-provided objective. Returns the trimmed objective on
 /// success.
 ///
@@ -148,7 +161,7 @@ pub fn validate_objective(raw: &str) -> Result<String, String> {
     let char_count = trimmed.chars().count();
     if char_count > MAX_OBJECTIVE_CHARS {
         return Err(format!(
-            "objective is {char_count} characters; limit is {MAX_OBJECTIVE_CHARS}"
+            "objective is {char_count} characters; limit is {MAX_OBJECTIVE_CHARS}. {OBJECTIVE_TOO_LONG_FILE_HINT}"
         ));
     }
     Ok(trimmed.to_string())
@@ -174,12 +187,31 @@ mod tests {
             GoalStatus::Active,
             GoalStatus::Paused,
             GoalStatus::BudgetLimited,
+            GoalStatus::UsageLimited,
             GoalStatus::Blocked,
             GoalStatus::Complete,
         ] {
             assert_eq!(GoalStatus::from_str(status.as_str()), Some(status));
         }
         assert_eq!(GoalStatus::from_str("nonsense"), None);
+    }
+
+    #[test]
+    fn usage_limited_wire_form_matches_codex_snake_case() {
+        // Codex serializes ThreadGoalStatus::UsageLimited as snake_case
+        // "usage_limited" over its protocol. Borg must use the same string
+        // so a daemon-side write with `status="usage_limited"` round-trips
+        // through `GoalStatus::from_str` rather than silently dropping the
+        // status to an unrecognized variant.
+        assert_eq!(GoalStatus::UsageLimited.as_str(), "usage_limited");
+        assert_eq!(
+            GoalStatus::from_str("usage_limited"),
+            Some(GoalStatus::UsageLimited)
+        );
+        // Negative: the camelCase form codex uses on the TS protocol must
+        // not be silently accepted alongside the snake_case wire form, or
+        // we'd hide a real serialization mismatch.
+        assert_eq!(GoalStatus::from_str("usageLimited"), None);
     }
 
     #[test]
@@ -214,6 +246,13 @@ mod tests {
         let too_big = "x".repeat(MAX_OBJECTIVE_CHARS + 1);
         let err = validate_objective(&too_big).unwrap_err();
         assert!(err.contains("limit is"));
+        // Operator-facing recovery hint: codex parity. Without this the user is
+        // told the limit but not what to do about it, so we'd lose the
+        // "put it in a file" affordance that makes long objectives usable.
+        assert!(
+            err.contains("docs/goal.md"),
+            "too-long error must include the file-hint suggestion: {err}"
+        );
     }
 
     #[test]

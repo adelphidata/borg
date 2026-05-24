@@ -346,6 +346,7 @@ mod tests {
         for s in [
             GoalStatus::Paused,
             GoalStatus::BudgetLimited,
+            GoalStatus::UsageLimited,
             GoalStatus::Blocked,
             GoalStatus::Complete,
         ] {

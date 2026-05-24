@@ -1016,9 +1016,9 @@ impl App<'_> {
     /// writes from the TUI; no more synthetic agent instructions for the
     /// initial-set path.
     fn cmd_goal_dispatch(&mut self, args: &str) -> Result<AppAction> {
-        match args {
-            "" => self.cmd_goal_show(),
-            "clear" => {
+        match parse_goal_subcommand(args) {
+            GoalSubcommand::Show => self.cmd_goal_show(),
+            GoalSubcommand::Clear => {
                 let report = match self.rpc_clear_goal() {
                     Ok(()) => "/goal: cleared".to_string(),
                     Err(e) => format!("/goal: clear failed — {e}"),
@@ -1026,7 +1026,7 @@ impl App<'_> {
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
             }
-            "pause" => {
+            GoalSubcommand::Pause => {
                 let report = match self.rpc_set_goal_status("paused") {
                     Ok(detail) if detail.present => {
                         format!("/goal: paused — \"{}\"", detail.objective)
@@ -1037,7 +1037,7 @@ impl App<'_> {
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
             }
-            "resume" => {
+            GoalSubcommand::Resume => {
                 let report = match self.rpc_set_goal_status("active") {
                     Ok(detail) if detail.present => {
                         format!("/goal: resumed — \"{}\"", detail.objective)
@@ -1048,21 +1048,26 @@ impl App<'_> {
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
             }
-            _ => {
-                let (budget, body) = parse_goal_budget_prefix(args);
-                let stripped = body.strip_prefix("edit ").unwrap_or(body).trim();
-                if stripped.is_empty() {
-                    self.push_system_message(
-                        "Usage:\n  /goal                       Show current goal\n  \
-                         /goal <text>                Set or replace the session goal\n  \
-                         /goal --budget N <text>     Set with a token budget\n  \
-                         /goal edit <text>           Replace the objective\n  \
-                         /goal pause|resume|clear    Manage goal status"
-                            .to_string(),
-                    );
-                    return Ok(AppAction::Continue);
-                }
-                let trimmed = match cortex::goals::validate_objective(stripped) {
+            GoalSubcommand::BareEdit => {
+                // Codex's `/goal edit` opens an editor popup; borg has no goal
+                // editor surface, so the closest parity is an explicit usage
+                // error. Without this guard the literal text "edit" would be
+                // accepted as an objective.
+                self.push_system_message(
+                    "Usage: /goal edit <text> — replace the current objective.".to_string(),
+                );
+                Ok(AppAction::Continue)
+            }
+            GoalSubcommand::EmptyObjective => {
+                self.push_system_message("/goal: Goal objective must not be empty.".to_string());
+                Ok(AppAction::Continue)
+            }
+            GoalSubcommand::Usage => {
+                self.push_system_message(GOAL_USAGE.to_string());
+                Ok(AppAction::Continue)
+            }
+            GoalSubcommand::Set { objective, budget } => {
+                let trimmed = match cortex::goals::validate_objective(&objective) {
                     Ok(v) => v,
                     Err(e) => {
                         self.push_system_message(format!("/goal: {e}"));
@@ -1231,7 +1236,8 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
         Some(cortex::goals::GoalStatus::Paused) => {
             "Commands: /goal <new text>, /goal resume, /goal clear"
         }
-        Some(cortex::goals::GoalStatus::Blocked) => {
+        Some(cortex::goals::GoalStatus::Blocked)
+        | Some(cortex::goals::GoalStatus::UsageLimited) => {
             "Commands: /goal <new text>, /goal resume, /goal clear"
         }
         Some(cortex::goals::GoalStatus::BudgetLimited)
@@ -1242,12 +1248,108 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
     out
 }
 
+/// Multi-line usage card for `/goal`.
+const GOAL_USAGE: &str = "Usage:\n  /goal                       Show current goal\n  \
+     /goal <text>                Set or replace the session goal\n  \
+     /goal --budget N <text>     Set with a token budget\n  \
+     /goal edit <text>           Replace the objective\n  \
+     /goal pause|resume|clear    Manage goal status";
+
+/// Parsed `/goal …` subcommand. Splits the dispatcher's pure-parse half from
+/// the side-effecting RPC half so the parser can be tested independently.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GoalSubcommand {
+    /// `/goal` (no args) — show summary card.
+    Show,
+    /// `/goal clear`.
+    Clear,
+    /// `/goal pause`.
+    Pause,
+    /// `/goal resume`.
+    Resume,
+    /// `/goal edit` (bare) — codex opens an editor; borg has none, so this
+    /// surfaces a usage error rather than silently setting the objective
+    /// to the literal text "edit".
+    BareEdit,
+    /// `/goal edit ` (trailing whitespace, empty objective).
+    EmptyObjective,
+    /// `/goal --budget` with no value — show usage.
+    Usage,
+    /// `/goal <text>` or `/goal edit <text>` or `/goal --budget N <text>`.
+    Set {
+        /// Raw objective text (unvalidated, to be passed to
+        /// [`cortex::goals::validate_objective`]).
+        objective: String,
+        /// Optional token budget from the `--budget N` prefix.
+        budget: Option<i64>,
+    },
+}
+
+pub(super) fn parse_goal_subcommand(args: &str) -> GoalSubcommand {
+    match args.trim() {
+        "" => return GoalSubcommand::Show,
+        "clear" => return GoalSubcommand::Clear,
+        "pause" => return GoalSubcommand::Pause,
+        "resume" => return GoalSubcommand::Resume,
+        "edit" => return GoalSubcommand::BareEdit,
+        "--budget" => return GoalSubcommand::Usage,
+        _ => {}
+    }
+    // A literal `--budget ` prefix is always an attempt at the flag — if the
+    // value doesn't parse as an integer, treat that as Usage rather than
+    // letting the malformed flag text leak into the objective. "Objective
+    // starts with --budget" is far less likely than a typo on the budget.
+    if args.starts_with("--budget ") && !args.starts_with("--budget --") {
+        let after = &args["--budget ".len()..];
+        let first = after.split_whitespace().next().unwrap_or("");
+        if first.parse::<i64>().is_err() {
+            return GoalSubcommand::Usage;
+        }
+    }
+    let (budget, body) = parse_goal_budget_prefix(args);
+    // `--budget N` with nothing after the number → usage, not a goal whose
+    // objective is the empty string.
+    if budget.is_some() && body.trim().is_empty() {
+        return GoalSubcommand::Usage;
+    }
+    // `edit ` prefix strips for the `/goal edit <text>` form. Trim trailing
+    // whitespace after stripping so `/goal edit ` reports empty cleanly
+    // rather than falling into the generic "objective must not be empty"
+    // path via validate_objective (which would also work, but the explicit
+    // arm makes the test surface sharper).
+    let after_edit = body.strip_prefix("edit ").map(str::trim);
+    if let Some(stripped) = after_edit {
+        if stripped.is_empty() {
+            return GoalSubcommand::EmptyObjective;
+        }
+        return GoalSubcommand::Set {
+            objective: stripped.to_string(),
+            budget,
+        };
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return GoalSubcommand::EmptyObjective;
+    }
+    GoalSubcommand::Set {
+        objective: trimmed.to_string(),
+        budget,
+    }
+}
+
 /// Parse a leading `--budget N` flag from `args`, returning `(budget, rest)`.
+///
+/// `rest` is the post-flag remainder (objective text). When the flag is
+/// present with a numeric value but no trailing objective (e.g. `--budget 5000`
+/// or `--budget 5000 `), returns `(Some(n), "")` so the dispatcher can
+/// report a usage error rather than letting `parse_goal_subcommand` treat
+/// the literal `--budget 5000` text as the objective.
 fn parse_goal_budget_prefix(args: &str) -> (Option<i64>, &str) {
     if let Some(rest) = args.strip_prefix("--budget ") {
         let mut parts = rest.splitn(2, char::is_whitespace);
-        if let (Some(num), Some(rest2)) = (parts.next(), parts.next()) {
+        if let Some(num) = parts.next() {
             if let Ok(n) = num.parse::<i64>() {
+                let rest2 = parts.next().unwrap_or("");
                 return (Some(n), rest2);
             }
         }
@@ -1366,6 +1468,123 @@ mod tests {
     }
 
     #[test]
+    fn parse_goal_subcommand_dispatches_known_keywords() {
+        assert_eq!(parse_goal_subcommand(""), GoalSubcommand::Show);
+        assert_eq!(parse_goal_subcommand("   "), GoalSubcommand::Show);
+        assert_eq!(parse_goal_subcommand("clear"), GoalSubcommand::Clear);
+        assert_eq!(parse_goal_subcommand("pause"), GoalSubcommand::Pause);
+        assert_eq!(parse_goal_subcommand("resume"), GoalSubcommand::Resume);
+    }
+
+    #[test]
+    fn parse_goal_subcommand_set_from_objective() {
+        let parsed = parse_goal_subcommand("ship it");
+        assert_eq!(
+            parsed,
+            GoalSubcommand::Set {
+                objective: "ship it".to_string(),
+                budget: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_set_from_edit_prefix() {
+        let parsed = parse_goal_subcommand("edit ship it");
+        assert_eq!(
+            parsed,
+            GoalSubcommand::Set {
+                objective: "ship it".to_string(),
+                budget: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_set_with_budget() {
+        let parsed = parse_goal_subcommand("--budget 5000 ship it");
+        assert_eq!(
+            parsed,
+            GoalSubcommand::Set {
+                objective: "ship it".to_string(),
+                budget: Some(5000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_bare_edit_does_not_set_literal() {
+        // Regression: `/goal edit` (no trailing text) used to silently set the
+        // session goal to the literal text "edit". The parser must surface a
+        // distinct BareEdit so the dispatcher can report usage instead.
+        assert_eq!(parse_goal_subcommand("edit"), GoalSubcommand::BareEdit);
+    }
+
+    #[test]
+    fn parse_goal_subcommand_empty_after_edit_prefix() {
+        // `/goal edit ` (trailing whitespace, no objective) collapses to the
+        // same intent as bare `/goal edit` — the user wanted to type an
+        // objective and didn't. Both must error out instead of setting the
+        // goal text to "" or to the literal "edit".
+        assert_eq!(parse_goal_subcommand("edit "), GoalSubcommand::BareEdit);
+        assert_eq!(parse_goal_subcommand("edit   "), GoalSubcommand::BareEdit);
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_flag_without_value_is_usage() {
+        // `/goal --budget` alone is operator confusion, not a goal whose
+        // objective is the literal "--budget".
+        assert_eq!(parse_goal_subcommand("--budget"), GoalSubcommand::Usage);
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_value_without_objective_is_usage() {
+        // Regression: `/goal --budget 5000` (numeric budget, no objective)
+        // used to silently fall through with `budget=None` and set the goal
+        // objective to the literal "--budget 5000". The same bug shape as
+        // bare `/goal edit`. Both bare and trailing-whitespace variants must
+        // route to Usage so the operator gets told what's missing.
+        assert_eq!(
+            parse_goal_subcommand("--budget 5000"),
+            GoalSubcommand::Usage
+        );
+        assert_eq!(
+            parse_goal_subcommand("--budget 5000 "),
+            GoalSubcommand::Usage
+        );
+        assert_eq!(
+            parse_goal_subcommand("--budget 5000   "),
+            GoalSubcommand::Usage
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_non_numeric_budget_is_usage() {
+        // `--budget abc` is operator typo, not "objective starts with the
+        // literal text --budget". Codex-style strictness: surface a usage
+        // error rather than swallowing the malformed flag value into the
+        // objective.
+        assert_eq!(
+            parse_goal_subcommand("--budget abc ship it"),
+            GoalSubcommand::Usage
+        );
+        assert_eq!(parse_goal_subcommand("--budget abc"), GoalSubcommand::Usage);
+    }
+
+    #[test]
+    fn parse_goal_budget_prefix_value_without_rest_returns_empty_rest() {
+        // `--budget N` with no trailing objective must surface the parsed
+        // budget so the caller can branch into Usage. Returning
+        // `(None, "--budget N")` was the original bug.
+        let (b, rest) = parse_goal_budget_prefix("--budget 5000");
+        assert_eq!(b, Some(5000));
+        assert_eq!(rest, "");
+        let (b, rest) = parse_goal_budget_prefix("--budget 5000 ");
+        assert_eq!(b, Some(5000));
+        assert_eq!(rest, "");
+    }
+
+    #[test]
     fn parse_goal_budget_prefix_rejects_non_numeric_budget() {
         // `--budget foo ship it` — the number is unparseable, so the whole
         // string is returned untouched (the agent will then fail validation).
@@ -1404,6 +1623,40 @@ mod tests {
         assert!(s.contains("2m 5s"));
         assert!(s.contains("1200 / 5000"));
         assert!(s.contains("/goal pause"));
+    }
+
+    #[test]
+    fn format_goal_detail_offers_resume_when_usage_limited() {
+        // Codex parity: when the provider cut us off (UsageLimited), the
+        // summary card must point the operator at `/goal resume` once the
+        // provider is happy again. Falling back to the BudgetLimited/Complete
+        // arm (clear-only) would strand the goal.
+        let detail = protocols::admin::GoalDetail {
+            present: true,
+            session_id: "s".into(),
+            goal_id: "g1".into(),
+            objective: "ship it".into(),
+            status: "usage_limited".into(),
+            token_budget_present: false,
+            token_budget: 0,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let s = format_goal_detail(&detail);
+        assert!(
+            s.contains("usage limited"),
+            "label must use the spaced human form: {s}"
+        );
+        assert!(
+            s.contains("/goal resume"),
+            "usage-limited goals are resumable, hint must include /goal resume: {s}"
+        );
+        assert!(
+            s.contains("/goal clear"),
+            "usage-limited goals are also clearable: {s}"
+        );
     }
 
     #[test]
