@@ -26,16 +26,17 @@ use protocols::admin::{
     GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HandoffClaimRequest, HandoffClaimResponse,
     HandoffFailRequest, HandoffRequest, HandoffStatusReply, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    KeychainRef, ListCredentialsRequest, LogActivityRequest, MessageView, MonthlyTokenTotal,
-    MonthlyTotalCost, OnboardingState, PairCredentialRequest, PairCredentialResponse,
-    PairingApproval, PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest,
-    PluginInstallResponse, ProviderCredentials, RemoveCredentialRequest, RemoveProviderRequest,
-    ResetCredentialsRequest, ResetCredentialsResponse, RevokedClientToken, ScheduledTask,
-    ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
-    ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest,
-    SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, Subprocess as PbSubprocess,
-    SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
+    KeychainRef, ListCredentialsRequest, LogActivityRequest, McpReloadFailure, MessageView,
+    MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairCredentialRequest,
+    PairCredentialResponse, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
+    PluginInstallRequest, PluginInstallResponse, ProviderCredentials, ReloadRequest,
+    ReloadResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
+    ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
+    SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry,
+    SettingKey, SettingMutation, SettingsSnapshot, Subprocess as PbSubprocess, SubprocessSnapshot,
+    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -2371,6 +2372,64 @@ impl Admin for AdminSvc {
             .tunnel_supervisor_handle()
             .ok_or_else(|| TStatus::failed_precondition("tunnel supervisor not wired"))?;
         Ok(Response::new(snapshot_to_reply(sup.status().await)))
+    }
+
+    async fn reload(
+        &self,
+        req: Request<ReloadRequest>,
+    ) -> Result<Response<ReloadResponse>, TStatus> {
+        use protocols::admin::reload_request::Target;
+
+        let target = Target::try_from(req.into_inner().target).unwrap_or(Target::Unspecified);
+        // Unspecified is treated as `All` so older clients that leave the
+        // field at proto3 default still get a sensible reload rather than a
+        // no-op masquerading as success.
+        let (reload_mcp, reload_skills) = match target {
+            Target::Mcp => (true, false),
+            Target::Skills => (false, true),
+            Target::All | Target::Unspecified => (true, true),
+        };
+
+        let config = cortex::config::Config::load_from_db()
+            .await
+            .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
+
+        let mut resp = ReloadResponse::default();
+
+        if reload_mcp {
+            let report = cortex::mcp_clients::reload_from_config(&config)
+                .await
+                .map_err(|e| TStatus::internal(format!("mcp reload failed: {e}")))?;
+            resp.mcp_added = report.added;
+            resp.mcp_removed = report.removed;
+            resp.mcp_unchanged = report.unchanged as u32;
+            resp.mcp_failures = report
+                .failed
+                .into_iter()
+                .map(|(server, error)| McpReloadFailure { server, error })
+                .collect();
+            resp.mcp_total_tools = report.total_tools as u32;
+        }
+
+        if reload_skills {
+            let resolved_creds = config.resolve_credentials();
+            let report = cortex::skills::reload_user_skills(&resolved_creds, &config.skills)
+                .map_err(|e| TStatus::internal(format!("skills reload failed: {e}")))?;
+            resp.skills_total = report.total as u32;
+            resp.skills_user = report.user as u32;
+            resp.skills_user_unavailable = report.user_unavailable as u32;
+            resp.skills_disabled = report.disabled as u32;
+        }
+
+        // Only kick the config watcher when skills changed — the watcher
+        // tick clears the per-session skills-context cache. MCP tool defs
+        // are pulled fresh from `mcp_clients::tool_definitions()` each
+        // turn so the MCP-only path needs no session-side invalidation.
+        if reload_skills {
+            notify_runtime_config_reload(&self.config_notify_tx).await;
+        }
+
+        Ok(Response::new(resp))
     }
 }
 

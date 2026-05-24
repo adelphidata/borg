@@ -99,6 +99,7 @@ impl App<'_> {
                 return Some(Ok(AppAction::EnterAltScreen));
             }
             "/poke" => return Some(self.cmd_poke()),
+            "/reload" => return Some(self.cmd_reload("")),
             "/terminal-setup" => return Some(self.cmd_terminal_setup("")),
             "/browser" => return Some(self.cmd_browser("")),
             "/cancel" | "/stop" | "/abort" => return Some(self.cmd_cancel()),
@@ -210,6 +211,10 @@ impl App<'_> {
         }
         if let Some(rest) = trimmed.strip_prefix("/think ") {
             return Some(self.cmd_think_set(rest.trim()));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/reload ") {
+            return Some(self.cmd_reload(rest.trim()));
         }
 
         if trimmed == "/voice" {
@@ -369,6 +374,7 @@ impl App<'_> {
              /doctor squelch <Category>:<Name>   - Suppress a finding from heartbeat / heal\n  \
              /doctor unsquelch <Category>:<Name> - Resume reminders for it\n  \
              /heal      - Run the self-healing maintenance sweep on demand\n  \
+             /reload [mcp|skills] - Hot-reload MCP servers and/or user skills without restart\n  \
              /status    - Show agent vitals\n  \
              /voice     - Voice mode: /voice [on|off|rec|tts|status]\n  \
              /poke      - Trigger immediate heartbeat\n  \
@@ -900,6 +906,44 @@ impl App<'_> {
             question: question.to_string(),
             snapshot,
         })
+    }
+
+    /// `/reload [mcp|skills]` — hot-reload MCP catalog and/or user skills
+    /// without restarting the daemon. No argument means reload both.
+    ///
+    /// MCP: diffs DB-resident server config against the running session map
+    /// and spins up new / tears down removed servers in place. Mid-flight
+    /// tool calls survive teardown — they hold their own session handle.
+    /// Skills: re-scans `~/.borg/skills/` and invalidates per-session skill
+    /// caches so the next turn picks up new/edited `SKILL.md` files.
+    fn cmd_reload(&mut self, arg: &str) -> Result<AppAction> {
+        use protocols::admin::reload_request::Target;
+        let target = match arg.trim().to_lowercase().as_str() {
+            "" | "all" => Target::All as i32,
+            "mcp" => Target::Mcp as i32,
+            "skills" => Target::Skills as i32,
+            other => {
+                self.push_system_message(format!(
+                    "Usage: /reload [mcp|skills]\nunknown target: {other}"
+                ));
+                return Ok(AppAction::Continue);
+            }
+        };
+        let client = self.client.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.reload(target).await
+            })
+        });
+        match result {
+            Ok(resp) => self.push_system_message(format_reload_response(target, &resp)),
+            Err(e) => {
+                tracing::warn!(error = %e, "on-demand /reload: daemon Reload RPC failed");
+                self.push_system_message(format!("Reload failed: {e}"));
+            }
+        }
+        Ok(AppAction::Continue)
     }
 
     /// `/heal` — run the self-healing maintenance sweep on demand. This is the
@@ -1756,6 +1800,76 @@ pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> Strin
     text
 }
 
+/// Render a daemon-side [`protocols::admin::ReloadResponse`] as a one-line
+/// (or short multi-line) system message. `target` is the proto enum value
+/// the caller used; it shapes the heading and decides which sections to
+/// include.
+pub(super) fn format_reload_response(
+    target: i32,
+    resp: &protocols::admin::ReloadResponse,
+) -> String {
+    use protocols::admin::reload_request::Target;
+    let parsed = Target::try_from(target).unwrap_or(Target::All);
+    let (show_mcp, show_skills) = match parsed {
+        Target::Mcp => (true, false),
+        Target::Skills => (false, true),
+        Target::All | Target::Unspecified => (true, true),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    if show_mcp {
+        let mut parts: Vec<String> = Vec::new();
+        if !resp.mcp_added.is_empty() {
+            parts.push(format!(
+                "+{} ({})",
+                resp.mcp_added.len(),
+                resp.mcp_added.join(", ")
+            ));
+        }
+        if !resp.mcp_removed.is_empty() {
+            parts.push(format!(
+                "-{} ({})",
+                resp.mcp_removed.len(),
+                resp.mcp_removed.join(", ")
+            ));
+        }
+        if resp.mcp_unchanged > 0 {
+            parts.push(format!("{} unchanged", resp.mcp_unchanged));
+        }
+        if !resp.mcp_failures.is_empty() {
+            parts.push(format!("{} failed", resp.mcp_failures.len()));
+        }
+        let summary = if parts.is_empty() {
+            "no MCP servers configured".to_string()
+        } else {
+            parts.join(", ")
+        };
+        lines.push(format!(
+            "MCP reloaded: {summary}; {} tool(s) available",
+            resp.mcp_total_tools
+        ));
+        for f in &resp.mcp_failures {
+            lines.push(format!("  • {}: {}", f.server, f.error));
+        }
+    }
+    if show_skills {
+        let missing = if resp.skills_user_unavailable > 0 {
+            format!(", {} missing deps", resp.skills_user_unavailable)
+        } else {
+            String::new()
+        };
+        let disabled = if resp.skills_disabled > 0 {
+            format!(", {} disabled", resp.skills_disabled)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "Skills reloaded: {} total ({} user{missing}{disabled}); next turn picks up changes",
+            resp.skills_total, resp.skills_user,
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Render a [`MaintenanceReport`] as the multi-line system-message body
 /// shown after `/heal`. Retained for tests covering the in-process formatter
 /// shape; the production `/heal` path now goes through [`format_heal_report`]
@@ -2137,6 +2251,79 @@ mod tests {
         });
         assert!(out.starts_with("Self-healing sweep skipped"), "{out:?}");
         assert!(out.contains("maintenance.enabled is false"), "{out:?}");
+    }
+
+    /// Spec: the reload summary renders the diff in a way that lets the
+    /// operator answer "did my MCP catalog change?" at a glance. Counts
+    /// alone are not enough — server *names* must appear, since "+1
+    /// server" without a name leaves the operator wondering whether the
+    /// one that landed is the one they just added. Regression guard for
+    /// the formatter shape: a refactor that drops names from the line
+    /// would technically still be valid prose but would silently degrade
+    /// the operator-facing UX.
+    #[test]
+    fn format_reload_response_shows_mcp_diff_with_names_and_tool_count() {
+        let resp = protocols::admin::ReloadResponse {
+            mcp_added: vec!["new-server".into()],
+            mcp_removed: vec!["old-server".into()],
+            mcp_unchanged: 2,
+            mcp_failures: vec![protocols::admin::McpReloadFailure {
+                server: "broken".into(),
+                error: "connect timeout".into(),
+            }],
+            mcp_total_tools: 14,
+            skills_total: 0,
+            skills_user: 0,
+            skills_user_unavailable: 0,
+            skills_disabled: 0,
+        };
+        let out = format_reload_response(2 /* TARGET_MCP */, &resp);
+        assert!(out.contains("+1 (new-server)"), "added diff: {out:?}");
+        assert!(out.contains("-1 (old-server)"), "removed diff: {out:?}");
+        assert!(out.contains("2 unchanged"), "unchanged count: {out:?}");
+        assert!(out.contains("1 failed"), "failure count: {out:?}");
+        assert!(out.contains("14 tool"), "tool count: {out:?}");
+        assert!(
+            out.contains("broken: connect timeout"),
+            "per-failure detail: {out:?}"
+        );
+        assert!(
+            !out.contains("Skills reloaded"),
+            "MCP-only target must not include skills line: {out:?}"
+        );
+    }
+
+    /// Spec: `/reload skills` must report on what the operator actually
+    /// cares about — total count and how many of their user skills are
+    /// unavailable due to missing deps. Hiding the unavailable count
+    /// would be a silent-failure UX bug: the operator drops in a SKILL.md
+    /// requiring `gh`, sees "reload succeeded", and never knows it isn't
+    /// actually usable until the LLM fails to invoke it.
+    #[test]
+    fn format_reload_response_surfaces_skills_unavailable_count() {
+        let resp = protocols::admin::ReloadResponse {
+            mcp_added: vec![],
+            mcp_removed: vec![],
+            mcp_unchanged: 0,
+            mcp_failures: vec![],
+            mcp_total_tools: 0,
+            skills_total: 25,
+            skills_user: 3,
+            skills_user_unavailable: 1,
+            skills_disabled: 2,
+        };
+        let out = format_reload_response(3 /* TARGET_SKILLS */, &resp);
+        assert!(out.contains("25 total"), "total count: {out:?}");
+        assert!(out.contains("3 user"), "user count: {out:?}");
+        assert!(
+            out.contains("1 missing deps"),
+            "missing-deps count must surface: {out:?}"
+        );
+        assert!(out.contains("2 disabled"), "disabled count: {out:?}");
+        assert!(
+            !out.contains("MCP reloaded"),
+            "skills-only target must not include MCP line: {out:?}"
+        );
     }
 
     #[test]

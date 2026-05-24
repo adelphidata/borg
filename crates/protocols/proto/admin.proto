@@ -155,6 +155,47 @@ service Admin {
   // `chromiumoxide::Browser::connect(url)` instead of launching its own
   // headless Chrome; this lets the agent share the user's live profile.
   rpc BrowserManage(BrowserManageRequest) returns (BrowserManageResponse);
+
+  // Hot-reload MCP catalog and/or user skills without restarting the daemon.
+  // `target=ALL` reloads both; `MCP` / `SKILLS` target one subsystem.
+  rpc Reload(ReloadRequest) returns (ReloadResponse);
+}
+
+message ReloadRequest {
+  enum Target {
+    TARGET_UNSPECIFIED = 0;
+    TARGET_ALL = 1;
+    TARGET_MCP = 2;
+    TARGET_SKILLS = 3;
+  }
+  Target target = 1;
+}
+
+message ReloadResponse {
+  // Names of MCP servers that were not running and are now connected. Empty
+  // when the reload did not touch MCP (target=SKILLS).
+  repeated string mcp_added = 1;
+  // Names of MCP servers torn down. Empty when target=SKILLS.
+  repeated string mcp_removed = 2;
+  // Count of MCP servers already running that were left alone (limits were
+  // reseated in place). Zero when target=SKILLS.
+  uint32 mcp_unchanged = 3;
+  // Per-server start failures from this reload pass. Empty when target=SKILLS.
+  repeated McpReloadFailure mcp_failures = 4;
+  // Total MCP tool count visible to the LLM after the reload (post-disabled
+  // filtering). Zero when target=SKILLS.
+  uint32 mcp_total_tools = 5;
+
+  // Skills counts after the on-disk re-scan. All zero when target=MCP.
+  uint32 skills_total = 6;
+  uint32 skills_user = 7;
+  uint32 skills_user_unavailable = 8;
+  uint32 skills_disabled = 9;
+}
+
+message McpReloadFailure {
+  string server = 1;
+  string error = 2;
 }
 
 message BrowserManageRequest {

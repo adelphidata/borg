@@ -717,6 +717,61 @@ pub fn load_all_skills(
     Ok(skills)
 }
 
+/// Result of a [`reload_user_skills`] pass.
+///
+/// Per-session skills context is rebuilt from disk on every turn (the cache
+/// in `SystemPromptCache` re-derives whenever the user request changes, and
+/// is force-cleared by `on_config_reloaded`), so this function does **not**
+/// mutate any process-global state. Its job is to (a) re-scan the on-disk
+/// `~/.borg/skills/` directory eagerly so the operator gets a parse/audit
+/// signal *now* instead of on the next turn, and (b) return counts the TUI
+/// can render in a one-line summary.
+///
+/// Caller is responsible for kicking the config-watch broadcast (see
+/// `notify_runtime_config_reload`) so live sessions invalidate their cached
+/// skills prompt and re-render on the next turn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkillsReloadReport {
+    /// Total skills loaded (built-in + user, post-dedup).
+    pub total: usize,
+    /// User skills loaded from `~/.borg/skills/`.
+    pub user: usize,
+    /// User skills that failed `check_requirements` (missing bin / env).
+    pub user_unavailable: usize,
+    /// Skills explicitly disabled via per-skill config.
+    pub disabled: usize,
+}
+
+/// Re-scan user skills on disk and return a summary report.
+///
+/// See [`SkillsReloadReport`] for the contract — this function does not
+/// touch any in-memory cache. The agent loop's per-turn skills load already
+/// reads from disk; this exists so the operator can validate that a newly
+/// dropped `~/.borg/skills/<name>/SKILL.md` parses, meets requirements,
+/// and is reachable before the next turn fires.
+pub fn reload_user_skills(
+    resolved_creds: &std::collections::HashMap<String, String>,
+    skills_config: &SkillsConfig,
+) -> Result<SkillsReloadReport> {
+    let skills = load_all_skills(resolved_creds, skills_config)?;
+    let mut report = SkillsReloadReport {
+        total: skills.len(),
+        ..SkillsReloadReport::default()
+    };
+    for s in &skills {
+        if matches!(s.source, SkillSource::User) {
+            report.user += 1;
+            if !s.available && !s.disabled {
+                report.user_unavailable += 1;
+            }
+        }
+        if s.disabled {
+            report.disabled += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// Diagnostic report from `load_skills_context` describing what fit, what was
 /// downgraded, and what was dropped entirely. The agent loop logs and surfaces
 /// non-empty drops to the user so silent loss of skill context is visible.
@@ -1916,6 +1971,53 @@ Short body.
         assert!(
             !report.omitted_entirely.iter().any(|name| name == "pdf"),
             "matching pdf skill should not be omitted entirely: {report:?}"
+        );
+    }
+
+    /// Spec: `reload_user_skills` must count a freshly-dropped user
+    /// SKILL.md as a user skill in the report. Regression guard for the
+    /// `/reload skills` operator surface — the report drives the TUI
+    /// summary line, so under-counting user skills would silently tell
+    /// operators their newly-installed skill failed to load when it
+    /// actually loaded fine.
+    #[test]
+    fn reload_user_skills_counts_new_user_skill() {
+        let env = SkillsDataDirEnv::new();
+        let cfg = SkillsConfig::default();
+        let creds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        let baseline = reload_user_skills(&creds, &cfg).expect("baseline reload");
+        assert_eq!(
+            baseline.user, 0,
+            "fresh tempdir starts with zero user skills (baseline: {baseline:?})"
+        );
+
+        let skill_dir = env.skills_path().join("ad-hoc-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: ad-hoc-test
+description: "Hot-reload acceptance test skill."
+---
+
+# Ad-hoc
+
+body
+"#,
+        )
+        .unwrap();
+
+        let after = reload_user_skills(&creds, &cfg).expect("post-add reload");
+        assert_eq!(
+            after.user, 1,
+            "newly-dropped SKILL.md must surface as a user skill in the next reload report (got: {after:?})"
+        );
+        assert!(
+            after.total > baseline.total,
+            "total must include built-ins plus the new user skill (baseline {} vs after {})",
+            baseline.total,
+            after.total
         );
     }
 

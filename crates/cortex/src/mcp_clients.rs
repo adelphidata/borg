@@ -26,7 +26,7 @@
 //! plain `tokio::spawn`. Slice 3 will lift this into `borgd`'s
 //! `spawn_supervised` wrapper without changing the cortex-facing API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -630,6 +630,145 @@ pub async fn initialize(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Result of a [`reload_from_config`] pass. Designed for the operator-facing
+/// summary in the TUI `/reload mcp` command — added/removed name lists drive
+/// the diff line, `failed` keeps partial-success visible, and `total_tools`
+/// confirms the LLM-visible catalog size after the swap.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// Servers that were not running before this reload and are now connected.
+    pub added: Vec<String>,
+    /// Servers that were running before this reload and have been torn down
+    /// (either removed from config or flipped to disabled).
+    pub removed: Vec<String>,
+    /// Servers that were already running and remain. Limits are reseated
+    /// in-place so rate-limit knob changes take effect without a teardown.
+    pub unchanged: usize,
+    /// Per-server start failures: `(server_name, error_message)`. Reload is
+    /// best-effort per-server — other servers still come up.
+    pub failed: Vec<(String, String)>,
+    /// Total tool count visible to the LLM after the reload (post-disabled
+    /// filtering). Matches the count that `tool_definitions()` would return.
+    pub total_tools: usize,
+}
+
+/// Diff DB-resident MCP server config against the running session map and
+/// apply the delta in place. Surfaces a [`ReloadReport`] the operator can
+/// see in the TUI.
+///
+/// Mid-flight tool calls hold their own `mpsc::Sender` clone obtained at
+/// dispatch time, so tearing a server down via this function does not
+/// cancel calls already in flight — they finish against the old session
+/// and the actor exits when the call replies.
+pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
+    // If MCP is globally disabled, the desired set is empty — tear everything
+    // down. The registry stays initialized so a subsequent reload that flips
+    // `mcp.enabled` back to true does not need a daemon restart.
+    let desired: HashSet<String> = if config.mcp.enabled {
+        config
+            .mcp
+            .servers
+            .iter()
+            .filter(|(name, srv)| srv.enabled && !config.mcp.disabled_servers.contains(*name))
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let current: HashSet<String> = {
+        let map = match session_map().lock() {
+            Ok(m) => m,
+            Err(p) => p.into_inner(),
+        };
+        map.keys().cloned().collect()
+    };
+
+    let mut to_remove: Vec<String> = current.difference(&desired).cloned().collect();
+    let mut to_add: Vec<String> = desired.difference(&current).cloned().collect();
+    let unchanged: Vec<String> = desired.intersection(&current).cloned().collect();
+    to_remove.sort();
+    to_add.sort();
+
+    let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(config.mcp.max_tools_total));
+    reg.set_global_cap(config.mcp.max_tools_total);
+    set_disabled_servers(&config.mcp.disabled_servers);
+
+    for name in &to_remove {
+        // Dropping the sender closes the actor's receiver — the task exits
+        // and the transport's Drop closes the underlying connection.
+        if let Ok(mut map) = session_map().lock() {
+            map.remove(name);
+        }
+        reg.drop_server(name);
+        if let Ok(mut b) = buckets().lock() {
+            b.remove(name);
+        }
+        if let Ok(mut l) = limits_map().lock() {
+            l.remove(name);
+        }
+        tracing::info!(server = %name, "MCP server torn down via reload");
+    }
+
+    // Reseat limits for unchanged servers so rate-limit / timeout knob
+    // changes land without a teardown-and-respawn.
+    for name in &unchanged {
+        if let Some(cfg) = config.mcp.servers.get(name) {
+            record_limits(name, cfg);
+        }
+    }
+
+    let builtin = builtin_tool_names();
+    let builtin_refs: Vec<&str> = builtin.to_vec();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+
+    for name in to_add {
+        let Some(cfg) = config.mcp.servers.get(&name) else {
+            // Race: server was removed from config between the diff and now.
+            continue;
+        };
+        match start_server(&name, cfg, config, reg, &builtin_refs).await {
+            Ok(()) => {
+                tracing::info!(server = %name, "MCP server started via reload");
+                added.push(name);
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                tracing::warn!(server = %name, error = %err_msg, "MCP reload: server failed to start");
+                crate::db::try_emit_global(
+                    crate::db::audit_events::MCP_SCHEMA_REJECTED,
+                    &name,
+                    &serde_json::json!({
+                        "server": name,
+                        "reason": format!("reload start_server failed: {err_msg}"),
+                    }),
+                )
+                .await;
+                failures.push((name, err_msg));
+            }
+        }
+    }
+
+    let total_tools = REGISTRY
+        .get()
+        .map(|r| {
+            r.tools()
+                .into_iter()
+                .filter(|t| !is_server_disabled(&t.server))
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(ReloadReport {
+        added,
+        removed: to_remove,
+        unchanged: unchanged.len(),
+        failed: failures,
+        total_tools,
+    })
+}
+
 async fn start_server(
     server_name: &str,
     server_cfg: &McpServerConfig,
@@ -972,6 +1111,15 @@ pub mod testing {
             .await;
         });
         Ok(())
+    }
+
+    /// Return the per-server rate-limit and call-timeout currently
+    /// recorded in `SERVER_LIMITS`. Tests use this to assert that
+    /// [`reload_from_config`] reseated limits on an unchanged server when
+    /// the operator tightened (or loosened) the knobs.
+    pub fn limits_for(server: &str) -> Option<(u32, u32, std::time::Duration)> {
+        super::lookup_limits(server)
+            .map(|l| (l.rate_limit_per_minute, l.rate_limit_burst, l.call_timeout))
     }
 
     /// Return registration outcomes for `server` from the live registry's

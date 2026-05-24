@@ -33,12 +33,13 @@ use protocols::admin::{
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost,
     OnboardingState, PairingApproval, PairingFilter, PairingRequestList, PluginInstallRequest,
-    PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
-    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
-    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
-    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
-    TunnelStatusReply, WarningList, WebhookRef,
+    PluginInstallResponse, ReloadRequest, ReloadResponse, RemoveCredentialRequest,
+    RemoveProviderRequest, ResetCredentialsRequest, RevokedClientToken, ScheduledTask,
+    ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
+    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey, SettingMutation,
+    SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList,
+    WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -616,6 +617,18 @@ impl DaemonClient {
             .context("Admin.Heal failed")?
             .into_inner();
         Ok(report)
+    }
+
+    /// Hot-reload MCP servers and/or user skills on the daemon without restart.
+    /// `target` selects the subsystem; `0`/`Unspecified` means everything.
+    pub async fn reload(&mut self, target: i32) -> Result<ReloadResponse> {
+        let resp = self
+            .admin
+            .reload(ReloadRequest { target })
+            .await
+            .context("Admin.Reload failed")?
+            .into_inner();
+        Ok(resp)
     }
 
     /// Run memory consolidation on the daemon.

@@ -1054,3 +1054,269 @@ async fn tools_list_changed_refreshes_registry_without_reconnect() {
     }
     panic!("tools/list_changed did not refresh registry within timeout");
 }
+
+/// Spec: `reload_from_config` must tear down servers that disappeared from
+/// the desired set. After install, dropping the server from the config and
+/// reloading must remove its tools from `tool_definitions` and report the
+/// teardown via the returned diff. Regression guard: a reload that leaves
+/// stale entries in the registry would let the LLM call tools whose
+/// session has been closed — every dispatch would then fail with "no live
+/// session" after `borg mcp remove` until daemon restart.
+#[tokio::test]
+async fn reload_removes_servers_dropped_from_config() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    cfg.mcp.servers.insert("kept".into(), sc.clone());
+    cfg.mcp.servers.insert("dropped".into(), sc.clone());
+    mcp_clients::testing::install_session("kept", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install kept");
+
+    let t2 = ScriptedTransport::new();
+    {
+        let mut h = t2.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+        );
+    }
+    mcp_clients::testing::install_session("dropped", &sc, &cfg, Box::new(t2))
+        .await
+        .expect("install dropped");
+
+    let before: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert!(
+        before.contains(&"mcp_kept_ping".to_string())
+            && before.contains(&"mcp_dropped_ping".to_string()),
+        "both servers must be live before reload: {before:?}"
+    );
+
+    // Reload config no longer mentions `dropped`. We do NOT add `dropped`
+    // to disabled_servers — removal from the servers map alone must be
+    // enough; otherwise `borg mcp remove` would silently keep the server
+    // running.
+    cfg.mcp.servers.remove("dropped");
+    let report = mcp_clients::reload_from_config(&cfg)
+        .await
+        .expect("reload ok");
+
+    assert_eq!(report.removed, vec!["dropped".to_string()]);
+    assert!(
+        report.added.is_empty(),
+        "no servers should be added: {:?}",
+        report.added
+    );
+    assert_eq!(report.unchanged, 1, "`kept` should be unchanged");
+    assert!(
+        report.failed.is_empty(),
+        "no failures expected: {:?}",
+        report.failed
+    );
+
+    let after: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert!(
+        !after.contains(&"mcp_dropped_ping".to_string()),
+        "dropped server's tools must be gone after reload: {after:?}"
+    );
+    assert!(
+        after.contains(&"mcp_kept_ping".to_string()),
+        "kept server's tools must survive reload: {after:?}"
+    );
+    assert_eq!(
+        report.total_tools, 1,
+        "total_tools must reflect post-teardown count"
+    );
+}
+
+/// Spec: a server still present in config but added to
+/// `mcp.disabled_servers` must be torn down by reload. The live-disabled
+/// flag is the operator's "kill this server *now*" switch — leaving its
+/// session alive would let `try_execute_tool` keep dispatching to a server
+/// the operator just disabled (the dispatch path's `is_server_disabled`
+/// gate is defense-in-depth, not the primary teardown).
+#[tokio::test]
+async fn reload_tears_down_live_disabled_servers() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("query", well_formed_schema())])),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    cfg.mcp.servers.insert("killed".into(), sc.clone());
+    mcp_clients::testing::install_session("killed", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    assert_eq!(mcp_clients::tool_definitions().len(), 1);
+
+    cfg.mcp.disabled_servers = vec!["killed".to_string()];
+    let report = mcp_clients::reload_from_config(&cfg)
+        .await
+        .expect("reload ok");
+
+    assert_eq!(report.removed, vec!["killed".to_string()]);
+    assert_eq!(report.unchanged, 0);
+    assert_eq!(report.total_tools, 0);
+    assert!(
+        mcp_clients::tool_definitions().is_empty(),
+        "live-disabled server tools must not survive reload"
+    );
+}
+
+/// Spec: a server present in both pre- and post-reload state must not be
+/// torn down — its session, its mid-flight calls, and its registered tools
+/// all survive. Rate-limit knob changes, however, must take effect: the
+/// reload reseats `SERVER_LIMITS` so a tightened `rate_limit_per_minute`
+/// applies on the next call without forcing a teardown that would close a
+/// possibly-expensive subprocess child.
+#[tokio::test]
+async fn reload_keeps_unchanged_servers_alive() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("echo", well_formed_schema())])),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(|_| text_call_result("ok")),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    cfg.mcp.servers.insert("stable".into(), sc.clone());
+    mcp_clients::testing::install_session("stable", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let report = mcp_clients::reload_from_config(&cfg)
+        .await
+        .expect("reload ok");
+    assert!(report.added.is_empty());
+    assert!(report.removed.is_empty());
+    assert_eq!(report.unchanged, 1);
+    assert_eq!(report.total_tools, 1);
+
+    // The session must still dispatch — i.e., reload did not tear it down
+    // and respawn it. The handler returns "ok" wrapped in the trust
+    // envelope.
+    let out = mcp_clients::try_execute_tool("mcp_stable_echo", &json!({}))
+        .await
+        .expect("call ok")
+        .expect("got body");
+    assert!(
+        out.contains("ok"),
+        "unchanged server must remain dispatchable: {out}"
+    );
+
+    // Now tighten rate-limit knobs on the same server name and reload
+    // again. The session must survive (unchanged), but `SERVER_LIMITS`
+    // must reflect the new values — otherwise an operator who tightens
+    // a server's rate limit in DB would see no effect until daemon
+    // restart, defeating the point of hot-reload.
+    let (per_min_before, burst_before, _) =
+        mcp_clients::testing::limits_for("stable").expect("limits installed");
+    assert_eq!((per_min_before, burst_before), (60, 10));
+
+    let tightened = server_config(vec![], 12, 3);
+    cfg.mcp.servers.insert("stable".into(), tightened);
+    let report = mcp_clients::reload_from_config(&cfg)
+        .await
+        .expect("reload ok");
+    assert_eq!(report.unchanged, 1, "session must not be torn down");
+    assert!(report.added.is_empty() && report.removed.is_empty());
+
+    let (per_min_after, burst_after, _) =
+        mcp_clients::testing::limits_for("stable").expect("limits still recorded");
+    assert_eq!(
+        (per_min_after, burst_after),
+        (12, 3),
+        "reload must reseat SERVER_LIMITS on an unchanged server"
+    );
+}
+
+/// Spec: flipping `mcp.enabled` to false must tear down every running
+/// server, even if `servers` map is unchanged. A regression here would let
+/// the global kill switch fail silently — the operator flips the flag,
+/// sees no error, but tools keep showing up to the LLM.
+#[tokio::test]
+async fn reload_tears_down_everything_when_mcp_disabled() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("t", well_formed_schema())])),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    cfg.mcp.servers.insert("x".into(), sc.clone());
+    mcp_clients::testing::install_session("x", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    cfg.mcp.enabled = false;
+    let report = mcp_clients::reload_from_config(&cfg)
+        .await
+        .expect("reload ok");
+
+    assert_eq!(report.removed, vec!["x".to_string()]);
+    assert_eq!(report.unchanged, 0);
+    assert!(report.added.is_empty());
+    assert!(
+        mcp_clients::tool_definitions().is_empty(),
+        "global kill switch must drain tool_definitions"
+    );
+}
