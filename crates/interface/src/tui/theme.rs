@@ -1,19 +1,58 @@
 use ratatui::style::{Color, Modifier, Style};
 
-pub const CYAN: Color = Color::Rgb(0, 185, 174);
-pub const YELLOW: Color = Color::Rgb(2, 195, 189);
-pub const GREEN: Color = Color::Rgb(0, 159, 147);
-pub const RED: Color = Color::Red;
-pub const AMBER: Color = Color::Rgb(255, 191, 0);
-pub const DIM_WHITE: Color = Color::DarkGray;
-pub const BORDER: Color = Color::Rgb(3, 113, 113);
+use super::themes;
+
+// ---------------------------------------------------------------------------
+// Color accessors — read from the active theme's palette every render.
+// Callers used to reference `theme::cyan()`; they now call `theme::cyan()`.
+// The previous constants are gone on purpose so a stale `theme::cyan()`
+// reference is a compile-time error rather than a silent legacy color.
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn cyan() -> Color {
+    themes::active().palette.accent
+}
+
+#[inline]
+pub fn yellow() -> Color {
+    themes::active().palette.tool_accent
+}
+
+#[inline]
+pub fn green() -> Color {
+    themes::active().palette.success
+}
+
+#[inline]
+pub fn red() -> Color {
+    themes::active().palette.error
+}
+
+#[inline]
+pub fn amber() -> Color {
+    themes::active().palette.warning
+}
+
+#[inline]
+pub fn border_color() -> Color {
+    themes::active().palette.border
+}
+
+#[inline]
+pub fn dim_color() -> Color {
+    themes::active().palette.dim
+}
+
+#[inline]
+pub fn tool_active_green() -> Color {
+    themes::active().palette.active
+}
 
 // glyphs: lighter bullet (•) and single chevron (›) for message prefixes.
 pub const BULLET: &str = "•";
 pub const CHEVRON: &str = "›";
 pub const TREE_END: &str = "└";
-
-pub const TOOL_ACTIVE_GREEN: Color = Color::Rgb(0, 200, 0);
 
 pub const CHECK: &str = "✓";
 pub const CROSS: &str = "✗";
@@ -33,32 +72,36 @@ pub fn dim() -> Style {
     // On light terminals, DarkGray blends into the background; use a mid-grey
     // so dim text still reads. `super::colors::is_light_terminal()` returns
     // false when the terminal bg was not detected, keeping the legacy behavior.
+    // NB: this branch is independent of theme. The theme's `dim` color is
+    // used on dark terminals; the light-terminal fallback is a fixed mid-grey
+    // so even a light theme's `dim` setting can't render unreadably bright
+    // against a bright terminal background.
     if super::colors::is_light_terminal() {
         Style::default().fg(Color::Rgb(90, 90, 90))
     } else {
-        Style::default().fg(DIM_WHITE)
+        Style::default().fg(dim_color())
     }
 }
 
 pub fn code_style() -> Style {
-    Style::default().fg(CYAN)
+    Style::default().fg(cyan())
 }
 
 pub fn tool_style() -> Style {
-    Style::default().fg(YELLOW)
+    Style::default().fg(yellow())
 }
 
 pub fn success_style() -> Style {
-    Style::default().fg(GREEN)
+    Style::default().fg(green())
 }
 
 pub fn error_style() -> Style {
-    Style::default().fg(RED)
+    Style::default().fg(red())
 }
 
 pub fn tool_bullet_active() -> Style {
     Style::default()
-        .fg(TOOL_ACTIVE_GREEN)
+        .fg(tool_active_green())
         .add_modifier(Modifier::BOLD)
 }
 
@@ -67,21 +110,26 @@ pub fn tool_bullet_done() -> Style {
 }
 
 pub fn popup_selected() -> Style {
-    Style::default().bg(Color::Rgb(3, 49, 46)).fg(Color::White)
+    let p = themes::active();
+    Style::default()
+        .bg(p.palette.popup_selected_bg)
+        .fg(p.palette.popup_selected_fg)
 }
 
 pub fn file_mention_style() -> Style {
-    Style::default().fg(CYAN).add_modifier(Modifier::UNDERLINED)
+    Style::default()
+        .fg(cyan())
+        .add_modifier(Modifier::UNDERLINED)
 }
 
 pub fn check_style() -> Style {
     Style::default()
-        .fg(TOOL_ACTIVE_GREEN)
+        .fg(tool_active_green())
         .add_modifier(Modifier::BOLD)
 }
 
 pub fn cross_style() -> Style {
-    Style::default().fg(RED).add_modifier(Modifier::BOLD)
+    Style::default().fg(red()).add_modifier(Modifier::BOLD)
 }
 
 pub fn header_style() -> Style {
@@ -91,11 +139,11 @@ pub fn header_style() -> Style {
 }
 
 pub fn warning_style() -> Style {
-    Style::default().fg(AMBER)
+    Style::default().fg(amber())
 }
 
 pub fn icon_style() -> Style {
-    Style::default().fg(CYAN)
+    Style::default().fg(cyan())
 }
 
 /// Italic + dim, used for reasoning/thinking bodies to visually separate
@@ -136,40 +184,43 @@ pub fn md_ordered_marker_style() -> Style {
 }
 
 pub fn diff_add_style() -> Style {
-    Style::default().fg(TOOL_ACTIVE_GREEN)
+    Style::default().fg(tool_active_green())
 }
 
 pub fn diff_remove_style() -> Style {
-    Style::default().fg(RED)
+    Style::default().fg(red())
 }
 
 /// adaptive backgrounds for diff add/remove rows.
 ///
-/// Dark terminals: muted green (`#213A2B`) / red (`#4A221D`).
-/// Light terminals: pastel green (`#dafbe1`) / red (`#ffebe9`).
+/// Dark vs light terminal branch is preserved; the actual colors on each
+/// branch come from the active theme so themes can tune diff legibility
+/// for their accent set (e.g. `daylight` for light terminals).
 pub fn diff_add_bg() -> Color {
+    let p = themes::active();
     if super::colors::is_light_terminal() {
-        Color::Rgb(218, 251, 225)
+        p.palette.diff_add_bg_light
     } else {
-        Color::Rgb(33, 58, 43)
+        p.palette.diff_add_bg_dark
     }
 }
 
 pub fn diff_remove_bg() -> Color {
+    let p = themes::active();
     if super::colors::is_light_terminal() {
-        Color::Rgb(255, 235, 233)
+        p.palette.diff_remove_bg_light
     } else {
-        Color::Rgb(74, 34, 29)
+        p.palette.diff_remove_bg_dark
     }
 }
 
 /// More-saturated diff gutter backgrounds for line-number / sign columns.
 /// On dark terminals the gutter shares the row bg (returns the row bg). On
-/// light terminals the gutter is more saturated (`#aceebb` / `#ffcecb`) so
-/// the line numbers still read against the pastel row bg.
+/// light terminals the gutter uses the theme's saturated gutter color so
+/// line numbers still read against the pastel row bg.
 pub fn diff_add_gutter_bg() -> Color {
     if super::colors::is_light_terminal() {
-        Color::Rgb(172, 238, 187)
+        themes::active().palette.diff_add_gutter_bg_light
     } else {
         diff_add_bg()
     }
@@ -177,7 +228,7 @@ pub fn diff_add_gutter_bg() -> Color {
 
 pub fn diff_remove_gutter_bg() -> Color {
     if super::colors::is_light_terminal() {
-        Color::Rgb(255, 206, 203)
+        themes::active().palette.diff_remove_gutter_bg_light
     } else {
         diff_remove_bg()
     }
@@ -193,24 +244,24 @@ pub fn diff_gutter_fg() -> Color {
     }
 }
 
-/// Magenta `$` shell prompt for exec/run_shell command echoes.
+/// Shell prompt color for exec/run_shell command echoes.
 pub fn shell_prompt_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(200, 100, 200))
+        .fg(themes::active().palette.shell_prompt)
         .add_modifier(Modifier::BOLD)
 }
 
-/// Composer cursor chevron (`›`) — cyan when focused, dim when blurred.
+/// Composer cursor chevron (`›`) — accent when focused, dim when blurred.
 pub fn composer_cursor_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+        Style::default().fg(cyan()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(DIM_WHITE)
+        Style::default().fg(dim_color())
     }
 }
 
 pub fn diff_header_style() -> Style {
-    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+    Style::default().fg(cyan()).add_modifier(Modifier::BOLD)
 }
 
 pub fn diff_hunk_style() -> Style {
@@ -218,19 +269,19 @@ pub fn diff_hunk_style() -> Style {
 }
 
 pub fn toast_info_border() -> Style {
-    Style::default().fg(CYAN)
+    Style::default().fg(cyan())
 }
 
 pub fn toast_success_border() -> Style {
-    Style::default().fg(TOOL_ACTIVE_GREEN)
+    Style::default().fg(tool_active_green())
 }
 
 pub fn toast_warning_border() -> Style {
-    Style::default().fg(AMBER)
+    Style::default().fg(amber())
 }
 
 pub fn toast_error_border() -> Style {
-    Style::default().fg(RED)
+    Style::default().fg(red())
 }
 
 pub fn format_elapsed(secs: u64) -> String {
@@ -266,6 +317,7 @@ pub fn user_message_style() -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // -- format_elapsed --
 
@@ -292,5 +344,79 @@ mod tests {
         assert_eq!(format_elapsed(7200), "2h");
         assert_eq!(format_elapsed(7260), "2h 1m");
         assert_eq!(format_elapsed(86400), "24h");
+    }
+
+    // -- theme integration --
+    //
+    // These tests verify that the accessor functions in this file actually
+    // read from the active theme. If someone re-hardcodes a constant by
+    // mistake, the active-theme swap will be ignored and these fail.
+
+    /// Snapshot/restore the active theme around a closure AND hold the
+    /// shared `themes::active::TEST_LOCK` for the body so a sibling test
+    /// in another module can't swap the cell mid-flight (cargo test
+    /// parallelizes within a binary).
+    fn with_theme<F: FnOnce()>(name: &str, body: F) {
+        let _guard = super::themes::active::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = themes::active();
+        let Some(t) = themes::builtin(name) else {
+            panic!("builtin '{name}' must exist");
+        };
+        themes::set_active(Arc::new(t.clone()));
+        body();
+        themes::set_active(before);
+    }
+
+    #[test]
+    fn color_accessors_track_active_theme() {
+        with_theme("default", || {
+            assert_eq!(cyan(), Color::Rgb(0, 185, 174));
+            assert_eq!(yellow(), Color::Rgb(2, 195, 189));
+            assert_eq!(green(), Color::Rgb(0, 159, 147));
+        });
+        with_theme("slate", || {
+            assert_eq!(cyan(), Color::Rgb(0x7E, 0xB8, 0xF6));
+        });
+        with_theme("mono", || {
+            assert_eq!(cyan(), Color::Rgb(0xC9, 0xD1, 0xD9));
+        });
+    }
+
+    #[test]
+    fn tool_style_follows_theme() {
+        with_theme("default", || {
+            assert_eq!(tool_style(), Style::default().fg(Color::Rgb(2, 195, 189)));
+        });
+        with_theme("slate", || {
+            assert_eq!(
+                tool_style(),
+                Style::default().fg(Color::Rgb(0x8E, 0xA8, 0xFF))
+            );
+        });
+    }
+
+    #[test]
+    fn shell_prompt_style_follows_theme() {
+        with_theme("default", || {
+            assert_eq!(
+                shell_prompt_style(),
+                Style::default()
+                    .fg(Color::Rgb(200, 100, 200))
+                    .add_modifier(Modifier::BOLD)
+            );
+        });
+        with_theme("slate", || {
+            // slate uses a different shell prompt color
+            let s = shell_prompt_style();
+            assert_ne!(
+                s,
+                Style::default()
+                    .fg(Color::Rgb(200, 100, 200))
+                    .add_modifier(Modifier::BOLD),
+                "slate must override the magenta shell prompt"
+            );
+        });
     }
 }

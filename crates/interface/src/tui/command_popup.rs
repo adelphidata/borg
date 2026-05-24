@@ -32,6 +32,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/mode", "Switch collaboration mode"),
     ("/model", "Switch LLM provider/model"),
+    ("/theme", "Pick TUI theme (alias: /skin)"),
     // Conversation
     ("/compact", "Compact conversation history"),
     ("/clear", "Clear conversation"),

@@ -999,7 +999,7 @@ fn render_logo(frame: &mut ratatui::Frame, area: Rect) {
             Line::from(Span::styled(
                 l.to_string(),
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme::cyan())
                     .add_modifier(Modifier::BOLD),
             ))
         })
@@ -1027,10 +1027,10 @@ fn render_tab_bar(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
 
         let style = if *tab == state.tab {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme::cyan())
                 .add_modifier(Modifier::BOLD)
         } else if completed {
-            Style::default().fg(theme::GREEN)
+            Style::default().fg(theme::green())
         } else {
             theme::dim()
         };
@@ -1068,7 +1068,7 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
 
     lines.push(Line::from(Span::styled(
         "Let's set up your personal AI assistant.",
-        Style::default().fg(theme::CYAN),
+        Style::default().fg(theme::cyan()),
     )));
     lines.push(Line::default());
     lines.push(Line::default());
@@ -1077,7 +1077,7 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     let user_name_focused = state.welcome_focus == WelcomeFocus::UserName;
     let user_label_style = if user_name_focused {
         Style::default()
-            .fg(theme::CYAN)
+            .fg(theme::cyan())
             .add_modifier(Modifier::BOLD)
     } else {
         theme::dim()
@@ -1088,14 +1088,14 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     )));
     let user_cursor = if user_name_focused { "▊" } else { "" };
     let user_border_style = if user_name_focused {
-        theme::CYAN
+        theme::cyan()
     } else {
-        theme::DIM_WHITE
+        theme::dim_color()
     };
     lines.push(Line::from(vec![
         Span::styled("  › ", Style::default().fg(user_border_style)),
         Span::raw(&state.user_name),
-        Span::styled(user_cursor, Style::default().fg(theme::CYAN)),
+        Span::styled(user_cursor, Style::default().fg(theme::cyan())),
     ]));
 
     lines.push(Line::default());
@@ -1105,7 +1105,7 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     let agent_name_focused = state.welcome_focus == WelcomeFocus::AgentName;
     let agent_label_style = if agent_name_focused {
         Style::default()
-            .fg(theme::CYAN)
+            .fg(theme::cyan())
             .add_modifier(Modifier::BOLD)
     } else {
         theme::dim()
@@ -1116,14 +1116,14 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     )));
     let agent_cursor = if agent_name_focused { "▊" } else { "" };
     let agent_border_style = if agent_name_focused {
-        theme::CYAN
+        theme::cyan()
     } else {
-        theme::DIM_WHITE
+        theme::dim_color()
     };
     lines.push(Line::from(vec![
         Span::styled("  › ", Style::default().fg(agent_border_style)),
         Span::raw(&state.agent_name),
-        Span::styled(agent_cursor, Style::default().fg(theme::CYAN)),
+        Span::styled(agent_cursor, Style::default().fg(theme::cyan())),
     ]));
 
     if state.user_name.trim().is_empty() {
@@ -1153,7 +1153,7 @@ fn render_security(frame: &mut ratatui::Frame, area: Rect, _state: &OnboardingSt
     for line in SECURITY_BODY.lines() {
         lines.push(Line::from(Span::styled(
             format!("  {line}"),
-            Style::default().fg(theme::YELLOW),
+            Style::default().fg(theme::yellow()),
         )));
     }
 
@@ -1162,7 +1162,7 @@ fn render_security(frame: &mut ratatui::Frame, area: Rect, _state: &OnboardingSt
     lines.push(Line::from(vec![
         Span::styled(
             "  Run diagnostics anytime: ",
-            Style::default().fg(theme::YELLOW),
+            Style::default().fg(theme::yellow()),
         ),
         Span::styled(
             "/doctor",
@@ -1188,7 +1188,7 @@ fn render_provider(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
 
     lines.push(Line::from(Span::styled(
         "Choose your LLM provider",
-        Style::default().fg(theme::CYAN),
+        Style::default().fg(theme::cyan()),
     )));
     lines.push(Line::default());
 
@@ -1197,7 +1197,7 @@ fn render_provider(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
         let indicator = if is_selected { "● " } else { "○ " };
         let style = if is_selected {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme::cyan())
                 .add_modifier(Modifier::BOLD)
         } else {
             theme::dim()
@@ -1208,7 +1208,7 @@ fn render_provider(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
             Span::styled(
                 format!("  {desc}"),
                 if is_selected {
-                    Style::default().fg(theme::DIM_WHITE)
+                    Style::default().fg(theme::dim_color())
                 } else {
                     theme::dim()
                 },
@@ -1230,14 +1230,14 @@ fn render_api_key(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
 
     lines.push(Line::from(Span::styled(
         "Paste your API key",
-        Style::default().fg(theme::CYAN),
+        Style::default().fg(theme::cyan()),
     )));
     lines.push(Line::default());
 
     if state.api_key_existing {
         lines.push(Line::from(Span::styled(
             "  ✓ API key already configured",
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme::green()),
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -1275,16 +1275,16 @@ fn render_api_key(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
 
         let masked: String = "*".repeat(state.api_key_input.len());
         lines.push(Line::from(vec![
-            Span::styled("  › ", Style::default().fg(theme::CYAN)),
+            Span::styled("  › ", Style::default().fg(theme::cyan())),
             Span::raw(masked),
-            Span::styled("▊", Style::default().fg(theme::CYAN)),
+            Span::styled("▊", Style::default().fg(theme::cyan())),
         ]));
 
         if state.api_key_required_hint {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "  ⚠ Please enter your API key to continue",
-                Style::default().fg(theme::YELLOW),
+                Style::default().fg(theme::yellow()),
             )));
         }
     }
@@ -1310,7 +1310,7 @@ fn render_model_selection(frame: &mut ratatui::Frame, area: Rect, state: &Onboar
     };
     lines.push(Line::from(Span::styled(
         header,
-        Style::default().fg(theme::CYAN),
+        Style::default().fg(theme::cyan()),
     )));
     lines.push(Line::default());
 
@@ -1337,7 +1337,7 @@ fn render_model_selection(frame: &mut ratatui::Frame, area: Rect, state: &Onboar
         let indicator = if is_selected { "● " } else { "○ " };
         let style = if is_selected {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme::cyan())
                 .add_modifier(Modifier::BOLD)
         } else {
             theme::dim()
@@ -1386,7 +1386,7 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
         ChannelPhase::Browsing => {
             lines.push(Line::from(Span::styled(
                 "Connect messaging channels (optional)",
-                Style::default().fg(theme::CYAN),
+                Style::default().fg(theme::cyan()),
             )));
             lines.push(Line::from(Span::styled(
                 "  You can skip this — add any channel later with `borg add <name>`",
@@ -1423,10 +1423,10 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
                     theme::dim()
                 } else if is_selected {
                     Style::default()
-                        .fg(theme::CYAN)
+                        .fg(theme::cyan())
                         .add_modifier(Modifier::BOLD)
                 } else if item.selected {
-                    Style::default().fg(theme::GREEN)
+                    Style::default().fg(theme::green())
                 } else {
                     theme::dim()
                 };
@@ -1436,7 +1436,7 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
                 if !item.platform_available {
                     spans.push(Span::styled("  (macOS only)", theme::dim()));
                 } else if item.selected && !item.credentials.is_empty() {
-                    spans.push(Span::styled("  ✓", Style::default().fg(theme::GREEN)));
+                    spans.push(Span::styled("  ✓", Style::default().fg(theme::green())));
                 }
 
                 lines.push(Line::from(spans));
@@ -1475,7 +1475,7 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
 
             lines.push(Line::from(Span::styled(
                 format!("Configure {}", item.name),
-                Style::default().fg(theme::CYAN),
+                Style::default().fg(theme::cyan()),
             )));
             lines.push(Line::default());
 
@@ -1487,7 +1487,7 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
                     item.cred_specs.len()
                 ),
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme::cyan())
                     .add_modifier(Modifier::BOLD),
             )));
 
@@ -1501,9 +1501,9 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
 
             let masked: String = "*".repeat(buffer.len());
             lines.push(Line::from(vec![
-                Span::styled("  › ", Style::default().fg(theme::CYAN)),
+                Span::styled("  › ", Style::default().fg(theme::cyan())),
                 Span::raw(masked),
-                Span::styled("▊", Style::default().fg(theme::CYAN)),
+                Span::styled("▊", Style::default().fg(theme::cyan())),
             ]));
         }
     }

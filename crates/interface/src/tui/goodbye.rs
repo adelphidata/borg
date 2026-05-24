@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::theme;
+use super::themes;
 use super::tui_lifecycle::Tui;
 
 const FAREWELL: &[&str] = &[
@@ -95,7 +96,8 @@ const MESSAGES: &[&[&str]] = &[
     ADIOS,
 ];
 
-const SUBTITLE: &str = "Borg Decommissioned";
+/// Default subtitle when the active theme doesn't override `branding.goodbye`.
+const DEFAULT_SUBTITLE: &str = "Borg Decommissioned";
 
 pub fn render(tui: &mut Tui) -> Result<()> {
     let idx = std::time::SystemTime::now()
@@ -104,8 +106,8 @@ pub fn render(tui: &mut Tui) -> Result<()> {
         .unwrap_or(0);
     let art = MESSAGES[idx];
 
-    let style = Style::default().fg(theme::CYAN);
-    let dim = Style::default().fg(theme::DIM_WHITE);
+    let style = Style::default().fg(theme::cyan());
+    let dim = Style::default().fg(theme::dim_color());
 
     // Use the alt screen so the goodbye art covers any prior viewport state.
     tui.enter_alt_screen()?;
@@ -144,8 +146,16 @@ pub fn render(tui: &mut Tui) -> Result<()> {
             .collect();
         f.render_widget(Paragraph::new(lines), h_chunks[1]);
 
-        // Center subtitle
-        let sub_len = SUBTITLE.len() as u16;
+        // Subtitle: themed goodbye string when the active theme overrides
+        // `branding.goodbye` to something other than the builtin "Bye"
+        // sentinel; otherwise the legacy "Borg Decommissioned" line.
+        let active = themes::active();
+        let subtitle: String = if active.branding.goodbye == "Bye" {
+            DEFAULT_SUBTITLE.to_string()
+        } else {
+            active.branding.goodbye.to_string()
+        };
+        let sub_len = subtitle.chars().count() as u16;
         let sub_pad = area.width.saturating_sub(sub_len) / 2;
         let sub_chunks = Layout::horizontal([
             Constraint::Length(sub_pad),
@@ -155,7 +165,7 @@ pub fn render(tui: &mut Tui) -> Result<()> {
         .split(chunks[3]);
 
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(SUBTITLE, dim))),
+            Paragraph::new(Line::from(Span::styled(subtitle, dim))),
             sub_chunks[1],
         );
     })?;

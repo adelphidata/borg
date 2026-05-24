@@ -36,6 +36,7 @@ use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
 use super::subprocesses_popup::SubprocessesPopup;
+use super::theme_popup::ThemePopup;
 use super::transcript_pager::TranscriptPager;
 use super::usage_popup::UsagePopup;
 
@@ -49,6 +50,7 @@ macro_rules! for_each_routed_popup {
     ($self:ident, $body:ident) => {
         $body!($self, settings_popup);
         $body!($self, model_popup);
+        $body!($self, theme_popup);
         $body!($self, plugins_popup);
         $body!($self, mcp_popup);
         $body!($self, pairing_popup);
@@ -458,6 +460,9 @@ pub struct App<'a> {
     pub command_popup: CommandPopup,
     pub settings_popup: SettingsPopup,
     pub model_popup: ModelPopup,
+    /// `/theme` picker — pairs with `model_popup` as a quick-swap that
+    /// avoids walking through `/settings`.
+    pub theme_popup: ThemePopup,
     pub plugins_popup: PluginsPopup,
     /// Read-only operator view of configured MCP servers (`/mcp`).
     /// Pairs with `/plugins` — the WASM side stays in its own popup
@@ -610,6 +615,7 @@ impl<'a> App<'a> {
             },
             settings_popup: SettingsPopup::new(),
             model_popup: ModelPopup::new(),
+            theme_popup: ThemePopup::new(),
             plugins_popup: PluginsPopup::new(),
             mcp_popup: McpPopup::new(),
             cells_emitted: 0,

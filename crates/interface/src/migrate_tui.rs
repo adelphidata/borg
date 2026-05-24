@@ -361,7 +361,7 @@ fn render_tab_bar(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) 
         };
         let style = if *tab == state.tab {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme::cyan())
                 .add_modifier(Modifier::BOLD)
         } else {
             theme::dim()
@@ -386,7 +386,7 @@ fn render_source(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) {
     if state.available_sources.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No migration sources detected.",
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme::red()),
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -406,7 +406,7 @@ fn render_source(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) {
             let selected = i == state.selected_source;
             let marker = if selected { ">" } else { " " };
             let style = if selected {
-                Style::default().fg(theme::CYAN)
+                Style::default().fg(theme::cyan())
             } else {
                 Style::default()
             };
@@ -442,7 +442,7 @@ fn render_categories(frame: &mut ratatui::Frame, area: Rect, state: &MigrateStat
         let checkbox = if checked { "[x]" } else { "[ ]" };
         let marker = if focused { ">" } else { " " };
         let style = if focused {
-            Style::default().fg(theme::CYAN)
+            Style::default().fg(theme::cyan())
         } else {
             Style::default()
         };
@@ -474,7 +474,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) 
     if let Some(ref err) = state.error {
         lines.push(Line::from(Span::styled(
             format!("  Error: {err}"),
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme::red()),
         )));
     } else {
         let visible_height = area.height.saturating_sub(4) as usize;
@@ -516,7 +516,7 @@ fn render_confirm(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) 
     if let Some(ref err) = state.error {
         lines.push(Line::from(Span::styled(
             format!("  {err}"),
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme::red()),
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -570,7 +570,7 @@ fn render_confirm(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) 
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  Press Enter to apply, Esc to cancel.",
-            Style::default().fg(theme::CYAN),
+            Style::default().fg(theme::cyan()),
         )));
     }
 

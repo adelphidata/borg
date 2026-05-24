@@ -111,7 +111,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 }
                 Tag::Link { dest_url, .. } => {
                     let base = current_style(&style_stack);
-                    style_stack.push(base.fg(theme::CYAN).add_modifier(Modifier::UNDERLINED));
+                    style_stack.push(base.fg(theme::cyan()).add_modifier(Modifier::UNDERLINED));
                     link_suffix_stack.push(resolve_local_link(dest_url.as_ref()));
                 }
                 _ => {}

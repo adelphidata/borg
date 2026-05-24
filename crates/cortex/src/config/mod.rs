@@ -16,6 +16,7 @@ pub mod security;
 mod settings_macro;
 pub mod settings_table;
 pub mod tunnel;
+pub mod ui;
 pub mod update;
 pub mod voice;
 
@@ -40,6 +41,7 @@ pub use tunnel::{
     CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
     TunnelConfig, TunnelProvider,
 };
+pub use ui::UiConfig;
 pub use update::*;
 pub use voice::VoiceConfig;
 
@@ -185,6 +187,9 @@ pub struct Config {
     /// APNs push pipeline for waking offline iOS clients.
     #[serde(default)]
     pub apns: ApnsConfig,
+    /// TUI presentation settings (currently: active theme name).
+    #[serde(default)]
+    pub ui: UiConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,

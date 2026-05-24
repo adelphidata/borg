@@ -53,6 +53,7 @@ reqwest = { workspace = true }
 tokio-util = { workspace = true }
 tracing-appender = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 throbber-widgets-tui = { workspace = true }
 ignore = { workspace = true }
 libc = "0.2"

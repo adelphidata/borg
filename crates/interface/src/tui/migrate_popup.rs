@@ -314,7 +314,7 @@ impl MigratePopup {
         if self.available_sources.is_empty() {
             lines.push(Line::from(Span::styled(
                 " No migration sources detected.",
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme::red()),
             )));
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -334,7 +334,7 @@ impl MigratePopup {
                 let selected = i == self.source_cursor;
                 let marker = if selected { ">" } else { " " };
                 let style = if selected {
-                    Style::default().fg(theme::CYAN)
+                    Style::default().fg(theme::cyan())
                 } else {
                     Style::default()
                 };
@@ -370,7 +370,7 @@ impl MigratePopup {
             let checkbox = if checked { "[x]" } else { "[ ]" };
             let marker = if focused { ">" } else { " " };
             let style = if focused {
-                Style::default().fg(theme::CYAN)
+                Style::default().fg(theme::cyan())
             } else {
                 Style::default()
             };
@@ -402,7 +402,7 @@ impl MigratePopup {
         if let Some(ref err) = self.error {
             lines.push(Line::from(Span::styled(
                 format!(" Error: {err}"),
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme::red()),
             )));
         } else {
             let visible_height = area.height.saturating_sub(4) as usize;
@@ -444,7 +444,7 @@ impl MigratePopup {
         if let Some(ref err) = self.error {
             lines.push(Line::from(Span::styled(
                 format!(" {err}"),
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme::red()),
             )));
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(

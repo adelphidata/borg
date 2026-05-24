@@ -86,6 +86,7 @@ impl<'a> App<'a> {
         self.file_popup.render(frame, app_layout.composer);
         self.settings_popup.render(frame, &self.config);
         self.model_popup.render(frame);
+        self.theme_popup.render(frame);
         self.plugins_popup.render(frame);
         self.mcp_popup.render(frame);
         self.pairing_popup.render(frame);
@@ -947,7 +948,7 @@ pub(super) fn build_borg_card_lines(
     pending_update_version: Option<&str>,
 ) -> Vec<Line<'static>> {
     let version = env!("CARGO_PKG_VERSION");
-    let teal = Style::default().fg(theme::CYAN);
+    let teal = Style::default().fg(theme::cyan());
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("BORG", teal.add_modifier(Modifier::BOLD)),
@@ -1023,7 +1024,7 @@ pub(super) fn build_queue_preview_lines(
     area_width: u16,
 ) -> Vec<Line<'static>> {
     let dim_italic = Style::default()
-        .fg(theme::DIM_WHITE)
+        .fg(theme::dim_color())
         .add_modifier(Modifier::ITALIC);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if queued.is_empty() {
@@ -1722,7 +1723,7 @@ mod tests {
         // Body must be dim+italic.
         let body_style = lines[1].spans[1].style;
         assert!(body_style.add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(body_style.fg, Some(theme::DIM_WHITE));
+        assert_eq!(body_style.fg, Some(theme::dim_color()));
     }
 
     #[test]

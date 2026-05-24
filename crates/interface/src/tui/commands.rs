@@ -81,6 +81,12 @@ impl App<'_> {
                 self.model_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::Continue));
             }
+            // `/theme` opens the picker; `/skin` is an alias for muscle
+            // memory from hermes' `/skin` command — same destination.
+            "/theme" | "/skin" => {
+                self.theme_popup.show(&self.config);
+                return Some(Ok(AppAction::Continue));
+            }
             "/plugins" | "/plugin" => return Some(self.cmd_plugins()),
             "/mcp" => return Some(self.cmd_mcp()),
             "/schedule-tasks" | "/schedule" => {

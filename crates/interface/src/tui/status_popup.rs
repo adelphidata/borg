@@ -172,7 +172,7 @@ impl StatusPopup {
             Span::styled(
                 "BORG",
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme::cyan())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::from(" "),
@@ -200,7 +200,7 @@ impl StatusPopup {
         if !snap.compact_class_line.is_empty() {
             self.lines.push(Line::from(vec![
                 Span::styled("class: ", theme::dim()),
-                Span::styled(snap.compact_class_line, Style::default().fg(theme::CYAN)),
+                Span::styled(snap.compact_class_line, Style::default().fg(theme::cyan())),
             ]));
             self.lines.push(Line::default());
         }
@@ -345,7 +345,7 @@ impl StatusPopup {
                 if !snap.compact_class_line.is_empty() {
                     self.lines.push(Line::from(vec![
                         Span::styled("class: ", theme::dim()),
-                        Span::styled(snap.compact_class_line, Style::default().fg(theme::CYAN)),
+                        Span::styled(snap.compact_class_line, Style::default().fg(theme::cyan())),
                     ]));
                     self.lines.push(Line::default());
                 }
@@ -384,7 +384,7 @@ impl StatusPopup {
             }
             let style = if *tab == self.current_tab {
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme::cyan())
                     .add_modifier(Modifier::BOLD)
             } else {
                 theme::dim()

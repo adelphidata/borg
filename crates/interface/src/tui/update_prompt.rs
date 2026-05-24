@@ -250,7 +250,7 @@ fn render(
         Span::styled(
             "  ✨ ",
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme::amber())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("Update available!", theme::bold()),
@@ -297,13 +297,13 @@ fn option_row(num: u8, label: String, highlighted: bool) -> Line<'static> {
     let pointer = if highlighted { "›" } else { " " };
     let style = if highlighted {
         Style::default()
-            .fg(theme::CYAN)
+            .fg(theme::cyan())
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     Line::from(vec![
-        Span::styled(format!("{pointer} "), Style::default().fg(theme::CYAN)),
+        Span::styled(format!("{pointer} "), Style::default().fg(theme::cyan())),
         Span::styled(format!("{num}. {label}"), style),
     ])
 }

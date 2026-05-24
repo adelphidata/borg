@@ -286,7 +286,7 @@ impl<'a> Composer<'a> {
                     Span::styled(theme::CHEVRON, theme::composer_cursor_style(true)),
                     Span::raw(" "),
                 ]))
-                .border_style(Style::default().fg(theme::BORDER)),
+                .border_style(Style::default().fg(theme::border_color())),
         );
         Self {
             textarea,

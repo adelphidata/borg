@@ -32,6 +32,8 @@ mod shimmer;
 mod status_popup;
 mod subprocesses_popup;
 pub(crate) mod theme;
+mod theme_popup;
+pub(crate) mod themes;
 mod toast;
 mod tool_display;
 mod transcript_pager;
@@ -235,6 +237,26 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     crate::openrouter_catalog::spawn_prefetch();
 
     let config = Config::load_from_db().await?;
+
+    // Initialize the active theme from the persisted `ui.theme` setting.
+    // Done before any TUI render so the very first frame already reflects
+    // the user's choice (otherwise the welcome banner flashes default
+    // colors first, then snaps). Unknown names fall back to the builtin
+    // `default` inside `themes::resolve`, so a fat-fingered DB value never
+    // breaks boot.
+    match Config::data_dir() {
+        Ok(data_dir) => {
+            let resolved = themes::resolve(&config.ui.theme, &themes::user_themes_dir(&data_dir));
+            themes::set_active(resolved);
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "borg::tui::themes",
+                error = %e,
+                "could not resolve borg data dir at startup; using builtin 'default' theme",
+            );
+        }
+    }
 
     // "Update available" prompt — runs before alt-screen / daemon connect so
     // a user choosing "Update now" exits cleanly before we wire up the rest
@@ -1024,8 +1046,39 @@ async fn run_event_loop(
                 }
             }
             AppAction::UpdateSetting { key, value } => {
-                if let Err(e) = client.set_setting(&key, &value).await {
-                    app.push_system_message(format!("Warning: set_setting failed: {e}"));
+                match client.set_setting(&key, &value).await {
+                    Ok(()) => {
+                        // Theme is the one setting that demands a live
+                        // process-side side effect: every render reads
+                        // `themes::active()`, so the swap has to land
+                        // before the next frame. Anything else (model,
+                        // temperature, …) is consumed by the daemon, not
+                        // by the TUI render path. Only swap on a
+                        // successful DB write — otherwise the next
+                        // restart would resurrect the old theme, leaving
+                        // the user's "did it take?" intuition broken.
+                        if key == "ui.theme" {
+                            match cortex::config::Config::data_dir() {
+                                Ok(data_dir) => {
+                                    let resolved = themes::resolve(
+                                        &value,
+                                        &themes::user_themes_dir(&data_dir),
+                                    );
+                                    themes::set_active(resolved);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "borg::tui::themes",
+                                        error = %e,
+                                        "could not resolve borg data dir; theme persisted to DB but live-swap skipped",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.push_system_message(format!("Warning: set_setting failed: {e}"));
+                    }
                 }
             }
             AppAction::ConfigReloaded => {

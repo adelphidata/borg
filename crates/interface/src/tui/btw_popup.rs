@@ -85,7 +85,7 @@ impl BtwPopup {
         frame.render_widget(Clear, area);
 
         let title_style = Style::default()
-            .fg(theme::CYAN)
+            .fg(theme::cyan())
             .add_modifier(Modifier::BOLD);
         let block = Block::default()
             .borders(Borders::ALL)

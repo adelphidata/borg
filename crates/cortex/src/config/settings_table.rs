@@ -310,6 +310,15 @@ define_settings! {
         "tunnel.custom.health_url" => tunnel.custom.health_url, opt_string;
         "tunnel.custom.url_pattern" => tunnel.custom.url_pattern, opt_string;
 
+        // ── UI / theme ──
+        // The active theme name. Validation is intentionally lax — the
+        // resolver at the TUI layer falls back to the builtin `default`
+        // with a `tracing::warn!` when the name is unknown (e.g. a user
+        // theme file was deleted), so the agent always boots. Builtin
+        // names + dynamically-discovered user themes drive the `/theme`
+        // picker; this row also surfaces in `/settings` under "Appearance".
+        "ui.theme" => ui.theme, string;
+
         // ── APNs ──
         "apns.enabled" => apns.enabled, parsed(bool);
         "apns.bundle_id" => apns.bundle_id, opt_string;
@@ -746,6 +755,9 @@ define_settings! {
         // in the TUI popup.
         "mcp.enabled" => "MCP", Bool, "MCP";
 
+        // — Appearance — TUI theme picker (also reachable as `/theme`)
+        "ui.theme" => "Theme", Select, "Appearance";
+
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";
         "conversation.concurrent_tools.max_workers" => "Parallel tool workers", Uint, "Advanced";
@@ -784,6 +796,14 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         "tunnel.provider",
         &["none", "cloudflare", "ngrok", "tailscale", "custom"],
     ),
+    // Builtin themes only — `/settings` cycles this static list AND fires
+    // the same `AppAction::UpdateSetting` plumbing that `/theme` uses, so
+    // a cycle here DOES live-swap the theme (not just persist the value).
+    // User themes from `~/.borg/themes/` are reachable via `/theme` (which
+    // discovers them at popup time) and via `borg config set ui.theme
+    // <name>` — they can't appear in this `static` slice. Keep in sync
+    // with the builtin registry in `crates/interface/src/tui/themes/builtins.rs`.
+    ("ui.theme", &["default", "mono", "slate", "daylight"]),
 ];
 
 /// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in
