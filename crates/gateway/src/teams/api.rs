@@ -115,6 +115,25 @@ impl TeamsClient {
         Ok(access_token)
     }
 
+    /// Download an attachment from a Bot Framework / SharePoint content
+    /// URL. Voice messages on Teams arrive as audio attachments; this
+    /// method fetches the bytes for downstream STT. Uses the cached
+    /// OAuth2 access token for authentication.
+    pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>> {
+        let token = self.get_token().await?;
+        let resp = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .context("teams: download attachment")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("teams attachment download returned HTTP {}", resp.status());
+        }
+        Ok(resp.bytes().await.context("teams: read attachment body")?.to_vec())
+    }
+
     /// Reply to a specific activity in a Teams conversation, automatically chunking long messages.
     pub async fn reply_to_activity(
         &self,

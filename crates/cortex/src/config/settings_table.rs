@@ -133,6 +133,7 @@ define_settings! {
         "voice.max_wait_secs" => voice.max_wait_secs, parsed(f32);
         "voice.no_speech_limit" => voice.no_speech_limit, parsed(u8);
         "voice.sample_rate_hz" => voice.sample_rate_hz, parsed(u32);
+        "voice.record_key" => voice.record_key, string;
 
         // ── Evolution ──
         "evolution.enabled" => evolution.enabled, parsed(bool);

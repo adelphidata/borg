@@ -205,6 +205,18 @@ pub struct TtsModelConfig {
     /// Per-provider timeout override in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Custom provider name suffix (provider: "custom" rows can ship
+    /// multiple distinct entries — `name = "piper-en"` etc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Shell command template for `provider = "custom"`. Tokens:
+    /// `{text_file}`, `{voice}`, `{out_path}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Output extension for custom providers (default `"wav"`). Used to
+    /// name the tempfile passed in `{out_path}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_extension: Option<String>,
 }
 
 /// Text-to-speech configuration with multi-provider fallback.

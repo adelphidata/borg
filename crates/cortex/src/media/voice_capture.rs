@@ -9,15 +9,13 @@
 //! tests can swap in [`MockRecorder`].
 //!
 //! Ported behavior-for-behavior from
-//! `reference/hermes-agent/tools/voice_mode.py::AudioRecorder` —
 //! including the "resume tracking with dip tolerance" sub-state at
-//! Python lines 487–503, which prevents brief sub-threshold dips
+//! which prevents brief sub-threshold dips
 //! mid-utterance from being mistaken for the user stopping. Don't
 //! simplify that path without matching tests; it has regressed twice
-//! in the reference implementation.
+//! once before.
 //!
 //! The Termux/Android backend from the reference is intentionally
-//! omitted — borg targets desktop and server hosts.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -66,9 +64,6 @@ pub enum VadDecision {
 ///
 /// Inputs: RMS level per chunk + monotonic `Instant`.
 /// Output: a [`VadDecision`] per chunk.
-///
-/// State transitions mirror
-/// `reference/hermes-agent/tools/voice_mode.py:463-543` exactly.
 #[derive(Debug)]
 pub struct VadFsm {
     cfg: VoiceConfig,
@@ -169,7 +164,7 @@ impl VadFsm {
         } else if self.has_spoken {
             // Below threshold after speech confirmed. Resume tracker
             // tolerates brief dips before declaring "user stopped
-            // resuming". Mirrors Python lines 493-503.
+            // resuming". 
             if self.resume_start.is_some() {
                 match self.resume_dip_start {
                     None => self.resume_dip_start = Some(now),
@@ -184,7 +179,7 @@ impl VadFsm {
         } else if let Some(start) = self.speech_start {
             // Pre-confirmation dip — tolerate `dip_tolerance_secs` of
             // sub-threshold before resetting the speech-attempt timer.
-            // Mirrors Python lines 504-514.
+            // 
             match self.dip_start {
                 None => self.dip_start = Some(now),
                 Some(dip) => {
@@ -422,7 +417,6 @@ impl AudioRecorder {
 impl Recorder for AudioRecorder {
     fn start(&self, on_silence: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
         // Idempotent — already-recording start is a no-op (mirrors
-        // hermes voice.py:316).
         if self.shared.recording.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -491,9 +485,7 @@ impl Drop for AudioRecorder {
 //
 // `cpal::default_host().default_input_device()` returning `None` is the
 // generic failure mode; the value of this preflight is converting it into a
-// platform-specific remediation string the user can act on directly. Hermes's
-// `detect_audio_environment()` at `tools/voice_mode.py` does the same thing
-// in Python.
+// platform-specific remediation string the user can act on directly.
 //
 // We intentionally do NOT call `AVCaptureDevice.authorizationStatus` on
 // macOS — that pulls in objc bindings for a single bit of info, and a denied
@@ -675,7 +667,7 @@ fn finalize_recording(shared: &Arc<RecorderShared>, discard: bool) -> Option<Pat
     if peak < shared.cfg.silence_threshold_rms {
         // Whole recording was below the speech-detection floor —
         // drop it rather than ship silence to Whisper, where it
-        // would hallucinate (hermes voice_mode.py:673).
+        // would hallucinate.
         return None;
     }
     match write_wav(&frames, shared.cfg.sample_rate_hz) {

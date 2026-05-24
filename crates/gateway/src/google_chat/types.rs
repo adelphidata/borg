@@ -77,6 +77,35 @@ pub struct ChatMessage {
     /// Creation time of the message.
     #[serde(default)]
     pub create_time: Option<String>,
+    /// File attachments (audio/image/etc.) — voice messages arrive here
+    /// with `contentType: audio/*` and a `resourceName` we fetch via
+    /// `media.download`.
+    #[serde(default)]
+    pub attachment: Option<Vec<ChatAttachment>>,
+}
+
+/// File attachment on a Google Chat message.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachment {
+    /// Display name (user-visible).
+    #[serde(default)]
+    pub content_name: Option<String>,
+    /// MIME type — `audio/*` for voice messages.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Reference to the binary content.
+    #[serde(default)]
+    pub attachment_data_ref: Option<AttachmentDataRef>,
+}
+
+/// Reference to attachment binary data, used by the media.download endpoint.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDataRef {
+    /// Opaque resource name like `ChatDataMedia/...` passed to media.download.
+    #[serde(default)]
+    pub resource_name: Option<String>,
 }
 
 /// A Google Chat user.

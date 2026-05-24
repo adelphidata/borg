@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::Client;
 use std::time::Duration;
@@ -120,6 +120,23 @@ impl TwilioClient {
         let sid = json["sid"].as_str().unwrap_or("unknown").to_string();
 
         Ok(sid)
+    }
+
+    /// Download media bytes from a Twilio media URL using the client's
+    /// existing Basic-auth credentials. Used to fetch voice/audio
+    /// attachments for STT before handing them to the agent.
+    pub async fn download_media(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .client
+            .get(url)
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await
+            .context("twilio: GET media url")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("twilio media download returned HTTP {}", resp.status());
+        }
+        Ok(resp.bytes().await.context("twilio: read media body")?.to_vec())
     }
 
     /// Returns the Messages API URL (for testing).

@@ -522,6 +522,21 @@ async fn handle_voice(
     channel_id: Option<&str>,
     args: &str,
 ) -> String {
+    let arg_lower = args.trim().to_ascii_lowercase();
+
+    // Discord voice-channel subcommands.
+    // `/voice join <channel_id>` joins; `/voice channel <id>` switches;
+    // `/voice leave` disconnects. When built with the
+    // `discord-voice-channels` feature AND a Discord bot is configured,
+    // these route to the songbird-backed manager; otherwise return the
+    // stub message naming the gap.
+    if matches!(arg_lower.as_str(), "join" | "leave")
+        || arg_lower.starts_with("join ")
+        || arg_lower.starts_with("channel ")
+    {
+        return handle_discord_voice_channel(channel_id, &arg_lower).await;
+    }
+
     if channel_name != "telegram" {
         return "Voice mode is currently implemented for Telegram only.".to_string();
     }
@@ -569,6 +584,148 @@ async fn handle_voice(
     }
 
     format!("Voice mode: {}", next.status_label())
+}
+
+/// Dispatch a Discord voice-channel subcommand. When built with
+/// `discord-voice-channels` AND the voice manager handle has been
+/// installed by `Server::run`, this drives the songbird-backed manager
+/// to actually join/leave the voice gateway. Otherwise returns a clear
+/// "not wired" message so users know what's available.
+async fn handle_discord_voice_channel(channel_id: Option<&str>, arg_lower: &str) -> String {
+    #[cfg(feature = "discord-voice-channels")]
+    {
+        if let Some(handle) = crate::discord::voice_channels::voice_manager_handle() {
+            return dispatch_voice_channel_via_handle(handle, channel_id, arg_lower).await;
+        }
+    }
+    let _ = channel_id; // unused when feature disabled
+    let action = if arg_lower == "leave" {
+        "leave"
+    } else if arg_lower.starts_with("channel ") || arg_lower == "channel" {
+        "switch"
+    } else {
+        "join"
+    };
+    format!(
+        "Discord voice-channel `{action}` is not active in this build. \
+         Rebuild with `--features discord-voice-channels` and configure a \
+         Discord bot token to enable; until then the `/voice on|off|tts|status` \
+         family is what's available."
+    )
+}
+
+#[cfg(feature = "discord-voice-channels")]
+async fn dispatch_voice_channel_via_handle(
+    handle: &crate::discord::voice_channels::VoiceManagerHandle,
+    discord_channel_id: Option<&str>,
+    arg_lower: &str,
+) -> String {
+    // The user-facing inputs:
+    //   `/voice join` — join the user's current voice channel (TODO: we
+    //                   need a guild lookup + Discord-side resolution of
+    //                   "user's current channel" which requires GUILD_MEMBERS
+    //                   intent + cache; reject for now).
+    //   `/voice join <channel_id>` — explicit channel id.
+    //   `/voice channel <name>` — switch to a different channel.
+    //   `/voice leave` — disconnect.
+    //
+    // The reference implementation resolves channel names → ids via a guild cache. Borg's
+    // Discord client doesn't currently maintain a guild cache (interactions
+    // come pre-resolved with channel_id). For first cut, accept only the
+    // explicit-id form and direct users at it.
+    let parts: Vec<&str> = arg_lower.split_whitespace().collect();
+    let action = parts.first().copied().unwrap_or("");
+    let arg = parts.get(1).copied().unwrap_or("");
+    // discord_channel_id is the channel_id of the text channel the command
+    // came from. We need the guild_id, which Discord interactions also carry
+    // — but our current dispatch path drops it. As a minimum-viable shim:
+    // require the user to supply guild_id explicitly via `<guild>:<channel>`
+    // syntax until guild_id plumbing lands in commands::dispatch.
+    let parse_target = |s: &str| -> Option<(u64, u64)> {
+        let (g, c) = s.split_once(':')?;
+        let g = g.trim().parse::<u64>().ok()?;
+        let c = c.trim().parse::<u64>().ok()?;
+        // `<guild>:user:<id>` is the user-resolve form — exclude it here
+        // so the explicit-channel path doesn't accidentally accept it.
+        if g == 0 || c == 0 {
+            return None;
+        }
+        Some((g, c))
+    };
+    // `<guild>:user:<user_id>` form → resolve current channel via cache.
+    let parse_user_target = |s: &str| -> Option<(u64, u64)> {
+        let rest = s.strip_prefix(char::is_alphanumeric).unwrap_or(s);
+        let _ = rest;
+        let mut parts = s.split(':');
+        let g = parts.next()?.trim().parse::<u64>().ok()?;
+        if parts.next()?.trim() != "user" {
+            return None;
+        }
+        let u = parts.next()?.trim().parse::<u64>().ok()?;
+        Some((g, u))
+    };
+
+    match action {
+        "join" => {
+            // Three accepted forms in priority order:
+            //   /voice join <guild>:<channel>   — explicit
+            //   /voice join <guild>:user:<user> — resolve user's current channel
+            //   /voice join                     — resolve from interaction context
+            // The third form requires guild_id + caller user_id wired
+            // from the slash-command dispatcher, which isn't plumbed
+            // yet — fall back to a usage hint when arg is empty.
+            if let Some((guild_id, channel_id)) = parse_target(arg) {
+                return match handle.join(guild_id, channel_id).await {
+                    Ok(()) => format!("Joined Discord voice channel {channel_id} in guild {guild_id}."),
+                    Err(e) => format!("Failed to join voice channel: {e}"),
+                };
+            }
+            // `<guild>:user:<user_id>` — auto-resolve via voice-state cache.
+            if let Some((guild_id, user_id)) = parse_user_target(arg) {
+                return match handle.resolve_user_channel(guild_id, user_id).await {
+                    Some(channel_id) => match handle.join(guild_id, channel_id).await {
+                        Ok(()) => format!(
+                            "Joined user {user_id}'s voice channel ({channel_id}) in guild {guild_id}."
+                        ),
+                        Err(e) => format!("Failed to join voice channel: {e}"),
+                    },
+                    None => format!(
+                        "Don't know what channel user {user_id} is in. \
+                         They need to be in a voice channel and the bot must \
+                         have observed their VOICE_STATE_UPDATE event since \
+                         it connected."
+                    ),
+                };
+            }
+            format!(
+                "Usage: /voice join <guild_id>:<channel_id>  or  \
+                 /voice join <guild_id>:user:<user_id> (auto-resolves their channel). \
+                 Discord interaction context: {discord_channel_id:?}"
+            )
+        }
+        "leave" => {
+            let Some(guild_id) = arg.parse::<u64>().ok() else {
+                return "Usage: /voice leave <guild_id>".to_string();
+            };
+            match handle.leave(guild_id).await {
+                Ok(()) => format!("Left Discord voice channel in guild {guild_id}."),
+                Err(e) => format!("Failed to leave voice channel: {e}"),
+            }
+        }
+        "channel" => {
+            // Switching channel = leave + rejoin a different channel id.
+            let target = parse_target(arg);
+            let Some((guild_id, channel_id)) = target else {
+                return "Usage: /voice channel <guild_id>:<channel_id>".to_string();
+            };
+            let _ = handle.leave(guild_id).await;
+            match handle.join(guild_id, channel_id).await {
+                Ok(()) => format!("Switched to voice channel {channel_id}."),
+                Err(e) => format!("Failed to switch voice channel: {e}"),
+            }
+        }
+        _ => "Usage: /voice [join|leave|channel] <guild_id>:<channel_id>".to_string(),
+    }
 }
 
 /// Handle `/plan [message]`. Returns `Some(response)` for bare `/plan`,
@@ -1174,6 +1331,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_voice_join_returns_stub_status() {
+        // The reference implementation ships `/voice join`, `/voice channel <name>`, `/voice leave`
+        // for Discord bidirectional voice. Borg's slash surface accepts them
+        // and returns a clear "not wired" message — keeps users from
+        // wondering whether they typed the command wrong while the audio
+        // bridging is genuinely deferred.
+        let db = gateway_test_db().await;
+        let config = Config::default();
+        let cases = [
+            "join",
+            "join General",
+            "leave",
+            "channel Lobby",
+        ];
+        for input in cases {
+            let resp = handle_voice(&db, &config, "discord", Some("999"), input).await;
+            // Default-feature build: returns "not active in this build"
+            // explanation. Feature-on build with the songbird stack: returns
+            // either a usage hint or the actual operation outcome. Both
+            // shapes mention `voice` somewhere so the test stays meaningful
+            // across feature configurations.
+            assert!(
+                !resp.is_empty(),
+                "input {input:?}: response must not be empty"
+            );
+            assert!(
+                resp.to_lowercase().contains("voice")
+                    || resp.to_lowercase().contains("usage")
+                    || resp.to_lowercase().contains("join")
+                    || resp.to_lowercase().contains("leave"),
+                "input {input:?}: response should reference the voice command surface, got: {resp}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_voice_join_works_from_any_channel() {
+        // The stub path runs BEFORE the Telegram-only guard, so users
+        // attempting /voice join from any channel see the same message.
+        // (When the songbird stack lands, this same dispatch routes to
+        // Discord-specific join logic.)
+        let db = gateway_test_db().await;
+        let config = Config::default();
+        let from_telegram = handle_voice(&db, &config, "telegram", Some("1"), "join").await;
+        let from_slack = handle_voice(&db, &config, "slack", Some("C1"), "join").await;
+        assert_eq!(from_telegram, from_slack);
+    }
+
+    #[tokio::test]
     async fn handle_voice_uses_default_mode_from_config() {
         let db = gateway_test_db().await;
         let config = Config::default();
@@ -1206,6 +1412,9 @@ mod tests {
             voice: None,
             timeout_ms: None,
             api_key_env: Some("BORG_TEST_TTS_KEY".to_string()),
+            name: None,
+            command: None,
+            output_extension: None,
         }];
         std::env::set_var("BORG_TEST_TTS_KEY", "test-key");
 

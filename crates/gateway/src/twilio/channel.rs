@@ -66,7 +66,42 @@ impl NativeChannel for TwilioChannel {
             }
         }
 
-        let parsed = super::parse::parse_webhook(body)?;
+        let mut parsed = super::parse::parse_webhook(body)?;
+
+        // Inbound voice/audio transcription — parity with the Telegram
+        // path (gateway/src/telegram/mod.rs:72-115). When the message
+        // carries an audio attachment AND the STT pipeline is
+        // configured, download via Twilio's Basic auth + transcribe +
+        // inject as `[Voice transcript]:` text. Failure is logged and
+        // the user sees `[Media message]` rather than dropping the turn.
+        if let (Some(audio_url), Some(audio_mime)) =
+            (parsed.audio_url.clone(), parsed.audio_mime.clone())
+        {
+            if let Some(transcriber) =
+                cortex::media::understanding::AudioTranscriber::from_config(&self.config)
+            {
+                match self.client.download_media(&audio_url).await {
+                    Ok(bytes) => {
+                        let filename = format!("twilio-{}.audio", parsed.message.message_id.as_deref().unwrap_or("unknown"));
+                        match transcriber
+                            .transcribe(&bytes, &audio_mime, &filename, None)
+                            .await
+                        {
+                            Ok((transcript, _attempts)) => {
+                                parsed.message.text =
+                                    format!("[Voice transcript]: {transcript}");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "twilio: audio transcription failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "twilio: media download failed");
+                    }
+                }
+            }
+        }
 
         let channel_type = parsed.channel_type;
         let sender = parsed.message.sender_id.clone();

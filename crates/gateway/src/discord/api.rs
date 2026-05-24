@@ -896,6 +896,7 @@ impl From<RawChannelMessage> for ChannelMessage {
             author_username: m.author.username,
             content: m.content,
             id: m.id,
+            attachments: m.attachments,
         }
     }
 }
@@ -1117,6 +1118,7 @@ mod tests {
                 id: "u1".into(),
                 username: "alice".into(),
             },
+            attachments: Vec::new(),
         };
         let msg = ChannelMessage::from(raw);
         assert_eq!(msg.id, "m1");

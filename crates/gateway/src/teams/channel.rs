@@ -26,6 +26,9 @@ pub struct TeamsChannel {
     pub client: Arc<TeamsClient>,
     pub app_secret: Option<String>,
     pub dedup: Arc<Mutex<ActivityDeduplicator>>,
+    /// Config handle — needed to build the inbound STT pipeline so
+    /// Teams voice attachments get transcribed before the agent runs.
+    pub config: cortex::config::Config,
 }
 
 #[async_trait]
@@ -47,7 +50,7 @@ impl NativeChannel for TeamsChannel {
             Some(self.dedup.as_ref()),
         )?;
 
-        let (inbound, activity) = match parsed {
+        let (mut inbound, activity) = match parsed {
             Some(pair) => pair,
             None => {
                 // Check for bot-added welcome scenario
@@ -71,6 +74,49 @@ impl NativeChannel for TeamsChannel {
                 return Ok(WebhookOutcome::Skip);
             }
         };
+
+        // Inbound voice transcription. Teams voice attachments come as
+        // `audio/*` content types on SharePoint URLs that require the
+        // Bot Framework OAuth token to fetch.
+        if let Some(ref atts) = activity.attachments {
+            if let Some(transcriber) =
+                cortex::media::understanding::AudioTranscriber::from_config(&self.config)
+            {
+                let mut transcripts: Vec<String> = Vec::new();
+                for att in atts {
+                    if !att.content_type.starts_with("audio/") {
+                        continue;
+                    }
+                    let Some(ref url) = att.content_url else {
+                        continue;
+                    };
+                    match self.client.download_attachment(url).await {
+                        Ok(bytes) => {
+                            let fname = att
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "teams-voice.audio".to_string());
+                            match transcriber
+                                .transcribe(&bytes, &att.content_type, &fname, None)
+                                .await
+                            {
+                                Ok((transcript, _)) => transcripts.push(transcript),
+                                Err(e) => tracing::warn!(error = %e, "teams: audio transcription failed"),
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "teams: attachment download failed"),
+                    }
+                }
+                if !transcripts.is_empty() {
+                    let joined = transcripts.join(" ");
+                    inbound.text = if inbound.text.trim().is_empty() {
+                        format!("[Voice transcript]: {joined}")
+                    } else {
+                        format!("{}\n[Voice transcript]: {joined}", inbound.text)
+                    };
+                }
+            }
+        }
 
         let service_url = activity
             .service_url

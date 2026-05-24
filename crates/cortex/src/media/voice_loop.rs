@@ -2,7 +2,6 @@
 //! a transcription provider, and the TTS-playback feedback guard into the
 //! continuous/single-shot loops that `/voice` exposes.
 //!
-//! Ported from `reference/hermes-agent/hermes_cli/voice.py` —
 //! `start_continuous` / `stop_continuous` / `_continuous_on_silence`
 //! (lines 369–735). The state-machine invariants live there; if you
 //! change one, change the matching guard test in this file.
@@ -23,6 +22,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::config::VoiceConfig;
+use crate::media::playback::Beeper;
 use crate::media::understanding::AudioTranscriber;
 use crate::media::voice_capture::{is_whisper_hallucination, Recorder};
 
@@ -93,11 +93,14 @@ pub struct VoiceLoop {
     /// TTS-pause guard. Cleared while TTS plays; set otherwise. The
     /// auto-restart path waits on this before re-arming the mic so the
     /// agent's own voice doesn't feed back as a new user message
-    /// (hermes voice.py:690-694).
+    ///.
     tts_idle: Arc<Notify>,
     tts_playing_flag: Arc<AtomicBool>,
     /// Set when shutdown is requested so the dispatcher task can exit.
     shutdown: Arc<AtomicBool>,
+    /// Audio-cue player (880 Hz on arm, 660 Hz×2 on stop). No-op when
+    /// `voice.beep_enabled` is false.
+    beeper: Arc<Beeper>,
 }
 
 impl VoiceLoop {
@@ -109,6 +112,7 @@ impl VoiceLoop {
         transcriber: Arc<dyn Transcriber>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<VoiceEvent>) {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let beeper = Arc::new(Beeper::new(cfg.beep_enabled));
         let me = Arc::new(Self {
             cfg,
             recorder,
@@ -123,6 +127,7 @@ impl VoiceLoop {
             tts_idle: Arc::new(Notify::new()),
             tts_playing_flag: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            beeper,
         });
         // Spawn the cycle-dispatcher. It awaits `cycle_notify` and
         // runs one transcribe-and-maybe-restart cycle per wakeup.
@@ -139,7 +144,7 @@ impl VoiceLoop {
 
     /// Start a single-shot recording — first silence triggers one
     /// transcription, then the loop returns to idle without
-    /// re-arming. Replaces hermes's Ctrl+B push-to-talk.
+    /// re-arming.Single-press Ctrl+B.
     pub async fn start_single(self: &Arc<Self>) -> Result<()> {
         self.start_internal(false).await
     }
@@ -154,7 +159,7 @@ impl VoiceLoop {
             s.auto_restart = auto_restart;
             // Continuous reset; single-shot retains so a pre-existing
             // /voice rec pattern can still hit the silent-limit guard
-            // across invocations (matches hermes voice.py:411).
+            // across invocations.
             if auto_restart {
                 s.no_speech_count = 0;
             }
@@ -212,8 +217,22 @@ impl VoiceLoop {
         self.events_tx.clone()
     }
 
+    /// Current RMS reading from the live recording, scaled to int16
+    /// amplitude (0..=32767). Returns 0 when the recorder is idle.
+    /// Used by the TUI footer to render a live level meter while
+    /// `voice_status == Listening`.
+    pub fn current_rms(&self) -> u16 {
+        self.recorder.current_rms()
+    }
+
+    /// Peak RMS sticky high-water mark for the current recording.
+    /// Resets when a new recording starts.
+    pub fn peak_rms(&self) -> u16 {
+        self.recorder.peak_rms()
+    }
+
     /// Mark TTS as playing — pauses the active recording so the
-    /// speaker output doesn't leak into the mic. Hermes calls the
+    /// speaker output doesn't leak into the mic. The reference implementation calls the
     /// equivalent path on every `speak_text` start.
     pub async fn notify_tts_started(self: &Arc<Self>) {
         self.tts_playing_flag.store(true, Ordering::SeqCst);
@@ -236,7 +255,7 @@ impl VoiceLoop {
         if !self.state.lock().await.active {
             return;
         }
-        // Brief delay matches hermes voice.py:834 — lets the OS flush
+        // Brief delay — lets the OS flush
         // the speaker buffer before the mic re-opens.
         tokio::time::sleep(Duration::from_millis(300)).await;
         // Re-check `active` AFTER the sleep: a `/voice off` that lands
@@ -260,7 +279,12 @@ impl VoiceLoop {
         let cb: Box<dyn Fn() + Send + Sync + 'static> = Box::new(move || {
             notify.notify_one();
         });
-        self.recorder.start(cb).context("start recorder")
+        self.recorder.start(cb).context("start recorder")?;
+        // Audible cue only after the mic actually opened — beeping
+        // before a failed `start()` would mislead the user about
+        // recorder state.
+        self.beeper.start();
+        Ok(())
     }
 
     async fn dispatcher_loop(self: Arc<Self>) {
@@ -293,6 +317,12 @@ impl VoiceLoop {
                 None
             }
         };
+        // Only beep when there's actually captured audio to process — a
+        // silence-only cycle would announce "stop" without anything
+        // having started in the user's perception.
+        if wav.is_some() {
+            self.beeper.stop();
+        }
 
         let transcript = if let Some(p) = wav {
             self.transcribe_filter(p).await

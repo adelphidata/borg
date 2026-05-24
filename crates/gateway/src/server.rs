@@ -176,6 +176,25 @@ impl GatewayServer {
         let (discord_client, discord_public_key) =
             crate::channel::channel_init::init_discord(&self.config).await;
 
+        // Discord voice-channel manager (feature-gated). When the
+        // `discord-voice-channels` feature is on AND a bot token is
+        // configured, spawn the songbird-backed manager so `/voice join`
+        // can actually connect. Without this init, the command falls back
+        // to its "not yet wired" stub.
+        #[cfg(feature = "discord-voice-channels")]
+        if discord_client.is_some() {
+            if let Some(token) = crate::channel::channel_init::resolve_credential(
+                &self.config,
+                "messaging/discord",
+                "DISCORD_BOT_TOKEN",
+            ) {
+                crate::discord::voice_channels::init_voice_manager(
+                    token,
+                    self.config.clone(),
+                );
+            }
+        }
+
         let (teams_client, teams_app_secret) =
             crate::channel::channel_init::init_teams(&self.config)?;
 
@@ -207,6 +226,7 @@ impl GatewayServer {
                     signing_secret: slack_signing_secret.clone(),
                     dedup: Arc::new(Mutex::new(EventDeduplicator::new())),
                     bot_user_id: slack_bot_user_id.clone(),
+                    config: self.config.clone(),
                 }));
             }
             if let Some(ref client) = twilio_client {
@@ -223,6 +243,7 @@ impl GatewayServer {
                     client.clone(),
                     discord_public_key.clone(),
                     self.config.gateway.discord_guild_allowlist.clone(),
+                    self.config.clone(),
                 )));
             }
             if let Some(ref client) = teams_client {
@@ -232,12 +253,14 @@ impl GatewayServer {
                     dedup: Arc::new(std::sync::Mutex::new(
                         crate::teams::dedup::ActivityDeduplicator::new(),
                     )),
+                    config: self.config.clone(),
                 }));
             }
             if let Some(ref client) = google_chat_client {
                 reg.register(Arc::new(GoogleChatChannel {
                     client: client.clone(),
                     token: google_chat_token.clone(),
+                    config: self.config.clone(),
                 }));
             }
             reg
@@ -584,8 +607,15 @@ impl GatewayServer {
                 });
 
             let sig_sse_client = sig_client.clone();
+            let sse_config = self.config.clone();
             tokio::spawn(async move {
-                crate::signal::sse::run_sse_loop(sig_sse_client, callback, sse_shutdown).await;
+                crate::signal::sse::run_sse_loop(
+                    sig_sse_client,
+                    callback,
+                    sse_shutdown,
+                    sse_config,
+                )
+                .await;
             });
         }
 

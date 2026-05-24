@@ -28,6 +28,9 @@ pub struct SlackChannel {
     pub signing_secret: Option<String>,
     pub dedup: Arc<Mutex<EventDeduplicator>>,
     pub bot_user_id: Option<String>,
+    /// Configuration handle — needed to build the STT pipeline for
+    /// inbound voice/audio file transcription (parity with Telegram).
+    pub config: cortex::config::Config,
 }
 
 #[async_trait]
@@ -68,12 +71,34 @@ impl NativeChannel for SlackChannel {
             self.client.add_reaction(ch, ts, "eyes").await;
         }
 
-        // Download file attachments (placeholder URLs → base64 data)
+        // Download file attachments (placeholder URLs → base64 data).
+        // Voice/audio files take a side-path through the STT pipeline so
+        // the agent sees `[Voice transcript]: …` in the message text
+        // (parity with Telegram + Twilio inbound voice).
+        let transcriber =
+            cortex::media::understanding::AudioTranscriber::from_config(&self.config);
         let mut resolved_attachments = Vec::new();
+        let mut voice_transcripts: Vec<String> = Vec::new();
         for att in &inbound.attachments {
             if att.data.starts_with("https://") {
                 match self.client.download_file(&att.data).await {
                     Ok((bytes, content_type)) => {
+                        let is_audio = content_type.starts_with("audio/");
+                        if is_audio {
+                            if let Some(ref t) = transcriber {
+                                let filename = att
+                                    .filename
+                                    .clone()
+                                    .unwrap_or_else(|| "slack-voice.audio".to_string());
+                                match t
+                                    .transcribe(&bytes, &content_type, &filename, None)
+                                    .await
+                                {
+                                    Ok((transcript, _)) => voice_transcripts.push(transcript),
+                                    Err(e) => tracing::warn!(error = %e, "slack: audio transcription failed"),
+                                }
+                            }
+                        }
                         use base64::Engine;
                         resolved_attachments.push(crate::handler::InboundAttachment {
                             mime_type: content_type,
@@ -93,6 +118,14 @@ impl NativeChannel for SlackChannel {
             }
         }
         inbound.attachments = resolved_attachments;
+        if !voice_transcripts.is_empty() {
+            let joined = voice_transcripts.join(" ");
+            inbound.text = if inbound.text.trim().is_empty() {
+                format!("[Voice transcript]: {joined}")
+            } else {
+                format!("{}\n[Voice transcript]: {joined}", inbound.text)
+            };
+        }
 
         // Channel history context for @mentions
         if inbound.text.contains("<@") && inbound.thread_ts.is_none() {

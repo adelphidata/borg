@@ -48,6 +48,27 @@ pub struct Activity {
     /// Emoji reactions removed in a `messageReaction` activity.
     #[serde(default)]
     pub reactions_removed: Option<Vec<MessageReaction>>,
+    /// Inbound file attachments. Voice messages from Teams arrive as
+    /// `contentType: audio/...` with a SharePoint `contentUrl`.
+    /// Different from the outbound `AdaptiveCardAttachment` (which is
+    /// Serialize-only) — this is the deserialize-only shape.
+    #[serde(default)]
+    pub attachments: Option<Vec<TeamsInboundAttachment>>,
+}
+
+/// File attachment on an inbound Teams Activity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamsInboundAttachment {
+    /// MIME content type. Audio files: `audio/wav`, `audio/mpeg`, etc.
+    pub content_type: String,
+    /// Download URL — for SharePoint-hosted files this requires Bot
+    /// Framework OAuth (the same token used to send replies).
+    #[serde(default)]
+    pub content_url: Option<String>,
+    /// Friendly filename.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A single reaction entry inside a `messageReaction` activity.

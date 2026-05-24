@@ -26,6 +26,32 @@ impl GoogleChatClient {
         })
     }
 
+    /// Download an attachment binary by its `resource_name` (the
+    /// `attachmentDataRef.resourceName` field on inbound messages).
+    /// Used by the inbound voice-transcription path — voice messages
+    /// arrive as `audio/*` attachments that we feed through STT before
+    /// the agent runs.
+    pub async fn download_attachment(&self, resource_name: &str) -> Result<Vec<u8>> {
+        // Defensive: refuse path traversal. The resource name is
+        // operator-controlled (came from a webhook payload), so it can
+        // contain anything; reject `..` and any leading slash.
+        if resource_name.contains("..") || resource_name.starts_with('/') {
+            bail!("invalid Google Chat attachment resource name: {resource_name}");
+        }
+        let url = format!("{GOOGLE_CHAT_API_BASE}/media/{resource_name}?alt=media");
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("google_chat: download attachment")?;
+        if !resp.status().is_success() {
+            bail!("google_chat attachment download returned HTTP {}", resp.status());
+        }
+        Ok(resp.bytes().await.context("google_chat: read body")?.to_vec())
+    }
+
     /// Send a message to a Google Chat space, automatically chunking at 4096 chars.
     /// Optionally replies in a thread if `thread_name` is provided.
     pub async fn send_message(

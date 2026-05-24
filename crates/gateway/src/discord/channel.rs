@@ -33,6 +33,9 @@ pub struct DiscordChannel {
     /// webhooks on non-2xx responses and transient network conditions; without
     /// this the agent can be invoked twice for the same interaction.
     pub dedup: Arc<Mutex<InteractionDeduplicator>>,
+    /// Configuration handle — needed to build the STT pipeline so voice
+    /// messages in channel context get transcribed before injection.
+    pub config: cortex::config::Config,
 }
 
 impl DiscordChannel {
@@ -41,12 +44,14 @@ impl DiscordChannel {
         client: Arc<DiscordClient>,
         public_key: Option<String>,
         guild_allowlist: Option<Vec<String>>,
+        config: cortex::config::Config,
     ) -> Self {
         Self {
             client,
             public_key,
             guild_allowlist,
             dedup: Arc::new(Mutex::new(InteractionDeduplicator::new())),
+            config,
         }
     }
 }
@@ -129,9 +134,63 @@ impl NativeChannel for DiscordChannel {
                     if let Some(ref channel_id) = inbound.channel_id {
                         match self.client.get_channel_messages(channel_id, 10).await {
                             Ok(history) if !history.is_empty() => {
+                                // STT pipeline for voice messages in channel
+                                // context. Discord voice attachments live at
+                                // `audio/ogg` CDN URLs that need no auth.
+                                let transcriber =
+                                    cortex::media::understanding::AudioTranscriber::from_config(
+                                        &self.config,
+                                    );
                                 let mut context = String::new();
                                 for m in history.iter().rev() {
-                                    let line = format!("{}: {}\n", m.author_username, m.content);
+                                    let mut line_text = m.content.clone();
+                                    if let Some(ref t) = transcriber {
+                                        for att in &m.attachments {
+                                            let mime = att
+                                                .content_type
+                                                .as_deref()
+                                                .unwrap_or("application/octet-stream");
+                                            if !mime.starts_with("audio/") {
+                                                continue;
+                                            }
+                                            match reqwest::get(&att.url).await {
+                                                Ok(resp) if resp.status().is_success() => {
+                                                    match resp.bytes().await {
+                                                        Ok(bytes) => {
+                                                            let fname = att
+                                                                .filename
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "discord-voice.audio"
+                                                                        .to_string()
+                                                                });
+                                                            if let Ok((transcript, _)) = t
+                                                                .transcribe(
+                                                                    &bytes, mime, &fname, None,
+                                                                )
+                                                                .await
+                                                            {
+                                                                if !line_text.is_empty() {
+                                                                    line_text.push(' ');
+                                                                }
+                                                                line_text.push_str(
+                                                                    "[Voice transcript]: ",
+                                                                );
+                                                                line_text.push_str(&transcript);
+                                                            }
+                                                        }
+                                                        Err(e) => tracing::warn!(error = %e, "discord: read attachment bytes failed"),
+                                                    }
+                                                }
+                                                Ok(resp) => tracing::warn!(
+                                                    status = %resp.status(),
+                                                    "discord: attachment fetch returned non-success"
+                                                ),
+                                                Err(e) => tracing::warn!(error = %e, "discord: attachment fetch failed"),
+                                            }
+                                        }
+                                    }
+                                    let line = format!("{}: {line_text}\n", m.author_username);
                                     if context.len() + line.len()
                                         > crate::constants::DISCORD_CHANNEL_CONTEXT_MAX_CHARS
                                     {

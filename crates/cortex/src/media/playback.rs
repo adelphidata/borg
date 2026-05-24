@@ -1,10 +1,9 @@
 //! Audio playback via system players (`afplay` / `ffplay` / `aplay`).
 //!
-//! Mirrors `reference/hermes-agent/tools/voice_mode.py::play_audio_file`
 //! exactly — no in-process audio output crate, just a small fallthrough
 //! over the players that exist on every supported host. Avoiding a
 //! `rodio`/`cpal`-output dependency keeps the binary lean and dodges
-//! the cross-platform output bugs that motivated hermes to use the
+//! the cross-platform output bugs that motivated this codepath to use the
 //! same strategy.
 //!
 //! [`stop_playback`] interrupts the currently playing process. The
@@ -15,12 +14,15 @@
 //! tests can drive the resolution order without touching the real
 //! filesystem.
 
-use std::path::Path;
+use std::f32::consts::TAU;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use hound::{SampleFormat, WavSpec, WavWriter};
 
 /// Lock the active-child slot, recovering on poisoning.
 ///
@@ -35,7 +37,7 @@ fn lock_slot() -> MutexGuard<'static, Option<Child>> {
     }
 }
 
-/// 5 minutes — longest plausible TTS reply. Same cap hermes uses.
+/// 5 minutes — longest plausible TTS reply.
 const PLAYBACK_HARD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One playback command — `(program, args)`.
@@ -52,7 +54,7 @@ pub trait PlayerResolver: Send + Sync {
 }
 
 /// Default resolver: `afplay` (macOS), then `ffplay`, then `aplay`
-/// (Linux). Same order as hermes voice_mode.py:1001-1006 so a host
+/// (Linux).
 /// with afplay+ffplay both installed picks afplay (matches CLI parity).
 pub struct DefaultPlayerResolver;
 
@@ -197,6 +199,202 @@ pub fn stop_playback() {
     }
 }
 
+// ─── Beep synthesis ─────────────────────────────────────────────────────────
+//
+// Mirrors `play_beep` —
+// 880 Hz single beep on record start, 660 Hz double beep on record stop.
+// The reference implementation synthesizes these inline; we cache to `$TMPDIR/borg_voice/` once
+// per process so playback is a cheap `afplay`/`ffplay`/`aplay` invocation.
+//
+// Beeps run on a detached `tokio::spawn` so the voice loop never blocks
+// on the speaker — a 100 ms beep behind a sluggish `afplay` spawn must
+// not delay the recorder re-arming.
+
+const BEEP_SAMPLE_RATE: u32 = 44_100;
+const BEEP_AMPLITUDE: f32 = 0.3; // -10 dBFS — audible but not jarring.
+const BEEP_DURATION_MS: u32 = 50;
+const BEEP_FADE_MS: u32 = 5; // Suppress the click at sample-0 and sample-N.
+const BEEP_GAP_MS: u32 = 50; // Silence between the two stop-beep tones.
+const START_BEEP_HZ: f32 = 880.0;
+const STOP_BEEP_HZ: f32 = 660.0;
+
+/// Synthesize a single sine-wave beep as a WAV byte vector.
+///
+/// Mono, 16-bit PCM, 44.1 kHz. Applies a `BEEP_FADE_MS` linear fade-in
+/// and fade-out to suppress the discontinuity click at the buffer edges
+/// — without it, speakers crack on every start/stop.
+pub fn synthesize_beep_wav(freq_hz: f32, duration_ms: u32) -> Vec<u8> {
+    let total = (BEEP_SAMPLE_RATE as f32 * duration_ms as f32 / 1000.0) as u32;
+    let fade = ((BEEP_SAMPLE_RATE as f32 * BEEP_FADE_MS as f32 / 1000.0) as u32).min(total / 2);
+    let samples = (0..total).map(|i| {
+        let t = i as f32 / BEEP_SAMPLE_RATE as f32;
+        let envelope = if i < fade {
+            i as f32 / fade as f32
+        } else if i >= total.saturating_sub(fade) {
+            (total - i) as f32 / fade as f32
+        } else {
+            1.0
+        };
+        let s = BEEP_AMPLITUDE * envelope * (TAU * freq_hz * t).sin();
+        (s * i16::MAX as f32) as i16
+    });
+    write_wav_bytes(samples)
+}
+
+/// Synthesize a double beep — two `freq_hz` tones with a `BEEP_GAP_MS`
+/// silent gap between them. Used for the stop beep; the doubled tone is
+/// distinct enough from the single start tone that the user can tell
+/// recording state changes by ear without watching the screen.
+pub fn synthesize_double_beep_wav(freq_hz: f32, duration_ms: u32) -> Vec<u8> {
+    let beep_samples = (BEEP_SAMPLE_RATE as f32 * duration_ms as f32 / 1000.0) as u32;
+    let gap_samples = (BEEP_SAMPLE_RATE as f32 * BEEP_GAP_MS as f32 / 1000.0) as u32;
+    let fade = ((BEEP_SAMPLE_RATE as f32 * BEEP_FADE_MS as f32 / 1000.0) as u32).min(beep_samples / 2);
+    let total = beep_samples * 2 + gap_samples;
+    let samples = (0..total).map(|i| {
+        // Position within the current beep, or in the silent gap.
+        let (pos_in_beep, in_beep) = if i < beep_samples {
+            (i, true)
+        } else if i < beep_samples + gap_samples {
+            (0, false)
+        } else {
+            (i - beep_samples - gap_samples, true)
+        };
+        if !in_beep {
+            return 0i16;
+        }
+        let t = pos_in_beep as f32 / BEEP_SAMPLE_RATE as f32;
+        let envelope = if pos_in_beep < fade {
+            pos_in_beep as f32 / fade as f32
+        } else if pos_in_beep >= beep_samples.saturating_sub(fade) {
+            (beep_samples - pos_in_beep) as f32 / fade as f32
+        } else {
+            1.0
+        };
+        let s = BEEP_AMPLITUDE * envelope * (TAU * freq_hz * t).sin();
+        (s * i16::MAX as f32) as i16
+    });
+    write_wav_bytes(samples)
+}
+
+#[allow(clippy::expect_used)]
+fn write_wav_bytes(samples: impl Iterator<Item = i16>) -> Vec<u8> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: BEEP_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut buf: Vec<u8> = Vec::with_capacity(8_192);
+    {
+        let mut writer = WavWriter::new(Cursor::new(&mut buf), spec).expect("WavWriter init");
+        for s in samples {
+            writer.write_sample(s).expect("write_sample");
+        }
+        writer.finalize().expect("WavWriter finalize");
+    }
+    buf
+}
+
+/// Cached beep WAV paths. Built once per process when [`Beeper::new`] is
+/// first asked to play; subsequent calls reuse the same files. Skips
+/// entirely if the operator disabled audio cues via `voice.beep_enabled`.
+pub struct Beeper {
+    enabled: bool,
+    start_path: OnceLock<PathBuf>,
+    stop_path: OnceLock<PathBuf>,
+}
+
+impl Beeper {
+    /// Construct with `enabled` from `voice.beep_enabled`. When false,
+    /// `start`/`stop` are no-ops — no files are written, no subprocess
+    /// runs.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            start_path: OnceLock::new(),
+            stop_path: OnceLock::new(),
+        }
+    }
+
+    /// Play the recording-start beep (880 Hz, 50 ms). Fire-and-forget —
+    /// errors are logged at `debug` level; the recorder must never be
+    /// blocked on the speaker.
+    pub fn start(&self) {
+        if !self.enabled {
+            return;
+        }
+        let path = self.start_path.get_or_init(|| {
+            ensure_beep_file("beep_start.wav", &synthesize_beep_wav(START_BEEP_HZ, BEEP_DURATION_MS))
+                .unwrap_or_else(|_| PathBuf::new())
+        });
+        spawn_beep_playback(path.clone());
+    }
+
+    /// Play the recording-stop beep (660 Hz × 2, 50 ms each with 50 ms gap).
+    pub fn stop(&self) {
+        if !self.enabled {
+            return;
+        }
+        let path = self.stop_path.get_or_init(|| {
+            ensure_beep_file(
+                "beep_stop.wav",
+                &synthesize_double_beep_wav(STOP_BEEP_HZ, BEEP_DURATION_MS),
+            )
+            .unwrap_or_else(|_| PathBuf::new())
+        });
+        spawn_beep_playback(path.clone());
+    }
+}
+
+fn ensure_beep_file(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join("borg_voice");
+    std::fs::create_dir_all(&dir).context("create beep cache dir")?;
+    let path = dir.join(name);
+    // Always rewrite — cheap (a few KB) and avoids stale corrupt files
+    // surviving a borg upgrade that changed the synth.
+    std::fs::write(&path, bytes).context("write beep wav")?;
+    Ok(path)
+}
+
+fn spawn_beep_playback(path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return; // ensure_beep_file failed silently; skip.
+    }
+    // Detached: a slow `afplay` spawn must not block the voice loop's
+    // re-arm path. Errors land in the trace log only.
+    tokio::spawn(async move {
+        if let Err(e) = play_beep_file(&path).await {
+            tracing::debug!(path = %path.display(), error = %e, "beep playback failed");
+        }
+    });
+}
+
+/// Play a beep file *outside* the active-child tracking that
+/// `stop_playback` manages. A beep is short and must not collide with
+/// (or be cancelled by) a TTS playback that's in flight.
+async fn play_beep_file(file: &Path) -> Result<()> {
+    let path = file.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let resolver = DefaultPlayerResolver;
+        let candidates = resolver.candidates(&path);
+        for invocation in candidates {
+            let status = Command::new(&invocation.program)
+                .args(&invocation.args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if let Ok(s) = status {
+                if s.success() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow!("no audio player available for beep"))
+    })
+    .await
+    .context("beep playback task panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +459,88 @@ mod tests {
         ]);
         play_audio_file_with(tmp.path(), &resolver)?;
         Ok(())
+    }
+
+    /// Decode a WAV byte buffer back to mono i16 samples + spec.
+    fn decode_wav(bytes: &[u8]) -> (WavSpec, Vec<i16>) {
+        let reader = hound::WavReader::new(Cursor::new(bytes)).expect("decode wav");
+        let spec = reader.spec();
+        let samples: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<std::result::Result<_, _>>()
+            .expect("decode samples");
+        (spec, samples)
+    }
+
+    /// Estimate dominant frequency from zero-crossing rate. For a pure
+    /// sine at `f`, ZCR ≈ 2f / sample_rate. We sample the middle 60% of
+    /// the buffer to avoid the fade-in/out regions where amplitude is
+    /// low enough that quantization noise can suppress crossings.
+    fn estimate_freq_from_zcr(samples: &[i16], sample_rate: u32) -> f32 {
+        let start = samples.len() * 2 / 10;
+        let end = samples.len() * 8 / 10;
+        let mid = &samples[start..end];
+        let mut crossings = 0usize;
+        for w in mid.windows(2) {
+            if (w[0] >= 0) != (w[1] >= 0) {
+                crossings += 1;
+            }
+        }
+        (crossings as f32 * sample_rate as f32) / (2.0 * mid.len() as f32)
+    }
+
+    #[test]
+    fn beep_wav_roundtrip_start_tone_is_880hz() {
+        let bytes = synthesize_beep_wav(880.0, 50);
+        let (spec, samples) = decode_wav(&bytes);
+        // Format contract — Mono 16-bit 44.1 kHz PCM (every player on
+        // PATH handles this; if we change it, beeps may go silent).
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(spec.bits_per_sample, 16);
+        // 50 ms @ 44.1 kHz = 2205 samples.
+        assert_eq!(samples.len(), 2_205, "sample count for 50 ms");
+        // Estimated frequency within 10% of 880 Hz.
+        let est = estimate_freq_from_zcr(&samples, spec.sample_rate);
+        assert!(
+            (est - 880.0).abs() < 88.0,
+            "expected ~880 Hz, got {est:.1} Hz from ZCR"
+        );
+    }
+
+    #[test]
+    fn double_beep_has_silent_gap_and_660hz_tones() {
+        let bytes = synthesize_double_beep_wav(660.0, 50);
+        let (spec, samples) = decode_wav(&bytes);
+        // 2 × 50 ms beep + 50 ms gap = 150 ms = 6615 samples.
+        assert_eq!(samples.len(), 6_615);
+        // The middle 50 ms (samples 2205..4410) must be silence.
+        let gap = &samples[2_205..4_410];
+        assert!(
+            gap.iter().all(|&s| s == 0),
+            "expected silence in gap region"
+        );
+        // The first beep region's middle dominant frequency ~ 660 Hz.
+        let first_beep = &samples[..2_205];
+        let est = estimate_freq_from_zcr(first_beep, spec.sample_rate);
+        assert!(
+            (est - 660.0).abs() < 66.0,
+            "expected ~660 Hz, got {est:.1} Hz"
+        );
+    }
+
+    #[test]
+    fn disabled_beeper_is_a_no_op() {
+        // A disabled Beeper must not synthesize or write any cache file.
+        let b = Beeper::new(false);
+        b.start();
+        b.stop();
+        // No assertions beyond the no-panic contract — the OnceLocks
+        // stay un-initialized because the gated branch is taken before
+        // either path executes. Inspecting their internal state would
+        // require RDD on OnceLock which isn't part of the public API.
+        assert!(b.start_path.get().is_none());
+        assert!(b.stop_path.get().is_none());
     }
 
     #[test]

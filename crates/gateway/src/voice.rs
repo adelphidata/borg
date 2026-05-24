@@ -215,21 +215,28 @@ mod tests {
         let mut config = Config::default();
         config.tts.enabled = true;
         config.tts.auto_mode = false;
+        // Unique per-test env var name so this doesn't race the
+        // commands.rs `handle_voice_can_enable_all_and_voice_only_modes`
+        // test, which uses the same `BORG_TEST_TTS_KEY` name with its
+        // own set/remove pair. Tests run in parallel by default.
         config.tts.models = vec![cortex::config::TtsModelConfig {
             provider: "openai".to_string(),
             model: None,
             voice: None,
             timeout_ms: None,
-            api_key_env: Some("BORG_TEST_TTS_KEY".to_string()),
+            api_key_env: Some("BORG_VOICE_RS_TEST_TTS_KEY".to_string()),
+            name: None,
+            command: None,
+            output_extension: None,
         }];
         unsafe {
-            std::env::set_var("BORG_TEST_TTS_KEY", "test-key");
+            std::env::set_var("BORG_VOICE_RS_TEST_TTS_KEY", "test-key");
         }
 
         assert!(configured_tts_synthesizer(&config).is_some());
 
         unsafe {
-            std::env::remove_var("BORG_TEST_TTS_KEY");
+            std::env::remove_var("BORG_VOICE_RS_TEST_TTS_KEY");
         }
     }
 }

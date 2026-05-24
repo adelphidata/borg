@@ -68,6 +68,16 @@ nucleo-matcher = "0.3"
 portable-pty = "0.9"
 cpal = "0.15"
 hound = "3.5"
+# Edge TTS — Microsoft's free TTS endpoint (used by as the default
+# provider). Adds WSS + tungstenite + rustls but no API key required.
+# default-features=false avoids the blocking `ureq` path; we drive the
+# tokio variant from cortex's async dispatcher.
+msedge-tts = { version = "0.4", default-features = false, features = ["tokio-runtime"] }
+# Local STT via whisper.cpp bindings — local STT provider.
+# Gated behind the `local-stt` feature so headless deploys that don't want
+# the C++ build pay nothing. Model file must be provided by the operator
+# at ~/.borg/models/whisper-{size}.bin (first-use auto-download deferred).
+whisper-rs = { version = "0.16", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -78,6 +88,11 @@ libc = { workspace = true }
 # require `BORG_ALLOW_LIVE_TESTS=1` at runtime so a feature-only build still
 # stays green offline.
 live-llm = []
+# Local STT via whisper.cpp — adds a C++ build step + ~150 MB model at
+# runtime. Off by default; enable for offline transcription. Users point
+# `voice.local_stt_model_path` at a downloaded ggml-base.en.bin (or
+# variant) before /voice on starts.
+local-stt = ["dep:whisper-rs"]
 # Gates test-only auxiliary binaries (e.g., the hermetic `codex app-server`
 # fixture) out of regular `cargo build` so they cannot ship in release
 # artifacts. Enable explicitly when running integration tests that need the

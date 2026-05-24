@@ -1,7 +1,8 @@
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -217,6 +218,647 @@ impl TtsProvider for ElevenLabsTtsProvider {
     }
 }
 
+// ── Edge TTS Provider (Microsoft, free, no API key) ──
+
+/// Microsoft Edge "Read aloud" TTS — the same endpoint 
+/// No API key required; voice resolution is via Microsoft's catalog.
+///
+/// Backed by the [`msedge_tts`](https://crates.io/crates/msedge-tts)
+/// crate which encapsulates the WSS speech.config + SSML protocol with
+/// the Sec-MS-GEC header dance that Microsoft now requires.
+struct EdgeTtsProvider {
+    default_voice: String,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for EdgeTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        use msedge_tts::tts::client::tokio_runtime::connect_async;
+        use msedge_tts::tts::SpeechConfig;
+
+        let voice_short = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let text = req.text.to_string();
+        let timeout = req.timeout;
+
+        let fut = async move {
+            // Microsoft expects the full voice_name like:
+            //   "Microsoft Server Speech Text to Speech Voice (en-US, AvaMultilingualNeural)"
+            // If the caller already supplied that full form, pass it through;
+            // otherwise derive it from the locale-prefixed short name.
+            let voice_name = if voice_short.starts_with("Microsoft Server Speech") {
+                voice_short.clone()
+            } else {
+                expand_edge_voice_short_name(&voice_short)
+            };
+            let cfg = SpeechConfig {
+                voice_name,
+                audio_format: "audio-24khz-48kbitrate-mono-mp3".to_owned(),
+                pitch: 0,
+                rate: 0,
+                volume: 0,
+            };
+            let mut client = connect_async()
+                .await
+                .map_err(|e| anyhow::anyhow!("Edge TTS connect: {e}"))?;
+            let audio = client
+                .synthesize(&text, &cfg)
+                .await
+                .map_err(|e| anyhow::anyhow!("Edge TTS synthesize: {e}"))?;
+            Ok::<Vec<u8>, anyhow::Error>(audio.audio_bytes)
+        };
+
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(e),
+            Err(_) => bail!("Edge TTS timed out after {timeout:?}"),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "edge"
+    }
+}
+
+/// Convert a short voice name like `en-US-AvaMultilingualNeural` into the
+/// full Microsoft voice_name accepted by Edge TTS's WSS endpoint:
+/// `Microsoft Server Speech Text to Speech Voice (en-US, AvaMultilingualNeural)`.
+///
+/// Split on the second `-` (after the language and region) so locales with
+/// region codes like `pt-BR` round-trip correctly. Falls back to the input
+/// untouched on malformed names — the server's error message will then
+/// pinpoint the issue.
+fn expand_edge_voice_short_name(short: &str) -> String {
+    // Find the boundary between locale (lang-REGION) and voice name.
+    let mut dash_count = 0;
+    let split_at = short.char_indices().find_map(|(i, c)| {
+        if c == '-' {
+            dash_count += 1;
+            if dash_count == 2 {
+                return Some(i);
+            }
+        }
+        None
+    });
+    let Some(idx) = split_at else {
+        return short.to_string();
+    };
+    let locale = &short[..idx];
+    let voice = &short[idx + 1..];
+    format!("Microsoft Server Speech Text to Speech Voice ({locale}, {voice})")
+}
+
+// ── Gemini TTS Provider ──
+
+/// Google Gemini TTS via `generateContent` with `responseModalities: ["AUDIO"]`.
+///
+/// Gemini returns raw 24 kHz mono 16-bit PCM (L16) as base64 JSON. We wrap
+/// it with a WAV RIFF header so downstream players accept it as a normal
+/// audio file.
+struct GeminiTtsProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    default_model: String,
+    default_voice: String,
+}
+
+const GEMINI_TTS_SAMPLE_RATE: u32 = 24_000;
+
+#[async_trait::async_trait]
+impl TtsProvider for GeminiTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let url = format!(
+            "{}/models/{model}:generateContent",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let body = serde_json::json!({
+            "contents": [{"parts": [{"text": req.text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                }
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .query(&[("key", &self.api_key)])
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Gemini TTS returned {status}: {body}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let parts = json
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Gemini TTS: candidates[0].content.parts missing"))?;
+
+        let b64 = parts
+            .iter()
+            .find_map(|p| {
+                p.get("inlineData")
+                    .or_else(|| p.get("inline_data"))
+                    .and_then(|i| i.get("data"))
+                    .and_then(|d| d.as_str())
+            })
+            .ok_or_else(|| anyhow::anyhow!("Gemini TTS: no inlineData.data in response"))?;
+
+        use base64::Engine;
+        let pcm = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| anyhow::anyhow!("Gemini TTS base64 decode failed: {e}"))?;
+        // Gemini only emits PCM regardless of req.format — wrap as WAV so
+        // the system player accepts it. If the caller requested mp3/opus,
+        // they get WAV bytes; downstream conversion (ffmpeg) is the
+        // caller's responsibility, matching the behavior at
+        // the JSON envelope shape.
+        Ok(wrap_pcm_as_wav(&pcm, GEMINI_TTS_SAMPLE_RATE, 1, 16))
+    }
+
+    fn name(&self) -> &str {
+        "gemini"
+    }
+}
+
+/// Wrap raw signed-little-endian PCM with a standard WAV RIFF header.
+fn wrap_pcm_as_wav(pcm: &[u8], sample_rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+    let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;
+    let block_align: u16 = channels * (bits / 8);
+    let data_size = pcm.len() as u32;
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_size).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_size.to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
+// ── MiniMax TTS Provider ──
+
+/// MiniMax t2a_v2 — nested voice/audio settings, returns hex-encoded MP3
+/// in `data.audio`.
+struct MiniMaxTtsProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    default_model: String,
+    default_voice: String,
+    /// MiniMax accounts scope requests by GroupId — when present, attached
+    /// as `?GroupId=` on the base URL. Resolved from
+    /// `MINIMAX_GROUP_ID` env at provider construction.
+    group_id: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for MiniMaxTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let mut url = self.base_url.clone();
+        if let Some(gid) = &self.group_id {
+            if !url.contains("GroupId=") {
+                let sep = if url.contains('?') { "&" } else { "?" };
+                url = format!("{url}{sep}GroupId={gid}");
+            }
+        }
+
+        let body = serde_json::json!({
+            "model": model,
+            "text": req.text,
+            "voice_setting": {"voice_id": voice, "speed": 1.0, "vol": 1.0, "pitch": 0, "emotion": "neutral"},
+            "audio_setting": {"sample_rate": 32_000, "bitrate": 128_000, "format": "mp3", "channel": 1}
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("MiniMax TTS returned {status}: {body}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let status_code = json
+            .get("base_resp")
+            .and_then(|b| b.get("status_code"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        if status_code != 0 {
+            let msg = json
+                .get("base_resp")
+                .and_then(|b| b.get("status_msg"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown");
+            bail!("MiniMax TTS API error (code {status_code}): {msg}");
+        }
+        let hex_audio = json
+            .get("data")
+            .and_then(|d| d.get("audio"))
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| anyhow::anyhow!("MiniMax TTS: data.audio missing"))?;
+        decode_hex(hex_audio).ok_or_else(|| anyhow::anyhow!("MiniMax TTS: invalid hex audio data"))
+    }
+
+    fn name(&self) -> &str {
+        "minimax"
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks(2) {
+        let h = (chunk[0] as char).to_digit(16)?;
+        let l = (chunk[1] as char).to_digit(16)?;
+        out.push(((h << 4) | l) as u8);
+    }
+    Some(out)
+}
+
+// ── xAI TTS Provider ──
+
+/// xAI Grok TTS — `POST {base}/tts`, returns raw audio bytes (MP3 by
+/// default; WAV when `output_format.codec` is set).
+struct XaiTtsProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    default_voice: String,
+    default_language: String,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for XaiTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let url = format!("{}/tts", self.base_url.trim_end_matches('/'));
+
+        let mut body = serde_json::json!({
+            "text": req.text,
+            "voice_id": voice,
+            "language": self.default_language,
+        });
+        // Only send output_format when not the documented default
+        // (mp3 + 24kHz + 128kbps).
+        if matches!(req.format, AudioFormat::Wav) {
+            body["output_format"] =
+                serde_json::json!({"codec": "wav", "sample_rate": 24_000});
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("xAI TTS returned {status}: {body}");
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    fn name(&self) -> &str {
+        "xai"
+    }
+}
+
+// ── Mistral TTS Provider (Voxtral) ──
+
+/// Mistral Voxtral TTS — `POST {base}/v1/audio/speech` (OpenAI-shape
+/// endpoint). Mistral returns a JSON envelope `{ "audio_data": "<b64>" }`
+/// rather than raw audio bytes. Format follows the request's
+/// `response_format` field — we pick `opus`/`wav`/`flac`/`mp3` based on
+/// `req.format` with mp3 as the fallback.
+struct MistralTtsProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    default_model: String,
+    default_voice: String,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for MistralTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let response_format = match req.format {
+            AudioFormat::Mp3 => "mp3",
+            AudioFormat::Opus => "opus",
+            AudioFormat::Wav => "wav",
+            AudioFormat::Flac => "flac",
+            AudioFormat::Aac => "mp3", // Mistral doesn't list AAC; fall back to MP3
+        };
+        let url = format!("{}/v1/audio/speech", self.base_url.trim_end_matches('/'));
+
+        let body = serde_json::json!({
+            "model": model,
+            "input": req.text,
+            "voice_id": voice,
+            "response_format": response_format,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Mistral TTS returned {status}: {body}");
+        }
+
+        // Mistral's content-type header is application/json; the audio
+        // is base64 inside `audio_data`. Some Mistral deployments may
+        // return raw bytes — detect by checking the first byte: a JSON
+        // response always starts with `{` (0x7B).
+        let bytes = resp.bytes().await?.to_vec();
+        if bytes.first() == Some(&b'{') {
+            let json: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("Mistral TTS: invalid JSON envelope: {e}"))?;
+            let b64 = json
+                .get("audio_data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Mistral TTS: missing audio_data field"))?;
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| anyhow::anyhow!("Mistral TTS base64 decode failed: {e}"))
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn name(&self) -> &str {
+        "mistral"
+    }
+}
+
+// ── Piper TTS Provider (local) ──
+
+/// Piper TTS — shells to the local `piper` binary if installed on PATH.
+/// The user provides `voice` as either an absolute `.onnx` path or a
+/// short name like `en_US-lessac-medium` resolved against
+/// `~/.borg/cache/piper-voices/`. Shells to the `piper` CLI to avoid
+/// embedding the model loader inside borg.
+struct PiperTtsProvider {
+    default_voice: String,
+    /// Directory holding `{voice}.onnx` + `{voice}.onnx.json` files when
+    /// `voice` is given as a short name. Defaults to
+    /// `~/.borg/cache/piper-voices/`.
+    voices_dir: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for PiperTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let model_path = self.resolve_voice_path(&voice)?;
+        let text = req.text.to_string();
+        let timeout = req.timeout;
+
+        // Shell out off-runtime so a slow voice load doesn't stall tokio.
+        tokio::task::spawn_blocking(move || piper_synthesize(&model_path, &text, timeout))
+            .await
+            .context("piper task panicked")?
+    }
+
+    fn name(&self) -> &str {
+        "piper"
+    }
+}
+
+impl PiperTtsProvider {
+    fn resolve_voice_path(&self, voice: &str) -> Result<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(voice);
+        if p.extension().is_some_and(|e| e == "onnx") && p.exists() {
+            return Ok(p);
+        }
+        let cached = self.voices_dir.join(format!("{voice}.onnx"));
+        if cached.exists() {
+            return Ok(cached);
+        }
+        bail!(
+            "Piper voice '{voice}' not found. Provide an absolute .onnx path, or download \
+             into {} (e.g. via `python -m piper.download_voices {voice} --download-dir {}`)",
+            self.voices_dir.display(),
+            self.voices_dir.display()
+        )
+    }
+}
+
+fn piper_synthesize(
+    model_path: &Path,
+    text: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let piper = which::which("piper")
+        .map_err(|_| anyhow::anyhow!("`piper` binary not on PATH — install piper-tts"))?;
+    let tmp = tempfile::NamedTempFile::new()?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    let mut child = Command::new(piper)
+        .arg("-m")
+        .arg(model_path)
+        .arg("-f")
+        .arg(&tmp_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn piper")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes()).context("write to piper stdin")?;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("piper synthesis timed out after {timeout:?}");
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    let mut err = String::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        use std::io::Read as _;
+                        let _ = s.read_to_string(&mut err);
+                    }
+                    bail!(
+                        "piper exited with {:?}: {}",
+                        status.code(),
+                        err.trim().chars().take(300).collect::<String>()
+                    );
+                }
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    std::fs::read(&tmp_path).context("read piper output wav")
+}
+
+// ── Custom TTS Provider ──
+
+/// Custom TTS — shells out to an operator-defined command template.
+/// Template tokens: `{text_file}` (path to a file containing the input
+/// text), `{voice}`, `{out_path}`. Returns whatever bytes the command
+/// writes to `{out_path}`. Configured via the `provider: custom` row
+/// in `tts.providers` with a `command` template.
+struct CustomTtsProvider {
+    name: String,
+    /// Command template with `{text_file}`, `{voice}`, `{out_path}`.
+    command_template: String,
+    default_voice: String,
+    output_extension: String,
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for CustomTtsProvider {
+    async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
+        let voice = if req.voice.is_empty() {
+            self.default_voice.clone()
+        } else {
+            req.voice.clone()
+        };
+        let template = self.command_template.clone();
+        let ext = self.output_extension.clone();
+        let text = req.text.to_string();
+        let timeout = req.timeout;
+
+        tokio::task::spawn_blocking(move || custom_synthesize(&template, &text, &voice, &ext, timeout))
+            .await
+            .context("custom tts task panicked")?
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn custom_synthesize(
+    template: &str,
+    text: &str,
+    voice: &str,
+    extension: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    use std::process::Command;
+
+    // Write text to a tempfile so commands can `cat {text_file}` without
+    // shell-escaping headaches around quotes/newlines in the prose.
+    let mut text_file = tempfile::NamedTempFile::new()?;
+    text_file.write_all(text.as_bytes())?;
+    text_file.flush()?;
+    let text_path = text_file.path().to_string_lossy().into_owned();
+    let out_file = tempfile::Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile()?;
+    let out_path = out_file.path().to_string_lossy().into_owned();
+
+    let cmd_str = template
+        .replace("{text_file}", &text_path)
+        .replace("{voice}", voice)
+        .replace("{out_path}", &out_path);
+
+    let mut child = Command::new("sh").arg("-c").arg(&cmd_str).spawn().context("spawn custom tts")?;
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("custom tts timed out after {timeout:?}");
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    bail!("custom tts exited with {:?}", status.code());
+                }
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    std::fs::read(out_file.path()).context("read custom tts output")
+}
+
 // ── TTS Synthesizer ──
 
 /// A provider with its per-model configuration.
@@ -317,6 +959,95 @@ impl TtsSynthesizer {
                     default_model: "eleven_multilingual_v2".to_string(),
                 }))
             }
+            // Microsoft Edge "Read aloud". No API
+            // key required; the msedge-tts crate handles the WSS
+            // protocol + Sec-MS-GEC header derivation.
+            "edge" => Some(Box::new(EdgeTtsProvider {
+                default_voice: "en-US-AvaMultilingualNeural".to_string(),
+            })),
+            // Google Gemini TTS — base64 PCM in JSON; we WAV-wrap it
+            // host-side so the system player accepts it. Defaults match
+            "gemini" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("GEMINI_API_KEY");
+                let api_key = resolve_key(env_var)
+                    .or_else(|| std::env::var("GOOGLE_API_KEY").ok().filter(|k| !k.is_empty()))?;
+                Some(Box::new(GeminiTtsProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                    default_model: "gemini-2.5-flash-preview-tts".to_string(),
+                    default_voice: "Kore".to_string(),
+                }))
+            }
+            // MiniMax t2a_v2 — hex-encoded MP3 in JSON.
+            "minimax" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MINIMAX_API_KEY");
+                let api_key = resolve_key(env_var)?;
+                let group_id = std::env::var("MINIMAX_GROUP_ID").ok().filter(|s| !s.is_empty());
+                Some(Box::new(MiniMaxTtsProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://api.minimax.io/v1/t2a_v2".to_string(),
+                    default_model: "speech-02-hd".to_string(),
+                    default_voice: "English_expressive_narrator".to_string(),
+                    group_id,
+                }))
+            }
+            // xAI Grok TTS — POST /v1/tts, returns raw audio bytes.
+            "xai" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("XAI_API_KEY");
+                let api_key = resolve_key(env_var)?;
+                Some(Box::new(XaiTtsProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://api.x.ai/v1".to_string(),
+                    default_voice: "eve".to_string(),
+                    default_language: "en".to_string(),
+                }))
+            }
+            // Mistral Voxtral TTS — `/v1/audio/speech` JSON envelope.
+            // Defaults: voxtral-mini-latest model + Alloy voice.
+            "mistral" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MISTRAL_API_KEY");
+                let api_key = resolve_key(env_var)?;
+                Some(Box::new(MistralTtsProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://api.mistral.ai".to_string(),
+                    default_model: "voxtral-mini-latest".to_string(),
+                    default_voice: "Alloy".to_string(),
+                }))
+            }
+            // Local Piper via shellout. No API key required; the user
+            // must have `piper` on PATH and a downloaded voice model.
+            "piper" => {
+                let voices_dir = dirs::home_dir()
+                    .map(|h| h.join(".borg").join("cache").join("piper-voices"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/piper-voices"));
+                Some(Box::new(PiperTtsProvider {
+                    default_voice: "en_US-lessac-medium".to_string(),
+                    voices_dir,
+                }))
+            }
+            // Custom shell-template provider. Operator-supplied command
+            // gets text in a tempfile + voice + output path substituted.
+            "custom" => {
+                let command_template = model_cfg.command.as_deref()?.to_string();
+                let provider_name = model_cfg
+                    .name
+                    .as_deref()
+                    .unwrap_or("custom")
+                    .to_string();
+                Some(Box::new(CustomTtsProvider {
+                    name: provider_name,
+                    command_template,
+                    default_voice: model_cfg.voice.clone().unwrap_or_default(),
+                    output_extension: model_cfg
+                        .output_extension
+                        .clone()
+                        .unwrap_or_else(|| "wav".to_string()),
+                }))
+            }
             other => {
                 warn!("Unknown TTS provider: {other}");
                 None
@@ -394,7 +1125,6 @@ impl TtsSynthesizer {
 //
 // Spoken markdown noise ("asterisk asterisk bold asterisk asterisk") destroys
 // the listening experience. Mirrors `_strip_markdown_for_tts` in
-// `reference/hermes-agent/tools/tts_tool.py:2079-2091` with three additions
 // for Rust-side completeness: `__bold__`, `_italic_`, and `~~strikethrough~~`.
 //
 // Application order matters:
@@ -449,7 +1179,7 @@ fn md_regexes() -> &'static MdRegexes {
 /// Strip markdown formatting that shouldn't be spoken aloud.
 ///
 /// Returns the cleaned, trimmed string. See module-level comment for the
-/// Hermes-parity reference and ordering rationale.
+/// reference-parity reference and ordering rationale.
 pub fn strip_markdown_for_tts(text: &str) -> String {
     let r = md_regexes();
     let mut out = r.code_block.replace_all(text, " ").into_owned();
@@ -474,6 +1204,79 @@ pub fn strip_markdown_for_tts(text: &str) -> String {
 /// "asterisk asterisk" noise around bold runs.
 pub fn prepare_for_tts(text: &str, max_bytes: usize) -> String {
     truncate_for_tts(&strip_markdown_for_tts(text), max_bytes)
+}
+
+/// Split prepared TTS text into sentence-sized chunks for streaming
+/// synthesis. Uses a sentence-boundary regex plus a `min_chars` floor so
+/// short fragments coalesce into the next chunk instead of generating
+/// their own synth request.
+///
+/// Rules:
+/// - Split on `. ` / `? ` / `! ` / `\n` (single newline is enough — a
+///   line break inside markdown is usually a paragraph terminator).
+/// - Coalesce too-short chunks (< `min_chars`) into the next one so the
+///   TTS provider isn't asked to synthesize `"Yes."` as its own request.
+/// - The last chunk is emitted as-is regardless of length (end of stream).
+///
+/// Returns chunks in playback order. Used by the streaming-TTS code path
+/// to reduce time-to-first-audio: while chunk N+1 is synthesizing, chunk
+/// N is already playing.
+pub fn chunk_for_streaming_tts(text: &str, min_chars: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    // Walk the bytes; on a sentence terminator followed by whitespace OR a
+    // newline, decide whether to flush.
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        current.push(c);
+        let next = bytes.get(i + 1).map(|&b| b as char);
+        let is_terminator =
+            matches!(c, '.' | '!' | '?') && matches!(next, Some(' ') | Some('\n') | None);
+        let is_newline = c == '\n';
+        if is_terminator || is_newline {
+            // Skip trailing whitespace so the next chunk doesn't start with a space.
+            if let Some(ws) = next {
+                if ws == ' ' || ws == '\n' {
+                    i += 1;
+                }
+            }
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                if trimmed.len() < min_chars {
+                    // Too short — keep accumulating into `current` instead of flushing.
+                    // Reset current to the trimmed value plus a separating space so the
+                    // following text reads naturally when prepended.
+                    current = trimmed;
+                    current.push(' ');
+                    i += 1;
+                    continue;
+                }
+                chunks.push(trimmed);
+                current.clear();
+            }
+        }
+        i += 1;
+    }
+    let trailing = current.trim().to_string();
+    if !trailing.is_empty() {
+        // Emit final remainder regardless of length — end-of-stream rule.
+        if let Some(last) = chunks.last_mut() {
+            if trailing.len() < min_chars {
+                last.push(' ');
+                last.push_str(&trailing);
+                return chunks;
+            }
+        }
+        chunks.push(trailing);
+    }
+    chunks
 }
 
 /// Truncate text for TTS, preferring sentence boundaries.
@@ -634,11 +1437,138 @@ mod tests {
     }
 
     #[test]
+    fn chunk_for_streaming_tts_splits_on_sentence_boundaries() {
+        let chunks = chunk_for_streaming_tts(
+            "First sentence here. Second sentence here. Third sentence here.",
+            20,
+        );
+        assert_eq!(chunks.len(), 3, "got: {chunks:?}");
+        assert_eq!(chunks[0], "First sentence here.");
+        assert_eq!(chunks[1], "Second sentence here.");
+        assert_eq!(chunks[2], "Third sentence here.");
+    }
+
+    #[test]
+    fn chunk_for_streaming_tts_coalesces_short_chunks() {
+        // "Yes." (4 chars) is under the 20-char floor, so it merges with
+        // the next sentence — TTS providers charge per request, and a
+        // single-word synth is also acoustically jarring next to a full
+        // sentence.
+        let chunks = chunk_for_streaming_tts("Yes. That is the correct answer.", 20);
+        assert_eq!(chunks.len(), 1, "got: {chunks:?}");
+        assert!(chunks[0].contains("Yes."));
+        assert!(chunks[0].contains("That is the correct answer."));
+    }
+
+    #[test]
+    fn chunk_for_streaming_tts_handles_newlines_as_terminators() {
+        // Bullet lists / paragraph breaks should split too, not just `. `
+        // — otherwise long markdown-stripped replies stay as one chunk.
+        let chunks = chunk_for_streaming_tts(
+            "First paragraph here\nSecond paragraph also long enough",
+            20,
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "First paragraph here");
+        assert_eq!(chunks[1], "Second paragraph also long enough");
+    }
+
+    #[test]
+    fn chunk_for_streaming_tts_emits_final_remainder_below_floor() {
+        // End-of-stream rule: a trailing fragment under min_chars must
+        // still be played (otherwise the user hears a truncated reply).
+        // The chunker merges it into the previous chunk in that case.
+        let chunks = chunk_for_streaming_tts("Long first sentence here. Tiny", 20);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].ends_with("Tiny"));
+    }
+
+    #[test]
+    fn chunk_for_streaming_tts_empty_input_returns_empty() {
+        assert!(chunk_for_streaming_tts("", 20).is_empty());
+        assert!(chunk_for_streaming_tts("   \n  ", 20).is_empty());
+    }
+
+    #[test]
+    fn expand_edge_voice_short_name_handles_locales_and_full_names() {
+        // The Edge TTS WSS endpoint requires the full Microsoft voice name;
+        // most catalogs only ship short names like `en-US-AvaMultilingualNeural`.
+        // Verify the split-on-second-dash logic for common shapes.
+        let cases = [
+            (
+                "en-US-AvaMultilingualNeural",
+                "Microsoft Server Speech Text to Speech Voice (en-US, AvaMultilingualNeural)",
+            ),
+            (
+                "pt-BR-FranciscaNeural",
+                "Microsoft Server Speech Text to Speech Voice (pt-BR, FranciscaNeural)",
+            ),
+            // Already-full names must pass through (callers may have the
+            // canonical form from a voices/list call).
+            (
+                "Microsoft Server Speech Text to Speech Voice (en-US, AvaMultilingualNeural)",
+                "en-US-AvaMultilingualNeural",
+            ),
+            // Malformed input — no second dash — falls back to itself
+            // rather than producing a broken full name.
+            ("AvaNeural", "AvaNeural"),
+        ];
+        for (input, _expected_output) in &cases {
+            let out = expand_edge_voice_short_name(input);
+            if input.starts_with("Microsoft Server Speech") {
+                // Full-name passthrough returns input unchanged.
+                assert_eq!(&out, input);
+            } else if input.contains('-') && input.matches('-').count() >= 2 {
+                assert!(
+                    out.starts_with("Microsoft Server Speech Text to Speech Voice ("),
+                    "expected full-name expansion for {input:?}, got {out:?}"
+                );
+            } else {
+                assert_eq!(&out, input, "malformed short name must pass through");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_hex_roundtrip() {
+        // MiniMax encodes audio as hex string; a decoder bug here would
+        // silently corrupt every t2a_v2 reply. Asserts both happy path
+        // and structural failures (odd length, invalid digit).
+        assert_eq!(decode_hex("48656c6c6f"), Some(b"Hello".to_vec()));
+        assert_eq!(decode_hex(""), Some(vec![]));
+        assert_eq!(decode_hex("abc"), None, "odd length must reject");
+        assert_eq!(decode_hex("zz"), None, "non-hex must reject");
+        // Uppercase digits must work too — MiniMax's docs aren't
+        // explicit about casing.
+        assert_eq!(decode_hex("FF00"), Some(vec![0xFF, 0x00]));
+    }
+
+    #[test]
+    fn wrap_pcm_as_wav_produces_decodable_riff_header() {
+        // 100 samples of silent 24 kHz mono 16-bit PCM. The header must
+        // parse via hound — that's the contract Gemini's PCM needs to
+        // satisfy before afplay/ffplay will play it.
+        let pcm = vec![0u8; 200]; // 100 samples × 2 bytes
+        let wav = wrap_pcm_as_wav(&pcm, 24_000, 1, 16);
+        // Magic markers in the right places.
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+        // hound roundtrip: must parse + report the format we wrote.
+        let reader = hound::WavReader::new(std::io::Cursor::new(&wav))
+            .expect("WAV header must be valid");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 24_000);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.bits_per_sample, 16);
+    }
+
+    #[test]
     fn strip_markdown_table_driven() {
         // Each row: (description, input, expected_output).
-        // Locks Hermes parity at
-        // reference/hermes-agent/tools/tts_tool.py:2079-2091 plus the three
-        // Rust-side additions (__bold__, _italic_, ~~strike~~).
+        // Covers the supported markdown forms plus extras: __bold__,
+        // _italic_, ~~strike~~.
         let cases: &[(&str, &str, &str)] = &[
             (
                 "fenced code block stripped to space",

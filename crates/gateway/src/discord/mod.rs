@@ -14,6 +14,11 @@ pub mod types;
 pub mod typing;
 /// Ed25519 signature verification for interaction webhooks.
 pub mod verify;
+/// Bidirectional Discord voice-channel manager (songbird-backed).
+/// Feature-gated because the audio stack adds ~30 transitive crates
+/// and a libopus build dependency.
+#[cfg(feature = "discord-voice-channels")]
+pub mod voice_channels;
 
 use anyhow::Result;
 use axum::http::HeaderMap;

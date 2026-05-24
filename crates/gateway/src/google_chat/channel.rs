@@ -23,6 +23,9 @@ struct GoogleChatResponseContext {
 pub struct GoogleChatChannel {
     pub client: Arc<GoogleChatClient>,
     pub token: Option<String>,
+    /// Config handle — needed to build the STT pipeline so voice
+    /// attachments get transcribed before the agent runs.
+    pub config: cortex::config::Config,
 }
 
 #[async_trait]
@@ -37,10 +40,48 @@ impl NativeChannel for GoogleChatChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
-        let inbound = match super::handle_google_chat_webhook(body, self.token.as_deref())? {
+        let mut inbound = match super::handle_google_chat_webhook(body, self.token.as_deref())? {
             Some(msg) => msg,
             None => return Ok(WebhookOutcome::Skip),
         };
+
+        // Inbound voice transcription. The parse step embeds the
+        // attachment's `resourceName` in `data`; download via the
+        // `media.download` endpoint (Bearer auth) and run STT.
+        if let Some(transcriber) =
+            cortex::media::understanding::AudioTranscriber::from_config(&self.config)
+        {
+            let mut transcripts: Vec<String> = Vec::new();
+            for att in &inbound.attachments {
+                if !att.mime_type.starts_with("audio/") {
+                    continue;
+                }
+                match self.client.download_attachment(&att.data).await {
+                    Ok(bytes) => {
+                        let fname = att
+                            .filename
+                            .clone()
+                            .unwrap_or_else(|| "gchat-voice.audio".to_string());
+                        match transcriber
+                            .transcribe(&bytes, &att.mime_type, &fname, None)
+                            .await
+                        {
+                            Ok((transcript, _)) => transcripts.push(transcript),
+                            Err(e) => tracing::warn!(error = %e, "google_chat: audio transcription failed"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "google_chat: attachment download failed"),
+                }
+            }
+            if !transcripts.is_empty() {
+                let joined = transcripts.join(" ");
+                inbound.text = if inbound.text.trim().is_empty() {
+                    format!("[Voice transcript]: {joined}")
+                } else {
+                    format!("{}\n[Voice transcript]: {joined}", inbound.text)
+                };
+            }
+        }
 
         let space_name = inbound.channel_id.clone().unwrap_or_default();
         let thread_name = inbound.thread_id.clone();

@@ -7,10 +7,11 @@ use tracing::{info, warn};
 
 use super::api::SignalClient;
 use super::dedup::MessageDeduplicator;
-use super::parse::parse_envelope;
-use super::types::SignalEnvelope;
+use super::parse::{enrich_attachments, parse_envelope};
+use super::types::{Attachment, SignalEnvelope};
 use crate::handler::InboundMessage;
 
+use cortex::config::Config;
 use cortex::constants;
 
 const MIN_BACKOFF: Duration = constants::SIGNAL_SSE_MIN_BACKOFF;
@@ -42,6 +43,7 @@ pub async fn run_sse_loop(
     client: Arc<SignalClient>,
     callback: SseCallback,
     shutdown: CancellationToken,
+    config: Config,
 ) {
     let mut consecutive_errors: u32 = 0;
     let mut dedup = MessageDeduplicator::new();
@@ -152,7 +154,7 @@ pub async fn run_sse_loop(
                         let event_data = data_lines.join("\n");
                         data_lines.clear();
 
-                        if let Some((inbound, recipient, group_id)) =
+                        if let Some((mut inbound, recipient, group_id, raw_attachments)) =
                             parse_sse_event(&event_data, client.account())
                         {
                             // Dedup: skip if we've seen this (sender, timestamp) before
@@ -163,6 +165,53 @@ pub async fn run_sse_loop(
                                 .unwrap_or(0);
                             if dedup.seen(&inbound.sender_id, ts) {
                                 continue;
+                            }
+                            // Download attachments via signal-cli; if any are
+                            // audio AND STT is configured, transcribe and
+                            // prepend `[Voice transcript]: …` to the message
+                            // text — parity with Telegram inbound voice.
+                            if !raw_attachments.is_empty() {
+                                enrich_attachments(&mut inbound, &raw_attachments, &client, 10_000)
+                                    .await;
+                                if let Some(transcriber) =
+                                    cortex::media::understanding::AudioTranscriber::from_config(
+                                        &config,
+                                    )
+                                {
+                                    let mut transcripts: Vec<String> = Vec::new();
+                                    for att in &inbound.attachments {
+                                        if !att.mime_type.starts_with("audio/") {
+                                            continue;
+                                        }
+                                        use base64::Engine;
+                                        let Ok(bytes) = base64::engine::general_purpose::STANDARD
+                                            .decode(&att.data)
+                                        else {
+                                            continue;
+                                        };
+                                        let fname = att
+                                            .filename
+                                            .clone()
+                                            .unwrap_or_else(|| "signal-voice.audio".to_string());
+                                        if let Ok((transcript, _)) = transcriber
+                                            .transcribe(&bytes, &att.mime_type, &fname, None)
+                                            .await
+                                        {
+                                            transcripts.push(transcript);
+                                        }
+                                    }
+                                    if !transcripts.is_empty() {
+                                        let joined = transcripts.join(" ");
+                                        inbound.text = if inbound.text.trim().is_empty() {
+                                            format!("[Voice transcript]: {joined}")
+                                        } else {
+                                            format!(
+                                                "{}\n[Voice transcript]: {joined}",
+                                                inbound.text
+                                            )
+                                        };
+                                    }
+                                }
                             }
                             callback(inbound, recipient, group_id).await;
                         }
@@ -176,19 +225,27 @@ pub async fn run_sse_loop(
     }
 }
 
-/// Parse an SSE event data payload into an InboundMessage + reply target.
+/// Parse an SSE event data payload into an InboundMessage + reply target +
+/// the raw attachment refs from the envelope's `data_message`. Callers run
+/// `enrich_attachments` against those refs to materialize the bytes (and
+/// optionally feed audio through STT) before dispatching to the handler.
 fn parse_sse_event(
     data: &str,
     own_account: &str,
-) -> Option<(InboundMessage, String, Option<String>)> {
+) -> Option<(InboundMessage, String, Option<String>, Vec<Attachment>)> {
     let envelope: SignalEnvelope = serde_json::from_str(data).ok()?;
     let inbound = parse_envelope(&envelope, own_account)?;
+    let raw_attachments = envelope
+        .envelope
+        .data_message
+        .as_ref()
+        .and_then(|dm| dm.attachments.clone())
+        .unwrap_or_default();
 
-    // Determine reply target: group_id for groups, sender_id for DMs
     let group_id = inbound.channel_id.clone();
     let recipient = inbound.sender_id.clone();
 
-    Some((inbound, recipient, group_id))
+    Some((inbound, recipient, group_id, raw_attachments))
 }
 
 /// Minimal percent-encoding for query string values.
@@ -226,7 +283,7 @@ mod tests {
     /// the only signal-specific invariants are (a) the first attempt
     /// floors at `MIN_BACKOFF` and (b) any number of attempts caps at
     /// `MAX_BACKOFF + jitter`. Exhaustive backoff curve testing lives in
-    /// `resilience::backoff` upstream.
+    /// `resilience::backoff`.
     #[test]
     fn backoff_floors_at_min_and_caps_at_max_plus_jitter() {
         let max_with_jitter = MAX_BACKOFF.as_secs_f64() * (1.0 + JITTER_FRACTION);
@@ -277,7 +334,7 @@ mod tests {
             },
             "account": "+15559876543"
         }"#;
-        let (msg, recipient, group_id) = parse_sse_event(data, "+15559876543").unwrap();
+        let (msg, recipient, group_id, _atts) = parse_sse_event(data, "+15559876543").unwrap();
         assert_eq!(msg.sender_id, "+15551234567");
         assert_eq!(msg.text, "Hello");
         assert_eq!(recipient, "+15551234567");
@@ -297,7 +354,7 @@ mod tests {
                 }
             }
         }"#;
-        let (msg, recipient, group_id) = parse_sse_event(data, "+15559876543").unwrap();
+        let (msg, recipient, group_id, _atts) = parse_sse_event(data, "+15559876543").unwrap();
         assert_eq!(msg.text, "Group msg");
         assert_eq!(msg.channel_id.as_deref(), Some("grp-abc"));
         assert_eq!(recipient, "+15551234567");

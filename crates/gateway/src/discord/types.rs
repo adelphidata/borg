@@ -348,6 +348,24 @@ pub struct ChannelMessage {
     pub content: String,
     /// Message ID.
     pub id: String,
+    /// File attachments. Discord voice messages arrive as audio
+    /// attachments (mime "audio/ogg") with the voice-message flag
+    /// (bit 13 of `flags`); the channel handler runs them through
+    /// STT to surface transcripts in `[Channel context]`.
+    pub attachments: Vec<DiscordAttachment>,
+}
+
+/// A Discord file attachment.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordAttachment {
+    /// CDN URL for the attachment file (no auth required).
+    pub url: String,
+    /// MIME type if Discord reported one. Voice messages: `audio/ogg`.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Original filename if known.
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// Raw Discord message for deserialization.
@@ -359,6 +377,9 @@ pub struct RawChannelMessage {
     pub content: String,
     /// Message author.
     pub author: RawAuthor,
+    /// File attachments (default empty list when absent from JSON).
+    #[serde(default)]
+    pub attachments: Vec<DiscordAttachment>,
 }
 
 /// Raw Discord author for deserialization.

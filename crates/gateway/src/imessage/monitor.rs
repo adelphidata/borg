@@ -129,6 +129,55 @@ async fn monitor_loop(
                                         Vec::new()
                                     });
 
+                                    // Inbound voice transcription — parity with Telegram
+                                    // (gateway/telegram/mod.rs:72-115). iMessage voice
+                                    // memos arrive as .caf/.m4a attachments on disk;
+                                    // run them through the STT pipeline before the
+                                    // agent sees the turn.
+                                    let mut text = text;
+                                    if let Some(transcriber) =
+                                        cortex::media::understanding::AudioTranscriber::from_config(
+                                            &config,
+                                        )
+                                    {
+                                        for att in &attachments {
+                                            if !att.mime_type.starts_with("audio/") {
+                                                continue;
+                                            }
+                                            // `att.data` is base64 by the time load_attachments
+                                            // is done — decode back to bytes for the STT call.
+                                            use base64::Engine;
+                                            let Ok(bytes) =
+                                                base64::engine::general_purpose::STANDARD
+                                                    .decode(&att.data)
+                                            else {
+                                                continue;
+                                            };
+                                            let filename = att
+                                                .filename
+                                                .clone()
+                                                .unwrap_or_else(|| "imessage-voice.audio".to_string());
+                                            match transcriber
+                                                .transcribe(&bytes, &att.mime_type, &filename, None)
+                                                .await
+                                            {
+                                                Ok((transcript, _)) => {
+                                                    text = if text.trim().is_empty() {
+                                                        format!("[Voice transcript]: {transcript}")
+                                                    } else {
+                                                        format!(
+                                                            "{text}\n[Voice transcript]: {transcript}"
+                                                        )
+                                                    };
+                                                }
+                                                Err(e) => warn!(
+                                                    error = %e,
+                                                    "iMessage: audio transcription failed"
+                                                ),
+                                            }
+                                        }
+                                    }
+
                                     let inbound = InboundMessage {
                                         sender_id: sender_id.clone(),
                                         text,

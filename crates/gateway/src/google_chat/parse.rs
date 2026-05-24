@@ -33,9 +33,33 @@ pub fn parse_event(event: &ChatEvent) -> Option<InboundMessage> {
     let text = message
         .argument_text
         .as_deref()
-        .or(message.text.as_deref())?;
+        .or(message.text.as_deref())
+        .unwrap_or("");
 
-    if text.is_empty() {
+    // Audio attachments — captured as `InboundAttachment { data = resourceName }`
+    // placeholders. The channel handler downloads + transcribes them.
+    let mut attachments: Vec<crate::handler::InboundAttachment> = Vec::new();
+    if let Some(ref atts) = message.attachment {
+        for att in atts {
+            let Some(ref resource) = att.attachment_data_ref else {
+                continue;
+            };
+            let Some(ref name) = resource.resource_name else {
+                continue;
+            };
+            attachments.push(crate::handler::InboundAttachment {
+                mime_type: att
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                data: name.clone(),
+                filename: att.content_name.clone(),
+            });
+        }
+    }
+
+    // Reject empty payload — no text AND no attachments to download.
+    if text.is_empty() && attachments.is_empty() {
         return None;
     }
 
@@ -55,7 +79,7 @@ pub fn parse_event(event: &ChatEvent) -> Option<InboundMessage> {
         thread_id,
         message_id,
         thread_ts: None,
-        attachments: Vec::new(),
+        attachments,
         reaction: None,
         metadata: serde_json::Value::Null,
         peer_kind: event
@@ -95,6 +119,7 @@ mod tests {
                     name: Some("spaces/SPACE1/threads/THREAD1".into()),
                 }),
                 create_time: None,
+                attachment: None,
             }),
             user: Some(ChatUser {
                 name: Some("users/USER1".into()),

@@ -681,6 +681,19 @@ impl<'a> super::App<'a> {
             return Ok(AppAction::Continue);
         }
 
+        // Voice push-to-talk hotkey — matches `voice.record_key`
+        // (default `ctrl-b`). Fires a single-shot
+        // recording; VAD silence detection auto-stops and transcribes.
+        // Press-to-toggle rather than hold-to-record so it works on
+        // terminals that don't emit KeyEventKind::Release reliably.
+        // Only active when `voice.enabled` so the default Ctrl+B
+        // doesn't shadow terminal page-back for users not using voice.
+        if self.config.voice.enabled
+            && matches_voice_record_key(key, &self.config.voice.record_key)
+        {
+            return Ok(self.cmd_voice("rec").unwrap_or(AppAction::Continue));
+        }
+
         if let Some(action) = self.handle_command_popup_key(key)? {
             return Ok(action);
         }
@@ -884,5 +897,112 @@ impl<'a> super::App<'a> {
             }
         }
         Ok(Some(AppAction::Continue))
+    }
+}
+
+/// Check whether `event` matches the configured `voice.record_key` spec.
+///
+/// Spec format: `<modifier>-<key>` lowercase. Recognized modifiers:
+/// `ctrl`, `alt`, `shift`. Keys: single chars (`b`, `v`) or named keys
+/// (`f1`-`f12`, `enter`, `space`, `tab`, `esc`). Unrecognized specs
+/// return false so a misconfigured record_key fails closed rather than
+/// hijacking a random key.
+///
+/// Examples: `ctrl-b`, `alt-v`, `ctrl-shift-r`, `f5`.
+fn matches_voice_record_key(event: crossterm::event::KeyEvent, spec: &str) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let spec = spec.trim().to_ascii_lowercase();
+    if spec.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = spec.split('-').collect();
+    let (mods_parts, key_part) = parts.split_at(parts.len() - 1);
+    let key_part = key_part[0];
+
+    let mut want = KeyModifiers::NONE;
+    for m in mods_parts {
+        match *m {
+            "ctrl" | "control" => want |= KeyModifiers::CONTROL,
+            "alt" | "meta" | "option" => want |= KeyModifiers::ALT,
+            "shift" => want |= KeyModifiers::SHIFT,
+            _ => return false, // unknown modifier — don't match anything
+        }
+    }
+    let code_matches = match key_part {
+        "enter" | "return" => event.code == KeyCode::Enter,
+        "space" => event.code == KeyCode::Char(' '),
+        "tab" => event.code == KeyCode::Tab,
+        "esc" | "escape" => event.code == KeyCode::Esc,
+        s if s.starts_with('f') && s.len() > 1 => {
+            s[1..].parse::<u8>().map(KeyCode::F).is_ok_and(|c| c == event.code)
+        }
+        s if s.chars().count() == 1 => {
+            // Single character. Crossterm reports Ctrl+letter as
+            // KeyCode::Char(<lower>) on most terminals — compare both
+            // cases so an uppercased spec ("ctrl-B") still works.
+            let Some(want_c) = s.chars().next() else {
+                return false;
+            };
+            event.code == KeyCode::Char(want_c)
+                || event.code == KeyCode::Char(want_c.to_ascii_uppercase())
+        }
+        _ => false,
+    };
+    // SHIFT is allowed-extra for letter keys because some terminals
+    // pass it through even when the user typed lowercase; require exact
+    // match on CTRL/ALT but be lenient on SHIFT.
+    let got_relevant = event.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let want_relevant = want & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+    code_matches && got_relevant == want_relevant
+}
+
+#[cfg(test)]
+mod voice_key_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn ctrl_b_matches_default_spec() {
+        // Default record_key is "ctrl-b" — the most common chord users
+        // see on terminals; the matcher must accept the canonical event.
+        let e = ev(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches_voice_record_key(e, "ctrl-b"));
+    }
+
+    #[test]
+    fn plain_b_does_not_match_ctrl_b() {
+        // No modifier on the event → must not hijack normal typing.
+        let e = ev(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(!matches_voice_record_key(e, "ctrl-b"));
+    }
+
+    #[test]
+    fn alt_v_matches_alt_dash_v() {
+        let e = ev(KeyCode::Char('v'), KeyModifiers::ALT);
+        assert!(matches_voice_record_key(e, "alt-v"));
+    }
+
+    #[test]
+    fn f5_matches_function_key_spec() {
+        let e = ev(KeyCode::F(5), KeyModifiers::NONE);
+        assert!(matches_voice_record_key(e, "f5"));
+    }
+
+    #[test]
+    fn unknown_modifier_fails_closed() {
+        // Garbage spec → never matches; better than hijacking a random
+        // event because the user typoed their config.
+        let e = ev(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!matches_voice_record_key(e, "hyper-b"));
+    }
+
+    #[test]
+    fn empty_spec_does_not_match_anything() {
+        let e = ev(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!matches_voice_record_key(e, ""));
     }
 }

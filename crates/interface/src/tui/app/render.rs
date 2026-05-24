@@ -557,6 +557,33 @@ impl<'a> App<'a> {
             ],
         };
 
+        // Voice-mode level meter. When `voice_status == Listening`, render
+        // a small 10-cell RMS bar so the user sees the mic is hot. The
+        // bar fills proportional to peak RMS (0..=32767, but speech
+        // normally peaks around 3000-8000). High-priority so it doesn't
+        // get culled when the terminal is narrow.
+        let mut hints = hints;
+        if matches!(
+            self.voice_status,
+            Some(cortex::media::voice_loop::VoiceStatus::Listening)
+        ) {
+            if let Some(vl) = self.voice_loop.as_ref() {
+                let peak = vl.peak_rms();
+                // Speech normally tops out around 6000-8000; clamp the
+                // bar range so a normal voice fills most of the bar
+                // without quiet speech showing as zero. 6000 ≈ full.
+                const BAR_FULL_RMS: u32 = 6_000;
+                const BAR_CELLS: u32 = 10;
+                let filled = (u32::from(peak) * BAR_CELLS / BAR_FULL_RMS).min(BAR_CELLS);
+                let bar: String = "█".repeat(filled as usize)
+                    + &"░".repeat((BAR_CELLS - filled) as usize);
+                hints.push(FooterHint {
+                    text: format!("🎤 {bar}"),
+                    priority: 95,
+                });
+            }
+        }
+
         // Goal-state hint. Surfaces the two cases the operator most needs to
         // notice — Paused (Ralph loop is dormant; user needs to `/goal
         // resume`) and BudgetLimited (auto-continuation stopped; user needs
@@ -564,7 +591,6 @@ impl<'a> App<'a> {
         // because the regular tooling already makes them visible (the agent
         // is mid-turn or the goal is done). Pushed onto `hints` so it
         // participates in priority-based fitting when the terminal narrows.
-        let mut hints = hints;
         match self.goal_status {
             Some(cortex::goals::GoalStatus::Paused) => hints.push(FooterHint {
                 text: "Goal paused (/goal resume)".into(),

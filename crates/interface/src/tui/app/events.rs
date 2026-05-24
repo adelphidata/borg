@@ -723,39 +723,59 @@ impl<'a> App<'a> {
         let format_str = self.config.tts.default_format.clone();
         let format = cortex::media::tts::AudioFormat::from_str_lossy(&format_str);
         let voice_loop = self.voice_loop.clone();
+        // Sentence-stream the reply: each chunk's synthesis runs in
+        // parallel while earlier chunks play in order. Cuts perceived
+        // time-to-first-audio dramatically on multi-sentence replies.
+        // Min-chars floor (20) avoids one-word synth requests.
+        let chunks = cortex::media::tts::chunk_for_streaming_tts(&speak, 20);
+        if chunks.is_empty() {
+            return;
+        }
         tokio::spawn(async move {
-            // Synthesize first — mic-pause only needs to span actual
-            // playback, not the LLM/TTS network round-trip.
-            let synth_result = synth.synthesize(&speak, None, format).await;
-            let bytes_and_fmt = match synth_result {
-                Ok((bytes, fmt, _attempts)) => Some((bytes, fmt)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "voice auto-tts: synth failed");
-                    None
-                }
-            };
-            let Some((bytes, fmt)) = bytes_and_fmt else {
-                return;
-            };
-            let path = match write_tmp_audio(&bytes, fmt.extension()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "voice auto-tts: failed to write temp audio");
-                    return;
-                }
-            };
-            // Pause the recorder only while the speaker is actually
-            // active so the mic isn't gated during the synth wait.
+            // Fan out the synth calls in order — Vec<JoinHandle<...>> keeps
+            // playback order intact even when later chunks finish first.
+            let mut pending: Vec<tokio::task::JoinHandle<_>> = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let synth = synth.clone();
+                pending.push(tokio::spawn(async move {
+                    synth.synthesize(&chunk, None, format).await
+                }));
+            }
+            // Open the mic-pause window once across the whole reply so
+            // the recorder doesn't flicker between chunks.
             if let Some(vl) = &voice_loop {
                 vl.notify_tts_started().await;
             }
-            if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
-                tracing::warn!(error = %e, "voice auto-tts playback failed");
+            for (i, handle) in pending.into_iter().enumerate() {
+                let result = match handle.await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(chunk = i, error = %e, "voice auto-tts: synth task panicked");
+                        continue;
+                    }
+                };
+                let (bytes, fmt) = match result {
+                    Ok((bytes, fmt, _attempts)) => (bytes, fmt),
+                    Err(e) => {
+                        tracing::warn!(chunk = i, error = %e, "voice auto-tts: synth failed");
+                        continue;
+                    }
+                };
+                let path = match write_tmp_audio(&bytes, fmt.extension()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(chunk = i, error = %e, "voice auto-tts: temp audio write failed");
+                        continue;
+                    }
+                };
+                if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
+                    tracing::warn!(chunk = i, error = %e, "voice auto-tts playback failed");
+                }
+                let _ = tokio::fs::remove_file(&path).await;
             }
             if let Some(vl) = &voice_loop {
                 vl.notify_tts_finished().await;
             }
-            let _ = tokio::fs::remove_file(&path).await;
         });
     }
 

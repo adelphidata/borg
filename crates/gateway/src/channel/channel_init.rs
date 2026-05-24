@@ -42,7 +42,7 @@ pub(crate) const GATEWAY_CREDENTIAL_KEYS: &[&str] = &[
 ///
 /// Delegates to `Config::resolve_credential_or_env` which handles config store,
 /// env var, and OS keychain fallback (using the plugin naming convention).
-fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -> Option<String> {
+pub(crate) fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -> Option<String> {
     config.resolve_credential_or_env(key)
 }
 

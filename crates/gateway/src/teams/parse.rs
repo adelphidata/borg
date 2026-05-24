@@ -263,6 +263,7 @@ mod tests {
             value: None,
             reactions_added: None,
             reactions_removed: None,
+            attachments: None,
         }
     }
 

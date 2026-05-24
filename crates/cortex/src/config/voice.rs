@@ -7,7 +7,7 @@
 //! `tts.models` ([`TtsConfig`](super::TtsConfig)); this section only
 //! owns the loop-level behavior.
 //!
-//! Defaults mirror the hermes voice-mode parameters (RMS threshold 200,
+//! Defaults mirror standard voice-mode parameters (RMS threshold 200,
 //! 3-second silence window, three-strike auto-disable) — those were
 //! tuned against real microphones over many iterations and are the
 //! contract `voice_capture` ports line-for-line.
@@ -23,7 +23,7 @@ pub struct VoiceConfig {
     /// gates the underlying STT provider chain).
     pub enabled: bool,
     /// RMS level (int16 range 0–32767) below which a chunk counts as
-    /// silence. 200 matches the hermes default tuned against typical
+    /// silence. 200 works well against typical
     /// USB/laptop microphones.
     pub silence_threshold_rms: u16,
     /// Continuous seconds below `silence_threshold_rms` (after at least
@@ -35,7 +35,7 @@ pub struct VoiceConfig {
     /// the silence timer.
     pub min_speech_duration_secs: f32,
     /// Seconds of sub-threshold dip tolerated mid-speech before the
-    /// speech-detection state resets. Hermes uses 0.3s — short enough
+    /// speech-detection state resets. The reference implementation uses 0.3s — short enough
     /// to avoid false silences in natural speech, long enough to ignore
     /// micro-pauses between syllables.
     pub dip_tolerance_secs: f32,
@@ -55,12 +55,16 @@ pub struct VoiceConfig {
     /// Toggled by `/voice tts`.
     pub auto_tts: bool,
     /// Whether the recorder plays short start/stop beeps to signal
-    /// capture state — UX parity with the hermes CLI.
+    /// capture state.
     pub beep_enabled: bool,
     /// Whether a recognized transcript is auto-submitted as the next
     /// user message. `false` puts the transcript in the composer for
     /// the user to review and submit manually.
     pub auto_submit: bool,
+    /// Keybinding for push-to-talk single-utterance recording. The TUI
+    /// arms a single-shot recorder on keydown and transcribes on keyup.
+    /// Format is `<modifier>-<key>` lowercase, e.g. `ctrl-b`, `alt-v`.
+    pub record_key: String,
 }
 
 impl Default for VoiceConfig {
@@ -77,6 +81,7 @@ impl Default for VoiceConfig {
             auto_tts: false,
             beep_enabled: true,
             auto_submit: true,
+            record_key: "ctrl-b".to_string(),
         }
     }
 }
@@ -85,12 +90,12 @@ impl Default for VoiceConfig {
 mod tests {
     use super::*;
 
-    /// Hermes-parity defaults are a contract, not an accident. The
+    /// reference-parity defaults are a contract, not an accident. The
     /// voice-mode VAD numbers were tuned against real mics over many
     /// rounds; changing one of these defaults must be a deliberate
     /// edit, not a typo that slips into a refactor.
     #[test]
-    fn defaults_match_hermes_parity() {
+    fn defaults_are_stable() {
         let cfg = VoiceConfig::default();
         assert_eq!(cfg.silence_threshold_rms, 200);
         assert!((cfg.silence_duration_secs - 3.0).abs() < f32::EPSILON);
@@ -103,6 +108,8 @@ mod tests {
         assert!(cfg.auto_submit);
         assert!(!cfg.auto_tts);
         assert!(!cfg.enabled);
+        // the keybinding is part of the parity contract.
+        assert_eq!(cfg.record_key, "ctrl-b");
     }
 
     #[test]

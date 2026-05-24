@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+#[cfg(feature = "local-stt")]
+use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -162,6 +164,188 @@ impl TranscriptionProvider for DeepgramProvider {
     }
 }
 
+/// Expand a leading `~/` to the user's home directory. Tiny inline
+/// helper — adding `shellexpand` as a dep just for this would be
+/// overkill, and the wider workspace doesn't use it.
+#[cfg(feature = "local-stt")]
+fn shellexpand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
+/// Local whisper.cpp STT via the whisper-rs ggml bindings. Gated behind
+/// the `local-stt` cargo feature so the C++ build cost stays opt-in.
+///
+/// The operator downloads a model to `~/.borg/models/whisper-{size}.bin`
+/// and points `audio.models[*].api_key_env` (here repurposed via
+/// `model.path`) at it.
+#[cfg(feature = "local-stt")]
+struct LocalWhisperProvider {
+    /// Filesystem path to a ggml model (e.g. `~/.borg/models/whisper-base.en.bin`).
+    /// Loaded lazily on first transcription so a /voice on with a misconfigured
+    /// model surfaces the error inline rather than at app start.
+    model_path: std::path::PathBuf,
+    /// Thread count for the inference call. Defaults to `num_cpus / 2`,
+    /// matching whisper.cpp's recommendation.
+    threads: i32,
+}
+
+#[cfg(feature = "local-stt")]
+#[async_trait::async_trait]
+impl TranscriptionProvider for LocalWhisperProvider {
+    async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
+        let model_path = self.model_path.clone();
+        let threads = self.threads;
+        let audio = req.audio_bytes.to_vec();
+        let language = req.language.clone();
+
+        // whisper-rs is purely synchronous + heavy — push it to spawn_blocking
+        // so a 5-second transcription doesn't stall the tokio dispatcher.
+        tokio::task::spawn_blocking(move || {
+            local_whisper_transcribe(&model_path, &audio, language.as_deref(), threads)
+        })
+        .await
+        .context("local whisper task panicked")?
+    }
+
+    fn name(&self) -> &str {
+        "local"
+    }
+}
+
+#[cfg(feature = "local-stt")]
+fn local_whisper_transcribe(
+    model_path: &std::path::Path,
+    audio_bytes: &[u8],
+    language: Option<&str>,
+    threads: i32,
+) -> Result<String> {
+    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+    if !model_path.exists() {
+        bail!(
+            "Whisper model not found at {}. Download one (e.g. ggml-base.en.bin) from \
+             https://huggingface.co/ggerganov/whisper.cpp and point voice.local_stt_model \
+             at it.",
+            model_path.display()
+        );
+    }
+
+    // Decode the WAV bytes to mono f32 samples at 16 kHz — whisper.cpp's
+    // native input shape. The voice recorder already emits 16 kHz mono int16
+    // PCM, so this is a straight int16→f32 normalize for the production path.
+    let reader = hound::WavReader::new(std::io::Cursor::new(audio_bytes))
+        .context("whisper: decode WAV header")?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16_000 || spec.channels != 1 {
+        bail!(
+            "whisper expects 16 kHz mono input; got {} Hz × {} channels",
+            spec.sample_rate,
+            spec.channels
+        );
+    }
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / 32_768.0))
+        .collect::<std::result::Result<_, _>>()
+        .context("whisper: decode WAV samples")?;
+
+    let ctx = WhisperContext::new_with_params(
+        model_path.to_string_lossy().as_ref(),
+        WhisperContextParameters::default(),
+    )
+    .context("whisper: load model")?;
+    let mut state = ctx.create_state().context("whisper: create state")?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(threads.max(1));
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    if let Some(lang) = language {
+        params.set_language(Some(lang));
+    }
+
+    state
+        .full(params, &samples)
+        .context("whisper: full inference")?;
+
+    let mut out = String::new();
+    let num_segments = state.full_n_segments();
+    for i in 0..num_segments {
+        let seg = state
+            .get_segment(i)
+            .ok_or_else(|| anyhow::anyhow!("whisper: segment {i} missing"))?;
+        out.push_str(&seg.to_str_lossy().context("whisper: decode segment text")?);
+    }
+    Ok(out.trim().to_string())
+}
+
+/// xAI Grok STT provider — `POST {base}/stt` (multipart). xAI's endpoint
+/// shape differs from OpenAI's (`/stt` instead of `/audio/transcriptions`)
+/// so it can't reuse [`WhisperProvider`].
+struct XaiSttProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    /// Inverse text normalization — emits punctuation/casing/digits. On
+    /// by default.
+    format: bool,
+    /// Speaker diarization. Off by default (paid feature).
+    diarize: bool,
+}
+
+#[async_trait::async_trait]
+impl TranscriptionProvider for XaiSttProvider {
+    async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
+        let url = format!("{}/stt", self.base_url.trim_end_matches('/'));
+
+        let file_part = reqwest::multipart::Part::bytes(req.audio_bytes.to_vec())
+            .file_name(req.filename.clone())
+            .mime_str(&req.mime_type)?;
+
+        let mut form = reqwest::multipart::Form::new().part("file", file_part);
+        if let Some(ref lang) = req.language {
+            form = form.text("language", lang.clone());
+        }
+        if self.format {
+            form = form.text("format", "true");
+        }
+        if self.diarize {
+            form = form.text("diarize", "true");
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .multipart(form)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("xAI STT returned {status}: {body}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let text = json["text"].as_str().map(str::trim).unwrap_or("");
+        if text.is_empty() {
+            bail!("xAI STT returned empty transcript");
+        }
+        Ok(text.to_string())
+    }
+
+    fn name(&self) -> &str {
+        "xai"
+    }
+}
+
 /// Parse Deepgram JSON response to extract transcript text.
 pub fn parse_deepgram_response(json: &serde_json::Value) -> Result<String> {
     json["results"]["channels"]
@@ -278,6 +462,62 @@ impl AudioTranscriber {
                     client: client.clone(),
                     api_key,
                     default_model: "nova-3".to_string(),
+                }))
+            }
+            // Mistral's `/v1/audio/transcriptions` is OpenAI-compatible
+            // (multipart `file`+`model`), so the existing WhisperProvider
+            // works as-is. Default model voxtral-mini-latest matches
+            // (DEFAULT_MISTRAL_STT_MODEL in
+            "mistral" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MISTRAL_API_KEY");
+                let api_key = resolve_key(env_var)?;
+                Some(Box::new(WhisperProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://api.mistral.ai".to_string(),
+                    default_model: "voxtral-mini-latest".to_string(),
+                    provider_name: "mistral".to_string(),
+                }))
+            }
+            // Local whisper.cpp via the optional `local-stt` cargo feature.
+            // When the feature is off, log + skip so a config row referencing
+            // "local" doesn't break the fallback chain.
+            #[cfg(feature = "local-stt")]
+            "local" => {
+                let path_str = model_cfg
+                    .api_key_env
+                    .clone()
+                    .unwrap_or_else(|| "~/.borg/models/whisper-base.en.bin".to_string());
+                let expanded = shellexpand_home(&path_str);
+                let model_path = std::path::PathBuf::from(expanded);
+                let cpus = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(2);
+                let threads = (cpus / 2).max(1) as i32;
+                Some(Box::new(LocalWhisperProvider {
+                    model_path,
+                    threads,
+                }))
+            }
+            #[cfg(not(feature = "local-stt"))]
+            "local" => {
+                debug!(
+                    "STT provider 'local' configured but cortex was built without \
+                     --features local-stt; skipping"
+                );
+                None
+            }
+            // xAI Grok STT — `/v1/stt` multipart (not OpenAI-compatible).
+            // Matches `_transcribe_xai` at
+            "xai" => {
+                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("XAI_API_KEY");
+                let api_key = resolve_key(env_var)?;
+                Some(Box::new(XaiSttProvider {
+                    client: client.clone(),
+                    api_key,
+                    base_url: "https://api.x.ai/v1".to_string(),
+                    format: true,
+                    diarize: false,
                 }))
             }
             other => {

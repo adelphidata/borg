@@ -44,6 +44,18 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 async-stream = "0.3"
 opentelemetry = { workspace = true }
+# Discord voice channels — Opus + RTP + libsodium under songbird's Driver.
+# Off by default; the audio stack adds ~30 transitive crates and is only
+# useful when borg is deployed against a Discord server with voice usage.
+# Enable with `cargo build -p gateway --features discord-voice-channels`.
+songbird = { version = "0.4", default-features = false, features = ["driver", "gateway", "rustls", "receive"], optional = true }
+hound = { version = "3.5", optional = true }
+
+[features]
+# Bundles the songbird Discord voice driver — opt-in because the dep
+# tree is heavy and only meaningful for operators who run borg in a
+# Discord guild with active voice channels.
+discord-voice-channels = ["dep:songbird", "dep:hound"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
