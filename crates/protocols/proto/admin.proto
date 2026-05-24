@@ -159,6 +159,94 @@ service Admin {
   // Hot-reload MCP catalog and/or user skills without restarting the daemon.
   // `target=ALL` reloads both; `MCP` / `SKILLS` target one subsystem.
   rpc Reload(ReloadRequest) returns (ReloadResponse);
+
+  // Sub-agent control — backs `/agents` (TUI popup) and `borg agents …`
+  // (CLI). The daemon owns the in-memory `AgentControl` registry and the
+  // `AgentTreeBus`; mutating RPCs delegate to the live registry, list ops
+  // also surface terminal agents persisted in `sub_agent_runs`.
+  rpc ListAgents(AgentListRequest) returns (AgentList);
+  rpc KillAgent(AgentRef) returns (Empty);
+  rpc KillAgentSubtree(AgentRef) returns (Empty);
+  rpc PauseAgent(AgentRef) returns (Empty);
+  rpc ResumeAgent(AgentRef) returns (Empty);
+  rpc SubscribeAgentTreeEvents(SessionRef) returns (stream AgentTreeEvent);
+  rpc ListAgentSnapshots(SessionRef) returns (AgentSnapshotList);
+  rpc GetAgentSnapshot(AgentSnapshotRefRequest) returns (AgentList);
+}
+
+// -- Sub-agent control messages -------------------------------------------
+
+message AgentRef {
+  string agent_id = 1;
+}
+
+message AgentListRequest {
+  // Owning session id. Empty string means "active session" — the daemon
+  // resolves it from the live registry. Explicit value lets the CLI page
+  // through historical sessions.
+  string session_id = 1;
+}
+
+message AgentMetrics {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 reasoning_tokens = 3;
+  double cost_usd = 4;
+  uint64 tool_calls = 5;
+  // De-duplicated file paths this agent has touched (read or written).
+  repeated string files_touched = 6;
+}
+
+message AgentEntry {
+  string id = 1;
+  string nickname = 2;
+  string role = 3;
+  string model = 4;
+  string parent_session_id = 5;
+  string session_id = 6;
+  uint32 depth = 7;
+  // Stable wire string: pending_init | running | paused | completed | errored | shutdown
+  string status = 8;
+  int64 created_at = 9;
+  // Set only when the agent has reached a terminal state.
+  int64 ended_at = 10;
+  // Populated when `status == errored`.
+  string error = 11;
+  // Populated when `status == completed`.
+  string result = 12;
+  AgentMetrics metrics = 13;
+}
+
+message AgentSnapshotRef {
+  string turn_id = 1;
+  string label = 2;
+  int64 started_at = 3;
+  int64 finished_at = 4;
+}
+
+message AgentList {
+  // Live (or historical) agents in display order (depth-first).
+  repeated AgentEntry agents = 1;
+  // Most-recent snapshots for this session (ring of 10), newest first.
+  repeated AgentSnapshotRef history = 2;
+}
+
+message AgentTreeEvent {
+  // Stable wire string: spawned | status_changed | paused | resumed | completed | errored | killed
+  string kind = 1;
+  AgentEntry agent = 2;
+  // Monotonic sequence number. Subscribers detect gaps and re-issue
+  // ListAgents on `Lagged` (broadcast) or non-contiguous seq.
+  uint64 seq = 3;
+}
+
+message AgentSnapshotList {
+  repeated AgentSnapshotRef snapshots = 1;
+}
+
+message AgentSnapshotRefRequest {
+  string session_id = 1;
+  string turn_id = 2;
 }
 
 message ReloadRequest {

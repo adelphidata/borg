@@ -1,3 +1,4 @@
+mod agents_popup;
 mod app;
 mod btw_popup;
 mod colors;

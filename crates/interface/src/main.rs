@@ -254,6 +254,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::browser::BrowserAction>,
     },
+    /// Inspect and control spawned sub-agents (list|tree|history|snapshot|kill|pause|resume).
+    /// Parity with the in-TUI `/agents` slash command.
+    Agents {
+        #[command(subcommand)]
+        action: commands::agents::AgentsAction,
+    },
     /// Run Borg as an Agent Client Protocol (ACP) server over stdio
     Acp,
     /// Manage LLM providers (BYO endpoints, rate-card refresh)
@@ -624,6 +630,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action).await?,
         Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
         Some(Commands::Browser { action }) => commands::browser::dispatch_browser(action).await?,
+        Some(Commands::Agents { action }) => commands::agents::dispatch_agents(action).await?,
         Some(Commands::Acp) => unreachable!("ACP handled before interactive bootstrap"),
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
         Some(Commands::Export {

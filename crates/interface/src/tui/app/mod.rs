@@ -19,6 +19,7 @@ use cortex::doctor::DiagnosticCheck;
 use heartbeat::scheduler::HeartbeatEvent;
 use throbber_widgets_tui::ThrobberState;
 
+use super::agents_popup::AgentsPopup;
 use super::btw_popup::BtwPopup;
 use super::command_popup::CommandPopup;
 use super::composer::Composer;
@@ -60,6 +61,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, status_popup);
         $body!($self, usage_popup);
         $body!($self, subprocesses_popup);
+        $body!($self, agents_popup);
         $body!($self, btw_popup);
     };
 }
@@ -469,6 +471,10 @@ pub struct App<'a> {
     /// because the trust models, install verbs, and lifecycle don't
     /// share enough to fold into one screen.
     pub mcp_popup: McpPopup,
+    /// Live spawn-tree dashboard for sub-agents (`/agents`). Reads
+    /// `Admin.ListAgents` on open; mutating keys (`p`/`x`/`Shift+X`)
+    /// route through the daemon's pause/kill RPCs.
+    pub agents_popup: AgentsPopup,
     /// Number of history cells already emitted to the scrollback above the
     /// inline viewport. Cells `< cells_emitted` were rendered into terminal
     /// scrollback via `insert_history_lines` and must never be re-rendered
@@ -618,6 +624,7 @@ impl<'a> App<'a> {
             theme_popup: ThemePopup::new(),
             plugins_popup: PluginsPopup::new(),
             mcp_popup: McpPopup::new(),
+            agents_popup: AgentsPopup::new(),
             cells_emitted: 0,
             pending_scrollback: Vec::new(),
             banner_emitted: false,
@@ -820,6 +827,7 @@ impl<'a> App<'a> {
             || self.status_popup.is_visible()
             || self.usage_popup.is_visible()
             || self.subprocesses_popup.is_visible()
+            || self.agents_popup.is_visible()
             || self.btw_popup.is_visible()
             || self.plugins_popup.is_visible()
             || self.mcp_popup.is_visible()

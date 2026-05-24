@@ -17,7 +17,10 @@ use cortex::process_registry::{ProcessEntry, ProcessRegistry};
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
     admin_server::Admin, goal_mutation::Op as GoalMutationOp, ActivityLogQuery, ActivityLogText,
-    AddCredentialRequest, AddProviderRequest, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef,
+    AddCredentialRequest, AddProviderRequest, AgentEntry as PbAgentEntry, AgentList as PbAgentList,
+    AgentListRequest, AgentMetrics as PbAgentMetrics, AgentRef, AgentSnapshotList,
+    AgentSnapshotRef as PbAgentSnapshotRef, AgentSnapshotRefRequest,
+    AgentTreeEvent as PbAgentTreeEvent, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef,
     ApiKeyValue, ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList, ApprovedSenderRef,
     BrowserManageRequest, BrowserManageResponse, ClientTokenRef, CreateWebhookRequest,
     CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
@@ -2302,6 +2305,9 @@ impl Admin for AdminSvc {
     type SubscribeGoalEventsStream =
         Pin<Box<dyn Stream<Item = Result<PbGoalEvent, TStatus>> + Send + 'static>>;
 
+    type SubscribeAgentTreeEventsStream =
+        Pin<Box<dyn Stream<Item = Result<PbAgentTreeEvent, TStatus>> + Send + 'static>>;
+
     async fn subscribe_goal_events(
         &self,
         _req: Request<Empty>,
@@ -2431,6 +2437,150 @@ impl Admin for AdminSvc {
 
         Ok(Response::new(resp))
     }
+
+    // -- Sub-agent control (`/agents`) --------------------------------------
+
+    /// List sub-agents owned by `session_id`. Reads from `sub_agent_runs` so
+    /// terminal agents (completed/errored/shutdown) and live agents both
+    /// surface — the operator's view of "what did this turn spawn" needs
+    /// the historical rows, not just the in-memory registry. Snapshots for
+    /// the same session are tacked on as `history` so the TUI can populate
+    /// its snapshot-cursor in one round-trip.
+    async fn list_agents(
+        &self,
+        req: Request<AgentListRequest>,
+    ) -> Result<Response<PbAgentList>, TStatus> {
+        let session_id = req.into_inner().session_id;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+        let resolved = resolve_agent_session_id(&db, &session_id)
+            .await
+            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        let Some(resolved) = resolved else {
+            return Ok(Response::new(PbAgentList::default()));
+        };
+        let rows = db
+            .list_sub_agent_runs(&resolved)
+            .await
+            .map_err(|e| TStatus::internal(format!("list_sub_agent_runs: {e}")))?;
+        let agents: Vec<PbAgentEntry> = rows.iter().map(sub_agent_row_to_pb).collect();
+        let snapshots = db
+            .list_agent_tree_snapshots(&resolved)
+            .await
+            .map_err(|e| TStatus::internal(format!("list_agent_tree_snapshots: {e}")))?;
+        let history: Vec<PbAgentSnapshotRef> = snapshots.iter().map(snapshot_row_to_pb).collect();
+        Ok(Response::new(PbAgentList { agents, history }))
+    }
+
+    /// Kill an agent. Today returns Unimplemented — the in-memory registry
+    /// handle the cancellation token lives behind is not yet plumbed through
+    /// the daemon session executor. The wire format is stable so the CLI
+    /// and TUI can be built against it and the executor lands separately.
+    async fn kill_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        Err(TStatus::unimplemented(
+            "kill_agent: executor wiring pending — only ListAgents/snapshots are live in this slice",
+        ))
+    }
+
+    /// Kill an agent and every descendant. See `kill_agent` for the same
+    /// executor-wiring caveat.
+    async fn kill_agent_subtree(
+        &self,
+        _req: Request<AgentRef>,
+    ) -> Result<Response<Empty>, TStatus> {
+        Err(TStatus::unimplemented(
+            "kill_agent_subtree: executor wiring pending",
+        ))
+    }
+
+    /// Pause an agent at its next iteration boundary. See `kill_agent`.
+    async fn pause_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        Err(TStatus::unimplemented(
+            "pause_agent: executor wiring pending",
+        ))
+    }
+
+    /// Resume a paused agent. See `kill_agent`.
+    async fn resume_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        Err(TStatus::unimplemented(
+            "resume_agent: executor wiring pending",
+        ))
+    }
+
+    /// Stream tree-lifecycle events. Returns `Unimplemented` until the
+    /// [`cortex::multi_agent::AgentTreeBus`] is wired into the daemon
+    /// session executor. An immediately-closed stream would let clients
+    /// confuse "no events yet" with "not wired" — the CLAUDE.md
+    /// "report success only if it succeeded" rule applies to streams too.
+    async fn subscribe_agent_tree_events(
+        &self,
+        _req: Request<SessionRef>,
+    ) -> Result<Response<Self::SubscribeAgentTreeEventsStream>, TStatus> {
+        Err(TStatus::unimplemented(
+            "subscribe_agent_tree_events: AgentTreeBus wiring pending — poll ListAgents instead",
+        ))
+    }
+
+    /// List persisted spawn-tree snapshots for a session (newest first,
+    /// capped to the per-session ring of 10).
+    async fn list_agent_snapshots(
+        &self,
+        req: Request<SessionRef>,
+    ) -> Result<Response<AgentSnapshotList>, TStatus> {
+        let session_id = req.into_inner().id;
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+        let resolved = resolve_agent_session_id(&db, &session_id)
+            .await
+            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        let Some(resolved) = resolved else {
+            return Ok(Response::new(AgentSnapshotList::default()));
+        };
+        let rows = db
+            .list_agent_tree_snapshots(&resolved)
+            .await
+            .map_err(|e| TStatus::internal(format!("list_agent_tree_snapshots: {e}")))?;
+        Ok(Response::new(AgentSnapshotList {
+            snapshots: rows.iter().map(snapshot_row_to_pb).collect(),
+        }))
+    }
+
+    /// Fetch the agents captured in one persisted snapshot. The snapshot
+    /// JSON is decoded server-side so the wire shape matches `ListAgents`.
+    async fn get_agent_snapshot(
+        &self,
+        req: Request<AgentSnapshotRefRequest>,
+    ) -> Result<Response<PbAgentList>, TStatus> {
+        let inner = req.into_inner();
+        if inner.turn_id.trim().is_empty() {
+            return Err(TStatus::invalid_argument("turn_id is required"));
+        }
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+        let resolved = resolve_agent_session_id(&db, &inner.session_id)
+            .await
+            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        let Some(resolved) = resolved else {
+            return Err(TStatus::failed_precondition("no active session"));
+        };
+        let row = db
+            .get_agent_tree_snapshot(&resolved, &inner.turn_id)
+            .await
+            .map_err(|e| TStatus::internal(format!("get_agent_tree_snapshot: {e}")))?
+            .ok_or_else(|| TStatus::not_found("snapshot not found"))?;
+        // Snapshot JSON is `Vec<PbAgentEntry>` serialized through serde-json
+        // by the writer; tolerate both bare array and `{agents: [...]}` so
+        // the format can grow without forcing a migration.
+        let agents: Vec<PbAgentEntry> = parse_snapshot_payload(&row.snapshot_json)
+            .map_err(|e| TStatus::internal(format!("snapshot decode failed: {e}")))?;
+        Ok(Response::new(PbAgentList {
+            agents,
+            history: Vec::new(),
+        }))
+    }
 }
 
 fn snapshot_to_reply(snap: crate::tunnel_supervisor::TunnelSnapshot) -> TunnelStatusReply {
@@ -2440,6 +2590,134 @@ fn snapshot_to_reply(snap: crate::tunnel_supervisor::TunnelSnapshot) -> TunnelSt
         public_url: snap.public_url,
         error: snap.last_error,
     }
+}
+
+/// Resolve the session id `ListAgents` / `ListAgentSnapshots` operates on.
+/// Empty input means "the most recently active session" — matches
+/// `resolve_goal_session_id`. Returns `None` when no session row exists.
+async fn resolve_agent_session_id(
+    db: &cortex::db::Database,
+    requested: &str,
+) -> anyhow::Result<Option<String>> {
+    let trimmed = requested.trim();
+    if !trimmed.is_empty() {
+        return Ok(Some(trimmed.to_string()));
+    }
+    Ok(db.list_sessions(1).await?.into_iter().next().map(|r| r.id))
+}
+
+/// Convert a stored `SubAgentRunRow` into the protobuf `AgentEntry` the
+/// CLI/TUI consume. Status strings match `SubAgentStatus::as_str`'s wire
+/// values so clients can pattern-match without re-encoding.
+fn sub_agent_row_to_pb(row: &cortex::db::SubAgentRunRow) -> PbAgentEntry {
+    let files_touched: Vec<String> = serde_json::from_str(&row.files_touched).unwrap_or_default();
+    PbAgentEntry {
+        id: row.id.clone(),
+        nickname: row.nickname.clone(),
+        role: row.role.clone(),
+        model: row.model.clone(),
+        parent_session_id: row.parent_session_id.clone(),
+        session_id: row.session_id.clone(),
+        depth: row.depth,
+        status: row.status.clone(),
+        created_at: row.created_at,
+        ended_at: row.completed_at.unwrap_or(0),
+        error: row.error_text.clone().unwrap_or_default(),
+        result: row.result_text.clone().unwrap_or_default(),
+        metrics: Some(PbAgentMetrics {
+            input_tokens: row.input_tokens.max(0) as u64,
+            output_tokens: row.output_tokens.max(0) as u64,
+            reasoning_tokens: row.reasoning_tokens.max(0) as u64,
+            cost_usd: row.cost_usd,
+            tool_calls: row.tool_calls.max(0) as u64,
+            files_touched,
+        }),
+    }
+}
+
+/// Convert a stored snapshot row into its protobuf reference.
+fn snapshot_row_to_pb(row: &cortex::db::multi_agent::AgentTreeSnapshotRow) -> PbAgentSnapshotRef {
+    PbAgentSnapshotRef {
+        turn_id: row.turn_id.clone(),
+        label: row.label.clone(),
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    }
+}
+
+/// Decode a snapshot payload, accepting either a bare JSON array of agent
+/// entries or an object with an `agents` field. Forward-compatible — future
+/// writers can wrap the array in a richer envelope without breaking older
+/// readers.
+fn parse_snapshot_payload(json: &str) -> anyhow::Result<Vec<PbAgentEntry>> {
+    #[derive(serde::Deserialize)]
+    struct StoredAgent {
+        id: String,
+        nickname: String,
+        role: String,
+        #[serde(default)]
+        model: String,
+        parent_session_id: String,
+        session_id: String,
+        depth: u32,
+        status: String,
+        #[serde(default)]
+        created_at: i64,
+        #[serde(default)]
+        ended_at: i64,
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        result: String,
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+        #[serde(default)]
+        reasoning_tokens: u64,
+        #[serde(default)]
+        cost_usd: f64,
+        #[serde(default)]
+        tool_calls: u64,
+        #[serde(default)]
+        files_touched: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Payload {
+        Bare(Vec<StoredAgent>),
+        Wrapped { agents: Vec<StoredAgent> },
+    }
+    let payload: Payload = serde_json::from_str(json)?;
+    let agents = match payload {
+        Payload::Bare(a) => a,
+        Payload::Wrapped { agents } => agents,
+    };
+    Ok(agents
+        .into_iter()
+        .map(|a| PbAgentEntry {
+            id: a.id,
+            nickname: a.nickname,
+            role: a.role,
+            model: a.model,
+            parent_session_id: a.parent_session_id,
+            session_id: a.session_id,
+            depth: a.depth,
+            status: a.status,
+            created_at: a.created_at,
+            ended_at: a.ended_at,
+            error: a.error,
+            result: a.result,
+            metrics: Some(PbAgentMetrics {
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                reasoning_tokens: a.reasoning_tokens,
+                cost_usd: a.cost_usd,
+                tool_calls: a.tool_calls,
+                files_touched: a.files_touched,
+            }),
+        })
+        .collect())
 }
 
 struct SetGoalOutcome {

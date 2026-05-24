@@ -1,4 +1,5 @@
 pub(crate) mod acp;
+pub(crate) mod agents;
 pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backup;

@@ -13,7 +13,7 @@ mod memory;
 mod meta;
 mod migrations;
 mod models;
-mod multi_agent;
+pub mod multi_agent;
 mod pairing;
 mod pki;
 mod plugins;

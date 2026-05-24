@@ -96,6 +96,7 @@ impl<'a> App<'a> {
         self.status_popup.render(frame);
         self.usage_popup.render(frame);
         self.subprocesses_popup.render(frame);
+        self.agents_popup.render(frame);
         self.btw_popup.render(frame);
 
         // Transcript pager (Ctrl+T) takes the full frame when active. Drawn

@@ -124,6 +124,11 @@ impl App<'_> {
                 self.subprocesses_popup.show(&client);
                 return Some(Ok(AppAction::EnterAltScreen));
             }
+            "/agents" => {
+                let client = self.client.clone();
+                self.agents_popup.show(&client);
+                return Some(Ok(AppAction::EnterAltScreen));
+            }
             "/save" => return Some(Ok(AppAction::SaveSession)),
             "/export" => {
                 return Some(Ok(AppAction::ExportCurrentSession {

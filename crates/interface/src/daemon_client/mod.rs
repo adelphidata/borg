@@ -22,10 +22,12 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
-    ActivityLogQuery, ActivityLogText, AddCredentialRequest, AddProviderRequest, AmbientStatus,
-    ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList,
-    ApprovedSenderRef, BrowserManageRequest, BrowserManageResponse, ClientTokenRef,
-    CreateWebhookRequest, CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
+    ActivityLogQuery, ActivityLogText, AddCredentialRequest, AddProviderRequest,
+    AgentList as PbAgentList, AgentListRequest, AgentRef as PbAgentRef, AgentSnapshotList,
+    AgentSnapshotRefRequest, AgentTreeEvent as PbAgentTreeEvent, AmbientStatus, ApiKeyList,
+    ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef,
+    BrowserManageRequest, BrowserManageResponse, ClientTokenRef, CreateWebhookRequest,
+    CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
     DoctorSquelchClearRequest, DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty,
     ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, GoalDetail,
     GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HandoffFailRequest,
@@ -1382,6 +1384,110 @@ impl DaemonClient {
             .subscribe_goal_events(AdminEmpty {})
             .await
             .context("Admin.SubscribeGoalEvents failed")?
+            .into_inner())
+    }
+
+    // -- Sub-agent control (`/agents`) --------------------------------------
+
+    /// List sub-agents owned by `session_id`. Empty `session_id` resolves to
+    /// the most-recently active session daemon-side.
+    pub async fn list_agents(&mut self, session_id: &str) -> Result<PbAgentList> {
+        Ok(self
+            .admin
+            .list_agents(AgentListRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.ListAgents failed")?
+            .into_inner())
+    }
+
+    /// Kill a single sub-agent.
+    pub async fn kill_agent(&mut self, agent_id: &str) -> Result<()> {
+        self.admin
+            .kill_agent(PbAgentRef {
+                agent_id: agent_id.to_string(),
+            })
+            .await
+            .context("Admin.KillAgent failed")?;
+        Ok(())
+    }
+
+    /// Kill an agent and every descendant in its subtree.
+    pub async fn kill_agent_subtree(&mut self, agent_id: &str) -> Result<()> {
+        self.admin
+            .kill_agent_subtree(PbAgentRef {
+                agent_id: agent_id.to_string(),
+            })
+            .await
+            .context("Admin.KillAgentSubtree failed")?;
+        Ok(())
+    }
+
+    /// Pause an agent at its next iteration boundary.
+    pub async fn pause_agent(&mut self, agent_id: &str) -> Result<()> {
+        self.admin
+            .pause_agent(PbAgentRef {
+                agent_id: agent_id.to_string(),
+            })
+            .await
+            .context("Admin.PauseAgent failed")?;
+        Ok(())
+    }
+
+    /// Resume a paused agent.
+    pub async fn resume_agent(&mut self, agent_id: &str) -> Result<()> {
+        self.admin
+            .resume_agent(PbAgentRef {
+                agent_id: agent_id.to_string(),
+            })
+            .await
+            .context("Admin.ResumeAgent failed")?;
+        Ok(())
+    }
+
+    /// Subscribe to tree-lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    pub async fn subscribe_agent_tree_events(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Streaming<PbAgentTreeEvent>> {
+        Ok(self
+            .admin
+            .subscribe_agent_tree_events(SessionRef {
+                id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.SubscribeAgentTreeEvents failed")?
+            .into_inner())
+    }
+
+    /// List persisted spawn-tree snapshots for a session.
+    pub async fn list_agent_snapshots(&mut self, session_id: &str) -> Result<AgentSnapshotList> {
+        Ok(self
+            .admin
+            .list_agent_snapshots(SessionRef {
+                id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.ListAgentSnapshots failed")?
+            .into_inner())
+    }
+
+    /// Fetch the agents captured in one persisted snapshot.
+    pub async fn get_agent_snapshot(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<PbAgentList> {
+        Ok(self
+            .admin
+            .get_agent_snapshot(AgentSnapshotRefRequest {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+            })
+            .await
+            .context("Admin.GetAgentSnapshot failed")?
             .into_inner())
     }
 

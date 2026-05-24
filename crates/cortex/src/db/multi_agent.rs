@@ -202,14 +202,34 @@ impl Database {
         Ok(())
     }
 
+    /// Return every sub-agent in the spawn tree rooted at the given session
+    /// — direct children PLUS transitive descendants (grandchildren etc.).
+    ///
+    /// A naïve `WHERE parent_session_id = ?1` only returns depth-1 rows
+    /// because grandchildren carry their *parent agent's* session_id, not
+    /// the root's. The dashboard and `borg agents tree` render the full
+    /// tree, so the recursive CTE walks `session_id → parent_session_id`
+    /// until the closure stabilizes. Ordering is `(depth, created_at)` so
+    /// callers can render the tree directly without re-sorting.
     pub async fn list_sub_agent_runs(
         &self,
         parent_session_id: &str,
     ) -> Result<Vec<SubAgentRunRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, nickname, role, parent_session_id, session_id, depth, status, result_text, error_text, created_at, completed_at, model, input_tokens, output_tokens, reasoning_tokens, cost_usd, tool_calls, files_touched FROM sub_agent_runs WHERE parent_session_id = ?1 ORDER BY created_at",
-            params!(parent_session_id),
-        ).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "WITH RECURSIVE tree(id, nickname, role, parent_session_id, session_id, depth, status, result_text, error_text, created_at, completed_at, model, input_tokens, output_tokens, reasoning_tokens, cost_usd, tool_calls, files_touched) AS (
+                    SELECT id, nickname, role, parent_session_id, session_id, depth, status, result_text, error_text, created_at, completed_at, model, input_tokens, output_tokens, reasoning_tokens, cost_usd, tool_calls, files_touched
+                    FROM sub_agent_runs WHERE parent_session_id = ?1
+                    UNION
+                    SELECT s.id, s.nickname, s.role, s.parent_session_id, s.session_id, s.depth, s.status, s.result_text, s.error_text, s.created_at, s.completed_at, s.model, s.input_tokens, s.output_tokens, s.reasoning_tokens, s.cost_usd, s.tool_calls, s.files_touched
+                    FROM sub_agent_runs s JOIN tree t ON s.parent_session_id = t.session_id
+                 )
+                 SELECT id, nickname, role, parent_session_id, session_id, depth, status, result_text, error_text, created_at, completed_at, model, input_tokens, output_tokens, reasoning_tokens, cost_usd, tool_calls, files_touched
+                 FROM tree ORDER BY depth, created_at",
+                params!(parent_session_id),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(Self::sub_agent_run_row_from_row(&row)?);
@@ -357,5 +377,63 @@ impl Database {
             })),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Database;
+
+    /// Tokio mutex — safe to hold across `await`. Serializes
+    /// process-wide `BORG_DATA_DIR` mutations so parallel tests don't
+    /// trample each other's data-dir env var (the cortex DB open path
+    /// resolves the path from that variable).
+    static DB_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn insert_at(db: &Database, id: &str, parent_session: &str, session: &str, depth: u32) {
+        db.insert_sub_agent_run(id, id, "role", parent_session, session, depth)
+            .await
+            .expect("insert");
+    }
+
+    /// Recursive CTE must surface grandchildren — the prior `WHERE
+    /// parent_session_id = ?1` shape only returned depth-1 rows, which
+    /// broke the tree renderer at level 2+. Both inclusion (descendants
+    /// reachable from the root) AND exclusion (sibling subtree under a
+    /// different root must not bleed in) are asserted.
+    #[tokio::test]
+    async fn list_sub_agent_runs_returns_full_transitive_descendants() {
+        let _guard = DB_ENV_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        let db = Database::open().await.expect("open test db");
+        // Tree under ROOT:  A → B → C ;  ROOT2 → X (must not appear)
+        insert_at(&db, "A", "ROOT", "sess-A", 0).await;
+        insert_at(&db, "B", "sess-A", "sess-B", 1).await;
+        insert_at(&db, "C", "sess-B", "sess-C", 2).await;
+        insert_at(&db, "X", "ROOT2", "sess-X", 0).await;
+
+        let rows = db.list_sub_agent_runs("ROOT").await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"A"), "depth-1 root must be returned");
+        assert!(
+            ids.contains(&"B"),
+            "depth-2 child must be returned via recursive CTE"
+        );
+        assert!(
+            ids.contains(&"C"),
+            "depth-3 grandchild must be returned via recursive CTE"
+        );
+        assert!(
+            !ids.contains(&"X"),
+            "agent rooted under ROOT2 must not bleed into ROOT's tree"
+        );
+        // Ordering: depth-first then created_at; verify grandchild
+        // appears after its ancestors so callers can render directly.
+        let depth_of = |id: &str| rows.iter().find(|r| r.id == id).unwrap().depth;
+        assert!(depth_of("A") <= depth_of("B"));
+        assert!(depth_of("B") <= depth_of("C"));
+
+        std::env::remove_var("BORG_DATA_DIR");
     }
 }
