@@ -1,6 +1,8 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -388,6 +390,92 @@ impl TtsSynthesizer {
     }
 }
 
+// ─── Markdown stripping for TTS ─────────────────────────────────────────────
+//
+// Spoken markdown noise ("asterisk asterisk bold asterisk asterisk") destroys
+// the listening experience. Mirrors `_strip_markdown_for_tts` in
+// `reference/hermes-agent/tools/tts_tool.py:2079-2091` with three additions
+// for Rust-side completeness: `__bold__`, `_italic_`, and `~~strikethrough~~`.
+//
+// Application order matters:
+// 1. Fenced code blocks first — their bodies may contain other markdown.
+// 2. Links before bare URLs — `[label](url)` becomes `label`; orphan URLs go.
+// 3. Bold (`**` / `__`) before italic (`*` / `_`) so `**x**` doesn't degrade
+//    into `*x*` and then match the italic pattern asymmetrically.
+// 4. Inline code after emphasis.
+// 5. Block-level markers (headers, bullets, rules) last.
+
+struct MdRegexes {
+    code_block: Regex,
+    link: Regex,
+    url: Regex,
+    bold_star: Regex,
+    bold_under: Regex,
+    italic_star: Regex,
+    italic_under: Regex,
+    strike: Regex,
+    inline_code: Regex,
+    header: Regex,
+    list_item: Regex,
+    hr: Regex,
+    excess_nl: Regex,
+}
+
+// Regex literals are compile-time-validated; a compile failure here is a
+// programmer bug at static-init time, not a runtime risk. Lint override
+// follows the codebase convention (see `memory/injection.rs:38`).
+#[allow(clippy::expect_used)]
+fn md_regexes() -> &'static MdRegexes {
+    static REGEXES: OnceLock<MdRegexes> = OnceLock::new();
+    REGEXES.get_or_init(|| MdRegexes {
+        // `(?s)` enables dot-matches-newline for code-block bodies.
+        code_block: Regex::new(r"(?s)```.*?```").expect("code_block regex"),
+        link: Regex::new(r"\[([^\]]+)\]\([^)]+\)").expect("link regex"),
+        url: Regex::new(r"https?://\S+").expect("url regex"),
+        bold_star: Regex::new(r"\*\*(.+?)\*\*").expect("bold_star regex"),
+        bold_under: Regex::new(r"__(.+?)__").expect("bold_under regex"),
+        italic_star: Regex::new(r"\*(.+?)\*").expect("italic_star regex"),
+        // Word-bounded so `snake_case_var` doesn't get mangled.
+        italic_under: Regex::new(r"\b_([^_\n]+?)_\b").expect("italic_under regex"),
+        strike: Regex::new(r"~~(.+?)~~").expect("strike regex"),
+        inline_code: Regex::new(r"`([^`]+)`").expect("inline_code regex"),
+        header: Regex::new(r"(?m)^#+\s*").expect("header regex"),
+        list_item: Regex::new(r"(?m)^\s*[-*]\s+").expect("list_item regex"),
+        hr: Regex::new(r"-{3,}").expect("hr regex"),
+        excess_nl: Regex::new(r"\n{3,}").expect("excess_nl regex"),
+    })
+}
+
+/// Strip markdown formatting that shouldn't be spoken aloud.
+///
+/// Returns the cleaned, trimmed string. See module-level comment for the
+/// Hermes-parity reference and ordering rationale.
+pub fn strip_markdown_for_tts(text: &str) -> String {
+    let r = md_regexes();
+    let mut out = r.code_block.replace_all(text, " ").into_owned();
+    out = r.link.replace_all(&out, "$1").into_owned();
+    out = r.url.replace_all(&out, "").into_owned();
+    out = r.bold_star.replace_all(&out, "$1").into_owned();
+    out = r.bold_under.replace_all(&out, "$1").into_owned();
+    out = r.italic_star.replace_all(&out, "$1").into_owned();
+    out = r.italic_under.replace_all(&out, "$1").into_owned();
+    out = r.strike.replace_all(&out, "$1").into_owned();
+    out = r.inline_code.replace_all(&out, "$1").into_owned();
+    out = r.header.replace_all(&out, "").into_owned();
+    out = r.list_item.replace_all(&out, "").into_owned();
+    out = r.hr.replace_all(&out, "").into_owned();
+    out = r.excess_nl.replace_all(&out, "\n\n").into_owned();
+    out.trim().to_string()
+}
+
+/// Prepare text for TTS: strip markdown, then truncate at a sentence boundary
+/// to fit within `max_bytes`. Single entry point that callers should use over
+/// raw `truncate_for_tts` — it avoids the agent's reply being read with
+/// "asterisk asterisk" noise around bold runs.
+pub fn prepare_for_tts(text: &str, max_bytes: usize) -> String {
+    truncate_for_tts(&strip_markdown_for_tts(text), max_bytes)
+}
+
 /// Truncate text for TTS, preferring sentence boundaries.
 /// Uses byte-level slicing with char-boundary safety to avoid panics on multi-byte UTF-8.
 pub fn truncate_for_tts(text: &str, max_bytes: usize) -> String {
@@ -543,6 +631,134 @@ mod tests {
         // Should not panic, should truncate before the emoji
         assert!(!result.is_empty());
         assert!(result.len() <= 11); // 8 + "..."
+    }
+
+    #[test]
+    fn strip_markdown_table_driven() {
+        // Each row: (description, input, expected_output).
+        // Locks Hermes parity at
+        // reference/hermes-agent/tools/tts_tool.py:2079-2091 plus the three
+        // Rust-side additions (__bold__, _italic_, ~~strike~~).
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "fenced code block stripped to space",
+                "Before ```rust\nfn x() {}\n``` after",
+                "Before   after",
+            ),
+            (
+                "link keeps label drops url",
+                "See [the docs](https://example.com/x) please",
+                "See the docs please",
+            ),
+            (
+                "bare url removed",
+                "Visit https://example.com now",
+                "Visit  now",
+            ),
+            (
+                "bold-star unwrapped",
+                "This is **important** text",
+                "This is important text",
+            ),
+            (
+                "bold-underscore unwrapped",
+                "This is __important__ text",
+                "This is important text",
+            ),
+            (
+                "italic-star unwrapped",
+                "This is *emphasized* text",
+                "This is emphasized text",
+            ),
+            (
+                "italic-underscore unwrapped on word boundary",
+                "This is _emphasized_ text",
+                "This is emphasized text",
+            ),
+            (
+                "snake_case identifier preserved (no italic match)",
+                "Call snake_case_var to fix",
+                "Call snake_case_var to fix",
+            ),
+            (
+                "strikethrough unwrapped",
+                "Use ~~old api~~ instead",
+                "Use old api instead",
+            ),
+            (
+                "inline code unwrapped",
+                "Run `cargo test` now",
+                "Run cargo test now",
+            ),
+            (
+                "atx headers stripped",
+                "# Title\n## Subtitle\nbody",
+                "Title\nSubtitle\nbody",
+            ),
+            (
+                "list items stripped",
+                "- one\n- two\n* three",
+                "one\ntwo\nthree",
+            ),
+            (
+                "horizontal rule removed",
+                "above\n---\nbelow",
+                "above\n\nbelow",
+            ),
+            ("excess newlines collapsed", "a\n\n\n\nb", "a\n\nb"),
+            (
+                "nested bold+italic+inline",
+                "**Bold _italic_ and `code`** here",
+                "Bold italic and code here",
+            ),
+            (
+                "multiple links in one line",
+                "[A](http://a) and [B](http://b)",
+                "A and B",
+            ),
+            (
+                "link before bare url leaves nothing dangling",
+                "[GitHub](https://github.com/x) vs https://gitlab.com",
+                "GitHub vs",
+            ),
+            ("empty input", "", ""),
+            (
+                "plain text untouched",
+                "The quick brown fox.",
+                "The quick brown fox.",
+            ),
+        ];
+
+        for (desc, input, expected) in cases {
+            let got = strip_markdown_for_tts(input);
+            assert_eq!(&got, expected, "case `{desc}`: input={input:?}");
+        }
+    }
+
+    #[test]
+    fn prepare_for_tts_strips_then_truncates() {
+        // Markdown is stripped first, then truncation applies to the cleaned
+        // text — so the byte budget covers spoken content, not syntax noise.
+        let input = "**First sentence.** *Second sentence.* `Third one.`";
+        let out = prepare_for_tts(input, 35);
+        // After strip: "First sentence. Second sentence. Third one."
+        // Truncated at last sentence boundary <= 35: "First sentence. Second sentence."
+        assert_eq!(out, "First sentence. Second sentence.");
+    }
+
+    #[test]
+    fn prepare_for_tts_handles_code_block_in_reply() {
+        // Models drop fenced code blocks into prose replies. The spoken
+        // version must not announce backticks or read the code body.
+        let input = "Here's the fix:\n```rust\nlet x = 1;\n```\nThat should work.";
+        let out = prepare_for_tts(input, 1000);
+        assert!(
+            !out.contains("```"),
+            "fenced markers leaked into TTS text: {out:?}"
+        );
+        assert!(!out.contains("let x = 1;"), "code body leaked: {out:?}");
+        assert!(out.contains("Here's the fix:"));
+        assert!(out.contains("That should work."));
     }
 
     #[test]

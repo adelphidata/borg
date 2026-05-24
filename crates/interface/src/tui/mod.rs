@@ -872,6 +872,9 @@ async fn run_event_loop(
 
         match action {
             AppAction::Quit => {
+                // Release the cpal stream and any in-flight playback so
+                // CoreAudio/ALSA are clean before the TUI tears down.
+                app.teardown_voice_loop();
                 // Browser-close is daemon-side now; no TUI hook needed.
                 let hint = match client.get_state(session_id).await {
                     Ok(s) if s.message_count > 0 => Some(ResumeHint {

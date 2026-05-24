@@ -49,7 +49,7 @@ pub async fn send_response(
     if let Some(synth) = tts_synthesizer {
         if let Some(mode) = voice_reply_mode {
             if should_send_voice_reply(mode, response_text, input_was_voice) {
-                let tts_text = cortex::media::tts::truncate_for_tts(response_text, 4096);
+                let tts_text = cortex::media::tts::prepare_for_tts(response_text, 4096);
                 match synth
                     .synthesize(&tts_text, None, Some(cortex::media::tts::AudioFormat::Opus))
                     .await

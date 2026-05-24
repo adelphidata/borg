@@ -402,12 +402,7 @@ impl AudioRecorder {
         // stream — building it can be expensive on macOS — but failing
         // here means the user gets a clear error instead of a recorder
         // that silently never produces samples.
-        {
-            use cpal::traits::HostTrait;
-            let host = cpal::default_host();
-            host.default_input_device()
-                .ok_or_else(|| anyhow!("no default audio input device"))?;
-        }
+        detect_audio_env()?;
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RecorderCmd>();
         let actor_shared = Arc::clone(&shared);
@@ -472,32 +467,70 @@ impl Recorder for AudioRecorder {
 
 impl Drop for AudioRecorder {
     fn drop(&mut self) {
-        // Best-effort: ask the thread to exit so the cpal stream is
-        // released. Errors here mean the channel is already closed —
-        // either we already shut down cleanly, or the thread panicked,
-        // in which case there's nothing more to do.
+        // Ask the actor to exit. Channel-closed error means the actor
+        // already returned (clean prior shutdown or panic); nothing
+        // more to do on that path.
         let _ = self.cmd_tx.send(RecorderCmd::Shutdown);
-        // Join with a short timeout so a Drop-without-prior-shutdown
-        // still releases the cpal stream deterministically. Callers
-        // that need guaranteed cleanup should still call `shutdown()`
-        // explicitly — Drop can't await — but this prevents the
-        // foot-gun where forgetting `shutdown()` leaves a CoreAudio
-        // stream alive past process teardown.
+        // Block Drop until the actor returns so the cpal stream is
+        // released deterministically before this handle is gone. The
+        // actor processes Shutdown immediately (the audio callback
+        // runs on its own OS-managed thread, not the actor loop), so
+        // this wait is effectively instant. Callers that want a
+        // cancelable teardown should still call `shutdown()` first.
         let handle_opt = match self.join.lock() {
             Ok(mut g) => g.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(h) = handle_opt {
-            // Best-effort wait — 500 ms is plenty for the actor to
-            // drain its command channel and drop the stream. If it
-            // doesn't, we proceed; the OS reclaims on exit anyway.
-            let _ = std::thread::Builder::new()
-                .name("borg-voice-recorder-joiner".into())
-                .spawn(move || {
-                    let _ = h.join();
-                });
+            let _ = h.join();
         }
     }
+}
+
+// ─── Audio environment preflight ────────────────────────────────────────────
+//
+// `cpal::default_host().default_input_device()` returning `None` is the
+// generic failure mode; the value of this preflight is converting it into a
+// platform-specific remediation string the user can act on directly. Hermes's
+// `detect_audio_environment()` at `tools/voice_mode.py` does the same thing
+// in Python.
+//
+// We intentionally do NOT call `AVCaptureDevice.authorizationStatus` on
+// macOS — that pulls in objc bindings for a single bit of info, and a denied
+// permission shows up as "no input device" in cpal anyway. The hint covers
+// both the missing-device and missing-permission cases.
+
+/// Probe the audio host and return Ok if a default input device exists.
+/// On failure, the error carries a platform-specific remediation hint so
+/// the user knows what to fix instead of seeing a generic cpal error.
+pub fn detect_audio_env() -> Result<()> {
+    use cpal::traits::HostTrait;
+    let host = cpal::default_host();
+    if host.default_input_device().is_some() {
+        return Ok(());
+    }
+    let hint = audio_env_remediation();
+    Err(anyhow!("no audio input device available — {hint}"))
+}
+
+#[cfg(target_os = "macos")]
+fn audio_env_remediation() -> &'static str {
+    "grant Microphone permission in System Settings → Privacy & Security → Microphone, \
+     then restart borg"
+}
+
+#[cfg(target_os = "linux")]
+fn audio_env_remediation() -> &'static str {
+    // PulseAudio is the modern default on Ubuntu/Debian/Fedora desktops;
+    // ALSA-only setups (headless / minimal) need alsa-utils. We can't tell
+    // which the operator has without shelling out, so name both.
+    "install audio support (Debian/Ubuntu: `sudo apt install pulseaudio-utils alsa-utils`; \
+     headless: ensure your shell has a working ALSA/PulseAudio session)"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn audio_env_remediation() -> &'static str {
+    "no default audio input device — check your OS audio configuration"
 }
 
 /// Audio actor — owns the cpal stream because `cpal::Stream` is `!Send`
@@ -843,6 +876,44 @@ mod tests {
 
     fn at(start: Instant, secs: f32) -> Instant {
         start + Duration::from_secs_f32(secs)
+    }
+
+    #[test]
+    fn audio_env_remediation_is_platform_specific() {
+        // Vague messages like "audio failed" defeat the purpose of a
+        // preflight; the hint must name something the user can act on.
+        let hint = audio_env_remediation();
+        if cfg!(target_os = "macos") {
+            assert!(
+                hint.contains("Microphone permission"),
+                "macOS hint must mention Microphone permission, got: {hint}"
+            );
+        } else if cfg!(target_os = "linux") {
+            assert!(
+                hint.contains("pulseaudio") || hint.contains("ALSA"),
+                "Linux hint must name the audio stack, got: {hint}"
+            );
+        }
+        assert!(!hint.is_empty());
+    }
+
+    #[test]
+    fn detect_audio_env_error_includes_remediation_hint() {
+        // We can't reliably force a no-device state on every CI host, so
+        // assert the wiring contract: any failure must embed the
+        // platform remediation rather than only "no device". On a host
+        // with a mic, Ok is expected and the assertion is skipped.
+        match detect_audio_env() {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e}");
+                let hint = audio_env_remediation();
+                assert!(
+                    msg.contains(hint),
+                    "error message must embed remediation hint;\n  msg:  {msg}\n  hint: {hint}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -569,7 +569,8 @@ pub struct App<'a> {
     /// `voice_loop` — both fields are set/cleared together by the
     /// command handler.
     pub voice_rx: Option<mpsc::UnboundedReceiver<cortex::media::voice_loop::VoiceEvent>>,
-    /// Latest status from the voice loop, surfaced in the footer.
+    /// Latest status from the voice loop. Read by `/voice status` to
+    /// report whether the loop is Listening / Transcribing / Idle.
     pub voice_status: Option<cortex::media::voice_loop::VoiceStatus>,
     /// Whether the active voice loop is a single-shot `/voice rec`. Used
     /// to suppress restart UX (no "listening…" indicator after the cycle

@@ -647,6 +647,15 @@ impl<'a> App<'a> {
                 if text.is_empty() {
                     return Ok(super::AppAction::Continue);
                 }
+                // Strip a leading `/` so a transcription that happens to
+                // start with that character (Whisper occasionally leaks
+                // formatting, or the user literally says "slash …")
+                // cannot reach `try_handle_command` and silently fire a
+                // slash command the user never typed.
+                let text = text.trim_start_matches('/').trim().to_string();
+                if text.is_empty() {
+                    return Ok(super::AppAction::Continue);
+                }
                 if self.config.voice.auto_submit {
                     // Echo the transcript as a system breadcrumb so the
                     // user sees what the recognizer heard before the
@@ -674,7 +683,7 @@ impl<'a> App<'a> {
         }
     }
 
-    fn teardown_voice_loop(&mut self) {
+    pub(crate) fn teardown_voice_loop(&mut self) {
         if let Some(vl) = self.voice_loop.take() {
             // Shutdown is async; we run it inline so the recorder is
             // released before the next slash command can fire.
@@ -691,52 +700,62 @@ impl<'a> App<'a> {
     }
 
     /// Auto-TTS hook called after every turn completes. Speaks the
-    /// finalized assistant message if `voice.auto_tts` is on and a
-    /// voice loop is active. Pauses the live recorder for the duration
-    /// of playback (TTS-feedback guard) and resumes it afterwards.
+    /// finalized assistant message if `voice.auto_tts` is on. When a
+    /// voice loop is active, pauses the live recorder for the duration
+    /// of playback (TTS-feedback guard) and resumes it afterwards;
+    /// without a loop, still synthesizes and plays so `auto_tts` works
+    /// as a standalone "speak replies" switch.
     pub(super) fn maybe_speak_assistant_reply(&mut self) {
         if !self.config.voice.auto_tts {
             return;
         }
-        let Some(voice_loop) = self.voice_loop.clone() else {
-            return;
-        };
         let Some(synth) = cortex::media::tts::TtsSynthesizer::from_config(&self.config) else {
             return;
         };
         let Some(text) = self.last_assistant_text() else {
             return;
         };
-        let speak = strip_markdown_for_tts(&text, self.config.tts.max_text_length);
+        let speak = cortex::media::tts::prepare_for_tts(&text, self.config.tts.max_text_length);
         if speak.trim().is_empty() {
             return;
         }
         let synth = std::sync::Arc::new(synth);
         let format_str = self.config.tts.default_format.clone();
         let format = cortex::media::tts::AudioFormat::from_str_lossy(&format_str);
+        let voice_loop = self.voice_loop.clone();
         tokio::spawn(async move {
-            voice_loop.notify_tts_started().await;
-            let result = synth.synthesize(&speak, None, format).await;
-            match result {
-                Ok((bytes, fmt, _attempts)) => {
-                    let ext = fmt.extension();
-                    match write_tmp_audio(&bytes, ext) {
-                        Ok(path) => {
-                            if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
-                                tracing::warn!(error = %e, "voice auto-tts playback failed");
-                            }
-                            let _ = tokio::fs::remove_file(&path).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "voice auto-tts: failed to write temp audio");
-                        }
-                    }
-                }
+            // Synthesize first — mic-pause only needs to span actual
+            // playback, not the LLM/TTS network round-trip.
+            let synth_result = synth.synthesize(&speak, None, format).await;
+            let bytes_and_fmt = match synth_result {
+                Ok((bytes, fmt, _attempts)) => Some((bytes, fmt)),
                 Err(e) => {
                     tracing::warn!(error = %e, "voice auto-tts: synth failed");
+                    None
                 }
+            };
+            let Some((bytes, fmt)) = bytes_and_fmt else {
+                return;
+            };
+            let path = match write_tmp_audio(&bytes, fmt.extension()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "voice auto-tts: failed to write temp audio");
+                    return;
+                }
+            };
+            // Pause the recorder only while the speaker is actually
+            // active so the mic isn't gated during the synth wait.
+            if let Some(vl) = &voice_loop {
+                vl.notify_tts_started().await;
             }
-            voice_loop.notify_tts_finished().await;
+            if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
+                tracing::warn!(error = %e, "voice auto-tts playback failed");
+            }
+            if let Some(vl) = &voice_loop {
+                vl.notify_tts_finished().await;
+            }
+            let _ = tokio::fs::remove_file(&path).await;
         });
     }
 
@@ -753,47 +772,6 @@ impl<'a> App<'a> {
             }
         }
         None
-    }
-}
-
-/// Strip markdown noise that doesn't read well aloud, then truncate to
-/// `max_chars`. Mirrors hermes voice.py:785-794 — fenced code blocks,
-/// links, bare URLs, bold/italic markers, headers, list bullets,
-/// horizontal rules, excess newlines.
-fn strip_markdown_for_tts(text: &str, max_chars: usize) -> String {
-    use regex::Regex;
-    let patterns: &[(&str, &str)] = &[
-        (r"(?s)```.*?```", " "),
-        (r"\[([^\]]+)\]\([^)]+\)", "$1"),
-        (r"https?://\S+", ""),
-        (r"\*\*(.+?)\*\*", "$1"),
-        (r"\*(.+?)\*", "$1"),
-        (r"`([^`]+)`", "$1"),
-        (r"(?m)^#+\s*", ""),
-        (r"(?m)^\s*[-*]\s+", ""),
-        (r"---+", ""),
-        (r"\n{3,}", "\n\n"),
-    ];
-    let mut out = text.to_string();
-    for (pat, repl) in patterns {
-        // Each regex compiles once per call — fine: this runs once per
-        // assistant turn, not per token. A pattern fault degrades to
-        // "leave that step's text alone" rather than panicking the
-        // whole TUI on an audio-cosmetic regex.
-        let re = match Regex::new(pat) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(pattern = pat, error = %e, "tts strip pattern failed to compile");
-                continue;
-            }
-        };
-        out = re.replace_all(&out, *repl).into_owned();
-    }
-    let out = out.trim().to_string();
-    if max_chars > 0 && out.chars().count() > max_chars {
-        out.chars().take(max_chars).collect()
-    } else {
-        out
     }
 }
 
