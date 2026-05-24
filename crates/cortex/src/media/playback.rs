@@ -248,7 +248,8 @@ pub fn synthesize_beep_wav(freq_hz: f32, duration_ms: u32) -> Vec<u8> {
 pub fn synthesize_double_beep_wav(freq_hz: f32, duration_ms: u32) -> Vec<u8> {
     let beep_samples = (BEEP_SAMPLE_RATE as f32 * duration_ms as f32 / 1000.0) as u32;
     let gap_samples = (BEEP_SAMPLE_RATE as f32 * BEEP_GAP_MS as f32 / 1000.0) as u32;
-    let fade = ((BEEP_SAMPLE_RATE as f32 * BEEP_FADE_MS as f32 / 1000.0) as u32).min(beep_samples / 2);
+    let fade =
+        ((BEEP_SAMPLE_RATE as f32 * BEEP_FADE_MS as f32 / 1000.0) as u32).min(beep_samples / 2);
     let total = beep_samples * 2 + gap_samples;
     let samples = (0..total).map(|i| {
         // Position within the current beep, or in the silent gap.
@@ -324,8 +325,11 @@ impl Beeper {
             return;
         }
         let path = self.start_path.get_or_init(|| {
-            ensure_beep_file("beep_start.wav", &synthesize_beep_wav(START_BEEP_HZ, BEEP_DURATION_MS))
-                .unwrap_or_else(|_| PathBuf::new())
+            ensure_beep_file(
+                "beep_start.wav",
+                &synthesize_beep_wav(START_BEEP_HZ, BEEP_DURATION_MS),
+            )
+            .unwrap_or_else(|_| PathBuf::new())
         });
         spawn_beep_playback(path.clone());
     }

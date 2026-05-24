@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{bail, Result};
 #[cfg(feature = "local-stt")]
 use anyhow::Context;
+use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -469,7 +469,10 @@ impl AudioTranscriber {
             // works as-is. Default model voxtral-mini-latest matches
             // (DEFAULT_MISTRAL_STT_MODEL in
             "mistral" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MISTRAL_API_KEY");
+                let env_var = model_cfg
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or("MISTRAL_API_KEY");
                 let api_key = resolve_key(env_var)?;
                 Some(Box::new(WhisperProvider {
                     client: client.clone(),

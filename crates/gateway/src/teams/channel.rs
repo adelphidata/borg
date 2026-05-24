@@ -101,7 +101,9 @@ impl NativeChannel for TeamsChannel {
                                 .await
                             {
                                 Ok((transcript, _)) => transcripts.push(transcript),
-                                Err(e) => tracing::warn!(error = %e, "teams: audio transcription failed"),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "teams: audio transcription failed")
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "teams: attachment download failed"),

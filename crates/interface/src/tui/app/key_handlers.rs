@@ -688,8 +688,7 @@ impl<'a> super::App<'a> {
         // terminals that don't emit KeyEventKind::Release reliably.
         // Only active when `voice.enabled` so the default Ctrl+B
         // doesn't shadow terminal page-back for users not using voice.
-        if self.config.voice.enabled
-            && matches_voice_record_key(key, &self.config.voice.record_key)
+        if self.config.voice.enabled && matches_voice_record_key(key, &self.config.voice.record_key)
         {
             return Ok(self.cmd_voice("rec").unwrap_or(AppAction::Continue));
         }
@@ -933,9 +932,10 @@ fn matches_voice_record_key(event: crossterm::event::KeyEvent, spec: &str) -> bo
         "space" => event.code == KeyCode::Char(' '),
         "tab" => event.code == KeyCode::Tab,
         "esc" | "escape" => event.code == KeyCode::Esc,
-        s if s.starts_with('f') && s.len() > 1 => {
-            s[1..].parse::<u8>().map(KeyCode::F).is_ok_and(|c| c == event.code)
-        }
+        s if s.starts_with('f') && s.len() > 1 => s[1..]
+            .parse::<u8>()
+            .map(KeyCode::F)
+            .is_ok_and(|c| c == event.code),
         s if s.chars().count() == 1 => {
             // Single character. Crossterm reports Ctrl+letter as
             // KeyCode::Char(<lower>) on most terminals — compare both

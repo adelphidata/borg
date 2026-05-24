@@ -3730,6 +3730,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "textwrap",
+ "thiserror 2.0.18",
  "throbber-widgets-tui",
  "tokio",
  "tokio-stream",

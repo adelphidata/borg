@@ -47,9 +47,16 @@ impl GoogleChatClient {
             .await
             .context("google_chat: download attachment")?;
         if !resp.status().is_success() {
-            bail!("google_chat attachment download returned HTTP {}", resp.status());
+            bail!(
+                "google_chat attachment download returned HTTP {}",
+                resp.status()
+            );
         }
-        Ok(resp.bytes().await.context("google_chat: read body")?.to_vec())
+        Ok(resp
+            .bytes()
+            .await
+            .context("google_chat: read body")?
+            .to_vec())
     }
 
     /// Send a message to a Google Chat space, automatically chunking at 4096 chars.

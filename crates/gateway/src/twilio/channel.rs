@@ -82,14 +82,16 @@ impl NativeChannel for TwilioChannel {
             {
                 match self.client.download_media(&audio_url).await {
                     Ok(bytes) => {
-                        let filename = format!("twilio-{}.audio", parsed.message.message_id.as_deref().unwrap_or("unknown"));
+                        let filename = format!(
+                            "twilio-{}.audio",
+                            parsed.message.message_id.as_deref().unwrap_or("unknown")
+                        );
                         match transcriber
                             .transcribe(&bytes, &audio_mime, &filename, None)
                             .await
                         {
                             Ok((transcript, _attempts)) => {
-                                parsed.message.text =
-                                    format!("[Voice transcript]: {transcript}");
+                                parsed.message.text = format!("[Voice transcript]: {transcript}");
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "twilio: audio transcription failed");

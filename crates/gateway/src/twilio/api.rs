@@ -136,7 +136,11 @@ impl TwilioClient {
         if !resp.status().is_success() {
             anyhow::bail!("twilio media download returned HTTP {}", resp.status());
         }
-        Ok(resp.bytes().await.context("twilio: read media body")?.to_vec())
+        Ok(resp
+            .bytes()
+            .await
+            .context("twilio: read media body")?
+            .to_vec())
     }
 
     /// Returns the Messages API URL (for testing).

@@ -164,7 +164,7 @@ impl VadFsm {
         } else if self.has_spoken {
             // Below threshold after speech confirmed. Resume tracker
             // tolerates brief dips before declaring "user stopped
-            // resuming". 
+            // resuming".
             if self.resume_start.is_some() {
                 match self.resume_dip_start {
                     None => self.resume_dip_start = Some(now),
@@ -179,7 +179,7 @@ impl VadFsm {
         } else if let Some(start) = self.speech_start {
             // Pre-confirmation dip — tolerate `dip_tolerance_secs` of
             // sub-threshold before resetting the speech-attempt timer.
-            // 
+            //
             match self.dip_start {
                 None => self.dip_start = Some(now),
                 Some(dip) => {

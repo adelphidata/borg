@@ -131,7 +131,11 @@ impl TeamsClient {
         if !resp.status().is_success() {
             anyhow::bail!("teams attachment download returned HTTP {}", resp.status());
         }
-        Ok(resp.bytes().await.context("teams: read attachment body")?.to_vec())
+        Ok(resp
+            .bytes()
+            .await
+            .context("teams: read attachment body")?
+            .to_vec())
     }
 
     /// Reply to a specific activity in a Teams conversation, automatically chunking long messages.

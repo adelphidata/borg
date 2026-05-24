@@ -75,8 +75,7 @@ impl NativeChannel for SlackChannel {
         // Voice/audio files take a side-path through the STT pipeline so
         // the agent sees `[Voice transcript]: …` in the message text
         // (parity with Telegram + Twilio inbound voice).
-        let transcriber =
-            cortex::media::understanding::AudioTranscriber::from_config(&self.config);
+        let transcriber = cortex::media::understanding::AudioTranscriber::from_config(&self.config);
         let mut resolved_attachments = Vec::new();
         let mut voice_transcripts: Vec<String> = Vec::new();
         for att in &inbound.attachments {
@@ -90,12 +89,11 @@ impl NativeChannel for SlackChannel {
                                     .filename
                                     .clone()
                                     .unwrap_or_else(|| "slack-voice.audio".to_string());
-                                match t
-                                    .transcribe(&bytes, &content_type, &filename, None)
-                                    .await
-                                {
+                                match t.transcribe(&bytes, &content_type, &filename, None).await {
                                     Ok((transcript, _)) => voice_transcripts.push(transcript),
-                                    Err(e) => tracing::warn!(error = %e, "slack: audio transcription failed"),
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "slack: audio transcription failed")
+                                    }
                                 }
                             }
                         }

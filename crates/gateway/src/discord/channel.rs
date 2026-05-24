@@ -179,14 +179,18 @@ impl NativeChannel for DiscordChannel {
                                                                 line_text.push_str(&transcript);
                                                             }
                                                         }
-                                                        Err(e) => tracing::warn!(error = %e, "discord: read attachment bytes failed"),
+                                                        Err(e) => {
+                                                            tracing::warn!(error = %e, "discord: read attachment bytes failed")
+                                                        }
                                                     }
                                                 }
                                                 Ok(resp) => tracing::warn!(
                                                     status = %resp.status(),
                                                     "discord: attachment fetch returned non-success"
                                                 ),
-                                                Err(e) => tracing::warn!(error = %e, "discord: attachment fetch failed"),
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "discord: attachment fetch failed")
+                                                }
                                             }
                                         }
                                     }

@@ -188,10 +188,7 @@ impl GatewayServer {
                 "messaging/discord",
                 "DISCORD_BOT_TOKEN",
             ) {
-                crate::discord::voice_channels::init_voice_manager(
-                    token,
-                    self.config.clone(),
-                );
+                crate::discord::voice_channels::init_voice_manager(token, self.config.clone());
             }
         }
 

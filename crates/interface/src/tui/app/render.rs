@@ -576,8 +576,8 @@ impl<'a> App<'a> {
                 const BAR_FULL_RMS: u32 = 6_000;
                 const BAR_CELLS: u32 = 10;
                 let filled = (u32::from(peak) * BAR_CELLS / BAR_FULL_RMS).min(BAR_CELLS);
-                let bar: String = "█".repeat(filled as usize)
-                    + &"░".repeat((BAR_CELLS - filled) as usize);
+                let bar: String =
+                    "█".repeat(filled as usize) + &"░".repeat((BAR_CELLS - filled) as usize);
                 hints.push(FooterHint {
                     text: format!("🎤 {bar}"),
                     priority: 95,

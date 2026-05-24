@@ -67,7 +67,9 @@ impl NativeChannel for GoogleChatChannel {
                             .await
                         {
                             Ok((transcript, _)) => transcripts.push(transcript),
-                            Err(e) => tracing::warn!(error = %e, "google_chat: audio transcription failed"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "google_chat: audio transcription failed")
+                            }
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "google_chat: attachment download failed"),

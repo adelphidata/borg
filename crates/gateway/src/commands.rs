@@ -676,7 +676,9 @@ async fn dispatch_voice_channel_via_handle(
             // yet — fall back to a usage hint when arg is empty.
             if let Some((guild_id, channel_id)) = parse_target(arg) {
                 return match handle.join(guild_id, channel_id).await {
-                    Ok(()) => format!("Joined Discord voice channel {channel_id} in guild {guild_id}."),
+                    Ok(()) => {
+                        format!("Joined Discord voice channel {channel_id} in guild {guild_id}.")
+                    }
                     Err(e) => format!("Failed to join voice channel: {e}"),
                 };
             }
@@ -1339,12 +1341,7 @@ mod tests {
         // bridging is genuinely deferred.
         let db = gateway_test_db().await;
         let config = Config::default();
-        let cases = [
-            "join",
-            "join General",
-            "leave",
-            "channel Lobby",
-        ];
+        let cases = ["join", "join General", "leave", "channel Lobby"];
         for input in cases {
             let resp = handle_voice(&db, &config, "discord", Some("999"), input).await;
             // Default-feature build: returns "not active in this build"

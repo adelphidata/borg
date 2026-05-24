@@ -101,7 +101,8 @@ impl VoiceManagerHandle {
             })
             .await
             .map_err(|_| anyhow!("voice manager task is down"))?;
-        rx.await.map_err(|_| anyhow!("voice manager dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow!("voice manager dropped reply"))?
     }
 
     pub async fn leave(&self, guild_id: u64) -> Result<()> {
@@ -113,7 +114,8 @@ impl VoiceManagerHandle {
             })
             .await
             .map_err(|_| anyhow!("voice manager task is down"))?;
-        rx.await.map_err(|_| anyhow!("voice manager dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow!("voice manager dropped reply"))?
     }
 
     pub async fn play(&self, guild_id: u64, path: std::path::PathBuf) -> Result<()> {
@@ -126,7 +128,8 @@ impl VoiceManagerHandle {
             })
             .await
             .map_err(|_| anyhow!("voice manager task is down"))?;
-        rx.await.map_err(|_| anyhow!("voice manager dropped reply"))?
+        rx.await
+            .map_err(|_| anyhow!("voice manager dropped reply"))?
     }
 
     pub async fn is_connected(&self, guild_id: u64) -> bool {
@@ -345,7 +348,8 @@ async fn run_voice_manager(
 
 async fn next_gateway_message<S>(ws_rx: &mut S) -> Option<String>
 where
-    S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
 {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
@@ -413,9 +417,10 @@ where
             // this guild (no-op on repeat). Bridges songbird's decoded
             // PCM stream → STT → inbox.
             let handler = InboundVoiceHandler::new(entry.inbox.clone(), cortex_config.clone());
-            entry
-                .driver
-                .add_global_event(Event::Core(songbird::CoreEvent::SpeakingStateUpdate), handler.clone());
+            entry.driver.add_global_event(
+                Event::Core(songbird::CoreEvent::SpeakingStateUpdate),
+                handler.clone(),
+            );
             entry
                 .driver
                 .add_global_event(Event::Core(songbird::CoreEvent::VoiceTick), handler);
@@ -528,10 +533,7 @@ async fn process_event(
             // Populate the voice-state cache for ALL users — this is
             // how `/voice join` (no-arg) resolves the caller's channel.
             if let (Some(gid), Some(uid)) = (guild_id, user_id) {
-                voice_states
-                    .lock()
-                    .await
-                    .insert((gid, uid), channel_id);
+                voice_states.lock().await.insert((gid, uid), channel_id);
             }
 
             // The session_id half of join-completion belongs only to us.
@@ -820,7 +822,9 @@ mod tests {
     fn downmix_48k_stereo_to_16k_mono_decimation_correctness() {
         // Six stereo samples (12 ints) at 48 kHz → average to 6 mono
         // samples → decimate by 3 → 2 mono samples.
-        let stereo: Vec<i16> = vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200];
+        let stereo: Vec<i16> = vec![
+            100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200,
+        ];
         let out = downmix_and_resample_48k_stereo_to_16k_mono(&stereo);
         // Mono averages: 150, 350, 550, 750, 950, 1150
         // Keep every 3rd → 150, 750

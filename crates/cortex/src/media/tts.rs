@@ -220,7 +220,7 @@ impl TtsProvider for ElevenLabsTtsProvider {
 
 // ── Edge TTS Provider (Microsoft, free, no API key) ──
 
-/// Microsoft Edge "Read aloud" TTS — the same endpoint 
+/// Microsoft Edge "Read aloud" TTS — the same endpoint
 /// No API key required; voice resolution is via Microsoft's catalog.
 ///
 /// Backed by the [`msedge_tts`](https://crates.io/crates/msedge-tts)
@@ -553,8 +553,7 @@ impl TtsProvider for XaiTtsProvider {
         // Only send output_format when not the documented default
         // (mp3 + 24kHz + 128kbps).
         if matches!(req.format, AudioFormat::Wav) {
-            body["output_format"] =
-                serde_json::json!({"codec": "wav", "sample_rate": 24_000});
+            body["output_format"] = serde_json::json!({"codec": "wav", "sample_rate": 24_000});
         }
 
         let resp = self
@@ -719,11 +718,7 @@ impl PiperTtsProvider {
     }
 }
 
-fn piper_synthesize(
-    model_path: &Path,
-    text: &str,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
+fn piper_synthesize(model_path: &Path, text: &str, timeout: Duration) -> Result<Vec<u8>> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
@@ -743,7 +738,9 @@ fn piper_synthesize(
         .spawn()
         .context("spawn piper")?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).context("write to piper stdin")?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("write to piper stdin")?;
     }
     let started = std::time::Instant::now();
     loop {
@@ -802,9 +799,11 @@ impl TtsProvider for CustomTtsProvider {
         let text = req.text.to_string();
         let timeout = req.timeout;
 
-        tokio::task::spawn_blocking(move || custom_synthesize(&template, &text, &voice, &ext, timeout))
-            .await
-            .context("custom tts task panicked")?
+        tokio::task::spawn_blocking(move || {
+            custom_synthesize(&template, &text, &voice, &ext, timeout)
+        })
+        .await
+        .context("custom tts task panicked")?
     }
 
     fn name(&self) -> &str {
@@ -838,7 +837,11 @@ fn custom_synthesize(
         .replace("{voice}", voice)
         .replace("{out_path}", &out_path);
 
-    let mut child = Command::new("sh").arg("-c").arg(&cmd_str).spawn().context("spawn custom tts")?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .spawn()
+        .context("spawn custom tts")?;
     let started = std::time::Instant::now();
     loop {
         if started.elapsed() >= timeout {
@@ -969,8 +972,11 @@ impl TtsSynthesizer {
             // host-side so the system player accepts it. Defaults match
             "gemini" => {
                 let env_var = model_cfg.api_key_env.as_deref().unwrap_or("GEMINI_API_KEY");
-                let api_key = resolve_key(env_var)
-                    .or_else(|| std::env::var("GOOGLE_API_KEY").ok().filter(|k| !k.is_empty()))?;
+                let api_key = resolve_key(env_var).or_else(|| {
+                    std::env::var("GOOGLE_API_KEY")
+                        .ok()
+                        .filter(|k| !k.is_empty())
+                })?;
                 Some(Box::new(GeminiTtsProvider {
                     client: client.clone(),
                     api_key,
@@ -981,9 +987,14 @@ impl TtsSynthesizer {
             }
             // MiniMax t2a_v2 — hex-encoded MP3 in JSON.
             "minimax" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MINIMAX_API_KEY");
+                let env_var = model_cfg
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or("MINIMAX_API_KEY");
                 let api_key = resolve_key(env_var)?;
-                let group_id = std::env::var("MINIMAX_GROUP_ID").ok().filter(|s| !s.is_empty());
+                let group_id = std::env::var("MINIMAX_GROUP_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 Some(Box::new(MiniMaxTtsProvider {
                     client: client.clone(),
                     api_key,
@@ -1008,7 +1019,10 @@ impl TtsSynthesizer {
             // Mistral Voxtral TTS — `/v1/audio/speech` JSON envelope.
             // Defaults: voxtral-mini-latest model + Alloy voice.
             "mistral" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("MISTRAL_API_KEY");
+                let env_var = model_cfg
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or("MISTRAL_API_KEY");
                 let api_key = resolve_key(env_var)?;
                 Some(Box::new(MistralTtsProvider {
                     client: client.clone(),
@@ -1033,11 +1047,7 @@ impl TtsSynthesizer {
             // gets text in a tempfile + voice + output path substituted.
             "custom" => {
                 let command_template = model_cfg.command.as_deref()?.to_string();
-                let provider_name = model_cfg
-                    .name
-                    .as_deref()
-                    .unwrap_or("custom")
-                    .to_string();
+                let provider_name = model_cfg.name.as_deref().unwrap_or("custom").to_string();
                 Some(Box::new(CustomTtsProvider {
                     name: provider_name,
                     command_template,
@@ -1556,8 +1566,8 @@ mod tests {
         assert_eq!(&wav[12..16], b"fmt ");
         assert_eq!(&wav[36..40], b"data");
         // hound roundtrip: must parse + report the format we wrote.
-        let reader = hound::WavReader::new(std::io::Cursor::new(&wav))
-            .expect("WAV header must be valid");
+        let reader =
+            hound::WavReader::new(std::io::Cursor::new(&wav)).expect("WAV header must be valid");
         let spec = reader.spec();
         assert_eq!(spec.sample_rate, 24_000);
         assert_eq!(spec.channels, 1);
