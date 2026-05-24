@@ -387,7 +387,7 @@ pub async fn handle_browser(
                 .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -504,7 +504,10 @@ mod tests {
             .await
             .expect("ok");
         if let ToolOutput::Text(msg) = out {
-            assert!(msg.contains("Error"), "expected validation error, got: {msg}");
+            assert!(
+                msg.contains("Error"),
+                "expected validation error, got: {msg}"
+            );
             assert!(msg.contains("delta"), "missing delta hint: {msg}");
         } else {
             panic!("expected text output");

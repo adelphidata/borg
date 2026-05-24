@@ -417,9 +417,7 @@ fn check_arg_coherence(args: &ComputerUseArgs) -> Option<String> {
     // screen change worth verifying.
     if args.capture_after.unwrap_or(false) {
         match args.action {
-            ComputerUseAction::Capture
-            | ComputerUseAction::ListApps
-            | ComputerUseAction::Wait => {
+            ComputerUseAction::Capture | ComputerUseAction::ListApps | ComputerUseAction::Wait => {
                 return Some(format!(
                     "capture_after is not valid for action '{:?}' — only mutating actions take a follow-up capture",
                     args.action
@@ -1553,8 +1551,13 @@ mod tests {
             ToolOutput::Multimodal { text, parts } => (text, parts),
             other => panic!("SOM mode must return Multimodal, got {other:?}"),
         };
-        assert!(text.contains("\"role\":\"button\""), "overlay missing: {text}");
-        assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
+        assert!(
+            text.contains("\"role\":\"button\""),
+            "overlay missing: {text}"
+        );
+        assert!(parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
         assert_eq!(driver.calls.lock().unwrap()[0].0, "screenshot");
         assert_eq!(driver.calls.lock().unwrap()[0].1["mode"], "som");
     }
@@ -1613,8 +1616,14 @@ mod tests {
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "click");
         assert_eq!(params["element_index"], 7);
-        assert!(params.get("x").is_none(), "stray x in element_index click: {params}");
-        assert!(params.get("y").is_none(), "stray y in element_index click: {params}");
+        assert!(
+            params.get("x").is_none(),
+            "stray x in element_index click: {params}"
+        );
+        assert!(
+            params.get("y").is_none(),
+            "stray y in element_index click: {params}"
+        );
     }
 
     /// Ambiguous target: model sets both pixel coords and element_index.
@@ -1685,7 +1694,9 @@ mod tests {
         };
         assert!(text.contains("click at (1, 2)"));
         assert!(text.contains("capture_after"));
-        assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
+        assert!(parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
         let calls = driver.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "click");

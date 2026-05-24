@@ -20,9 +20,7 @@ fn require_selector_or_ref(action: &str, args: &serde_json::Value) -> Option<Str
         (None, None) => Some(format!(
             "{action} requires 'selector' (CSS) or 'ref' (e.g. '@e5' from snapshot)"
         )),
-        (Some(s), None) if s.is_empty() => {
-            Some(format!("{action}: 'selector' must be non-empty"))
-        }
+        (Some(""), None) => Some(format!("{action}: 'selector' must be non-empty")),
         (None, Some(r)) if !r.starts_with("@e") => Some(format!(
             "{action}: 'ref' must look like '@e<N>' (from snapshot); got '{r}'"
         )),
@@ -67,9 +65,9 @@ pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<S
             let dx = args.get("delta_x").and_then(serde_json::Value::as_i64);
             let dy = args.get("delta_y").and_then(serde_json::Value::as_i64);
             match (dx, dy) {
-                (None, None) => Some(
-                    "scroll requires 'delta_x' or 'delta_y' (signed integer)".to_string(),
-                ),
+                (None, None) => {
+                    Some("scroll requires 'delta_x' or 'delta_y' (signed integer)".to_string())
+                }
                 _ => None,
             }
         }
@@ -95,10 +93,12 @@ pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<S
             }
             let files = args.get("files").and_then(|v| v.as_array());
             match files {
-                Some(arr) if !arr.is_empty() && arr.iter().all(|v| v.is_string()) => None,
-                _ => Some(
-                    "upload requires 'files' parameter (non-empty array of paths)".to_string(),
-                ),
+                Some(arr) if !arr.is_empty() && arr.iter().all(serde_json::Value::is_string) => {
+                    None
+                }
+                _ => {
+                    Some("upload requires 'files' parameter (non-empty array of paths)".to_string())
+                }
             }
         }
         "back" | "forward" | "get_images" => None,
@@ -245,11 +245,7 @@ mod tests {
             ("upload", json!({}), true),
             ("upload", json!({"selector": "input"}), true),
             ("upload", json!({"selector": "input", "files": []}), true),
-            (
-                "upload",
-                json!({"selector": "input", "files": [42]}),
-                true,
-            ),
+            ("upload", json!({"selector": "input", "files": [42]}), true),
             (
                 "upload",
                 json!({"selector": "input", "files": ["/tmp/a.png"]}),
@@ -257,24 +253,12 @@ mod tests {
             ),
             // click — selector OR ref, not both, not neither.
             ("click", json!({"ref": "@e5"}), false),
-            (
-                "click",
-                json!({"selector": "#btn", "ref": "@e5"}),
-                true,
-            ),
+            ("click", json!({"selector": "#btn", "ref": "@e5"}), true),
             ("click", json!({"ref": "e5"}), true),
             ("click", json!({"selector": ""}), true),
             // type — same selector-or-ref rule + text required.
-            (
-                "type",
-                json!({"ref": "@e1", "text": "hi"}),
-                false,
-            ),
-            (
-                "type",
-                json!({"ref": "@e1"}),
-                true,
-            ),
+            ("type", json!({"ref": "@e1", "text": "hi"}), false),
+            ("type", json!({"ref": "@e1"}), true),
         ];
 
         for (action, args, expect_err) in cases {

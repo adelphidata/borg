@@ -128,7 +128,7 @@ pub async fn snapshot(
 
     let total = raw
         .get("total")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as usize;
     let arr = raw
         .get("elements")
@@ -158,10 +158,20 @@ pub async fn snapshot(
         let bounds = item
             .get("bounds")
             .map(|b| ElementBounds {
-                x: b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                y: b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                width: b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                height: b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                x: b.get("x")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                y: b.get("y")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                width: b
+                    .get("width")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                height: b
+                    .get("height")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
             })
             .unwrap_or(ElementBounds {
                 x: 0.0,
@@ -196,10 +206,7 @@ pub fn render(result: &SnapshotResult) -> String {
         result.total
     ));
     for el in &result.elements {
-        out.push_str(&format!(
-            "  {} <{}> \"{}\"\n",
-            el.r#ref, el.tag, el.name
-        ));
+        out.push_str(&format!("  {} <{}> \"{}\"\n", el.r#ref, el.tag, el.name));
     }
     if result.elements.len() < result.total {
         out.push_str(&format!(

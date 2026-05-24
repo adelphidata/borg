@@ -201,12 +201,6 @@ impl BrowserSession {
         })
     }
 
-    /// Snapshot ref-store size — exposed for tests and debugging only.
-    #[cfg(test)]
-    pub(crate) fn snapshot_ref_count(&self) -> usize {
-        self.snapshot_refs.len()
-    }
-
     // -- Core Actions --
 
     /// Navigate to a URL after running it through the URL policy
@@ -506,8 +500,14 @@ impl BrowserSession {
             for (i, img) in arr.iter().enumerate() {
                 let src = img.get("src").and_then(|v| v.as_str()).unwrap_or("");
                 let alt = img.get("alt").and_then(|v| v.as_str()).unwrap_or("");
-                let w = img.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
-                let h = img.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                let w = img
+                    .get("width")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let h = img
+                    .get("height")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 out.push_str(&format!("  [{i}] {w}x{h} \"{alt}\" {src}\n"));
             }
             Ok(out)
@@ -538,9 +538,9 @@ impl BrowserSession {
                 .backend_node_id(el.backend_node_id)
                 .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build SetFileInputFiles: {e}"))?;
-            page.execute(params)
-                .await
-                .context("DOM.setFileInputFiles failed (target may not be an <input type=\"file\">)")?;
+            page.execute(params).await.context(
+                "DOM.setFileInputFiles failed (target may not be an <input type=\"file\">)",
+            )?;
             Ok(format!(
                 "Uploaded {} file(s) to {selector}: {}",
                 files.len(),
@@ -685,7 +685,10 @@ async fn history_navigate(
             .into_value()
             .context("history navigation result was not serialisable")?;
         let before = v.get("before").and_then(|v| v.as_str()).unwrap_or("");
-        let len = v.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+        let len = v
+            .get("len")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let dir = if delta < 0 { "back" } else { "forward" };
         if len <= 1 {
             Ok(format!(
@@ -821,7 +824,7 @@ mod tests {
         // Sanity: an empty HashMap-based ref store behaves as expected when
         // queried — keeps the resolver contract self-checked.
         let map: HashMap<String, String> = HashMap::new();
-        assert!(map.get("@e0").is_none());
+        assert!(!map.contains_key("@e0"));
     }
 
     #[test]

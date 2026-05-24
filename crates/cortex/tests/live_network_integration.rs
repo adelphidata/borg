@@ -155,7 +155,10 @@ async fn live_browser_snapshot_then_ref_click_then_back() {
             panic!("snapshot errored: {e}");
         }
     };
-    assert!(snap_text.contains("@e0"), "snapshot missing @e0: {snap_text}");
+    assert!(
+        snap_text.contains("@e0"),
+        "snapshot missing @e0: {snap_text}"
+    );
 
     // Step 3: click @e0 — must resolve through session refs without CSS.
     let click = tool_handlers::handle_browser(
