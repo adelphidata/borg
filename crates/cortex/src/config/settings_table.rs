@@ -121,6 +121,19 @@ define_settings! {
         "tts.timeout_ms" => tts.timeout_ms, parsed(u64);
         "tts.models" => tts.models, json_count("models");
 
+        // ── Voice ──
+        "voice.enabled" => voice.enabled, parsed(bool);
+        "voice.auto_tts" => voice.auto_tts, parsed(bool);
+        "voice.beep_enabled" => voice.beep_enabled, parsed(bool);
+        "voice.auto_submit" => voice.auto_submit, parsed(bool);
+        "voice.silence_threshold_rms" => voice.silence_threshold_rms, parsed(u16);
+        "voice.silence_duration_secs" => voice.silence_duration_secs, parsed(f32);
+        "voice.min_speech_duration_secs" => voice.min_speech_duration_secs, parsed(f32);
+        "voice.dip_tolerance_secs" => voice.dip_tolerance_secs, parsed(f32);
+        "voice.max_wait_secs" => voice.max_wait_secs, parsed(f32);
+        "voice.no_speech_limit" => voice.no_speech_limit, parsed(u8);
+        "voice.sample_rate_hz" => voice.sample_rate_hz, parsed(u32);
+
         // ── Evolution ──
         "evolution.enabled" => evolution.enabled, parsed(bool);
         "evolution.ambient_header_enabled" => evolution.ambient_header_enabled, parsed(bool);
@@ -661,8 +674,19 @@ define_settings! {
         "llm.proactive_rate_limit_min_window_secs" => "Proactive RL min window (s)", Uint, "Resilience";
 
         // — Voice —
-        "tts.enabled" => "Enabled", Bool, "Voice";
-        "tts.auto_mode" => "Auto reply", Bool, "Voice";
+        "tts.enabled" => "TTS provider enabled", Bool, "Voice";
+        "tts.auto_mode" => "TTS on gateway replies", Bool, "Voice";
+        "voice.enabled" => "Allow /voice", Bool, "Voice";
+        "voice.auto_tts" => "Speak agent replies", Bool, "Voice";
+        "voice.auto_submit" => "Auto-submit transcript", Bool, "Voice";
+        "voice.beep_enabled" => "Record/stop beeps", Bool, "Voice";
+        "voice.silence_threshold_rms" => "Silence RMS threshold", Uint, "Voice";
+        "voice.silence_duration_secs" => "Silence duration (s)", Float, "Voice";
+        "voice.min_speech_duration_secs" => "Min speech duration (s)", Float, "Voice";
+        "voice.dip_tolerance_secs" => "Dip tolerance (s)", Float, "Voice";
+        "voice.max_wait_secs" => "No-speech timeout (s)", Float, "Voice";
+        "voice.no_speech_limit" => "Silent-cycle limit", Uint, "Voice";
+        "voice.sample_rate_hz" => "Sample rate (Hz)", Uint, "Voice";
 
         // — Channels — only rows for channels with credentials configured
         // are shown; the popup filters at render time. Registry entries

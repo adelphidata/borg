@@ -846,6 +846,21 @@ async fn run_event_loop(
                 AppAction::Continue
             }
 
+            // Voice-mode lifecycle events. The recorder publishes
+            // Status/Transcript/SilentLimitReached here; a Transcript
+            // with `voice.auto_submit` becomes a normal SendMessage so
+            // we go through the same persistence and agent dispatch
+            // path the keyboard composer uses.
+            voice_ev = async {
+                if let Some(rx) = &mut app.voice_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                app.process_voice_event(voice_ev)?
+            }
+
             // Tick for status bar elapsed time + throbber animation + paste burst flush
             _ = tick_interval.tick() => {
                 app.tick_throbber();

@@ -77,7 +77,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev pkg-config protobuf-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
       - uses: actions/cache@v4
         with:
           path: |

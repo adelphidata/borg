@@ -66,6 +66,8 @@ bip39 = "2"
 iana-time-zone = "0.1"
 nucleo-matcher = "0.3"
 portable-pty = "0.9"
+cpal = "0.15"
+hound = "3.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

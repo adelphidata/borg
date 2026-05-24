@@ -52,6 +52,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/status", "Show agent vitals (alias of /stats)"),
     ("/stats", "Show agent vitals"),
+    ("/voice", "Voice mode (on|off|rec|tts|status)"),
     ("/evolution", "Show evolution overview"),
     ("/card", "Print an ASCII share card"),
     ("/pairing", "Manage sender pairing"),

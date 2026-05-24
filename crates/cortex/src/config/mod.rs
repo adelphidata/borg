@@ -17,6 +17,7 @@ mod settings_macro;
 pub mod settings_table;
 pub mod tunnel;
 pub mod update;
+pub mod voice;
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
@@ -40,6 +41,7 @@ pub use tunnel::{
     TunnelConfig, TunnelProvider,
 };
 pub use update::*;
+pub use voice::VoiceConfig;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -127,6 +129,9 @@ pub struct Config {
     /// Text-to-speech settings.
     #[serde(default)]
     pub tts: TtsConfig,
+    /// Voice-mode loop (mic capture VAD + TTS-pause guard + auto-submit).
+    #[serde(default)]
+    pub voice: VoiceConfig,
     /// Media understanding settings.
     #[serde(default)]
     pub media: MediaConfig,

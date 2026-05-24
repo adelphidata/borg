@@ -385,6 +385,14 @@ impl<'a> App<'a> {
         } else {
             self.state = AppState::Idle;
         }
+
+        // Auto-TTS hook: when /voice tts is on, speak the assistant's
+        // reply through the configured TTS provider. Runs after the
+        // turn is fully finalized so the spoken text matches the
+        // transcript the user sees. Pauses the active mic during
+        // playback to avoid the feedback loop where TTS audio feeds
+        // back as the next user message.
+        self.maybe_speak_assistant_reply();
     }
 
     fn handle_event_error(&mut self, e: String) {
@@ -605,6 +613,197 @@ impl<'a> App<'a> {
             },
         }
     }
+
+    /// Drain one voice-loop event. Returns the [`AppAction`] the event
+    /// loop should dispatch. A `Transcript` with `voice.auto_submit`
+    /// becomes a normal `handle_submit` call so the agent turn runs
+    /// through the same persistence path as a typed message — never
+    /// duplicate that path.
+    pub fn process_voice_event(
+        &mut self,
+        event: Option<cortex::media::voice_loop::VoiceEvent>,
+    ) -> anyhow::Result<super::AppAction> {
+        use cortex::media::voice_loop::{VoiceEvent, VoiceStatus};
+        let Some(event) = event else {
+            // Channel closed — voice loop is gone.
+            self.voice_loop = None;
+            self.voice_rx = None;
+            self.voice_status = None;
+            self.voice_single_shot = false;
+            return Ok(super::AppAction::Continue);
+        };
+        match event {
+            VoiceEvent::Status(s) => {
+                self.voice_status = Some(s);
+                if matches!(s, VoiceStatus::Idle) && self.voice_single_shot {
+                    // Single-shot finished — release the loop so the
+                    // user can `/voice rec` again without a manual off.
+                    self.teardown_voice_loop();
+                }
+                Ok(super::AppAction::Continue)
+            }
+            VoiceEvent::Transcript(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Ok(super::AppAction::Continue);
+                }
+                if self.config.voice.auto_submit {
+                    // Echo the transcript as a system breadcrumb so the
+                    // user sees what the recognizer heard before the
+                    // agent reply starts streaming.
+                    self.push_system_message(format!("[voice] {text}"));
+                    self.handle_submit(&text)
+                } else {
+                    // Drop into the composer for review.
+                    self.composer.set_text(&text);
+                    Ok(super::AppAction::Continue)
+                }
+            }
+            VoiceEvent::SilentLimitReached => {
+                self.push_system_message(
+                    "voice: no speech detected for several cycles — voice mode disabled."
+                        .to_string(),
+                );
+                self.teardown_voice_loop();
+                Ok(super::AppAction::Continue)
+            }
+            VoiceEvent::Error(e) => {
+                self.push_system_message(format!("voice: {e}"));
+                Ok(super::AppAction::Continue)
+            }
+        }
+    }
+
+    fn teardown_voice_loop(&mut self) {
+        if let Some(vl) = self.voice_loop.take() {
+            // Shutdown is async; we run it inline so the recorder is
+            // released before the next slash command can fire.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    vl.shutdown().await;
+                });
+            });
+        }
+        cortex::media::playback::stop_playback();
+        self.voice_rx = None;
+        self.voice_status = None;
+        self.voice_single_shot = false;
+    }
+
+    /// Auto-TTS hook called after every turn completes. Speaks the
+    /// finalized assistant message if `voice.auto_tts` is on and a
+    /// voice loop is active. Pauses the live recorder for the duration
+    /// of playback (TTS-feedback guard) and resumes it afterwards.
+    pub(super) fn maybe_speak_assistant_reply(&mut self) {
+        if !self.config.voice.auto_tts {
+            return;
+        }
+        let Some(voice_loop) = self.voice_loop.clone() else {
+            return;
+        };
+        let Some(synth) = cortex::media::tts::TtsSynthesizer::from_config(&self.config) else {
+            return;
+        };
+        let Some(text) = self.last_assistant_text() else {
+            return;
+        };
+        let speak = strip_markdown_for_tts(&text, self.config.tts.max_text_length);
+        if speak.trim().is_empty() {
+            return;
+        }
+        let synth = std::sync::Arc::new(synth);
+        let format_str = self.config.tts.default_format.clone();
+        let format = cortex::media::tts::AudioFormat::from_str_lossy(&format_str);
+        tokio::spawn(async move {
+            voice_loop.notify_tts_started().await;
+            let result = synth.synthesize(&speak, None, format).await;
+            match result {
+                Ok((bytes, fmt, _attempts)) => {
+                    let ext = fmt.extension();
+                    match write_tmp_audio(&bytes, ext) {
+                        Ok(path) => {
+                            if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
+                                tracing::warn!(error = %e, "voice auto-tts playback failed");
+                            }
+                            let _ = tokio::fs::remove_file(&path).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "voice auto-tts: failed to write temp audio");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "voice auto-tts: synth failed");
+                }
+            }
+            voice_loop.notify_tts_finished().await;
+        });
+    }
+
+    /// Newest finalized assistant cell text in the un-flushed tail. We
+    /// look at the just-finalized cell because by the time the
+    /// turn-complete event fires it has been pushed and unmarked
+    /// `streaming`.
+    fn last_assistant_text(&self) -> Option<String> {
+        for cell in self.cells.iter().rev() {
+            if let HistoryCell::Assistant { text, .. } = cell {
+                if !text.trim().is_empty() {
+                    return Some(text.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Strip markdown noise that doesn't read well aloud, then truncate to
+/// `max_chars`. Mirrors hermes voice.py:785-794 — fenced code blocks,
+/// links, bare URLs, bold/italic markers, headers, list bullets,
+/// horizontal rules, excess newlines.
+fn strip_markdown_for_tts(text: &str, max_chars: usize) -> String {
+    use regex::Regex;
+    let patterns: &[(&str, &str)] = &[
+        (r"(?s)```.*?```", " "),
+        (r"\[([^\]]+)\]\([^)]+\)", "$1"),
+        (r"https?://\S+", ""),
+        (r"\*\*(.+?)\*\*", "$1"),
+        (r"\*(.+?)\*", "$1"),
+        (r"`([^`]+)`", "$1"),
+        (r"(?m)^#+\s*", ""),
+        (r"(?m)^\s*[-*]\s+", ""),
+        (r"---+", ""),
+        (r"\n{3,}", "\n\n"),
+    ];
+    let mut out = text.to_string();
+    for (pat, repl) in patterns {
+        // Each regex compiles once per call — fine: this runs once per
+        // assistant turn, not per token. A pattern fault degrades to
+        // "leave that step's text alone" rather than panicking the
+        // whole TUI on an audio-cosmetic regex.
+        let re = match Regex::new(pat) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(pattern = pat, error = %e, "tts strip pattern failed to compile");
+                continue;
+            }
+        };
+        out = re.replace_all(&out, *repl).into_owned();
+    }
+    let out = out.trim().to_string();
+    if max_chars > 0 && out.chars().count() > max_chars {
+        out.chars().take(max_chars).collect()
+    } else {
+        out
+    }
+}
+
+fn write_tmp_audio(bytes: &[u8], ext: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("borg_voice");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f");
+    let path = dir.join(format!("tts_{stamp}.{ext}"));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 /// Pull the most informative short substring out of a tool's raw JSON args for

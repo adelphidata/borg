@@ -561,6 +561,20 @@ pub struct App<'a> {
     /// reacts within ~100ms of a daemon-side mutation. `None` until the
     /// initial `GetGoal` seed completes (or when no goal is set).
     pub goal_status: Option<cortex::goals::GoalStatus>,
+    /// Active voice-mode loop. `Some` while `/voice on` or `/voice rec`
+    /// is in flight; cleared on `/voice off` and `SilentLimitReached`.
+    /// See `crates/cortex/src/media/voice_loop.rs`.
+    pub voice_loop: Option<Arc<cortex::media::voice_loop::VoiceLoop>>,
+    /// Drains lifecycle events from [`Self::voice_loop`]. Paired 1:1 with
+    /// `voice_loop` — both fields are set/cleared together by the
+    /// command handler.
+    pub voice_rx: Option<mpsc::UnboundedReceiver<cortex::media::voice_loop::VoiceEvent>>,
+    /// Latest status from the voice loop, surfaced in the footer.
+    pub voice_status: Option<cortex::media::voice_loop::VoiceStatus>,
+    /// Whether the active voice loop is a single-shot `/voice rec`. Used
+    /// to suppress restart UX (no "listening…" indicator after the cycle
+    /// closes).
+    pub voice_single_shot: bool,
 }
 
 impl<'a> App<'a> {
@@ -642,6 +656,10 @@ impl<'a> App<'a> {
             toasts: super::toast::ToastStack::new(),
             client,
             goal_status: None,
+            voice_loop: None,
+            voice_rx: None,
+            voice_status: None,
+            voice_single_shot: false,
         };
         app.refresh_ambient_status();
         // One-shot persistent-warning notice. Rendered once after the
@@ -3726,5 +3744,126 @@ mod tests {
         assert!(matches!(result, AppAction::Continue));
         let sys = last_system_text(&app).expect("usage line printed");
         assert!(sys.starts_with("Usage: /think"), "got: {sys}");
+    }
+
+    // ── /voice ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn voice_unknown_subcommand_prints_usage_and_does_not_mutate_state() {
+        let mut app = make_app();
+        let result = app
+            .try_handle_command("/voice xyzzy")
+            .expect("handled")
+            .unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("usage printed");
+        assert!(
+            sys.starts_with("Usage: /voice"),
+            "must surface usage line for unknown subcommand, got: {sys}"
+        );
+        assert!(app.voice_loop.is_none());
+    }
+
+    #[test]
+    fn voice_off_when_inactive_says_so() {
+        // Off when nothing is running is a benign no-op; the user
+        // must still see a confirmation so they aren't left wondering
+        // whether the command did anything.
+        let mut app = make_app();
+        let result = app
+            .try_handle_command("/voice off")
+            .expect("handled")
+            .unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("system msg printed");
+        assert!(
+            sys.contains("not running"),
+            "must explain that voice was already off, got: {sys}"
+        );
+    }
+
+    #[test]
+    fn voice_start_when_disabled_in_config_hints_setting() {
+        // /voice on with voice.enabled=false must not silently fail.
+        // The user gets a one-line hint that explains exactly which
+        // setting to flip.
+        let mut app = make_app();
+        assert!(!app.config.voice.enabled);
+        let result = app
+            .try_handle_command("/voice on")
+            .expect("handled")
+            .unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("hint printed");
+        assert!(
+            sys.contains("voice.enabled"),
+            "hint must name the exact setting key, got: {sys}"
+        );
+        assert!(app.voice_loop.is_none());
+    }
+
+    #[test]
+    fn voice_tts_toggle_emits_update_setting_action() {
+        // /voice tts must persist via the canonical UpdateSetting
+        // pipeline so the change survives restart. A naive
+        // implementation that only mutates the in-memory config would
+        // lose the toggle on next startup.
+        let mut app = make_app();
+        let before = app.config.voice.auto_tts;
+        let result = app
+            .try_handle_command("/voice tts")
+            .expect("handled")
+            .unwrap();
+        match result {
+            AppAction::UpdateSetting { key, value } => {
+                assert_eq!(key, "voice.auto_tts");
+                assert_eq!(value, (!before).to_string());
+            }
+            _ => panic!("expected UpdateSetting AppAction"),
+        }
+        // And the in-memory config is updated for immediate /voice
+        // status feedback.
+        assert_eq!(app.config.voice.auto_tts, !before);
+    }
+
+    #[test]
+    fn voice_status_reports_full_state_in_one_message() {
+        // /voice status is the single source of truth for "what's
+        // configured". Every state row must be present so users can
+        // diagnose without inspecting config files.
+        let mut app = make_app();
+        let result = app
+            .try_handle_command("/voice status")
+            .expect("handled")
+            .unwrap();
+        assert!(matches!(result, AppAction::Continue));
+        let sys = last_system_text(&app).expect("status printed");
+        for needle in [
+            "Voice Mode",
+            "Allowed:",
+            "Mode:",
+            "State:",
+            "Auto-submit:",
+            "Auto-TTS:",
+            "STT provider:",
+            "TTS provider:",
+        ] {
+            assert!(
+                sys.contains(needle),
+                "status must include {needle:?}; got:\n{sys}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_help_lists_command() {
+        // /help is the discovery surface — /voice must show up.
+        let mut app = make_app();
+        let _ = app.try_handle_command("/help").expect("handled").unwrap();
+        let sys = last_system_text(&app).expect("help printed");
+        assert!(
+            sys.contains("/voice"),
+            "/help must list /voice so users can find it: {sys}"
+        );
     }
 }

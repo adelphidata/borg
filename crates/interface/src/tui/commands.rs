@@ -201,6 +201,13 @@ impl App<'_> {
             return Some(self.cmd_think_set(rest.trim()));
         }
 
+        if trimmed == "/voice" {
+            return Some(self.cmd_voice(""));
+        }
+        if let Some(rest) = trimmed.strip_prefix("/voice ") {
+            return Some(self.cmd_voice(rest.trim()));
+        }
+
         if let Some(question) = cortex::agent::parse_btw_command(trimmed) {
             if question.is_empty() {
                 self.push_system_message(
@@ -352,6 +359,7 @@ impl App<'_> {
              /doctor unsquelch <Category>:<Name> - Resume reminders for it\n  \
              /heal      - Run the self-healing maintenance sweep on demand\n  \
              /status    - Show agent vitals\n  \
+             /voice     - Voice mode: /voice [on|off|rec|tts|status]\n  \
              /poke      - Trigger immediate heartbeat\n  \
              /terminal-setup [target] - Install IDE terminal keybindings (auto|vscode|cursor|windsurf)\n  \
              /pairing   - Manage sender pairing\n  \
@@ -1242,6 +1250,215 @@ impl App<'_> {
             })
         })
     }
+
+    // ── /voice ─────────────────────────────────────────────────────────
+
+    /// Dispatch `/voice [on|off|rec|tts|status]`. Bare `/voice` toggles
+    /// the continuous loop on/off. Unknown subcommands print usage —
+    /// silently doing nothing erodes user trust when a typo happens.
+    pub(super) fn cmd_voice(&mut self, sub: &str) -> Result<AppAction> {
+        let normalized = sub.trim().to_lowercase();
+        match normalized.as_str() {
+            "" | "toggle" => {
+                if self.voice_loop.is_some() {
+                    self.cmd_voice_stop()
+                } else {
+                    self.cmd_voice_start(VoiceMode::Continuous)
+                }
+            }
+            "on" => self.cmd_voice_start(VoiceMode::Continuous),
+            "rec" | "record" => self.cmd_voice_start(VoiceMode::Single),
+            "off" => self.cmd_voice_stop(),
+            "tts" => self.cmd_voice_tts_toggle(),
+            "status" => self.cmd_voice_status(),
+            _ => {
+                self.push_system_message(
+                    "Usage: /voice [on|off|rec|tts|status]\n  \
+                     /voice         toggle continuous voice mode\n  \
+                     /voice rec     single recording, auto-submits transcript\n  \
+                     /voice tts     toggle speaking the agent's replies\n  \
+                     /voice status  show current voice-mode state"
+                        .to_string(),
+                );
+                Ok(AppAction::Continue)
+            }
+        }
+    }
+
+    fn cmd_voice_start(&mut self, mode: VoiceMode) -> Result<AppAction> {
+        if !self.config.voice.enabled {
+            self.push_system_message(
+                "voice mode is disabled. Enable it first:\n  \
+                 /settings voice.enabled true"
+                    .to_string(),
+            );
+            return Ok(AppAction::Continue);
+        }
+        if self.voice_loop.is_some() {
+            self.push_system_message("voice mode is already running.".to_string());
+            return Ok(AppAction::Continue);
+        }
+
+        let transcriber =
+            match cortex::media::understanding::AudioTranscriber::from_config(&self.config) {
+                Some(t) => std::sync::Arc::new(t),
+                None => {
+                    self.push_system_message(
+                        "voice: no audio transcription provider configured.\n  \
+                         Set `audio.enabled true` and add at least one model to `audio.models`."
+                            .to_string(),
+                    );
+                    return Ok(AppAction::Continue);
+                }
+            };
+
+        let recorder_result =
+            cortex::media::voice_capture::AudioRecorder::new(self.config.voice.clone());
+        let recorder = match recorder_result {
+            Ok(r) => {
+                std::sync::Arc::new(r) as std::sync::Arc<dyn cortex::media::voice_capture::Recorder>
+            }
+            Err(e) => {
+                self.push_system_message(format!(
+                    "voice: failed to open microphone — {e}.\n  \
+                     Ensure a default input device is available."
+                ));
+                return Ok(AppAction::Continue);
+            }
+        };
+
+        let (voice_loop, voice_rx) = cortex::media::voice_loop::VoiceLoop::new(
+            self.config.voice.clone(),
+            recorder,
+            transcriber,
+        );
+
+        let start_result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match mode {
+                    VoiceMode::Continuous => voice_loop.start_continuous().await,
+                    VoiceMode::Single => voice_loop.start_single().await,
+                }
+            })
+        });
+        if let Err(e) = start_result {
+            self.push_system_message(format!("voice: failed to start — {e}"));
+            return Ok(AppAction::Continue);
+        }
+
+        self.voice_single_shot = matches!(mode, VoiceMode::Single);
+        self.voice_loop = Some(voice_loop);
+        self.voice_rx = Some(voice_rx);
+        self.voice_status = Some(cortex::media::voice_loop::VoiceStatus::Listening);
+
+        let label = match mode {
+            VoiceMode::Continuous => "voice mode enabled — listening (continuous).",
+            VoiceMode::Single => "voice mode enabled — single recording.",
+        };
+        let tts_note = if self.config.voice.auto_tts {
+            " TTS on."
+        } else {
+            ""
+        };
+        self.push_system_message(format!("{label}{tts_note}\n  /voice off to stop."));
+        Ok(AppAction::Continue)
+    }
+
+    fn cmd_voice_stop(&mut self) -> Result<AppAction> {
+        let Some(vl) = self.voice_loop.take() else {
+            self.push_system_message("voice mode is not running.".to_string());
+            return Ok(AppAction::Continue);
+        };
+        // Stop the audio playback first so a TTS reply that's still
+        // talking doesn't keep going after the user hit "off".
+        cortex::media::playback::stop_playback();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                vl.stop().await;
+                vl.shutdown().await;
+            });
+        });
+        self.voice_rx = None;
+        self.voice_status = None;
+        self.voice_single_shot = false;
+        self.push_system_message("voice mode disabled.".to_string());
+        Ok(AppAction::Continue)
+    }
+
+    fn cmd_voice_tts_toggle(&mut self) -> Result<AppAction> {
+        let new_value = !self.config.voice.auto_tts;
+        // Apply locally so `/voice status` reflects the change
+        // immediately, and persist via the standard settings path.
+        self.config.voice.auto_tts = new_value;
+        let state = if new_value { "enabled" } else { "disabled" };
+        self.push_system_message(format!("voice TTS {state}."));
+        Ok(AppAction::UpdateSetting {
+            key: "voice.auto_tts".to_string(),
+            value: new_value.to_string(),
+        })
+    }
+
+    fn cmd_voice_status(&mut self) -> Result<AppAction> {
+        let on = self.voice_loop.is_some();
+        let tts = self.config.voice.auto_tts;
+        let enabled = self.config.voice.enabled;
+        let mode_label = match (on, self.voice_single_shot) {
+            (false, _) => "off",
+            (true, true) => "single-shot",
+            (true, false) => "continuous",
+        };
+        let status_label = match self.voice_status {
+            Some(cortex::media::voice_loop::VoiceStatus::Listening) => "listening",
+            Some(cortex::media::voice_loop::VoiceStatus::Transcribing) => "transcribing",
+            Some(cortex::media::voice_loop::VoiceStatus::Idle) | None => "idle",
+        };
+        let transcriber_ready =
+            cortex::media::understanding::AudioTranscriber::from_config(&self.config).is_some();
+        let stt_label = if transcriber_ready {
+            "configured"
+        } else {
+            "MISSING — set audio.enabled + audio.models"
+        };
+        let tts_ready = cortex::media::tts::TtsSynthesizer::from_config(&self.config).is_some();
+        let tts_provider_label = if tts_ready {
+            "configured"
+        } else {
+            "MISSING — set tts.enabled + tts.models"
+        };
+        self.push_system_message(format!(
+            "Voice Mode\n  \
+             Allowed:        {}\n  \
+             Mode:           {}\n  \
+             State:          {}\n  \
+             Auto-submit:    {}\n  \
+             Auto-TTS:       {}\n  \
+             STT provider:   {}\n  \
+             TTS provider:   {}",
+            if enabled {
+                "yes"
+            } else {
+                "no (voice.enabled is false)"
+            },
+            mode_label,
+            status_label,
+            if self.config.voice.auto_submit {
+                "on"
+            } else {
+                "off"
+            },
+            if tts { "on" } else { "off" },
+            stt_label,
+            tts_provider_label,
+        ));
+        Ok(AppAction::Continue)
+    }
+}
+
+/// Which flavor of voice loop `/voice` starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VoiceMode {
+    Continuous,
+    Single,
 }
 
 /// Render a `HandoffStatusReply` as a 3–5 line summary card body.
