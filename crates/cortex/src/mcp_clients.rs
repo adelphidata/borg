@@ -260,6 +260,93 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// One server's runtime view, joining the operator-side config (is it
+/// enabled? what transport?) with the live registry (is it healthy? how
+/// many tools landed?). Returned by [`server_status_snapshot`] for
+/// operator-facing UIs (`/mcp`, `/plugins`, `borg mcp list`).
+#[derive(Debug, Clone)]
+pub struct McpServerSnapshot {
+    /// Operator-chosen server name.
+    pub name: String,
+    /// Transport kind label: `"stdio"`, `"http"`, or `"sse"`.
+    pub transport: &'static str,
+    /// Operator-configured `enabled` flag (per-server).
+    pub config_enabled: bool,
+    /// True if the operator has the server in `mcp.disabled_servers` —
+    /// hides tools live without daemon restart.
+    pub live_disabled: bool,
+    /// Live registry health, if any. `None` means no session has been
+    /// installed yet (e.g. mcp.enabled=false, or daemon never started).
+    pub health: Option<mcp::registry::ServerHealth>,
+    /// Tools currently registered from this server (post-gauntlet).
+    pub tool_count: usize,
+    /// Number of tools that hit the schema gauntlet and were rejected.
+    pub rejected_count: usize,
+}
+
+impl McpServerSnapshot {
+    /// Single source of truth for the lifecycle label rendered in both
+    /// the `/mcp` popup and the `MCP SERVERS` section of `/plugins`.
+    /// Centralising avoids the two views drifting apart — a divergence
+    /// would surface as "the popup says connected but the unified view
+    /// says reconnecting" with no clue which is right.
+    ///
+    /// Precedence: `live_disabled` (operator's runtime kill switch) >
+    /// `!config_enabled` (per-server opt-out) > live registry health.
+    pub fn state_label(&self) -> &'static str {
+        use mcp::registry::ServerHealth;
+        if self.live_disabled {
+            return "live-disabled";
+        }
+        if !self.config_enabled {
+            return "disabled";
+        }
+        match self.health.as_ref() {
+            Some(ServerHealth::Healthy) => "connected",
+            Some(ServerHealth::Reconnecting { .. }) => "reconnecting",
+            Some(ServerHealth::AuthFailed { .. }) => "auth-failed",
+            Some(ServerHealth::Degraded) => "degraded",
+            None => "not-started",
+        }
+    }
+}
+
+/// Snapshot of every configured MCP server, joined with the live
+/// registry. Empty when MCP is globally disabled (`mcp.enabled=false`)
+/// AND no servers are configured. Cheap to call: clones a small
+/// `BTreeMap` of statuses.
+///
+/// Used by the TUI `/mcp` and `/plugins` popups for read-only operator
+/// visibility; the dispatch path uses [`tool_definitions`] and
+/// [`is_server_disabled`] directly.
+pub fn server_status_snapshot(config: &Config) -> Vec<McpServerSnapshot> {
+    let status = REGISTRY.get().map(McpRegistry::status);
+    let mut out: Vec<McpServerSnapshot> = config
+        .mcp
+        .servers
+        .iter()
+        .map(|(name, srv)| {
+            let transport = match &srv.transport {
+                crate::config::TransportSpec::Stdio { .. } => "stdio",
+                crate::config::TransportSpec::Http { .. } => "http",
+                crate::config::TransportSpec::Sse { .. } => "sse",
+            };
+            let live = status.as_ref().and_then(|s| s.servers.get(name));
+            McpServerSnapshot {
+                name: name.clone(),
+                transport,
+                config_enabled: srv.enabled,
+                live_disabled: config.mcp.disabled_servers.iter().any(|d| d == name),
+                health: live.map(|s| s.health.clone()),
+                tool_count: live.map(|s| s.tool_count).unwrap_or(0),
+                rejected_count: live.map(|s| s.rejected_tools.len()).unwrap_or(0),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// True iff `name` belongs to an MCP tool that is safe to fan out in
 /// parallel with other read-only calls. Combines operator opt-in
 /// (`tools.read_only`) with server-advertised `annotations.readOnlyHint`.
@@ -943,6 +1030,211 @@ mod tests {
         assert!(b.try_consume(0, 10).is_some());
         let mut b = TokenBucket::new(10.0);
         assert!(b.try_consume(60, 0).is_some());
+    }
+
+    #[test]
+    fn rate_bucket_refills_over_time() {
+        // Spec invariant: a bucket that has been drained refills at
+        // `per_minute / 60` tokens per second up to `burst`. An off-by-one
+        // in the refill math (e.g. dropping the elapsed-seconds multiplier)
+        // would silently turn the bucket into either "never refills" or
+        // "always full" — both observable only when a real operator hits
+        // the limit, where the failure looks like a flaky network rather
+        // than a configuration regression.
+        //
+        // `60 per minute, burst = 1` is one token per second. After
+        // draining, sleeping 1.1s must restore at least one token; the
+        // next `try_consume` must return `None`.
+        let mut b = TokenBucket::new(1.0);
+        assert!(b.try_consume(60, 1).is_none(), "initial token");
+        assert!(
+            b.try_consume(60, 1).is_some(),
+            "second call must be refused — burst is 1"
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            b.try_consume(60, 1).is_none(),
+            "after 1.1s the bucket must have refilled at least one token"
+        );
+    }
+
+    #[test]
+    fn builtin_tool_names_includes_dispatcher_critical_names() {
+        // Spec: any name in `builtin_tool_names` would silently shadow a
+        // first-class tool if an MCP server registered it. Missing one
+        // means a hostile (or merely careless) MCP server can shadow
+        // `run_shell` and execute arbitrary commands the user thinks are
+        // going to the trusted builtin.
+        let names = builtin_tool_names();
+        for required in [
+            "apply_patch",
+            "run_shell",
+            "read_file",
+            "list_dir",
+            "web_fetch",
+            "web_search",
+            "write_memory",
+            "read_memory",
+            "memory_search",
+            "schedule",
+        ] {
+            assert!(
+                names.contains(&required),
+                "builtin_tool_names missing '{required}' — an MCP server registering \
+                 this name would silently shadow the trusted builtin (full list: {names:?})"
+            );
+        }
+    }
+
+    /// `server_status_snapshot` is the read-only join consumed by the
+    /// TUI's `/mcp` and `/plugins` popups. It must:
+    ///
+    /// - return one row per configured server (regardless of
+    ///   live-registry presence — the registry only populates after
+    ///   `initialize`, but operators expect to see their config rows
+    ///   in `/mcp` immediately);
+    /// - sort by server name (deterministic order — operators scan);
+    /// - propagate the per-server `enabled` flag AND the global
+    ///   `mcp.disabled_servers` live-kill-switch into separate fields
+    ///   (the TUI uses both to render distinct lifecycle states);
+    /// - tag the transport so the popup can render `stdio`/`http`/`sse`
+    ///   without re-walking `TransportSpec` itself.
+    #[test]
+    fn server_status_snapshot_joins_config_with_registry() {
+        use crate::config::{McpServerConfig, TransportSpec};
+        use std::collections::HashMap;
+
+        let mut cfg = crate::config::Config::default();
+        cfg.mcp.enabled = true;
+        cfg.mcp.disabled_servers = vec!["killed".to_string()];
+        cfg.mcp.servers.insert(
+            "zeta".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: TransportSpec::Http {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: HashMap::new(),
+                    auth: Default::default(),
+                },
+                connect_timeout_ms: 60_000,
+                call_timeout_ms: 120_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+            },
+        );
+        cfg.mcp.servers.insert(
+            "alpha".to_string(),
+            McpServerConfig {
+                enabled: false,
+                transport: TransportSpec::Stdio {
+                    command: "uvx".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+                connect_timeout_ms: 60_000,
+                call_timeout_ms: 120_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+            },
+        );
+        cfg.mcp.servers.insert(
+            "killed".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: TransportSpec::Sse {
+                    url: "https://sse.example.com/".to_string(),
+                    headers: HashMap::new(),
+                    auth: Default::default(),
+                },
+                connect_timeout_ms: 60_000,
+                call_timeout_ms: 120_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+            },
+        );
+
+        let snap = server_status_snapshot(&cfg);
+        assert_eq!(snap.len(), 3);
+
+        let names: Vec<&str> = snap.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "killed", "zeta"],
+            "snapshot must be sorted by server name"
+        );
+
+        let alpha = &snap[0];
+        assert_eq!(alpha.transport, "stdio");
+        assert!(!alpha.config_enabled, "per-server disable must propagate");
+        assert!(!alpha.live_disabled);
+
+        let killed = &snap[1];
+        assert_eq!(killed.transport, "sse");
+        assert!(killed.config_enabled);
+        assert!(
+            killed.live_disabled,
+            "mcp.disabled_servers entry must surface as live_disabled — \
+             the TUI relies on this to show that a just-set kill switch \
+             actually took effect"
+        );
+
+        let zeta = &snap[2];
+        assert_eq!(zeta.transport, "http");
+        assert!(zeta.config_enabled);
+        assert!(!zeta.live_disabled);
+        // No `initialize()` ran in this test, so `health` is None for all
+        // rows; tool_count and rejected_count are 0. That's deliberate —
+        // the TUI surfaces `not-started` when health is None.
+        assert!(zeta.health.is_none());
+        assert_eq!(zeta.tool_count, 0);
+        assert_eq!(zeta.rejected_count, 0);
+    }
+
+    /// `state_label()` is the single source of truth for the lifecycle
+    /// string both popups render. The precedence rules matter: a server
+    /// that's enabled in config but live-killed via
+    /// `mcp.disabled_servers` MUST render as `live-disabled` (otherwise
+    /// the operator's runtime kill switch looks like it didn't take),
+    /// and a `Healthy`-but-`!config_enabled` row MUST render as
+    /// `disabled` (not `connected`) since registry health lags config
+    /// changes by a reconnect cycle.
+    #[test]
+    fn state_label_precedence() {
+        use mcp::registry::ServerHealth;
+        let base = McpServerSnapshot {
+            name: "s".to_string(),
+            transport: "stdio",
+            config_enabled: true,
+            live_disabled: false,
+            health: Some(ServerHealth::Healthy),
+            tool_count: 0,
+            rejected_count: 0,
+        };
+
+        // live_disabled wins over everything else.
+        let mut s = base.clone();
+        s.live_disabled = true;
+        s.config_enabled = true;
+        s.health = Some(ServerHealth::Healthy);
+        assert_eq!(s.state_label(), "live-disabled");
+
+        // !config_enabled wins over registry health.
+        let mut s = base.clone();
+        s.config_enabled = false;
+        s.health = Some(ServerHealth::Healthy);
+        assert_eq!(s.state_label(), "disabled");
+
+        // Health labels map directly when enabled + not live-disabled.
+        let mut s = base.clone();
+        s.health = Some(ServerHealth::Healthy);
+        assert_eq!(s.state_label(), "connected");
+        s.health = Some(ServerHealth::Degraded);
+        assert_eq!(s.state_label(), "degraded");
+        s.health = None;
+        assert_eq!(s.state_label(), "not-started");
     }
 
     #[test]

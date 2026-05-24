@@ -17,6 +17,7 @@ mod insert_history;
 mod layout;
 mod line_utils;
 mod markdown;
+mod mcp_popup;
 pub(crate) mod migrate_popup;
 mod model_popup;
 mod pairing_popup;

@@ -25,6 +25,7 @@ use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
 use super::file_search::FileSearchService;
 use super::history::HistoryCell;
+use super::mcp_popup::McpPopup;
 use super::migrate_popup::{MigrateAction, MigratePopup};
 use super::model_popup::ModelPopup;
 use super::pairing_popup::{PairingAction, PairingPopup};
@@ -49,6 +50,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, settings_popup);
         $body!($self, model_popup);
         $body!($self, plugins_popup);
+        $body!($self, mcp_popup);
         $body!($self, pairing_popup);
         $body!($self, sessions_popup);
         $body!($self, schedule_popup);
@@ -457,6 +459,11 @@ pub struct App<'a> {
     pub settings_popup: SettingsPopup,
     pub model_popup: ModelPopup,
     pub plugins_popup: PluginsPopup,
+    /// Read-only operator view of configured MCP servers (`/mcp`).
+    /// Pairs with `/plugins` — the WASM side stays in its own popup
+    /// because the trust models, install verbs, and lifecycle don't
+    /// share enough to fold into one screen.
+    pub mcp_popup: McpPopup,
     /// Number of history cells already emitted to the scrollback above the
     /// inline viewport. Cells `< cells_emitted` were rendered into terminal
     /// scrollback via `insert_history_lines` and must never be re-rendered
@@ -589,6 +596,7 @@ impl<'a> App<'a> {
             settings_popup: SettingsPopup::new(),
             model_popup: ModelPopup::new(),
             plugins_popup: PluginsPopup::new(),
+            mcp_popup: McpPopup::new(),
             cells_emitted: 0,
             pending_scrollback: Vec::new(),
             banner_emitted: false,
@@ -789,6 +797,7 @@ impl<'a> App<'a> {
             || self.subprocesses_popup.is_visible()
             || self.btw_popup.is_visible()
             || self.plugins_popup.is_visible()
+            || self.mcp_popup.is_visible()
     }
 
     /// Toggle the collapsed state on the most recent collapsible tool result.
@@ -2544,6 +2553,97 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert_eq!(app.composer.text(), initial_text);
         assert!(app.status_popup.is_visible());
+    }
+
+    // --- /mcp + /plugin alias dispatch ---
+
+    /// Table-driven coverage that `/mcp` opens the dedicated MCP
+    /// popup, and that `/plugin` is a live alias of `/plugins`
+    /// (operators routinely type the singular form). One row per
+    /// alias keeps any future per-variant divergence obvious in the
+    /// failure message.
+    #[test]
+    fn mcp_and_plugin_alias_open_their_popups() {
+        struct Case {
+            input: &'static str,
+            opens_mcp: bool,
+            opens_plugins: bool,
+        }
+        let cases = [
+            Case {
+                input: "/mcp",
+                opens_mcp: true,
+                opens_plugins: false,
+            },
+            Case {
+                input: "/plugins",
+                opens_mcp: false,
+                opens_plugins: true,
+            },
+            Case {
+                input: "/plugin",
+                opens_mcp: false,
+                opens_plugins: true,
+            },
+            Case {
+                input: "/skills",
+                opens_mcp: false,
+                opens_plugins: true,
+            },
+        ];
+
+        for case in &cases {
+            let mut app = make_app();
+            assert!(
+                !app.mcp_popup.is_visible(),
+                "{}: mcp_popup should start hidden",
+                case.input
+            );
+            assert!(
+                !app.plugins_popup.is_visible(),
+                "{}: plugins_popup should start hidden",
+                case.input
+            );
+
+            let _ = app
+                .handle_submit(case.input)
+                .unwrap_or_else(|e| panic!("{} submit failed: {e}", case.input));
+
+            assert_eq!(
+                app.mcp_popup.is_visible(),
+                case.opens_mcp,
+                "{}: mcp_popup visibility mismatch",
+                case.input
+            );
+            assert_eq!(
+                app.plugins_popup.is_visible(),
+                case.opens_plugins,
+                "{}: plugins_popup visibility mismatch",
+                case.input
+            );
+        }
+    }
+
+    /// Esc must close the `/mcp` popup the same way it closes every
+    /// other routed popup, so muscle memory stays consistent. The
+    /// popup also has to absorb the key — otherwise it would leak to
+    /// the composer and the operator would see an `Esc`-shaped artifact
+    /// in their input line.
+    #[test]
+    fn mcp_popup_esc_dismisses_and_consumes_key() {
+        let mut app = make_app();
+        let _ = app.handle_submit("/mcp").unwrap();
+        assert!(app.mcp_popup.is_visible());
+
+        let initial_text = app.composer.text().to_string();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+
+        assert!(!app.mcp_popup.is_visible(), "Esc must close /mcp popup");
+        assert_eq!(
+            app.composer.text(),
+            initial_text,
+            "Esc routed to /mcp popup must not leak into composer"
+        );
     }
 
     // --- /uninstall ---

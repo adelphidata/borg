@@ -45,6 +45,27 @@ borg mcp remove <id>                       # delete the config entry
 borg mcp test <id>                         # one-shot connect + tools/list, no daemon
 ```
 
+## TUI surface (read-only)
+
+Inside the TUI, two slash commands surface MCP state without dropping to
+a shell. Both are read-only: every mutation (add, remove, disable, test)
+still flows through `borg mcp …` so the trust model — env allowlist,
+DNS pinning, schema gauntlet — stays anchored in one place.
+
+| Command | Effect |
+|---|---|
+| `/mcp` | Open a dedicated popup that lists every configured server with its transport (`stdio`/`http`/`sse`), lifecycle state (`connected`, `reconnecting`, `auth-failed`, `degraded`, `disabled`, `live-disabled`, `not-started`), and live tool count. |
+| `/plugins` (alias: `/plugin`) | The unified plugins/skills/WASM popup also shows an `MCP SERVERS` section so operators see "everything that adds tools to the agent" in one view. |
+
+`live-disabled` rows are the ones the operator has live-killed via
+`borg settings set mcp.disabled_servers=…`; that state wins over the
+per-server `enabled` flag in both popups so a just-applied kill switch
+is visible without restarting borgd. The `/plugins` MCP section
+intentionally does not accept Space-to-toggle — pressing Space on an
+MCP row prints a pointer to `borg mcp disable <id>` instead. The
+schema gauntlet only runs on the install path, so accepting toggles
+inside a popup would be a quiet way to bypass it.
+
 Common flags on `add`:
 
 | Flag | Default | Notes |

@@ -206,7 +206,7 @@ Borg consumes external MCP servers — it does **not** expose itself as an MCP s
 
 **Plan mode trust gate.** MCP tools default to blocked in Plan mode; only tools the operator has explicitly named in per-server `tools.read_only` config are admitted. Server-advertised `annotations.readOnlyHint` is **not** trusted for this — it informs Execute-mode parallel-fanout batching only.
 
-**Operator surface.** `borg mcp {list,add,add-preset,remove,enable,disable,test}`. The `test` verb is standalone — it connects, runs `tools/list`, prints diagnostics, and exits without touching `borgd`. Built-in presets: `time`, `filesystem`, `github`, `notion` (Hermes parity). Kill switches: `mcp.enabled`, `mcp.disabled_servers`, `mcp.max_tools_total`. See `docs/mcp.md`.
+**Operator surface.** `borg mcp {list,add,add-preset,remove,enable,disable,test}`. The `test` verb is standalone — it connects, runs `tools/list`, prints diagnostics, and exits without touching `borgd`. Built-in presets: `time`, `filesystem`, `github`, `notion` (Hermes parity). Inside the TUI, `/mcp` opens a read-only popup with the same listing `borg mcp list` produces; `/plugins` (alias `/plugin`) includes an `MCP SERVERS` section so the unified view of "things that add tools" lives in one place. All mutating verbs stay on the CLI so the env-allowlist + DNS-pinning + schema gauntlet runs in exactly one path. Kill switches: `mcp.enabled`, `mcp.disabled_servers`, `mcp.max_tools_total`. See `docs/mcp.md`.
 
 ### WASM Plugin Sandbox
 

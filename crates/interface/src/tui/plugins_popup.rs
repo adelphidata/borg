@@ -26,6 +26,19 @@ enum ItemKind {
         /// such rows is a no-op and the render shows a `[quarantined]` tag.
         quarantined: bool,
     },
+    /// A configured MCP server. Read-only inside this popup — toggling
+    /// shows a pointer to `borg mcp` instead. Lives here so operators
+    /// can see "everything that adds tools" in one view, but trust-model
+    /// boundaries (signature/HMAC vs env-allowlist+pinned-DNS) stay
+    /// owned by their respective install paths.
+    Mcp {
+        /// Transport label (`stdio`/`http`/`sse`) shown inline.
+        transport: &'static str,
+        /// Human-readable lifecycle state for the trailing tag.
+        state: &'static str,
+        /// Tool count from the live registry.
+        tool_count: usize,
+    },
 }
 
 /// Section heading for the popup grouping. Wraps `plugins::Category` so the
@@ -35,6 +48,7 @@ enum ItemKind {
 enum Section {
     Catalog(Category),
     Wasm,
+    Mcp,
 }
 
 impl Section {
@@ -42,6 +56,7 @@ impl Section {
         match self {
             Self::Catalog(c) => c.to_string(),
             Self::Wasm => "WASM PLUGINS".to_string(),
+            Self::Mcp => "MCP SERVERS".to_string(),
         }
     }
 
@@ -58,6 +73,10 @@ impl Section {
             // the curated marketplace surface so operators read the trusted
             // built-ins first.
             Self::Wasm => 7,
+            // MCP servers last: they're operator-configured external code
+            // at arm's length, and edits flow through `borg mcp` rather
+            // than the popup itself.
+            Self::Mcp => 8,
         }
     }
 }
@@ -205,6 +224,31 @@ impl PluginsPopup {
             }
         }
 
+        // MCP servers — read-only listing. Toggles in this popup point
+        // operators at the `borg mcp` CLI; the trust-boundary checks
+        // (env allowlist, DNS pinning, schema gauntlet) only run on the
+        // CLI path, so accepting toggles here would be a subtle way to
+        // bypass them.
+        for snap in cortex::mcp_clients::server_status_snapshot(config) {
+            let state = snap.state_label();
+            items.push(PluginItem {
+                id: format!("mcp/{}", snap.name),
+                name: snap.name.clone(),
+                section: Section::Mcp,
+                kind: ItemKind::Mcp {
+                    transport: snap.transport,
+                    state,
+                    tool_count: snap.tool_count,
+                },
+                // `original_enabled == toggled` ensures
+                // `compute_pending_actions` never produces an action for
+                // this row, even if the user mashes Space (the handler
+                // also short-circuits Mcp rows for clearer feedback).
+                original_enabled: !snap.live_disabled && snap.config_enabled,
+                toggled: !snap.live_disabled && snap.config_enabled,
+            });
+        }
+
         items.sort_by(|a, b| {
             a.section
                 .order()
@@ -313,6 +357,20 @@ impl PluginsPopup {
                                 format!(
                                     "{} is quarantined; run `borg plugin verify {}` after restoring on-disk files",
                                     item.name, item.id
+                                ),
+                                false,
+                            ));
+                            return None;
+                        }
+                        // MCP server rows are intentionally read-only here:
+                        // enable/disable, transport edits, and the schema
+                        // gauntlet all live on the `borg mcp` CLI path so
+                        // there's one place that owns the trust model.
+                        if let ItemKind::Mcp { .. } = &item.kind {
+                            self.status_message = Some((
+                                format!(
+                                    "{} is an MCP server — manage via `borg mcp disable {}` / `enable` / `remove`",
+                                    item.name, item.name
                                 ),
                                 false,
                             ));
@@ -521,6 +579,10 @@ impl PluginsPopup {
                     // double-check here so a future keybind change cannot
                     // sneak an action through.
                 }
+                ItemKind::Mcp { .. } => {
+                    // MCP rows have no popup-emitted action; the
+                    // Space handler bounces the user to the CLI.
+                }
                 ItemKind::Channel { .. } => {
                     if item.toggled && !item.original_enabled {
                         channel_actions.push((item.id.clone(), true));
@@ -559,31 +621,44 @@ impl PluginsPopup {
 
             row_indices.push(lines.len());
 
-            let check = if item.toggled { "x" } else { " " };
-
-            // Tag quarantined WASM rows so the operator sees the read-only
-            // state at a glance — toggling does nothing for those.
-            let status = match &item.kind {
-                ItemKind::WasmPlugin { quarantined: true } => "  [quarantined]",
-                _ => "",
-            };
-
-            // Platform note for channels
-            let platform_note = if let ItemKind::Channel { def } = &item.kind {
-                if let Some(label) = def.platform.label() {
-                    if !def.platform.is_available() {
-                        format!("  ({label})")
+            // MCP rows render without the toggle checkbox (this popup
+            // never mutates them); other kinds get the `[x]/[ ]` glyph.
+            let label = if let ItemKind::Mcp {
+                transport,
+                state,
+                tool_count,
+            } = &item.kind
+            {
+                let tools = if *tool_count == 1 {
+                    "1 tool".to_string()
+                } else {
+                    format!("{tool_count} tools")
+                };
+                format!(
+                    "  · {name}  ({transport}, {state}, {tools})",
+                    name = item.name
+                )
+            } else {
+                let check = if item.toggled { "x" } else { " " };
+                let status = match &item.kind {
+                    ItemKind::WasmPlugin { quarantined: true } => "  [quarantined]",
+                    _ => "",
+                };
+                let platform_note = if let ItemKind::Channel { def } = &item.kind {
+                    if let Some(label) = def.platform.label() {
+                        if !def.platform.is_available() {
+                            format!("  ({label})")
+                        } else {
+                            String::new()
+                        }
                     } else {
                         String::new()
                     }
                 } else {
                     String::new()
-                }
-            } else {
-                String::new()
+                };
+                format!("  [{check}] {}{status}{platform_note}", item.name)
             };
-
-            let label = format!("  [{check}] {}{status}{platform_note}", item.name,);
 
             let is_selected = i == self.cursor;
             let style = if is_selected {
@@ -739,6 +814,75 @@ mod tests {
         assert!(!popup.items.is_empty(), "items must be loaded on show");
         popup.dismiss();
         assert!(!popup.is_visible());
+    }
+
+    /// When an MCP server is configured, `/plugins` must surface it
+    /// under the "MCP SERVERS" section as a read-only row — operators
+    /// expect "things that add tools to the agent" to live in one
+    /// place. The section sits below WASM plugins so the trusted
+    /// built-ins read first; the popup MUST NOT generate a toggle
+    /// action for MCP rows (those flow through `borg mcp` to keep the
+    /// schema gauntlet on the install path).
+    #[test]
+    fn mcp_section_appears_when_servers_are_configured() {
+        use cortex::config::{McpServerConfig, TransportSpec};
+        use std::collections::HashMap;
+
+        let mut config = cortex::config::Config::default();
+        config.mcp.servers.insert(
+            "time".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: TransportSpec::Stdio {
+                    command: "uvx".to_string(),
+                    args: vec!["mcp-server-time".to_string()],
+                    env: HashMap::new(),
+                },
+                connect_timeout_ms: 60_000,
+                call_timeout_ms: 120_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+            },
+        );
+
+        let mut popup = PluginsPopup::new();
+        let tmp = std::env::temp_dir().join("borg-plugins-mcp-section-test");
+        popup.show(&config, &tmp);
+
+        let mcp_item = popup
+            .items
+            .iter()
+            .find(|i| matches!(i.kind, ItemKind::Mcp { .. }))
+            .expect("an MCP server in config should produce an Mcp item");
+        assert_eq!(mcp_item.section, Section::Mcp);
+        assert_eq!(mcp_item.name, "time");
+
+        // Toggling an MCP row must not produce any action — the popup
+        // is intentionally read-only for MCP, and any drift would let
+        // operators bypass the schema gauntlet by flipping rows here
+        // instead of in the CLI.
+        let mcp_idx = popup
+            .items
+            .iter()
+            .position(|i| matches!(i.kind, ItemKind::Mcp { .. }))
+            .unwrap();
+        popup.cursor = mcp_idx;
+        press(&mut popup, KeyCode::Char(' '));
+        let (immediate, channels) = popup.compute_pending_actions();
+        assert!(
+            immediate.iter().all(|a| !matches!(
+                a,
+                PluginAction::SetSkillEnabled { name, .. } if name == "time"
+            )),
+            "MCP row must not emit a skill-toggle action"
+        );
+        assert!(
+            channels
+                .iter()
+                .all(|(id, _)| id != "time" && id != "mcp/time"),
+            "MCP row must not be queued for channel install/uninstall"
+        );
     }
 
     #[test]

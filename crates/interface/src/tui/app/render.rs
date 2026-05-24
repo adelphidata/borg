@@ -87,6 +87,7 @@ impl<'a> App<'a> {
         self.settings_popup.render(frame, &self.config);
         self.model_popup.render(frame);
         self.plugins_popup.render(frame);
+        self.mcp_popup.render(frame);
         self.pairing_popup.render(frame);
         self.sessions_popup.render(frame);
         self.schedule_popup.render(frame);

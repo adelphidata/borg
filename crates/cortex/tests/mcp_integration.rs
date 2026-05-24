@@ -812,6 +812,162 @@ async fn boundary_breakout_in_payload_is_escaped() {
 }
 
 #[tokio::test]
+async fn global_max_tools_total_caps_registry_and_audits_rejection() {
+    // Spec: `mcp.max_tools_total` is the global ceiling on MCP tools the
+    // LLM ever sees. Two servers each advertising 3 tools, with the cap
+    // set to 4, must register exactly 4 in total and reject the excess
+    // via `mcp_schema_rejected` audit (so an operator can SEE the cap was
+    // hit — silent truncation would look like a missing tool bug). The
+    // *first* server in is preferred because cap-checking is per-call to
+    // `replace_server_tools`; reordering would surface as different
+    // survivors here.
+    let _g = begin_test();
+
+    let mut cfg = enabled_config();
+    cfg.mcp.max_tools_total = 4;
+    let sc = server_config(vec![], 60, 10);
+
+    fn three_tools_responder() -> Box<dyn FnMut(&Value) -> Value + Send> {
+        Box::new(|_| {
+            tools_list(&[
+                ("a", well_formed_schema()),
+                ("b", well_formed_schema()),
+                ("c", well_formed_schema()),
+            ])
+        })
+    }
+
+    let t1 = ScriptedTransport::new();
+    {
+        let mut h = t1.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(methods::TOOLS_LIST.into(), three_tools_responder());
+    }
+    mcp_clients::testing::install_session("s1", &sc, &cfg, Box::new(t1))
+        .await
+        .expect("install s1");
+
+    let t2 = ScriptedTransport::new();
+    {
+        let mut h = t2.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(methods::TOOLS_LIST.into(), three_tools_responder());
+    }
+    mcp_clients::testing::install_session("s2", &sc, &cfg, Box::new(t2))
+        .await
+        .expect("install s2");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names.len(),
+        4,
+        "global cap=4 must hold across servers; got {names:?}"
+    );
+    // s1 went in first and must keep all three; s2 contributes exactly one.
+    let s1_count = names.iter().filter(|n| n.starts_with("mcp_s1_")).count();
+    let s2_count = names.iter().filter(|n| n.starts_with("mcp_s2_")).count();
+    assert_eq!(
+        s1_count, 3,
+        "first server should fill before the cap: {names:?}"
+    );
+    assert_eq!(
+        s2_count, 1,
+        "second server should be capped at the remainder: {names:?}"
+    );
+
+    // The two rejected tools from s2 surface as audit rejections so the
+    // operator isn't left wondering why tools vanished.
+    let rejected = mcp_clients::testing::rejected_for("s2");
+    assert_eq!(
+        rejected.len(),
+        2,
+        "expected 2 cap-rejected tools from s2; got {rejected:?}"
+    );
+    for (_orig, reason) in &rejected {
+        assert!(
+            reason.to_ascii_lowercase().contains("cap")
+                || reason.to_ascii_lowercase().contains("global"),
+            "rejection reason must name the cap; got: {reason}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clean_tool_output_wraps_with_server_and_tool_attributes() {
+    // Spec: every MCP tool result is wrapped in
+    // `<mcp_tool_result server="…" tool="…" trust="untrusted">…</…>` —
+    // not just the injection-flagged ones (that path is covered by
+    // `prompt_injection_payload_is_wrapped_with_warning`). The
+    // `server` and `tool` attributes carry the provenance the prompt
+    // assembler uses to attribute output; an empty attribute would
+    // confuse the trust pipeline downstream. Failure mode: the wrapping
+    // format string is changed in a way that drops attributes silently.
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("echo", well_formed_schema())])),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(|_| text_call_result("hello world")),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("w", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let out = mcp_clients::try_execute_tool("mcp_w_echo", &json!({}))
+        .await
+        .expect("call ok")
+        .expect("got output");
+
+    assert!(
+        out.contains(r#"server="w""#),
+        "missing server attribute; got: {out}"
+    );
+    assert!(
+        out.contains(r#"tool="mcp_w_echo""#),
+        "missing tool attribute; got: {out}"
+    );
+    assert!(
+        out.contains(r#"trust="untrusted""#),
+        "missing trust attribute; got: {out}"
+    );
+    assert!(out.contains("hello world"), "missing payload; got: {out}");
+    // Exactly one open + one close — the wrapper is not duplicated.
+    assert_eq!(
+        out.matches("<mcp_tool_result").count(),
+        1,
+        "wrapper not unique; got: {out}"
+    );
+    assert_eq!(
+        out.matches("</mcp_tool_result>").count(),
+        1,
+        "wrapper close not unique; got: {out}"
+    );
+}
+
+#[tokio::test]
 async fn tools_list_changed_refreshes_registry_without_reconnect() {
     // Spec: when a server emits `notifications/tools/list_changed`, the
     // session task re-issues `tools/list` and the registry now exposes

@@ -459,7 +459,16 @@ fn sanitize_component(s: &str) -> String {
 /// Returns `Err` with a [`SchemaRejectionReason`] if the schema is rejected;
 /// `Ok(())` if it passes.
 pub fn validate_schema(schema: &Value) -> std::result::Result<(), SchemaRejectionReason> {
-    let serialized = serde_json::to_string(schema).unwrap_or_default();
+    // `serde_json::to_string(&Value)` is infallible on the current `Value`
+    // type — re-serialization can't fail. If that ever changes (e.g. a swap
+    // to `RawValue`), treat the failure as "too large to size-check safely"
+    // and refuse rather than waving the schema through with bytes=0.
+    let serialized = match serde_json::to_string(schema) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(SchemaRejectionReason::TooLarge { bytes: usize::MAX });
+        }
+    };
     if serialized.len() > MAX_SCHEMA_BYTES {
         return Err(SchemaRejectionReason::TooLarge {
             bytes: serialized.len(),
@@ -578,6 +587,34 @@ mod tests {
         });
         let err = validate_schema(&s).unwrap_err();
         assert!(matches!(err, SchemaRejectionReason::TooLarge { .. }));
+    }
+
+    /// Regression for the silent-swallow bug: `validate_schema` used to
+    /// call `serde_json::to_string(...).unwrap_or_default()`, which
+    /// would collapse any serialization failure to an empty string and
+    /// then *pass* the size check on `bytes == 0`. `serde_json::Value`
+    /// can't actually fail to re-serialize, so the bug was latent — but
+    /// the gauntlet must still report the correct size for a *real*
+    /// oversize schema rather than masking it. This test pins that the
+    /// reported `bytes` reflects the actual serialized length, not the
+    /// fallback default. A regression that re-introduces the swallow
+    /// would either return `bytes == 0` (gauntlet bypassed) or skip the
+    /// reject entirely.
+    #[test]
+    fn schema_gauntlet_reports_real_byte_count_on_oversize() {
+        let payload = "x".repeat(MAX_SCHEMA_BYTES + 100);
+        let s = json!({ "type": "object", "description": payload });
+        let err = validate_schema(&s).unwrap_err();
+        match err {
+            SchemaRejectionReason::TooLarge { bytes } => {
+                assert!(
+                    bytes > MAX_SCHEMA_BYTES,
+                    "reported {bytes} bytes must exceed cap {MAX_SCHEMA_BYTES}; \
+                     a bytes==0 result would mean the size check was bypassed"
+                );
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 
     #[test]

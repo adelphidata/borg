@@ -81,7 +81,8 @@ impl App<'_> {
                 self.model_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::Continue));
             }
-            "/plugins" => return Some(self.cmd_plugins()),
+            "/plugins" | "/plugin" => return Some(self.cmd_plugins()),
+            "/mcp" => return Some(self.cmd_mcp()),
             "/schedule-tasks" | "/schedule" => {
                 let client = self.client.clone();
                 self.schedule_popup.show(&client);
@@ -494,6 +495,15 @@ impl App<'_> {
             self.push_system_message("Error: could not determine data directory".to_string());
             Ok(AppAction::Continue)
         }
+    }
+
+    /// `/mcp` — read-only listing of configured MCP servers. Mutating
+    /// operations (`add`, `remove`, `disable`, `test`) still flow
+    /// through the `borg mcp` CLI so the trust model stays anchored
+    /// in one place; this popup is the TUI parity for `borg mcp list`.
+    fn cmd_mcp(&mut self) -> Result<AppAction> {
+        self.mcp_popup.show(&self.config);
+        Ok(AppAction::EnterAltScreen)
     }
 
     fn cmd_new(&mut self) -> Result<AppAction> {
