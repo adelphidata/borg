@@ -248,6 +248,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::mcp::McpAction>,
     },
+    /// Manage the browser CDP connection (connect|disconnect|status). Parity
+    /// with the in-TUI `/browser` slash command.
+    Browser {
+        #[command(subcommand)]
+        action: Option<commands::browser::BrowserAction>,
+    },
     /// Run Borg as an Agent Client Protocol (ACP) server over stdio
     Acp,
     /// Manage LLM providers (BYO endpoints, rate-card refresh)
@@ -617,6 +623,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Auth { action }) => commands::auth::dispatch_auth(action)?,
         Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action).await?,
         Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
+        Some(Commands::Browser { action }) => commands::browser::dispatch_browser(action).await?,
         Some(Commands::Acp) => unreachable!("ACP handled before interactive bootstrap"),
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
         Some(Commands::Export {

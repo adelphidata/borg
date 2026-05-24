@@ -147,6 +147,33 @@ service Admin {
   rpc CompleteHandoff(SessionRef) returns (Empty);
   rpc FailHandoff(HandoffFailRequest) returns (Empty);
   rpc GetHandoffStatus(SessionRef) returns (HandoffStatusReply);
+
+  // Browser CDP attach — `/browser connect|disconnect|status` and
+  // `borg browser …` both route through this single RPC so the URL
+  // parsing + reachability probe + DB-settings persistence live in one
+  // place. When `cdp_url` is set, the browser tool calls
+  // `chromiumoxide::Browser::connect(url)` instead of launching its own
+  // headless Chrome; this lets the agent share the user's live profile.
+  rpc BrowserManage(BrowserManageRequest) returns (BrowserManageResponse);
+}
+
+message BrowserManageRequest {
+  // "connect" | "disconnect" | "status".
+  string action = 1;
+  // For "connect": optional CDP URL. Empty means use the default
+  // (http://127.0.0.1:9222) and auto-launch a Chromium-family browser
+  // when nothing is listening yet.
+  string url = 2;
+}
+
+message BrowserManageResponse {
+  // True iff `browser.cdp_url` is currently set and reachable.
+  bool connected = 1;
+  // The CDP URL the daemon resolved to (empty when not connected).
+  string url = 2;
+  // Human-readable progress / diagnostic lines for the TUI transcript
+  // and CLI stdout (probe results, auto-launch attempts, etc.).
+  repeated string messages = 3;
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }

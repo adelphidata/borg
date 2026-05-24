@@ -24,20 +24,21 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
     ActivityLogQuery, ActivityLogText, AddCredentialRequest, AddProviderRequest, AmbientStatus,
     ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList,
-    ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest, CreateWebhookResponse,
-    CredentialEntry, CredentialList, DaemonStatus, DoctorSquelchClearRequest,
-    DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty, ExportSessionRequest,
-    ExportSessionResponse, GetScheduledTaskRunsRequest, GoalDetail, GoalEvent as PbGoalEvent,
-    GoalMutation, GoalRef, HandoffFailRequest, HandoffRequest as AdminHandoffRequest,
-    HandoffStatusReply, HealReport, HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest,
-    IssueClientTokenResponse, ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal,
-    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest,
-    ResetCredentialsRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
-    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
-    ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SetCredentialStrategyRequest,
-    SetSubprocessPinnedRequest, SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot,
-    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
+    ApprovedSenderRef, BrowserManageRequest, BrowserManageResponse, ClientTokenRef,
+    CreateWebhookRequest, CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
+    DoctorSquelchClearRequest, DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty,
+    ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, GoalDetail,
+    GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HandoffFailRequest,
+    HandoffRequest as AdminHandoffRequest, HandoffStatusReply, HealReport,
+    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
+    ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost,
+    OnboardingState, PairingApproval, PairingFilter, PairingRequestList, PluginInstallRequest,
+    PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
+    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
+    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
+    TunnelStatusReply, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -572,6 +573,26 @@ impl DaemonClient {
             .await
             .context("Admin.TunnelStop failed")?;
         Ok(())
+    }
+
+    /// Manage the browser CDP attach setting. `action` is one of
+    /// `"connect"`, `"disconnect"`, `"status"`; `url` is only honored for
+    /// `"connect"` and may be empty to use the default.
+    pub async fn browser_manage(
+        &mut self,
+        action: &str,
+        url: Option<&str>,
+    ) -> Result<BrowserManageResponse> {
+        let reply = self
+            .admin
+            .browser_manage(BrowserManageRequest {
+                action: action.to_string(),
+                url: url.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.BrowserManage failed")?
+            .into_inner();
+        Ok(reply)
     }
 
     /// Snapshot of the daemon's tunnel state.

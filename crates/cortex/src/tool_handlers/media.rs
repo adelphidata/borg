@@ -146,11 +146,49 @@ pub async fn handle_browser(
         }
     }
 
-    // Lazy-launch browser session
+    // Drop any active session whose attach mode no longer matches the live
+    // setting — `/browser connect` and `/browser disconnect` take effect on
+    // the very next tool call without needing an explicit signal.
+    if let Some(s) = session.as_ref() {
+        let live = config.browser.cdp_url.as_deref();
+        if crate::browser::cdp_attach::should_reconnect(s.connection_url(), live) {
+            tracing::info!(
+                prev = ?s.connection_url(),
+                next = ?live,
+                "browser CDP setting drifted — closing prior session",
+            );
+            if let Some(prev) = session.take() {
+                // Close failures are non-fatal (CDP channel may already be
+                // dead) but must be logged per CLAUDE.md's no-silent-swallow
+                // rule — without this, a broken disconnect path is invisible.
+                if let Err(e) = prev.close().await {
+                    tracing::warn!(error = %e, "failed to close prior browser session before reattach");
+                }
+            }
+        }
+    }
+
+    // Lazy-launch (or connect to) a browser session.
     if session.is_none() {
-        match BrowserSession::launch(&config.browser).await {
+        let result = match config.browser.cdp_url.as_deref() {
+            Some(url) => BrowserSession::connect(&config.browser, url).await,
+            None => BrowserSession::launch(&config.browser).await,
+        };
+        match result {
             Ok(s) => *session = Some(s),
-            Err(e) => return Ok(ToolOutput::Text(format!("Error launching browser: {e}"))),
+            Err(e) => {
+                let hint = if let Some(url) = config.browser.cdp_url.as_deref() {
+                    format!(
+                        "Error opening browser session via CDP at {url}: {e}\n\
+                         Hint: the configured browser may have exited or stopped serving CDP. \
+                         Run `/browser disconnect` to revert to headless, or relaunch the browser \
+                         with --remote-debugging-port and retry `/browser connect`."
+                    )
+                } else {
+                    format!("Error launching browser: {e}")
+                };
+                return Ok(ToolOutput::Text(hint));
+            }
         }
     }
 

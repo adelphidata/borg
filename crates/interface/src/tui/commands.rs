@@ -100,6 +100,7 @@ impl App<'_> {
             }
             "/poke" => return Some(self.cmd_poke()),
             "/terminal-setup" => return Some(self.cmd_terminal_setup("")),
+            "/browser" => return Some(self.cmd_browser("")),
             "/cancel" | "/stop" | "/abort" => return Some(self.cmd_cancel()),
             "/restart" => return Some(Ok(AppAction::RestartGateway)),
             "/compact" => return Some(Ok(AppAction::CompactHistory)),
@@ -170,6 +171,10 @@ impl App<'_> {
         // Prefix commands
         if let Some(rest) = trimmed.strip_prefix("/logs ") {
             return Some(self.handle_logs_command(Some(rest.trim())));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/browser ") {
+            return Some(self.cmd_browser(rest.trim()));
         }
 
         if trimmed == "/mode" {
@@ -793,6 +798,70 @@ impl App<'_> {
 
         self.push_system_message(format!("Updated: provider = {provider}, model = {model}"));
         Ok(AppAction::ConfigReloaded)
+    }
+
+    /// `/browser [connect|disconnect|status] [url]` — manage CDP attach.
+    /// Default action when no args is `status`. The Admin RPC owns URL
+    /// parsing, reachability probing, optional auto-launch, and DB
+    /// persistence — this handler just renders the daemon's `messages`
+    /// list and final connection state to the transcript.
+    fn cmd_browser(&mut self, arg: &str) -> Result<AppAction> {
+        let arg = arg.trim();
+        let (action, url): (&str, Option<&str>) = if arg.is_empty() {
+            ("status", None)
+        } else {
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            let act = parts.next().unwrap_or("").to_lowercase();
+            let url = parts.next().map(str::trim).filter(|s| !s.is_empty());
+            match act.as_str() {
+                "connect" | "disconnect" | "status" => {
+                    return self.run_browser_rpc(act.as_str(), url);
+                }
+                _ => {
+                    self.push_system_message(
+                        "Usage: /browser [connect|disconnect|status] [url]".to_string(),
+                    );
+                    return Ok(AppAction::Continue);
+                }
+            }
+        };
+        self.run_browser_rpc(action, url)
+    }
+
+    fn run_browser_rpc(&mut self, action: &str, url: Option<&str>) -> Result<AppAction> {
+        let client = self.client.clone();
+        let action_owned = action.to_string();
+        let url_owned = url.map(std::string::ToString::to_string);
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.browser_manage(&action_owned, url_owned.as_deref()).await
+            })
+        });
+        match result {
+            Ok(reply) => {
+                for line in &reply.messages {
+                    self.push_system_message(line.clone());
+                }
+                let summary = match action {
+                    "status" if reply.connected => {
+                        format!("browser connected: {}", reply.url)
+                    }
+                    "status" => "browser not connected (try /browser connect [url])".to_string(),
+                    "connect" if reply.connected => {
+                        format!("browser connected: {}", reply.url)
+                    }
+                    "connect" => "browser not connected — see messages above".to_string(),
+                    "disconnect" => "browser reverted to default (headless local)".to_string(),
+                    _ => return Ok(AppAction::Continue),
+                };
+                self.push_system_message(summary);
+            }
+            Err(e) => {
+                self.push_system_message(format!("/browser failed: {e}"));
+            }
+        }
+        Ok(AppAction::Continue)
     }
 
     fn cmd_poke(&mut self) -> Result<AppAction> {

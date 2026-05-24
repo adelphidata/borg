@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod cdp_attach;
 pub mod console;
 pub mod detection;
 pub mod health;
@@ -44,6 +45,12 @@ pub struct BrowserSession {
     /// `switch_tab`, and `close_tab` — stale refs cannot leak across
     /// pages because the underlying DOM is different.
     snapshot_refs: HashMap<String, String>,
+    /// CDP URL this session is attached to. `None` for sessions launched
+    /// via `BrowserSession::launch` (borg owns the Chrome process); `Some`
+    /// for sessions opened via [`Self::connect`]. Compared against
+    /// `config.browser.cdp_url` on every tool call so changes to the
+    /// `/browser connect|disconnect` setting take effect on the next call.
+    connected_url: Option<String>,
 }
 
 impl BrowserSession {
@@ -132,7 +139,70 @@ impl BrowserSession {
             config: config.clone(),
             _registry_guard: registry_guard,
             snapshot_refs: HashMap::new(),
+            connected_url: None,
         })
+    }
+
+    /// Attach to an already-running Chromium-family browser exposing a CDP
+    /// endpoint. Set via `/browser connect` — the agent then shares the user's
+    /// live profile/cookies instead of operating in a fresh headless instance.
+    ///
+    /// The URL is expected to be the canonical form produced by
+    /// [`cdp_attach::parse_cdp_url`]: `http(s)://host:port` for the discovery
+    /// API, or `ws(s)://host:port/devtools/browser/<id>` for a specific
+    /// browser endpoint. No process registry guard is taken — the Chromium
+    /// process is owned by the user.
+    #[instrument(skip_all, fields(browser.action = "connect"))]
+    pub async fn connect(config: &BorgBrowserConfig, cdp_url: &str) -> Result<Self> {
+        // chromiumoxide's connect() accepts an http(s) or ws(s) URL; for the
+        // discovery API form it issues a `/json/version` request itself and
+        // upgrades to the browser ws endpoint.
+        let launch_timeout = Duration::from_millis(config.startup_timeout_ms);
+        let (browser, mut handler) =
+            tokio::time::timeout(launch_timeout, Browser::connect(cdp_url))
+                .await
+                .with_context(|| format!("Browser connect timed out for {cdp_url}"))?
+                .with_context(|| format!("Failed to connect to CDP at {cdp_url}"))?;
+
+        let event_handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+        // Always open a fresh about:blank tab. Reusing whatever `pages()`
+        // returns first is non-deterministic (CDP `Target.getTargets` order
+        // is unspecified and includes background pages / extensions on some
+        // Chrome builds), and it would land the agent on whatever sensitive
+        // tab — banking, email — the user happened to have focused. A new
+        // tab is visible in the user's tab strip so the agent's actions are
+        // observable, and the user can drag it elsewhere if they want.
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .context("Failed to create initial page on CDP connection")?;
+
+        let event_buffers = console::EventBuffers::new(
+            config.console_buffer_size,
+            config.error_buffer_size,
+            config.network_buffer_size,
+        );
+
+        let event_listener_handles = console::spawn_event_listeners(&page, &event_buffers).await;
+
+        Ok(Self {
+            browser,
+            tab_manager: tabs::TabManager::new(page),
+            _event_handle: event_handle,
+            event_listener_handles,
+            event_buffers,
+            config: config.clone(),
+            _registry_guard: None,
+            snapshot_refs: HashMap::new(),
+            connected_url: Some(cdp_url.to_string()),
+        })
+    }
+
+    /// CDP URL this session is attached to, or `None` when borg launched
+    /// the Chrome process itself.
+    pub fn connection_url(&self) -> Option<&str> {
+        self.connected_url.as_deref()
     }
 
     // -- Health & Recovery --
@@ -163,19 +233,31 @@ impl BrowserSession {
             }
         }
 
-        // Full relaunch
+        // Full relaunch. Refs are tied to the now-defunct DOM — drop them
+        // immediately so a stale `@e<N>` cannot accidentally resolve to a
+        // different element on the recovered page (snapshot_refs.clear()
+        // also satisfies the `snapshot_refs_cleared_on_tab_changes` guard).
         self.abort_listeners();
-        let new_session = Self::launch(&self.config).await?;
+        self.snapshot_refs.clear();
+        // Preserve the session's attach mode — if we were attached to an
+        // external CDP endpoint, reattach to it rather than silently
+        // downgrading to headless. The operator's mental model is "I'm
+        // driving my live Chrome"; quietly swapping in a fresh headless
+        // instance would break that without surfacing why.
+        let new_session = match self.connected_url.clone() {
+            Some(url) => Self::connect(&self.config, &url).await?,
+            None => Self::launch(&self.config).await?,
+        };
 
         self.browser = new_session.browser;
         self.tab_manager = new_session.tab_manager;
         self._event_handle = new_session._event_handle;
         self.event_listener_handles = new_session.event_listener_handles;
         self.event_buffers = new_session.event_buffers;
-        // Refs were tied to the now-defunct DOM — drop them so a stale
-        // `@e<N>` cannot accidentally resolve to a different element on
-        // the recovered page.
-        self.snapshot_refs.clear();
+        // `connected_url` already matches what we recovered to (it was
+        // cloned from `self`); re-assign for clarity and so a future
+        // refactor of recovery can't drop it.
+        self.connected_url = new_session.connected_url;
 
         tracing::info!("Browser recovery: full relaunch complete");
         Ok(())
@@ -923,6 +1005,7 @@ mod tests {
             network_buffer_size: 500,
             js_eval_timeout_ms: 10000,
             snapshot_max_elements: 100,
+            cdp_url: None,
         };
         let result = BrowserSession::launch(&config).await;
         assert!(result.is_err());

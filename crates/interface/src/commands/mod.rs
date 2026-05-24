@@ -2,6 +2,7 @@ pub(crate) mod acp;
 pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backup;
+pub(crate) mod browser;
 pub(crate) mod client_token;
 pub(crate) mod device_pair;
 pub(crate) mod doctor;

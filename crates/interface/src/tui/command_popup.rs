@@ -80,6 +80,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "Manage skills (alias of /plugins)"),
     ("/schedule", "Manage schedules"),
     ("/migrate", "Import from another agent"),
+    (
+        "/browser",
+        "Manage browser CDP connection (connect|disconnect|status)",
+    ),
     ("/restart", "Restart gateway server"),
     ("/xp", "Show XP summary and feed"),
     ("/exit", "Exit Borg chat"),

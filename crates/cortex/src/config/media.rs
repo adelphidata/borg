@@ -112,6 +112,13 @@ pub struct BrowserConfig {
     /// Cap on the number of elements `browser.snapshot` returns. Default
     /// 100; dense pages would otherwise dominate the LLM's context budget.
     pub snapshot_max_elements: usize,
+    /// Optional Chrome DevTools Protocol endpoint to attach to instead of
+    /// launching a fresh headless Chrome. Set via `/browser connect` or
+    /// `borg browser connect`; cleared by `/browser disconnect`. When `Some`,
+    /// the browser tool uses `chromiumoxide::Browser::connect(url)` so the
+    /// agent shares the user's already-running Chromium profile/cookies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_url: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -129,6 +136,7 @@ impl Default for BrowserConfig {
             network_buffer_size: constants::BROWSER_NETWORK_BUFFER_SIZE,
             js_eval_timeout_ms: constants::BROWSER_JS_EVAL_TIMEOUT_MS,
             snapshot_max_elements: constants::BROWSER_SNAPSHOT_MAX_ELEMENTS,
+            cdp_url: None,
         }
     }
 }

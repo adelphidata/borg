@@ -90,6 +90,28 @@ networking-bundle PR. The App Attest verifier is the one remaining gap.
   iMessage in a future session instead of re-implementing per-platform
   toggles ad hoc.
 
+## Browser CDP attach
+
+The `/browser connect|disconnect|status` slash command and the matching
+`borg browser …` CLI let the agent attach to a user's live Chromium over
+Chrome DevTools Protocol and share that profile/cookies instead of always
+launching a fresh headless instance. Two follow-ups were intentionally
+deferred:
+
+- **Cloud / managed-browser providers.** Borg has no `BrowserProvider`
+  trait + plugin registration today — the browser tool only supports
+  local-headless launch and local-CDP-attach. A future pass should add a
+  provider trait, wire it through the WASM/MCP plugin surfaces, and let
+  `/browser` toggle between local-headless, local-attached-CDP, and
+  remote managed endpoints (e.g. browserless-style cloud browsers).
+  Deferred from the initial `/browser` CDP-attach pass.
+- **TUI browser pane / screenshot overlay.** Today `/browser` only emits
+  sys-messages into the transcript. A future pane that renders the live
+  page would need to coexist with the mouse-interaction invariant in
+  `CLAUDE.md` (no `?1000h`/mouse-capture escapes in the inline viewport),
+  so it's a non-trivial design problem rather than a drop-in. Deferred
+  from the initial `/browser` CDP-attach pass.
+
 ## Headless KEK — passphrase lifecycle
 
 The headless-VPS path (`security.kek_backend = file`) ships in v0.1.x as
