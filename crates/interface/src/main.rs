@@ -61,6 +61,7 @@ mod openrouter_catalog;
 mod plugins;
 mod repl;
 mod terminal_guard;
+mod terminal_setup;
 mod tui;
 
 #[derive(Parser)]

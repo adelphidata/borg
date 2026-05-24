@@ -93,6 +93,7 @@ impl App<'_> {
                 return Some(Ok(AppAction::EnterAltScreen));
             }
             "/poke" => return Some(self.cmd_poke()),
+            "/terminal-setup" => return Some(self.cmd_terminal_setup("")),
             "/cancel" | "/stop" | "/abort" => return Some(self.cmd_cancel()),
             "/restart" => return Some(Ok(AppAction::RestartGateway)),
             "/compact" => return Some(Ok(AppAction::CompactHistory)),
@@ -310,6 +311,10 @@ impl App<'_> {
             return Some(self.cmd_uninstall());
         }
 
+        if let Some(rest) = trimmed.strip_prefix("/terminal-setup ") {
+            return Some(self.cmd_terminal_setup(rest));
+        }
+
         // Reject unknown slash commands
         if trimmed.starts_with('/') {
             self.push_system_message(format!(
@@ -348,6 +353,7 @@ impl App<'_> {
              /heal      - Run the self-healing maintenance sweep on demand\n  \
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
+             /terminal-setup [target] - Install IDE terminal keybindings (auto|vscode|cursor|windsurf)\n  \
              /pairing   - Manage sender pairing\n  \
              /pairing approve <code> - Approve a pairing request\n  \
              /pairing <code> - Approve (shortcut)\n  \
@@ -832,6 +838,49 @@ impl App<'_> {
                 tracing::warn!(error = %e, "on-demand /heal: daemon heal RPC failed");
                 self.push_system_message(format!("Self-healing failed: {e}"));
             }
+        }
+        Ok(AppAction::Continue)
+    }
+
+    /// `/terminal-setup [auto|vscode|cursor|windsurf]` — install IDE terminal
+    /// keybindings so the TUI receives multiline-submit and undo/redo keys
+    /// rather than having the IDE swallow them. Default is auto-detect.
+    fn cmd_terminal_setup(&mut self, arg: &str) -> Result<AppAction> {
+        use crate::terminal_setup as ts;
+
+        let target = match ts::parse_terminal_setup_target(arg) {
+            Ok(t) => t,
+            Err(bad) => {
+                self.push_system_message(format!(
+                    "usage: /terminal-setup [auto|vscode|cursor|windsurf]\n\
+                     unrecognized target: {bad}"
+                ));
+                return Ok(AppAction::Continue);
+            }
+        };
+
+        let Some(home) = dirs::home_dir() else {
+            self.push_system_message(
+                "/terminal-setup: could not determine home directory".to_string(),
+            );
+            return Ok(AppAction::Continue);
+        };
+
+        let env = ts::ProcessEnv;
+        let fs = ts::RealFileOps;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let os = ts::Os::current();
+
+        let result = match target {
+            Some(t) => ts::configure_terminal_keybindings(t, os, &env, &home, &fs, &now_iso),
+            None => ts::configure_detected_terminal_keybindings(os, &env, &home, &fs, &now_iso),
+        };
+
+        self.push_system_message(result.message);
+        if result.success && result.requires_restart {
+            self.push_system_message(
+                "Restart the IDE terminal for the new keybindings to take effect.".to_string(),
+            );
         }
         Ok(AppAction::Continue)
     }
