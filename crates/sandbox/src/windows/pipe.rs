@@ -27,7 +27,7 @@
 //! `OpenProcess(PROCESS_DUP_HANDLE, ...)` on the parent and call
 //! `DuplicateHandle` to grab a copy of the read-end. Default Windows
 //! ACLs allow same-session, same-integrity processes to do this. The
-//! Phase 7 elevated-runner named-pipe transport closes that gap by
+//! elevated-runner named-pipe transport closes that gap by
 //! authenticating the caller via the pipe's security descriptor.
 
 use std::io;

@@ -10,8 +10,6 @@
 //! Top-level argument names (the `properties` keys) are preserved through
 //! every pass so the model still knows *what* arguments exist; only the
 //! description of *what they accept* is allowed to degrade.
-//!
-//! Mirrors the codex `compact_large_tool_schema` waterfall (PR #23904).
 
 use serde_json::Value;
 

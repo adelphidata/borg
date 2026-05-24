@@ -1,6 +1,6 @@
 //! Named-pipe IPC between trampoline and elevated runner.
 //!
-//! Replaces the Phase 1 anonymous-pipe transport once Tier 2 is
+//! Replaces the anonymous-pipe transport once Tier 2 is
 //! active. Named pipes carry their own security descriptor, which
 //! the trampoline can use to *authenticate* the caller — closing the
 //! same-session same-integrity `DuplicateHandle` gap that the

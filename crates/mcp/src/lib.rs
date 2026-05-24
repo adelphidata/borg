@@ -27,8 +27,8 @@
 //!   pinned to `rustls-tls` with default features off) so the verifier
 //!   behaviour is identical on macOS / Linux / CI.
 //!
-//! Phase 1 covers MCP *tools* only. Resources, prompts, sampling, and
-//! borg-as-MCP-server are deferred.
+//! Covers MCP *tools* only. Resources, prompts, sampling, and
+//! borg-as-MCP-server are out of scope.
 #![warn(missing_docs)]
 #![cfg_attr(
     test,

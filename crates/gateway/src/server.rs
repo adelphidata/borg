@@ -1451,10 +1451,9 @@ mod tests {
         // Source-grep guard: both webhook entry points must instantiate a
         // GatewayTimer at the top so all early-return paths are timed. If a
         // future edit removes one, the gateway_duration histogram silently
-        // becomes a partial sample of webhook traffic — exactly the bug this
-        // change fixed. Acceptable per CLAUDE.md's source-grep allowance:
-        // the invariant ("every webhook entry point starts a timer") is not
-        // type-expressible.
+        // becomes a partial sample of webhook traffic. The invariant ("every
+        // webhook entry point starts a timer") is not type-expressible, hence
+        // the source-grep guard.
         let src = include_str!("server.rs");
         let webhook_idx = src
             .find("async fn webhook_handler")

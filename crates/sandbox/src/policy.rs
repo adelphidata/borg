@@ -28,7 +28,7 @@ pub struct SandboxPolicy {
 ///
 /// The optional `_resources` field carries OS handles or other RAII
 /// guards whose lifetime must outlive `Command::spawn()`. The current
-/// user is the Windows trampoline (Phase 1): `wrap_windows` allocates
+/// user is the Windows trampoline: `wrap_windows` allocates
 /// an anonymous pipe, writes the framed `SpawnRequest` into it, marks
 /// the read-end inheritable, embeds that handle's value on the
 /// trampoline argv, and stashes the parent's copy here. The Drop
@@ -47,7 +47,7 @@ pub struct SandboxCommand {
     /// Command-line arguments.
     pub args: Vec<String>,
     /// OS-side resources held for the lifetime of this command. See
-    /// the type-level docs for the Phase 1 pipe-IPC use case.
+    /// the type-level docs for the Windows trampoline pipe-IPC use case.
     pub(crate) _resources: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 

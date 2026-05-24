@@ -109,7 +109,7 @@ pub struct BrowserConfig {
     pub network_buffer_size: usize,
     /// Inner JS evaluation timeout in ms for Promise.race wrapper (default: 10000).
     pub js_eval_timeout_ms: u64,
-    /// Cap on the number of elements `browser.snapshot` returns. Hermes uses
+    /// Cap on the number of elements `browser.snapshot` returns. Default
     /// 100; dense pages would otherwise dominate the LLM's context budget.
     pub snapshot_max_elements: usize,
 }

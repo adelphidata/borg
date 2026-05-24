@@ -29,7 +29,7 @@
 //!
 //! # Status — scaffolding only
 //!
-//! The Phase 7 code in this directory lays out the module structure,
+//! The code in this directory lays out the module structure,
 //! the on-disk `setup.json` schema, the named-pipe message protocol,
 //! and the auto-promote detection logic. The operational paths
 //! (`NetUserAdd` to create accounts, `LogonUserW` to obtain a sandbox-

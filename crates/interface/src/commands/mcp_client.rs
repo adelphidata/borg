@@ -375,7 +375,7 @@ async fn persist_server(id: &str, server: McpServerConfig, force: bool) -> Resul
 /// Optimistic-CAS read-modify-write on the `mcp.servers` JSON setting.
 ///
 /// libsql's WAL mode allows concurrent writers (borgd's settings writer +
-/// standalone `borg` CLI processes per CLAUDE.md). A naive read-then-write
+/// standalone `borg` CLI processes). A naive read-then-write
 /// can lose entries when two `borg mcp add` invocations interleave — both
 /// read the same prior JSON, both insert, the later `set_setting` wins, and
 /// the earlier entry is silently dropped.
@@ -467,9 +467,8 @@ fn truncate(s: &str, n: usize) -> String {
 /// time the server actually runs it pulls the underlying binary via
 /// `npx`/`uvx`, so operators control the install moment.
 ///
-/// Keep the list short. Hermes (the reference Python agent) ships exactly
-/// these four — copying the same set keeps mental overhead low while still
-/// covering the whole transport matrix:
+/// Keep the list short. These four cover the whole transport matrix while
+/// keeping the mental overhead of picking a preset low:
 ///
 /// - `time` exercises stdio with no secrets (smoke test).
 /// - `filesystem` exercises stdio with a scoped path argument.

@@ -2,7 +2,7 @@
 //!
 //! Seals sandbox-account credentials so they aren't readable as
 //! plaintext from `~/.borg/sandbox-windows/setup.json`. Used by the
-//! Phase 7 elevated-runner provisioning step: the install pass
+//! elevated-runner provisioning step: the install pass
 //! generates a random password for `BorgSandboxOffline` /
 //! `BorgSandboxOnline`, seals it with DPAPI, and stores the blob.
 //! The trampoline / runner unseals on startup before calling

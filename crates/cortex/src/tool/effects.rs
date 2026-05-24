@@ -177,7 +177,7 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// `Delete File` headers) from an `apply_patch` call.
 ///
 /// Header matching is **column-0 only** — patch body content lines start
-/// with `+`, `-`, or space (per CLAUDE.md patch DSL), so a header-like
+/// with `+`, `-`, or space in the patch DSL, so a header-like
 /// string embedded in a content line will have a leading prefix character
 /// and will correctly be ignored.
 ///

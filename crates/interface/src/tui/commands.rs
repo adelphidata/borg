@@ -1059,10 +1059,9 @@ impl App<'_> {
                 Ok(AppAction::Continue)
             }
             GoalSubcommand::BareEdit => {
-                // Codex's `/goal edit` opens an editor popup; borg has no goal
-                // editor surface, so the closest parity is an explicit usage
-                // error. Without this guard the literal text "edit" would be
-                // accepted as an objective.
+                // Borg has no goal-editor popup, so surface an explicit
+                // usage error. Without this guard the literal text "edit"
+                // would be accepted as an objective.
                 self.push_system_message(
                     "Usage: /goal edit <text> — replace the current objective.".to_string(),
                 );
@@ -1277,9 +1276,8 @@ pub(super) enum GoalSubcommand {
     Pause,
     /// `/goal resume`.
     Resume,
-    /// `/goal edit` (bare) — codex opens an editor; borg has none, so this
-    /// surfaces a usage error rather than silently setting the objective
-    /// to the literal text "edit".
+    /// `/goal edit` (bare) — surfaces a usage error rather than silently
+    /// setting the objective to the literal text "edit".
     BareEdit,
     /// `/goal edit ` (trailing whitespace, empty objective).
     EmptyObjective,
@@ -1570,10 +1568,9 @@ mod tests {
 
     #[test]
     fn parse_goal_subcommand_non_numeric_budget_is_usage() {
-        // `--budget abc` is operator typo, not "objective starts with the
-        // literal text --budget". Codex-style strictness: surface a usage
-        // error rather than swallowing the malformed flag value into the
-        // objective.
+        // `--budget abc` is an operator typo, not "objective starts with the
+        // literal text --budget". Surface a usage error rather than swallowing
+        // the malformed flag value into the objective.
         assert_eq!(
             parse_goal_subcommand("--budget abc ship it"),
             GoalSubcommand::Usage
@@ -1637,10 +1634,10 @@ mod tests {
 
     #[test]
     fn format_goal_detail_offers_resume_when_usage_limited() {
-        // Codex parity: when the provider cut us off (UsageLimited), the
-        // summary card must point the operator at `/goal resume` once the
-        // provider is happy again. Falling back to the BudgetLimited/Complete
-        // arm (clear-only) would strand the goal.
+        // When the provider cut us off (UsageLimited), the summary card must
+        // point the operator at `/goal resume` once the provider is happy
+        // again. Falling back to the BudgetLimited/Complete arm (clear-only)
+        // would strand the goal.
         let detail = protocols::admin::GoalDetail {
             present: true,
             session_id: "s".into(),

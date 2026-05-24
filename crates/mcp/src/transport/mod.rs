@@ -1,7 +1,7 @@
 //! Transport abstraction.
 //!
-//! A transport is a duplex stream of JSON-RPC messages. Phase 1 ships three
-//! concrete implementations:
+//! A transport is a duplex stream of JSON-RPC messages. Three concrete
+//! implementations ship today:
 //!
 //! - [`stdio`] — line-delimited JSON over a child process's stdin/stdout.
 //! - [`http`] — streamable HTTP (one HTTP request per call).

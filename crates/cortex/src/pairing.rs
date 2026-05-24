@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_channel_prefix_table_round_trips() {
-        // Table-driven (per CLAUDE.md): one row per channel, both directions.
+        // Table-driven: one row per channel, both directions.
         // A typo in either map breaks routing — the per-channel parse_prefixed_code
         // smoke test below pins the end-to-end shape.
         for (channel, expected_prefix) in CHANNEL_PREFIXES {

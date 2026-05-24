@@ -1,7 +1,6 @@
 //! Trampoline IPC: `SpawnRequest` + length-prefixed framing.
 //!
-//! Phase 1 of the Codex-parity work moves the sandbox policy off the
-//! trampoline's argv. The wire format is:
+//! Moves the sandbox policy off the trampoline's argv. The wire format is:
 //!
 //! ```text
 //! [u32 little-endian length][JSON-encoded SpawnRequest]
@@ -48,7 +47,7 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// concern noted in `windows/mod.rs` — a co-tenant scraping process
 /// command lines now sees only `borg.exe __windows-sandbox-spawn
 /// --request-pipe <decimal>`. The handle value is meaningless without
-/// `PROCESS_DUP_HANDLE` rights on the parent (closed by Phase 7's
+/// `PROCESS_DUP_HANDLE` rights on the parent (closed by the
 /// elevated-runner named-pipe transport with explicit SDDL).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {

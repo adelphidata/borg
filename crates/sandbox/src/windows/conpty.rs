@@ -34,10 +34,10 @@
 //!
 //! # Why a separate module
 //!
-//! Codex's `conpty/` is its own directory because pseudo-console
-//! setup interacts with multiple subsystems (process attributes,
-//! pipe pumping, terminal-mode detection). Mirroring that boundary
-//! here keeps the eventual wire-up to `process.rs` a single import
+//! Kept as its own directory because pseudo-console setup interacts
+//! with multiple subsystems (process attributes, pipe pumping,
+//! terminal-mode detection). Isolating it here keeps the eventual
+//! wire-up to `process.rs` a single import
 //! change rather than a hundred-line diff in the middle of
 //! `spawn_with_token`.
 

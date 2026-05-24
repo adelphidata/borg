@@ -1419,10 +1419,9 @@ fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
 /// spec-blessed kind for them. Tool-call replay is a known follow-up:
 /// the daemon's `MessageView` proto only carries `{role, text}` today,
 /// so persisted tool calls and their results aren't surfaced to the
-/// translator. Plan §"Phase 7 Session load/replay" calls for replaying
-/// tool calls/statuses; that requires extending `MessageView` (and the
-/// underlying DB read in `borgd/src/grpc/admin.rs`) to carry structured
-/// tool-event entries — out of scope for v1.
+/// translator. Replaying tool calls/statuses requires extending
+/// `MessageView` (and the underlying DB read in `borgd/src/grpc/admin.rs`)
+/// to carry structured tool-event entries.
 fn history_replay_update(session_id: &str, message: &HistoryMessage) -> Option<Value> {
     let kind = match message.role.as_str() {
         "user" => "user_message_chunk",

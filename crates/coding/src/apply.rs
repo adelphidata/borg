@@ -1566,11 +1566,11 @@ EOF";
 
     #[test]
     fn not_found_error_includes_nearest_context_snippet() {
-        // Regression guard for codex-parity hunk diagnostics: when a hunk
-        // fails because the file content has drifted, the error must include
-        // (a) the strategies that were attempted and (b) a 3-line snippet of
-        // the file lines closest to the search anchor — so the LLM can fix
-        // the patch without re-reading the whole file.
+        // Regression guard: when a hunk fails because the file content has
+        // drifted, the error must include (a) the strategies that were
+        // attempted and (b) a 3-line snippet of the file lines closest to the
+        // search anchor — so the LLM can fix the patch without re-reading the
+        // whole file.
         let dir = TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("file.txt"),

@@ -36,8 +36,7 @@ impl Tier {
 /// Falls back to `Tier::Tier1` for any failure mode — missing file,
 /// malformed JSON, version mismatch, no home directory. This makes
 /// Tier 2 strictly additive: an operator who hasn't run `borg service
-/// install --windows-sandbox` sees identical Tier 1 behavior to before
-/// Phase 7 landed.
+/// install --windows-sandbox` sees identical Tier 1 behavior.
 pub fn detect() -> Tier {
     let Some(path) = setup::setup_path() else {
         return Tier::Tier1;

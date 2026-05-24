@@ -197,12 +197,11 @@ mod tests {
     }
 
     #[test]
-    fn usage_limited_wire_form_matches_codex_snake_case() {
-        // Codex serializes ThreadGoalStatus::UsageLimited as snake_case
-        // "usage_limited" over its protocol. Borg must use the same string
-        // so a daemon-side write with `status="usage_limited"` round-trips
-        // through `GoalStatus::from_str` rather than silently dropping the
-        // status to an unrecognized variant.
+    fn usage_limited_wire_form_is_snake_case() {
+        // Wire form for ThreadGoalStatus::UsageLimited must serialize as
+        // snake_case "usage_limited" so a daemon-side write with
+        // `status="usage_limited"` round-trips through `GoalStatus::from_str`
+        // rather than silently dropping the status to an unrecognized variant.
         assert_eq!(GoalStatus::UsageLimited.as_str(), "usage_limited");
         assert_eq!(
             GoalStatus::from_str("usage_limited"),

@@ -39,7 +39,7 @@
 //! It does NOT defeat an *active* same-session same-integrity attacker
 //! who can `OpenProcess(PROCESS_DUP_HANDLE, ...)` on the parent borg
 //! process and `DuplicateHandle` the read-end. Default Windows ACLs
-//! allow that. The Phase 7 elevated-runner named-pipe transport closes
+//! allow that. The elevated-runner named-pipe transport closes
 //! that gap by authenticating the caller via the pipe's security
 //! descriptor — until then, treat same-session same-integrity isolation
 //! as a soft boundary that the OS sandbox layer (restricted token +

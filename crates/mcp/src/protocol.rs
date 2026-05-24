@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 framing + the minimal MCP method bodies we use.
 //!
 //! Hand-rolled rather than pulling in a third-party MCP SDK: the wire
-//! surface borg cares about in Phase 1 is small (`initialize`, `tools/list`,
+//! surface borg cares about is small (`initialize`, `tools/list`,
 //! `tools/call`, the `notifications/tools/list_changed` notification), and
 //! borg's security posture prefers auditable bytes over transitive deps.
 //!
@@ -127,7 +127,7 @@ pub struct InitializeParams<'a> {
     pub client_info: ClientInfo,
 }
 
-/// Capability advertisement. Phase 1 declares nothing — we only consume
+/// Capability advertisement. Declares nothing — we only consume
 /// `tools`, not resources / prompts / sampling.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClientCapabilities {}
@@ -246,8 +246,7 @@ pub enum ContentBlock {
         json: Value,
     },
     /// Anything else: image, audio, resource link — surfaced to the agent as
-    /// a placeholder ("[unsupported content block: <kind>]"). Phase 2 may
-    /// surface images/audio properly.
+    /// a placeholder ("[unsupported content block: <kind>]").
     #[serde(other)]
     Other,
 }

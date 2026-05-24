@@ -1,6 +1,6 @@
 //! Windows Filtering Platform — per-account outbound block.
 //!
-//! Phase 8 of the Codex-parity work. Installs persistent WFP filter
+//! Installs persistent WFP filter
 //! rules that deny all outbound TCP/UDP for the `BorgSandboxOffline`
 //! account SID. With these rules in place, the operating system
 //! enforces the `network=false` policy bit at the kernel filter layer
@@ -74,7 +74,7 @@ pub const SUBLAYER_GUID: &str = "B07B6E8A-1F4C-4D2E-9A60-BA1F4C0DE002";
 /// fall back to `wfp_filters_installed = false` and surface a
 /// warning" branch.
 pub fn install_offline_outbound_block(_offline_sid: &str) -> io::Result<()> {
-    // TODO Phase 8: FwpmEngineOpen0 → FwpmTransactionBegin0 →
+    // TODO: FwpmEngineOpen0 → FwpmTransactionBegin0 →
     //   FwpmProviderAdd0 (provider GUID, persistent)
     //   FwpmSubLayerAdd0 (sublayer GUID, persistent, weight=max)
     //   FwpmFilterAdd0 (layer=ALE_AUTH_CONNECT_V4, action=BLOCK,
@@ -97,7 +97,7 @@ pub fn install_offline_outbound_block(_offline_sid: &str) -> io::Result<()> {
 ///
 /// `Err(io::ErrorKind::Unsupported)` until the operational FFI lands.
 pub fn uninstall_offline_outbound_block() -> io::Result<()> {
-    // TODO Phase 8: FwpmEngineOpen0 → enumerate filters via
+    // TODO: FwpmEngineOpen0 → enumerate filters via
     // FwpmFilterEnum0 with provider_key = PROVIDER_GUID → delete
     // each via FwpmFilterDeleteByKey0 → FwpmSubLayerDeleteByKey0
     // → FwpmProviderDeleteByKey0.

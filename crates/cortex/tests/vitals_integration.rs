@@ -36,7 +36,7 @@ async fn record_and_retrieve_events() {
     assert_eq!(events[0].source, "test");
 }
 
-// ── HMAC chain is a load-bearing invariant per CLAUDE.md ──
+// HMAC chain is a load-bearing invariant.
 
 #[tokio::test]
 async fn hmac_chain_links_events() {

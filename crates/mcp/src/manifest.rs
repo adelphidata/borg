@@ -71,10 +71,8 @@ pub enum Transport {
     },
 }
 
-/// HTTP auth flavour. Phase 1 supports None (use `headers` directly) and
+/// HTTP auth flavour. Supports None (use `headers` directly) and
 /// Bearer (set `Authorization: Bearer <token>` automatically).
-///
-/// OAuth 2.1 PKCE is deferred to Phase 2.
 #[derive(Debug, Clone, Default)]
 pub enum HttpAuth {
     /// Use `headers` as-is.
