@@ -674,8 +674,8 @@ async fn start_server(
     let filter = manifest.tools.clone();
     let server_owned = server_name.to_string();
     let builtin_owned: Vec<String> = builtin.iter().map(ToString::to_string).collect();
-    // TODO(slice3): adopt `borgd::supervisor::spawn_supervised` so panics
-    // and disconnects retry with backoff and surface to the daemon's
+    // TODO: adopt `borgd::supervisor::spawn_supervised` so panics and
+    // disconnects retry with backoff and surface to the daemon's
     // degraded-state machinery.
     tokio::spawn(async move {
         run_session_task(

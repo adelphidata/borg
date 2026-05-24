@@ -51,8 +51,8 @@ pub trait GoalEventSink: Send + Sync + 'static {
     fn emit(&self, kind: &str, session_id: &str, goal: Option<&Goal>);
 }
 
-/// Hard cap on objective length, mirrors codex's protocol cap and prevents the
-/// objective from blowing out the system-prompt suffix.
+/// Hard cap on objective length. Prevents the objective from blowing
+/// out the system-prompt suffix.
 pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
 
 /// Goal lifecycle status. Stored in SQLite as snake_case strings.

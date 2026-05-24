@@ -23,8 +23,7 @@ pub struct VoiceConfig {
     /// gates the underlying STT provider chain).
     pub enabled: bool,
     /// RMS level (int16 range 0–32767) below which a chunk counts as
-    /// silence. 200 works well against typical
-    /// USB/laptop microphones.
+    /// silence. 200 is tuned against typical USB/laptop microphones.
     pub silence_threshold_rms: u16,
     /// Continuous seconds below `silence_threshold_rms` (after at least
     /// one confirmed speech burst) required before the recorder stops
@@ -35,8 +34,8 @@ pub struct VoiceConfig {
     /// the silence timer.
     pub min_speech_duration_secs: f32,
     /// Seconds of sub-threshold dip tolerated mid-speech before the
-    /// speech-detection state resets. The reference implementation uses 0.3s — short enough
-    /// to avoid false silences in natural speech, long enough to ignore
+    /// speech-detection state resets. 0.3s is short enough to avoid
+    /// false silences in natural speech, long enough to ignore
     /// micro-pauses between syllables.
     pub dip_tolerance_secs: f32,
     /// Maximum seconds to wait for any speech at all before the
@@ -90,10 +89,10 @@ impl Default for VoiceConfig {
 mod tests {
     use super::*;
 
-    /// reference-parity defaults are a contract, not an accident. The
-    /// voice-mode VAD numbers were tuned against real mics over many
-    /// rounds; changing one of these defaults must be a deliberate
-    /// edit, not a typo that slips into a refactor.
+    /// VAD defaults are a contract, not an accident. The voice-mode
+    /// numbers were tuned against real mics over many rounds; changing
+    /// one of these defaults must be a deliberate edit, not a typo
+    /// that slips into a refactor.
     #[test]
     fn defaults_are_stable() {
         let cfg = VoiceConfig::default();
