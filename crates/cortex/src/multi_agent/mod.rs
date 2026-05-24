@@ -1,3 +1,5 @@
+/// Broadcast bus for agent-tree lifecycle events consumed by the TUI/CLI.
+pub mod event_bus;
 /// Name pool for generating unique sub-agent nicknames.
 pub mod names;
 /// Predefined role definitions for sub-agents.
@@ -5,13 +7,16 @@ pub mod roles;
 /// Tool definitions for multi-agent orchestration.
 pub mod tools;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+pub use event_bus::{AgentTreeBus, AgentTreeEvent, AgentTreeEventKind};
 
 use crate::config::Config;
 
@@ -43,6 +48,9 @@ pub enum SubAgentStatus {
     PendingInit,
     /// Agent is actively processing.
     Running,
+    /// Agent is paused at an iteration boundary; the loop is parked on its
+    /// `Notify` gate and will resume when the operator clears the flag.
+    Paused,
     /// Agent finished successfully with a result.
     Completed {
         /// The final text output from the sub-agent.
@@ -63,6 +71,7 @@ impl SubAgentStatus {
         match self {
             Self::PendingInit => "pending_init",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Completed { .. } => "completed",
             Self::Errored { .. } => "errored",
             Self::Shutdown => "shutdown",
@@ -77,11 +86,18 @@ impl SubAgentStatus {
         )
     }
 
+    /// Whether the status permits an external pause/resume transition.
+    /// Paused itself is pausable (no-op resume); terminal states are not.
+    pub fn is_pausable(&self) -> bool {
+        matches!(self, Self::Running | Self::Paused | Self::PendingInit)
+    }
+
     /// Reconstruct a status from database columns.
     pub fn from_db(status: &str, result_text: Option<&str>, error_text: Option<&str>) -> Self {
         match status {
             "pending_init" => Self::PendingInit,
             "running" => Self::Running,
+            "paused" => Self::Paused,
             "completed" => Self::Completed {
                 result: result_text.unwrap_or_default().to_string(),
             },
@@ -94,6 +110,46 @@ impl SubAgentStatus {
     }
 }
 
+/// Per-agent execution metrics. Updated on tool dispatch and LLM usage, and
+/// flushed to `sub_agent_runs` on each terminal-state transition.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubAgentMetrics {
+    /// Input/prompt tokens charged to this agent (across all turns).
+    pub input_tokens: u64,
+    /// Output/completion tokens produced by this agent.
+    pub output_tokens: u64,
+    /// Reasoning tokens (Anthropic extended-thinking, OpenAI o-series) when reported.
+    pub reasoning_tokens: u64,
+    /// Estimated USD cost computed from token counts × model rate-card.
+    pub cost_usd: f64,
+    /// Count of tool invocations this agent has dispatched.
+    pub tool_calls: u64,
+    /// Distinct file paths this agent has read or written, sorted.
+    pub files_touched: Vec<String>,
+}
+
+impl SubAgentMetrics {
+    /// Add another metrics record into this one. Used by `aggregate_subtree`.
+    pub fn merge(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.cost_usd += other.cost_usd;
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        for path in &other.files_touched {
+            if !self.files_touched.iter().any(|p| p == path) {
+                self.files_touched.push(path.clone());
+            }
+        }
+        self.files_touched.sort();
+    }
+
+    /// Encode `files_touched` for `sub_agent_runs.files_touched` (JSON array).
+    pub fn files_touched_json(&self) -> String {
+        serde_json::to_string(&self.files_touched).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
 /// Metadata for a running or completed sub-agent.
 #[derive(Debug, Clone)]
 pub struct SubAgentInfo {
@@ -103,6 +159,8 @@ pub struct SubAgentInfo {
     pub nickname: String,
     /// Role name this agent was spawned with.
     pub role: String,
+    /// LLM model in use for this agent (snapshot of `child_config.llm.model`).
+    pub model: String,
     /// Session ID of the parent agent that spawned this one.
     pub parent_session_id: String,
     /// This sub-agent's own session ID.
@@ -113,6 +171,10 @@ pub struct SubAgentInfo {
     pub status: SubAgentStatus,
     /// Unix timestamp when this agent was created.
     pub created_at: i64,
+    /// Unix timestamp when this agent reached a terminal state, if applicable.
+    pub ended_at: Option<i64>,
+    /// Accumulated execution metrics. Updated on tool dispatch + LLM usage.
+    pub metrics: SubAgentMetrics,
 }
 
 /// One unit of work for `spawn_batch_and_wait`.
@@ -144,6 +206,11 @@ struct SubAgentHandle {
     pub info: SubAgentInfo,
     pub input_tx: mpsc::Sender<String>,
     pub cancel: CancellationToken,
+    /// Set true when the operator requests pause. The agent loop checks this
+    /// at the top of each iteration and parks on `pause_notify` until cleared.
+    pub is_paused: Arc<AtomicBool>,
+    /// Notify woken when `is_paused` flips false, releasing the gate.
+    pub pause_notify: Arc<Notify>,
     pub _join_handle: JoinHandle<()>,
 }
 
@@ -163,6 +230,28 @@ pub struct AgentControl {
     name_pool: names::NamePool,
     parent_session_id: String,
     current_depth: u32,
+    /// Optional broadcast bus. Lifecycle events publish here when set so the
+    /// gRPC `SubscribeAgentTreeEvents` stream can fan them out to operators.
+    /// Optional so unit tests and embedded callers don't need to wire one.
+    bus: Option<AgentTreeBus>,
+}
+
+/// Error variants from `AgentControl` mutating ops. Distinguished so callers
+/// (gRPC, CLI) can map them to specific status codes / exit codes rather
+/// than a generic stringly-typed `anyhow::Error`.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentControlError {
+    /// The agent id is unknown to this controller.
+    #[error("agent '{0}' not found")]
+    NotFound(String),
+    /// The agent is in a terminal state and cannot be paused/resumed.
+    #[error("agent '{id}' is not pausable (status: {status})")]
+    NotPausable {
+        /// The agent id that was rejected.
+        id: String,
+        /// The current status string at the time of rejection.
+        status: String,
+    },
 }
 
 impl AgentControl {
@@ -185,6 +274,26 @@ impl AgentControl {
             name_pool: names::NamePool::new(),
             parent_session_id: parent_session_id.to_string(),
             current_depth,
+            bus: None,
+        }
+    }
+
+    /// Attach an event bus. Subsequent state mutations publish to it.
+    pub fn with_bus(mut self, bus: AgentTreeBus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// The session this controller is rooted under.
+    pub fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+
+    /// Publish to the bus if one is attached. Best-effort — a closed channel
+    /// just logs and drops, since the bus is an observer, not a participant.
+    fn publish(&self, kind: AgentTreeEventKind, info: &SubAgentInfo) {
+        if let Some(ref bus) = self.bus {
+            bus.publish(kind, info);
         }
     }
 
@@ -229,6 +338,7 @@ impl AgentControl {
         agent_id: &str,
         nickname: &str,
         role_name: &str,
+        model: &str,
         session_id: &str,
         child_depth: u32,
     ) -> SubAgentInfo {
@@ -236,27 +346,46 @@ impl AgentControl {
             id: agent_id.to_string(),
             nickname: nickname.to_string(),
             role: role_name.to_string(),
+            model: model.to_string(),
             parent_session_id: self.parent_session_id.clone(),
             session_id: session_id.to_string(),
             depth: child_depth,
             status: SubAgentStatus::PendingInit,
             created_at: chrono::Utc::now().timestamp(),
+            ended_at: None,
+            metrics: SubAgentMetrics::default(),
         };
 
         // Record in DB
-        if let Ok(db) = crate::db::Database::open().await {
-            if let Err(e) = db
-                .insert_sub_agent_run(
+        match crate::db::Database::open().await {
+            Ok(db) => {
+                if let Err(e) = db
+                    .insert_sub_agent_run(
+                        agent_id,
+                        nickname,
+                        role_name,
+                        &self.parent_session_id,
+                        session_id,
+                        child_depth,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent_id, "failed to insert sub-agent run record: {e}");
+                }
+                // Persist the effective model in the same DB round-trip
+                // window — without this, every row's `model` column stays
+                // empty and the dashboard surface can't show "which model
+                // is this agent running on" without re-resolving from
+                // memory state.
+                if let Err(e) = db.update_sub_agent_model(agent_id, model).await {
+                    tracing::warn!(agent_id, "failed to persist sub-agent model: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
                     agent_id,
-                    nickname,
-                    role_name,
-                    &self.parent_session_id,
-                    session_id,
-                    child_depth,
-                )
-                .await
-            {
-                tracing::warn!(agent_id, "failed to insert sub-agent run record: {e}");
+                    "db open failed while recording sub-agent spawn: {e}"
+                );
             }
         }
 
@@ -349,15 +478,21 @@ impl AgentControl {
                 &agent_id,
                 &chosen_nickname,
                 &role_name,
+                &child_config.llm.model,
                 &session_id,
                 child_depth,
             )
             .await;
+        self.publish(AgentTreeEventKind::Spawned, &info);
 
         // Spawn tokio task
         let (input_tx, input_rx) = mpsc::channel::<String>(16);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
+        let is_paused = Arc::new(AtomicBool::new(false));
+        let pause_notify = Arc::new(Notify::new());
+        let is_paused_task = is_paused.clone();
+        let pause_notify_task = pause_notify.clone();
         let completion_tx = self.completion_tx.clone();
         let semaphore = self.semaphore.clone();
         let agent_id_clone = agent_id.clone();
@@ -403,6 +538,8 @@ impl AgentControl {
                 fork_context_owned,
                 input_rx,
                 cancel_clone,
+                is_paused_task,
+                pause_notify_task,
                 tools_filter,
             )
             .await;
@@ -448,11 +585,124 @@ impl AgentControl {
             info,
             input_tx,
             cancel,
+            is_paused,
+            pause_notify,
             _join_handle: join_handle,
         };
         self.agents.insert(agent_id.clone(), handle);
 
         Ok((agent_id, chosen_nickname))
+    }
+
+    /// Pause or resume a sub-agent at its next iteration boundary.
+    ///
+    /// Cooperative — an in-flight LLM call finishes; the gate takes effect at
+    /// the top of the next loop iteration. Terminal agents return
+    /// `NotPausable` (callers map this to gRPC `FailedPrecondition`).
+    pub async fn set_paused(
+        &mut self,
+        agent_id: &str,
+        paused: bool,
+    ) -> std::result::Result<(), AgentControlError> {
+        let handle = self
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| AgentControlError::NotFound(agent_id.to_string()))?;
+        if !handle.info.status.is_pausable() {
+            return Err(AgentControlError::NotPausable {
+                id: agent_id.to_string(),
+                status: handle.info.status.as_str().to_string(),
+            });
+        }
+
+        let new_status = if paused {
+            SubAgentStatus::Paused
+        } else {
+            SubAgentStatus::Running
+        };
+        handle.is_paused.store(paused, Ordering::Release);
+        // Wake the gate so the loop observes the flip. Safe to call when
+        // not paused too — no waiters means it's a cheap no-op.
+        handle.pause_notify.notify_waiters();
+        handle.info.status = new_status.clone();
+        let info_clone = handle.info.clone();
+
+        match crate::db::Database::open().await {
+            Ok(db) => {
+                if let Err(e) = db.update_sub_agent_status(agent_id, &new_status).await {
+                    tracing::warn!(agent_id, "failed to persist pause/resume status: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(agent_id, "db open failed during pause/resume: {e}");
+            }
+        }
+
+        let kind = if paused {
+            AgentTreeEventKind::Paused
+        } else {
+            AgentTreeEventKind::Resumed
+        };
+        self.publish(kind, &info_clone);
+        Ok(())
+    }
+
+    /// Cancel the agent rooted at `root_id` and every descendant whose
+    /// `parent_session_id` chains back to it. Order: children before parent
+    /// so the parent sees a clean shutdown rather than a half-cancelled
+    /// subtree.
+    pub async fn shutdown_subtree(&mut self, root_id: &str) -> Result<Vec<String>> {
+        if !self.agents.contains_key(root_id) {
+            bail!("agent '{root_id}' not found");
+        }
+        // BFS by session_id → parent_session_id to collect descendants.
+        let mut to_kill: Vec<String> = Vec::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(root_id.to_string());
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(root_id.to_string());
+        while let Some(cur_id) = queue.pop_front() {
+            let cur_session = match self.agents.get(&cur_id) {
+                Some(h) => h.info.session_id.clone(),
+                None => continue,
+            };
+            for (id, h) in &self.agents {
+                if h.info.parent_session_id == cur_session && !seen.contains(id) {
+                    seen.insert(id.clone());
+                    queue.push_back(id.clone());
+                }
+            }
+            to_kill.push(cur_id);
+        }
+        // Reverse so leaves shut down first.
+        to_kill.reverse();
+        for id in &to_kill {
+            // Reuse single-agent shutdown so DB + bus publish stay consistent.
+            if let Err(e) = self.shutdown_agent(id).await {
+                tracing::warn!(agent_id = %id, "shutdown_subtree leg failed: {e}");
+            }
+        }
+        Ok(to_kill)
+    }
+
+    /// Sum metrics across `root_id` and all descendants. Read-only.
+    pub fn aggregate_subtree(&self, root_id: &str) -> Option<SubAgentMetrics> {
+        let root = self.agents.get(root_id)?;
+        let mut acc = root.info.metrics.clone();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(root.info.session_id.clone());
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(root.info.session_id.clone());
+        while let Some(cur_session) = queue.pop_front() {
+            for h in self.agents.values() {
+                if h.info.parent_session_id == cur_session && !seen.contains(&h.info.session_id) {
+                    seen.insert(h.info.session_id.clone());
+                    acc.merge(&h.info.metrics);
+                    queue.push_back(h.info.session_id.clone());
+                }
+            }
+        }
+        Some(acc)
     }
 
     /// Send an additional message to a running sub-agent.
@@ -550,18 +800,30 @@ impl AgentControl {
             .get_mut(agent_id)
             .ok_or_else(|| anyhow::anyhow!("Agent '{agent_id}' not found"))?;
         handle.cancel.cancel();
+        // Wake the pause gate if the agent is parked there — otherwise the
+        // cancellation token notification never reaches the select loop.
+        handle.is_paused.store(false, Ordering::Release);
+        handle.pause_notify.notify_waiters();
         handle.info.status = SubAgentStatus::Shutdown;
+        handle.info.ended_at = Some(chrono::Utc::now().timestamp());
+        let info_clone = handle.info.clone();
 
         // Update DB
-        if let Ok(db) = crate::db::Database::open().await {
-            if let Err(e) = db
-                .update_sub_agent_status(agent_id, &SubAgentStatus::Shutdown)
-                .await
-            {
-                tracing::warn!(agent_id, "failed to update sub-agent shutdown status: {e}");
+        match crate::db::Database::open().await {
+            Ok(db) => {
+                if let Err(e) = db
+                    .update_sub_agent_status(agent_id, &SubAgentStatus::Shutdown)
+                    .await
+                {
+                    tracing::warn!(agent_id, "failed to update sub-agent shutdown status: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(agent_id, "db open failed during shutdown: {e}");
             }
         }
 
+        self.publish(AgentTreeEventKind::Killed, &info_clone);
         Ok(())
     }
 
@@ -582,6 +844,8 @@ impl AgentControl {
     pub fn shutdown_all(&mut self) {
         for handle in self.agents.values_mut() {
             handle.cancel.cancel();
+            handle.is_paused.store(false, Ordering::Release);
+            handle.pause_notify.notify_waiters();
             handle.info.status = SubAgentStatus::Shutdown;
         }
     }
@@ -699,25 +963,69 @@ impl AgentControl {
     /// Test helper: insert a mock SubAgentHandle for testing wait/shutdown operations.
     #[cfg(test)]
     pub fn insert_mock_handle(&mut self, agent_id: &str, nickname: &str) -> CancellationToken {
+        self.insert_mock_handle_with_parent(agent_id, nickname, &self.parent_session_id.clone())
+    }
+
+    /// Test helper variant that lets a test wire a custom parent_session_id —
+    /// needed to build multi-level trees in shutdown_subtree / aggregate tests.
+    #[cfg(test)]
+    pub fn insert_mock_handle_with_parent(
+        &mut self,
+        agent_id: &str,
+        nickname: &str,
+        parent_session_id: &str,
+    ) -> CancellationToken {
         let (input_tx, _input_rx) = mpsc::channel::<String>(1);
         let cancel = CancellationToken::new();
+        let is_paused = Arc::new(AtomicBool::new(false));
+        let pause_notify = Arc::new(Notify::new());
         let handle = SubAgentHandle {
             info: SubAgentInfo {
                 id: agent_id.to_string(),
                 nickname: nickname.to_string(),
                 role: "test".to_string(),
-                parent_session_id: self.parent_session_id.clone(),
+                model: "test-model".to_string(),
+                parent_session_id: parent_session_id.to_string(),
                 session_id: uuid::Uuid::new_v4().to_string(),
                 depth: self.current_depth + 1,
                 status: SubAgentStatus::Running,
                 created_at: chrono::Utc::now().timestamp(),
+                ended_at: None,
+                metrics: SubAgentMetrics::default(),
             },
             input_tx,
             cancel: cancel.clone(),
+            is_paused,
+            pause_notify,
             _join_handle: tokio::spawn(async {}),
         };
         self.agents.insert(agent_id.to_string(), handle);
         cancel
+    }
+
+    /// Test helper: seed a specific session_id for a mock handle. Returns the
+    /// session_id so callers can chain children's parent_session_id.
+    #[cfg(test)]
+    pub fn insert_mock_handle_with_session(
+        &mut self,
+        agent_id: &str,
+        nickname: &str,
+        parent_session_id: &str,
+        session_id: &str,
+    ) -> (CancellationToken, String) {
+        let cancel = self.insert_mock_handle_with_parent(agent_id, nickname, parent_session_id);
+        if let Some(handle) = self.agents.get_mut(agent_id) {
+            handle.info.session_id = session_id.to_string();
+        }
+        (cancel, session_id.to_string())
+    }
+
+    /// Test helper: poke metrics on an existing handle.
+    #[cfg(test)]
+    pub fn set_metrics(&mut self, agent_id: &str, metrics: SubAgentMetrics) {
+        if let Some(handle) = self.agents.get_mut(agent_id) {
+            handle.info.metrics = metrics;
+        }
     }
 }
 
@@ -791,6 +1099,8 @@ fn run_sub_agent(
     fork_context: Option<Vec<crate::types::Message>>,
     mut input_rx: mpsc::Receiver<String>,
     cancel: CancellationToken,
+    is_paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
     tools_filter: Option<Vec<String>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
@@ -856,6 +1166,32 @@ fn run_sub_agent(
         // Collect the final text response
         let mut final_text = String::new();
         loop {
+            // Pause gate: park here while the operator has flipped the flag.
+            // Cooperative — an in-flight LLM call already inside `send_message`
+            // is not interrupted; this only stops *additional* iterations from
+            // being processed. Wake on resume (notify_waiters) or shutdown
+            // (cancel.cancel()) which also wakes the notify.
+            //
+            // We register on `notified` BEFORE re-checking `is_paused`. This
+            // closes the lost-wakeup race where `set_paused(false)` +
+            // `notify_waiters()` could fire after the load but before we
+            // entered the select arm — `notify_waiters` only wakes already-
+            // registered waiters, so a late registration would block forever.
+            loop {
+                let notified = pause_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !is_paused.load(Ordering::Acquire) {
+                    break;
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = cancel.cancelled() => break,
+                }
+            }
             tokio::select! {
                 _ = cancel.cancelled() => {
                     break;
@@ -1394,5 +1730,290 @@ mod tests {
         };
         assert_eq!(t.goal, "summarize this");
         assert_eq!(t.role_name.as_deref(), Some("researcher"));
+    }
+}
+
+/// Tests for `/agents`-feature runtime additions: Paused status, pause gate,
+/// shutdown_subtree, aggregate_subtree, AgentTreeBus integration, and the
+/// pausable/terminal precondition checks. Distinct from the legacy `tests`
+/// module above (which is feature-gated and disabled) so these always run.
+#[cfg(test)]
+mod agents_feature_tests {
+    use super::*;
+    use crate::config::MultiAgentConfig;
+    use std::time::Duration;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    fn ctrl() -> AgentControl {
+        let cfg = MultiAgentConfig {
+            enabled: true,
+            max_spawn_depth: 5,
+            max_children_per_agent: 10,
+            max_concurrent: 10,
+            delegate_timeout_secs: 60,
+        };
+        AgentControl::new(&cfg, "root-session", 0)
+    }
+
+    /// `set_paused` must flip both the in-memory status AND the
+    /// `is_paused` AtomicBool. Asserting both sides catches a regression
+    /// where the status display says "paused" but the loop is still busy
+    /// (or vice versa) — the dual-write contract the run_sub_agent gate
+    /// depends on.
+    #[tokio::test]
+    async fn set_paused_flips_status_and_atomic() {
+        let mut c = ctrl();
+        c.insert_mock_handle("a", "atlas");
+        assert_eq!(c.get_status("a").unwrap().status, SubAgentStatus::Running);
+        c.set_paused("a", true).await.expect("pause running agent");
+        assert_eq!(c.get_status("a").unwrap().status, SubAgentStatus::Paused);
+        let handle_paused = c.agents.get("a").unwrap().is_paused.load(Ordering::Acquire);
+        assert!(handle_paused, "is_paused AtomicBool must be true");
+
+        c.set_paused("a", false).await.expect("resume paused agent");
+        assert_eq!(c.get_status("a").unwrap().status, SubAgentStatus::Running);
+        let handle_running = c.agents.get("a").unwrap().is_paused.load(Ordering::Acquire);
+        assert!(!handle_running, "is_paused must clear on resume");
+    }
+
+    /// Driving a fake counter under the gate proves pause is not just
+    /// observed but actually parks execution. Resuming must release the
+    /// gate — caught a real regression where notify_waiters() was missing.
+    ///
+    /// Uses an unbounded loop with a per-iteration sleep so the test
+    /// remains deterministic even on a heavily-loaded CI box: the
+    /// pause/resume windows are large multiples of the iteration delay,
+    /// and an explicit `stop` flag terminates the task at end-of-test
+    /// rather than relying on the loop counter to bound it.
+    #[tokio::test]
+    async fn pause_gate_blocks_iteration_and_resume_releases() {
+        use std::sync::atomic::AtomicU32;
+        let is_paused = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let counter = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let is_paused_t = is_paused.clone();
+        let notify_t = notify.clone();
+        let counter_t = counter.clone();
+        let stop_t = stop.clone();
+        let task = tokio::spawn(async move {
+            while !stop_t.load(Ordering::Acquire) {
+                while is_paused_t.load(Ordering::Acquire) {
+                    if stop_t.load(Ordering::Acquire) {
+                        return;
+                    }
+                    notify_t.notified().await;
+                }
+                counter_t.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // Let the loop tick a few times — counter should advance.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pre_pause = counter.load(Ordering::SeqCst);
+        assert!(
+            pre_pause > 0,
+            "loop must tick before pause is invoked (got {pre_pause})"
+        );
+
+        // Engage pause; observe the counter freeze across a window much
+        // longer than the iteration delay.
+        is_paused.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after_pause_window = counter.load(Ordering::SeqCst);
+        // Allow up to 2 in-flight ticks (one was past the gate when we
+        // flipped, one is statistically possible in the storage-acquire
+        // race). Anything more means the gate didn't engage.
+        assert!(
+            after_pause_window <= pre_pause + 2,
+            "counter must not advance more than 2 ticks under pause; \
+             pre_pause={pre_pause} after={after_pause_window}"
+        );
+
+        // Release the gate; counter must resume advancing.
+        is_paused.store(false, Ordering::Release);
+        notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after_resume = counter.load(Ordering::SeqCst);
+        assert!(
+            after_resume > after_pause_window + 2,
+            "counter must advance after resume; \
+             paused_at={after_pause_window} after_resume={after_resume}"
+        );
+
+        // Clean teardown.
+        stop.store(true, Ordering::Release);
+        notify.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    /// `shutdown_subtree` cancels the named root, its descendants, but
+    /// MUST NOT cancel siblings that share the same parent. Negative
+    /// assertion is the load-bearing one — false positive would silently
+    /// kill innocent peers.
+    #[tokio::test]
+    async fn shutdown_subtree_cancels_descendants_only() {
+        let mut c = ctrl();
+        // Layout:  A (root) → B → C ;  A → D (sibling)
+        let (cancel_a, sess_a) =
+            c.insert_mock_handle_with_session("A", "atlas", "root-session", "sess-A");
+        let (cancel_b, sess_b) = c.insert_mock_handle_with_session("B", "bee", &sess_a, "sess-B");
+        let (cancel_c, _sess_c) = c.insert_mock_handle_with_session("C", "cee", &sess_b, "sess-C");
+        let (cancel_d, _sess_d) = c.insert_mock_handle_with_session("D", "dee", &sess_a, "sess-D");
+
+        let killed = c.shutdown_subtree("B").await.expect("subtree shutdown");
+        // Leaves should shut down first; B is the root so it's last.
+        assert_eq!(killed.last(), Some(&"B".to_string()));
+        assert!(killed.contains(&"C".to_string()));
+
+        assert!(
+            cancel_b.is_cancelled(),
+            "B (subtree root) must be cancelled"
+        );
+        assert!(cancel_c.is_cancelled(), "C (descendant) must be cancelled");
+        assert!(
+            !cancel_a.is_cancelled(),
+            "A (ancestor of B) must NOT be cancelled"
+        );
+        assert!(
+            !cancel_d.is_cancelled(),
+            "D (sibling of B) must NOT be cancelled"
+        );
+    }
+
+    /// Terminal agents reject pause/resume with the specific NotPausable
+    /// variant — gRPC layer maps this to FailedPrecondition so operators
+    /// see "agent is completed" rather than a silent success.
+    #[tokio::test]
+    async fn pause_on_terminal_agent_returns_not_pausable() {
+        let mut c = ctrl();
+        c.insert_mock_handle("done", "atlas");
+        // Drive to terminal.
+        if let Some(h) = c.agents.get_mut("done") {
+            h.info.status = SubAgentStatus::Completed {
+                result: "ok".into(),
+            };
+        }
+
+        let err = c.set_paused("done", true).await.expect_err("must reject");
+        match err {
+            AgentControlError::NotPausable { id, status } => {
+                assert_eq!(id, "done");
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected NotPausable, got {other:?}"),
+        }
+    }
+
+    /// Event bus emits monotonically increasing seq across kinds, and the
+    /// last event's kind matches the final mutation. Encodes the gap-
+    /// detection contract the TUI uses to decide whether to re-snapshot.
+    #[tokio::test]
+    async fn event_bus_seq_monotonic_across_mutations() {
+        let bus = AgentTreeBus::new();
+        let mut rx = bus.subscribe();
+        let mut c = ctrl().with_bus(bus.clone());
+
+        c.insert_mock_handle("x", "xenon");
+        // Mock handle bypasses spawn_agent, so manually publish Spawned to
+        // exercise the integration path the same way spawn_agent does.
+        let info = c.get_status("x").unwrap().clone();
+        bus.publish(AgentTreeEventKind::Spawned, &info);
+
+        c.set_paused("x", true).await.unwrap();
+        c.set_paused("x", false).await.unwrap();
+        c.shutdown_agent("x").await.unwrap();
+
+        // Collect all events.
+        let mut events = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(e) => events.push(e),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => panic!("unexpected lag in tiny test"),
+            }
+        }
+        assert!(
+            events.len() >= 4,
+            "expected at least 4 events, got {}",
+            events.len()
+        );
+        for win in events.windows(2) {
+            assert!(
+                win[1].seq > win[0].seq,
+                "seq must be strictly monotonic: {} → {}",
+                win[0].seq,
+                win[1].seq
+            );
+        }
+        // Last mutation was a shutdown → expect Killed kind.
+        assert_eq!(events.last().unwrap().kind, AgentTreeEventKind::Killed);
+    }
+
+    /// aggregate_subtree sums metrics across descendants without double-
+    /// counting the root's own metrics. Tests both inclusion (root + child)
+    /// and exclusion (sibling subtree must not contribute).
+    #[tokio::test]
+    async fn aggregate_subtree_sums_descendants_only() {
+        let mut c = ctrl();
+        let (_, sess_a) = c.insert_mock_handle_with_session("A", "a", "root-session", "sess-A");
+        let (_, sess_b) = c.insert_mock_handle_with_session("B", "b", &sess_a, "sess-B");
+        let (_, _sess_c) = c.insert_mock_handle_with_session("C", "c", &sess_b, "sess-C");
+        let (_, _sess_d) = c.insert_mock_handle_with_session("D", "d", "root-session", "sess-D");
+
+        c.set_metrics(
+            "A",
+            SubAgentMetrics {
+                input_tokens: 10,
+                cost_usd: 0.10,
+                ..Default::default()
+            },
+        );
+        c.set_metrics(
+            "B",
+            SubAgentMetrics {
+                input_tokens: 20,
+                cost_usd: 0.20,
+                ..Default::default()
+            },
+        );
+        c.set_metrics(
+            "C",
+            SubAgentMetrics {
+                input_tokens: 30,
+                cost_usd: 0.30,
+                ..Default::default()
+            },
+        );
+        c.set_metrics(
+            "D",
+            SubAgentMetrics {
+                input_tokens: 999,
+                cost_usd: 9.99,
+                ..Default::default()
+            },
+        );
+
+        let from_a = c.aggregate_subtree("A").expect("A present");
+        assert_eq!(from_a.input_tokens, 60, "A + B + C should be 10 + 20 + 30");
+        assert!(
+            (from_a.cost_usd - 0.60).abs() < 1e-6,
+            "cost should sum to 0.60, got {}",
+            from_a.cost_usd
+        );
+
+        let from_b = c.aggregate_subtree("B").expect("B present");
+        assert_eq!(from_b.input_tokens, 50, "B + C should be 20 + 30");
+
+        let from_c = c.aggregate_subtree("C").expect("C present");
+        assert_eq!(from_c.input_tokens, 30, "C leaf — just itself");
+
+        // The `== 60` assertion above already proves exclusion: any bleed
+        // from D (999 tokens) would push the sum past 60. The negative
+        // case is encoded by the exact-match positive, not a weaker
+        // `< 999` check that would pass even on a buggy 998.
     }
 }

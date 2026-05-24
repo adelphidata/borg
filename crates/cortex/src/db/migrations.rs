@@ -101,6 +101,72 @@ impl Database {
         Ok(())
     }
 
+    /// Backfill `sub_agent_runs` with the per-agent metrics + model columns
+    /// and create `agent_tree_snapshots`. Idempotent — fresh installs get
+    /// the final shape from `SCHEMA_SQL` and ALTERs short-circuit when the
+    /// column already exists.
+    pub(super) async fn migrate_v6(&self) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query("PRAGMA table_info(sub_agent_runs)", ())
+            .await?;
+        let mut existing = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            existing.insert(row.get::<String>(1)?);
+        }
+        for (col, ddl) in [
+            (
+                "model",
+                "ALTER TABLE sub_agent_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "input_tokens",
+                "ALTER TABLE sub_agent_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "output_tokens",
+                "ALTER TABLE sub_agent_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "reasoning_tokens",
+                "ALTER TABLE sub_agent_runs ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "cost_usd",
+                "ALTER TABLE sub_agent_runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+            ),
+            (
+                "tool_calls",
+                "ALTER TABLE sub_agent_runs ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "files_touched",
+                "ALTER TABLE sub_agent_runs ADD COLUMN files_touched TEXT NOT NULL DEFAULT '[]'",
+            ),
+        ] {
+            if !existing.contains(col) {
+                self.conn.execute(ddl, ()).await?;
+            }
+        }
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sub_agent_runs_session ON sub_agent_runs(session_id);
+                 CREATE TABLE IF NOT EXISTS agent_tree_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_agent_tree_snapshots_session
+                    ON agent_tree_snapshots(session_id, id DESC);",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn migrate_v4(&self) -> Result<()> {
         // Fresh installs already emit the final shape via `SCHEMA_SQL`
         // (which defines `code_hash`). Only DBs that ran through the v3
@@ -632,9 +698,32 @@ CREATE TABLE IF NOT EXISTS sub_agent_runs (
     result_text TEXT,
     error_text TEXT,
     created_at INTEGER NOT NULL,
-    completed_at INTEGER
+    completed_at INTEGER,
+    model TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    files_touched TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_sub_agent_runs_parent ON sub_agent_runs(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sub_agent_runs_session ON sub_agent_runs(session_id);
+
+-- Per-turn snapshots of the spawn tree. The agent loop writes one row at
+-- EndTurn for any turn that spawned ≥1 sub-agent; a per-session ring of 10
+-- is enforced at write time so this never grows unbounded.
+CREATE TABLE IF NOT EXISTS agent_tree_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tree_snapshots_session
+    ON agent_tree_snapshots(session_id, id DESC);
 
 -- Memory -------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS settings (

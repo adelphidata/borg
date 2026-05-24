@@ -481,6 +481,20 @@ pub struct SubAgentRunRow {
     pub created_at: i64,
     /// Unix timestamp when the run completed, if finished.
     pub completed_at: Option<i64>,
+    /// LLM model in use for this agent.
+    pub model: String,
+    /// Accumulated input/prompt tokens.
+    pub input_tokens: i64,
+    /// Accumulated output/completion tokens.
+    pub output_tokens: i64,
+    /// Accumulated reasoning tokens (provider-dependent).
+    pub reasoning_tokens: i64,
+    /// Estimated USD cost.
+    pub cost_usd: f64,
+    /// Count of tool dispatches.
+    pub tool_calls: i64,
+    /// JSON-encoded list of file paths touched.
+    pub files_touched: String,
 }
 
 /// Aggregated token usage per model from SQLite.
