@@ -94,21 +94,22 @@ fn resolve_full_path(data_dir: &Path, relative_path: &str) -> Option<std::path::
     Some(channels_path)
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_db() -> Database {
-        Database::test_db()
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn verify_integrity_all_files_match() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_all_files_match() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
         // Create files
@@ -121,23 +122,28 @@ mod tests {
         let hash1 = compute_sha256(b"name = \"test\"");
         let hash2 = compute_sha256(b"print('hello')");
         db.insert_file_hash("test/pkg", "pkg/tool.toml", &hash1)
+            .await
             .expect("insert hash");
         db.insert_file_hash("test/pkg", "pkg/main.py", &hash2)
+            .await
             .expect("insert hash");
 
-        let result = verify_integrity(&db, "test/pkg", data_dir).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", data_dir)
+            .await
+            .expect("verify");
         assert!(result.ok);
         assert!(result.tampered.is_empty());
         assert!(result.missing.is_empty());
     }
 
-    #[test]
-    fn verify_integrity_detects_tampered_file() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_detects_tampered_file() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
         let tools_dir = data_dir.join("tools").join("pkg");
@@ -146,40 +152,48 @@ mod tests {
 
         let original_hash = compute_sha256(b"print('original')");
         db.insert_file_hash("test/pkg", "pkg/main.py", &original_hash)
+            .await
             .expect("insert hash");
 
-        let result = verify_integrity(&db, "test/pkg", data_dir).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", data_dir)
+            .await
+            .expect("verify");
         assert!(!result.ok);
         assert_eq!(result.tampered, vec!["pkg/main.py"]);
         assert!(result.missing.is_empty());
     }
 
-    #[test]
-    fn verify_integrity_detects_missing_file() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_detects_missing_file() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
         let hash = compute_sha256(b"content");
         db.insert_file_hash("test/pkg", "pkg/main.py", &hash)
+            .await
             .expect("insert hash");
 
-        let result = verify_integrity(&db, "test/pkg", data_dir).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", data_dir)
+            .await
+            .expect("verify");
         assert!(!result.ok);
         assert!(result.tampered.is_empty());
         assert_eq!(result.missing, vec!["pkg/main.py"]);
     }
 
-    #[test]
-    fn verify_integrity_mixed_pass_and_fail() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_mixed_pass_and_fail() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
         let tools_dir = data_dir.join("tools").join("pkg");
@@ -189,44 +203,53 @@ mod tests {
         std::fs::write(tools_dir.join("good.py"), "good").expect("write");
         let good_hash = compute_sha256(b"good");
         db.insert_file_hash("test/pkg", "pkg/good.py", &good_hash)
+            .await
             .expect("insert hash");
 
         // File 2: tampered
         std::fs::write(tools_dir.join("bad.py"), "modified").expect("write");
         let original_hash = compute_sha256(b"original");
         db.insert_file_hash("test/pkg", "pkg/bad.py", &original_hash)
+            .await
             .expect("insert hash");
 
         // File 3: missing (not on disk)
         let missing_hash = compute_sha256(b"missing");
         db.insert_file_hash("test/pkg", "pkg/gone.py", &missing_hash)
+            .await
             .expect("insert hash");
 
-        let result = verify_integrity(&db, "test/pkg", data_dir).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", data_dir)
+            .await
+            .expect("verify");
         assert!(!result.ok);
         assert_eq!(result.tampered, vec!["pkg/bad.py"]);
         assert_eq!(result.missing, vec!["pkg/gone.py"]);
     }
 
-    #[test]
-    fn verify_integrity_no_hashes_stored() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_no_hashes_stored() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
-        let result = verify_integrity(&db, "test/pkg", tmp.path()).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", tmp.path())
+            .await
+            .expect("verify");
         assert!(result.ok);
     }
 
-    #[test]
-    fn verify_integrity_empty_file() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_integrity_empty_file() {
+        let db = test_db().await;
         let tmp = tempfile::tempdir().expect("create temp dir");
         let data_dir = tmp.path();
 
         db.insert_plugin("test/pkg", "Test", "tool", "test")
+            .await
             .expect("insert cust");
 
         let tools_dir = data_dir.join("tools").join("pkg");
@@ -235,9 +258,12 @@ mod tests {
 
         let empty_hash = compute_sha256(b"");
         db.insert_file_hash("test/pkg", "pkg/empty.txt", &empty_hash)
+            .await
             .expect("insert hash");
 
-        let result = verify_integrity(&db, "test/pkg", data_dir).expect("verify");
+        let result = verify_integrity(&db, "test/pkg", data_dir)
+            .await
+            .expect("verify");
         assert!(result.ok);
     }
 }

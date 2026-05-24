@@ -198,6 +198,216 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_days_zero_resolves_to_default_not_min() {
+        // Spec: the proto wire uses 0 as the "no arg" sentinel because
+        // uint32 has no Option. A regression that returned MIN_DAYS (1)
+        // for 0 would silently shrink every default request to 1 day.
+        assert_eq!(clamp_days(0), DEFAULT_DAYS);
+        assert_ne!(clamp_days(0), MIN_DAYS, "0 must NOT collapse to MIN_DAYS");
+    }
+
+    #[test]
+    fn clamp_days_clamps_to_min_and_max() {
+        // Boundary: 1 stays at 1, max stays at max, beyond max collapses
+        // to max, between is preserved. A wrong direction on the clamp
+        // would silently render years of usage in a popup.
+        assert_eq!(clamp_days(1), 1);
+        assert_eq!(clamp_days(MAX_DAYS), MAX_DAYS);
+        assert_eq!(clamp_days(MAX_DAYS + 100), MAX_DAYS);
+        assert_eq!(clamp_days(30), 30);
+        assert_eq!(clamp_days(u32::MAX), MAX_DAYS);
+    }
+
+    #[test]
+    fn fmt_count_inserts_commas_at_thousand_boundaries() {
+        // Spec encoded as a table — a regression that mis-counted from
+        // the right (e.g. counting from the left) would put commas in
+        // the wrong place: "1234567" → "12,34,567" instead of "1,234,567".
+        let cases: &[(u64, &str)] = &[
+            (0, "0"),
+            (1, "1"),
+            (12, "12"),
+            (123, "123"),
+            (1_000, "1,000"),
+            (1_234, "1,234"),
+            (12_345, "12,345"),
+            (123_456, "123,456"),
+            (1_234_567, "1,234,567"),
+            (1_000_000, "1,000,000"),
+            (1_234_567_890, "1,234,567,890"),
+            (u64::MAX, "18,446,744,073,709,551,615"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(fmt_count(*input), *expected, "fmt_count({input})");
+        }
+    }
+
+    #[test]
+    fn format_relative_buckets_by_unit() {
+        // Boundaries: a regression that swapped `<` for `<=` would
+        // shift the seconds→minutes transition by one second and surface
+        // as "59m ago" vs "just now" inconsistencies.
+        let now = 1_700_000_000_i64;
+        assert_eq!(format_relative(now, now), "just now");
+        assert_eq!(format_relative(now, now - 59), "just now");
+        assert_eq!(format_relative(now, now - 60), "1m ago");
+        assert_eq!(format_relative(now, now - 3_599), "59m ago");
+        assert_eq!(format_relative(now, now - 3_600), "1h ago");
+        assert_eq!(format_relative(now, now - 86_399), "23h ago");
+        assert_eq!(format_relative(now, now - 86_400), "1d ago");
+        assert_eq!(format_relative(now, now - 7 * 86_400), "7d ago");
+    }
+
+    #[test]
+    fn format_relative_future_timestamps_clamp_to_just_now() {
+        // Spec: future ts (clock skew between daemon and DB row) must
+        // not produce a negative-number string — `delta = (now - ts).max(0)`
+        // is the load-bearing line; a refactor that dropped `.max(0)`
+        // would surface as "-1234m ago" in the UI.
+        let now = 1_700_000_000_i64;
+        assert_eq!(format_relative(now, now + 5_000), "just now");
+    }
+
+    #[test]
+    fn format_since_date_is_iso_yyyy_mm_dd() {
+        // The date string is consumed by users; lock the format.
+        // 1_700_000_000 = 2023-11-14T22:13:20Z.
+        let s = format_since_date(1_700_000_000);
+        assert_eq!(s, "2023-11-14");
+    }
+
+    #[test]
+    fn format_since_date_handles_unsupported_timestamps_via_sentinel() {
+        // Spec: out-of-range or ambiguous timestamps fall back to "—"
+        // instead of panicking. A `.unwrap()` regression in the chrono
+        // adapter would crash the formatter for any large value.
+        let s = format_since_date(i64::MAX);
+        assert_eq!(s, "—");
+        let s = format_since_date(i64::MIN);
+        assert_eq!(s, "—");
+    }
+
+    #[test]
+    fn format_model_row_handles_missing_provider_or_model() {
+        // Spec: empty-string provider falls back to model alone; empty
+        // model falls back to provider alone; both present joins with
+        // a slash. A regression to "/{model}" or "{provider}/" formats
+        // would surface dangling separators in the UI.
+        let row = ModelUsageRow {
+            provider: "".into(),
+            model: "claude".into(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            total_cost_usd: None,
+        };
+        let s = format_model_row(&row);
+        assert!(s.contains("claude"), "label must include model name");
+        assert!(!s.contains("/claude"), "must NOT have dangling slash");
+
+        let row = ModelUsageRow {
+            provider: "openai".into(),
+            model: "".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost_usd: None,
+        };
+        let s = format_model_row(&row);
+        assert!(s.contains("openai"));
+        assert!(!s.contains("openai/"));
+
+        let row = ModelUsageRow {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            prompt_tokens: 1234,
+            completion_tokens: 5678,
+            total_tokens: 6912,
+            total_cost_usd: Some(0.5678),
+        };
+        let s = format_model_row(&row);
+        assert!(s.contains("openai/gpt-4o"));
+        // Cost present → must surface $X.XXXX, four-decimal precision.
+        assert!(s.contains("$0.5678"), "must format cost: {s}");
+        // Token counts must be comma-formatted via fmt_count.
+        assert!(s.contains("1,234"), "prompt tokens commafied: {s}");
+        assert!(s.contains("5,678"), "completion tokens commafied: {s}");
+        assert!(s.contains("6,912"), "total tokens commafied: {s}");
+    }
+
+    #[test]
+    fn format_model_row_without_cost_omits_dollar_segment() {
+        // Spec: rows with None cost must NOT render "$0.00" — the cost
+        // section is a separate concept and showing $0 here would imply
+        // we have rate-card data when we don't.
+        let row = ModelUsageRow {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            total_cost_usd: None,
+        };
+        let s = format_model_row(&row);
+        assert!(!s.contains('$'), "must NOT show $ when cost is None: {s}");
+    }
+
+    #[tokio::test]
+    async fn format_usage_text_omits_cost_section_when_no_rate_card_data() {
+        // End-to-end: every row has None cost → no "Cost:" header in the
+        // formatted output. The Activity and Tokens sections still appear.
+        let db = crate::db::Database::test_db().await;
+        db.log_token_usage(100, 50, 150, "ollama", "llama3", None)
+            .await
+            .unwrap();
+        let out = format_usage_text(&db, 30).await.expect("format");
+        assert!(!out.contains("Cost:"), "no rate data must omit Cost section: {out}");
+        assert!(out.contains("Tokens:"));
+        assert!(out.contains("Activity:"));
+    }
+
+    #[tokio::test]
+    async fn format_usage_text_includes_cost_when_any_row_has_cost() {
+        // Inverse: a single priced row must light up the Cost section
+        // with the four-decimal estimate.
+        let db = crate::db::Database::test_db().await;
+        db.log_token_usage(100, 50, 150, "openai", "gpt-4o", Some(0.0123))
+            .await
+            .unwrap();
+        let out = format_usage_text(&db, 30).await.expect("format");
+        assert!(out.contains("Cost:"));
+        assert!(out.contains("$0.0123"));
+    }
+
+    #[tokio::test]
+    async fn format_usage_text_header_includes_day_count_and_since_date() {
+        // The header is the user's primary orientation: "Usage (30 days,
+        // since YYYY-MM-DD)". A regression that broke the substitution
+        // would surface as `{days}` literally in the popup.
+        let db = crate::db::Database::test_db().await;
+        let out = format_usage_text(&db, 7).await.expect("format");
+        assert!(out.starts_with("Usage (7 days, since "), "got: {out}");
+        assert!(!out.contains("{days}"));
+    }
+
+    #[tokio::test]
+    async fn format_usage_text_zero_days_resolves_to_default() {
+        // Spec: the proto sentinel must round-trip through the formatter
+        // to the default window, not collapse to "0 days".
+        let db = crate::db::Database::test_db().await;
+        let out = format_usage_text(&db, 0).await.expect("format");
+        assert!(
+            out.contains(&format!("Usage ({DEFAULT_DAYS} days,")),
+            "zero must resolve to DEFAULT_DAYS={DEFAULT_DAYS}: {out}"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

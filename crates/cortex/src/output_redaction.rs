@@ -250,7 +250,7 @@ pub fn current_policy() -> RedactionPolicy {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::secrets::SECRET_PATTERNS_FOR_TEST;

@@ -69,3 +69,102 @@ impl From<Provider> for ProviderCategory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_local_is_air_gap_safe() {
+        // Spec: air-gap mode must refuse public-cloud AND BYO endpoints —
+        // the latter because we can't statically prove the URL targets a
+        // local resource. A regression that flipped BYO to "safe" would
+        // silently let an air-gapped operator phone home.
+        assert!(ProviderCategory::Local.is_air_gap_safe());
+        assert!(!ProviderCategory::PublicCloud.is_air_gap_safe());
+        assert!(!ProviderCategory::BYOEndpoint.is_air_gap_safe());
+    }
+
+    #[test]
+    fn db_str_round_trip_for_every_variant() {
+        // The DB column stores these values; a rename without a migration
+        // is silently corrupting on first restart. Lock the wire form.
+        for c in [
+            ProviderCategory::PublicCloud,
+            ProviderCategory::Local,
+            ProviderCategory::BYOEndpoint,
+        ] {
+            let s = c.as_db_str();
+            assert_eq!(ProviderCategory::from_db_str(s), Some(c));
+        }
+        // Also lock the exact strings — the migration test for an older
+        // DB depends on these literals matching.
+        assert_eq!(ProviderCategory::PublicCloud.as_db_str(), "public_cloud");
+        assert_eq!(ProviderCategory::Local.as_db_str(), "local");
+        assert_eq!(ProviderCategory::BYOEndpoint.as_db_str(), "byo_endpoint");
+    }
+
+    #[test]
+    fn from_db_str_returns_none_for_unknown() {
+        // Negative: unknown DB values surface as None so callers can
+        // fall back / quarantine. A panic / wrong-default here would
+        // make an upgraded DB unstartable.
+        assert_eq!(ProviderCategory::from_db_str(""), None);
+        assert_eq!(ProviderCategory::from_db_str("Local"), None); // case-sensitive
+        assert_eq!(ProviderCategory::from_db_str("future_category"), None);
+    }
+
+    #[test]
+    fn provider_to_category_classifies_oauth_as_public_cloud() {
+        // OAuth-credential providers still hit the same public-cloud
+        // endpoints — they MUST be classified as PublicCloud, not Local,
+        // or air-gap enforcement is bypassed. Encode the spec invariant.
+        for p in [
+            Provider::OpenAi,
+            Provider::Anthropic,
+            Provider::OpenRouter,
+            Provider::Gemini,
+            Provider::DeepSeek,
+            Provider::Groq,
+            Provider::XAi,
+            Provider::ClaudeCodeOAuth,
+            Provider::CodexOAuth,
+            Provider::CopilotOAuth,
+            Provider::AzureOpenAi,
+            Provider::VertexAi,
+            Provider::Bedrock,
+        ] {
+            assert_eq!(
+                ProviderCategory::from(p),
+                ProviderCategory::PublicCloud,
+                "{p:?} must classify as PublicCloud"
+            );
+        }
+    }
+
+    #[test]
+    fn local_providers_classify_as_local() {
+        // Ollama and the Claude Code CLI both run on the operator's
+        // machine. A misclassification to PublicCloud would silently
+        // disable them under air-gap mode.
+        assert_eq!(
+            ProviderCategory::from(Provider::Ollama),
+            ProviderCategory::Local
+        );
+        assert_eq!(
+            ProviderCategory::from(Provider::ClaudeCli),
+            ProviderCategory::Local
+        );
+    }
+
+    #[test]
+    fn custom_provider_classifies_as_byo_endpoint() {
+        // The BYO category triggers the runtime address check in air-gap
+        // mode rather than a compile-time refusal. A miscategorization
+        // would either over-block (Local) or under-block (PublicCloud).
+        assert_eq!(
+            ProviderCategory::from(Provider::Custom),
+            ProviderCategory::BYOEndpoint
+        );
+    }
+}

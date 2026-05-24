@@ -185,4 +185,79 @@ mod tests {
         assert!(!f.is_read_only("delete"));
         assert!(!f.is_read_only("unlisted"));
     }
+
+    #[test]
+    fn default_filter_is_open_admit_anything_nothing_read_only() {
+        // Spec: the default filter is "let everything through, nothing
+        // privileged for Plan mode". A regression that flipped the default
+        // to a deny-by-default would silently disable freshly-added MCP
+        // servers — fail loudly here instead.
+        let f = ToolFilter::default();
+        assert!(f.admits("anything"));
+        assert!(f.admits(""));
+        assert!(!f.is_read_only("anything"));
+        assert_eq!(f.max, ToolFilter::DEFAULT_MAX);
+        assert_eq!(ToolFilter::DEFAULT_MAX, 32);
+    }
+
+    #[test]
+    fn empty_exclude_admits_everything() {
+        let f = ToolFilter::default();
+        for name in ["a", "search", "delete", "anything"] {
+            assert!(f.admits(name), "default must admit {name}");
+        }
+    }
+
+    #[test]
+    fn include_is_exact_match_not_substring() {
+        // Real-world failure: an `include` of "search" accidentally
+        // admitting "search_pro" would widen the operator-curated set.
+        // Reject substring matching.
+        let f = ToolFilter {
+            include: vec!["search".into()],
+            ..Default::default()
+        };
+        assert!(f.admits("search"));
+        assert!(!f.admits("search_pro"));
+        assert!(!f.admits("pre_search"));
+    }
+
+    #[test]
+    fn http_auth_default_is_none() {
+        // Spec: the *absence* of structured auth must not silently inject
+        // an `Authorization: Bearer <empty>` header. Default is None;
+        // operators opt into Bearer explicitly.
+        let auth = HttpAuth::default();
+        assert!(
+            matches!(auth, HttpAuth::None),
+            "default HttpAuth must be None, got {auth:?}"
+        );
+    }
+
+    #[test]
+    fn tool_filter_deserializes_with_defaults() {
+        // An empty JSON object must deserialize to the open default —
+        // operator config is allowed to omit any subset of fields without
+        // surprising-default surprises.
+        let f: ToolFilter = serde_json::from_str("{}").expect("default deserialize");
+        assert!(f.include.is_empty());
+        assert!(f.exclude.is_empty());
+        assert!(f.read_only.is_empty());
+        assert_eq!(f.max, ToolFilter::DEFAULT_MAX);
+    }
+
+    #[test]
+    fn tool_filter_partial_deserialize_honors_specified_fields() {
+        // Mixed config: only `include` and `max` specified. Everything
+        // else must still apply defaults — protects callers that grow
+        // the config gradually.
+        let f: ToolFilter =
+            serde_json::from_str(r#"{"include":["a","b"],"max":4}"#).expect("partial");
+        assert_eq!(f.include, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(f.max, 4);
+        assert!(f.exclude.is_empty());
+        assert!(f.read_only.is_empty());
+        assert!(f.admits("a"));
+        assert!(!f.admits("c"));
+    }
 }

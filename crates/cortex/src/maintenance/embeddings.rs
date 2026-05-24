@@ -135,20 +135,24 @@ pub(super) async fn repair_embedding_backlog(
     Ok(report)
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn repair_embedding_backlog_no_provider_is_bounded_failure() {
-        let db = crate::db::Database::test_db();
+    #[tokio::test]
+    async fn repair_embedding_backlog_no_provider_is_bounded_failure() {
+        let db = crate::db::Database::test_db().await;
         let mut config = Config::default();
         config.memory.embeddings.enabled = true;
         config.memory.embeddings.provider = Some("openai".into());
         config.memory.embeddings.api_key_env = Some("BORG_TEST_MISSING_EMBED_KEY".into());
-        std::env::remove_var("BORG_TEST_MISSING_EMBED_KEY");
+        unsafe {
+            std::env::remove_var("BORG_TEST_MISSING_EMBED_KEY");
+        }
 
-        let report = repair_embedding_backlog(&db, &config).expect("repair");
+        let report = repair_embedding_backlog(&db, &config)
+            .await
+            .expect("repair");
         assert!(report.failed, "missing provider creds should skip repair");
         assert_eq!(report.repaired_files, 0);
         assert_eq!(report.repaired_chunks, 0);

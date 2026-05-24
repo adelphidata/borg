@@ -114,32 +114,35 @@ fn build_transcript(messages: &[MessageRow], max_chars: usize) -> String {
     transcript
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_db() -> Database {
-        Database::test_db()
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn gather_daily_context_empty_db() {
-        let db = test_db();
-        let ctx = gather_daily_context(&db).expect("should succeed");
+    #[tokio::test]
+    async fn gather_daily_context_empty_db() {
+        let db = test_db().await;
+        let ctx = gather_daily_context(&db).await.expect("should succeed");
         assert!(ctx.contains("## Sessions (0 in last 24h)"));
         assert!(ctx.contains("## Task Runs"));
         assert!(ctx.contains("0 total"));
     }
 
-    #[test]
-    fn gather_daily_context_with_sessions() {
-        let db = test_db();
+    #[tokio::test]
+    async fn gather_daily_context_with_sessions() {
+        let db = test_db().await;
         let now = chrono::Utc::now().timestamp();
         db.upsert_session("s1", now - 100, now - 50, 500, "test-model", "My Session")
+            .await
             .unwrap();
         db.insert_message("s1", "user", Some("Hello world"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "assistant", Some("Hi there!"), None, None, None, None)
+            .await
             .unwrap();
         // Tool messages should be filtered out
         db.insert_message(
@@ -151,9 +154,10 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
-        let ctx = gather_daily_context(&db).expect("should succeed");
+        let ctx = gather_daily_context(&db).await.expect("should succeed");
         assert!(ctx.contains("## Sessions (1 in last 24h)"));
         assert!(ctx.contains("### My Session"));
         assert!(ctx.contains("User: Hello world"));
@@ -161,9 +165,9 @@ mod tests {
         assert!(!ctx.contains("tool output"));
     }
 
-    #[test]
-    fn gather_daily_context_excludes_old_sessions() {
-        let db = test_db();
+    #[tokio::test]
+    async fn gather_daily_context_excludes_old_sessions() {
+        let db = test_db().await;
         let now = chrono::Utc::now().timestamp();
         // Session from 2 days ago
         let two_days_ago = now - 2 * SECS_PER_DAY;
@@ -175,11 +179,13 @@ mod tests {
             "model",
             "Old Session",
         )
+        .await
         .unwrap();
         db.insert_message("old", "user", Some("old message"), None, None, None, None)
+            .await
             .unwrap();
 
-        let ctx = gather_daily_context(&db).expect("should succeed");
+        let ctx = gather_daily_context(&db).await.expect("should succeed");
         assert!(ctx.contains("## Sessions (0 in last 24h)"));
         assert!(!ctx.contains("Old Session"));
         assert!(!ctx.contains("old message"));

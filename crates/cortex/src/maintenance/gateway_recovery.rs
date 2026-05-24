@@ -59,61 +59,80 @@ pub async fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Res
     Ok(())
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn recover_gateway_silent_when_flag_not_set() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn recover_gateway_silent_when_flag_not_set() {
+        let db = Database::test_db().await;
         let cfg = Config::default();
         // Flag absent → no-op, no error.
-        recover_gateway_if_abandoned(&db, &cfg).expect("noop");
-        assert!(db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().is_none());
+        recover_gateway_if_abandoned(&db, &cfg).await.expect("noop");
+        assert!(db
+            .get_meta(GATEWAY_UNRECOVERABLE_KEY)
+            .await
+            .unwrap()
+            .is_none());
     }
 
-    #[test]
-    fn recover_gateway_leaves_flag_when_probe_fails() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn recover_gateway_leaves_flag_when_probe_fails() {
+        let db = Database::test_db().await;
         let mut cfg = Config::default();
         // Point at a port that nobody could possibly be listening on.
         cfg.gateway.host = "127.0.0.1".into();
         cfg.gateway.port = 1; // privileged + universally closed in tests
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "1234567890")
+            .await
             .unwrap();
-        recover_gateway_if_abandoned(&db, &cfg).expect("probe");
+        recover_gateway_if_abandoned(&db, &cfg)
+            .await
+            .expect("probe");
         // Flag must remain — no false recovery.
         assert_eq!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "failed probe must leave the flag set"
         );
     }
 
-    #[test]
-    fn recover_gateway_clears_flag_when_probe_succeeds() {
+    #[tokio::test]
+    async fn recover_gateway_clears_flag_when_probe_succeeds() {
         // Bind a temporary listener on an OS-chosen port, then point the
         // config at it. The probe succeeds → flag clears. This exercises
         // the actual TCP-connect path rather than mocking it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let db = Database::test_db();
+        let db = Database::test_db().await;
         let mut cfg = Config::default();
         cfg.gateway.host = addr.ip().to_string();
         cfg.gateway.port = addr.port();
-        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").await.unwrap();
         db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "1234567890")
+            .await
             .unwrap();
 
-        recover_gateway_if_abandoned(&db, &cfg).expect("probe");
+        recover_gateway_if_abandoned(&db, &cfg)
+            .await
+            .expect("probe");
 
         assert!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().is_none(),
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY)
+                .await
+                .unwrap()
+                .is_none(),
             "successful probe must delete the flag row"
         );
         assert!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY).unwrap().is_none(),
+            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
+                .await
+                .unwrap()
+                .is_none(),
             "successful probe must delete the timestamp row"
         );
     }

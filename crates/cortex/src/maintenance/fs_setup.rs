@@ -66,7 +66,7 @@ pub async fn ensure_global_index(db: &Database) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -85,39 +85,52 @@ mod tests {
         assert!(marker.is_dir(), "second call should not blow away contents");
     }
 
-    #[test]
-    fn ensure_global_index_seeds_when_entries_exist_without_index() {
-        let db = Database::test_db();
-        db.upsert_memory_entry("global", "notes", "stuff").unwrap();
-        let seeded = ensure_global_index(&db).unwrap();
+    #[tokio::test]
+    async fn ensure_global_index_seeds_when_entries_exist_without_index() {
+        let db = Database::test_db().await;
+        db.upsert_memory_entry("global", "notes", "stuff")
+            .await
+            .unwrap();
+        let seeded = ensure_global_index(&db).await.unwrap();
         assert!(seeded, "should write a fresh INDEX");
         let idx = db
             .get_memory_entry("global", "INDEX")
+            .await
             .unwrap()
             .expect("INDEX must exist");
         assert!(idx.content.contains("- notes"));
     }
 
-    #[test]
-    fn ensure_global_index_noop_when_no_entries() {
-        let db = Database::test_db();
-        let seeded = ensure_global_index(&db).unwrap();
+    #[tokio::test]
+    async fn ensure_global_index_noop_when_no_entries() {
+        let db = Database::test_db().await;
+        let seeded = ensure_global_index(&db).await.unwrap();
         assert!(!seeded, "no entries means nothing to seed");
         assert!(
-            db.get_memory_entry("global", "INDEX").unwrap().is_none(),
+            db.get_memory_entry("global", "INDEX")
+                .await
+                .unwrap()
+                .is_none(),
             "must not write an INDEX into an empty scope"
         );
     }
 
-    #[test]
-    fn ensure_global_index_noop_when_index_already_exists() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn ensure_global_index_noop_when_index_already_exists() {
+        let db = Database::test_db().await;
         db.upsert_memory_entry("global", "INDEX", "user-curated body")
+            .await
             .unwrap();
-        db.upsert_memory_entry("global", "notes", "x").unwrap();
-        let seeded = ensure_global_index(&db).unwrap();
+        db.upsert_memory_entry("global", "notes", "x")
+            .await
+            .unwrap();
+        let seeded = ensure_global_index(&db).await.unwrap();
         assert!(!seeded, "must not overwrite an existing INDEX");
-        let idx = db.get_memory_entry("global", "INDEX").unwrap().unwrap();
+        let idx = db
+            .get_memory_entry("global", "INDEX")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             idx.content, "user-curated body",
             "existing INDEX content must be preserved verbatim"

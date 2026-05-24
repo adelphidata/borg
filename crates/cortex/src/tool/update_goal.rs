@@ -155,48 +155,23 @@ mod accept_status_tests {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
-mod tests {
+#[cfg(test)]
+mod ported_tests {
     use super::*;
 
-    fn db_with_session(id: &str) -> Database {
-        let db = Database::test_db();
-        db.upsert_session(id, 0, 0, 0, "m", "t").unwrap();
+    async fn db_with_session(id: &str) -> Database {
+        let db = Database::test_db().await;
+        db.upsert_session(id, 0, 0, 0, "m", "t").await.unwrap();
         db
     }
 
-    #[test]
-    fn rejects_status_values_other_than_complete() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
-        for bad in ["paused", "active", "budget_limited", "garbage", ""] {
-            let out = handle(
-                &UpdateGoalArgs {
-                    status: bad.to_string(),
-                },
-                &db,
-                "s",
-            )
-            .unwrap();
-            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-            assert!(
-                v["error"].as_str().unwrap().contains("must be"),
-                "expected error for status={bad:?}, got {out}"
-            );
-        }
-        // Goal still Active.
-        assert_eq!(
-            db.get_goal("s").unwrap().unwrap().status,
-            GoalStatus::Active
-        );
-    }
-
-    #[test]
-    fn marks_active_goal_complete() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn marks_active_goal_complete() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "ship", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
-        db.account_goal_usage("s", 250, 5, None).unwrap();
+        db.account_goal_usage("s", 250, 5, None).await.unwrap();
         let out = handle(
             &UpdateGoalArgs {
                 status: "complete".into(),
@@ -204,20 +179,21 @@ mod tests {
             &db,
             "s",
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["status"], "complete");
         assert_eq!(v["tokens_used"], 250);
         assert_eq!(
-            db.get_goal("s").unwrap().unwrap().status,
+            db.get_goal("s").await.unwrap().unwrap().status,
             GoalStatus::Complete
         );
     }
 
-    #[test]
-    fn errors_when_no_goal() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn errors_when_no_goal() {
+        let db = db_with_session("s").await;
         let out = handle(
             &UpdateGoalArgs {
                 status: "complete".into(),
@@ -225,15 +201,18 @@ mod tests {
             &db,
             "s",
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["error"].as_str().unwrap().contains("no goal"));
     }
 
-    #[test]
-    fn idempotent_when_already_complete() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
+    #[tokio::test]
+    async fn idempotent_when_already_complete() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
+            .unwrap();
         let _ = handle(
             &UpdateGoalArgs {
                 status: "complete".into(),
@@ -241,6 +220,7 @@ mod tests {
             &db,
             "s",
         )
+        .await
         .unwrap();
         // Second call must not error.
         let out = handle(
@@ -250,6 +230,7 @@ mod tests {
             &db,
             "s",
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);

@@ -209,6 +209,11 @@ impl Database {
             )
             .await?;
         for entry in crate::pricing::bundled_rate_card_entries() {
+            // libsql's `Statement` holds binding/execution state between
+            // calls — without `reset()`, only the first iteration's
+            // INSERT actually fires (the rest are silently no-op'd). See
+            // the matching fix in `Database::ensure_all_settings`.
+            stmt.reset();
             stmt.execute(params!(
                 entry.provider_id,
                 entry.model,

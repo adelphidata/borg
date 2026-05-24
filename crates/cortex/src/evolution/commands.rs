@@ -209,9 +209,10 @@ async fn format_posture_line(db: &Database) -> String {
 
 // ── Tests ──
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use libsql::params;
 
     #[test]
     fn parse_evolution() {
@@ -249,15 +250,17 @@ mod tests {
         assert!(parse("").is_none());
     }
 
-    #[test]
-    fn dispatch_xp_renders_all_sections() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn dispatch_xp_renders_all_sections() {
+        let db = Database::test_db().await;
         db.record_evolution_event("xp_gain", 2, Some("builder"), "apply_patch", None)
+            .await
             .expect("record xp_gain");
         db.record_evolution_event("xp_gain", 1, Some("ops"), "run_shell", None)
+            .await
             .expect("record xp_gain");
 
-        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch xp");
+        let out = dispatch(EvolutionCommand::Xp, &db).await.expect("dispatch xp");
         assert!(out.image_png.is_none());
         assert!(out.text.contains("XP Summary"), "text was: {}", out.text);
         assert!(out.text.contains("Top sources"));
@@ -267,19 +270,19 @@ mod tests {
         assert!(out.text.contains("run_shell"));
     }
 
-    #[test]
-    fn dispatch_xp_empty_db_still_renders() {
-        let db = Database::test_db();
-        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch xp");
+    #[tokio::test]
+    async fn dispatch_xp_empty_db_still_renders() {
+        let db = Database::test_db().await;
+        let out = dispatch(EvolutionCommand::Xp, &db).await.expect("dispatch xp");
         assert!(out.text.contains("XP Summary"));
         assert!(out.text.contains("Recent XP"));
         assert!(out.text.contains("no recent activity"));
     }
 
-    #[test]
-    fn dispatch_card_stdout_returns_rendered_card() {
-        let db = Database::test_db();
-        let output = dispatch(EvolutionCommand::Card { out: None }, &db).expect("dispatch");
+    #[tokio::test]
+    async fn dispatch_card_stdout_returns_rendered_card() {
+        let db = Database::test_db().await;
+        let output = dispatch(EvolutionCommand::Card { out: None }, &db).await.expect("dispatch");
         assert!(output.image_png.is_none());
         assert!(output.text.contains('\u{256D}'));
         assert!(output.text.contains('\u{2570}'));
@@ -288,14 +291,10 @@ mod tests {
         assert!(output.text.contains("Archetype:"));
     }
 
-    #[test]
-    fn dispatch_evolution_baseline_state_renders_header() {
-        // Empty DB → baseline "Base Borg Lvl.0" header + Archetype Scores
-        // block. No readiness block since an empty state has no archetype
-        // yet and readiness blocking gates only render through
-        // format_evolution_overview when present.
-        let db = Database::test_db();
-        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+    #[tokio::test]
+    async fn dispatch_evolution_baseline_state_renders_header() {
+        let db = Database::test_db().await;
+        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
         assert!(out.image_png.is_none());
         assert!(
             out.text.contains("Base Borg Lvl."),
@@ -309,13 +308,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_evolution_includes_hints_when_nonempty() {
-        // A baseline DB still produces next_step_hints (at minimum "Use
-        // tools to start forming an archetype identity."), so the Next
-        // Steps section must be appended to the overview.
-        let db = Database::test_db();
-        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+    #[tokio::test]
+    async fn dispatch_evolution_includes_hints_when_nonempty() {
+        let db = Database::test_db().await;
+        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
         assert!(
             out.text.contains("Next Steps"),
             "missing Next Steps block in: {}",
@@ -323,32 +319,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_evolution_tolerates_missing_bond_and_vitals() {
-        // A fresh in-memory DB has no bond or vitals events. Dispatch must
-        // still render cleanly rather than panic — the commands.rs fallback
-        // branches log-and-continue with baseline state.
-        let db = Database::test_db();
-        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+    #[tokio::test]
+    async fn dispatch_evolution_tolerates_missing_bond_and_vitals() {
+        let db = Database::test_db().await;
+        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
         assert!(!out.text.is_empty());
     }
 
-    #[test]
-    fn dispatch_card_populates_mood_not_em_dash() {
-        // Regression: `/card` went through pure `get_evolution_state` which
-        // leaves `state.mood = None`, so `render_ascii_card` printed
-        // `Mood: —`. Dispatch must derive mood from vitals+bond the same way
-        // `/evolution` does, so a realistic state yields a concrete label.
-        let db = Database::test_db();
-        // Seed enough archetype XP that dominant_archetype resolves — without
-        // it, baseline vitals (40/40/…) produce Mood::Drifting. With it,
-        // they produce Mood::Stable.
+    #[tokio::test]
+    async fn dispatch_card_populates_mood_not_em_dash() {
+        let db = Database::test_db().await;
         for _ in 0..10 {
             db.record_evolution_event("xp_gain", 2, Some("builder"), "apply_patch", None)
+                .await
                 .expect("record xp_gain");
         }
 
-        let out = dispatch(EvolutionCommand::Card { out: None }, &db).expect("dispatch");
+        let out = dispatch(EvolutionCommand::Card { out: None }, &db).await.expect("dispatch");
         assert!(
             out.text.contains("Mood: Stable"),
             "expected Mood: Stable baseline in card, got: {}",
@@ -361,12 +348,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn evolution_command_renders_posture_line_with_boosted_state() {
-        // Real failure mode: posture surface drift — the daemon ships
-        // posture changes via the audit chain but the human-facing surface
-        // never reads them, so users can't tell what multiplier is active.
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn evolution_command_renders_posture_line_with_boosted_state() {
+        let db = Database::test_db().await;
         let now = chrono::Utc::now().timestamp();
         let seq = db
             .append_audit_event(
@@ -375,16 +359,18 @@ mod tests {
                 "system",
                 now,
             )
+            .await
             .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO posture_snapshots
                  (evolution_event_id, taken_at, posture, source, schema_version)
                  VALUES (?1, ?2, 'Boosted', 'ListenerBind', 1)",
-                rusqlite::params![seq, now],
+                params!(seq, now),
             )
+            .await
             .unwrap();
-        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch");
+        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch");
         assert!(
             out.text.contains("Posture: Boosted"),
             "missing posture line: {}",
@@ -397,19 +383,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xp_command_renders_posture_header_default_on_fresh_db() {
-        // Fallback path: fresh DB has no posture row, but `/xp` should still
-        // render a posture header (Default × 1.00) — no missing surface.
-        let db = Database::test_db();
-        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch");
+    #[tokio::test]
+    async fn xp_command_renders_posture_header_default_on_fresh_db() {
+        let db = Database::test_db().await;
+        let out = dispatch(EvolutionCommand::Xp, &db).await.expect("dispatch");
         assert!(out.text.contains("Posture: Default"));
         assert!(out.text.contains("\u{00d7}1.00"));
     }
 
-    #[test]
-    fn dispatch_card_with_out_writes_file() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn dispatch_card_with_out_writes_file() {
+        let db = Database::test_db().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("card.txt");
         let output = dispatch(
@@ -418,6 +402,7 @@ mod tests {
             },
             &db,
         )
+        .await
         .expect("dispatch");
         assert!(output.image_png.is_none());
         assert!(output.text.contains("Card written to"));

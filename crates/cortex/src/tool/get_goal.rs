@@ -37,32 +37,33 @@ pub(crate) async fn handle(_args: &GetGoalArgs, db: &Database, session_id: &str)
     Ok(payload.to_string())
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::goals::GoalStatus;
 
-    fn db_with_session(id: &str) -> Database {
-        let db = Database::test_db();
-        db.upsert_session(id, 0, 0, 0, "m", "t").unwrap();
+    async fn db_with_session(id: &str) -> Database {
+        let db = Database::test_db().await;
+        db.upsert_session(id, 0, 0, 0, "m", "t").await.unwrap();
         db
     }
 
-    #[test]
-    fn returns_null_when_no_goal() {
-        let db = db_with_session("s");
-        let out = handle(&GetGoalArgs::default(), &db, "s").unwrap();
+    #[tokio::test]
+    async fn returns_null_when_no_goal() {
+        let db = db_with_session("s").await;
+        let out = handle(&GetGoalArgs::default(), &db, "s").await.unwrap();
         assert_eq!(out, "null");
     }
 
-    #[test]
-    fn returns_serialized_goal_with_remaining_budget() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn returns_serialized_goal_with_remaining_budget() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "ship", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
-        db.account_goal_usage("s", 300, 5, None).unwrap();
+        db.account_goal_usage("s", 300, 5, None).await.unwrap();
 
-        let out = handle(&GetGoalArgs::default(), &db, "s").unwrap();
+        let out = handle(&GetGoalArgs::default(), &db, "s").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["objective"], "ship");
         assert_eq!(v["status"], "active");
@@ -71,12 +72,13 @@ mod tests {
         assert_eq!(v["tokens_remaining"], 700);
     }
 
-    #[test]
-    fn tokens_remaining_null_when_unbounded() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn tokens_remaining_null_when_unbounded() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "ship", GoalStatus::Active, None)
+            .await
             .unwrap();
-        let out = handle(&GetGoalArgs::default(), &db, "s").unwrap();
+        let out = handle(&GetGoalArgs::default(), &db, "s").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["tokens_remaining"].is_null());
         assert!(v["token_budget"].is_null());

@@ -167,8 +167,7 @@ impl fmt::Debug for BondHook {
     }
 }
 
-// TODO: needs async DB harness
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::HookPoint;
@@ -208,116 +207,105 @@ mod tests {
         }
     }
 
-    fn fresh_hook() -> BondHook {
-        BondHook::from_db(Database::test_db())
+    async fn fresh_hook() -> BondHook {
+        BondHook::from_db(Database::test_db().await).await
     }
 
-    /// Read the persisted bond chain. The hook keeps an internal Database
-    /// behind a Mutex; we open a second handle to the same in-memory pool
-    /// won't work (each `:memory:` connection is isolated), so we drop
-    /// access to the hook's DB by going through the public hook surface
-    /// instead — `inject_context` reflects the chain state.
-    fn events_from_hook(hook: &BondHook) -> Vec<crate::bond::BondEvent> {
-        let db = hook.db.lock().expect("lock");
-        db.get_all_bond_events().expect("read events")
+    async fn events_from_hook(hook: &BondHook) -> Vec<crate::bond::BondEvent> {
+        let db = hook.db.lock().await;
+        db.get_all_bond_events().await.expect("read events")
     }
 
-    #[test]
-    fn agent_start_acceptance_records_suggestion_accepted() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_agent_start("go ahead"));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn agent_start_acceptance_records_suggestion_accepted() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_agent_start("go ahead")).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "suggestion_accepted");
         assert_eq!(events[0].score_delta, 1);
         assert_eq!(events[0].reason, "user_message");
     }
 
-    #[test]
-    fn agent_start_rejection_records_suggestion_rejected() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_agent_start("cancel that"));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn agent_start_rejection_records_suggestion_rejected() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_agent_start("cancel that")).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "suggestion_rejected");
         assert_eq!(events[0].score_delta, -1);
     }
 
-    #[test]
-    fn agent_start_correction_records_correction() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_agent_start("that's wrong"));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn agent_start_correction_records_correction() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_agent_start("that's wrong")).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "correction");
         assert_eq!(events[0].score_delta, -2);
     }
 
-    #[test]
-    fn agent_start_neutral_message_records_nothing() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_agent_start("hello world"));
-        assert!(events_from_hook(&hook).is_empty());
+    #[tokio::test]
+    async fn agent_start_neutral_message_records_nothing() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_agent_start("hello world")).await;
+        assert!(events_from_hook(&hook).await.is_empty());
     }
 
-    #[test]
-    fn tool_result_creation_tool_records_creation() {
-        // apply_patch is in vitals::classify_tool's Creation list.
-        let hook = fresh_hook();
-        hook.execute(&ctx_tool_result("apply_patch", false));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn tool_result_creation_tool_records_creation() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_tool_result("apply_patch", false)).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "creation");
         assert_eq!(events[0].score_delta, 1);
         assert_eq!(events[0].reason, "apply_patch");
     }
 
-    #[test]
-    fn tool_result_error_records_tool_failure() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_tool_result("read_file", true));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn tool_result_error_records_tool_failure() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_tool_result("read_file", true)).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "tool_failure");
         assert_eq!(events[0].score_delta, -1);
     }
 
-    #[test]
-    fn tool_result_success_non_creation_records_tool_success() {
-        let hook = fresh_hook();
-        hook.execute(&ctx_tool_result("read_file", false));
-        let events = events_from_hook(&hook);
+    #[tokio::test]
+    async fn tool_result_success_non_creation_records_tool_success() {
+        let hook = fresh_hook().await;
+        hook.execute(&ctx_tool_result("read_file", false)).await;
+        let events = events_from_hook(&hook).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "tool_success");
         assert_eq!(events[0].score_delta, 1);
     }
 
-    #[test]
-    fn session_start_does_not_record_or_inject() {
-        let hook = fresh_hook();
-        let action = hook.execute(&ctx_session_start());
+    #[tokio::test]
+    async fn session_start_does_not_record_or_inject() {
+        let hook = fresh_hook().await;
+        let action = hook.execute(&ctx_session_start()).await;
         assert!(matches!(action, HookAction::Continue));
-        assert!(events_from_hook(&hook).is_empty());
+        assert!(events_from_hook(&hook).await.is_empty());
     }
 
-    /// After `record(...)`, the cached state is invalidated and the next
-    /// `inject_context` reflects the new chain. If the cache stuck, every
-    /// system prompt would still report the pre-event score forever.
-    #[test]
-    fn record_invalidates_cache_so_next_inject_reflects_new_event() {
-        let hook = fresh_hook();
-        // Pre-event injection should reflect the baseline (25). Two corrections
-        // (-2 each) drop the score by 4.
-        let pre = match hook.inject_context() {
+    #[tokio::test]
+    async fn record_invalidates_cache_so_next_inject_reflects_new_event() {
+        let hook = fresh_hook().await;
+        let pre = match hook.inject_context().await {
             HookAction::InjectContext(s) => s,
             _ => panic!("expected InjectContext"),
         };
         assert!(pre.contains("(25/100)"), "baseline missing: {pre}");
 
-        hook.execute(&ctx_agent_start("that's wrong"));
-        hook.execute(&ctx_agent_start("that's wrong"));
+        hook.execute(&ctx_agent_start("that's wrong")).await;
+        hook.execute(&ctx_agent_start("that's wrong")).await;
 
-        let post = match hook.inject_context() {
+        let post = match hook.inject_context().await {
             HookAction::InjectContext(s) => s,
             _ => panic!("expected InjectContext"),
         };

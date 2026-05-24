@@ -396,4 +396,144 @@ mod tests {
         };
         assert_eq!(render_call_result(&r), "hello\n{\"k\":1}");
     }
+
+    #[test]
+    fn unsupported_content_block_renders_placeholder_not_silent_drop() {
+        // Spec: surfacing image/audio/resource as a labeled placeholder is
+        // important — the LLM should know a block existed and was elided,
+        // not get a silently-truncated response. A regression that emitted
+        // an empty string would let the model think the call succeeded
+        // with no content.
+        let r = ToolCallResult {
+            content: vec![
+                ContentBlock::Text { text: "before".into() },
+                ContentBlock::Other,
+                ContentBlock::Text { text: "after".into() },
+            ],
+            is_error: false,
+        };
+        let out = render_call_result(&r);
+        assert!(out.contains("[unsupported mcp content block]"), "got: {out}");
+        // Ordering must be preserved so the model sees the text-around-blob
+        // structure rather than a reordered transcript.
+        let pre = out.find("before").expect("before");
+        let placeholder = out.find("[unsupported").expect("placeholder");
+        let post = out.find("after").expect("after");
+        assert!(pre < placeholder && placeholder < post);
+    }
+
+    #[test]
+    fn other_variant_decodes_from_unknown_block_type() {
+        // Real-world failure: a future MCP spec block type (e.g. "video")
+        // must NOT fail decode of the whole response — it should land in
+        // `Other` so we degrade gracefully. Encode the spec.
+        let resp = br#"{
+            "content":[
+                {"type":"image","data":"..."},
+                {"type":"text","text":"caption"}
+            ],
+            "isError":false
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        assert_eq!(result.content.len(), 2);
+        assert!(matches!(result.content[0], ContentBlock::Other));
+        match &result.content[1] {
+            ContentBlock::Text { text } => assert_eq!(text, "caption"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_content_renders_empty_string_not_an_error() {
+        // A tools/call response with `content: []` and `isError: false` is
+        // legal MCP — render to an empty string, don't panic / pad with
+        // a placeholder. The caller's `is_error` flag is the failure signal.
+        let r = ToolCallResult {
+            content: vec![],
+            is_error: false,
+        };
+        assert_eq!(render_call_result(&r), "");
+    }
+
+    #[test]
+    fn is_error_flag_decodes_when_present_and_defaults_false() {
+        // `isError` is the authoritative tool-failure signal. Both shapes —
+        // present `true`, and absent (must default to `false`) — are common
+        // and must round-trip correctly.
+        let with_error: ToolCallResult =
+            serde_json::from_str(r#"{"content":[],"isError":true}"#).expect("decode");
+        assert!(with_error.is_error);
+
+        let without: ToolCallResult =
+            serde_json::from_str(r#"{"content":[]}"#).expect("decode");
+        assert!(!without.is_error, "absent isError must default to false");
+    }
+
+    #[test]
+    fn tools_list_decodes_with_optional_annotations() {
+        // Both shapes the wire produces: with and without `annotations`.
+        // A regression that made `annotations` required would silently
+        // reject every minimal-spec server (Hermes-style toy MCPs).
+        let resp = br#"{
+            "tools":[
+                {"name":"a","inputSchema":{"type":"object"}},
+                {"name":"b","inputSchema":{"type":"object"},
+                 "annotations":{"readOnlyHint":true}}
+            ]
+        }"#;
+        let list: ToolsListResult = serde_json::from_slice(resp).expect("decode");
+        assert_eq!(list.tools.len(), 2);
+        assert_eq!(list.tools[0].name, "a");
+        assert!(list.tools[0].annotations.is_none());
+
+        let ann = list.tools[1]
+            .annotations
+            .as_ref()
+            .expect("second tool has annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+    }
+
+    #[test]
+    fn client_info_matches_borg_identity() {
+        // Servers log clientInfo for triage. The constants must stay
+        // borg-branded (no upstream-name leakage) and the version must
+        // be the actual crate version, not a static placeholder.
+        let info = ClientInfo::standard();
+        assert_eq!(info.name, "borg");
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn decode_line_surfaces_offending_prefix_in_error() {
+        // Spec: when a peer sends garbage, the operator needs to see what
+        // we tried to decode. Locking the prefix-in-error contract so a
+        // refactor doesn't silently drop the diagnostic payload.
+        let err = decode_line(b"not even json").expect_err("must fail");
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(msg.contains("not even json"), "must echo bytes: {msg}");
+                assert!(msg.contains("decode failed"), "must explain: {msg}");
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_line_truncates_diagnostic_to_256_bytes() {
+        // Defense: a malicious peer that sends megabytes of garbage must
+        // not blow up the audit log. The decoder caps the echoed payload
+        // at 256 bytes. Regression: a refactor that drops the cap would
+        // silently make logs grow unboundedly under attack.
+        let big = vec![b'x'; 4096];
+        let err = decode_line(&big).expect_err("must fail");
+        let msg = err.to_string();
+        // The error string includes more than just the echoed bytes (e.g.
+        // the serde error and "decode failed" prefix). Bound the total
+        // length conservatively to catch the unbounded case.
+        assert!(
+            msg.len() < 1024,
+            "diagnostic should be bounded, got {} bytes",
+            msg.len()
+        );
+    }
 }

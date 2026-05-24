@@ -58,19 +58,20 @@ pub(crate) async fn handle(
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goals::GoalStatus;
 
-    fn db_with_session(id: &str) -> Database {
-        let db = Database::test_db();
-        db.upsert_session(id, 0, 0, 0, "m", "t").unwrap();
+    async fn db_with_session(id: &str) -> Database {
+        let db = Database::test_db().await;
+        db.upsert_session(id, 0, 0, 0, "m", "t").await.unwrap();
         db
     }
 
-    #[test]
-    fn creates_goal_when_none_exists() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn creates_goal_when_none_exists() {
+        let db = db_with_session("s").await;
         let out = handle(
             &CreateGoalArgs {
                 objective: "do the thing".into(),
@@ -80,6 +81,7 @@ mod tests {
             "s",
             None,
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);
@@ -88,10 +90,11 @@ mod tests {
         assert_eq!(v["token_budget"], 1000);
     }
 
-    #[test]
-    fn rejects_when_goal_already_exists() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn rejects_when_goal_already_exists() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "first", GoalStatus::Active, None)
+            .await
             .unwrap();
         let out = handle(
             &CreateGoalArgs {
@@ -102,16 +105,17 @@ mod tests {
             "s",
             None,
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["error"].as_str().unwrap().contains("already exists"));
         // First goal is still intact.
-        assert_eq!(db.get_goal("s").unwrap().unwrap().objective, "first");
+        assert_eq!(db.get_goal("s").await.unwrap().unwrap().objective, "first");
     }
 
-    #[test]
-    fn rejects_empty_objective() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn rejects_empty_objective() {
+        let db = db_with_session("s").await;
         let out = handle(
             &CreateGoalArgs {
                 objective: "   ".into(),
@@ -121,15 +125,16 @@ mod tests {
             "s",
             None,
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["error"].as_str().unwrap().contains("empty"));
-        assert!(db.get_goal("s").unwrap().is_none());
+        assert!(db.get_goal("s").await.unwrap().is_none());
     }
 
-    #[test]
-    fn default_budget_applies_when_args_omit_one() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn default_budget_applies_when_args_omit_one() {
+        let db = db_with_session("s").await;
         let out = handle(
             &CreateGoalArgs {
                 objective: "x".into(),
@@ -139,15 +144,16 @@ mod tests {
             "s",
             Some(7777),
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["token_budget"], 7777);
     }
 
-    #[test]
-    fn args_budget_overrides_default() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn args_budget_overrides_default() {
+        let db = db_with_session("s").await;
         let out = handle(
             &CreateGoalArgs {
                 objective: "x".into(),
@@ -157,14 +163,15 @@ mod tests {
             "s",
             Some(7777),
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["token_budget"], 500);
     }
 
-    #[test]
-    fn rejects_non_positive_budget() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn rejects_non_positive_budget() {
+        let db = db_with_session("s").await;
         let out = handle(
             &CreateGoalArgs {
                 objective: "x".into(),
@@ -174,6 +181,7 @@ mod tests {
             "s",
             None,
         )
+        .await
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["error"].as_str().unwrap().contains("positive"));

@@ -490,7 +490,7 @@ impl<W: Write> Write for ShaWriter<'_, W> {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -509,34 +509,39 @@ mod tests {
         fs::write(home.join("borgd.lock"), b"flock sentinel").unwrap();
     }
 
-    /// Real DB roundtrip: create_backup over a populated `BORG_HOME` whose
-    /// `borg.db` is a real Database with audit-chain rows; then verify_backup
-    /// must accept the tarball and report `Ok` (or `OkWithTombstones`).
-    #[test]
-    fn create_then_verify_roundtrip_on_real_db() {
+    #[tokio::test]
+    async fn create_then_verify_roundtrip_on_real_db() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("borg_home");
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
 
-        // Stand up a real SQLite at borg.db with audit chain rows.
         let db_path = home.join("borg.db");
-        let db = Database::open_at(&db_path).unwrap();
+        let db = Database::open_at(&db_path).await.unwrap();
         db.append_audit_event("evt", r#"{"i":1}"#, "p", 1_700_000_000)
+            .await
             .unwrap();
         db.append_audit_event("evt", r#"{"i":2}"#, "p", 1_700_000_001)
+            .await
             .unwrap();
-        // Insert a couple of messages so verify can count them.
         db.conn()
             .execute(
                 "INSERT INTO messages (session_id, role, content, created_at)
-                 VALUES ('s', 'user', 'hi', 1), ('s', 'assistant', 'hello', 2)",
-                [],
+                 VALUES ('s', 'user', 'hi', 1)",
+                (),
             )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages (session_id, role, content, created_at)
+                 VALUES ('s', 'assistant', 'hello', 2)",
+                (),
+            )
+            .await
             .unwrap();
         drop(db);
 
-        // Add a logs/ + .lock that must NOT roundtrip.
         fs::create_dir_all(home.join("logs")).unwrap();
         fs::write(home.join("logs/daemon.log"), b"noisy").unwrap();
         fs::write(home.join("borgd.lock"), b"x").unwrap();
@@ -544,26 +549,25 @@ mod tests {
         let path = create_backup(&home, &out, 47).expect("create");
         assert!(path.exists());
 
-        let report = verify_backup(&path).expect("verify");
+        let report = verify_backup(&path).await.expect("verify");
         assert_eq!(report.manifest.schema_version, 47);
-        // Real audit chain → `Ok` (no tombstones written in this test).
         assert_eq!(report.audit_outcome, AuditChainOutcome::Ok);
         assert_eq!(report.messages_count, 2);
     }
 
-    /// Restore must refuse a non-empty BORG_HOME without `--force`.
-    #[test]
-    fn restore_refuses_existing_state_without_force() {
+    #[tokio::test]
+    async fn restore_refuses_existing_state_without_force() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("borg_home");
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
         let db_path = home.join("borg.db");
-        Database::open_at(&db_path).unwrap();
+        Database::open_at(&db_path).await.unwrap();
         let backup = create_backup(&home, &out, 47).expect("create");
 
-        // borg_home still has borg.db → has_existing_state == true.
-        let err = restore_backup(&backup, &home, false).expect_err("must refuse");
+        let err = restore_backup(&backup, &home, false)
+            .await
+            .expect_err("must refuse");
         let msg = format!("{err}");
         assert!(
             msg.contains("existing state"),
@@ -571,24 +575,22 @@ mod tests {
         );
     }
 
-    /// `--force` renames the existing dir to `.bak.<ts>` and proceeds.
-    #[test]
-    fn restore_with_force_renames_existing_dir() {
+    #[tokio::test]
+    async fn restore_with_force_renames_existing_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("borg_home");
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
-        Database::open_at(&home.join("borg.db")).unwrap();
-        // Marker file the rename should preserve in the .bak dir.
+        Database::open_at(&home.join("borg.db")).await.unwrap();
         fs::write(home.join("hooks.json"), b"{}").unwrap();
         let backup = create_backup(&home, &out, 47).expect("create");
 
-        // Mutate borg_home so there's a clear "before" to find afterwards.
         fs::write(home.join("hooks.json"), b"{\"before\":1}").unwrap();
 
-        restore_backup(&backup, &home, true).expect("force restore");
+        restore_backup(&backup, &home, true)
+            .await
+            .expect("force restore");
 
-        // `.bak.*` sibling must exist with the pre-restore hooks.json.
         let parent = home.parent().unwrap();
         let bak = fs::read_dir(parent)
             .unwrap()
@@ -602,51 +604,36 @@ mod tests {
         let preserved = fs::read(bak.path().join("hooks.json")).unwrap();
         assert_eq!(preserved, b"{\"before\":1}");
 
-        // Restored dir contains the original hooks.json content (`{}`).
         let restored = fs::read(home.join("hooks.json")).unwrap();
         assert_eq!(restored, b"{}");
     }
 
-    /// Tampering the inner tar after create breaks digest verification.
-    /// Without the SHA pin, an attacker could swap blobs after backup.
-    #[test]
-    fn verify_rejects_digest_mismatch() {
+    #[tokio::test]
+    async fn verify_rejects_digest_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("borg_home");
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
-        Database::open_at(&home.join("borg.db")).unwrap();
+        Database::open_at(&home.join("borg.db")).await.unwrap();
         let backup = create_backup(&home, &out, 47).expect("create");
 
-        // Decompress, tamper the inner tar, recompress as plain bytes —
-        // simplest tamper: append junk to the file. zstd will still
-        // decompress its own frame; the inner tar's hash will mismatch.
-        // (We don't need a perfect tamper, just any byte change inside.)
         let mut bytes = fs::read(&backup).unwrap();
-        // Flip one byte in the middle (skip the zstd frame header).
         let idx = bytes.len() / 2;
         bytes[idx] ^= 0xFF;
         fs::write(&backup, &bytes).unwrap();
 
-        let err = verify_backup(&backup);
+        let err = verify_backup(&backup).await;
         assert!(err.is_err(), "tampered backup must fail verification");
     }
 
-    /// Missing manifest → fail. Defends against shipping a malformed
-    /// tarball that happens to decompress.
-    #[test]
-    fn verify_rejects_missing_manifest() {
+    #[tokio::test]
+    async fn verify_rejects_missing_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let bad = tmp.path().join("bogus.tar.zst");
-        // Write a tar.zst whose contents are literally "garbage" — zstd
-        // will fail decompression long before tar parsing.
         fs::write(&bad, b"not a tarball").unwrap();
-        assert!(verify_backup(&bad).is_err());
+        assert!(verify_backup(&bad).await.is_err());
     }
 
-    /// `should_skip_entry` filters out the four exclusion classes.
-    /// Failure mode: a future restructuring that moves `logs` deeper would
-    /// silently include log files in backups.
     #[test]
     fn should_skip_entry_filters_excluded_paths() {
         for skip in [
@@ -671,10 +658,6 @@ mod tests {
         }
     }
 
-    /// Filesystem-only roundtrip variant: confirms exclusions actually
-    /// land in the right place even when borg.db is just a stub. Pairs
-    /// with the real-DB roundtrip above (which exercises verify); this
-    /// one focuses on what gets included.
     #[test]
     fn create_backup_excludes_logs_socket_and_lock() {
         let tmp = tempfile::tempdir().unwrap();
@@ -685,8 +668,6 @@ mod tests {
 
         let path = create_backup(&home, &out, 47).expect("create");
 
-        // Extract the outer container manually — verify_backup would
-        // reject this because borg.db isn't a real SQLite.
         let inspect = tempfile::tempdir().unwrap();
         let (_manifest, body_tar) = extract_outer(&path, inspect.path()).expect("outer");
         let inner = inspect.path().join("inner");

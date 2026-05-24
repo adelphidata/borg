@@ -191,7 +191,7 @@ impl std::fmt::Debug for HookRegistry {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -225,15 +225,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_registry_returns_continue() {
+    #[tokio::test]
+    async fn empty_registry_returns_continue() {
         let registry = HookRegistry::new();
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Continue));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
     }
 
-    #[test]
-    fn hook_receives_matching_point() {
+    #[tokio::test]
+    async fn hook_receives_matching_point() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "test".to_string(),
@@ -242,14 +242,14 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        match registry.dispatch(&ctx) {
+        match registry.dispatch(&ctx).await {
             HookAction::InjectContext(text) => assert_eq!(text, "injected"),
             other => panic!("Expected InjectContext, got {other:?}"),
         }
     }
 
-    #[test]
-    fn hook_ignores_non_matching_point() {
+    #[tokio::test]
+    async fn hook_ignores_non_matching_point() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "test".to_string(),
@@ -258,11 +258,11 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Continue));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
     }
 
-    #[test]
-    fn skip_short_circuits() {
+    #[tokio::test]
+    async fn skip_short_circuits() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "skipper".to_string(),
@@ -284,11 +284,11 @@ mod tests {
                 args: "{}".to_string(),
             },
         };
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Skip));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Skip));
     }
 
-    #[test]
-    fn multiple_inject_contexts_merge() {
+    #[tokio::test]
+    async fn multiple_inject_contexts_merge() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "hook1".to_string(),
@@ -302,7 +302,7 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        match registry.dispatch(&ctx) {
+        match registry.dispatch(&ctx).await {
             HookAction::InjectContext(text) => {
                 assert!(text.contains("first"));
                 assert!(text.contains("second"));
@@ -323,8 +323,8 @@ mod tests {
         assert_eq!(registry.hook_count(), 1);
     }
 
-    #[test]
-    fn continue_hook_does_not_affect_result() {
+    #[tokio::test]
+    async fn continue_hook_does_not_affect_result() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "noop".to_string(),
@@ -340,11 +340,11 @@ mod tests {
                 prompt_tokens: None,
             },
         };
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Continue));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
     }
 
-    #[test]
-    fn hook_multi_point_registration() {
+    #[tokio::test]
+    async fn hook_multi_point_registration() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "multi".to_string(),
@@ -354,7 +354,7 @@ mod tests {
 
         let ctx1 = make_ctx(HookPoint::BeforeAgentStart);
         assert!(matches!(
-            registry.dispatch(&ctx1),
+            registry.dispatch(&ctx1).await,
             HookAction::InjectContext(_)
         ));
 
@@ -367,13 +367,13 @@ mod tests {
             },
         };
         assert!(matches!(
-            registry.dispatch(&ctx2),
+            registry.dispatch(&ctx2).await,
             HookAction::InjectContext(_)
         ));
     }
 
-    #[test]
-    fn skip_before_inject_short_circuits() {
+    #[tokio::test]
+    async fn skip_before_inject_short_circuits() {
         let mut registry = HookRegistry::new();
         // Skip registered first
         registry.register(Box::new(TestHook {
@@ -397,7 +397,7 @@ mod tests {
                 text_length: 100,
             },
         };
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Skip));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Skip));
     }
 
     #[test]
@@ -446,8 +446,8 @@ mod tests {
         assert_ne!(HookPoint::BeforeAgentStart, HookPoint::TurnComplete);
     }
 
-    #[test]
-    fn session_start_hook_fires() {
+    #[tokio::test]
+    async fn session_start_hook_fires() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "session_start".to_string(),
@@ -463,14 +463,14 @@ mod tests {
                 session_id: "s1".to_string(),
             },
         };
-        match registry.dispatch(&ctx) {
+        match registry.dispatch(&ctx).await {
             HookAction::InjectContext(text) => assert_eq!(text, "session started"),
             other => panic!("Expected InjectContext, got {other:?}"),
         }
     }
 
-    #[test]
-    fn session_end_hook_fires() {
+    #[tokio::test]
+    async fn session_end_hook_fires() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "session_end".to_string(),
@@ -487,14 +487,14 @@ mod tests {
                 total_turns: 5,
             },
         };
-        match registry.dispatch(&ctx) {
+        match registry.dispatch(&ctx).await {
             HookAction::InjectContext(text) => assert_eq!(text, "session ended"),
             other => panic!("Expected InjectContext, got {other:?}"),
         }
     }
 
-    #[test]
-    fn session_hooks_do_not_fire_on_other_points() {
+    #[tokio::test]
+    async fn session_hooks_do_not_fire_on_other_points() {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(TestHook {
             name: "session_only".to_string(),
@@ -503,7 +503,7 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx), HookAction::Continue));
+        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
     }
 
     #[test]

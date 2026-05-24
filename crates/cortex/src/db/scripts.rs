@@ -117,3 +117,136 @@ impl Database {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ns<'a>(
+        id: &'a str,
+        name: &'a str,
+        ephemeral: bool,
+        created_at: i64,
+    ) -> NewScript<'a> {
+        NewScript {
+            id,
+            name,
+            description: "test",
+            runtime: "bash",
+            entrypoint: "/tmp/x.sh",
+            sandbox_profile: "default",
+            network_access: false,
+            fs_read: "/tmp",
+            fs_write: "/tmp",
+            ephemeral,
+            hmac: "deadbeef",
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_then_get_by_name_round_trips_all_fields() {
+        // Spec: insert + read must preserve every column. A regression
+        // that swapped column order or dropped network_access would
+        // silently let an unsandboxed script run.
+        let db = Database::test_db().await;
+        let mut s = ns("id-1", "my-script", false, 1_000);
+        s.network_access = true;
+        s.description = "important";
+        db.create_script(&s).await.unwrap();
+        let row = db
+            .get_script_by_name("my-script")
+            .await
+            .unwrap()
+            .expect("must round-trip");
+        assert_eq!(row.id, "id-1");
+        assert_eq!(row.description, "important");
+        assert!(row.network_access);
+        assert_eq!(row.runtime, "bash");
+        assert_eq!(row.hmac, "deadbeef");
+        // Counters start at zero.
+        assert_eq!(row.run_count, 0);
+        assert_eq!(row.last_run_at, None);
+    }
+
+    #[tokio::test]
+    async fn get_by_name_returns_none_for_missing() {
+        let db = Database::test_db().await;
+        assert!(db.get_script_by_name("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_scripts_returns_rows_sorted_by_name() {
+        let db = Database::test_db().await;
+        db.create_script(&ns("c", "charlie", false, 1)).await.unwrap();
+        db.create_script(&ns("a", "alpha", false, 2)).await.unwrap();
+        db.create_script(&ns("b", "bravo", false, 3)).await.unwrap();
+        let rows = db.list_scripts().await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[tokio::test]
+    async fn record_script_run_increments_count_and_sets_last_run() {
+        // Real-world failure: a refactor that swapped UPDATE for INSERT
+        // would silently double-count and reset the counter. Encode the
+        // increment + non-null last_run contract.
+        let db = Database::test_db().await;
+        db.create_script(&ns("id-x", "x", false, 1_000)).await.unwrap();
+
+        for expected_count in 1..=3 {
+            db.record_script_run("id-x").await.unwrap();
+            let row = db.get_script_by_name("x").await.unwrap().unwrap();
+            assert_eq!(row.run_count, expected_count, "iteration {expected_count}");
+            assert!(row.last_run_at.is_some(), "last_run_at must be set");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_script_hmac_changes_hmac_and_updated_at() {
+        let db = Database::test_db().await;
+        db.create_script(&ns("id-h", "hmacable", false, 1_000))
+            .await
+            .unwrap();
+        db.update_script_hmac("id-h", "ffeeddcc", 5_000)
+            .await
+            .unwrap();
+        let row = db.get_script_by_name("hmacable").await.unwrap().unwrap();
+        assert_eq!(row.hmac, "ffeeddcc");
+        assert_eq!(row.updated_at, 5_000);
+        // created_at must NOT change — only updated_at moves.
+        assert_eq!(row.created_at, 1_000);
+    }
+
+    #[tokio::test]
+    async fn delete_script_removes_row_and_is_idempotent() {
+        let db = Database::test_db().await;
+        db.create_script(&ns("id-d", "delete-me", false, 1)).await.unwrap();
+        db.delete_script("id-d").await.unwrap();
+        assert!(db.get_script_by_name("delete-me").await.unwrap().is_none());
+        // Idempotent — deleting a non-existent id must not error.
+        db.delete_script("id-d").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_ephemeral_only_removes_ephemeral_and_old() {
+        // Spec: the cleanup sweep must NEVER touch non-ephemeral scripts
+        // (operator-installed) regardless of age, AND must keep fresh
+        // ephemerals (the agent might still be writing them). Encode the
+        // AND condition with a 2×2 fixture.
+        let db = Database::test_db().await;
+        db.create_script(&ns("e-old", "e-old", true, 100)).await.unwrap();
+        db.create_script(&ns("e-new", "e-new", true, 1_000)).await.unwrap();
+        db.create_script(&ns("p-old", "p-old", false, 100)).await.unwrap();
+        db.create_script(&ns("p-new", "p-new", false, 1_000)).await.unwrap();
+
+        // cutoff = 500: only `e-old` matches both conditions.
+        let deleted = db.delete_ephemeral_scripts_older_than(500).await.unwrap();
+        assert_eq!(deleted, 1, "must delete exactly e-old");
+        assert!(db.get_script_by_name("e-old").await.unwrap().is_none());
+        assert!(db.get_script_by_name("e-new").await.unwrap().is_some());
+        assert!(db.get_script_by_name("p-old").await.unwrap().is_some());
+        assert!(db.get_script_by_name("p-new").await.unwrap().is_some());
+    }
+}

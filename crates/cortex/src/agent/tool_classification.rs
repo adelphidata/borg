@@ -69,3 +69,116 @@ pub(crate) fn classify_action(tool_name: &str) -> ActionType {
         _ => ActionType::ToolCall,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_action_bucket_table() {
+        // Real-world failure: a refactor moves `run_shell` out of the
+        // `ShellCommand` arm — the rate guard for shell commands silently
+        // stops firing while the LLM keeps shell-spamming. Lock the
+        // bucket-per-tool mapping. Each arm of the match is one row here.
+        let cases: &[(&str, ActionType)] = &[
+            ("run_shell", ActionType::ShellCommand),
+            ("apply_patch", ActionType::FileWrite),
+            ("apply_skill_patch", ActionType::FileWrite),
+            ("create_channel", ActionType::FileWrite),
+            ("write_memory", ActionType::MemoryWrite),
+            ("memory_search", ActionType::ToolCall),
+            ("read_memory", ActionType::ToolCall),
+            ("web_fetch", ActionType::WebRequest),
+            ("web_search", ActionType::WebRequest),
+            ("browser", ActionType::WebRequest),
+            ("text_to_speech", ActionType::WebRequest),
+            ("generate_image", ActionType::WebRequest),
+            ("vision_analyze", ActionType::WebRequest),
+        ];
+        for (tool, expected) in cases {
+            assert_eq!(
+                classify_action(tool),
+                *expected,
+                "tool {tool} should map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_action_unknown_tool_falls_back_to_tool_call() {
+        // Spec: unrecognized tools must still count against *some* bucket
+        // so they're rate-limited. Defaulting to ToolCall (the generic
+        // bucket) is the safe default — switching to e.g. "no bucket"
+        // would let a malicious / hallucinated tool burn through the loop.
+        for unknown in [
+            "totally_made_up_tool",
+            "mcp_github_search",
+            "",
+            "schedule",
+            "spawn_agent",
+        ] {
+            assert_eq!(
+                classify_action(unknown),
+                ActionType::ToolCall,
+                "unknown tool {unknown:?} must default to ToolCall"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_tool_names_includes_known_mutators() {
+        // Spec: the union returned here must contain every tool that
+        // mutates external state. A drop here would silently let a
+        // sub-agent inherit a forbidden tool in Plan mode.
+        let names = mutating_tool_names();
+        for required in [
+            "apply_patch",
+            "run_shell",
+            "write_memory",
+            "create_channel",
+            "spawn_agent",
+            "schedule",
+        ] {
+            assert!(
+                names.contains(&required),
+                "mutating_tool_names() must include {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_tool_names_excludes_read_only_tools() {
+        // Inverse spec: read-only tools must NEVER appear in the
+        // mutating list — otherwise sub-agents in Plan mode lose access
+        // to memory_search etc. and the agent can't reason.
+        let names = mutating_tool_names();
+        for read_only in [
+            "memory_search",
+            "read_memory",
+            "read_file",
+            "list_dir",
+            "web_fetch",
+            "web_search",
+            "list",
+            "get_goal",
+            "request_user_input",
+        ] {
+            assert!(
+                !names.contains(&read_only),
+                "mutating_tool_names() must NOT include read-only tool {read_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_tool_names_has_no_duplicates() {
+        // Cheap invariant: duplicates indicate a merge mistake and would
+        // hide a typo in one entry behind a working duplicate.
+        let names = mutating_tool_names();
+        let mut sorted: Vec<&&str> = names.iter().collect();
+        sorted.sort();
+        let len = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), len, "duplicate in mutating_tool_names()");
+    }
+}

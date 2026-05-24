@@ -162,3 +162,119 @@ impl fmt::Display for UrlRefusalReason {
 
 /// Convenience result alias.
 pub type Result<T, E = McpError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_rejection_display_includes_diagnostic_payload() {
+        // The Display output is operator-facing in `borg mcp status` and
+        // structured-tool-result JSON. A regression that dropped the
+        // numeric byte-count or property-count would surface as a less
+        // actionable "schema too large" with no number. Lock the payload.
+        assert_eq!(
+            SchemaRejectionReason::TooLarge { bytes: 12_345 }.to_string(),
+            "schema too large (12345 bytes)"
+        );
+        assert_eq!(
+            SchemaRejectionReason::TooManyProperties { count: 99 }.to_string(),
+            "schema declares 99 properties (cap exceeded)"
+        );
+        assert_eq!(
+            SchemaRejectionReason::NotObjectRoot.to_string(),
+            "schema root is not type:object"
+        );
+        assert_eq!(
+            SchemaRejectionReason::ContainsRef.to_string(),
+            "schema contains $ref"
+        );
+        assert_eq!(
+            SchemaRejectionReason::PerServerCapReached.to_string(),
+            "per-server tool cap reached"
+        );
+        assert_eq!(
+            SchemaRejectionReason::GlobalCapReached.to_string(),
+            "global tool cap reached"
+        );
+        assert_eq!(
+            SchemaRejectionReason::EmptyName.to_string(),
+            "sanitized name was empty"
+        );
+    }
+
+    #[test]
+    fn url_refusal_display_distinguishes_reasons() {
+        // Distinct phrasing per variant lets operators disambiguate
+        // "switch to https" vs "flip allow_local_network" without reading
+        // the source. Catch any reword that collapses the variants.
+        assert_eq!(UrlRefusalReason::NotHttps.to_string(), "not https");
+        assert_eq!(
+            UrlRefusalReason::LocalNetworkBlocked.to_string(),
+            "loopback / RFC1918 blocked"
+        );
+        assert_eq!(UrlRefusalReason::Malformed.to_string(), "malformed url");
+    }
+
+    #[test]
+    fn mcp_error_display_surfaces_inner_context() {
+        // Spec: every variant carries enough context that an operator
+        // can act without log-grepping. The schema/URL/rate-limit/timeout
+        // variants embed their structured payloads in Display; locking
+        // the exact wording protects the audit log format.
+        let timeout = McpError::Timeout { ms: 2_500 };
+        assert_eq!(timeout.to_string(), "timeout after 2500ms");
+
+        let rate = McpError::RateLimited {
+            server: "github".into(),
+            retry_after_ms: 4_000,
+        };
+        assert_eq!(
+            rate.to_string(),
+            "rate limited (server=github, retry_after_ms=4000)"
+        );
+
+        let schema = McpError::SchemaRejected {
+            server: "notion".into(),
+            tool: "ghost".into(),
+            reason: SchemaRejectionReason::ContainsRef,
+        };
+        let s = schema.to_string();
+        assert!(s.contains("notion/ghost"), "must name server/tool: {s}");
+        assert!(s.contains("$ref"), "must surface inner reason: {s}");
+
+        let url = McpError::UrlRefused {
+            url: "http://10.0.0.1".into(),
+            reason: UrlRefusalReason::LocalNetworkBlocked,
+        };
+        let s = url.to_string();
+        assert!(s.contains("http://10.0.0.1"), "must echo URL: {s}");
+        assert!(s.contains("loopback / RFC1918 blocked"), "must explain reason: {s}");
+
+        let collision = McpError::NameCollision {
+            server: "github".into(),
+            full_name: "mcp_github_search".into(),
+        };
+        let s = collision.to_string();
+        assert!(s.contains("mcp_github_search"));
+        assert!(s.contains("server=github"));
+    }
+
+    #[test]
+    fn io_and_json_errors_convert_via_from() {
+        // The #[from] derivations are how transport code wraps low-level
+        // failures without losing the original cause. A breaking refactor
+        // (e.g. removing #[from]) would surface as a compile error here,
+        // not silently change the type at runtime.
+        let io: McpError = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst").into();
+        match io {
+            McpError::Io(inner) => assert_eq!(inner.kind(), std::io::ErrorKind::ConnectionReset),
+            other => panic!("expected Io variant, got {other:?}"),
+        }
+
+        let parse_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+        let json: McpError = parse_err.into();
+        assert!(matches!(json, McpError::Json(_)));
+        assert!(json.to_string().starts_with("json error:"));
+    }
+}
