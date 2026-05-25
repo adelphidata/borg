@@ -148,6 +148,19 @@ Per-session Ralph-loop objective. The DB row in `goals` is the source of truth; 
 
 Model-visible tools: `get_goal` (read-only, Plan-mode OK), `create_goal`, `update_goal` (mark complete only). Operator surface: `/goal [pause|resume|clear|<text>]` via Admin gRPC `GetGoal` / `SetGoal` / `ClearGoal` / `PauseGoalOnInterrupt`. Lifecycle telemetry (`goal_created`, `goal_completed`, `goal_budget_limited`) is recorded as `EventCategory::Telemetry` vitals events with zero stat deltas — pure metrics, no posture multiplier change. The TUI footer subscribes to `SubscribeGoalEvents` for sub-100ms paused/budget-limited indicators. Sub-agents (`spawn_agent`) get a fresh `session_id` and intentionally do NOT inherit the parent goal.
 
+### Multi-Agent — Sub-Agent Spawning
+
+Hermes-parity `spawn_agent` tool (`crates/cortex/src/multi_agent/`). Single-task, blocking, and batch (`tasks: [...]`) modes. The caller surface mirrors hermes' delegate tool:
+
+- `context` — background block injected into the child's preamble under `<context trust="parent">…</context>`. Kept distinct from `message`/`goal` (rendered under `<goal>…</goal>`) so the child knows what it should *know* vs. what it should *do*. The system prompt builder is `build_subagent_preamble` in `multi_agent/mod.rs`.
+- `toolsets` — per-call allowlist intersected with the role's allowlist and `parent_tools - blocklist` in `compute_tools_filter`. `toolsets: []` legitimately means "no tools" (Some(empty) ≠ None).
+- `role_kind` — `"leaf"` (default) or `"orchestrator"`. Orchestrator re-permits `spawn_agent`/`wait_for_agent`/`close_agent` via the blocklist overlay in `assemble_delegate_blocklist`, but **only** when `agents.orchestrator_enabled` is true AND `depth + 1 < max_spawn_depth` (`can_orchestrate` predicate). Plan-mode unions every mutating tool *after* the overlay, so plan-mode children stay read-only even at orchestrator role.
+- `files_written` — child reports paths it mutated (parsed from `apply_patch` args via `extract_apply_patch_paths`) so the parent can re-read them before continuing.
+
+Config knobs (all under `agents.*`): `orchestrator_enabled`, `subagent_auto_approve` (default `false` — deny-by-default like hermes; parent's deny list always carries through), `delegation_model`/`delegation_provider` (per-spawn fallback; precedence: explicit arg > role.model > delegation_model > parent), `heartbeat_interval_secs` (default 30), `heartbeat_stale_cycles` (default 15). `AgentTreeBus` carries `Heartbeat` and `Stalled` event kinds in addition to lifecycle transitions.
+
+Sub-agents (`spawn_agent`) get a fresh `session_id` and intentionally do NOT inherit the parent goal. The `subagent-driven-development` bundled skill teaches the implementer → spec-reviewer → quality-reviewer loop.
+
 ### Config
 
 DB-only — `crates/cortex/src/config/`. All settings in the `settings` table. Two-tier: DB → compiled defaults. `Config::load_from_db()` builds runtime; `SettingsResolver` for set/get/unset. No config.toml.

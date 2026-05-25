@@ -96,6 +96,7 @@ bundled_skills! {
     "notion"         => "notion"         { category: "productivity", default_enabled: false, hidden: false },
     "healthcheck"    => "healthcheck"    { category: "core",      default_enabled: false, hidden: false },
     "video-frames"   => "video-frames"   { category: "utilities", default_enabled: false, hidden: false },
+    "subagent-driven-development" => "subagent-driven-development" { category: "developer", default_enabled: true, hidden: false },
 }
 
 /// Filter `SKILL_REGISTRY` to the names satisfying a predicate, all at compile time.

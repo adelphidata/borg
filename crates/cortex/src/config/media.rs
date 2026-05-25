@@ -797,6 +797,31 @@ pub struct MultiAgentConfig {
     /// Default timeout (seconds) used by `spawn_agent` in blocking and batch
     /// modes when the caller does not supply `timeout_secs`.
     pub delegate_timeout_secs: u64,
+    /// Global kill switch for orchestrator-role re-delegation. When `false`,
+    /// every spawned child is treated as a leaf regardless of role — they
+    /// cannot themselves call `spawn_agent`. The numeric `max_spawn_depth`
+    /// remains the terminal safety net.
+    pub orchestrator_enabled: bool,
+    /// When `false` (default), child agents inherit only the parent's deny
+    /// list and do not auto-approve commands. When `true`, children
+    /// auto-approve every command the parent's deny list allows — useful
+    /// for unattended batch/cron flows that can't pause for any prompt.
+    pub subagent_auto_approve: bool,
+    /// Optional per-spawn model override. Used when neither the role nor
+    /// the `spawn_agent` call supplies an explicit `model`. Precedence:
+    /// explicit arg > role.model > this > parent's model.
+    pub delegation_model: Option<String>,
+    /// Optional per-spawn provider override. Same precedence rules as
+    /// `delegation_model`.
+    pub delegation_provider: Option<String>,
+    /// Interval (seconds) between liveness heartbeat events from a running
+    /// child to the parent's `AgentTreeBus`. TUI subscribers use the cadence
+    /// to render a "still working" indicator.
+    pub heartbeat_interval_secs: u64,
+    /// Number of consecutive heartbeat intervals with no LLM/tool activity
+    /// after which the child publishes a `StalledChild` event so the operator
+    /// can intervene.
+    pub heartbeat_stale_cycles: u32,
 }
 
 impl Default for MultiAgentConfig {
@@ -807,6 +832,12 @@ impl Default for MultiAgentConfig {
             max_children_per_agent: 5,
             max_concurrent: 3,
             delegate_timeout_secs: 600,
+            orchestrator_enabled: true,
+            subagent_auto_approve: false,
+            delegation_model: None,
+            delegation_provider: None,
+            heartbeat_interval_secs: 30,
+            heartbeat_stale_cycles: 15,
         }
     }
 }

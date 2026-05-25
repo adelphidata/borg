@@ -6,7 +6,7 @@ use crate::tool_handlers::require_str_param;
 use crate::types::ToolDefinition;
 
 use super::roles;
-use super::AgentControl;
+use super::{AgentControl, AgentRoleKind};
 
 /// One-line summaries for multi-agent tools, surfaced in the system prompt's
 /// `<tooling>` section. Mirrors [`crate::tool::definitions::TOOL_SUMMARIES`]
@@ -85,7 +85,7 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
     if spawn_depth < max_spawn_depth {
         defs.push(ToolDefinition::new(
             "spawn_agent",
-            "Spawn a sub-agent to work on a task. By default returns immediately with an agent_id you can wait on later. Set blocking=true to wait in-line and receive the child's final result in the same turn. Pass tasks=[…] to fan out N children in parallel and collect all results. Use roles (researcher, coder, writer) to specialize the child.",
+            "Spawn a sub-agent to work on a task. By default returns immediately with an agent_id you can wait on later. Set blocking=true to wait in-line and receive the child's final result in the same turn. Pass tasks=[…] to fan out N children in parallel and collect all results. Use roles (researcher, coder, writer) to specialize the child. Use `context` to share background info, `toolsets` to narrow the child's tool surface, and `role_kind: orchestrator` to permit further delegation (subject to depth and the operator kill switch).",
             json!({
                 "type": "object",
                 "properties": {
@@ -93,9 +93,23 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
                         "type": "string",
                         "description": "The task/message to send to the sub-agent. Required unless 'tasks' is provided."
                     },
+                    "context": {
+                        "type": "string",
+                        "description": "Background information injected into the child's preamble (file paths, prior findings, constraints). Kept separate from `message` so the child knows what it should know vs. what it should do."
+                    },
                     "role": {
                         "type": "string",
                         "description": "Role name (researcher, coder, writer, or custom). Determines model, temperature, and allowed tools."
+                    },
+                    "role_kind": {
+                        "type": "string",
+                        "enum": ["leaf", "orchestrator"],
+                        "description": "Delegation kind overlay. `leaf` (default) cannot re-delegate. `orchestrator` may spawn grandchildren when depth + the `agents.orchestrator_enabled` kill switch permit."
+                    },
+                    "toolsets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional explicit allowlist of tool names this child may call. Intersected with the role's allowlist (if any) and with the parent's enabled tools minus the delegate blocklist. Empty array = no tools."
                     },
                     "nickname": {
                         "type": "string",
@@ -124,7 +138,10 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
                             "type": "object",
                             "properties": {
                                 "goal": {"type": "string"},
+                                "context": {"type": "string"},
                                 "role": {"type": "string"},
+                                "role_kind": {"type": "string", "enum": ["leaf", "orchestrator"]},
+                                "toolsets": {"type": "array", "items": {"type": "string"}},
                                 "model": {"type": "string"}
                             },
                             "required": ["goal"]
@@ -176,12 +193,28 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
     defs
 }
 
-/// Compose the effective child-tool blocklist for a delegated sub-agent:
-/// the default delegate blocklist, unioned with every mutating tool when
-/// the parent is in Plan collaboration mode. Called on every `spawn_agent`
-/// dispatch so children can never bypass plan-mode safety.
-pub fn assemble_delegate_blocklist(parent_config: &crate::config::Config) -> Vec<&'static str> {
+/// Compose the effective child-tool blocklist for a delegated sub-agent.
+///
+/// Starts from `DELEGATE_DEFAULT_BLOCKLIST` (delegate/memory/user-input
+/// tools), then:
+/// - If `role_kind == Orchestrator` and `can_orchestrate` is true, removes
+///   the re-delegation tools (`spawn_agent`/`wait_for_agent`/`close_agent`)
+///   so the child can fan out further. `can_orchestrate` is computed at the
+///   call site as `agents.orchestrator_enabled && depth+1 < max_spawn_depth`
+///   — the kill switch and the numeric cap both have to permit it.
+/// - In Plan collaboration mode, additionally unions every mutating tool so
+///   the child inherits the parent's read-only guarantee.
+pub fn assemble_delegate_blocklist(
+    parent_config: &crate::config::Config,
+    role_kind: AgentRoleKind,
+    can_orchestrate: bool,
+) -> Vec<&'static str> {
     let mut blocklist: Vec<&'static str> = AgentControl::DELEGATE_DEFAULT_BLOCKLIST.to_vec();
+
+    if role_kind == AgentRoleKind::Orchestrator && can_orchestrate {
+        blocklist.retain(|t| !matches!(*t, "spawn_agent" | "wait_for_agent" | "close_agent"));
+    }
+
     if parent_config
         .conversation
         .collaboration_mode
@@ -194,6 +227,15 @@ pub fn assemble_delegate_blocklist(parent_config: &crate::config::Config) -> Vec
         }
     }
     blocklist
+}
+
+/// Returns true iff this controller is permitted to spawn an orchestrator
+/// child at its current depth: both the operator kill switch
+/// (`agents.orchestrator_enabled`) and the numeric depth cap
+/// (`agents.max_spawn_depth`) must allow it.
+pub fn can_orchestrate(parent_config: &crate::config::Config, current_depth: u32) -> bool {
+    parent_config.agents.orchestrator_enabled
+        && current_depth + 1 < parent_config.agents.max_spawn_depth
 }
 
 /// Handle the spawn_agent tool call.
@@ -219,6 +261,12 @@ pub async fn handle_spawn_agent(
     parent_history: Option<&[crate::types::Message]>,
 ) -> Result<String> {
     let role_name = args["role"].as_str();
+    let role_kind = args["role_kind"]
+        .as_str()
+        .map(AgentRoleKind::parse)
+        .unwrap_or_default();
+    let toolsets_top = parse_string_array(args.get("toolsets"));
+    let context_top = args["context"].as_str();
     let nickname = args["nickname"].as_str();
     let model_override = args["model"].as_str();
     let fork_context = args["fork_context"].as_bool().unwrap_or(false);
@@ -227,8 +275,6 @@ pub async fn handle_spawn_agent(
         .as_u64()
         .unwrap_or(parent_config.agents.delegate_timeout_secs);
     let batch_tasks = args.get("tasks").and_then(|v| v.as_array());
-
-    let blocklist = assemble_delegate_blocklist(parent_config);
 
     // Batch mode — wins over single-task inputs. `blocking` is ignored here
     // (batch always blocks until every child finishes).
@@ -241,6 +287,9 @@ pub async fn handle_spawn_agent(
         if blocking {
             tracing::debug!("spawn_agent: 'blocking' ignored; batch mode always blocks");
         }
+        // For batch mode, every task in the batch shares the same kill-switch
+        // posture (orchestrator gating is depth- and config-driven), so we
+        // resolve the blocklist for *each* task by its own role_kind below.
         let mut tasks: Vec<super::DelegatedTask> = Vec::with_capacity(tasks_json.len());
         for (i, t) in tasks_json.iter().enumerate() {
             let goal = t
@@ -248,15 +297,31 @@ pub async fn handle_spawn_agent(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("tasks[{i}] missing required 'goal' string"))?
                 .to_string();
+            let per_task_kind = t
+                .get("role_kind")
+                .and_then(|v| v.as_str())
+                .map(AgentRoleKind::parse)
+                .unwrap_or(role_kind);
             tasks.push(super::DelegatedTask {
                 goal,
+                context: t
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| context_top.map(str::to_string)),
                 role_name: t.get("role").and_then(|v| v.as_str()).map(str::to_string),
+                role_kind: per_task_kind,
+                toolsets: parse_string_array(t.get("toolsets")).or_else(|| toolsets_top.clone()),
                 model_override: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
             });
         }
 
+        // `spawn_batch_and_wait` computes the blocklist per task using
+        // each task's own `role_kind`. No batch-wide blocklist — that
+        // pattern let a leaf task inherit a sibling orchestrator's
+        // carve-out (see the mixed-batch regression test).
         let completions = agent_control
-            .spawn_batch_and_wait(tasks, parent_config, Some(&blocklist), timeout_secs)
+            .spawn_batch_and_wait(tasks, parent_config, None, timeout_secs)
             .await?;
         let results: Vec<serde_json::Value> = completions
             .iter()
@@ -266,6 +331,7 @@ pub async fn handle_spawn_agent(
                     "nickname": c.nickname,
                     "status": c.status.as_str(),
                     "result": c.final_response,
+                    "files_written": c.files_written,
                 })
             })
             .collect();
@@ -282,17 +348,23 @@ pub async fn handle_spawn_agent(
         Some(name) => roles::load_role(name).await,
         None => None,
     };
-    let context = if fork_context { parent_history } else { None };
+    let fork = if fork_context { parent_history } else { None };
+
+    let can_orchestrate_now = can_orchestrate(parent_config, agent_control.current_depth());
+    let blocklist = assemble_delegate_blocklist(parent_config, role_kind, can_orchestrate_now);
 
     if blocking {
         let completion = agent_control
             .spawn_and_wait(
                 message,
+                context_top,
                 role,
+                role_kind,
+                toolsets_top.as_deref(),
                 nickname,
                 model_override,
                 parent_config,
-                context,
+                fork,
                 Some(&blocklist),
                 timeout_secs,
             )
@@ -303,6 +375,7 @@ pub async fn handle_spawn_agent(
             "nickname": completion.nickname,
             "status": completion.status.as_str(),
             "result": completion.final_response,
+            "files_written": completion.files_written,
         })
         .to_string());
     }
@@ -311,11 +384,14 @@ pub async fn handle_spawn_agent(
     let (agent_id, chosen_nickname) = agent_control
         .spawn_agent(
             message,
+            context_top,
             role,
+            role_kind,
+            toolsets_top.as_deref(),
             nickname,
             model_override,
             parent_config,
-            context,
+            fork,
             Some(&blocklist),
         )
         .await?;
@@ -327,6 +403,31 @@ pub async fn handle_spawn_agent(
         "status": "spawned"
     })
     .to_string())
+}
+
+/// Parse a JSON array of strings out of a tool-call argument value.
+/// Returns `None` if the value is absent or not an array; returns
+/// `Some(Vec::new())` for an explicit empty array (caller-distinguishable
+/// from "unset", since an empty `toolsets` means "no tools"). Non-string
+/// entries are dropped with a `tracing::warn!` so malformed-array bugs
+/// surface in logs rather than silently truncating the allowlist.
+fn parse_string_array(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let arr = v?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    let mut dropped = 0usize;
+    for x in arr {
+        match x.as_str() {
+            Some(s) => out.push(s.to_string()),
+            None => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "spawn_agent: parse_string_array dropped {dropped} non-string element(s)"
+        );
+    }
+    Some(out)
 }
 
 /// Handle the send_to_agent tool call.
@@ -492,318 +593,166 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Same drift guard as `tool::definitions::tool_summaries_cover_all_core_tool_definitions`,
-    /// but for the multi-agent surface. A future rename of `SPAWN_AGENT`
-    /// (or the others) would silently demote the static one-line summary
-    /// to the description-fallback path in the system prompt; this test
-    /// fails first.
+    /// `spawn_agent` schema is what the LLM sees every turn. The new
+    /// hermes-parity parameters (`context`, `toolsets`, `role_kind`) must
+    /// appear in `properties` so the model knows it can pass them. A
+    /// regression that drops one silently downgrades the tool back to
+    /// pre-parity behavior with no error.
     #[test]
-    fn multi_agent_summaries_cover_their_definitions() {
-        let defs = tool_definitions(0, /*max_spawn_depth*/ 2);
-        let def_names: std::collections::HashSet<&str> =
-            defs.iter().map(|d| d.function.name.as_str()).collect();
-
-        for (name, _) in MULTI_AGENT_TOOL_SUMMARIES {
-            assert!(
-                def_names.contains(name),
-                "MULTI_AGENT_TOOL_SUMMARIES has `{name}` but no \
-                 multi-agent definition produces it — remove the stale summary"
-            );
-        }
-
-        // `list_agents` and `manage_roles` intentionally fall through to the
-        // first-sentence fallback in `system_prompt::build_tooling_section`;
-        // they're discovery/management tools where the verbose description
-        // is fine.
-        let intentional_fallbacks: &[&str] = &["list_agents", "manage_roles"];
-        let summary_names: std::collections::HashSet<&str> =
-            MULTI_AGENT_TOOL_SUMMARIES.iter().map(|(n, _)| *n).collect();
-        for def in &defs {
-            let name = def.function.name.as_str();
-            if intentional_fallbacks.contains(&name) {
-                continue;
-            }
-            assert!(
-                summary_names.contains(name),
-                "multi-agent tool `{name}` has a definition but no entry in \
-                 MULTI_AGENT_TOOL_SUMMARIES — add one or list it in this \
-                 test's `intentional_fallbacks`"
-            );
-        }
-    }
-
-    #[test]
-    fn test_spawn_agent_tool_definition() {
-        let defs = tool_definitions(0, 1);
-        let spawn = defs.iter().find(|d| d.function.name == "spawn_agent");
-        assert!(spawn.is_some(), "spawn_agent should be in tool definitions");
-        let spawn = spawn.unwrap();
-        let params = &spawn.function.parameters;
-        // `message` is still the primary input and should be described, but
-        // it's no longer strictly required (tasks[] can replace it in batch
-        // mode). Runtime validation in handle_spawn_agent enforces exactly
-        // one of the two is supplied.
-        let props = &params["properties"];
-        assert!(props.get("message").is_some(), "message must be described");
-    }
-
-    #[test]
-    fn test_tool_filtering_at_max_depth() {
-        let defs = tool_definitions(1, 1);
-        assert!(
-            defs.iter().all(|d| d.function.name != "spawn_agent"),
-            "spawn_agent should be excluded at max depth"
-        );
-        assert!(
-            defs.iter().all(|d| d.function.name != "wait_for_agent"),
-            "wait_for_agent should be excluded at max depth"
-        );
-        assert!(
-            defs.iter().all(|d| d.function.name != "send_to_agent"),
-            "send_to_agent should be excluded at max depth"
-        );
-        assert!(
-            defs.iter().all(|d| d.function.name != "close_agent"),
-            "close_agent should be excluded at max depth"
-        );
-        // manage_roles should still be present (list_agents moved to unified `list` tool)
-        assert!(defs.iter().any(|d| d.function.name == "manage_roles"));
-    }
-
-    #[test]
-    fn test_handle_list_agents_empty() {
-        let config = crate::config::MultiAgentConfig::default();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        let result = handle_list_agents(&ctrl).unwrap();
-        assert_eq!(result, "No active sub-agents.");
-    }
-
-    #[tokio::test]
-    async fn test_handle_spawn_agent_missing_message() {
-        let config = crate::config::MultiAgentConfig::default();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let parent_config = crate::config::Config::default();
-        let args = json!({});
-        let result = handle_spawn_agent(&args, &mut ctrl, &parent_config, None).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("message"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_spawn_agent_batch_missing_goal_is_error() {
-        let config = crate::config::MultiAgentConfig::default();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let parent_config = crate::config::Config::default();
-        // Batch with a task that's missing the required `goal` field.
-        let args = json!({"tasks": [{"role": "researcher"}]});
-        let result = handle_spawn_agent(&args, &mut ctrl, &parent_config, None).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("goal"), "expected 'goal' error, got: {err}");
-    }
-
-    #[test]
-    fn assemble_delegate_blocklist_default_mode_is_just_defaults() {
-        // In Default collaboration mode, only the delegate defaults apply.
-        let cfg = crate::config::Config::default();
-        let blocklist = assemble_delegate_blocklist(&cfg);
-        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
-            assert!(blocklist.contains(banned), "defaults must include {banned}");
-        }
-        // Mutating tools that aren't in the default set should NOT be present
-        // — e.g. run_shell is mutating but allowed outside Plan mode.
-        assert!(
-            !blocklist.contains(&"run_shell"),
-            "run_shell should not be blocked outside Plan mode"
-        );
-        assert!(
-            !blocklist.contains(&"apply_patch"),
-            "apply_patch should not be blocked outside Plan mode"
-        );
-    }
-
-    #[test]
-    fn assemble_delegate_blocklist_plan_mode_unions_mutating_tools() {
-        // In Plan mode, the child inherits the parent's read-only guarantee:
-        // every mutating tool is added on top of the delegate defaults.
-        let mut cfg = crate::config::Config::default();
-        cfg.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
-        let blocklist = assemble_delegate_blocklist(&cfg);
-        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
-            assert!(
-                blocklist.contains(banned),
-                "defaults must still be present in Plan mode"
-            );
-        }
-        // Pick a handful of representative mutating tools that must be added.
-        for extra in [
-            "run_shell",
-            "apply_patch",
-            "apply_skill_patch",
-            "generate_image",
-            "browser",
-        ] {
-            assert!(
-                blocklist.contains(&extra),
-                "Plan mode must block '{extra}' from children"
-            );
-        }
-        // No duplicates — the union dedupes.
-        let mut unique = blocklist.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), blocklist.len(), "blocklist has duplicates");
-    }
-
-    #[test]
-    fn test_spawn_agent_schema_exposes_blocking_and_tasks() {
-        let defs = tool_definitions(0, 1);
+    fn spawn_agent_schema_advertises_hermes_parity_params() {
+        let defs = tool_definitions(0, 3);
         let spawn = defs
             .iter()
             .find(|d| d.function.name == "spawn_agent")
-            .expect("spawn_agent should exist at depth 0");
+            .expect("spawn_agent must be present at depth 0");
         let props = &spawn.function.parameters["properties"];
-        assert!(
-            props.get("blocking").is_some(),
-            "spawn_agent schema must expose 'blocking' parameter"
-        );
-        assert!(
-            props.get("tasks").is_some(),
-            "spawn_agent schema must expose 'tasks' parameter for batch mode"
-        );
-        assert!(
-            props.get("timeout_secs").is_some(),
-            "spawn_agent schema must expose 'timeout_secs' parameter"
-        );
-        // `message` is now optional (tasks can replace it), so it must not
-        // appear in `required` anymore.
-        let required = spawn.function.parameters.get("required");
-        if let Some(r) = required.and_then(|v| v.as_array()) {
+        for required in ["context", "toolsets", "role_kind"] {
             assert!(
-                !r.iter().any(|v| v == "message"),
-                "'message' must not be a required field (tasks[] can replace it)"
+                props.get(required).is_some(),
+                "spawn_agent schema must advertise '{required}'"
+            );
+        }
+        // role_kind must be an enum, not an open string — keeps the LLM
+        // from inventing "manager", "supervisor", etc.
+        let role_kind = &props["role_kind"];
+        let enum_vals = role_kind
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("role_kind must declare an enum");
+        let names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            names.contains(&"leaf") && names.contains(&"orchestrator"),
+            "role_kind enum must include leaf + orchestrator, got {names:?}"
+        );
+    }
+
+    /// Batch-mode `tasks[]` elements must accept the same per-task
+    /// hermes-parity fields. Without per-task `toolsets` and `context`
+    /// the LLM can't differentiate sibling tasks in a fan-out — they all
+    /// share the top-level context, which defeats the point of batch mode.
+    #[test]
+    fn spawn_agent_schema_per_task_fields() {
+        let defs = tool_definitions(0, 3);
+        let spawn = defs
+            .iter()
+            .find(|d| d.function.name == "spawn_agent")
+            .unwrap();
+        let item_props = &spawn.function.parameters["properties"]["tasks"]["items"]["properties"];
+        for required in ["goal", "context", "role", "role_kind", "toolsets", "model"] {
+            assert!(
+                item_props.get(required).is_some(),
+                "tasks[] item must allow '{required}'"
             );
         }
     }
 
+    /// At max depth the multi-agent tool surface must disappear entirely.
+    /// If a future refactor leaks any of the four through, a leaf at the
+    /// cap could re-delegate without going through `can_orchestrate`.
     #[test]
-    fn test_handle_close_agent_nonexistent() {
-        let config = crate::config::MultiAgentConfig::default();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let args = json!({"agent_id": "nonexistent"});
-        let result = handle_close_agent(&args, &mut ctrl);
-        assert!(result.is_err());
+    fn tool_definitions_at_max_depth_strips_delegation_surface() {
+        let defs = tool_definitions(2, 2);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for forbidden in ["spawn_agent", "wait_for_agent", "close_agent"] {
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden} must be absent at max depth, got {names:?}"
+            );
+        }
+        // `manage_roles` is depth-independent (metadata, not delegation).
+        assert!(names.contains(&"manage_roles"));
     }
 
+    /// `parse_string_array` distinguishes Absent (None) from Empty
+    /// (Some(empty)). The handler relies on this distinction for
+    /// `toolsets: []` to mean "no tools" rather than "inherit".
     #[test]
-    fn test_handle_manage_roles_list() {
-        let args = json!({"action": "list"});
-        let result = handle_manage_roles(&args);
-        assert!(result.is_ok());
-    }
+    fn parse_string_array_distinguishes_absent_from_empty() {
+        assert!(parse_string_array(None).is_none());
+        assert!(
+            parse_string_array(Some(&serde_json::Value::Null)).is_none(),
+            "JSON null must yield None"
+        );
 
-    #[test]
-    fn test_tool_definitions_at_depth_0_count() {
-        let defs = tool_definitions(0, 1);
-        // manage_roles + spawn_agent + wait_for_agent + close_agent = 4
+        let empty = serde_json::json!([]);
         assert_eq!(
-            defs.len(),
-            4,
-            "Expected 4 tools at depth 0, got: {:?}",
-            defs.iter().map(|d| &d.function.name).collect::<Vec<_>>()
+            parse_string_array(Some(&empty)),
+            Some(Vec::<String>::new()),
+            "[] must yield Some(empty), not None"
         );
-        assert!(
-            defs.iter().all(|d| d.function.name != "send_to_agent"),
-            "send_to_agent should not be in tool definitions"
+
+        let filled = serde_json::json!(["a", "b"]);
+        assert_eq!(
+            parse_string_array(Some(&filled)),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+
+        // Mixed-type arrays drop non-string entries defensively.
+        let mixed = serde_json::json!(["a", 42, "b"]);
+        assert_eq!(
+            parse_string_array(Some(&mixed)),
+            Some(vec!["a".to_string(), "b".to_string()])
         );
     }
 
-    #[test]
-    fn test_handle_manage_roles_unknown_action() {
-        let args = json!({"action": "foobar"});
-        let result = handle_manage_roles(&args).unwrap();
-        assert!(
-            result.contains("error"),
-            "Expected error JSON, got: {result}"
-        );
-        assert!(result.contains("foobar"));
-    }
-
+    /// Batch entry missing `goal` must error with the offending index
+    /// named. Silent skip would produce a results array shorter than the
+    /// input — unreconcilable for the calling LLM.
     #[tokio::test]
-    async fn test_handle_send_to_agent_nonexistent() {
-        let config = crate::config::MultiAgentConfig::default();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        let args = json!({"agent_id": "nonexistent", "message": "hello"});
-        let result = handle_send_to_agent(&args, &ctrl).await;
-        assert!(result.is_err());
+    async fn handle_spawn_agent_batch_rejects_missing_goal() {
+        let cfg = crate::config::MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "session-1", 0);
+        let parent_config = crate::config::Config::default();
+        let args = json!({"tasks": [{"role": "researcher"}]});
+        let err = handle_spawn_agent(&args, &mut ctrl, &parent_config, None)
+            .await
+            .expect_err("batch with missing goal must error");
+        let msg = err.to_string();
+        assert!(msg.contains("goal"), "error must name 'goal': {msg}");
+        assert!(msg.contains("tasks[0]"), "error must name index: {msg}");
     }
 
-    /// Verify that tools_filter logic (applied in Agent.build_tool_definitions) correctly
-    /// filters tool definitions by an allowed set.
-    #[test]
-    fn test_tools_filter_restricts_tools() {
-        use crate::types::ToolDefinition;
-        let tools = vec![
-            ToolDefinition::new("run_shell", "desc", json!({"type": "object"})),
-            ToolDefinition::new("apply_patch", "desc", json!({"type": "object"})),
-            ToolDefinition::new("read_memory", "desc", json!({"type": "object"})),
-            ToolDefinition::new("write_memory", "desc", json!({"type": "object"})),
-        ];
-        let allowed: Vec<String> = vec!["run_shell".into(), "read_memory".into()];
-        let allowed_set: std::collections::HashSet<&str> =
-            allowed.iter().map(String::as_str).collect();
-        let filtered: Vec<ToolDefinition> = tools
-            .into_iter()
-            .filter(|t| allowed_set.contains(t.function.name.as_str()))
-            .collect();
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().any(|t| t.function.name == "run_shell"));
-        assert!(filtered.iter().any(|t| t.function.name == "read_memory"));
-        assert!(filtered.iter().all(|t| t.function.name != "apply_patch"));
-        assert!(filtered.iter().all(|t| t.function.name != "write_memory"));
+    /// Empty `tasks: []` is a user/LLM error, not a no-op. Catching it
+    /// surfaces a clear message instead of silently returning
+    /// `{count: 0, results: []}` (which the LLM treats as "succeeded").
+    #[tokio::test]
+    async fn handle_spawn_agent_batch_rejects_empty_array() {
+        let cfg = crate::config::MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "session-1", 0);
+        let parent_config = crate::config::Config::default();
+        let args = json!({"tasks": []});
+        let err = handle_spawn_agent(&args, &mut ctrl, &parent_config, None)
+            .await
+            .expect_err("empty tasks must error");
+        assert!(err.to_string().contains("non-empty"));
     }
 
-    /// Verify that an empty tools_filter strips all tools.
+    /// Outside Plan mode, the leaf blocklist contains the hermes default
+    /// set (memory mutation, user-input, delegation surface) and does NOT
+    /// block mutating tools the agent normally calls.
     #[test]
-    fn test_tools_filter_empty_strips_all() {
-        use crate::types::ToolDefinition;
-        let tools = vec![
-            ToolDefinition::new("run_shell", "desc", json!({"type": "object"})),
-            ToolDefinition::new("apply_patch", "desc", json!({"type": "object"})),
-        ];
-        let allowed: Vec<String> = vec![];
-        let allowed_set: std::collections::HashSet<&str> =
-            allowed.iter().map(String::as_str).collect();
-        let filtered: Vec<ToolDefinition> = tools
-            .into_iter()
-            .filter(|t| allowed_set.contains(t.function.name.as_str()))
-            .collect();
-        assert!(filtered.is_empty());
-    }
-
-    /// Verify that None tools_filter passes all tools through.
-    #[test]
-    fn test_tools_filter_none_passes_all() {
-        use crate::types::ToolDefinition;
-        let tools = vec![
-            ToolDefinition::new("run_shell", "desc", json!({"type": "object"})),
-            ToolDefinition::new("apply_patch", "desc", json!({"type": "object"})),
-        ];
-        let filter: Option<Vec<String>> = None;
-        let filtered: Vec<ToolDefinition> = if let Some(ref allowed) = filter {
-            let allowed_set: std::collections::HashSet<&str> =
-                allowed.iter().map(String::as_str).collect();
-            tools
-                .into_iter()
-                .filter(|t| allowed_set.contains(t.function.name.as_str()))
-                .collect()
-        } else {
-            tools
-        };
-        assert_eq!(filtered.len(), 2);
+    fn assemble_delegate_blocklist_default_set_outside_plan_mode() {
+        let cfg = crate::config::Config::default();
+        let blocklist = assemble_delegate_blocklist(&cfg, AgentRoleKind::Leaf, false);
+        for required in [
+            "spawn_agent",
+            "wait_for_agent",
+            "close_agent",
+            "write_memory",
+            "request_user_input",
+        ] {
+            assert!(
+                blocklist.contains(&required),
+                "leaf blocklist must contain '{required}': {blocklist:?}"
+            );
+        }
+        assert!(
+            !blocklist.contains(&"run_shell"),
+            "run_shell must NOT be blocked outside Plan mode"
+        );
     }
 }

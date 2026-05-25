@@ -20,6 +20,53 @@ pub use event_bus::{AgentTreeBus, AgentTreeEvent, AgentTreeEventKind};
 
 use crate::config::Config;
 
+/// Delegation kind for a sub-agent. `Leaf` (default) cannot re-delegate
+/// — the multi-agent tool surface is stripped from its tool definitions.
+/// `Orchestrator` may re-delegate iff `agents.orchestrator_enabled` is true
+/// *and* the numeric depth cap permits it. The kind is an overlay on top of
+/// a named role: a "coder" role can be spawned as either a leaf or an
+/// orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentRoleKind {
+    /// Worker child. Cannot spawn further sub-agents.
+    #[default]
+    Leaf,
+    /// Coordinator child. May spawn grandchildren subject to depth and
+    /// the `orchestrator_enabled` kill switch.
+    Orchestrator,
+}
+
+impl AgentRoleKind {
+    /// Parse a user-supplied kind literal. Unknown values fall back to
+    /// `Leaf` — a safer default than rejecting the spawn outright since
+    /// the LLM may type "orchestrate" or "leaf-only". The fallback emits
+    /// a `tracing::warn!` so unexpected values aren't silently swallowed
+    /// (the JSON schema declares this as a closed enum, so an unknown
+    /// value indicates either an LLM mistake or schema drift).
+    pub fn parse(s: &str) -> Self {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "leaf" | "" => Self::Leaf,
+            "orchestrator" | "orchestrate" => Self::Orchestrator,
+            other => {
+                tracing::warn!(
+                    role_kind = other,
+                    "spawn_agent: unknown role_kind, defaulting to leaf"
+                );
+                Self::Leaf
+            }
+        }
+    }
+
+    /// Stable string for telemetry / event payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Leaf => "leaf",
+            Self::Orchestrator => "orchestrator",
+        }
+    }
+}
+
 /// Role definition for a sub-agent.
 #[derive(Debug, Clone)]
 pub struct AgentRole {
@@ -39,6 +86,9 @@ pub struct AgentRole {
     pub tools_allowed: Option<Vec<String>>,
     /// Maximum agent loop iterations for this role.
     pub max_iterations: Option<u32>,
+    /// Delegation kind. The named role is kind-agnostic — callers of
+    /// `spawn_agent` set this from the `role_kind` parameter.
+    pub kind: AgentRoleKind,
 }
 
 /// State machine for sub-agent lifecycle.
@@ -178,12 +228,20 @@ pub struct SubAgentInfo {
 }
 
 /// One unit of work for `spawn_batch_and_wait`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DelegatedTask {
     /// Task description sent to the child as its initial user message.
     pub goal: String,
+    /// Background information rendered into the child's preamble under a
+    /// `<context trust="parent">` block. Kept separate from `goal` so the
+    /// child can distinguish what it should know vs. what it should do.
+    pub context: Option<String>,
     /// Optional role name (looked up via `roles::load_role`).
     pub role_name: Option<String>,
+    /// Delegation kind overlay (`Leaf` or `Orchestrator`). Default `Leaf`.
+    pub role_kind: AgentRoleKind,
+    /// Optional explicit toolset allowlist for this specific child.
+    pub toolsets: Option<Vec<String>>,
     /// Optional model override for this specific child.
     pub model_override: Option<String>,
 }
@@ -199,6 +257,11 @@ pub struct SubAgentCompletion {
     pub status: SubAgentStatus,
     /// The sub-agent's final text output, if any.
     pub final_response: Option<String>,
+    /// File paths the child wrote (or otherwise mutated) during its run.
+    /// Surfaced to the parent's LLM so it knows which paths to re-read
+    /// before continuing — without this, a parent that read `foo.rs`
+    /// pre-spawn would carry stale content past the child's edits.
+    pub files_written: Vec<String>,
 }
 
 /// Handle to a spawned sub-agent.
@@ -289,6 +352,13 @@ impl AgentControl {
         &self.parent_session_id
     }
 
+    /// Current depth of the parent in the agent tree. Exposed so callers
+    /// (e.g. the `spawn_agent` tool handler) can compute orchestrator
+    /// gating decisions without reaching into private state.
+    pub fn current_depth(&self) -> u32 {
+        self.current_depth
+    }
+
     /// Publish to the bus if one is attached. Best-effort — a closed channel
     /// just logs and drops, since the bus is an observer, not a participant.
     fn publish(&self, kind: AgentTreeEventKind, info: &SubAgentInfo) {
@@ -298,6 +368,17 @@ impl AgentControl {
     }
 
     /// Build a sub-agent config by applying role overrides and model override to the parent config.
+    ///
+    /// Precedence for the effective LLM model/provider, highest first:
+    ///   1. `model_override` (explicit `spawn_agent` arg) / role.provider
+    ///   2. `role.model` / `role.provider`
+    ///   3. `agents.delegation_model` / `agents.delegation_provider`
+    ///   4. Inherited parent value.
+    ///
+    /// The child's `ExecutionPolicy` is rebuilt from scratch: the parent's
+    /// deny list is preserved (a child can never escalate past denies),
+    /// and the auto-approve list is gated by `agents.subagent_auto_approve`
+    /// — defaulting to deny-by-default to match hermes' safer posture.
     fn build_sub_agent_config(
         &self,
         role: Option<&AgentRole>,
@@ -305,6 +386,16 @@ impl AgentControl {
         parent_config: &Config,
     ) -> Config {
         let mut child_config = parent_config.clone();
+
+        // Layer 3: per-spawn delegation defaults from config.
+        if let Some(ref m) = parent_config.agents.delegation_model {
+            child_config.llm.model = m.clone();
+        }
+        if let Some(ref p) = parent_config.agents.delegation_provider {
+            child_config.llm.provider = Some(p.clone());
+        }
+
+        // Layer 2: role overrides win over delegation defaults.
         if let Some(role) = role {
             if let Some(ref model) = role.model {
                 child_config.llm.model = model.clone();
@@ -319,13 +410,24 @@ impl AgentControl {
                 child_config.conversation.max_iterations = max_iter;
             }
         }
+
+        // Layer 1: explicit per-call override wins above all.
         if let Some(model) = model_override {
             child_config.llm.model = model.to_string();
         }
 
-        // Sub-agents auto-approve shell commands but preserve deny list
+        // Sub-agent execution policy. The parent's deny list always carries
+        // over so a child can never escalate past a parent's denial. The
+        // auto-approve list is operator-gated: deny-by-default unless the
+        // operator has opted in via `agents.subagent_auto_approve` (e.g. for
+        // unattended cron flows where a halt-on-confirmation deadlocks).
+        let auto_approve = if parent_config.agents.subagent_auto_approve {
+            vec!["*".to_string()]
+        } else {
+            Vec::new()
+        };
         child_config.policy = crate::policy::ExecutionPolicy {
-            auto_approve: vec!["*".to_string()],
+            auto_approve,
             deny: parent_config.policy.deny.clone(),
         };
 
@@ -436,15 +538,30 @@ impl AgentControl {
 
     /// Spawn a new sub-agent. Returns (agent_id, nickname).
     ///
-    /// `tools_blocklist` takes precedence over any role allowlist: names in
-    /// the blocklist are stripped from the effective tool filter. When a
-    /// blocklist is provided and the role has no allowlist, the effective
-    /// filter becomes `parent_tools - blocklist`.
+    /// Parameters:
+    /// - `message`: the goal (first user message).
+    /// - `context`: optional background block rendered into the child's
+    ///   preamble under `<context trust="parent">`. Separates "what to know"
+    ///   from "what to do".
+    /// - `role`: optional named role (model/temperature/tool allowlist).
+    /// - `role_kind`: delegation kind overlay. `Leaf` (default) cannot
+    ///   re-delegate; `Orchestrator` can iff
+    ///   `agents.orchestrator_enabled && depth + 1 < max_spawn_depth`.
+    /// - `toolsets`: optional explicit per-call allowlist intersected with
+    ///   the role's allowlist and the parent's enabled tools.
+    /// - `tools_blocklist`: takes precedence over any allowlist; names in
+    ///   the blocklist are stripped from the effective tool filter. The
+    ///   `assemble_delegate_blocklist` helper in `tools::` is the canonical
+    ///   producer (handles delegate defaults + Plan-mode mutating union +
+    ///   orchestrator re-delegation re-enabling).
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent(
         &mut self,
         message: &str,
+        context: Option<&str>,
         role: Option<AgentRole>,
+        role_kind: AgentRoleKind,
+        toolsets: Option<&[String]>,
         nickname: Option<&str>,
         model_override: Option<&str>,
         parent_config: &Config,
@@ -470,6 +587,7 @@ impl AgentControl {
             self.build_sub_agent_config(role.as_ref(), model_override, parent_config);
 
         let child_depth = self.current_depth + 1;
+        let max_spawn_depth = self.max_spawn_depth;
         let session_id = uuid::Uuid::new_v4().to_string();
 
         // Prepare info and record in DB
@@ -498,11 +616,14 @@ impl AgentControl {
         let agent_id_clone = agent_id.clone();
         let nickname_clone = chosen_nickname.clone();
         let message_owned = message.to_string();
+        let context_owned = context.map(str::to_string);
         let fork_context_owned: Option<Vec<crate::types::Message>> =
             fork_context.map(<[crate::types::Message]>::to_vec);
         let agents_config = parent_config.agents.clone();
         let tools_filter =
-            compute_tools_filter(role.as_ref(), tools_blocklist, parent_config).await;
+            compute_tools_filter(role.as_ref(), toolsets, tools_blocklist, parent_config).await;
+        let bus = self.bus.clone();
+        let info_clone = info.clone();
 
         let join_handle = tokio::spawn(async move {
             // Acquire semaphore permit
@@ -517,6 +638,7 @@ impl AgentControl {
                                 error: "Semaphore closed".to_string(),
                             },
                             final_response: None,
+                            files_written: Vec::new(),
                         })
                         .await
                         .is_err()
@@ -527,22 +649,31 @@ impl AgentControl {
                 }
             };
 
+            let files_written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let result = run_sub_agent(
                 agent_id_clone.clone(),
                 nickname_clone.clone(),
                 child_config,
                 child_depth,
+                max_spawn_depth,
                 agents_config,
                 message_owned,
+                context_owned,
                 role,
+                role_kind,
                 fork_context_owned,
                 input_rx,
                 cancel_clone,
                 is_paused_task,
                 pause_notify_task,
                 tools_filter,
+                files_written.clone(),
+                bus.clone(),
+                info_clone,
             )
             .await;
+
+            let files_written_vec = files_written.lock().map(|g| g.clone()).unwrap_or_default();
 
             let (status, final_response) = match result {
                 Ok(response) => (
@@ -572,6 +703,7 @@ impl AgentControl {
                     nickname: nickname_clone,
                     status,
                     final_response,
+                    files_written: files_written_vec,
                 })
                 .await
                 .is_err()
@@ -742,6 +874,7 @@ impl AgentControl {
                             SubAgentStatus::Completed { result } => Some(result.clone()),
                             _ => None,
                         },
+                        files_written: handle.info.metrics.files_touched.clone(),
                     });
                 }
                 _ => {}
@@ -854,15 +987,16 @@ impl AgentControl {
     ///
     /// Collapses the common `spawn_agent` → `wait_for_agent` pattern into a
     /// single in-loop call so the LLM doesn't burn a round-trip to start and
-    /// then wait. Honors the same limits and tool filtering as `spawn_agent`
-    /// (including the `tools_blocklist`). Returns whatever completion the
-    /// child emits — including partial results for max-iteration/error/
-    /// shutdown cases — rather than surfacing those as Rust errors.
+    /// then wait. Same parameters as [`Self::spawn_agent`] plus an explicit
+    /// `timeout_secs`.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_and_wait(
         &mut self,
         message: &str,
+        context: Option<&str>,
         role: Option<AgentRole>,
+        role_kind: AgentRoleKind,
+        toolsets: Option<&[String]>,
         nickname: Option<&str>,
         model_override: Option<&str>,
         parent_config: &Config,
@@ -873,7 +1007,10 @@ impl AgentControl {
         let (agent_id, _nickname) = self
             .spawn_agent(
                 message,
+                context,
                 role,
+                role_kind,
+                toolsets,
                 nickname,
                 model_override,
                 parent_config,
@@ -892,29 +1029,45 @@ impl AgentControl {
     /// whatever order the children finish; the returned `Vec` is reordered
     /// so index `i` matches `tasks[i]`. Tasks whose spawn fails return
     /// `SubAgentStatus::Errored` rather than aborting the batch.
+    ///
+    /// **Per-task blocklist.** The blocklist is computed *inside* the loop
+    /// using each task's own `role_kind`. A previous version computed a
+    /// single batch-wide blocklist outside the loop, which let a leaf task
+    /// in a mixed batch inherit the orchestrator carve-out — see the
+    /// `mixed_batch_each_task_gets_own_blocklist` regression test.
     pub async fn spawn_batch_and_wait(
         &mut self,
         tasks: Vec<DelegatedTask>,
         parent_config: &Config,
-        tools_blocklist: Option<&[&str]>,
+        _tools_blocklist: Option<&[&str]>,
         timeout_secs: u64,
     ) -> Result<Vec<SubAgentCompletion>> {
         let mut agent_ids: Vec<std::result::Result<String, SubAgentCompletion>> =
             Vec::with_capacity(tasks.len());
+        let depth = self.current_depth;
         for (i, task) in tasks.iter().enumerate() {
             let role = match task.role_name.as_deref() {
                 Some(name) => roles::load_role(name).await,
                 None => None,
             };
+            // Compute the blocklist using THIS task's role_kind. A mixed
+            // batch with an orchestrator must not promote sibling leaves.
+            let can_orch = tools::can_orchestrate(parent_config, depth);
+            let per_task_blocklist =
+                tools::assemble_delegate_blocklist(parent_config, task.role_kind, can_orch);
+            let per_task_refs: Vec<&str> = per_task_blocklist.to_vec();
             match self
                 .spawn_agent(
                     &task.goal,
+                    task.context.as_deref(),
                     role,
+                    task.role_kind,
+                    task.toolsets.as_deref(),
                     None,
                     task.model_override.as_deref(),
                     parent_config,
                     None,
-                    tools_blocklist,
+                    Some(&per_task_refs),
                 )
                 .await
             {
@@ -929,6 +1082,7 @@ impl AgentControl {
                         error: format!("spawn failed: {e}"),
                     },
                     final_response: None,
+                    files_written: Vec::new(),
                 })),
             }
         }
@@ -1037,52 +1191,194 @@ impl Drop for AgentControl {
 
 /// Compute the effective `tools_allowed` filter for a new sub-agent.
 ///
-/// Rules:
-/// - If both the role's `tools_allowed` and `blocklist` are `None`, the
-///   result is `None` (inherit all parent tools).
-/// - If a `blocklist` is provided:
-///     - When the role has an allowlist, the result is
-///       `role_allowlist - blocklist` (blocklist wins on conflict).
-///     - When the role has no allowlist, the result is
-///       `parent_enabled_tools - blocklist` — this prevents the child from
-///       inheriting access to tools the parent explicitly blocked.
-/// - If only an allowlist is present, it's returned as-is.
+/// Layered intersection (each narrows the previous):
+/// 1. Start with the role's `tools_allowed` if present, else the parent's
+///    full enabled tool surface (core + multi-agent).
+/// 2. If `toolsets` is `Some` (per-call narrowing from the LLM), intersect.
+/// 3. If `blocklist` is `Some`, subtract.
+///
+/// Returns `None` only when every layer is unset — i.e. the child inherits
+/// all parent tools verbatim. Returns `Some(Vec::new())` when narrowing
+/// reduces the set to empty (a legitimate caller intent, e.g.
+/// `toolsets: []` means "no tools beyond memory/exit").
 async fn compute_tools_filter(
     role: Option<&AgentRole>,
+    toolsets: Option<&[String]>,
     blocklist: Option<&[&str]>,
     parent_config: &Config,
 ) -> Option<Vec<String>> {
-    let allowlist = role.and_then(|r| r.tools_allowed.clone());
-    match (allowlist, blocklist) {
-        (None, None) => None,
-        (Some(allow), None) => Some(allow),
-        (Some(allow), Some(block)) => {
-            let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
-            Some(
-                allow
-                    .into_iter()
-                    .filter(|t| !block_set.contains(t.as_str()))
-                    .collect(),
-            )
-        }
-        (None, Some(block)) => {
-            // Enumerate the full parent tool surface: core tools + any
-            // multi-agent tools the parent can see at its current depth.
-            // Without unioning multi-agent here, children would silently lose
-            // access to e.g. `wait_for_agent` even if a caller deliberately
-            // removed it from the blocklist — a confusing invariant to debug.
+    let role_allow = role.and_then(|r| r.tools_allowed.clone());
+
+    // No constraints at all → inherit everything from parent.
+    if role_allow.is_none() && toolsets.is_none() && blocklist.is_none() {
+        return None;
+    }
+
+    // Layer 1: starting set.
+    let mut allowed: Vec<String> = match role_allow {
+        Some(a) => a,
+        None => {
             let mut parent_tools =
                 crate::tool::definitions::core_tool_definitions(parent_config).await;
             parent_tools.extend(tools::tool_definitions(0, u32::MAX));
-            let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
-            let filtered: Vec<String> = parent_tools
-                .into_iter()
-                .map(|t| t.function.name)
-                .filter(|name| !block_set.contains(name.as_str()))
-                .collect();
-            Some(filtered)
+            parent_tools.into_iter().map(|t| t.function.name).collect()
+        }
+    };
+
+    // Layer 2: intersect with explicit per-call toolsets.
+    if let Some(narrow) = toolsets {
+        let narrow_set: std::collections::HashSet<&str> =
+            narrow.iter().map(String::as_str).collect();
+        allowed.retain(|t| narrow_set.contains(t.as_str()));
+    }
+
+    // Layer 3: subtract blocklist.
+    if let Some(block) = blocklist {
+        let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
+        allowed.retain(|t| !block_set.contains(t.as_str()));
+    }
+
+    Some(allowed)
+}
+
+/// Render the child's initial user-message preamble: identity + role +
+/// delegation policy + workspace + optional context + goal. Replaces the
+/// ad-hoc string concatenation previously embedded in `run_sub_agent`.
+///
+/// The structured `<context trust="parent">…</context>` and
+/// `<goal>…</goal>` blocks let the child parse intent unambiguously and
+/// match hermes' `_build_child_system_prompt` format so callers (and
+/// downstream tests) can rely on the same anchors regardless of which
+/// project produced the spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn build_subagent_preamble(
+    nickname: &str,
+    agent_id: &str,
+    role: Option<&AgentRole>,
+    role_kind: AgentRoleKind,
+    goal: &str,
+    context: Option<&str>,
+    depth: u32,
+    max_depth: u32,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "You are a sub-agent named \"{nickname}\" (id: {agent_id}).\n"
+    ));
+
+    let role_label = role.map_or("default", |r| r.name.as_str());
+    out.push_str(&format!(
+        "Role: {role_label} ({kind})",
+        kind = role_kind.as_str()
+    ));
+    if let Some(r) = role {
+        if !r.description.is_empty() {
+            out.push_str(&format!(" — {desc}", desc = r.description));
         }
     }
+    out.push('\n');
+
+    out.push_str(&format!("Depth: {depth}/{max_depth}. "));
+    match role_kind {
+        AgentRoleKind::Orchestrator if depth + 1 < max_depth => {
+            out.push_str("You may delegate further via spawn_agent.\n");
+        }
+        AgentRoleKind::Orchestrator => {
+            out.push_str("Orchestrator role but depth cap reached — cannot delegate further.\n");
+        }
+        AgentRoleKind::Leaf => {
+            out.push_str("You are a leaf — do not attempt to delegate.\n");
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push_str(&format!("Workspace: {}\n", cwd.display()));
+    }
+
+    if let Some(r) = role {
+        if let Some(instr) = r.system_instructions.as_deref() {
+            if !instr.is_empty() {
+                out.push_str(instr);
+                out.push('\n');
+            }
+        }
+    }
+
+    out.push_str(
+        "\nComplete the task and return a clear, concise final response. \
+         Your full response is returned verbatim to the parent.\n\n",
+    );
+
+    if let Some(ctx) = context {
+        if !ctx.is_empty() {
+            out.push_str("<context trust=\"parent\">\n");
+            out.push_str(ctx);
+            if !ctx.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("</context>\n\n");
+        }
+    }
+
+    out.push_str("<goal>\n");
+    out.push_str(goal);
+    if !goal.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("</goal>\n");
+
+    out
+}
+
+/// True iff an `apply_patch` tool result string represents a successful
+/// application (vs. an error, plan-mode rejection, blocked-path
+/// rejection, or hook abort). The handler at
+/// `tool_handlers/filesystem/patch.rs` returns `Ok(format!("Error
+/// applying patch: …"))`, `Ok(format!("Access denied: …"))`, and other
+/// `Ok(format!("Plan mode is active …"))` strings for failures — they
+/// all return `Ok`, so we can't rely on Result variant to decide; we
+/// pattern-match on the success prefix instead.
+fn is_apply_patch_success(result: &str) -> bool {
+    let trimmed = result.trim_start();
+    // Success returns `Patch applied successfully.` (and a diff
+    // appendix). Every failure path begins with one of these sentinels.
+    !(trimmed.starts_with("Error ")
+        || trimmed.starts_with("Access denied")
+        || trimmed.starts_with("Plan mode")
+        || trimmed.starts_with("Rate limit")
+        || trimmed.is_empty())
+}
+
+/// Extract file paths from `apply_patch` tool arguments. The patch DSL
+/// uses `*** Add File:`, `*** Update File:`, `*** Delete File:` markers
+/// preceded by an optional input path. Pulled out as a free function so
+/// it can be unit-tested without spinning up an agent.
+fn extract_apply_patch_paths(args_json: &str) -> Vec<String> {
+    // Args are either {"patch": "..."} (apply_patch tool) or a raw patch
+    // string. Strip JSON wrapping if present, then scan for markers.
+    let patch_text: std::borrow::Cow<'_, str> =
+        match serde_json::from_str::<serde_json::Value>(args_json) {
+            Ok(v) => v
+                .get("patch")
+                .and_then(|p| p.as_str())
+                .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                .unwrap_or(std::borrow::Cow::Borrowed(args_json)),
+            Err(_) => std::borrow::Cow::Borrowed(args_json),
+        };
+
+    let mut paths = Vec::new();
+    for line in patch_text.lines() {
+        let trimmed = line.trim_start();
+        for marker in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+            if let Some(rest) = trimmed.strip_prefix(marker) {
+                let path = rest.trim().to_string();
+                if !path.is_empty() && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Run a sub-agent task. Returns the final text response.
@@ -1093,15 +1389,21 @@ fn run_sub_agent(
     nickname: String,
     config: Config,
     depth: u32,
+    max_spawn_depth: u32,
     agents_config: crate::config::MultiAgentConfig,
     initial_message: String,
+    context: Option<String>,
     role: Option<AgentRole>,
+    role_kind: AgentRoleKind,
     fork_context: Option<Vec<crate::types::Message>>,
     mut input_rx: mpsc::Receiver<String>,
     cancel: CancellationToken,
     is_paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
     tools_filter: Option<Vec<String>>,
+    files_written: Arc<std::sync::Mutex<Vec<String>>>,
+    bus: Option<AgentTreeBus>,
+    info: SubAgentInfo,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         use crate::agent::{Agent, AgentEvent};
@@ -1116,27 +1418,22 @@ fn run_sub_agent(
         .await?;
 
         // Inject fork context if provided
-        if let Some(context) = fork_context {
-            for msg in context {
+        if let Some(context_msgs) = fork_context {
+            for msg in context_msgs {
                 agent.inject_history_message(msg);
             }
         }
 
-        // Prepend role instructions to the initial message
-        let mut full_message =
-            format!("You are a sub-agent named \"{nickname}\" (id: {agent_id}).\n");
-        if let Some(ref role) = role {
-            full_message.push_str(&format!("Role: {} — {}\n", role.name, role.description));
-            if let Some(ref instructions) = role.system_instructions {
-                full_message.push_str(instructions);
-                full_message.push('\n');
-            }
-        }
-        full_message.push_str(
-            "Complete the task and provide a clear, concise final response. \
-             Your full response will be returned to the parent agent.\n\n",
+        let full_message = build_subagent_preamble(
+            &nickname,
+            &agent_id,
+            role.as_ref(),
+            role_kind,
+            &initial_message,
+            context.as_deref(),
+            depth,
+            max_spawn_depth,
         );
-        full_message.push_str(&initial_message);
 
         // Update DB status to running
         if let Ok(db) = crate::db::Database::open().await {
@@ -1162,6 +1459,35 @@ fn run_sub_agent(
                     .await
             })
         };
+
+        // Heartbeat: tick every `heartbeat_interval_secs` and publish a
+        // Heartbeat event on the bus. If no AgentEvent activity for
+        // `heartbeat_stale_cycles` consecutive ticks, publish a single
+        // Stalled event so the operator/TUI can intervene. Interval is
+        // clamped to ≥1s to keep the test runner sane if the config is 0.
+        let heartbeat_interval =
+            std::time::Duration::from_secs(agents_config.heartbeat_interval_secs.max(1));
+        let stale_threshold = agents_config.heartbeat_stale_cycles.max(1);
+        let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        // Skip the immediate first tick — we want to wait one full interval
+        // before the first heartbeat fires, not race the spawn.
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat_tick.tick().await;
+        let mut idle_cycles: u32 = 0;
+        let mut stalled_emitted = false;
+
+        // Track apply_patch calls that have NOT yet had a ToolResult: the
+        // patch paths are known at ToolExecuting time (from args), but
+        // committing them to files_written before we see a successful
+        // result would surface paths from hook-blocked, plan-mode-blocked,
+        // or otherwise-failed patches that never touched disk.
+        let mut pending_patch_paths: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        // Update the controller's snapshot to Running so heartbeat events
+        // carry the live status instead of the spawn-time PendingInit.
+        let mut info = info;
+        info.status = SubAgentStatus::Running;
 
         // Collect the final text response
         let mut final_text = String::new();
@@ -1197,6 +1523,9 @@ fn run_sub_agent(
                     break;
                 }
                 event = event_rx.recv() => {
+                    // Any agent event resets the idle counter — the child is
+                    // still alive, even if we get only ToolOutputDelta noise.
+                    idle_cycles = 0;
                     match event {
                         Some(AgentEvent::TextDelta(delta)) => {
                             final_text.push_str(&delta);
@@ -1209,7 +1538,46 @@ fn run_sub_agent(
                                 tracing::debug!("sub-agent shell confirmation receiver dropped");
                             }
                         }
+                        Some(AgentEvent::ToolExecuting { tool_call_id, name, args }) => {
+                            // Stash the apply_patch paths keyed by call id;
+                            // commit to files_written only when the matching
+                            // ToolResult comes back successful. Buffered here
+                            // (not committed) so failures don't leak.
+                            if name == "apply_patch" {
+                                let new_paths = extract_apply_patch_paths(&args);
+                                if !new_paths.is_empty() {
+                                    pending_patch_paths.insert(tool_call_id, new_paths);
+                                }
+                            }
+                        }
+                        Some(AgentEvent::ToolResult { tool_call_id, name, result }) => {
+                            if name == "apply_patch" {
+                                if let Some(paths) = pending_patch_paths.remove(&tool_call_id) {
+                                    if is_apply_patch_success(&result) {
+                                        if let Ok(mut guard) = files_written.lock() {
+                                            for p in paths {
+                                                if !guard.contains(&p) {
+                                                    guard.push(p);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
+                    }
+                }
+                _ = heartbeat_tick.tick() => {
+                    if let Some(ref b) = bus {
+                        b.publish(AgentTreeEventKind::Heartbeat, &info);
+                    }
+                    idle_cycles = idle_cycles.saturating_add(1);
+                    if !stalled_emitted && idle_cycles >= stale_threshold {
+                        stalled_emitted = true;
+                        if let Some(ref b) = bus {
+                            b.publish(AgentTreeEventKind::Stalled, &info);
+                        }
                     }
                 }
                 msg = input_rx.recv() => {
@@ -1235,502 +1603,6 @@ fn run_sub_agent(
     })
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
-mod tests {
-    use super::*;
-    use crate::config::MultiAgentConfig;
-
-    fn test_config() -> MultiAgentConfig {
-        MultiAgentConfig {
-            enabled: true,
-            max_spawn_depth: 1,
-            max_children_per_agent: 5,
-            max_concurrent: 3,
-            delegate_timeout_secs: 60,
-        }
-    }
-
-    #[test]
-    fn test_agent_control_new() {
-        let config = test_config();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        assert!(ctrl.is_empty());
-        assert_eq!(ctrl.max_spawn_depth, 1);
-        assert_eq!(ctrl.max_children_per_agent, 5);
-    }
-
-    #[test]
-    fn test_sub_agent_status_transitions() {
-        let status = SubAgentStatus::PendingInit;
-        assert_eq!(status.as_str(), "pending_init");
-
-        let status = SubAgentStatus::Running;
-        assert_eq!(status.as_str(), "running");
-
-        let status = SubAgentStatus::Completed {
-            result: "done".to_string(),
-        };
-        assert_eq!(status.as_str(), "completed");
-
-        let status = SubAgentStatus::Errored {
-            error: "oops".to_string(),
-        };
-        assert_eq!(status.as_str(), "errored");
-
-        let status = SubAgentStatus::Shutdown;
-        assert_eq!(status.as_str(), "shutdown");
-    }
-
-    #[test]
-    fn test_sub_agent_status_from_db() {
-        assert_eq!(
-            SubAgentStatus::from_db("pending_init", None, None),
-            SubAgentStatus::PendingInit
-        );
-        assert_eq!(
-            SubAgentStatus::from_db("running", None, None),
-            SubAgentStatus::Running
-        );
-        assert_eq!(
-            SubAgentStatus::from_db("completed", Some("result"), None),
-            SubAgentStatus::Completed {
-                result: "result".to_string()
-            }
-        );
-        assert_eq!(
-            SubAgentStatus::from_db("errored", None, Some("fail")),
-            SubAgentStatus::Errored {
-                error: "fail".to_string()
-            }
-        );
-        assert_eq!(
-            SubAgentStatus::from_db("shutdown", None, None),
-            SubAgentStatus::Shutdown
-        );
-        // Unknown defaults to PendingInit
-        assert_eq!(
-            SubAgentStatus::from_db("unknown", None, None),
-            SubAgentStatus::PendingInit
-        );
-    }
-
-    #[tokio::test]
-    async fn test_spawn_depth_limit() {
-        let config = MultiAgentConfig {
-            enabled: true,
-            max_spawn_depth: 1,
-            max_children_per_agent: 5,
-            max_concurrent: 3,
-            delegate_timeout_secs: 60,
-        };
-        // current_depth=1 means we're already at the limit
-        let mut ctrl = AgentControl::new(&config, "session-1", 1);
-        let parent_config = Config::default();
-        let result = ctrl
-            .spawn_agent("test", None, None, None, &parent_config, None, None)
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max spawn depth"));
-    }
-
-    #[tokio::test]
-    async fn test_max_children_limit() {
-        let config = MultiAgentConfig {
-            enabled: true,
-            max_spawn_depth: 2,
-            max_children_per_agent: 0, // no children allowed
-            max_concurrent: 3,
-            delegate_timeout_secs: 60,
-        };
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let parent_config = Config::default();
-        let result = ctrl
-            .spawn_agent("test", None, None, None, &parent_config, None, None)
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max children"));
-    }
-
-    #[test]
-    fn test_list_agents_empty() {
-        let config = test_config();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        assert!(ctrl.list_agents().is_empty());
-    }
-
-    #[test]
-    fn test_shutdown_agent_nonexistent() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        assert!(ctrl.shutdown_agent("nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_drain_completions_empty() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        assert!(ctrl.drain_completions().is_empty());
-    }
-
-    #[test]
-    fn test_config_merge_role_overrides() {
-        let role = AgentRole {
-            name: "researcher".to_string(),
-            description: "Research agent".to_string(),
-            model: Some("gpt-4".to_string()),
-            provider: None,
-            temperature: Some(0.3),
-            system_instructions: None,
-            tools_allowed: None,
-            max_iterations: None,
-        };
-        let mut parent_config = Config::default();
-        parent_config.llm.model = "default-model".to_string();
-        parent_config.llm.temperature = 0.7;
-
-        let ctrl = AgentControl::new(&test_config(), "session-1", 0);
-        let child_config = ctrl.build_sub_agent_config(Some(&role), None, &parent_config);
-
-        assert_eq!(child_config.llm.model, "gpt-4");
-        assert!((child_config.llm.temperature - 0.3).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_config_merge_model_override_takes_precedence() {
-        let role = AgentRole {
-            name: "researcher".to_string(),
-            description: "Research agent".to_string(),
-            model: Some("gpt-4".to_string()),
-            provider: None,
-            temperature: None,
-            system_instructions: None,
-            tools_allowed: None,
-            max_iterations: None,
-        };
-        let parent_config = Config::default();
-
-        let ctrl = AgentControl::new(&test_config(), "session-1", 0);
-        let child_config =
-            ctrl.build_sub_agent_config(Some(&role), Some("claude-3"), &parent_config);
-
-        // model_override should win over role.model
-        assert_eq!(child_config.llm.model, "claude-3");
-    }
-
-    #[test]
-    fn test_validate_spawn_limits_depth() {
-        let config = MultiAgentConfig {
-            enabled: true,
-            max_spawn_depth: 2,
-            max_children_per_agent: 5,
-            max_concurrent: 3,
-            delegate_timeout_secs: 60,
-        };
-        // At depth 2 with max_spawn_depth=2, should fail
-        let ctrl = AgentControl::new(&config, "session-1", 2);
-        assert!(ctrl.validate_spawn_limits().is_err());
-
-        // At depth 1 with max_spawn_depth=2, should pass
-        let ctrl = AgentControl::new(&config, "session-1", 1);
-        assert!(ctrl.validate_spawn_limits().is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_drain_completions_receives_sent_completion() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let tx = ctrl.test_completion_tx();
-
-        ctrl.insert_mock_handle("agent-1", "Atlas");
-
-        tx.send(SubAgentCompletion {
-            agent_id: "agent-1".to_string(),
-            nickname: "Atlas".to_string(),
-            status: SubAgentStatus::Completed {
-                result: "done".to_string(),
-            },
-            final_response: Some("done".to_string()),
-        })
-        .await
-        .unwrap();
-
-        let completions = ctrl.drain_completions();
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].agent_id, "agent-1");
-        assert_eq!(completions[0].status.as_str(), "completed");
-
-        let info = ctrl.get_status("agent-1").unwrap();
-        assert_eq!(info.status.as_str(), "completed");
-    }
-
-    #[tokio::test]
-    async fn test_wait_buffers_other_completions() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let tx = ctrl.test_completion_tx();
-
-        ctrl.insert_mock_handle("agent-a", "Atlas");
-        ctrl.insert_mock_handle("agent-b", "Aurora");
-
-        tx.send(SubAgentCompletion {
-            agent_id: "agent-a".to_string(),
-            nickname: "Atlas".to_string(),
-            status: SubAgentStatus::Completed {
-                result: "result-a".to_string(),
-            },
-            final_response: Some("result-a".to_string()),
-        })
-        .await
-        .unwrap();
-
-        tx.send(SubAgentCompletion {
-            agent_id: "agent-b".to_string(),
-            nickname: "Aurora".to_string(),
-            status: SubAgentStatus::Completed {
-                result: "result-b".to_string(),
-            },
-            final_response: Some("result-b".to_string()),
-        })
-        .await
-        .unwrap();
-
-        // Wait for B — should buffer A's completion
-        let completion = ctrl.wait_for_agent("agent-b", 5).await.unwrap();
-        assert_eq!(completion.agent_id, "agent-b");
-
-        // A's completion should be retrievable via drain
-        let drained = ctrl.drain_completions();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].agent_id, "agent-a");
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_agent_cancels_token() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let cancel = ctrl.insert_mock_handle("agent-1", "Atlas");
-
-        assert!(!cancel.is_cancelled());
-        ctrl.shutdown_agent("agent-1").unwrap();
-        assert!(cancel.is_cancelled());
-        assert_eq!(
-            ctrl.get_status("agent-1").unwrap().status.as_str(),
-            "shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_all_cancels_all_tokens() {
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let cancel_a = ctrl.insert_mock_handle("agent-a", "Atlas");
-        let cancel_b = ctrl.insert_mock_handle("agent-b", "Aurora");
-
-        assert!(!cancel_a.is_cancelled());
-        assert!(!cancel_b.is_cancelled());
-        ctrl.shutdown_all();
-        assert!(cancel_a.is_cancelled());
-        assert!(cancel_b.is_cancelled());
-    }
-
-    #[test]
-    fn test_build_sub_agent_config_max_iterations() {
-        let role = AgentRole {
-            name: "researcher".to_string(),
-            description: "Research agent".to_string(),
-            model: None,
-            provider: None,
-            temperature: None,
-            system_instructions: None,
-            tools_allowed: None,
-            max_iterations: Some(10),
-        };
-        let parent_config = Config::default();
-        let ctrl = AgentControl::new(&test_config(), "session-1", 0);
-        let child_config = ctrl.build_sub_agent_config(Some(&role), None, &parent_config);
-        assert_eq!(child_config.conversation.max_iterations, 10);
-    }
-
-    #[test]
-    fn test_build_sub_agent_config_auto_approve() {
-        let parent_config = Config::default();
-        let ctrl = AgentControl::new(&test_config(), "session-1", 0);
-        let child_config = ctrl.build_sub_agent_config(None, None, &parent_config);
-        assert_eq!(child_config.policy.auto_approve, vec!["*".to_string()]);
-        assert_eq!(child_config.policy.deny, parent_config.policy.deny);
-    }
-
-    #[tokio::test]
-    async fn test_send_input_nonexistent_agent() {
-        let config = test_config();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        let result = ctrl.send_input("nonexistent", "hello").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
-    }
-
-    #[test]
-    fn test_get_status_returns_none_for_unknown() {
-        let config = test_config();
-        let ctrl = AgentControl::new(&config, "session-1", 0);
-        assert!(ctrl.get_status("nonexistent").is_none());
-    }
-
-    #[test]
-    fn delegate_blocklist_applied_without_role_produces_filtered_allowlist() {
-        let parent = Config::default();
-        let filter = compute_tools_filter(
-            None,
-            Some(AgentControl::DELEGATE_DEFAULT_BLOCKLIST),
-            &parent,
-        );
-        let allowed = filter.expect("blocklist without role should yield a filter");
-        // Every blocklisted name must be absent.
-        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
-            assert!(
-                !allowed.iter().any(|t| t == *banned),
-                "blocked tool '{banned}' leaked into the allowlist"
-            );
-        }
-        // And we should still have a non-trivial set — at minimum read_file
-        // must survive the filter.
-        assert!(
-            allowed.iter().any(|t| t == "read_file"),
-            "read_file should survive the blocklist"
-        );
-    }
-
-    #[test]
-    fn delegate_blocklist_with_role_allowlist_intersects() {
-        let role = AgentRole {
-            name: "test".to_string(),
-            description: "".to_string(),
-            model: None,
-            provider: None,
-            temperature: None,
-            system_instructions: None,
-            tools_allowed: Some(vec![
-                "read_file".to_string(),
-                "write_memory".to_string(),
-                "run_shell".to_string(),
-            ]),
-            max_iterations: None,
-        };
-        let parent = Config::default();
-        let filter = compute_tools_filter(
-            Some(&role),
-            Some(AgentControl::DELEGATE_DEFAULT_BLOCKLIST),
-            &parent,
-        );
-        let allowed = filter.unwrap();
-        assert!(allowed.contains(&"read_file".to_string()));
-        assert!(allowed.contains(&"run_shell".to_string()));
-        assert!(
-            !allowed.contains(&"write_memory".to_string()),
-            "write_memory (blocked) must be removed even though the role allowed it"
-        );
-    }
-
-    #[test]
-    fn delegate_no_filters_returns_none() {
-        let parent = Config::default();
-        let filter = compute_tools_filter(None, None, &parent);
-        assert!(
-            filter.is_none(),
-            "no role allowlist and no blocklist = inherit all"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_agent_returns_completion_shape() {
-        // Exercises the wait-side of `spawn_and_wait` in isolation: we can't
-        // reach the full spawn_and_wait path without an LLM, but this
-        // confirms the completion the caller eventually receives carries the
-        // expected `agent_id`/`status`/`final_response` shape.
-        let config = test_config();
-        let mut ctrl = AgentControl::new(&config, "session-1", 0);
-        let tx = ctrl.test_completion_tx();
-        ctrl.insert_mock_handle("agent-x", "Atlas");
-        tx.send(SubAgentCompletion {
-            agent_id: "agent-x".to_string(),
-            nickname: "Atlas".to_string(),
-            status: SubAgentStatus::Completed {
-                result: "all done".to_string(),
-            },
-            final_response: Some("all done".to_string()),
-        })
-        .await
-        .unwrap();
-
-        let completion = ctrl.wait_for_agent("agent-x", 5).await.unwrap();
-        assert_eq!(completion.agent_id, "agent-x");
-        assert_eq!(completion.status.as_str(), "completed");
-        assert_eq!(completion.final_response.as_deref(), Some("all done"));
-    }
-
-    #[test]
-    fn mutating_tool_names_covers_every_non_readonly_tool() {
-        // Guard: every tool surfaced to the LLM must be classified by
-        // `is_mutating_tool` (via its read-only allowlist) OR appear in
-        // `mutating_tool_names()`. If this test fails, a newly-added tool
-        // is silently escaping Plan-mode's child blocklist.
-        let parent = Config::default();
-        let mut all: Vec<String> = crate::tool::definitions::core_tool_definitions(&parent)
-            .into_iter()
-            .map(|t| t.function.name)
-            .collect();
-        all.extend(
-            tools::tool_definitions(0, u32::MAX)
-                .into_iter()
-                .map(|t| t.function.name),
-        );
-        // `is_mutating_tool`'s read-only allowlist (kept in sync by
-        // construction — these are the names listed in agent.rs).
-        let readonly: std::collections::HashSet<&str> = [
-            "read_file",
-            "list_dir",
-            "list",
-            "list_skills",
-            "list_channels",
-            "list_agents",
-            "read_memory",
-            "memory_search",
-            "web_fetch",
-            "web_search",
-            "request_user_input",
-            "get_goal",
-            "vision_analyze",
-        ]
-        .into_iter()
-        .collect();
-        let mutating: std::collections::HashSet<&str> = crate::agent::mutating_tool_names()
-            .iter()
-            .copied()
-            .collect();
-        let mut missing: Vec<String> = Vec::new();
-        for name in &all {
-            if !readonly.contains(name.as_str()) && !mutating.contains(name.as_str()) {
-                missing.push(name.clone());
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "mutating_tool_names() is missing: {missing:?}. Add them or classify as read-only."
-        );
-    }
-
-    #[test]
-    fn delegated_task_round_trip() {
-        let t = DelegatedTask {
-            goal: "summarize this".into(),
-            role_name: Some("researcher".into()),
-            model_override: None,
-        };
-        assert_eq!(t.goal, "summarize this");
-        assert_eq!(t.role_name.as_deref(), Some("researcher"));
-    }
-}
-
 /// Tests for `/agents`-feature runtime additions: Paused status, pause gate,
 /// shutdown_subtree, aggregate_subtree, AgentTreeBus integration, and the
 /// pausable/terminal precondition checks. Distinct from the legacy `tests`
@@ -1749,6 +1621,7 @@ mod agents_feature_tests {
             max_children_per_agent: 10,
             max_concurrent: 10,
             delegate_timeout_secs: 60,
+            ..MultiAgentConfig::default()
         };
         AgentControl::new(&cfg, "root-session", 0)
     }
@@ -2013,5 +1886,560 @@ mod agents_feature_tests {
         // from D (999 tokens) would push the sum past 60. The negative
         // case is encoded by the exact-match positive, not a weaker
         // `< 999` check that would pass even on a buggy 998.
+    }
+}
+
+/// Tests for the hermes-parity additions: `context` / `toolsets` /
+/// `role_kind` schema, orchestrator gating, kill switch, the dedicated
+/// preamble builder, file-write tracking, heartbeat config plumbing, and
+/// the auto-approve / delegation-model precedence chain in
+/// `build_sub_agent_config`. Each test pins a behavior the new caller
+/// surface promises — none assert on `Default`/`Clone` round-trips.
+#[cfg(test)]
+mod hermes_parity_tests {
+    use super::*;
+    use crate::config::{Config, MultiAgentConfig};
+
+    fn mk_role(name: &str, tools_allowed: Option<Vec<&str>>) -> AgentRole {
+        AgentRole {
+            name: name.into(),
+            description: "test role".into(),
+            model: None,
+            provider: None,
+            temperature: None,
+            system_instructions: None,
+            tools_allowed: tools_allowed.map(|v| v.into_iter().map(str::to_string).collect()),
+            max_iterations: None,
+            kind: AgentRoleKind::Leaf,
+        }
+    }
+
+    /// `<context trust="parent">…</context>` and `<goal>…</goal>` must
+    /// land in the preamble verbatim. The block delimiters are the
+    /// hermes-parity anchor: downstream prompts and tests grep for them.
+    /// If a refactor silently drops `context` between handler and run, the
+    /// child has no way to know background facts the parent wanted to share.
+    #[test]
+    fn preamble_renders_context_and_goal_blocks() {
+        let preamble = build_subagent_preamble(
+            "atlas",
+            "id-1",
+            None,
+            AgentRoleKind::Leaf,
+            "do the thing",
+            Some("the user prefers tabs"),
+            0,
+            3,
+        );
+        assert!(
+            preamble.contains("<context trust=\"parent\">\nthe user prefers tabs\n</context>"),
+            "preamble must wrap context in trust-tagged block, got:\n{preamble}"
+        );
+        assert!(
+            preamble.contains("<goal>\ndo the thing\n</goal>"),
+            "preamble must wrap goal in <goal> block, got:\n{preamble}"
+        );
+    }
+
+    /// Leaf preamble must explicitly tell the child not to delegate;
+    /// orchestrator preamble must say it may. Without this signal the child
+    /// guesses from its (silent) tool surface — an LLM-visible miscue.
+    #[test]
+    fn preamble_signals_delegation_capability() {
+        let leaf =
+            build_subagent_preamble("atlas", "id", None, AgentRoleKind::Leaf, "g", None, 0, 3);
+        assert!(
+            leaf.contains("leaf — do not attempt to delegate"),
+            "leaf preamble must forbid delegation, got:\n{leaf}"
+        );
+
+        let orch = build_subagent_preamble(
+            "atlas",
+            "id",
+            None,
+            AgentRoleKind::Orchestrator,
+            "g",
+            None,
+            0,
+            3,
+        );
+        assert!(
+            orch.contains("may delegate further via spawn_agent"),
+            "orchestrator under cap must signal delegation, got:\n{orch}"
+        );
+
+        let orch_capped = build_subagent_preamble(
+            "atlas",
+            "id",
+            None,
+            AgentRoleKind::Orchestrator,
+            "g",
+            None,
+            2,
+            3,
+        );
+        assert!(
+            orch_capped.contains("depth cap reached"),
+            "orchestrator AT cap must say cap reached, got:\n{orch_capped}"
+        );
+    }
+
+    /// Toolsets narrow the parent's surface. A `toolsets: ["a", "b"]`
+    /// where "b" is not in the parent's enabled set must NOT inject "b"
+    /// into the child — toolsets is an intersection, not an additive
+    /// allowlist. Catches a regression where a future refactor flips the
+    /// semantic and lets the LLM grant itself tools.
+    #[tokio::test]
+    async fn toolsets_intersects_with_parent_surface_not_adds() {
+        let parent = Config::default();
+        let filter = compute_tools_filter(
+            None,
+            Some(&["read_file".into(), "definitely_fake_tool".into()]),
+            None,
+            &parent,
+        )
+        .await;
+        let allowed = filter.expect("intersection should yield a filter");
+        assert!(
+            allowed.iter().any(|t| t == "read_file"),
+            "read_file must survive intersection: {allowed:?}"
+        );
+        assert!(
+            !allowed.iter().any(|t| t == "definitely_fake_tool"),
+            "names not in parent surface must NOT be injected: {allowed:?}"
+        );
+    }
+
+    /// Toolsets applied on top of a role allowlist must produce the
+    /// intersection. A role that allows `[read_file, write_memory]` plus
+    /// `toolsets: [write_memory, run_shell]` must yield exactly
+    /// `[write_memory]`. This is hermes' restrictive semantic — neither
+    /// side adds tools the other didn't already permit.
+    #[tokio::test]
+    async fn toolsets_intersect_with_role_allowlist() {
+        let role = mk_role("r", Some(vec!["read_file", "write_memory"]));
+        let parent = Config::default();
+        let filter = compute_tools_filter(
+            Some(&role),
+            Some(&["write_memory".into(), "run_shell".into()]),
+            None,
+            &parent,
+        )
+        .await;
+        let allowed = filter.expect("intersection result");
+        assert_eq!(
+            allowed,
+            vec!["write_memory".to_string()],
+            "expected pure intersection of role and toolsets, got {allowed:?}"
+        );
+    }
+
+    /// Empty `toolsets: []` means "no tools" — a legitimate caller intent
+    /// (e.g. "summarize this text"). The filter must distinguish this from
+    /// `toolsets: None` (inherit parent).
+    #[tokio::test]
+    async fn empty_toolsets_yields_empty_filter_not_inherit() {
+        let parent = Config::default();
+        let with_none = compute_tools_filter(None, None, None, &parent).await;
+        assert!(
+            with_none.is_none(),
+            "None toolsets must yield None (inherit), got {with_none:?}"
+        );
+        let with_empty = compute_tools_filter(None, Some(&[]), None, &parent).await;
+        assert_eq!(
+            with_empty,
+            Some(Vec::<String>::new()),
+            "Empty toolsets must yield Some(empty) (no tools), not None"
+        );
+    }
+
+    /// `can_orchestrate` is the call-site predicate for whether the
+    /// blocklist should re-permit spawn_agent. Both the kill switch
+    /// (`orchestrator_enabled`) and the numeric depth cap must permit.
+    #[test]
+    fn can_orchestrate_requires_kill_switch_and_depth_under_cap() {
+        let mut cfg = Config::default();
+        cfg.agents.max_spawn_depth = 3;
+
+        cfg.agents.orchestrator_enabled = true;
+        assert!(
+            super::tools::can_orchestrate(&cfg, 0),
+            "depth 0 + enabled must permit"
+        );
+        assert!(
+            super::tools::can_orchestrate(&cfg, 1),
+            "depth 1 + enabled must permit (1+1 < 3)"
+        );
+        assert!(
+            !super::tools::can_orchestrate(&cfg, 2),
+            "depth 2 + enabled MUST NOT permit (2+1 == 3, not <)"
+        );
+
+        cfg.agents.orchestrator_enabled = false;
+        assert!(
+            !super::tools::can_orchestrate(&cfg, 0),
+            "kill switch off must veto even at depth 0"
+        );
+    }
+
+    /// Orchestrator blocklist re-permits spawn/wait/close ONLY when
+    /// `can_orchestrate` is true. A leaf NEVER gets them, regardless of
+    /// the kill switch. Catches a regression where leaf/orchestrator
+    /// gating is wired only at the schema level and not at the blocklist.
+    #[test]
+    fn assemble_delegate_blocklist_re_permits_orchestrator_tools_iff_allowed() {
+        let cfg = Config::default();
+
+        // Leaf, can_orchestrate=true (doesn't matter — leaf is leaf)
+        let leaf = super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Leaf, true);
+        assert!(
+            leaf.contains(&"spawn_agent"),
+            "leaf must block spawn_agent regardless of can_orchestrate: {leaf:?}"
+        );
+
+        // Orchestrator, can_orchestrate=false (depth maxed OR kill switch off)
+        let orch_blocked =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, false);
+        assert!(
+            orch_blocked.contains(&"spawn_agent"),
+            "orchestrator at cap must still be blocked: {orch_blocked:?}"
+        );
+
+        // Orchestrator, can_orchestrate=true
+        let orch_ok =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, true);
+        assert!(
+            !orch_ok.contains(&"spawn_agent"),
+            "orchestrator under cap with switch on must re-permit spawn_agent: {orch_ok:?}"
+        );
+        assert!(
+            !orch_ok.contains(&"wait_for_agent"),
+            "orchestrator must also re-permit wait_for_agent: {orch_ok:?}"
+        );
+        assert!(
+            !orch_ok.contains(&"close_agent"),
+            "orchestrator must also re-permit close_agent: {orch_ok:?}"
+        );
+        // The non-delegation members of the blocklist must still be present.
+        assert!(
+            orch_ok.contains(&"write_memory"),
+            "orchestrator does NOT re-permit memory mutation: {orch_ok:?}"
+        );
+        assert!(
+            orch_ok.contains(&"request_user_input"),
+            "orchestrator does NOT re-permit user input: {orch_ok:?}"
+        );
+    }
+
+    /// Plan mode is a hard read-only guarantee — it unions every
+    /// mutating tool into the child blocklist *after* the orchestrator
+    /// overlay, so the carve-out can't smuggle delegation tools (which
+    /// are themselves mutations) past the plan-mode contract. Both run_shell
+    /// AND spawn_agent must be blocked when the parent is in Plan, even
+    /// for an orchestrator role.
+    #[test]
+    fn plan_mode_blocks_all_mutations_including_delegation() {
+        let mut cfg = Config::default();
+        cfg.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
+
+        let blocklist =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, true);
+        // Every mutating tool blocked — including the delegation surface,
+        // even though an orchestrator role would otherwise re-permit it.
+        for must_block in ["run_shell", "apply_patch", "spawn_agent", "write_memory"] {
+            assert!(
+                blocklist.contains(&must_block),
+                "Plan mode must block '{must_block}' even for orchestrator: {blocklist:?}"
+            );
+        }
+    }
+
+    /// And the corollary: outside Plan mode, the orchestrator carve-out
+    /// IS effective — `spawn_agent` is available to the child even though
+    /// it'd be in the default leaf blocklist. This is the test that
+    /// proves the overlay-then-union order has a useful effect.
+    #[test]
+    fn orchestrator_carve_out_works_outside_plan_mode() {
+        let cfg = Config::default(); // Execute mode (default)
+        let blocklist =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, true);
+        assert!(
+            !blocklist.contains(&"spawn_agent"),
+            "outside Plan mode, orchestrator must NOT have spawn_agent blocked: {blocklist:?}"
+        );
+        // run_shell wasn't in the default leaf blocklist either — it's
+        // only added in Plan mode — so the orchestrator gets it too.
+        assert!(
+            !blocklist.contains(&"run_shell"),
+            "run_shell not in default blocklist, orchestrator should have it: {blocklist:?}"
+        );
+    }
+
+    /// Auto-approve defaults to deny (hermes parity, safer posture). Only
+    /// when `agents.subagent_auto_approve` is explicitly enabled does the
+    /// child inherit a permissive auto-approve. Parent's deny list always
+    /// carries through.
+    #[test]
+    fn build_sub_agent_config_auto_approve_defaults_to_deny() {
+        let mut parent = Config::default();
+        parent.policy.deny = vec!["dangerous".into()];
+        let cfg = MultiAgentConfig {
+            enabled: true,
+            max_spawn_depth: 2,
+            ..MultiAgentConfig::default()
+        };
+
+        // Default config: subagent_auto_approve is false.
+        assert!(!parent.agents.subagent_auto_approve);
+        let ctrl = AgentControl::new(&cfg, "p", 0);
+        let child = ctrl.build_sub_agent_config(None, None, &parent);
+        assert!(
+            child.policy.auto_approve.is_empty(),
+            "auto_approve must default to empty (deny posture), got {:?}",
+            child.policy.auto_approve
+        );
+        assert_eq!(
+            child.policy.deny, parent.policy.deny,
+            "parent deny list must always carry through"
+        );
+
+        // Flip the switch — child becomes permissive but deny still applies.
+        parent.agents.subagent_auto_approve = true;
+        let child2 = ctrl.build_sub_agent_config(None, None, &parent);
+        assert_eq!(
+            child2.policy.auto_approve,
+            vec!["*".to_string()],
+            "switch ON must produce wildcard auto_approve"
+        );
+        assert_eq!(
+            child2.policy.deny, parent.policy.deny,
+            "deny list must carry through regardless of switch"
+        );
+    }
+
+    /// Model precedence (highest first): explicit `model_override` arg,
+    /// then `role.model`, then `agents.delegation_model`, then the parent's
+    /// model. A regression that reorders these silently routes the child
+    /// to the wrong provider — caught by exact-string assertions at each
+    /// layer.
+    #[test]
+    fn build_sub_agent_config_model_precedence_chain() {
+        let mut parent = Config::default();
+        parent.llm.model = "parent-model".into();
+        parent.agents.delegation_model = Some("delegation-default".into());
+        let role_with_model = AgentRole {
+            model: Some("role-model".into()),
+            ..mk_role("r", None)
+        };
+        let ctrl = AgentControl::new(&MultiAgentConfig::default(), "p", 0);
+
+        // No role, no override → delegation_model takes over.
+        let c1 = ctrl.build_sub_agent_config(None, None, &parent);
+        assert_eq!(c1.llm.model, "delegation-default");
+
+        // Role with model → role wins over delegation_model.
+        let c2 = ctrl.build_sub_agent_config(Some(&role_with_model), None, &parent);
+        assert_eq!(c2.llm.model, "role-model");
+
+        // Explicit override → wins over both.
+        let c3 =
+            ctrl.build_sub_agent_config(Some(&role_with_model), Some("explicit-model"), &parent);
+        assert_eq!(c3.llm.model, "explicit-model");
+
+        // No role, no override, no delegation_model → parent's model.
+        let mut parent_no_delegation = parent.clone();
+        parent_no_delegation.agents.delegation_model = None;
+        let c4 = ctrl.build_sub_agent_config(None, None, &parent_no_delegation);
+        assert_eq!(c4.llm.model, "parent-model");
+    }
+
+    /// `extract_apply_patch_paths` is what populates `files_written` from
+    /// observed tool calls. Every patch DSL header type must produce a
+    /// path; non-header lines must NOT (a regression here would surface
+    /// bogus paths to the parent).
+    #[test]
+    fn extract_apply_patch_paths_parses_all_three_headers() {
+        let patch = r#"
+*** Begin Patch
+*** Add File: src/new.rs
++pub fn foo() {}
+*** Update File: src/existing.rs
+@@
+ context
+-old
++new
+*** Delete File: src/dead.rs
+*** End Patch
+"#;
+        let paths = extract_apply_patch_paths(patch);
+        assert_eq!(
+            paths,
+            vec![
+                "src/new.rs".to_string(),
+                "src/existing.rs".to_string(),
+                "src/dead.rs".to_string(),
+            ]
+        );
+    }
+
+    /// The handler wraps `apply_patch` args as JSON `{"patch": "..."}`.
+    /// The extractor must unwrap that without false-positives on the JSON
+    /// punctuation.
+    #[test]
+    fn extract_apply_patch_paths_unwraps_json_args() {
+        let json_args = r#"{"patch": "*** Update File: a/b.rs\n@@\n context\n-old\n+new\n"}"#;
+        let paths = extract_apply_patch_paths(json_args);
+        assert_eq!(paths, vec!["a/b.rs".to_string()]);
+    }
+
+    /// Fresh `session_id` per spawn — the CLAUDE.md:149 invariant. Two
+    /// consecutive `prepare_sub_agent_info` calls must produce distinct
+    /// UUIDs *and* neither must equal the parent's session id.
+    #[tokio::test]
+    async fn prepare_sub_agent_info_assigns_distinct_session_ids() {
+        let cfg = MultiAgentConfig::default();
+        let ctrl = AgentControl::new(&cfg, "parent-session-xyz", 0);
+        let s1 = uuid::Uuid::new_v4().to_string();
+        let s2 = uuid::Uuid::new_v4().to_string();
+        let info1 = ctrl
+            .prepare_sub_agent_info("id-1", "atlas", "default", "m", &s1, 1)
+            .await;
+        let info2 = ctrl
+            .prepare_sub_agent_info("id-2", "aurora", "default", "m", &s2, 1)
+            .await;
+        assert_ne!(info1.session_id, info2.session_id);
+        assert_ne!(info1.session_id, "parent-session-xyz");
+        assert_ne!(info2.session_id, "parent-session-xyz");
+    }
+
+    /// `Spawned`, `Heartbeat`, and `Stalled` must each have unique wire
+    /// strings — these go into the gRPC stream and the TUI keys events by
+    /// `kind.as_str()`. A duplicate string would silently merge two
+    /// distinct event kinds in the UI.
+    #[test]
+    fn agent_tree_event_kind_strings_are_distinct() {
+        use std::collections::HashSet;
+        let all = [
+            AgentTreeEventKind::Spawned,
+            AgentTreeEventKind::StatusChanged,
+            AgentTreeEventKind::Paused,
+            AgentTreeEventKind::Resumed,
+            AgentTreeEventKind::Completed,
+            AgentTreeEventKind::Errored,
+            AgentTreeEventKind::Killed,
+            AgentTreeEventKind::Heartbeat,
+            AgentTreeEventKind::Stalled,
+        ];
+        let strings: HashSet<&str> = all.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            strings.len(),
+            all.len(),
+            "every AgentTreeEventKind must have a unique wire string"
+        );
+        // The two new ones must actually be reachable through as_str.
+        assert!(strings.contains("heartbeat"));
+        assert!(strings.contains("stalled"));
+    }
+
+    /// `AgentRoleKind::parse` accepts hermes-style literals and falls
+    /// back to Leaf for everything else. The fallback is intentional:
+    /// an LLM that types "leaf-only" or a typo'd "orchestratorr" should
+    /// degrade safely rather than reject the spawn.
+    #[test]
+    fn agent_role_kind_parse_known_and_unknown() {
+        assert_eq!(AgentRoleKind::parse("leaf"), AgentRoleKind::Leaf);
+        assert_eq!(
+            AgentRoleKind::parse("orchestrator"),
+            AgentRoleKind::Orchestrator
+        );
+        assert_eq!(
+            AgentRoleKind::parse("ORCHESTRATOR"),
+            AgentRoleKind::Orchestrator,
+            "parse must be case-insensitive"
+        );
+        assert_eq!(
+            AgentRoleKind::parse("  orchestrate  "),
+            AgentRoleKind::Orchestrator,
+            "parse must trim and accept 'orchestrate' alias"
+        );
+        // Garbage falls back to Leaf — safer default.
+        assert_eq!(AgentRoleKind::parse("bogus"), AgentRoleKind::Leaf);
+        assert_eq!(AgentRoleKind::parse(""), AgentRoleKind::Leaf);
+    }
+
+    /// The subagent-driven-development skill must be registered. Pure
+    /// registration check — the SKILL.md body is markdown for the LLM
+    /// and not load-bearing here.
+    #[test]
+    fn subagent_driven_development_skill_is_registered() {
+        assert!(
+            crate::skills::is_builtin_skill_name("subagent-driven-development"),
+            "the SDD skill must appear in the bundled-skills registry"
+        );
+    }
+
+    /// REGRESSION: `is_apply_patch_success` must reject every failure
+    /// prefix the apply_patch handler can emit, otherwise `files_written`
+    /// would surface paths from plan-mode-blocked, hook-aborted, or
+    /// blocked-path-rejected patches that never touched disk. Mirrors the
+    /// `Ok(format!(...))` sentinels in
+    /// `tool_handlers/filesystem/patch.rs`.
+    #[test]
+    fn is_apply_patch_success_only_on_real_success_strings() {
+        // Success cases — start with "Patch applied successfully."
+        assert!(is_apply_patch_success(
+            "Patch applied successfully.\n--- diff ---"
+        ));
+        assert!(is_apply_patch_success(
+            "Unified patch applied successfully."
+        ));
+
+        // Every failure sentinel must NOT be counted as success.
+        for failure in [
+            "Error applying patch: hunk did not apply",
+            "Error applying unified patch: bad context",
+            "Access denied: /etc/passwd is in a blocked path",
+            "Plan mode is active — apply_patch refused",
+            "Rate limit reached for apply_patch",
+            "",    // empty is not success
+            "   ", // whitespace-only is not success
+        ] {
+            assert!(
+                !is_apply_patch_success(failure),
+                "must reject failure string: {failure:?}"
+            );
+        }
+    }
+
+    /// REGRESSION: in a mixed batch, the per-task blocklist must be
+    /// computed from THAT task's role_kind — a leaf sibling of an
+    /// orchestrator must NOT inherit the orchestrator's spawn_agent
+    /// carve-out. Tests the post-review fix to `spawn_batch_and_wait`.
+    /// Pre-fix, both tasks shared a single blocklist computed from
+    /// `any_orchestrator`, opening the gating bypass.
+    #[test]
+    fn batch_per_task_blocklist_does_not_promote_leaf_siblings() {
+        let mut cfg = Config::default();
+        cfg.agents.max_spawn_depth = 3;
+        cfg.agents.orchestrator_enabled = true;
+
+        // Simulate what spawn_batch_and_wait computes for each task.
+        let depth: u32 = 0;
+        let can = super::tools::can_orchestrate(&cfg, depth);
+        assert!(can, "test premise: depth 0 + enabled should permit");
+
+        let orch_blocklist =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, can);
+        let leaf_blocklist =
+            super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Leaf, can);
+
+        assert!(
+            !orch_blocklist.contains(&"spawn_agent"),
+            "orchestrator task: spawn_agent re-permitted"
+        );
+        assert!(
+            leaf_blocklist.contains(&"spawn_agent"),
+            "leaf task in the SAME batch: spawn_agent still blocked, regardless of sibling"
+        );
     }
 }

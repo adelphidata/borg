@@ -47,6 +47,16 @@ pub enum AgentTreeEventKind {
     Errored,
     /// Agent was explicitly killed by an operator.
     Killed,
+    /// Periodic liveness ping from a running child. Cadence configured by
+    /// `agents.heartbeat_interval_secs`. TUI consumers surface this as a
+    /// "still working" indicator; absence past `heartbeat_stale_cycles`
+    /// triggers a `Stalled` event.
+    Heartbeat,
+    /// Child has gone past `heartbeat_stale_cycles × heartbeat_interval_secs`
+    /// without producing any agent activity. Operator-actionable signal —
+    /// either the LLM provider is wedged, a tool is hanging, or the child
+    /// is genuinely waiting on something. Fires at most once per child.
+    Stalled,
 }
 
 impl AgentTreeEventKind {
@@ -60,6 +70,8 @@ impl AgentTreeEventKind {
             Self::Completed => "completed",
             Self::Errored => "errored",
             Self::Killed => "killed",
+            Self::Heartbeat => "heartbeat",
+            Self::Stalled => "stalled",
         }
     }
 }
