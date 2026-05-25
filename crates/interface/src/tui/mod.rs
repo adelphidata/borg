@@ -28,6 +28,7 @@ mod plan_overlay;
 mod plugins_popup;
 mod popup_utils;
 mod schedule_popup;
+mod scroll_state;
 mod sessions_popup;
 mod settings_popup;
 mod shimmer;
