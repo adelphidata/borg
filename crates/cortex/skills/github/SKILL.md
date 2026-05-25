@@ -10,63 +10,41 @@ requires:
   bins: ["gh"]
 ---
 
-# GitHub Skill
+# GitHub
 
-Use the `gh` CLI to interact with GitHub repositories, issues, PRs, and CI.
+`gh` CLI. Add `--repo owner/repo` outside a clone, or pass a URL directly
+(`gh pr view https://github.com/owner/repo/pull/55`). `--cache 1h` on
+`gh api` to avoid rate limits. Use `git` for local commit/push/pull.
 
-## Setup
-
-```bash
-gh auth login    # one-time authentication
-gh auth status   # verify
-```
-
-## Pull Requests
+## PRs
 
 ```bash
-gh pr list --repo owner/repo
-gh pr view 55 --repo owner/repo
-gh pr checks 55 --repo owner/repo
-gh pr create --title "feat: add feature" --body "Description"
-gh pr merge 55 --squash --repo owner/repo
+gh pr list
+gh pr view 55
+gh pr checks 55
+gh pr create --title "feat: add feature" --body "…"
+gh pr merge 55 --squash
 ```
 
 ## Issues
 
 ```bash
-gh issue list --repo owner/repo --state open
-gh issue create --title "Bug: something broken" --body "Details..."
-gh issue close 42 --repo owner/repo
+gh issue list --state open
+gh issue create --title "Bug: …" --body "…"
+gh issue close 42
 ```
 
-## CI / Workflow Runs
+## CI runs
 
 ```bash
-gh run list --repo owner/repo --limit 10
-gh run view <run-id> --repo owner/repo
-gh run view <run-id> --repo owner/repo --log-failed
-gh run rerun <run-id> --failed --repo owner/repo
+gh run list --limit 10
+gh run view <id> [--log-failed]
+gh run rerun <id> --failed
 ```
 
-## API Queries
+## API + jq
 
 ```bash
 gh api repos/owner/repo/pulls/55 --jq '.title, .state, .user.login'
-gh api repos/owner/repo/labels --jq '.[].name'
-```
-
-## JSON Output
-
-Most commands support `--json` with `--jq` filtering:
-
-```bash
 gh pr list --json number,title,state --jq '.[] | "\(.number): \(.title)"'
-gh issue list --json number,title,labels --jq '.[] | "[\(.number)] \(.title)"'
 ```
-
-## Notes
-
-- Always specify `--repo owner/repo` when not in a git directory
-- Use URLs directly: `gh pr view https://github.com/owner/repo/pull/55`
-- Use `gh api --cache 1h` for repeated queries to avoid rate limits
-- For local git operations (commit, push, pull), use `git` directly

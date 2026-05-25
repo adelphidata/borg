@@ -5,63 +5,52 @@ requires:
   bins: ["docker"]
 ---
 
-# Docker Skill
+# Docker
 
-Use `docker` and `docker compose` for container management.
+Use `docker compose` (v2), not `docker-compose` (v1).
 
-## Container Operations
+## Containers
 
 ```bash
-docker ps                                # running containers
-docker ps -a                             # all containers including stopped
+docker ps [-a]                            # running / all
 docker run -d --name myapp -p 8080:80 nginx
-docker stop myapp
-docker rm myapp
-docker exec -it myapp /bin/sh            # shell into running container
+docker stop|rm myapp
+docker exec -it myapp /bin/sh
 ```
 
 ## Images
 
 ```bash
 docker images
-docker build -t myapp:latest .
-docker build -t myapp:latest -f Dockerfile.prod .
+docker build -t myapp:latest [-f Dockerfile.prod] .
 docker rmi myapp:latest
 docker pull postgres:16
 ```
 
-## Logs & Inspection
+## Logs / inspect
 
 ```bash
-docker logs myapp
-docker logs myapp --tail 50 -f           # last 50 lines, follow
+docker logs myapp [--tail 50 -f]
 docker inspect myapp --format '{{.State.Status}}'
-docker stats --no-stream                 # resource usage snapshot
+docker stats --no-stream
 ```
 
-## Docker Compose
+## Compose
 
 ```bash
-docker compose up -d                     # start stack in background
-docker compose down                      # stop and remove stack
-docker compose ps                        # list services
-docker compose logs api --tail 100       # logs for specific service
-docker compose build                     # rebuild images
-docker compose exec api /bin/sh          # shell into service
+docker compose up -d
+docker compose down
+docker compose ps
+docker compose logs api --tail 100
+docker compose build
+docker compose exec api /bin/sh
 ```
 
 ## Cleanup
 
 ```bash
-docker system prune -f                   # remove unused data
-docker volume ls                         # list volumes
-docker volume rm mydata                  # remove specific volume
-docker network ls                        # list networks
+docker system df                          # check before prune
+docker system prune -f
+docker volume ls | rm mydata
+docker network ls
 ```
-
-## Notes
-
-- Use `docker compose` (v2) not `docker-compose` (v1)
-- Always use `-d` for background when starting services
-- Use `--tail` with logs to avoid overwhelming output
-- Use `docker system df` to check disk usage before pruning

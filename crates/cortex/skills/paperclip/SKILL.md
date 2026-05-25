@@ -5,73 +5,40 @@ requires:
   bins: ["npx", "curl"]
 ---
 
-# Paperclip Skill
+# Paperclip
 
-Paperclip is a Node.js control plane that orchestrates multiple AI agents as an "autonomous company" — org charts, budgets, governance, goal alignment, and activity logging. It is **not** a chatbot or agent framework; it coordinates agents you already have (Claude Code, Cursor, Bash, HTTP, etc.).
-
-Server runs at `http://localhost:3100` with an embedded PostgreSQL DB.
-
-## Install / run
+Node.js control plane that orchestrates AI agents (Claude Code, Cursor, Bash,
+HTTP) as an "autonomous company" — org charts, budgets, governance, goals,
+activity logs. Server: `http://localhost:3100` with embedded PostgreSQL.
 
 ```bash
 npx paperclipai onboard --yes                 # local, unauthenticated
-npx paperclipai onboard --yes --bind lan      # LAN-bound, authenticated
-npx paperclipai onboard --yes --bind tailnet  # tailnet-bound
-```
-
-Manual dev setup (Node 20+, pnpm 9.15+):
-
-```bash
-git clone https://github.com/paperclipai/paperclip.git && cd paperclip
-pnpm install && pnpm dev
+# Also: --bind lan  (auth'd), --bind tailnet
 ```
 
 ## Auth
 
-Agents authenticate with bearer API keys from the `agent_api_keys` table (hashed at rest, **company-scoped** — a key cannot cross companies). Export as `PAPERCLIP_API_KEY` and pass on every request:
+Bearer API keys from `agent_api_keys` (hashed, company-scoped — can't cross
+companies). Export `PAPERCLIP_API_KEY`:
 
 ```bash
-curl -H "Authorization: Bearer $PAPERCLIP_API_KEY" http://localhost:3100/api/companies
+curl -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  http://localhost:3100/api/companies
 ```
 
-## Core endpoints
+## Mutation invariants
 
-All routes live under `/api`. Mutations respect these invariants:
+- Single-assignee tasks (one agent per task).
+- Atomic checkout / exclusive issue locks → `409` on conflict; re-read state
+  and retry.
+- Governed actions need approval; budget hard-stops auto-pause.
+- Every mutation writes an activity log entry.
 
-- Single-assignee tasks (one agent per task)
-- Atomic checkout / exclusive issue locking
-- Approval gates on governed actions
-- Budget hard-stops auto-pause when limits hit
-- Every mutation writes an activity log entry
+`/api/health` is unauthenticated. 403 = bearer key doesn't own the target.
 
-```bash
-curl http://localhost:3100/api/health
-curl -H "Authorization: Bearer $PAPERCLIP_API_KEY" http://localhost:3100/api/companies
-```
+## Adapters & telemetry
 
-Expected status codes: `400/401/403/404/409/422/500`. `409` generally means a checkout/lock conflict — retry after re-reading state.
+External adapter registry: `~/.paperclip/adapter-plugins.json`.
 
-## External adapters
-
-Register external agent adapters (instead of building them in) via:
-
-```
-~/.paperclip/adapter-plugins.json
-```
-
-## Telemetry
-
-Telemetry is on by default. Disable with any of:
-
-```bash
-export PAPERCLIP_TELEMETRY_DISABLED=1
-export DO_NOT_TRACK=1
-```
-
-Or set `telemetry.enabled: false` in the Paperclip config file. CI environments auto-disable.
-
-## Notes
-
-- Always scope requests to a company — responses 403 if the bearer key doesn't own the target entity.
-- For ad-hoc exploration, `curl ... | jq` over the `/api/*` endpoints is the path of least resistance.
-- Use `pnpm test` / `pnpm test:e2e` only when working inside a cloned Paperclip checkout.
+Disable telemetry: `PAPERCLIP_TELEMETRY_DISABLED=1` or `DO_NOT_TRACK=1` or
+`telemetry.enabled: false` in config. CI auto-disables.

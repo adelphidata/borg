@@ -13,125 +13,57 @@ requires:
 
 # Email
 
-Manage email via Himalaya CLI (IMAP/SMTP). Works with Gmail, Outlook, iCloud, or any IMAP provider.
+Himalaya CLI (IMAP/SMTP). Config: `~/.config/himalaya/config.toml`
+(`himalaya account configure` for interactive setup; see
+`references/configuration.md` for provider specifics). Gmail with 2FA needs
+an App Password.
 
-## Setup
+Add `--output json` to any read command for parseable output.
 
-```bash
-brew install himalaya          # macOS
-cargo install himalaya         # from source
-himalaya account configure     # interactive setup wizard
-```
-
-Configuration file: `~/.config/himalaya/config.toml`
-See `references/configuration.md` for provider-specific configs.
-
-## List Folders
+## Folders & messages
 
 ```bash
 himalaya folder list
-himalaya folder list --output json
-```
-
-## List Emails
-
-```bash
 himalaya envelope list                              # default inbox
-himalaya envelope list --folder "Sent"              # specific folder
-himalaya envelope list --page 1 --page-size 20      # pagination
-himalaya envelope list --output json                # structured output
-```
-
-## Search Emails
-
-```bash
+himalaya envelope list --folder "Sent" --page 1 --page-size 20
 himalaya envelope list from john@example.com subject meeting
-himalaya envelope list "from:alice@company.com since:2026-01-01"
-```
-
-## Read Email
-
-```bash
-himalaya message read 42                            # plain text
-himalaya message read 42 --output json              # structured
+himalaya envelope list "from:alice@co.com since:2026-01-01"
+himalaya message read 42
 himalaya message export 42 --full                   # raw MIME
 ```
 
-## Send Email
+## Send
 
 ```bash
-# Non-interactive with headers flag
-himalaya message write -H "To:recipient@example.com" -H "Subject:Hello" "Message body here"
+himalaya message write -H "To:r@example.com" -H "Subject:Hi" "Body"
 
-# From stdin using MML template
 cat << 'EOF' | himalaya template send
 From: me@example.com
-To: recipient@example.com
-Subject: Hello
+To: r@example.com
+Subject: Hi
 
-Message body here.
+Body.
 EOF
 ```
 
-See `references/message-composition.md` for MML syntax (attachments, HTML, multipart).
+MML for attachments/HTML/multipart: see `references/message-composition.md`.
 
-## Reply
-
-```bash
-himalaya message reply 42                           # reply to sender
-himalaya message reply 42 --all                     # reply all
-```
-
-## Forward
+## Reply / forward / organize
 
 ```bash
+himalaya message reply 42 [--all]
 himalaya message forward 42
-```
-
-## Move / Copy / Delete
-
-```bash
-himalaya message move 42 "Archive"
-himalaya message copy 42 "Important"
+himalaya message move|copy 42 "Archive"
 himalaya message delete 42
+himalaya flag add|remove 42 --flag seen|flagged
+himalaya attachment download 42 [--dir ~/Downloads]
 ```
 
-## Flags
-
-```bash
-himalaya flag add 42 --flag seen
-himalaya flag remove 42 --flag seen
-himalaya flag add 42 --flag flagged
-```
-
-## Attachments
-
-```bash
-himalaya attachment download 42
-himalaya attachment download 42 --dir ~/Downloads
-```
-
-## Multiple Accounts
+## Multiple accounts
 
 ```bash
 himalaya account list
-himalaya --account work envelope list               # use specific account
-himalaya --account personal message read 42
+himalaya --account work envelope list
 ```
 
-## JSON Output
-
-Always use `--output json` when you need to parse results programmatically:
-
-```bash
-himalaya envelope list --output json
-himalaya folder list --output json
-himalaya message read 42 --output json
-```
-
-## Notes
-
-- First run may prompt for password or keyring access
-- Gmail requires an App Password if 2FA is enabled (not your regular password)
-- Outlook/Microsoft 365 supports both app passwords and OAuth2
-- Use `RUST_LOG=debug himalaya envelope list` for troubleshooting
+Debug: `RUST_LOG=debug himalaya envelope list`.

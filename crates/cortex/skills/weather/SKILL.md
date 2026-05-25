@@ -5,56 +5,23 @@ requires:
   bins: ["curl"]
 ---
 
-# Weather Skill
+# Weather
 
-Get current weather conditions and forecasts using wttr.in.
-
-## Current Weather
-
-```bash
-# One-line summary
-curl -s "wttr.in/London?format=3"
-
-# Detailed current conditions
-curl -s "wttr.in/London?0"
-
-# Custom format
-curl -s "wttr.in/London?format=%l:+%c+%t+(feels+like+%f),+%w+wind,+%h+humidity"
-```
-
-## Forecasts
+`wttr.in` — no API key. Accepts city names (use `+` for spaces:
+`New+York`) and airport codes (`ORD`). Rate-limited.
 
 ```bash
-# 3-day forecast
-curl -s "wttr.in/London"
-
-# Week forecast
-curl -s "wttr.in/London?format=v2"
-
-# Specific day (0=today, 1=tomorrow, 2=day after)
-curl -s "wttr.in/London?1"
+curl -s "wttr.in/London?format=3"               # one-line summary
+curl -s "wttr.in/London?0"                      # detailed current
+curl -s "wttr.in/London"                        # 3-day forecast
+curl -s "wttr.in/London?format=v2"              # week
+curl -s "wttr.in/London?1"                      # tomorrow (0/1/2)
+curl -s "wttr.in/London?format=j1"              # JSON
 ```
 
-## JSON Output
+Custom format codes: `%l` location, `%c` condition emoji, `%t` temp,
+`%f` feels-like, `%w` wind, `%h` humidity, `%p` precip.
 
 ```bash
-curl -s "wttr.in/London?format=j1"
+curl -s "wttr.in/London?format=%l:+%c+%t+(feels+like+%f),+%w,+%h"
 ```
-
-## Format Codes
-
-- `%c` — Weather condition emoji
-- `%t` — Temperature
-- `%f` — "Feels like"
-- `%w` — Wind
-- `%h` — Humidity
-- `%p` — Precipitation
-- `%l` — Location
-
-## Notes
-
-- No API key needed
-- Works for most global cities
-- Supports airport codes: `curl wttr.in/ORD`
-- Use `+` for spaces in city names: `New+York`
-- Rate limited; don't spam requests

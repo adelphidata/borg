@@ -10,70 +10,58 @@ requires:
   bins: ["git"]
 ---
 
-# Git Skill
+# Git
 
-Use `git` for local version control operations.
-
-## Status & Diff
+## Status / diff
 
 ```bash
 git status
-git diff                          # unstaged changes
-git diff --staged                 # staged changes
-git diff HEAD~3..HEAD             # last 3 commits
-git diff main..feature-branch     # branch comparison
+git diff [--staged]
+git diff HEAD~3..HEAD
+git diff main..feature
 ```
 
-## Commits
+## Commit
 
 ```bash
-git add -p                        # interactive staging
-git add file1.rs file2.rs
+git add -p                                    # interactive
+git add file1 file2
 git commit -m "feat: add feature"
-git commit --amend --no-edit      # amend last commit (keep message)
+git commit --amend --no-edit
 ```
 
-## Log & History
+## Log
 
 ```bash
 git log --oneline -20
 git log --oneline --graph --all
-git log --since="2 days ago" --oneline
-git log --author="name" --oneline
-git show HEAD                     # last commit details
+git log --since="2 days ago" --author="name" --oneline
+git show HEAD
 git blame file.rs
 ```
 
-## Branches
+## Branch
 
 ```bash
-git branch -a                     # list all branches
-git switch -c new-branch          # create and switch
+git branch -a
+git switch -c new-branch                       # prefer over `checkout -b`
 git switch main
-git branch -d old-branch          # delete merged branch
-git merge feature-branch
+git branch -d old-branch
+git merge feature
 ```
 
 ## Stash
 
 ```bash
-git stash                         # stash working changes
+git stash
 git stash list
-git stash pop                     # apply and remove latest stash
-git stash apply stash@{1}         # apply specific stash
+git stash pop                                  # latest
+git stash apply stash@{1}
 ```
 
 ## Rebase
 
 ```bash
-git rebase main                   # rebase current branch onto main
-git rebase --continue             # after resolving conflicts
-git rebase --abort                # cancel rebase
+git rebase main
+git rebase --continue|--abort                  # after conflict resolution
 ```
-
-## Notes
-
-- Use `git status` before committing to verify what will be included
-- Prefer `git switch` over `git checkout` for branch operations
-- Use `git log --oneline` for compact history summaries
-- When conflicts arise, use `git diff` to inspect and resolve them
