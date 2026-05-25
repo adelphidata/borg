@@ -78,18 +78,16 @@ Invite the bot to a channel or send it a direct message. You should get a respon
 
 Restrict the bot to specific Slack channels:
 
-```toml
-[gateway]
-slack_channel_allowlist = ["C01234567", "C89012345"]
+```sh
+borg settings set gateway.slack_channel_allowlist '["C01234567","C89012345"]'
 ```
 
 ### Group activation mode
 
 Control how the bot responds in channels (vs DMs):
 
-```toml
-[gateway]
-group_activation = "mention"   # mention (default) | always
+```sh
+borg settings set gateway.group_activation mention   # mention (default) | always
 ```
 
 - `mention` — only responds when @mentioned in channels; DMs always activate
@@ -97,9 +95,8 @@ group_activation = "mention"   # mention (default) | always
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-slack = "open"    # trust Slack workspace auth (no pairing needed)
+```sh
+borg settings set gateway.channel_policies.slack open
 ```
 
-Options: `pairing` (default), `open`, `disabled`. Manage via `borg settings set gateway.channel_policies.slack <value>`.
+Options: `pairing` (default), `open`, `disabled`.

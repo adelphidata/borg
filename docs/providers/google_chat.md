@@ -64,7 +64,6 @@ Add the bot to a Google Chat space or send it a direct message. You should get a
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-google-chat = "open"   # trust Google Workspace auth
+```sh
+borg settings set gateway.channel_policies.google-chat open   # pairing (default) | open | disabled
 ```

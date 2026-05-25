@@ -71,7 +71,6 @@ Send an SMS to your Twilio number or a WhatsApp message to your WhatsApp-enabled
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-twilio = "pairing"   # pairing (default) | open | disabled
+```sh
+borg settings set gateway.channel_policies.twilio pairing   # pairing (default) | open | disabled
 ```

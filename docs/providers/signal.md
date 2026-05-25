@@ -58,9 +58,8 @@ Send a message to the registered phone number on Signal. You should get a respon
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-signal = "pairing"   # pairing (default) | open | disabled
+```sh
+borg settings set gateway.channel_policies.signal pairing   # pairing (default) | open | disabled
 ```
 
 ### signal-cli connection

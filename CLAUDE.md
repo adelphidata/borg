@@ -252,7 +252,7 @@ Every long-running task in `borgd` runs under `crates/borgd/src/supervisor.rs`'s
 
 ### Debugging
 
-Logs at `~/.borg/logs/`: `tui.log`, `daemon.log`/`daemon.err`, `{date}.jsonl`. Config at `~/.borg/config.toml`. `RUST_LOG=debug` for module-level control.
+Logs at `~/.borg/logs/`: `tui.log`, `daemon.log`/`daemon.err`, `{date}.jsonl`. Settings in the `settings` table of `~/.borg/borg.db` (inspect via `borg settings get/set/unset` — no `config.toml`). `RUST_LOG=debug` for module-level control.
 
 ## Adding New Things
 

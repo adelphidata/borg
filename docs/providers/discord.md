@@ -83,21 +83,18 @@ Send a message to your bot in Discord (DM or in a server channel where the bot i
 
 Restrict the bot to specific Discord servers:
 
-```toml
-[gateway]
-discord_guild_allowlist = ["123456789012345678"]
+```sh
+borg settings set gateway.discord_guild_allowlist '["123456789012345678"]'
 ```
 
 ### Group activation mode
 
-```toml
-[gateway]
-group_activation = "mention"   # mention (default) | always
+```sh
+borg settings set gateway.group_activation mention   # mention (default) | always
 ```
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-discord = "pairing"   # pairing (default) | open | disabled
+```sh
+borg settings set gateway.channel_policies.discord pairing   # pairing (default) | open | disabled
 ```

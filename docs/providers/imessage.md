@@ -39,9 +39,8 @@ Send an iMessage to the Mac running Borg. You should get a response from your ag
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-imessage = "pairing"   # pairing (default) | open | disabled
+```sh
+borg settings set gateway.channel_policies.imessage pairing   # pairing (default) | open | disabled
 ```
 
 ## Limitations

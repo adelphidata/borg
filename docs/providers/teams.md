@@ -60,7 +60,6 @@ Message the bot in Microsoft Teams. You should get a response from your agent.
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-teams = "open"   # trust Teams workspace auth
+```sh
+borg settings set gateway.channel_policies.teams open   # pairing (default) | open | disabled
 ```

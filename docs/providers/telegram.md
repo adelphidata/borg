@@ -82,9 +82,8 @@ The secret is verified on each incoming request via the `X-Telegram-Bot-Api-Secr
 
 Control how the bot responds in group chats:
 
-```toml
-[gateway]
-group_activation = "mention"   # mention (default) | always
+```sh
+borg settings set gateway.group_activation mention   # mention (default) | always
 ```
 
 - `mention` — only responds when @mentioned in groups; DMs always activate
@@ -92,31 +91,28 @@ group_activation = "mention"   # mention (default) | always
 
 ### Access control
 
-```toml
-[gateway.channel_policies]
-telegram = "pairing"   # pairing (default) | open | disabled
+```sh
+borg settings set gateway.channel_policies.telegram pairing   # pairing (default) | open | disabled
 ```
 
-Manage via `borg settings set gateway.channel_policies.telegram <value>`. See [getting-started.md](../getting-started.md) and `borg pairing --help` for the pairing flow.
+See [getting-started.md](../getting-started.md) and `borg pairing --help` for the pairing flow.
 
 ### Telegram-specific tuning
 
-```toml
-[gateway]
-telegram_poll_timeout_secs = 30           # long-polling timeout
-telegram_circuit_failure_threshold = 10   # failures before circuit breaker trips
-telegram_circuit_suspension_secs = 300    # suspension after circuit break
-telegram_dedup_capacity = 1000            # dedup cache size
+```sh
+borg settings set gateway.telegram_poll_timeout_secs 30            # long-polling timeout
+borg settings set gateway.telegram_circuit_failure_threshold 10    # failures before circuit breaker trips
+borg settings set gateway.telegram_circuit_suspension_secs 300     # suspension after circuit break
+borg settings set gateway.telegram_dedup_capacity 1000             # dedup cache size
 ```
 
 ## Voice and transcription
 
 Inbound voice and audio transcription uses Borg's global audio settings:
 
-```toml
-[audio]
-enabled = true
-echo_transcript = false
+```sh
+borg settings set audio.enabled true
+borg settings set audio.echo_transcript false
 ```
 
 - `audio.enabled = true` lets Borg download and transcribe Telegram `voice` and `audio` messages before sending them to the agent.
@@ -124,10 +120,9 @@ echo_transcript = false
 
 Outbound voice replies use Borg's TTS settings plus a per-chat Telegram mode:
 
-```toml
-[tts]
-enabled = true
-auto_mode = false
+```sh
+borg settings set tts.enabled true
+borg settings set tts.auto_mode false
 ```
 
 - `tts.enabled = true` enables TTS capability.
