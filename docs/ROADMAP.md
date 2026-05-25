@@ -206,18 +206,9 @@ top-down by priority, not by section order.
   endpoints (LM Studio, vLLM, llama.cpp) already work via the custom
   OpenAI-compatible credential type — no dedicated provider needed.
   Order is priority, not alphabetical:
-    1. **AWS Bedrock.** SigV4-signed Anthropic/Llama access; the
-       enterprise gateway for shops that can't ship API keys to vendors.
-       Needed for any serious AWS-shop adoption.
-    2. **Azure OpenAI.** Deployment-name-scoped OpenAI on Microsoft
-       tenancy with AAD auth. Same enterprise rationale as Bedrock;
-       covers the Microsoft half of the market.
-    3. **Google Vertex AI.** Gemini + Anthropic via GCP service-account
-       auth. Rounds out the big-three cloud gateways and unlocks Gemini
-       for orgs that ban consumer Google AI Studio keys.
-    4. **Cerebras.** Wafer-scale inference, fastest tokens/sec for
+    1. **Cerebras.** Wafer-scale inference, fastest tokens/sec for
        Llama/Qwen; ideal `llm.aux` target where latency dominates quality.
-    5. **Together AI / Fireworks.** Broad OSS-model hosting
+    2. **Together AI / Fireworks.** Broad OSS-model hosting
        (Llama/Qwen/DeepSeek). Either covers the "I want OSS without
        self-hosting" lane; pick one.
 
@@ -311,11 +302,6 @@ top-down by priority, not by section order.
 
 ### Agent loop ergonomics
 
-- **Mid-run steering.** `[H]` Deferred. Operator sends a directive
-  between turns without restarting the session — "skip the auth module,
-  try the parser instead." Injected as a system-level nudge for the next
-  turn, not as a user message, so the assistant's reply chain stays
-  clean. Removes the restart cycle for long-running autonomous tasks.
 - **Todo tool / in-session task list.** `[H]` Deferred. Agent-managed
   task list persisted across turns and visible to the operator. Borg has
   `scheduled_tasks` (cron-style) but no in-session lightweight TODO
@@ -385,24 +371,6 @@ at `cost_usd_present = false` until a local-pricing policy exists.
 
 ### MCP & external integrations
 
-- **ACP — Agent Client Protocol (IDE backend).** `[Z]` Deferred.
-  JSON-RPC 2.0 over stdio so Zed / VS Code / Cursor can use the agent
-  as a coding-assistant backend. `cortex/codex_app_server` and
-  `cortex/claude_cli.rs` exist as outbound CLI providers, but Borg
-  does not expose an _inbound_ ACP server — no editor can drive Borg.
-  Adding this turns Borg into a usable in-editor assistant alongside
-  other coding-agent backends without giving up its background daemon role.
-  Complement to the MCP server mode below (ACP is coding-backend
-  surface; MCP server is state-introspection surface).
-- **MCP support — both directions, native.** `[H][O]` Deferred. Adopt
-  MCP (Model Context Protocol) as a first-class extensibility surface
-  in addition to today's WASM plugins, both directions:
-  Borg-as-server (`borgd serve-mcp`) so external IDEs / desktop
-  clients (Claude Code, Cursor, and similar editors) drive Borg over JSON-RPC and
-  can read/write sessions, messages, events, and permissions; and
-  Borg-as-client so it consumes external MCP servers as
-  agent-callable tools. Sibling of the ACP IDE-backend surface
-  above (ACP is coding-backend, MCP server is state-introspection).
 - **MCP OAuth client.** `[H]` Deferred. Borg as MCP **client** with an
   OAuth flow for servers that require it. Most enterprise MCP servers
   do — without OAuth, a meaningful slice of the existing MCP ecosystem
@@ -463,15 +431,6 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   model picker → terminal/sandbox backend → channels → tools →
   credentials. Each section idempotent, invokable alone via
   `borg setup <section>`. Today onboarding is one linear flow.
-- **Cross-tool migration importer (`borg migrate` / `borg import`).**
-  `[H][I]` Bundled importers for Claude Code, Claude Desktop, and similar
-  coding agents — pulls `AGENTS.md` / `CLAUDE.md` / hooks /
-  approved-command lists / persona files / MCP servers / skills /
-  command prompts / model providers / credentials into Borg's memory
-    - config. Dry-run + overwrite presets. Removes the "redo your whole
-      setup" tax for new users and lowers switching cost from other
-      agents.
-
 ### Security & sandboxing
 
 - **Windows sandbox — validate Tier 1 on a real host.** Tier 1+
@@ -587,11 +546,6 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   Off by default. Today borg only exports OTel metrics for WASM plugins
   — this expands coverage across the agent loop. Targets power users
   running Borg as a long-lived service.
-- **`borg health --json`.** `[O]` Machine-readable component status
-  (DB / KEK / channels / sandbox / LLM provider). Distinct from
-  `borg doctor` (fix-oriented) and `borg status` (vitals-only) —
-  this is for monitoring integration.
-
 ### Scheduling
 
 - **Heartbeat `lightContext` + `isolatedSession` modes.** `[O]`
@@ -666,21 +620,6 @@ roughly by ROI — each is independent.
 
 ### Gateway & ergonomics
 
-- **OpenAI-compatible HTTP API.** `[I]` Expose `/v1/chat/completions`,
-  `/v1/models`, `/v1/embeddings` on `borgd` so borg is a drop-in
-  backend for any OpenAI client (Cursor, Continue, custom apps). Cheap
-  to layer on top of the existing LLM stack; massive ecosystem reach.
-- **Self-update command.** `[I]` `borg update` with a
-  `BORG_NO_AUTO_UPDATE=1` kill switch for locked-down installs.
-
-### Agent loop safety
-
-- **Stuck-loop detection / unknown-tool guard.** `[I]` Default-on
-  exponential backoff when the agent enters a tight tool-call loop,
-  plus a guard that refuses hallucinated tool names instead of
-  surfacing them as errors that the model then retries. Today a runaway
-  model can burn an entire goal budget in seconds with no safety net.
-
 ### Voice & media
 
 - **Voice Call channel.** `[I]` Twilio/Telnyx/Plivo realtime voice
@@ -697,14 +636,8 @@ roughly by ROI — each is independent.
 - **Tailscale + mDNS/Bonjour discovery.** `[I]` Networked multi-device
   setup without manual cert + hostname wrangling. Pairs naturally with
   borg's mTLS-but-loopback-only constraint.
-- **launchd / systemd integration.** `[I]` Full service lifecycle —
-  install / uninstall / status / restart. Today `borg service install
---secure` only covers KEK setup.
 - **APNs push pipeline.** `[I]` Wake disconnected iOS clients via a
   push relay with App Attest verification.
-- **Tunneling.** `[I]` Bundled cloudflared/ngrok integration so users
-  can expose the gateway without manual port-forwarding or reverse
-  proxy setup.
 
 ### Observability
 
@@ -745,9 +678,6 @@ roughly by ROI — each is independent.
   opt-in for prompt cache keys, plus repair of orphaned reasoning,
   displaced tool results, and Anthropic/Bedrock thinking-signature
   stripping during replay.
-- **URL allowlist for `web_search` / `web_fetch`.** `[I]` First-class
-  HTTP egress restriction at the tool layer, matching
-  `[security] blocked_paths` for files.
 - **Session-management CLI.** `[I]` `borg agents`, `borg sessions`,
   `sessions export-trajectory`, `/subagents spawn` from chat.
 - **Inferred follow-up commitments.** `[I]` Opt-in batched extraction
