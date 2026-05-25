@@ -6,18 +6,15 @@ use ratatui::text::{Line, Span};
 use std::cell::RefCell;
 use throbber_widgets_tui::ThrobberState;
 
+use super::constants::{
+    ASSISTANT_COLLAPSE_THRESHOLD, ASSISTANT_PREVIEW_LINES, COLLAPSE_PREVIEW_LINES,
+    COLLAPSE_THRESHOLD, SHELL_PREVIEW_LINES,
+};
 use super::diff_render;
 use super::line_utils;
 use super::line_utils::{prefix_lines, LIVE_PREFIX_COLS};
 use super::markdown;
 use super::theme;
-
-/// Head/tail line count for collapsed long assistant messages. A finalized
-/// assistant cell with more than `2 * ASSISTANT_PREVIEW_LINES` rendered lines
-/// is shown as `head + ellipsis + tail`; the user reaches the full body via
-/// the Ctrl+T transcript pager.
-const ASSISTANT_PREVIEW_LINES: usize = 20;
-const ASSISTANT_COLLAPSE_THRESHOLD: usize = ASSISTANT_PREVIEW_LINES * 2;
 
 /// Collapse a finalized assistant cell's rendered lines into
 /// `head + ellipsis + tail` when the body exceeds the threshold. Streaming
@@ -265,18 +262,7 @@ pub(super) fn build_doctor_warning_lines(warnings: &[String], width: u16) -> Vec
     render_boxed_lines(inner, theme::warning_style(), Some(&label), width, 0)
 }
 
-/// Display *rows* of tool output shown before collapsing. Row-aware
-/// (post-wrap) — a single logical line that wraps to many rows counts
-/// against this budget, so a stray long URL can't blow past the preview.
-/// Toggled with Ctrl+E.
-pub const COLLAPSE_THRESHOLD: usize = 10;
-/// Preview budget (display rows) when a tool result is collapsed.
-pub const COLLAPSE_PREVIEW_LINES: usize = 8;
-/// Per-stream preview rows for `run_shell` results when collapsed,
-/// before emitting the `… +N lines (ctrl + t to view transcript)` footer.
-/// Stdout and stderr each get their own budget so a noisy stderr can't
-/// hide the head of stdout.
-pub const SHELL_PREVIEW_LINES: usize = 5;
+// Collapse / preview thresholds live in `super::constants`; imported above.
 
 /// Parsed view of `run_shell`'s success-path output envelope:
 /// `"Exit code: {n}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"`.

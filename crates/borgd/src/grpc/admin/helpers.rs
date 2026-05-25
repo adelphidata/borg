@@ -31,6 +31,70 @@ use tonic::{Response, Status as TStatus};
 use cortex::db::Database;
 use cortex::process_registry::ProcessEntry;
 
+// ── Sentinel conversions ────────────────────────────────────────────────
+//
+// Protobuf has no native "absent" for primitive fields, so the admin RPCs
+// reserve sentinel values (empty string, non-positive ints) to mean "leave
+// unchanged" or "use default". These helpers turn those sentinels into the
+// `Option<&str> / Option<i64>` shape the DB layer wants, without each
+// handler re-inlining the same `(!s.is_empty()).then_some(s)` dance.
+
+/// `Some(s)` when non-empty, else `None`. Used for proto string fields where
+/// "" means "leave unchanged" (most update/patch requests).
+#[inline]
+pub(super) fn opt_if_not_empty(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// `Some(v)` for positive values; `0` and negatives map to `None`. Used for
+/// `next_run_unix` / `timeout_ms` proto fields where `0` means "unset".
+#[inline]
+pub(super) fn opt_if_positive_i64(v: i64) -> Option<i64> {
+    (v > 0).then_some(v)
+}
+
+/// `Some(v)` for non-negative values; negative maps to `None`. Used for
+/// `max_retries` where a `-1` sentinel means "leave to the DB default".
+#[inline]
+pub(super) fn opt_if_non_negative_i32(v: i32) -> Option<i32> {
+    (v >= 0).then_some(v)
+}
+
+// ── Status-code mappers ─────────────────────────────────────────────────
+//
+// The handlers repeat the same `.map_err(|e| TStatus::*(format!("{verb} \
+// failed: {e}")))` recipe for every RPC. These helpers keep the verb at the
+// call site (the part that's actually distinct) and centralize the code
+// classification.
+
+/// Wrap an internal error with a verb prefix, surfacing as
+/// `tonic::Code::Internal`.
+#[inline]
+pub(super) fn map_internal<E: std::fmt::Display>(verb: &'static str) -> impl FnOnce(E) -> TStatus {
+    move |e| TStatus::internal(format!("{verb} failed: {e}"))
+}
+
+/// Wrap a validation/input error with a verb prefix, surfacing as
+/// `tonic::Code::InvalidArgument`.
+#[inline]
+pub(super) fn map_invalid_arg<E: std::fmt::Display>(
+    verb: &'static str,
+) -> impl FnOnce(E) -> TStatus {
+    move |e| TStatus::invalid_argument(format!("{verb} failed: {e}"))
+}
+
+// ── Settings-resolver lifecycle ─────────────────────────────────────────
+
+/// Load the `SettingsResolver`, mapping load failures to a consistent
+/// `Internal` status. Every settings RPC opens the same way; this kills the
+/// per-handler boilerplate.
+pub(super) async fn open_settings_resolver() -> Result<cortex::settings::SettingsResolver, TStatus>
+{
+    cortex::settings::SettingsResolver::load()
+        .await
+        .map_err(map_internal("settings load"))
+}
+
 pub(super) fn snapshot_to_reply(
     snap: crate::tunnel_supervisor::TunnelSnapshot,
 ) -> TunnelStatusReply {

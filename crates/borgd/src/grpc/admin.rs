@@ -314,13 +314,11 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<SettingsSnapshot>, TStatus> {
-        let resolver = SettingsResolver::load()
-            .await
-            .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
+        let resolver = open_settings_resolver().await?;
         let entries = resolver
             .list_all()
             .await
-            .map_err(|e| TStatus::internal(format!("settings list failed: {e}")))?;
+            .map_err(map_internal("settings list"))?;
         Ok(Response::new(SettingsSnapshot {
             entries: entries
                 .into_iter()
@@ -335,9 +333,7 @@ impl Admin for AdminSvc {
 
     async fn set_setting(&self, req: Request<SettingMutation>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
-        let resolver = SettingsResolver::load()
-            .await
-            .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
+        let resolver = open_settings_resolver().await?;
         resolver
             .set(&req.key, &req.value)
             .await
@@ -348,9 +344,7 @@ impl Admin for AdminSvc {
 
     async fn unset_setting(&self, req: Request<SettingKey>) -> Result<Response<Empty>, TStatus> {
         let key = req.into_inner().key;
-        let resolver = SettingsResolver::load()
-            .await
-            .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
+        let resolver = open_settings_resolver().await?;
         resolver
             .unset(&key)
             .await
@@ -444,17 +438,11 @@ impl Admin for AdminSvc {
         let inserted = async {
             use cortex::db::NewTask;
             let db = Database::open().await?;
-            let delivery_channel =
-                (!req.delivery_channel.is_empty()).then_some(req.delivery_channel.as_str());
-            let delivery_target =
-                (!req.delivery_target.is_empty()).then_some(req.delivery_target.as_str());
             let task_type = if req.task_type.is_empty() {
                 "prompt"
             } else {
                 req.task_type.as_str()
             };
-            let allowed_tools =
-                (!req.allowed_tools.is_empty()).then_some(req.allowed_tools.as_str());
             let new_task = NewTask {
                 id: &id,
                 name: &req.name,
@@ -462,26 +450,12 @@ impl Admin for AdminSvc {
                 schedule_type: &req.schedule_type,
                 schedule_expr: &req.schedule_expr,
                 timezone: &req.timezone,
-                // 0 = unset; positive = explicit unix-ts.
-                next_run: if req.next_run_unix > 0 {
-                    Some(req.next_run_unix)
-                } else {
-                    None
-                },
-                // <0 sentinel = leave to DB default; >=0 = explicit.
-                max_retries: if req.max_retries >= 0 {
-                    Some(req.max_retries)
-                } else {
-                    None
-                },
-                timeout_ms: if req.timeout_ms > 0 {
-                    Some(req.timeout_ms)
-                } else {
-                    None
-                },
-                delivery_channel,
-                delivery_target,
-                allowed_tools,
+                next_run: opt_if_positive_i64(req.next_run_unix),
+                max_retries: opt_if_non_negative_i32(req.max_retries),
+                timeout_ms: opt_if_positive_i64(req.timeout_ms),
+                delivery_channel: opt_if_not_empty(&req.delivery_channel),
+                delivery_target: opt_if_not_empty(&req.delivery_target),
+                allowed_tools: opt_if_not_empty(&req.allowed_tools),
                 task_type,
                 pre_run_command: None,
                 pre_run_cwd: None,
@@ -492,7 +466,7 @@ impl Admin for AdminSvc {
             anyhow::Ok(db.list_tasks().await?.into_iter().find(|t| t.id == id))
         }
         .await
-        .map_err(|e| TStatus::invalid_argument(format!("create_task failed: {e}")))?
+        .map_err(map_invalid_arg("create_task"))?
         .ok_or_else(|| {
             TStatus::internal(format!(
                 "create_task: row `{id_for_lookup}` not found after insert"
@@ -530,13 +504,11 @@ impl Admin for AdminSvc {
             // Empty string sentinel = "leave unchanged", matching the
             // ScheduledTaskUpdate proto semantics + Option<&str> on UpdateTask.
             let update = UpdateTask {
-                name: (!req.name.is_empty()).then_some(req.name.as_str()),
-                prompt: (!req.prompt.is_empty()).then_some(req.prompt.as_str()),
-                schedule_type: (!req.schedule_type.is_empty())
-                    .then_some(req.schedule_type.as_str()),
-                schedule_expr: (!req.schedule_expr.is_empty())
-                    .then_some(req.schedule_expr.as_str()),
-                timezone: (!req.timezone.is_empty()).then_some(req.timezone.as_str()),
+                name: opt_if_not_empty(&req.name),
+                prompt: opt_if_not_empty(&req.prompt),
+                schedule_type: opt_if_not_empty(&req.schedule_type),
+                schedule_expr: opt_if_not_empty(&req.schedule_expr),
+                timezone: opt_if_not_empty(&req.timezone),
             };
             let found = db.update_task(&req.id, &update).await?;
             if !found {
@@ -547,7 +519,7 @@ impl Admin for AdminSvc {
             Ok(db.list_tasks().await?.into_iter().find(|t| t.id == req.id))
         }
         .await
-        .map_err(|e| TStatus::invalid_argument(format!("update_task failed: {e}")))?
+        .map_err(map_invalid_arg("update_task"))?
         .ok_or_else(|| TStatus::not_found(format!("scheduled task `{id_for_lookup}` not found")))?;
         Ok(Response::new(scheduled_task_row_to_proto(updated)))
     }
@@ -2585,9 +2557,11 @@ impl Admin for AdminSvc {
 mod helpers;
 use helpers::{
     approved_sender_row_to_proto, build_primary_pool, credential_pool_to_proto, goal_to_detail,
-    load_ambient_status, notify_runtime_config_reload, pairing_row_to_proto,
-    parse_snapshot_payload, pool_provider_matches, pooled_to_proto, process_entry_to_proto,
-    require_provider_match, resolve_agent_session_id, resolve_goal_session_id,
-    scheduled_task_row_to_proto, snapshot_row_to_pb, snapshot_to_reply, sub_agent_row_to_pb,
-    task_run_row_to_proto, update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome,
+    load_ambient_status, map_internal, map_invalid_arg, notify_runtime_config_reload,
+    open_settings_resolver, opt_if_non_negative_i32, opt_if_not_empty, opt_if_positive_i64,
+    pairing_row_to_proto, parse_snapshot_payload, pool_provider_matches, pooled_to_proto,
+    process_entry_to_proto, require_provider_match, resolve_agent_session_id,
+    resolve_goal_session_id, scheduled_task_row_to_proto, snapshot_row_to_pb, snapshot_to_reply,
+    sub_agent_row_to_pb, task_run_row_to_proto, update_task_status, ApiKeyRouting, SetGoalError,
+    SetGoalOutcome,
 };

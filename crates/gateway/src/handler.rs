@@ -10,9 +10,6 @@ use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::constants;
 use cortex::db::{Database, NewDelivery};
-use cortex::security::sanitize::{
-    scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
-};
 use cortex::security::validation::{sanitize_filename, sanitize_thread_id};
 
 use crate::constants::MAX_THREAD_ID_LEN;
@@ -538,89 +535,6 @@ fn format_dream_report(report: &cortex::memory::consolidation::DreamReport) -> S
 ///
 /// Handles link understanding, injection scanning, truncation, and wrapping.
 /// Returns the final message text and whether the inbound has image attachments.
-async fn prepare_message_text(
-    channel_name: &str,
-    inbound: &InboundMessage,
-    config: &Config,
-    cleaned_text: String,
-) -> (String, bool) {
-    // Link understanding: augment message with fetched URL content
-    let cleaned_text = if config.gateway.link_understanding.enabled {
-        let (augmented, fetched) =
-            crate::message_processing::link_understanding::augment_with_links(
-                &cleaned_text,
-                &config.gateway.link_understanding,
-            )
-            .await;
-        if !fetched.is_empty() {
-            info!(
-                "Link understanding: fetched {} URL(s) for channel '{}'",
-                fetched.len(),
-                channel_name
-            );
-        }
-        augmented
-    } else {
-        cleaned_text
-    };
-
-    // Scan full text for injection BEFORE truncation so patterns spanning
-    // the truncation boundary are still detected.
-    // Cap scan input at 256 KB to prevent regex DoS on extremely large payloads.
-    let scan_limit = constants::MAX_RESPONSE_SIZE;
-    let scan_input = if cleaned_text.len() > scan_limit {
-        let mut end = scan_limit;
-        while end > 0 && !cleaned_text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &cleaned_text[..end]
-    } else {
-        &cleaned_text
-    };
-    let injection_level = scan_for_injection(scan_input);
-
-    // Truncate inbound text to prevent excessive LLM token consumption
-    let text = if cleaned_text.len() > constants::MAX_INBOUND_TEXT_BYTES {
-        let original_len = cleaned_text.len();
-        let mut truncated = cleaned_text;
-        truncated.truncate(constants::MAX_INBOUND_TEXT_BYTES);
-        // Ensure we don't split a multi-byte char
-        while !truncated.is_char_boundary(truncated.len()) {
-            truncated.pop();
-        }
-        warn!(
-            "Truncated inbound message from {} bytes to {} bytes for channel '{}'",
-            original_len,
-            truncated.len(),
-            channel_name
-        );
-        truncated
-    } else {
-        cleaned_text
-    };
-
-    // Apply injection wrapping using the pre-truncation scan result
-    let message_text = {
-        let base = format!(
-            "[Channel: {}, Sender: {}]\n{}",
-            channel_name, inbound.sender_id, text
-        );
-        match injection_level {
-            ThreatLevel::HighRisk { .. } => wrap_with_injection_warning(channel_name, &base),
-            ThreatLevel::Flagged { .. } => wrap_untrusted(channel_name, &base),
-            ThreatLevel::Clean => base,
-        }
-    };
-
-    // Check for image attachments
-    let has_image_attachments = inbound
-        .attachments
-        .iter()
-        .any(|a| a.mime_type.starts_with("image/"));
-
-    (message_text, has_image_attachments)
-}
-
 /// Collect the full agent response from the event channel.
 ///
 /// Uses an **inactivity-based** timeout: the
@@ -1024,7 +938,13 @@ async fn invoke_agent_inner(
 
     // Prepare the message text (link understanding, injection scan, truncation, wrapping)
     let (message_text, has_image_attachments) =
-        prepare_message_text(channel_name, inbound, config, cleaned_text).await;
+        crate::message_processing::inbound_prep::prepare_message_text(
+            channel_name,
+            inbound,
+            config,
+            cleaned_text,
+        )
+        .await;
 
     // Collect inline images for the multimodal turn payload.
     let images: Vec<crate::session_executor::InlineImage> = if has_image_attachments {

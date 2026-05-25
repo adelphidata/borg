@@ -5,6 +5,7 @@ mod colors;
 mod command_popup;
 mod commands;
 mod composer;
+mod constants;
 mod custom_commands;
 mod custom_terminal;
 mod diff_render;
