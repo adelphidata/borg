@@ -406,14 +406,21 @@ mod tests {
         // with no content.
         let r = ToolCallResult {
             content: vec![
-                ContentBlock::Text { text: "before".into() },
+                ContentBlock::Text {
+                    text: "before".into(),
+                },
                 ContentBlock::Other,
-                ContentBlock::Text { text: "after".into() },
+                ContentBlock::Text {
+                    text: "after".into(),
+                },
             ],
             is_error: false,
         };
         let out = render_call_result(&r);
-        assert!(out.contains("[unsupported mcp content block]"), "got: {out}");
+        assert!(
+            out.contains("[unsupported mcp content block]"),
+            "got: {out}"
+        );
         // Ordering must be preserved so the model sees the text-around-blob
         // structure rather than a reordered transcript.
         let pre = out.find("before").expect("before");
@@ -464,8 +471,7 @@ mod tests {
             serde_json::from_str(r#"{"content":[],"isError":true}"#).expect("decode");
         assert!(with_error.is_error);
 
-        let without: ToolCallResult =
-            serde_json::from_str(r#"{"content":[]}"#).expect("decode");
+        let without: ToolCallResult = serde_json::from_str(r#"{"content":[]}"#).expect("decode");
         assert!(!without.is_error, "absent isError must default to false");
     }
 
@@ -473,7 +479,7 @@ mod tests {
     fn tools_list_decodes_with_optional_annotations() {
         // Both shapes the wire produces: with and without `annotations`.
         // A regression that made `annotations` required would silently
-        // reject every minimal-spec server (Hermes-style toy MCPs).
+        // reject every minimal-spec server.
         let resp = br#"{
             "tools":[
                 {"name":"a","inputSchema":{"type":"object"}},

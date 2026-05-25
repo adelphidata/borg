@@ -104,6 +104,9 @@ pub(super) const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
 
 const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
+const GOALS_DISABLED_ERROR: &str = r#"{"error":"goals are disabled"}"#;
+const DATABASE_UNAVAILABLE_ERROR: &str = r#"{"error":"database unavailable"}"#;
+
 /// Result of monthly token budget check.
 enum BudgetCheck {
     Ok,
@@ -1029,7 +1032,7 @@ impl Agent {
         let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
 
-        // === STABLE PREFIX (cache-friendly) ===
+        // Stable prefix (cache-friendly).
         // Ordered so the largest byte-stable content comes first, enabling
         // implicit prefix caching on providers that hash the prompt (OpenAI,
         // Gemini) and maximizing cache hits on providers with explicit markers
@@ -1127,7 +1130,7 @@ impl Agent {
             );
         }
 
-        // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
+        // Dynamic suffix (per-turn, cache-invalidating).
 
         // Active memory: per-turn hybrid search of memory + past sessions
         // keyed off the latest user message. Placed at the start of the
@@ -2698,9 +2701,7 @@ impl Agent {
             }
             crate::tool::Tool::GetGoal(args) => {
                 if !self.config.goals.enabled {
-                    return Ok(ToolOutput::Text(
-                        serde_json::json!({"error": "goals are disabled"}).to_string(),
-                    ));
+                    return Ok(ToolOutput::Text(GOALS_DISABLED_ERROR.to_string()));
                 }
                 let guard = self.db_guard().await;
                 match guard.as_ref() {
@@ -2712,9 +2713,7 @@ impl Agent {
             }
             crate::tool::Tool::CreateGoal(args) => {
                 if !self.config.goals.enabled {
-                    return Ok(ToolOutput::Text(
-                        serde_json::json!({"error": "goals are disabled"}).to_string(),
-                    ));
+                    return Ok(ToolOutput::Text(GOALS_DISABLED_ERROR.to_string()));
                 }
                 let handler_out = {
                     let guard = self.db_guard().await;
@@ -2728,9 +2727,7 @@ impl Agent {
                             )
                             .await
                         }
-                        None => {
-                            Ok(serde_json::json!({"error":"database unavailable"}).to_string())
-                        }
+                        None => Ok(DATABASE_UNAVAILABLE_ERROR.to_string()),
                     }
                 };
                 if let Ok(ref text) = handler_out {
@@ -2740,9 +2737,7 @@ impl Agent {
             }
             crate::tool::Tool::UpdateGoal(args) => {
                 if !self.config.goals.enabled {
-                    return Ok(ToolOutput::Text(
-                        serde_json::json!({"error": "goals are disabled"}).to_string(),
-                    ));
+                    return Ok(ToolOutput::Text(GOALS_DISABLED_ERROR.to_string()));
                 }
                 let handler_out = {
                     let guard = self.db_guard().await;
@@ -2751,9 +2746,7 @@ impl Agent {
                             crate::tool::update_goal::handle(args, db, &self.session.meta.id)
                                 .await
                         }
-                        None => {
-                            Ok(serde_json::json!({"error":"database unavailable"}).to_string())
-                        }
+                        None => Ok(DATABASE_UNAVAILABLE_ERROR.to_string()),
                     }
                 };
                 if let Ok(ref text) = handler_out {
