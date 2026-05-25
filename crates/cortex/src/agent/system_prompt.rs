@@ -609,7 +609,7 @@ impl Agent {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod scheduled_tasks_snapshot_tests {
     //! Tests for the `<scheduled_tasks>` system-prompt snapshot.
     //!
@@ -625,13 +625,8 @@ mod scheduled_tasks_snapshot_tests {
         render_scheduled_tasks_snapshot, SCHEDULED_TASKS_MAX_LISTED, SCHEDULED_TASKS_WINDOW_SECS,
     };
     use crate::db::{Database, NewTask};
-    use rusqlite::Connection;
 
-    fn in_mem_db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("open")).expect("init db")
-    }
-
-    fn make_task(db: &Database, id: &str, name: &str) {
+    async fn make_task(db: &Database, id: &str, name: &str) {
         db.create_task(&NewTask {
             id,
             name,
@@ -651,33 +646,36 @@ mod scheduled_tasks_snapshot_tests {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create task");
     }
 
-    #[test]
-    fn snapshot_empty_when_no_failures() {
+    #[tokio::test]
+    async fn snapshot_empty_when_no_failures() {
         // Negative case: clean DB (only the seeded default tasks, none with
         // last_error) must NOT emit a <scheduled_tasks> block. We don't want
         // to bloat the system prompt for users with healthy schedules.
-        let db = in_mem_db();
-        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let db = Database::test_db().await;
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
         assert!(
             snap.is_empty(),
             "expected empty snapshot on clean DB, got: {snap}"
         );
     }
 
-    #[test]
-    fn snapshot_emits_block_with_names_ids_and_errors() {
-        let db = in_mem_db();
-        make_task(&db, "task-a-id", "daily_summary");
-        make_task(&db, "task-b-id", "weekly_report");
+    #[tokio::test]
+    async fn snapshot_emits_block_with_names_ids_and_errors() {
+        let db = Database::test_db().await;
+        make_task(&db, "task-a-id", "daily_summary").await;
+        make_task(&db, "task-b-id", "weekly_report").await;
         db.set_task_retry("task-a-id", 1, "openrouter 429", 9999)
+            .await
             .expect("set");
         db.set_task_retry("task-b-id", 1, "timeout reading model", 9999)
+            .await
             .expect("set");
 
-        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
         assert!(snap.contains("<scheduled_tasks trust=\"db\">"), "{snap}");
         // Names verbatim — so the LLM can resolve "the tasks" from the heartbeat.
         assert!(snap.contains("daily_summary"), "missing name: {snap}");
@@ -703,16 +701,18 @@ mod scheduled_tasks_snapshot_tests {
         );
     }
 
-    #[test]
-    fn snapshot_window_filters_run_counts() {
-        let db = in_mem_db();
-        make_task(&db, "t1", "task1");
+    #[tokio::test]
+    async fn snapshot_window_filters_run_counts() {
+        let db = Database::test_db().await;
+        make_task(&db, "t1", "task1").await;
         let now = 1_000_000_i64;
 
         // Within 24h
         db.record_task_run("t1", now - 60, 100, None, Some("e1"))
+            .await
             .expect("record");
         db.record_task_run("t1", now - 120, 100, Some("ok"), None)
+            .await
             .expect("record");
         // Outside 24h — must be excluded
         db.record_task_run(
@@ -722,9 +722,10 @@ mod scheduled_tasks_snapshot_tests {
             None,
             Some("ancient"),
         )
+        .await
         .expect("record");
 
-        let snap = render_scheduled_tasks_snapshot(&db, now);
+        let snap = render_scheduled_tasks_snapshot(&db, now).await;
         assert!(
             snap.contains("task_runs in last 24h: 1 succeeded, 1 failed"),
             "expected 24h-windowed counts: {snap}"
@@ -735,17 +736,17 @@ mod scheduled_tasks_snapshot_tests {
         );
     }
 
-    #[test]
-    fn snapshot_truncates_long_failure_list() {
-        let db = in_mem_db();
+    #[tokio::test]
+    async fn snapshot_truncates_long_failure_list() {
+        let db = Database::test_db().await;
         let total = SCHEDULED_TASKS_MAX_LISTED + 3;
         for i in 0..total {
             let id = format!("id-{i}");
             let name = format!("task_{i}");
-            make_task(&db, &id, &name);
-            db.set_task_retry(&id, 1, "boom", 9999).expect("set");
+            make_task(&db, &id, &name).await;
+            db.set_task_retry(&id, 1, "boom", 9999).await.expect("set");
         }
-        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
         // Header reflects the full count, not the truncated one.
         assert!(
             snap.contains(&format!("{total} task(s) currently carry a last_error")),
@@ -761,19 +762,20 @@ mod scheduled_tasks_snapshot_tests {
         );
     }
 
-    #[test]
-    fn snapshot_emits_when_only_recent_runs_failed() {
+    #[tokio::test]
+    async fn snapshot_emits_when_only_recent_runs_failed() {
         // Positive edge case: no scheduled_tasks.last_error set, but task_runs
         // shows recent failures (e.g. a task that already cleared its
         // last_error after success but had failures earlier in the window).
         // The block should still surface the failed-runs count.
-        let db = in_mem_db();
-        make_task(&db, "t1", "fluky");
+        let db = Database::test_db().await;
+        make_task(&db, "t1", "fluky").await;
         let now = 1_000_000_i64;
         db.record_task_run("t1", now - 60, 100, None, Some("transient"))
+            .await
             .expect("record");
 
-        let snap = render_scheduled_tasks_snapshot(&db, now);
+        let snap = render_scheduled_tasks_snapshot(&db, now).await;
         assert!(
             !snap.is_empty(),
             "should emit when there are recent failed runs even with no last_error set"
@@ -789,23 +791,24 @@ mod scheduled_tasks_snapshot_tests {
         );
     }
 
-    #[test]
-    fn snapshot_size_stays_bounded_under_worst_case() {
+    #[tokio::test]
+    async fn snapshot_size_stays_bounded_under_worst_case() {
         // Bloat guard: the snapshot ships in EVERY main-session system prompt
         // when failures exist, so unbounded growth there is a per-turn token
         // tax. Worst case = MAX_LISTED tasks each carrying a 120-char error.
         // We pin the upper bound at 2KB (~500 tokens) — generous, but small
         // enough that a future change adding a new field per row will trip
         // this test before shipping.
-        let db = in_mem_db();
+        let db = Database::test_db().await;
         for i in 0..(SCHEDULED_TASKS_MAX_LISTED * 4) {
             let id = format!("id-{i}");
             let name = format!("task_with_a_reasonably_long_name_{i}");
-            make_task(&db, &id, &name);
+            make_task(&db, &id, &name).await;
             db.set_task_retry(&id, 1, &"x".repeat(500), 9999)
+                .await
                 .expect("set");
         }
-        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
         assert!(
             snap.len() < 2048,
             "snapshot must stay under 2KB even with many long-error tasks; got {} bytes:\n{snap}",
@@ -813,15 +816,16 @@ mod scheduled_tasks_snapshot_tests {
         );
     }
 
-    #[test]
-    fn snapshot_redacts_newlines_in_error_messages() {
+    #[tokio::test]
+    async fn snapshot_redacts_newlines_in_error_messages() {
         // Defensive: a multi-line error message would otherwise break the
         // single-line bullet format and confuse an LLM scanning the section.
-        let db = in_mem_db();
-        make_task(&db, "t1", "noisy");
+        let db = Database::test_db().await;
+        make_task(&db, "t1", "noisy").await;
         db.set_task_retry("t1", 1, "line one\nline two\nline three", 9999)
+            .await
             .expect("set");
-        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
         let bullet = snap
             .lines()
             .find(|l| l.starts_with("  - noisy"))
