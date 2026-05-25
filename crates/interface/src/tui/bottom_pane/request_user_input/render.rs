@@ -116,34 +116,75 @@ impl RequestUserInputOverlay {
 
     fn render_options(&self, buf: &mut Buffer, area: Rect) {
         let rows = self.option_rows();
-        if rows.is_empty() {
+        if rows.is_empty() || area.height == 0 {
             return;
         }
         let visible = area.height as usize;
-        // Clone the scroll state so render stays read-only — the key
-        // handler is what actually advances the cursor.
-        let mut state = self.current_answer().options_state;
-        state.ensure_visible(rows.len(), visible);
-        let start = state.scroll_top;
-        let end = (start + visible).min(rows.len());
-        let selected = state.selected_idx;
+        let selected = self.current_answer().options_state.selected_idx;
+        let other_idx = rows.len() - 1;
 
-        for (paint_idx, row_idx) in (start..end).enumerate() {
-            let row = &rows[row_idx];
-            let y = area.y.saturating_add(paint_idx as u16);
-            if y >= area.y.saturating_add(area.height) {
-                break;
+        // When the list fits, render every row top-to-bottom; no pinning
+        // needed. The common case (≤ 4 options + Other = 5 rows, visible
+        // cap = 5) takes this branch.
+        if rows.len() <= visible {
+            for (paint_idx, row) in rows.iter().enumerate() {
+                let is_selected_cursor = Some(paint_idx) == selected;
+                let line = build_option_line(row, is_selected_cursor, area.width as usize);
+                let rect = Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(paint_idx as u16),
+                    width: area.width,
+                    height: 1,
+                };
+                Paragraph::new(line).render(rect, buf);
             }
-            let is_selected_cursor = Some(row_idx) == selected;
-            let line = build_option_line(row, is_selected_cursor, area.width as usize);
-            let rect = Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            };
-            Paragraph::new(line).render(rect, buf);
+            return;
         }
+
+        // Tight area: pin "Other" to the last visible line so the user
+        // always sees it (otherwise it'd hide behind the scroll window
+        // until they navigated past every caller-supplied option). Regular
+        // options scroll inside the remaining rows.
+        let scroll_height = area.height.saturating_sub(1) as usize;
+        if scroll_height > 0 {
+            let regular_count = rows.len() - 1;
+            let mut state = self.current_answer().options_state;
+            // Confine scrolling to the non-Other rows; when the cursor is
+            // on Other we don't move the window — Other is rendered in the
+            // pinned slot regardless.
+            if let Some(i) = state.selected_idx {
+                if i == other_idx {
+                    state.selected_idx = None;
+                }
+            }
+            state.ensure_visible(regular_count, scroll_height);
+            let start = state.scroll_top;
+            let end = (start + scroll_height).min(regular_count);
+            for (paint_idx, row_idx) in (start..end).enumerate() {
+                let row = &rows[row_idx];
+                let is_selected_cursor = Some(row_idx) == selected;
+                let line = build_option_line(row, is_selected_cursor, area.width as usize);
+                let rect = Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(paint_idx as u16),
+                    width: area.width,
+                    height: 1,
+                };
+                Paragraph::new(line).render(rect, buf);
+            }
+        }
+
+        // Pinned Other row, always rendered on the last visible line.
+        let other_row = &rows[other_idx];
+        let is_other_selected = Some(other_idx) == selected;
+        let line = build_option_line(other_row, is_other_selected, area.width as usize);
+        let rect = Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.height.saturating_sub(1)),
+            width: area.width,
+            height: 1,
+        };
+        Paragraph::new(line).render(rect, buf);
     }
 
     /// Render `notes` as a single text row with a left vertical bar.
@@ -511,6 +552,30 @@ mod tests {
         assert!(
             text.contains(other_label()),
             "Other row missing from render:\n{text}"
+        );
+    }
+
+    /// When the options area is too short to fit every row, the "Other"
+    /// row stays pinned to the last visible line even with the cursor on
+    /// the first option. Without this, the user wouldn't know Other is
+    /// available until they navigated past every caller-supplied option.
+    #[test]
+    fn other_row_stays_pinned_when_options_area_is_tight() {
+        let mut overlay = RequestUserInputOverlay::new(vec![q("pick", 4, false)]).unwrap();
+        // Cursor on the first option so the scroll window naturally
+        // shows the head of the list. With 4 caller options + Other = 5
+        // rows and the layout-allocated options area shorter than 5, the
+        // pin keeps Other visible.
+        overlay.answers[0].options_state.selected_idx = Some(0);
+        let buf = render_to_buffer(&overlay, 60, 8);
+        let text = buffer_to_text(&buf);
+        assert!(
+            text.contains(other_label()),
+            "Other row must stay pinned when cursor is on first option:\n{text}"
+        );
+        assert!(
+            text.contains("Option 0"),
+            "first option must still render alongside pinned Other:\n{text}"
         );
     }
 
