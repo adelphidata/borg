@@ -17,30 +17,23 @@ use crate::conversation::{
 };
 use crate::db::Database;
 use crate::hooks::{HookAction, HookData, HookPoint, HookRegistry};
-use crate::identity::load_identity;
 use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::llm_error::{classify_error_text, FailoverReason};
 use crate::llm::{LlmClient, StreamEvent, UsageData};
-use crate::logging::log_message;
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{RateDecision, SessionRateGuard};
-use crate::security::secrets::redact_secrets;
 use crate::session::Session;
-use crate::skills::load_skills_context;
 use crate::telemetry::BorgMetrics;
-use crate::template::Template;
 use crate::tool::names as tn;
 #[cfg(test)]
 use crate::tool_handlers;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition, ToolOutput};
-use crate::util::truncate::truncate_output;
-
-use std::sync::LazyLock;
 
 pub mod btw;
 mod goal_loop;
 mod hooks_dispatch;
 mod prompt_assembly;
+mod session_manager;
 mod stream_handler;
 mod system_prompt;
 pub(crate) mod system_prompt_cache;
@@ -70,39 +63,9 @@ pub(crate) fn spawn_logged(
 /// Max tokens for tool output before truncation (head + tail preserved).
 const TOOL_OUTPUT_MAX_TOKENS: usize = constants::TOOL_OUTPUT_MAX_TOKENS;
 
-fn parse_template(source: &str) -> Template {
-    Template::parse(source).unwrap_or_else(|e| {
-        tracing::error!("Failed to parse template: {e} — using fallback");
-        // SAFETY: This literal template string is known valid at compile time
-        #[allow(clippy::expect_used)]
-        Template::parse("{{ memory }}").expect("fallback template must parse")
-    })
-}
-
-static MEMORY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_template("\n<long_term_memory trust=\"stored\">\n{{ memory }}\n</long_term_memory>\n")
-});
-
-static KNOWLEDGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_template("\n<knowledge_files trust=\"curated\">\n{{ knowledge }}\n</knowledge_files>\n")
-});
-
-static SKILLS_TEMPLATE: LazyLock<Template> =
-    LazyLock::new(|| parse_template("\n<skills trust=\"verified\">\n{{ skills }}\n</skills>\n"));
-
-static SETUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_template("\n<first_conversation>\n{{ setup }}\n</first_conversation>\n")
-});
-
-// Collaboration mode templates
-const COLLAB_MODE_EXECUTE: &str = include_str!("../../templates/collaboration_mode/execute.md");
-const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
-
 /// Maximum number of parallel tool calls allowed in a single LLM response.
 /// Prevents OOM from malformed stream events with huge indices.
 pub(super) const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
-
-const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
 const GOALS_DISABLED_ERROR: &str = r#"{"error":"goals are disabled"}"#;
 const DATABASE_UNAVAILABLE_ERROR: &str = r#"{"error":"database unavailable"}"#;
@@ -230,8 +193,8 @@ fn should_nudge_for_response(
 }
 
 use tool_validation::{
-    format_invalid_tool_result, has_unresolved_tool_calls, partition_tool_calls, InvalidToolCall,
-    PartialToolCall, ToolCallRepeatTracker,
+    format_invalid_tool_result, partition_tool_calls, InvalidToolCall, PartialToolCall,
+    ToolCallRepeatTracker,
 };
 use tool_validation::{
     repeated_tool_call_block_message, unknown_tool_refusal_message, RepeatDecision,
@@ -750,198 +713,11 @@ impl Agent {
         &mut self.hook_registry
     }
 
-    /// Restore a session's history into this agent.
-    pub fn load_session(&mut self, id: &str) -> Result<()> {
-        let session = Session::load(id)?;
-        self.history = session.messages.clone();
-        self.session = session;
-        Ok(())
-    }
-
-    /// Start a new session, clearing history.
-    pub async fn new_session(&mut self) {
-        // Fire SessionEnd for the previous session if any turns were executed
-        if self.turn_count > 0 {
-            let hook_ctx = self.hook_ctx(
-                HookPoint::SessionEnd,
-                HookData::SessionEnd {
-                    session_id: self.session.meta.id.clone(),
-                    total_turns: self.turn_count,
-                },
-            );
-            self.hook_registry.dispatch(&hook_ctx).await;
-            self.flush_short_term_memory().await;
-        }
-
-        self.history.clear();
-        self.session = Session::new();
-        self.short_term_memory = crate::memory::short_term_memory::ShortTermMemory::new(
-            self.session.meta.id.clone(),
-            2000,
-        );
-
-        // Fire SessionStart for the new session
-        let hook_ctx = self.hook_ctx(
-            HookPoint::SessionStart,
-            HookData::SessionStart {
-                session_id: self.session.meta.id.clone(),
-            },
-        );
-        self.hook_registry.dispatch(&hook_ctx).await;
-    }
-
-    /// Flush accumulated short-term memory facts to the daily log entry in
-    /// the database. Called on session end so facts the agent collected during
-    /// the session are promoted into long-term memory (via nightly
-    /// consolidation).
-    ///
-    /// Reuses the agent's open DB handle when available so a session-end
-    /// flush doesn't race a fresh `Database::open()` against the agent's own
-    /// writes (and, in tests, so the flush hits the same in-memory DB the
-    /// caller is inspecting).
-    ///
-    /// Fire-and-forget: background shutdown must not crash on a storage error.
-    /// Any failure is logged but otherwise ignored.
-    pub async fn flush_short_term_memory(&self) {
-        let facts = self.short_term_memory.facts_as_text();
-        if facts.trim().is_empty() {
-            return;
-        }
-        let guard = self.db_guard().await;
-        if let Err(e) = crate::memory::consolidation::flush_short_term_to_daily_with_optional_db(
-            guard.as_ref(),
-            &facts,
-        )
-        .await
-        {
-            warn!("flush_short_term_memory failed: {e}");
-        }
-    }
-
-    /// Signal that this agent's owning context is ending (e.g. CLI shutdown,
-    /// gateway handler finishing). Fires SessionEnd and flushes short-term
-    /// memory even when no `new_session()` call follows. Safe to call multiple
-    /// times; a no-op if no turns were executed.
-    pub async fn end_session(&mut self) {
-        if self.turn_count == 0 {
-            return;
-        }
-        let hook_ctx = self.hook_ctx(
-            HookPoint::SessionEnd,
-            HookData::SessionEnd {
-                session_id: self.session.meta.id.clone(),
-                total_turns: self.turn_count,
-            },
-        );
-        self.hook_registry.dispatch(&hook_ctx).await;
-        self.flush_short_term_memory().await;
-        // Clear turn_count so a repeat end_session() is a no-op.
-        self.turn_count = 0;
-    }
-
-    /// Auto-save current session state.
-    pub fn auto_save(&mut self) {
-        self.session.update_from_history(&self.history);
-        if let Err(e) = self.session.save() {
-            warn!("Failed to auto-save session: {e}");
-        }
-    }
-
-    /// Append a system-injected assistant message to the agent's history.
-    ///
-    /// Used to mirror text the user already saw on this client (e.g. a
-    /// heartbeat that was streamed in by the daemon while the TUI was open)
-    /// into the active session so the next user reply has it in context.
-    /// Without this, the user's "yes please" reply lands in a session whose
-    /// history has no record of the heartbeat, and the agent answers the
-    /// previous turn instead.
-    ///
-    /// Refuses to inject if doing so would split an `assistant(tool_calls)`
-    /// message from its outstanding `tool` results — both Anthropic and
-    /// OpenAI reject orphaned tool_use blocks on the next turn, so a
-    /// well-meaning mid-turn mirror would brick the session.
-    pub async fn append_assistant_message(&mut self, text: &str) {
-        if has_unresolved_tool_calls(&self.history) {
-            warn!(
-                "append_assistant_message: refused — last assistant turn has unresolved \
-                 tool_calls; injecting now would orphan them. Dropping the mirrored message."
-            );
-            return;
-        }
-        self.persist_message(Message::assistant(text)).await;
-    }
-
-    /// Log a message and push it to history + SQLite in one step.
-    async fn log_and_persist(&mut self, msg: Message) {
-        log_message(&msg);
-        self.persist_message(msg).await;
-    }
-
-    /// Record a skipped/cancelled tool call as a tool_result message.
-    async fn skip_tool_call(&mut self, tool_call_id: &str, reason: &str) {
-        self.log_and_persist(Message::tool_result(tool_call_id, reason))
-            .await;
-    }
-
-    /// Optionally redact secrets from a string based on config.
-    fn maybe_redact(&self, s: String) -> String {
-        if self.config.security.secret_detection {
-            redact_secrets(&s)
-        } else {
-            s
-        }
-    }
-
-    /// Truncate and optionally redact secrets from raw tool output.
-    fn truncate_and_redact(&self, raw: &str) -> String {
-        self.maybe_redact(truncate_output(raw, TOOL_OUTPUT_MAX_TOKENS))
-    }
-
-    /// Push a message to history and persist it to SQLite for crash recovery.
-    async fn persist_message(&mut self, msg: Message) {
-        let session_id = self.session.meta.id.clone();
-        let role = match msg.role {
-            crate::types::Role::System => "system",
-            crate::types::Role::User => "user",
-            crate::types::Role::Assistant => "assistant",
-            crate::types::Role::Tool => "tool",
-        };
-        let tool_calls_json = msg
-            .tool_calls
-            .as_ref()
-            .and_then(|tc| serde_json::to_string(tc).ok());
-        let (content_text, content_parts_json) = match &msg.content {
-            Some(crate::types::MessageContent::Parts(parts)) => {
-                let full = msg
-                    .content
-                    .as_ref()
-                    .map(crate::types::MessageContent::full_text);
-                let parts_json = serde_json::to_string(parts).ok();
-                (full, parts_json)
-            }
-            _ => (msg.text_content().map(str::to_string), None),
-        };
-        {
-            let guard = self.db_guard().await;
-            if let Some(ref db) = *guard {
-                if let Err(e) = db
-                    .insert_message(
-                        &session_id,
-                        role,
-                        content_text.as_deref(),
-                        tool_calls_json.as_deref(),
-                        msg.tool_call_id.as_deref(),
-                        msg.timestamp.as_deref(),
-                        content_parts_json.as_deref(),
-                    )
-                    .await
-                {
-                    warn!("Failed to persist message to SQLite: {e}");
-                }
-            }
-        }
-        self.history.push(msg);
-    }
+    // Session lifecycle (`load_session`, `new_session`, `end_session`,
+    // `flush_short_term_memory`, `auto_save`) and message persistence
+    // (`persist_message`, `log_and_persist`, `skip_tool_call`,
+    // `append_assistant_message`, `maybe_redact`, `truncate_and_redact`)
+    // live in `agent::session_manager`.
 
     /// Get a reference to the current session.
     pub fn session(&self) -> &Session {
@@ -1022,163 +798,8 @@ impl Agent {
         (self.history.len(), history_tokens(&self.history))
     }
 
-    // Per-section builders live in `agent::system_prompt` (second impl block);
-    // `build_system_prompt` remains here because it orchestrates caches.
-
-    #[instrument(skip_all)]
-    async fn build_system_prompt(&mut self) -> Result<String> {
-        let identity = self.caches.identity_or_load(load_identity)?;
-        let memory = self.load_memory_with_ranking().await?;
-        let knowledge = self.load_knowledge_with_ranking().await?;
-        let mut system = String::with_capacity(16_384);
-
-        // Stable prefix (cache-friendly).
-        // Ordered so the largest byte-stable content comes first, enabling
-        // implicit prefix caching on providers that hash the prompt (OpenAI,
-        // Gemini) and maximizing cache hits on providers with explicit markers
-        // (Anthropic). Anything that changes turn-to-turn is pushed to the
-        // dynamic suffix below.
-        system.push_str("<system_instructions>\n");
-        system.push_str(&identity);
-        system.push_str("\n</system_instructions>\n\n");
-
-        // Tooling: list available tools with summaries
-        system.push_str(&self.build_tooling_section().await);
-
-        // Tool call style guidance
-        system.push_str(Self::build_tool_call_style_section());
-        system.push_str(Self::build_skill_usage_section());
-
-        // Safety / security policy
-        use std::fmt::Write as _;
-        let _ = write!(
-            system,
-            "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
-        );
-
-        if self.config.skills.enabled {
-            let user_request = self.latest_user_message_text().to_string();
-            let skills = if let Some(cached) = self.caches.skills_for_request(&user_request) {
-                cached.to_string()
-            } else {
-                self.ensure_credentials_cached();
-                let budget = crate::skills::effective_skill_budget(
-                    &self.config.skills,
-                    Some(self.active_context_window()),
-                );
-                let (rendered, report) = load_skills_context(
-                    budget,
-                    self.credentials_cached(),
-                    &self.config.skills,
-                    &user_request,
-                )?;
-                self.warn_skill_budget_loss(&report);
-                self.caches.set_skills(user_request, rendered.clone());
-                rendered
-            };
-            if !skills.is_empty() {
-                system.push_str(
-                    &SKILLS_TEMPLATE
-                        .render([("skills", skills.as_str())])
-                        .context("skills template render failed")?,
-                );
-            }
-        }
-
-        if !memory.is_empty() {
-            system.push_str(
-                &MEMORY_TEMPLATE
-                    .render([("memory", memory.as_str())])
-                    .context("memory template render failed")?,
-            );
-        }
-        if !knowledge.is_empty() {
-            system.push_str(
-                &KNOWLEDGE_TEMPLATE
-                    .render([("knowledge", knowledge.as_str())])
-                    .context("knowledge template render failed")?,
-            );
-        }
-
-        system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
-
-        // Reply tags for message threading (channels)
-        system.push_str(Self::build_reply_tags_section());
-
-        // Messaging / channel routing guidance
-        system.push_str(&self.build_messaging_section());
-
-        // Silent reply protocol
-        system.push_str(&Self::build_silent_reply_section());
-
-        // Heartbeat ack protocol
-        system.push_str(&self.build_heartbeat_section());
-
-        // Reasoning format (conditional on thinking level)
-        system.push_str(&self.build_reasoning_section());
-
-        // Project documentation (AGENTS.md / CLAUDE.md)
-        let project_docs = self.caches.project_docs_or_load(|| {
-            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
-                .ok()
-                .flatten()
-        });
-        if let Some(ref docs) = project_docs {
-            let _ = write!(
-                system,
-                "\n<project_instructions trust=\"stored\">\n{docs}\n</project_instructions>\n"
-            );
-        }
-
-        // Dynamic suffix (per-turn, cache-invalidating).
-
-        // Active memory: per-turn hybrid search of memory + past sessions
-        // keyed off the latest user message. Placed at the start of the
-        // dynamic suffix so it sits adjacent to <working_memory> and after
-        // the stable <long_term_memory> prefix. Empty string when disabled
-        // or when the search returns no hits.
-        system.push_str(&self.build_active_memory_section().await);
-
-        // Active goal context — the agent must see the current objective so
-        // every turn pulls toward it. Untrusted: the objective is user-data,
-        // not a higher-priority instruction set.
-        system.push_str(&self.build_goal_context_section().await);
-
-        // Short-term working memory (session facts, active project)
-        let working_memory = self.short_term_memory.render();
-        if !working_memory.is_empty() {
-            system.push_str(&working_memory);
-        }
-
-        system.push_str(&self.build_collaboration_section());
-        system.push_str(&self.build_environment_section().await);
-        system.push_str(&self.build_scheduled_tasks_section().await);
-
-        // Inject first-conversation instructions from SETUP.md (created during onboarding)
-        if let Ok(data_dir) = crate::config::Config::data_dir() {
-            let setup_path = data_dir.join("SETUP.md");
-            // Atomically rename to prevent duplicate injection from concurrent sessions
-            let consumed = setup_path.with_extension("md.consumed");
-            if tokio::fs::rename(&setup_path, &consumed).await.is_ok() {
-                if let Ok(setup) = tokio::fs::read_to_string(&consumed).await {
-                    system.push_str(
-                        &SETUP_TEMPLATE
-                            .render([("setup", setup.as_str())])
-                            .context("setup template render failed")?,
-                    );
-                    // Signal to the agent turn: on this turn we must not offer
-                    // tools to the model. SETUP.md forbids first-message tool
-                    // calls in prose, but that is not sufficient for weak
-                    // instruction-following models (e.g. Grok-4.20 emits a
-                    // malformed `write_memory` call anyway).
-                    self.setup_just_consumed = true;
-                }
-                let _ = tokio::fs::remove_file(&consumed).await;
-            }
-        }
-
-        Ok(system)
-    }
+    // `build_system_prompt` and the per-section builders live in
+    // `agent::system_prompt`.
 
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
     /// Send a user message and run the agent loop, emitting events to the channel.
@@ -2908,14 +2529,15 @@ mod tests {
     // through the Anthropic request tests in `llm.rs`.
 
     const AGENT_RS_SRC: &str = include_str!("mod.rs");
+    const SYSTEM_PROMPT_RS_SRC: &str = include_str!("system_prompt.rs");
 
     fn extract_build_system_prompt_body() -> &'static str {
-        let start = AGENT_RS_SRC
+        let start = SYSTEM_PROMPT_RS_SRC
             .find("async fn build_system_prompt")
-            .expect("build_system_prompt must exist");
+            .expect("build_system_prompt must exist in system_prompt.rs");
         // Extract ~6KB following the signature — plenty to cover the body.
-        let end = (start + 6000).min(AGENT_RS_SRC.len());
-        &AGENT_RS_SRC[start..end]
+        let end = (start + 6000).min(SYSTEM_PROMPT_RS_SRC.len());
+        &SYSTEM_PROMPT_RS_SRC[start..end]
     }
 
     #[test]
@@ -3419,22 +3041,10 @@ mod tests {
     }
 
     // -- SETUP template tests --
-
-    #[test]
-    fn setup_template_wraps_in_first_conversation_tags() {
-        let rendered = SETUP_TEMPLATE.render([("setup", "Hello world")]).unwrap();
-        assert!(rendered.contains("<first_conversation>"));
-        assert!(rendered.contains("</first_conversation>"));
-        assert!(rendered.contains("Hello world"));
-    }
-
-    #[test]
-    fn setup_template_preserves_multiline_content() {
-        let content = "# First Boot\n\nLine 1\nLine 2\n- bullet";
-        let rendered = SETUP_TEMPLATE.render([("setup", content)]).unwrap();
-        assert!(rendered.contains("# First Boot"));
-        assert!(rendered.contains("- bullet"));
-    }
+    //
+    // The two `setup_template_*` template-rendering tests live alongside
+    // `SETUP_TEMPLATE` in `agent::system_prompt`. The filesystem-lifecycle
+    // tests below stay here because they don't touch the template itself.
 
     #[test]
     fn setup_file_lifecycle_atomic_consume() {

@@ -1,20 +1,227 @@
-//! System-prompt section builders.
+//! System-prompt section builders and the top-level `build_system_prompt`
+//! orchestrator.
 //!
-//! Extracted from `agent/mod.rs` so the per-section logic lives next to each
-//! other and isn't interleaved with session-management, tool-execution, and
-//! loop state. `build_system_prompt` itself remains in `mod.rs` because it
-//! pulls together many caches and fallbacks and is more agent-orchestration
-//! than prompt assembly.
+//! Extracted from `agent/mod.rs` so the per-section logic lives next to the
+//! orchestrator that stitches them together — interleaving with
+//! session-management, tool-execution, and loop state made `mod.rs`
+//! unnavigable.
 //!
-//! These are all methods on `Agent`; the trait-like surface is kept intact
-//! through a second `impl Agent` block — Rust allows multiple impls of the
-//! same type within a crate.
+//! All section builders and `build_system_prompt` itself are methods on
+//! `Agent`; the trait-like surface is kept intact through additional
+//! `impl Agent` blocks — Rust allows multiple impls of the same type within
+//! a crate.
+
+use std::sync::LazyLock;
+
+use anyhow::{Context, Result};
+use tracing::instrument;
 
 use crate::constants;
+use crate::identity::load_identity;
+use crate::skills::load_skills_context;
+use crate::template::Template;
 
-use super::{Agent, COLLAB_MODE_EXECUTE, COLLAB_MODE_PLAN};
+use super::Agent;
+
+fn parse_template(source: &str) -> Template {
+    Template::parse(source).unwrap_or_else(|e| {
+        tracing::error!("Failed to parse template: {e} — using fallback");
+        // SAFETY: This literal template string is known valid at compile time
+        #[allow(clippy::expect_used)]
+        Template::parse("{{ memory }}").expect("fallback template must parse")
+    })
+}
+
+static MEMORY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_template("\n<long_term_memory trust=\"stored\">\n{{ memory }}\n</long_term_memory>\n")
+});
+
+static KNOWLEDGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_template("\n<knowledge_files trust=\"curated\">\n{{ knowledge }}\n</knowledge_files>\n")
+});
+
+static SKILLS_TEMPLATE: LazyLock<Template> =
+    LazyLock::new(|| parse_template("\n<skills trust=\"verified\">\n{{ skills }}\n</skills>\n"));
+
+pub(super) static SETUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_template("\n<first_conversation>\n{{ setup }}\n</first_conversation>\n")
+});
+
+const COLLAB_MODE_EXECUTE: &str = include_str!("../../templates/collaboration_mode/execute.md");
+const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
+
+const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
 impl Agent {
+    /// Build the full system prompt for this turn.
+    ///
+    /// Ordering matters: the stable prefix (identity, tooling, security
+    /// policy, skills, long-term memory, knowledge, project docs) MUST
+    /// come before the dynamic suffix (active memory, goal context,
+    /// working memory, collaboration mode, environment, scheduled tasks).
+    /// Anything that changes turn-to-turn lives in the suffix so the
+    /// prefix-cache stays warm on providers that hash the prompt.
+    ///
+    /// The `// === STABLE PREFIX ===` and `// === DYNAMIC SUFFIX ===`
+    /// comment markers below are load-bearing — guard tests in
+    /// `mod scheduled_tasks_section_placement_tests` and the
+    /// `build_system_prompt_*` tests source-grep for them to detect
+    /// reordering regressions.
+    #[instrument(skip_all)]
+    pub(super) async fn build_system_prompt(&mut self) -> Result<String> {
+        let identity = self.caches.identity_or_load(load_identity)?;
+        let memory = self.load_memory_with_ranking().await?;
+        let knowledge = self.load_knowledge_with_ranking().await?;
+        let mut system = String::with_capacity(16_384);
+
+        // === STABLE PREFIX (cache-friendly) ===
+        // Ordered so the largest byte-stable content comes first, enabling
+        // implicit prefix caching on providers that hash the prompt (OpenAI,
+        // Gemini) and maximizing cache hits on providers with explicit markers
+        // (Anthropic). Anything that changes turn-to-turn is pushed to the
+        // dynamic suffix below.
+        system.push_str("<system_instructions>\n");
+        system.push_str(&identity);
+        system.push_str("\n</system_instructions>\n\n");
+
+        // Tooling: list available tools with summaries
+        system.push_str(&self.build_tooling_section().await);
+
+        // Tool call style guidance
+        system.push_str(Self::build_tool_call_style_section());
+        system.push_str(Self::build_skill_usage_section());
+
+        // Safety / security policy
+        use std::fmt::Write as _;
+        let _ = write!(
+            system,
+            "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
+        );
+
+        if self.config.skills.enabled {
+            let user_request = self.latest_user_message_text().to_string();
+            let skills = if let Some(cached) = self.caches.skills_for_request(&user_request) {
+                cached.to_string()
+            } else {
+                self.ensure_credentials_cached();
+                let budget = crate::skills::effective_skill_budget(
+                    &self.config.skills,
+                    Some(self.active_context_window()),
+                );
+                let (rendered, report) = load_skills_context(
+                    budget,
+                    self.credentials_cached(),
+                    &self.config.skills,
+                    &user_request,
+                )?;
+                self.warn_skill_budget_loss(&report);
+                self.caches.set_skills(user_request, rendered.clone());
+                rendered
+            };
+            if !skills.is_empty() {
+                system.push_str(
+                    &SKILLS_TEMPLATE
+                        .render([("skills", skills.as_str())])
+                        .context("skills template render failed")?,
+                );
+            }
+        }
+
+        if !memory.is_empty() {
+            system.push_str(
+                &MEMORY_TEMPLATE
+                    .render([("memory", memory.as_str())])
+                    .context("memory template render failed")?,
+            );
+        }
+        if !knowledge.is_empty() {
+            system.push_str(
+                &KNOWLEDGE_TEMPLATE
+                    .render([("knowledge", knowledge.as_str())])
+                    .context("knowledge template render failed")?,
+            );
+        }
+
+        system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
+
+        // Reply tags for message threading (channels)
+        system.push_str(Self::build_reply_tags_section());
+
+        // Messaging / channel routing guidance
+        system.push_str(&self.build_messaging_section());
+
+        // Silent reply protocol
+        system.push_str(&Self::build_silent_reply_section());
+
+        // Heartbeat ack protocol
+        system.push_str(&self.build_heartbeat_section());
+
+        // Reasoning format (conditional on thinking level)
+        system.push_str(&self.build_reasoning_section());
+
+        // Project documentation (AGENTS.md / CLAUDE.md)
+        let project_docs = self.caches.project_docs_or_load(|| {
+            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
+                .ok()
+                .flatten()
+        });
+        if let Some(ref docs) = project_docs {
+            let _ = write!(
+                system,
+                "\n<project_instructions trust=\"stored\">\n{docs}\n</project_instructions>\n"
+            );
+        }
+
+        // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
+
+        // Active memory: per-turn hybrid search of memory + past sessions
+        // keyed off the latest user message. Placed at the start of the
+        // dynamic suffix so it sits adjacent to <working_memory> and after
+        // the stable <long_term_memory> prefix. Empty string when disabled
+        // or when the search returns no hits.
+        system.push_str(&self.build_active_memory_section().await);
+
+        // Active goal context — the agent must see the current objective so
+        // every turn pulls toward it. Untrusted: the objective is user-data,
+        // not a higher-priority instruction set.
+        system.push_str(&self.build_goal_context_section().await);
+
+        // Short-term working memory (session facts, active project)
+        let working_memory = self.short_term_memory.render();
+        if !working_memory.is_empty() {
+            system.push_str(&working_memory);
+        }
+
+        system.push_str(&self.build_collaboration_section());
+        system.push_str(&self.build_environment_section().await);
+        system.push_str(&self.build_scheduled_tasks_section().await);
+
+        // Inject first-conversation instructions from SETUP.md (created during onboarding)
+        if let Ok(data_dir) = crate::config::Config::data_dir() {
+            let setup_path = data_dir.join("SETUP.md");
+            // Atomically rename to prevent duplicate injection from concurrent sessions
+            let consumed = setup_path.with_extension("md.consumed");
+            if tokio::fs::rename(&setup_path, &consumed).await.is_ok() {
+                if let Ok(setup) = tokio::fs::read_to_string(&consumed).await {
+                    system.push_str(
+                        &SETUP_TEMPLATE
+                            .render([("setup", setup.as_str())])
+                            .context("setup template render failed")?,
+                    );
+                    // Signal to the agent turn: on this turn we must not offer
+                    // tools to the model. SETUP.md forbids first-message tool
+                    // calls in prose, but that is not sufficient for weak
+                    // instruction-following models (e.g. Grok-4.20 emits a
+                    // malformed `write_memory` call anyway).
+                    self.setup_just_consumed = true;
+                }
+                let _ = tokio::fs::remove_file(&consumed).await;
+            }
+        }
+
+        Ok(system)
+    }
+
     /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
     pub(super) async fn build_environment_section(&self) -> String {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -627,20 +834,99 @@ mod scheduled_tasks_snapshot_tests {
 }
 
 #[cfg(test)]
-mod scheduled_tasks_section_placement_tests {
-    //! Source-level guard: the snapshot must live in the dynamic suffix.
-    //! The `<scheduled_tasks>` block changes whenever the task queue changes,
-    //! so emitting it before the cache-stable prefix would invalidate prefix
-    //! caching on every turn for every user — a perf regression that's hard
-    //! to spot at runtime. This test pins it next to the other suffix calls.
-    const AGENT_RS_SRC: &str = include_str!("mod.rs");
+mod build_system_prompt_tests {
+    //! Source-level guards over `build_system_prompt`. The function ships in
+    //! every turn's system prompt, so reordering bugs (dynamic content before
+    //! the cache-stable prefix) silently break prompt caching across every
+    //! provider. These tests source-grep the function body for the `===
+    //! STABLE PREFIX ===` / `=== DYNAMIC SUFFIX ===` markers and pin the
+    //! relative order of each section call.
+    const SYSTEM_PROMPT_RS_SRC: &str = include_str!("system_prompt.rs");
+
+    fn extract_build_system_prompt_body() -> &'static str {
+        let start = SYSTEM_PROMPT_RS_SRC
+            .find("async fn build_system_prompt")
+            .expect("build_system_prompt must exist");
+        // Extract ~6KB following the signature — plenty to cover the body.
+        let end = (start + 6000).min(SYSTEM_PROMPT_RS_SRC.len());
+        &SYSTEM_PROMPT_RS_SRC[start..end]
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_security_policy() {
+        let body = extract_build_system_prompt_body();
+        let security_idx = body
+            .find("security_policy")
+            .expect("security_policy section must exist in build_system_prompt");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist in build_system_prompt");
+        assert!(
+            env_idx > security_idx,
+            "build_environment_section must be pushed AFTER security_policy \
+             to keep the cached prefix stable across turns \
+             (env_idx={env_idx}, security_idx={security_idx})",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_identity() {
+        let body = extract_build_system_prompt_body();
+        let identity_idx = body
+            .find("system_instructions")
+            .expect("system_instructions (identity) section must exist");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist");
+        assert!(
+            env_idx > identity_idx,
+            "dynamic environment section must come after identity",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_tooling() {
+        let body = extract_build_system_prompt_body();
+        let tooling_idx = body
+            .find("build_tooling_section")
+            .expect("build_tooling_section call must exist");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist");
+        assert!(
+            env_idx > tooling_idx,
+            "dynamic environment section must come after tooling",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_active_memory_in_dynamic_suffix() {
+        // Cache-stability invariant: <active_memory> changes per turn (its
+        // content is keyed off the latest user message), so it MUST live in
+        // the DYNAMIC SUFFIX block — never before, where it would invalidate
+        // the prefix cache on every turn.
+        let body = extract_build_system_prompt_body();
+        let suffix_marker = body
+            .find("DYNAMIC SUFFIX")
+            .expect("DYNAMIC SUFFIX marker must exist");
+        let active_idx = body
+            .find("build_active_memory_section")
+            .expect("build_active_memory_section call must exist in build_system_prompt");
+        assert!(
+            active_idx > suffix_marker,
+            "active_memory must be pushed AFTER the DYNAMIC SUFFIX marker \
+             so it does not invalidate the prefix cache \
+             (active_idx={active_idx}, suffix_marker={suffix_marker})",
+        );
+    }
 
     #[test]
     fn snapshot_call_lives_in_dynamic_suffix() {
-        let suffix_marker = AGENT_RS_SRC
+        let body = extract_build_system_prompt_body();
+        let suffix_marker = body
             .find("DYNAMIC SUFFIX")
             .expect("DYNAMIC SUFFIX marker must exist in build_system_prompt");
-        let call_idx = AGENT_RS_SRC
+        let call_idx = body
             .find("build_scheduled_tasks_section")
             .expect("build_scheduled_tasks_section call must exist");
         assert!(
@@ -649,5 +935,23 @@ mod scheduled_tasks_section_placement_tests {
              SUFFIX marker so it does not invalidate the prompt-cache prefix \
              (call_idx={call_idx}, suffix_marker={suffix_marker})",
         );
+    }
+
+    #[test]
+    fn setup_template_wraps_in_first_conversation_tags() {
+        let rendered = super::SETUP_TEMPLATE
+            .render([("setup", "Hello world")])
+            .unwrap();
+        assert!(rendered.contains("<first_conversation>"));
+        assert!(rendered.contains("</first_conversation>"));
+        assert!(rendered.contains("Hello world"));
+    }
+
+    #[test]
+    fn setup_template_preserves_multiline_content() {
+        let content = "# First Boot\n\nLine 1\nLine 2\n- bullet";
+        let rendered = super::SETUP_TEMPLATE.render([("setup", content)]).unwrap();
+        assert!(rendered.contains("# First Boot"));
+        assert!(rendered.contains("- bullet"));
     }
 }
