@@ -482,22 +482,22 @@ impl<'a> App<'a> {
             }
         }
         self.cells.push(HistoryCell::System { text });
-        // Install the BottomPane picker overlay. The legacy `AwaitingInput`
-        // path was removed in the Phase 7b refactor — this host is now the
-        // sole render+input surface for `request_user_input`.
+        // Install the BottomPane picker overlay. Empty batches (cortex
+        // validates ≥ 1 question, so this is purely defensive) get the
+        // responder back via `Err` so we can reply with an empty map
+        // rather than silently dropping the channel and stalling the LLM.
         match super::super::bottom_pane::request_user_input::RequestUserInputOverlay::new_with_responder(
             questions,
             respond,
         ) {
-            Some(overlay) => {
+            Ok(overlay) => {
                 self.bottom_pane.set_view(Box::new(overlay));
             }
-            None => {
-                // Defensive: an empty batch never reaches us in practice
-                // (cortex validates ≥1 question), but we'd otherwise drop
-                // the responder silently and stall the LLM. Reply with an
-                // empty map so the agent can recover.
-                tracing::warn!("user-input: empty question batch reached TUI; signalling empty response");
+            Err(tx) => {
+                tracing::warn!("user-input: empty question batch reached TUI; replying empty");
+                if tx.send(std::collections::HashMap::new()).is_err() {
+                    tracing::warn!("user-input: empty-batch reply receiver already dropped");
+                }
             }
         }
     }

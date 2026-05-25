@@ -1,17 +1,12 @@
-// Phase 2 of the bottom-pane port: this module ships the host abstraction
-// before any concrete View attaches. The allow is removed in Phase 7 when the
-// host is wired into `App` and starts dispatching real input. See
-// `docs/tui-bottom-pane-port.md`.
-#![allow(dead_code)]
-
 //! Bottom pane host: a screen-bottom region that owns whichever modal "view"
 //! is currently displacing the composer (picker overlay, list selection, …).
 //!
 //! The host is intentionally tiny — it stores a single optional boxed View and
 //! routes input/render to it. The composer continues to render in its own
 //! `Rect`; when a View is active it claims height ABOVE the composer (the
-//! transcript shrinks to accommodate). Old popups in `crates/interface/src/tui/`
-//! are not migrated through this host — they keep their existing surfaces.
+//! transcript shrinks to accommodate). Existing popups in
+//! `crates/interface/src/tui/` are not migrated through this host — they keep
+//! their existing surfaces.
 //!
 //! Inspired by the reference TUI's BottomPane, with the View stack flattened
 //! to one slot (borg never stacks request_user_input overlays inside another
@@ -87,6 +82,10 @@ impl BottomPane {
     }
 
     /// Drop the current view without giving it a chance to handle anything.
+    /// Reserved for an LLM-side cancel that needs to tear the overlay down
+    /// without dispatching a key event; currently unused in production but
+    /// kept as the host's "force-close" surface.
+    #[allow(dead_code)]
     pub fn clear_view(&mut self) {
         self.view = None;
     }

@@ -1,20 +1,11 @@
-// Phase 6 lands the state machine — key dispatch, focus transitions, answer
-// submission, completion tracking. The trait wiring into `BottomPaneView`
-// arrives in Phase 7 with the App-side host integration. See
-// `docs/tui-bottom-pane-port.md`.
-#![allow(dead_code)]
-
 //! Picker overlay state for `request_user_input`.
 //!
-//! Phase 6 turns the geometric skeleton from Phase 3 into a functional
-//! overlay: key bindings (navigation, toggle, notes, submit, cancel), focus
-//! transitions between options and notes, and answer serialization back to
-//! cortex via the `respond` oneshot.
+//! Functional overlay state: key bindings (navigation, toggle, notes,
+//! submit, cancel), focus transitions between options and notes, and
+//! answer serialization back to cortex via the `respond` oneshot.
 //!
-//! Layout math (`layout.rs`) and render path (`render.rs`) remain pure
-//! visual modules — every behavioural decision lives in this file. The
-//! trait wiring (`BottomPaneView`) and removal of the legacy `AwaitingInput`
-//! state lands in Phase 7.
+//! Layout math (`layout.rs`) and render path (`render.rs`) are pure
+//! visual modules — every behavioural decision lives here.
 
 mod layout;
 mod render;
@@ -24,9 +15,6 @@ use ratatui::layout::Rect;
 use crate::tui::custom_terminal::Frame;
 
 use super::{BottomPaneView, CancellationEvent};
-
-#[allow(unused_imports)] // Re-export consumed by render.rs (Phase 4, parallel session).
-pub(crate) use layout::LayoutSections;
 
 use std::collections::HashMap;
 
@@ -52,14 +40,9 @@ pub(super) const DESIRED_SPACERS_BETWEEN_SECTIONS: u16 = 2;
 pub(super) const OPTIONS_PREFERRED_VISIBLE: u16 = 5;
 
 /// Height the notes editor wants when active: label row + input row + cursor.
-/// Phase 5 swaps the placeholder text editor for a real one; the preferred
-/// height stays the same so layout doesn't need to change.
 pub(super) const NOTES_DESIRED_HEIGHT: u16 = 3;
 
 /// Per-question UI state — selection cursor + free-form notes draft.
-///
-/// Phase 6 wires keys into this; Phase 3 just needs the fields so layout
-/// can ask "does this question want notes visible?"
 #[derive(Default, Debug, Clone)]
 pub(super) struct AnswerState {
     pub(super) options_state: ScrollState,
@@ -76,8 +59,7 @@ pub(super) struct AnswerState {
     pub(super) notes_visible: bool,
 }
 
-/// Which sub-region of the overlay currently owns the cursor. Phase 3 only
-/// needs `Options` (default); `Notes` is wired in Phase 6.
+/// Which sub-region of the overlay currently owns the cursor.
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum Focus {
     #[default]
@@ -91,12 +73,11 @@ pub(super) enum Focus {
 pub(crate) enum OverlayKeyOutcome {
     /// Key consumed; overlay stays active.
     Consumed,
-    /// Overlay finished (Enter on the last question, or Esc/Ctrl-C cancel).
-    /// Caller should drop the overlay on the next render pass.
+    /// Overlay finished (Enter on the last question, or Esc cancel). Ctrl-C
+    /// is delivered via the `on_ctrl_c` trait path instead — the host
+    /// short-circuits it before the trait-level key dispatch so it can also
+    /// cancel the in-flight turn.
     Done,
-    /// Ctrl-C was the trigger — host should also cancel the in-flight turn,
-    /// matching the legacy `handle_key_awaiting_input` semantic.
-    DoneInterruptingTurn,
 }
 
 /// Overlay state for one batch of `request_user_input` questions.
@@ -117,24 +98,8 @@ impl RequestUserInputOverlay {
     /// Construct a fresh overlay for a non-empty question batch with no
     /// responder attached — used by render/layout tests that don't drive
     /// the state machine. For real use call [`new_with_responder`].
+    #[cfg(test)]
     pub(crate) fn new(questions: Vec<Question>) -> Option<Self> {
-        Self::build(questions, None)
-    }
-
-    /// Construct an overlay bound to a oneshot responder. Returns `None` if
-    /// the question batch is empty (the cortex side validates this earlier;
-    /// the overlay refuses defensively rather than panicking on `[0]`).
-    pub(crate) fn new_with_responder(
-        questions: Vec<Question>,
-        respond: oneshot::Sender<HashMap<String, Answer>>,
-    ) -> Option<Self> {
-        Self::build(questions, Some(respond))
-    }
-
-    fn build(
-        questions: Vec<Question>,
-        respond: Option<oneshot::Sender<HashMap<String, Answer>>>,
-    ) -> Option<Self> {
         if questions.is_empty() {
             return None;
         }
@@ -144,19 +109,40 @@ impl RequestUserInputOverlay {
             answers,
             current_idx: 0,
             focus: Focus::Options,
-            respond,
+            respond: None,
+            done: false,
+        })
+    }
+
+    /// Construct an overlay bound to a oneshot responder. If the question
+    /// batch is empty (cortex validates ≥ 1 question, but the overlay
+    /// refuses defensively rather than panicking on `[0]`), the responder
+    /// is given back to the caller via `Err` so the agent doesn't stall
+    /// on a dropped channel.
+    pub(crate) fn new_with_responder(
+        questions: Vec<Question>,
+        respond: oneshot::Sender<HashMap<String, Answer>>,
+    ) -> Result<Self, oneshot::Sender<HashMap<String, Answer>>> {
+        if questions.is_empty() {
+            return Err(respond);
+        }
+        let answers = questions.iter().map(|_| AnswerState::default()).collect();
+        Ok(Self {
+            questions,
+            answers,
+            current_idx: 0,
+            focus: Focus::Options,
+            respond: Some(respond),
             done: false,
         })
     }
 
     /// `true` once the user has submitted or cancelled the batch. The host
-    /// uses this to drop the overlay; subsequent key events are ignored.
+    /// reads completion via the `BottomPaneView::is_complete` trait method;
+    /// this accessor is for direct callers (tests) and stays cfg-test.
+    #[cfg(test)]
     pub(crate) fn is_done(&self) -> bool {
         self.done
-    }
-
-    pub(super) fn questions(&self) -> &[Question] {
-        &self.questions
     }
 
     pub(super) fn current(&self) -> &Question {
@@ -232,14 +218,13 @@ impl RequestUserInputOverlay {
         }
     }
 
-    /// Footer hint rows. Phase 4 replaces this with a real composer of
-    /// hints (Enter/Tab/Esc descriptions); for now a single row is enough
-    /// for layout to be exercised end-to-end.
+    /// Footer hint rows reserved by layout. A single row carries the
+    /// Enter/Tab/Esc legend; render.rs composes the actual text.
     pub(super) fn footer_required_height(&self, _width: u16) -> u16 {
         1
     }
 
-    // ----- State machine (Phase 6) ---------------------------------------
+    // ----- State machine -------------------------------------------------
 
     /// Index of the auto-appended "Other" row for the current question.
     /// Always `current().options.len()`.
@@ -257,19 +242,16 @@ impl RequestUserInputOverlay {
             return OverlayKeyOutcome::Done;
         }
 
-        // Esc and Ctrl-C cancel the entire batch with INTERRUPTED_MARKER per
-        // question so the LLM sees one shape regardless of which key the
-        // user mashed. Tab is the only key that toggles the notes editor
-        // closed — Esc does not steal it (matches legacy semantics).
+        // Esc cancels the entire batch with INTERRUPTED_MARKER per question.
+        // Ctrl-C is intercepted by the host *before* the trait-level
+        // key dispatch and routed through `on_ctrl_c`, so the trait path
+        // only sees Esc here. We still match Ctrl-C defensively in case
+        // a future caller invokes `handle_key` directly.
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if key.code == KeyCode::Esc || ctrl_c {
             self.cancel_with_interrupt();
-            return if ctrl_c {
-                OverlayKeyOutcome::DoneInterruptingTurn
-            } else {
-                OverlayKeyOutcome::Done
-            };
+            return OverlayKeyOutcome::Done;
         }
 
         if self.focus == Focus::Notes {
@@ -357,9 +339,41 @@ impl RequestUserInputOverlay {
                     self.auto_open_notes_on_other(multi);
                 }
             }
+            KeyCode::PageUp => {
+                self.answers[self.current_idx]
+                    .options_state
+                    .page_up_clamped(total_rows, OPTIONS_PREFERRED_VISIBLE as usize);
+                self.auto_open_notes_on_other(multi);
+            }
+            KeyCode::PageDown => {
+                self.answers[self.current_idx]
+                    .options_state
+                    .page_down_clamped(total_rows, OPTIONS_PREFERRED_VISIBLE as usize);
+                self.auto_open_notes_on_other(multi);
+            }
+            KeyCode::Home => {
+                self.answers[self.current_idx]
+                    .options_state
+                    .jump_top(total_rows, OPTIONS_PREFERRED_VISIBLE as usize);
+                self.auto_open_notes_on_other(multi);
+            }
+            KeyCode::End => {
+                self.answers[self.current_idx]
+                    .options_state
+                    .jump_bottom(total_rows, OPTIONS_PREFERRED_VISIBLE as usize);
+                self.auto_open_notes_on_other(multi);
+            }
             KeyCode::Tab => {
                 self.answers[self.current_idx].notes_visible = true;
                 self.focus = Focus::Notes;
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                // Clear the current question's selection — both single-select
+                // cursor and multi-select committed set. Notes are untouched
+                // (Backspace inside Notes focus has its own handler).
+                let answer = &mut self.answers[self.current_idx];
+                answer.options_state.selected_idx = None;
+                answer.selected.clear();
             }
             KeyCode::Enter => {
                 self.advance_or_submit();
@@ -499,19 +513,18 @@ impl BottomPaneView for RequestUserInputOverlay {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Delegates to the Phase 4 visual layer in `render.rs`, which
-        // takes a `&mut Buffer` so the call site stays Frame-agnostic.
-        // BottomPane has already issued a `Clear` over `area`.
+        // Delegates to the visual layer in `render.rs`, which takes a
+        // `&mut Buffer` so the call site stays Frame-agnostic. BottomPane
+        // has already issued a `Clear` over `area`.
         self.render_ui(frame.buffer_mut(), area);
     }
 
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
-        // The host inspects `is_complete()` after dispatch — outcomes
-        // `Done` and `DoneInterruptingTurn` both flip `self.done = true`,
-        // which is what `is_complete` reads. The Ctrl-C distinction is
-        // surfaced through `on_ctrl_c` instead so the host can decide
-        // whether to ALSO cancel the in-flight turn.
-        let _ = self.handle_key(key);
+        // The host inspects `is_complete()` after dispatch; the outcome
+        // enum itself is only relevant to direct callers (tests). Ctrl-C
+        // is delivered via `on_ctrl_c` so the host can ALSO cancel the
+        // in-flight turn.
+        self.handle_key(key);
     }
 
     fn is_complete(&self) -> bool {
@@ -571,6 +584,24 @@ mod tests {
     #[test]
     fn empty_question_batch_refuses_to_construct() {
         assert!(RequestUserInputOverlay::new(Vec::new()).is_none());
+    }
+
+    /// Empty batch through the responder constructor returns the sender via
+    /// `Err` so the caller can reply with an empty/interrupt map instead of
+    /// silently dropping the channel — which would deadlock the agent on
+    /// `recv()`. This is the contract `events.rs` relies on.
+    #[test]
+    fn empty_batch_with_responder_returns_sender_via_err() {
+        let (tx, mut rx) = oneshot::channel();
+        let err_tx = match RequestUserInputOverlay::new_with_responder(Vec::new(), tx) {
+            Ok(_) => panic!("empty batch must not construct an overlay"),
+            Err(tx) => tx,
+        };
+        // The recovered sender still works — agent can be unblocked.
+        err_tx
+            .send(HashMap::new())
+            .expect("recovered sender must still send");
+        assert!(rx.try_recv().is_ok());
     }
 
     /// `current_options_len` includes the auto-appended "Other" row. Layout
@@ -640,10 +671,6 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
-    fn ctrl_c() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
-    }
-
     /// Submit on a single-select question with cursor on first option
     /// produces that option's label. Receiver gets the answer map keyed
     /// by question id; overlay flips to `done`.
@@ -651,7 +678,9 @@ mod tests {
     fn single_select_enter_submits_selected_option() {
         let (tx, mut rx) = oneshot::channel();
         let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("timezone", "tz?", 3)], tx).unwrap();
+            RequestUserInputOverlay::new_with_responder(vec![q("timezone", "tz?", 3)], tx)
+                .ok()
+                .unwrap();
         // Cursor defaults to None; pressing Down once selects row 0 (wrap
         // semantics of move_down_wrap on an empty selection).
         let outcome = overlay.handle_key(key_code(KeyCode::Down));
@@ -672,7 +701,9 @@ mod tests {
     fn multi_select_space_toggles_and_preserves_declaration_order() {
         let (tx, mut rx) = oneshot::channel();
         let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![multi_q("flavors", 3)], tx).unwrap();
+            RequestUserInputOverlay::new_with_responder(vec![multi_q("flavors", 3)], tx)
+                .ok()
+                .unwrap();
         // Toggle rows 2, 0, 1 in that order; expect declaration order back.
         overlay.handle_key(key_char('3'));
         overlay.handle_key(key_code(KeyCode::Char(' ')));
@@ -698,8 +729,9 @@ mod tests {
     #[test]
     fn tab_into_notes_round_trips_typed_text_with_user_note_prefix() {
         let (tx, mut rx) = oneshot::channel();
-        let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("style", "?", 2)], tx).unwrap();
+        let mut overlay = RequestUserInputOverlay::new_with_responder(vec![q("style", "?", 2)], tx)
+            .ok()
+            .unwrap();
         overlay.handle_key(key_code(KeyCode::Down)); // pick option 0
         overlay.handle_key(key_code(KeyCode::Tab));
         assert_eq!(overlay.focus, Focus::Notes);
@@ -724,6 +756,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let mut overlay =
             RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2), q("b", "?", 2)], tx)
+                .ok()
                 .unwrap();
         let outcome = overlay.handle_key(key_code(KeyCode::Esc));
         assert_eq!(outcome, OverlayKeyOutcome::Done);
@@ -739,27 +772,35 @@ mod tests {
         }
     }
 
-    /// Ctrl-C signals DoneInterruptingTurn so the host knows to also cancel
-    /// the in-flight LLM turn. Esc alone returns Done (overlay dismissed,
-    /// turn resumes). Distinguishing the two is what lets the user pick
-    /// between "answer aborted, keep streaming" vs "kill everything".
+    /// Ctrl-C delivered via the `on_ctrl_c` trait path cancels the batch
+    /// with INTERRUPTED_MARKER per question AND returns `Handled` so the
+    /// host can ALSO tear down the in-flight LLM turn. Esc through the
+    /// key path returns Done (overlay dismissed, turn resumes).
     #[test]
-    fn ctrl_c_signals_turn_cancel_distinct_from_esc() {
+    fn ctrl_c_cancels_via_on_ctrl_c_and_esc_via_handle_key() {
         let (tx_a, _rx_a) = oneshot::channel();
         let mut esc_overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx_a).unwrap();
+            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx_a)
+                .ok()
+                .unwrap();
         assert_eq!(
             esc_overlay.handle_key(key_code(KeyCode::Esc)),
             OverlayKeyOutcome::Done
         );
+        assert!(esc_overlay.is_done());
 
-        let (tx_b, _rx_b) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
         let mut ctrl_overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx_b).unwrap();
+            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx_b)
+                .ok()
+                .unwrap();
         assert_eq!(
-            ctrl_overlay.handle_key(ctrl_c()),
-            OverlayKeyOutcome::DoneInterruptingTurn
+            ctrl_overlay.on_ctrl_c(),
+            super::super::CancellationEvent::Handled
         );
+        assert!(ctrl_overlay.is_done());
+        let answers = rx_b.try_recv().expect("on_ctrl_c must send interrupt map");
+        assert_eq!(answers.get("a").unwrap().answers, vec!["[interrupted]"]);
     }
 
     /// Enter on a non-last question advances to the next question instead
@@ -772,6 +813,7 @@ mod tests {
             vec![q("a", "?", 2), q("b", "?", 2), q("c", "?", 2)],
             tx,
         )
+        .ok()
         .unwrap();
         overlay.handle_key(key_code(KeyCode::Down));
         overlay.handle_key(key_code(KeyCode::Enter));
@@ -797,8 +839,9 @@ mod tests {
     #[test]
     fn single_select_other_row_auto_opens_notes() {
         let (tx, _rx) = oneshot::channel();
-        let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx).unwrap();
+        let mut overlay = RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx)
+            .ok()
+            .unwrap();
         // 3 rows total (2 options + Other). Press Down once (cursor 0),
         // Down again (cursor 1), Down again (cursor 2 = Other).
         overlay.handle_key(key_code(KeyCode::Down));
@@ -816,8 +859,9 @@ mod tests {
     #[test]
     fn numeric_keys_jump_cursor_in_range_only() {
         let (tx, _rx) = oneshot::channel();
-        let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 3)], tx).unwrap();
+        let mut overlay = RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 3)], tx)
+            .ok()
+            .unwrap();
         // 3 options + Other = 4 rows (indices 0-3).
         overlay.handle_key(key_char('2'));
         assert_eq!(overlay.cursor_row(), 1);
@@ -839,8 +883,9 @@ mod tests {
     #[test]
     fn keys_after_done_are_no_op_and_dont_double_send() {
         let (tx, mut rx) = oneshot::channel();
-        let mut overlay =
-            RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx).unwrap();
+        let mut overlay = RequestUserInputOverlay::new_with_responder(vec![q("a", "?", 2)], tx)
+            .ok()
+            .unwrap();
         overlay.handle_key(key_code(KeyCode::Down));
         overlay.handle_key(key_code(KeyCode::Enter));
         assert!(overlay.is_done());
@@ -851,11 +896,10 @@ mod tests {
         assert_eq!(outcome, OverlayKeyOutcome::Done);
     }
 
-    /// End-to-end Phase 8 integration: drive the overlay programmatically
-    /// through a multi-question batch, then serialize the answers through
-    /// cortex's `serialize_answers` and assert the JSON matches the
-    /// cortex-contract shape. This is the "works just like Codex" test —
-    /// it goes through the same code path the running app would, including
+    /// End-to-end integration: drive the overlay programmatically through a
+    /// multi-question batch, then serialize the answers through cortex's
+    /// `serialize_answers` and assert the JSON matches the cortex-contract
+    /// shape. Exercises the same code path the running app would, including
     /// the user_note prefix, declaration order for multi-select, and the
     /// preserved-question-order JSON output that the LLM sees.
     #[test]
@@ -863,8 +907,9 @@ mod tests {
         use cortex::tool_handlers::user_input::serialize_answers;
         let questions = vec![q("color", "?", 2), multi_q("flavors", 3), q("size", "?", 2)];
         let (tx, mut rx) = oneshot::channel();
-        let mut overlay =
-            RequestUserInputOverlay::new_with_responder(questions.clone(), tx).unwrap();
+        let mut overlay = RequestUserInputOverlay::new_with_responder(questions.clone(), tx)
+            .ok()
+            .unwrap();
 
         // Q1: pick Option 0 (single-select).
         overlay.handle_key(key_code(KeyCode::Down));

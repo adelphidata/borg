@@ -4,11 +4,9 @@
 //! question, options list, notes editor) plus a footer-row count, collapsing
 //! gracefully as available height shrinks. Near-verbatim port of the
 //! reference TUI's layout module; the overlay's geometric accessors live in
-//! the sibling `mod.rs`.
-//!
-//! Phase 3 only needs the math + tests against the overlay skeleton; Phase 4
-//! consumes `LayoutSections` for rendering and Phase 6 wires the focus
-//! transitions that change the inputs (notes visibility, question count).
+//! the sibling `mod.rs`. `render.rs` consumes `LayoutSections`; the state
+//! machine in `mod.rs` decides when the inputs change (notes visibility,
+//! question count).
 
 use ratatui::layout::Rect;
 

@@ -79,9 +79,8 @@ impl<'a> App<'a> {
         self.composer.render(frame, app_layout.composer);
         // BottomPane: when a modal view is active, give it the bottom slice
         // of the screen (composer rect plus enough rows above to satisfy
-        // its desired_height). This is the Phase 7 hook for the new
-        // request_user_input picker — over-paints the transcript above the
-        // composer when the picker is larger than the composer's own
+        // its desired_height). Over-paints the transcript above the
+        // composer when the view is larger than the composer's own
         // height. The view's render path Clears its rect first.
         if self.bottom_pane.is_active() {
             let desired = self.bottom_pane.desired_height(area.width);

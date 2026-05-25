@@ -1,10 +1,3 @@
-// Phase 4 of the bottom-pane port: visual layer for the picker overlay. The
-// state machine that drives focus, selection, and submission lands in Phase 6;
-// until then this module only reads from the overlay's existing accessors and
-// is exercised through layout-driven render tests. See
-// `docs/tui-bottom-pane-port.md`.
-#![allow(dead_code)]
-
 //! Picker overlay render path.
 //!
 //! Five stacked sections (see `layout.rs`) get painted top-to-bottom:
@@ -12,14 +5,11 @@
 //! `RequestUserInputOverlay::layout_sections`; this module only decides
 //! *what pixels go where* once the rects are handed to it.
 //!
-//! Adapted-not-verbatim port: the reference TUI's render shares helpers with
-//! a dozen other popups (`selection_popup_common`, `menu_surface_inset`,
-//! `FooterTip`, the `Renderable` trait). Pulling those in is its own
-//! multi-file port, so this module inlines the small bits it needs (option-
-//! row line construction, footer hint composition) and skips features that
-//! depend on Phase 6 state (the unanswered-confirmation overlay, the
-//! ChatComposer-backed notes editor). Phase 5 will swap the notes stub for a
-//! real `TextLine` editor; Phase 6 wires keys + the confirmation flow.
+//! Adapted-not-verbatim port from the reference TUI: the reference render
+//! shares helpers across a dozen popups; here we inline the small bits we
+//! need (option-row line construction, footer hint composition) and skip
+//! features that aren't wired (the unanswered-confirmation overlay, the
+//! richer composer-backed notes editor).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -130,7 +120,7 @@ impl RequestUserInputOverlay {
             return;
         }
         let visible = area.height as usize;
-        // Clone the scroll state so render stays read-only — Phase 6's key
+        // Clone the scroll state so render stays read-only — the key
         // handler is what actually advances the cursor.
         let mut state = self.current_answer().options_state;
         state.ensure_visible(rows.len(), visible);
@@ -156,11 +146,8 @@ impl RequestUserInputOverlay {
         }
     }
 
-    /// Phase 4 stub: render `notes` as a single read-only text row with a
-    /// left vertical bar. Phase 5 replaces this with a real `TextLine`
-    /// editor (cursor, insert, backspace). Layout already reserves
-    /// `NOTES_DESIRED_HEIGHT` rows when notes are visible, so the visual
-    /// footprint stays stable when the editor lands.
+    /// Render `notes` as a single text row with a left vertical bar.
+    /// Layout reserves `NOTES_DESIRED_HEIGHT` rows when notes are visible.
     fn render_notes(&self, buf: &mut Buffer, area: Rect) {
         let label_row = Rect {
             x: area.x,
@@ -183,7 +170,12 @@ impl RequestUserInputOverlay {
         let notes = &self.current_answer().notes;
         let bar = Span::styled("▌ ", Style::default().fg(theme::cyan()));
         let body = if notes.is_empty() {
-            Span::styled("(type when focused on Notes)", theme::dim())
+            let hint = if self.focus == Focus::Notes {
+                "(start typing)"
+            } else {
+                "(press Tab to add a note)"
+            };
+            Span::styled(hint, theme::dim())
         } else {
             Span::raw(notes.clone())
         };

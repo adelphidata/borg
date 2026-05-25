@@ -1,9 +1,3 @@
-// Phase 1 of the bottom-pane port: this module lands ahead of its first
-// consumer (the picker overlay arrives in later phases). The allow is
-// temporary and is removed in the phase that wires the overlay into `App`.
-// See `docs/tui-bottom-pane-port.md`.
-#![allow(dead_code)]
-
 //! Selection + scroll bookkeeping for vertical list pickers.
 //!
 //! Encapsulates the common behaviour of a selectable list that supports:
@@ -28,19 +22,13 @@ pub(crate) struct ScrollState {
 }
 
 impl ScrollState {
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            selected_idx: None,
-            scroll_top: 0,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.selected_idx = None;
-        self.scroll_top = 0;
+        Self::default()
     }
 
     /// Clamp selection into `[0, len-1]`, or `None` when empty.
+    #[cfg(test)]
     pub fn clamp_selection(&mut self, len: usize) {
         if self.clear_if_empty(len) {
             return;

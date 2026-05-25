@@ -135,9 +135,8 @@ impl<'a> App<'a> {
             // Esc-cancelled). In either case we resume the streaming
             // surface — the responder oneshot was already consumed
             // inside the overlay's submit/cancel paths.
-            let was_active = true;
-            let _consumed = self.bottom_pane.handle_key_event(key);
-            if was_active && !self.bottom_pane.is_active() {
+            self.bottom_pane.handle_key_event(key);
+            if !self.bottom_pane.is_active() {
                 self.composer.set_text("");
                 self.resume_streaming();
             }
