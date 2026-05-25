@@ -422,13 +422,7 @@ impl Agent {
     }
 }
 
-/// Number of `task_runs` rows to inspect when summarizing 24h activity for
-/// the `<scheduled_tasks>` snapshot. 24h matches the heartbeat augmenter's
-/// window so the two surfaces stay in sync.
-pub(super) const SCHEDULED_TASKS_WINDOW_SECS: i64 = 24 * 60 * 60;
-/// Cap on per-task lines emitted into the snapshot to keep prompt size sane
-/// when many tasks are failing simultaneously.
-pub(super) const SCHEDULED_TASKS_MAX_LISTED: usize = 5;
+pub(super) use crate::constants::{SCHEDULED_TASKS_MAX_LISTED, SCHEDULED_TASKS_WINDOW_SECS};
 
 /// Pure formatter — extracted so the section can be unit-tested without
 /// constructing a full `Agent` (which requires sessions, metrics, etc.).

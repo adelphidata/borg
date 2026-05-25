@@ -646,6 +646,15 @@ pub const STALLED_TASK_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 /// that is about to fire on the normal cadence.
 pub const STALLED_TASK_GRACE_SECS: i64 = 3600;
 
+/// Lookback window (24h) used by the `<scheduled_tasks>` system-prompt
+/// snapshot when counting recent failed/succeeded `task_runs`. Matches the
+/// heartbeat augmenter's window so the two surfaces stay in sync.
+pub const SCHEDULED_TASKS_WINDOW_SECS: i64 = SECS_PER_DAY;
+
+/// Cap on per-task lines emitted into the `<scheduled_tasks>` snapshot to
+/// keep prompt size bounded when many tasks are failing simultaneously.
+pub const SCHEDULED_TASKS_MAX_LISTED: usize = 5;
+
 /// Warn when a memory entry exceeds this token count — writes succeed
 /// but the entry is close to the hard cap.
 pub const MEMORY_ENTRY_WARN_TOKENS: usize = 8_000;
