@@ -133,13 +133,14 @@ pub enum AppState {
     AwaitingApproval {
         respond: Option<oneshot::Sender<bool>>,
     },
-    /// Agent has asked one or more questions mid-turn via `request_user_input`;
-    /// waiting for the user to walk through the carousel and submit answers.
-    ///
-    /// `questions` is the immutable batch (up to `MAX_QUESTIONS` entries). `current_idx` is the
-    /// active question; `per_question_state` parallels `questions` and holds
-    /// per-question UI state (cursor + selections + notes). `respond` carries
-    /// the oneshot back to the agent — `None` once consumed.
+    /// Legacy carousel state — Phase 7 of the bottom-pane port moved
+    /// production `request_user_input` flow into the `BottomPane` host
+    /// (`App::bottom_pane`). The variant + its handlers stay so the
+    /// existing test suite (which directly injects this state) keeps
+    /// exercising the legacy key handler. New production flow never
+    /// constructs this variant. Phase 7b cleanup deletes the variant
+    /// and its supporting code once those tests are migrated.
+    #[allow(dead_code)]
     AwaitingInput {
         questions: Vec<cortex::tool_handlers::user_input::Question>,
         current_idx: usize,
@@ -587,6 +588,11 @@ pub struct App<'a> {
     /// to suppress restart UX (no "listening…" indicator after the cycle
     /// closes).
     pub voice_single_shot: bool,
+    /// Host for modal "views" displacing the composer — currently only the
+    /// `request_user_input` picker overlay. When `is_active()` returns true
+    /// the App routes keys to the pane and renders it above the composer.
+    /// See `crates/interface/src/tui/bottom_pane/`.
+    pub bottom_pane: super::bottom_pane::BottomPane,
 }
 
 impl<'a> App<'a> {
@@ -674,6 +680,7 @@ impl<'a> App<'a> {
             voice_rx: None,
             voice_status: None,
             voice_single_shot: false,
+            bottom_pane: super::bottom_pane::BottomPane::new(),
         };
         app.refresh_ambient_status();
         // One-shot persistent-warning notice. Rendered once after the

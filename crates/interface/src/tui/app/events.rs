@@ -482,15 +482,27 @@ impl<'a> App<'a> {
             }
         }
         self.cells.push(HistoryCell::System { text });
-        let per_question_state = (0..questions.len())
-            .map(|_| super::QuestionState::default())
-            .collect();
-        self.state = AppState::AwaitingInput {
+        // Install the new BottomPane overlay (Phase 7 wiring). The legacy
+        // `AppState::AwaitingInput` carousel is no longer instantiated from
+        // production — its tests still exercise the old key handler via
+        // direct state injection, but real UserInputRequest events flow
+        // through the new host now. The old struct fields remain only
+        // until Phase 7b cleanup deletes them.
+        match super::super::bottom_pane::request_user_input::RequestUserInputOverlay::new_with_responder(
             questions,
-            current_idx: 0,
-            per_question_state,
-            respond: Some(respond),
-        };
+            respond,
+        ) {
+            Some(overlay) => {
+                self.bottom_pane.set_view(Box::new(overlay));
+            }
+            None => {
+                // Defensive: an empty batch never reaches us in practice
+                // (cortex validates ≥1 question), but we'd otherwise drop
+                // the responder silently and stall the LLM. Reply with an
+                // empty map so the agent can recover.
+                tracing::warn!("user-input: empty question batch reached TUI; signalling empty response");
+            }
+        }
     }
 
     fn handle_event_tool_output_delta(&mut self, delta: String, is_stderr: bool) {

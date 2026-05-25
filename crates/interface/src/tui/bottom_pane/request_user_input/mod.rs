@@ -19,6 +19,15 @@
 mod layout;
 mod render;
 
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
+
+use crate::tui::custom_terminal::Frame;
+
+use super::{BottomPaneView, CancellationEvent};
+
 #[allow(unused_imports)] // Re-export consumed by render.rs (Phase 4, parallel session).
 pub(crate) use layout::LayoutSections;
 
@@ -468,6 +477,184 @@ impl RequestUserInputOverlay {
             out.insert(q.id.clone(), Answer { answers });
         }
         out
+    }
+
+    /// Paint the overlay into `area` using the Phase 3 layout sections.
+    /// Minimal but functional — progress header, wrapped question, options
+    /// list with selection marker + checkbox glyph, optional notes input,
+    /// footer hints. Themes come from `crate::tui::theme` so colours match
+    /// the rest of the TUI; no new colour constants introduced here.
+    fn render_inline(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let sections = self.layout_sections(area);
+        let total = self.questions.len();
+
+        // Progress row: "Question N/Total"
+        if sections.progress_area.height > 0 {
+            let progress = Line::from(vec![Span::styled(
+                format!("Question {}/{}", self.current_idx + 1, total),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]);
+            frame.render_widget(
+                Paragraph::new(progress).wrap(Wrap { trim: false }),
+                sections.progress_area,
+            );
+        }
+
+        // Question text (wrapped earlier by layout_sections).
+        if sections.question_area.height > 0 && !sections.question_lines.is_empty() {
+            let lines: Vec<Line> = sections
+                .question_lines
+                .iter()
+                .map(|s| Line::from(Span::raw(s.clone())))
+                .collect();
+            frame.render_widget(Paragraph::new(lines), sections.question_area);
+        }
+
+        // Options list with selection + checkbox markers.
+        if sections.options_area.height > 0 {
+            let cursor = self.cursor_row();
+            let multi = self.current().multi_select;
+            let selected = &self.current_answer().selected;
+            let mut rows: Vec<Line> = Vec::new();
+            let options_len = self.current().options.len();
+            let total_rows = options_len + 1;
+            let visible = sections.options_area.height as usize;
+            let scroll_top = self.current_answer().options_state.scroll_top;
+            let end = (scroll_top + visible).min(total_rows);
+            for idx in scroll_top..end {
+                let label = if idx < options_len {
+                    self.current().options[idx].label.as_str()
+                } else {
+                    other_label()
+                };
+                let marker = if idx == cursor { "› " } else { "  " };
+                let check = if multi {
+                    if selected.contains(&idx) {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    }
+                } else {
+                    ""
+                };
+                let style = if idx == cursor {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(marker.to_string(), style),
+                    Span::styled(check.to_string(), style),
+                    Span::styled(label.to_string(), style),
+                ]));
+            }
+            frame.render_widget(Paragraph::new(rows), sections.options_area);
+        }
+
+        // Notes section (when visible).
+        if sections.notes_area.height > 0 {
+            let notes = &self.current_answer().notes;
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "Notes (Tab to toggle):",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            lines.push(Line::from(Span::raw(
+                if notes.is_empty() && self.focus != Focus::Notes {
+                    "(empty)".to_string()
+                } else {
+                    notes.clone()
+                },
+            )));
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                sections.notes_area,
+            );
+        }
+
+        // Footer hint — single line giving the basic bindings the user
+        // needs to operate the picker. Anchored just below the overlay
+        // area when room allows; otherwise overlaid at the bottom of
+        // `area`. Phase 4 expands this into proper coloured key hints.
+        if sections.footer_lines > 0 {
+            let footer_y = area.y + area.height - 1;
+            let footer_rect = Rect {
+                x: area.x,
+                y: footer_y,
+                width: area.width,
+                height: 1,
+            };
+            let hint = "↑↓ select  Space toggle  Tab notes  Enter next/submit  Esc cancel";
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    hint,
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                footer_rect,
+            );
+        }
+    }
+}
+
+impl BottomPaneView for RequestUserInputOverlay {
+    /// Preferred overlay height: question + options + (optional) notes + 1
+    /// progress row + 1 footer hint. The layout module's collapse rules
+    /// take over when the host hands us less; this is a "give me what
+    /// you'd give me at full size" estimate the host arbitrates against.
+    fn desired_height(&self, width: u16) -> u16 {
+        let question = self.wrapped_question_lines(width).len() as u16;
+        let options = self.options_preferred_height(width);
+        let notes = self.notes_input_height(width);
+        let footer = self.footer_required_height(width);
+        // +1 progress row, +1 spacer between question and options when both
+        // are present. Matches the layout module's preferred allocation.
+        let spacers = if question > 0 && options > 0 { 1 } else { 0 };
+        question
+            .saturating_add(options)
+            .saturating_add(notes)
+            .saturating_add(footer)
+            .saturating_add(1) // progress row
+            .saturating_add(spacers)
+    }
+
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        // Minimal in-trait render path that consumes the Phase 3
+        // `LayoutSections` directly. The parallel-session richer
+        // `render.rs` (using `ratatui::Frame`) sits as a future
+        // beautification step — borg's `App` uses `custom_terminal::Frame`
+        // throughout, so all in-tree views render through this path. When
+        // the visual layer is unified, this body becomes a thin delegator.
+        self.render_inline(frame, area);
+    }
+
+    fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
+        // The host inspects `is_complete()` after dispatch — outcomes
+        // `Done` and `DoneInterruptingTurn` both flip `self.done = true`,
+        // which is what `is_complete` reads. The Ctrl-C distinction is
+        // surfaced through `on_ctrl_c` instead so the host can decide
+        // whether to ALSO cancel the in-flight turn.
+        let _ = self.handle_key(key);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.done
+    }
+
+    fn on_ctrl_c(&mut self) -> CancellationEvent {
+        if self.done {
+            return CancellationEvent::Handled;
+        }
+        self.cancel_with_interrupt();
+        // `cancel_with_interrupt` sets done=true, so the host will drop
+        // the view after this call. We return `Handled` so the App-level
+        // cancel path (which would tear down the turn) does NOT also fire
+        // — Esc-style cancel keeps the turn streaming. Ctrl-C-style cancel
+        // is delivered via `handle_key_event` so the App can disambiguate
+        // from the key path.
+        CancellationEvent::Handled
     }
 }
 

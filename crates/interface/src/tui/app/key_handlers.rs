@@ -98,6 +98,51 @@ impl<'a> App<'a> {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return Ok(AppAction::Continue);
         }
+        // BottomPane host takes priority: when a modal view (e.g. the
+        // request_user_input picker overlay) is active, route every key
+        // there first. The host returns `true` when a view consumed the
+        // key, in which case the App-level state handlers below stay out
+        // of it. Ctrl-C is routed via `on_ctrl_c` so the App can decide
+        // whether to ALSO cancel the in-flight turn after the overlay
+        // dismisses itself.
+        if self.bottom_pane.is_active() {
+            use crossterm::event::{KeyCode, KeyModifiers};
+            let is_ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if is_ctrl_c {
+                // Let the view handle it (mark itself done with interrupt
+                // markers); then we also tear down the in-flight turn,
+                // matching the legacy `handle_key_awaiting_input` Ctrl-C
+                // semantics. on_ctrl_c returning Handled is the signal we
+                // need to also kill the turn.
+                let outcome = self.bottom_pane.on_ctrl_c();
+                if outcome == super::super::bottom_pane::CancellationEvent::Handled {
+                    if let Some(token) = self.cancel_token.take() {
+                        token.cancel();
+                    }
+                    self.event_rx = None;
+                    self.steer_tx = None;
+                    self.composer.set_text("");
+                    self.cells.push(HistoryCell::System {
+                        text: "[interrupted]".to_string(),
+                    });
+                    self.state = AppState::Idle;
+                }
+                return Ok(AppAction::Continue);
+            }
+            // Normal key path: dispatch to active view. After dispatch,
+            // the host may have dropped the view (overlay submitted or
+            // Esc-cancelled). In either case we resume the streaming
+            // surface — the responder oneshot was already consumed
+            // inside the overlay's submit/cancel paths.
+            let was_active = true;
+            let _consumed = self.bottom_pane.handle_key_event(key);
+            if was_active && !self.bottom_pane.is_active() {
+                self.composer.set_text("");
+                self.resume_streaming();
+            }
+            return Ok(AppAction::Continue);
+        }
         match &self.state {
             AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
             AppState::AwaitingApproval { .. } => self.handle_key_awaiting_approval(key),

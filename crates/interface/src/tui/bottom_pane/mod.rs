@@ -19,7 +19,9 @@
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
-use ratatui::Frame;
+use ratatui::widgets::{Clear, Widget};
+
+use crate::tui::custom_terminal::Frame;
 
 pub(crate) mod request_user_input;
 
@@ -101,6 +103,10 @@ impl BottomPane {
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(view) = self.view.as_ref() {
+            // Wipe the rect before delegating so the view never sees stale
+            // pixels from the transcript or composer underneath. Views
+            // document this expectation (see `request_user_input::render`).
+            Clear.render(area, frame.buffer_mut());
             view.render(frame, area);
         }
     }

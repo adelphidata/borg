@@ -78,6 +78,30 @@ impl<'a> App<'a> {
         }
         self.composer.render(frame, app_layout.composer);
         self.render_choices_overlay(frame, app_layout.composer);
+        // BottomPane: when a modal view is active, give it the bottom slice
+        // of the screen (composer rect plus enough rows above to satisfy
+        // its desired_height). This is the Phase 7 hook for the new
+        // request_user_input picker — over-paints the transcript above the
+        // composer when the picker is larger than the composer's own
+        // height. The view's render path Clears its rect first.
+        if self.bottom_pane.is_active() {
+            let desired = self.bottom_pane.desired_height(area.width);
+            // Anchor the overlay to the bottom of the composer; grow
+            // upward as needed. Clamp to the screen area so we never
+            // render outside the terminal.
+            let bottom = app_layout
+                .composer
+                .y
+                .saturating_add(app_layout.composer.height);
+            let top = bottom.saturating_sub(desired).max(area.y);
+            let overlay_rect = ratatui::layout::Rect {
+                x: area.x,
+                y: top,
+                width: area.width,
+                height: bottom.saturating_sub(top),
+            };
+            self.bottom_pane.render(frame, overlay_rect);
+        }
         if app_layout.footer.height > 0 {
             self.render_footer(frame, app_layout.footer);
         }
