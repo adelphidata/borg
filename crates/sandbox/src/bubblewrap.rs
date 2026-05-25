@@ -1,3 +1,4 @@
+use crate::constants::{SYSTEM_RO_BINDS, SYSTEM_TMPFS_MOUNTS};
 use crate::policy::SandboxPolicy;
 use std::path::Path;
 
@@ -67,13 +68,15 @@ pub fn build_bwrap_args_versioned(
 
     push_bind(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
 
-    for path in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
+    for path in SYSTEM_RO_BINDS {
         if Path::new(path).exists() {
             push_bind(&mut args, "--ro-bind", path);
         }
     }
 
-    args.extend(["--tmpfs".to_string(), "/tmp".to_string()]);
+    for mount in SYSTEM_TMPFS_MOUNTS {
+        args.extend(["--tmpfs".to_string(), (*mount).to_string()]);
+    }
     args.extend(["--proc".to_string(), "/proc".to_string()]);
     args.extend(["--dev".to_string(), "/dev".to_string()]);
 

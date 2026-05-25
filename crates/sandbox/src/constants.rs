@@ -89,6 +89,19 @@ pub const STANDARD_EXEC_PATHS: &[&str] =
 /// allowed. Mirrors the manifest-level `blocked_paths` filter.
 pub const SENSITIVE_HOME_PATHS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config/gh"];
 
+/// Host system directories Bubblewrap binds read-only into every sandboxed
+/// child so the child can resolve `cat`/`bash`/`libc` etc. Each entry is
+/// checked for existence before binding — missing dirs are silently skipped
+/// to support minimal Linux containers without `/lib64` or `/sbin`.
+///
+/// SECURITY: every addition widens the read surface visible to a sandboxed
+/// script. Justify in the commit message if extending.
+pub const SYSTEM_RO_BINDS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
+
+/// Tmpfs mounts overlaid by Bubblewrap inside the sandbox to give the child
+/// a writable scratch area without touching the host filesystem.
+pub const SYSTEM_TMPFS_MOUNTS: &[&str] = &["/tmp"];
+
 #[cfg(test)]
 mod tests {
     use super::*;

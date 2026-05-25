@@ -5,14 +5,29 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::theme;
 
+/// Popup width as a percentage of the host terminal width.
+pub const POPUP_WIDTH_PCT: u16 = 60;
+/// Popup height as a percentage of the host terminal height.
+pub const POPUP_HEIGHT_PCT: u16 = 80;
+/// Minimum popup width in cells; below this, lists wrap unreadably.
+pub const POPUP_MIN_WIDTH: u16 = 44;
+/// Minimum popup height in cells; below this, header + footer crowd the body out.
+pub const POPUP_MIN_HEIGHT: u16 = 12;
+/// Horizontal breathing room reserved either side of the popup.
+const POPUP_H_MARGIN: u16 = 4;
+/// Vertical breathing room reserved above and below the popup.
+const POPUP_V_MARGIN: u16 = 2;
+/// Hard floor on inner popup width; popups narrower than this skip render.
+const POPUP_RENDER_MIN_INNER_WIDTH: u16 = 12;
+
 /// Compute centered popup geometry (60% width, 80% height, clamped).
 pub fn popup_area(area: Rect) -> Rect {
-    let popup_width = (area.width * 60 / 100)
-        .max(44)
-        .min(area.width.saturating_sub(4));
-    let popup_height = (area.height * 80 / 100)
-        .max(12)
-        .min(area.height.saturating_sub(2));
+    let popup_width = (area.width * POPUP_WIDTH_PCT / 100)
+        .max(POPUP_MIN_WIDTH)
+        .min(area.width.saturating_sub(POPUP_H_MARGIN));
+    let popup_height = (area.height * POPUP_HEIGHT_PCT / 100)
+        .max(POPUP_MIN_HEIGHT)
+        .min(area.height.saturating_sub(POPUP_V_MARGIN));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     Rect::new(x, y, popup_width, popup_height)
@@ -83,7 +98,7 @@ pub fn begin_popup_render(
     }
     let area = popup_area(frame.area());
     let inner = render_popup_frame(frame, area, title);
-    if inner.height < min_height || inner.width < 12 {
+    if inner.height < min_height || inner.width < POPUP_RENDER_MIN_INNER_WIDTH {
         return None;
     }
     let content_height = (inner.height as usize).saturating_sub(footer_lines);
