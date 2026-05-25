@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,12 +25,14 @@ use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{RateDecision, SessionRateGuard};
 use crate::session::Session;
 use crate::telemetry::BorgMetrics;
+#[cfg(test)]
 use crate::tool::names as tn;
 #[cfg(test)]
 use crate::tool_handlers;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition, ToolOutput};
 
 pub mod btw;
+mod credentials;
 mod goal_loop;
 mod hooks_dispatch;
 mod prompt_assembly;
@@ -362,55 +365,18 @@ impl Agent {
         self.db.lock().await
     }
 
-    /// Ensure credential cache is populated, resolving on first call or after config reload.
-    /// Separated from the getter so the getter can return a borrow while leaving
-    /// `&self` free for other immutable accesses.
-    fn ensure_credentials_cached(&mut self) {
-        let config = &self.config;
-        self.caches
-            .ensure_credentials(|| config.resolve_credentials());
-    }
+    // Credential cache + skill-runtime refresh helpers
+    // (`ensure_credentials_cached`, `credentials_cached`,
+    // `refresh_skill_runtime_state`, `maybe_refresh_skills_after_tool`)
+    // live in `agent::credentials`.
 
-    fn latest_user_message_text(&self) -> &str {
+    pub(super) fn latest_user_message_text(&self) -> &str {
         self.history
             .iter()
             .rev()
             .find(|m| m.role == crate::types::Role::User)
             .and_then(|m| m.text_content())
             .unwrap_or("")
-    }
-
-    fn refresh_skill_runtime_state(&mut self) {
-        self.caches.on_skill_modified();
-        self.ensure_credentials_cached();
-        self.skill_env_allowlist = crate::skills::collect_required_env_vars(
-            self.credentials_cached(),
-            &self.config.skills,
-        );
-    }
-
-    fn maybe_refresh_skills_after_tool(
-        &mut self,
-        tool_name: &str,
-        args: &serde_json::Value,
-        output: &str,
-    ) {
-        let touched_skills = match tool_name {
-            tn::APPLY_SKILL_PATCH => true,
-            tn::APPLY_PATCH => args["target"].as_str() == Some("skills"),
-            _ => false,
-        };
-        if touched_skills && output.contains("applied successfully") {
-            self.refresh_skill_runtime_state();
-        }
-    }
-
-    /// Borrow the cached credentials, falling back to an empty map if the cache
-    /// was not populated yet. Callers inside this module always invoke
-    /// [`Self::ensure_credentials_cached`] first; the fallback keeps the
-    /// skill-loading path robust if that ordering ever regresses.
-    fn credentials_cached(&self) -> &HashMap<String, String> {
-        self.caches.credentials_or_empty()
     }
 
     /// Assemble an `Agent` from pre-computed parts shared by all constructors.
