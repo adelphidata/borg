@@ -647,7 +647,7 @@ impl Default for HeartbeatConfig {
             min_interval_secs: crate::constants::MIN_HEARTBEAT_INTERVAL_SECS,
             pre_run_command: String::new(),
             pre_run_cwd: String::new(),
-            pre_run_timeout_ms: 60_000,
+            pre_run_timeout_ms: crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS,
             turn_timeout_secs: 75,
         }
     }

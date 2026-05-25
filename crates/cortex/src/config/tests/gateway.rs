@@ -55,8 +55,6 @@ fn gateway_bindings_empty_by_default() {
     assert!(cfg.gateway.bindings.is_empty());
 }
 
-// -- CollaborationMode --
-
 #[test]
 fn collaboration_mode_default_is_execute() {
     // Borg is autonomous: the default mode is Execute. There is no "Default"

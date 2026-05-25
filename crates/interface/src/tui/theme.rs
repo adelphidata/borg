@@ -2,12 +2,9 @@ use ratatui::style::{Color, Modifier, Style};
 
 use super::themes;
 
-// ---------------------------------------------------------------------------
-// Color accessors — read from the active theme's palette every render.
-// Callers used to reference `theme::cyan()`; they now call `theme::cyan()`.
-// The previous constants are gone on purpose so a stale `theme::cyan()`
+// Color accessors read from the active theme's palette every render. The
+// previous module-level color constants were removed on purpose so a stale
 // reference is a compile-time error rather than a silent legacy color.
-// ---------------------------------------------------------------------------
 
 #[inline]
 pub fn cyan() -> Color {
@@ -152,8 +149,6 @@ pub fn icon_style() -> Style {
 pub fn reasoning_style() -> Style {
     dim().add_modifier(Modifier::ITALIC)
 }
-
-// --- markdown semantic styles ---
 
 /// Heading level 1: bold + underlined.
 pub fn md_h1_style() -> Style {

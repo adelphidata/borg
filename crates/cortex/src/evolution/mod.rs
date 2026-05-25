@@ -55,8 +55,6 @@ use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
-// ── Rate Limiting ──
-
 /// Maximum events per bucket per hour during replay, indexed by event type.
 /// Event types not listed fall back to `RATE_LIMIT_DEFAULT`.
 const RATE_LIMITS: &[(&str, u32)] = &[

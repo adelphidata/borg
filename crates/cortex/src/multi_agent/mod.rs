@@ -1576,8 +1576,6 @@ mod tests {
         assert!(ctrl.get_status("nonexistent").is_none());
     }
 
-    // -- delegate + batch --
-
     #[test]
     fn delegate_blocklist_applied_without_role_produces_filtered_allowlist() {
         let parent = Config::default();

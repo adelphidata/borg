@@ -377,8 +377,6 @@ pub fn build_filtered_env(extra_env: &HashMap<String, String>) -> HashMap<String
 mod tests {
     use super::*;
 
-    // ---- is_allowed: positive coverage ----
-
     #[test]
     fn allows_process_basics() {
         // If a refactor strips PATH/HOME/SHELL/USER, every spawned shell
@@ -439,8 +437,6 @@ mod tests {
             assert!(is_allowed(name), "expected prefix rule to allow {name}");
         }
     }
-
-    // ---- is_allowed: negative coverage (the actual leak regression) ----
 
     #[test]
     fn denies_provider_api_keys() {
@@ -565,8 +561,6 @@ mod tests {
         }
     }
 
-    // ---- filter_iter: the pure unit. ----
-
     #[test]
     fn filter_keeps_allowed_drops_rest() {
         let pairs = vec![
@@ -627,7 +621,7 @@ mod tests {
         );
     }
 
-    // ---- End-to-end: actually spawn a subprocess. ----
+    // End-to-end: actually spawn a subprocess.
     //
     // This is the single most important test in the file: it's the only
     // one that catches a regression where someone accidentally forgets

@@ -76,8 +76,6 @@ max_context_tokens = 6000
     assert!(cfg.memory.embeddings.provider.is_none());
 }
 
-// -- ToolPolicyConfig --
-
 #[test]
 fn tool_policy_default_values() {
     let policy = ToolPolicyConfig::default();

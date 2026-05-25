@@ -744,8 +744,6 @@ mod tests {
         "2026-05-24T12:34:56.789Z"
     }
 
-    // ---- detection ----------------------------------------------------
-
     #[test]
     fn detect_returns_cursor_when_cursor_trace_id_set() {
         let env = MapEnv::new().with("CURSOR_TRACE_ID", "abc");
@@ -809,8 +807,6 @@ mod tests {
             Some(SupportedTerminal::Cursor)
         );
     }
-
-    // ---- config dir per platform -------------------------------------
 
     #[test]
     fn config_dir_darwin_is_application_support() {

@@ -54,7 +54,9 @@ fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
             .unwrap_or_else(|| "prompt".to_string()),
         pre_run_command: row.get::<Option<String>>(18)?,
         pre_run_cwd: row.get::<Option<String>>(19)?,
-        pre_run_timeout_ms: row.get::<Option<i64>>(20)?.unwrap_or(60_000),
+        pre_run_timeout_ms: row
+            .get::<Option<i64>>(20)?
+            .unwrap_or(crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS as i64),
         bypass_quiet_hours_once: row.get::<Option<i64>>(21)?.unwrap_or(0) != 0,
         min_interval_secs: row.get::<Option<i64>>(22)?,
         last_response_hash: row.get::<Option<String>>(23)?,
@@ -69,7 +71,9 @@ impl Database {
         let timeout_ms = task
             .timeout_ms
             .unwrap_or(crate::constants::SCHEDULED_TASK_DEFAULT_TIMEOUT_MS as i64);
-        let pre_run_timeout_ms = task.pre_run_timeout_ms.unwrap_or(60_000);
+        let pre_run_timeout_ms = task
+            .pre_run_timeout_ms
+            .unwrap_or(crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS as i64);
         self.conn.execute(
             "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
