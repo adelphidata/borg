@@ -292,6 +292,16 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .await
             .context("set foreign_keys=ON")?;
+        // Page cache: -131072 = 128 MiB (negative = KiB units). Default
+        // is 2 MiB which forces cold-page churn for large embedding /
+        // chunk scans. Memory-mapped I/O: 256 MiB read-only window keeps
+        // hot pages in the OS page cache without copying through SQLite.
+        conn.execute_batch("PRAGMA cache_size=-131072;")
+            .await
+            .context("set cache_size")?;
+        conn.execute_batch("PRAGMA mmap_size=268435456;")
+            .await
+            .context("set mmap_size")?;
         let mut db = Self {
             conn,
             hmac_salt: Vec::new(),
@@ -437,7 +447,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 6;
+    const CURRENT_VERSION: u32 = 7;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -517,8 +527,11 @@ impl Database {
         if current < 6 {
             self.migrate_v6().await?;
         }
+        if current < 7 {
+            self.migrate_v7().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 6,
+            Database::CURRENT_VERSION == 7,
             "add the new migrate_vN call above and bump this constant",
         );
 

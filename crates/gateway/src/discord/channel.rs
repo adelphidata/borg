@@ -153,7 +153,7 @@ impl NativeChannel for DiscordChannel {
                                             if !mime.starts_with("audio/") {
                                                 continue;
                                             }
-                                            match reqwest::get(&att.url).await {
+                                            match self.client.http().get(&att.url).send().await {
                                                 Ok(resp) if resp.status().is_success() => {
                                                     match resp.bytes().await {
                                                         Ok(bytes) => {

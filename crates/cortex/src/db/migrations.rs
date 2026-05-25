@@ -167,6 +167,27 @@ impl Database {
         Ok(())
     }
 
+    /// Add covering indexes for time-range scans on `sessions` and
+    /// `messages`. `sessions(created_at)` and `messages(created_at)`
+    /// drove full-table scans on dashboard / audit / consolidation
+    /// queries; the partial `messages(created_at) WHERE tool_calls_json
+    /// IS NOT NULL` index speeds up `tool_call_counts_since` without
+    /// indexing the much larger plain-message majority. Idempotent.
+    pub(super) async fn migrate_v7(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_created_at
+                    ON sessions(created_at);
+                 CREATE INDEX IF NOT EXISTS idx_messages_created_at
+                    ON messages(created_at);
+                 CREATE INDEX IF NOT EXISTS idx_messages_toolcalls
+                    ON messages(created_at)
+                    WHERE tool_calls_json IS NOT NULL;",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn migrate_v4(&self) -> Result<()> {
         // Fresh installs already emit the final shape via `SCHEMA_SQL`
         // (which defines `code_hash`). Only DBs that ran through the v3

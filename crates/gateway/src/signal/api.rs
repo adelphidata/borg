@@ -25,6 +25,7 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct SignalClient {
     client: Client,
+    sse_client: Client,
     base_url: String,
     account: String,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -32,12 +33,17 @@ pub struct SignalClient {
 
 impl SignalClient {
     pub fn new(base_url: &str, account: &str) -> Result<Self> {
+        let sse_client = Client::builder()
+            .connect_timeout(SIGNAL_HTTP_CONNECT_TIMEOUT)
+            .build()
+            .context("build Signal SSE client")?;
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Signal",
                 RPC_TIMEOUT,
                 Some(SIGNAL_HTTP_CONNECT_TIMEOUT),
             )?,
+            sse_client,
             base_url: base_url.trim_end_matches('/').to_string(),
             account: account.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new(
@@ -57,15 +63,11 @@ impl SignalClient {
         &self.base_url
     }
 
-    /// Make a GET request for SSE streaming (reuses the configured HTTP client).
+    /// Make a GET request for SSE streaming. Reuses the long-lived
+    /// `sse_client` built at construction so reconnects don't pay the
+    /// TLS / connection-pool setup cost on every retry.
     pub async fn get_sse(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
-        // Build a client without the short RPC timeout for long-lived SSE connections
-        let sse_client = Client::builder()
-            .connect_timeout(SIGNAL_HTTP_CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_default();
-
-        sse_client
+        self.sse_client
             .get(url)
             .header("Accept", "text/event-stream")
             .send()

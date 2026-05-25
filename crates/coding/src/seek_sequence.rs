@@ -203,10 +203,12 @@ pub(crate) fn find_nearest_context(
 
     let mut best: Option<(usize, usize)> = None; // (score, idx)
     for (idx, line) in lines.iter().enumerate() {
-        let line_norm = normalise(line);
+        // Stream normalization on the line rather than allocating a fresh
+        // String per candidate — the score only needs char-by-char
+        // equality against the (already-normalized) anchor prefix.
         let score = anchor_norm
             .chars()
-            .zip(line_norm.chars())
+            .zip(normalise_iter(line))
             .take_while(|(a, b)| a == b)
             .count();
         if score > 0 && best.is_none_or(|(s, _)| score > s) {
@@ -221,19 +223,24 @@ pub(crate) fn find_nearest_context(
 }
 
 fn normalise(s: &str) -> String {
-    s.trim()
-        .chars()
-        .map(|c| match c {
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' => '-',
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
-            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
-            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
-            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
-            | '\u{3000}' => ' ',
-            other => other,
-        })
-        .collect::<String>()
+    normalise_iter(s).collect()
+}
+
+fn normalise_char(c: char) -> char {
+    match c {
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
+fn normalise_iter(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.trim().chars().map(normalise_char)
 }
 
 #[cfg(test)]

@@ -539,10 +539,10 @@ pub async fn embed_memory_file_chunked(
 
     let db = Database::open().await?;
     let existing = db.get_chunks_for_file(scope, filename).await?;
-    let existing_map: std::collections::HashMap<i64, String> = existing
-        .iter()
-        .map(|c| (c.chunk_index, c.content_hash.clone()))
-        .collect();
+    // O(1) lookup by chunk_index — replaces a per-chunk `.iter().find(...)`
+    // that made the whole rebuild loop O(n²) for files with many chunks.
+    let existing_by_idx: std::collections::HashMap<i64, &_> =
+        existing.iter().map(|c| (c.chunk_index, c)).collect();
 
     let mut chunk_data = Vec::new();
     let model = Some(provider.model.clone());
@@ -551,11 +551,8 @@ pub async fn embed_memory_file_chunked(
         let hash = content_hash(&chunk.content);
         let idx = i as i64;
 
-        // Check if chunk is unchanged
-        let needs_embedding = existing_map
-            .get(&idx)
-            .map(|existing_hash| existing_hash != &hash)
-            .unwrap_or(true);
+        let prior = existing_by_idx.get(&idx).copied();
+        let needs_embedding = prior.map(|c| c.content_hash != hash).unwrap_or(true);
 
         let embedding = if needs_embedding {
             match generate_embedding_cached(&EMBEDDING_CLIENT, &provider, &chunk.content).await {
@@ -566,11 +563,7 @@ pub async fn embed_memory_file_chunked(
                 }
             }
         } else {
-            // Reuse existing embedding
-            existing
-                .iter()
-                .find(|c| c.chunk_index == idx)
-                .and_then(|c| c.embedding.clone())
+            prior.and_then(|c| c.embedding.clone())
         };
 
         chunk_data.push(ChunkData {

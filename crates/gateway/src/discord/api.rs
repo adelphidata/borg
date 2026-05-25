@@ -98,6 +98,14 @@ impl DiscordClient {
         self.application_id = Some(id);
     }
 
+    /// Borrow the shared HTTP client. Use this for ad-hoc fetches (e.g.
+    /// CDN attachment downloads) so they pay into the same connection
+    /// pool instead of spinning up a fresh `reqwest::get` client per
+    /// request.
+    pub fn http(&self) -> &Client {
+        &self.client
+    }
+
     /// Get the current bot user via GET /users/@me.
     pub async fn get_current_user(&self) -> Result<CurrentUser> {
         let resp = self
