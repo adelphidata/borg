@@ -19,6 +19,7 @@ use ratatui::widgets::{Clear, Widget};
 use crate::tui::custom_terminal::Frame;
 
 pub(crate) mod request_user_input;
+mod text_line;
 
 /// Outcome of routing a cancellation key (Esc / Ctrl-C) to the active View.
 ///

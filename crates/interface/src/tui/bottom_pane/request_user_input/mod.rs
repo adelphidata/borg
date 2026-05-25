@@ -28,6 +28,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::scroll_state::ScrollState;
 use crate::tui::wrapping;
 
+use super::text_line::TextLine;
+
 /// Vertical spacers reserved between visual sections (question → options →
 /// notes/footer) when there is enough room. Matches the reference TUI
 /// constant; layout.rs is a near-verbatim port and references this value
@@ -51,7 +53,7 @@ pub(super) struct AnswerState {
     /// keeps at most one.
     pub(super) selected: Vec<usize>,
     /// Free-form notes draft typed in the Tab-focused notes field.
-    pub(super) notes: String,
+    pub(super) notes: TextLine,
     /// `true` when the user has explicitly opened the notes editor for this
     /// question (Tab into Notes focus, or any key while Notes is focused).
     /// Layout collapses the notes section while this is `false` so the
@@ -276,17 +278,18 @@ impl RequestUserInputOverlay {
                 // the notes section room for the next reopen.
                 self.focus = Focus::Options;
             }
-            KeyCode::Backspace => {
-                answer.notes.pop();
-            }
+            KeyCode::Backspace => answer.notes.backspace(),
+            KeyCode::Delete => answer.notes.delete(),
+            KeyCode::Left => answer.notes.move_left(),
+            KeyCode::Right => answer.notes.move_right(),
+            KeyCode::Home => answer.notes.move_home(),
+            KeyCode::End => answer.notes.move_end(),
             KeyCode::Enter => {
                 // Enter inside Notes commits + advances the same way it
                 // does in Options focus.
                 self.advance_or_submit();
             }
-            KeyCode::Char(c) => {
-                answer.notes.push(c);
-            }
+            KeyCode::Char(c) => answer.notes.insert_char(c),
             _ => {}
         }
     }
@@ -481,7 +484,7 @@ impl RequestUserInputOverlay {
                     answers.push(opt.label.clone());
                 }
             }
-            let trimmed = st.notes.trim();
+            let trimmed = st.notes.text().trim();
             if !trimmed.is_empty() {
                 answers.push(format!("{USER_NOTE_PREFIX}{trimmed}"));
             }

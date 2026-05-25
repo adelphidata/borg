@@ -187,8 +187,10 @@ impl RequestUserInputOverlay {
         Paragraph::new(line).render(rect, buf);
     }
 
-    /// Render `notes` as a single text row with a left vertical bar.
-    /// Layout reserves `NOTES_DESIRED_HEIGHT` rows when notes are visible.
+    /// Render the notes editor — a `Notes` label row plus the editable
+    /// body row. Body delegates to `TextLine::render`, which paints the
+    /// `▌` bar, the typed text, and a reversed cursor block at the
+    /// insertion point when the field is focused.
     fn render_notes(&self, buf: &mut Buffer, area: Rect) {
         let label_row = Rect {
             x: area.x,
@@ -208,19 +210,10 @@ impl RequestUserInputOverlay {
             width: area.width,
             height: 1,
         };
-        let notes = &self.current_answer().notes;
-        let bar = Span::styled("▌ ", Style::default().fg(theme::cyan()));
-        let body = if notes.is_empty() {
-            let hint = if self.focus == Focus::Notes {
-                "(start typing)"
-            } else {
-                "(press Tab to add a note)"
-            };
-            Span::styled(hint, theme::dim())
-        } else {
-            Span::raw(notes.clone())
-        };
-        Paragraph::new(Line::from(vec![bar, body])).render(body_row, buf);
+        let focused = self.focus == Focus::Notes;
+        self.current_answer()
+            .notes
+            .render(buf, body_row, focused, Some("press Tab to add a note"));
     }
 
     fn render_footer(&self, buf: &mut Buffer, area: Rect) {
