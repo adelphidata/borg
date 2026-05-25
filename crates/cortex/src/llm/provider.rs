@@ -501,8 +501,8 @@ impl FromStr for Provider {
             "gemini" => Ok(Provider::Gemini),
             "deepseek" => Ok(Provider::DeepSeek),
             "groq" => Ok(Provider::Groq),
-            // `grok` and `x.ai` are common user-typed spellings — match the
-            // hermes-agent alias set so a config copy-pasted from there parses.
+            // `grok` and `x.ai` are common user-typed spellings — accept them
+            // alongside the canonical `xai` so configs from any docs page parse.
             "xai" | "x-ai" | "x_ai" | "x.ai" | "grok" => Ok(Provider::XAi),
             "ollama" => Ok(Provider::Ollama),
             "claude-cli" | "claudecli" | "claude_cli" => Ok(Provider::ClaudeCli),
@@ -981,7 +981,7 @@ mod tests {
         //   x.ai             — the dotted brand name
         //   grok             — the product name users actually type
         // All must resolve to the same provider; if any drifts apart, a
-        // config copy-pasted from hermes-agent or xAI docs silently fails.
+        // config copy-pasted from any xAI docs page silently fails.
         assert_eq!(Provider::from_str("XAI").unwrap(), Provider::XAi);
         assert_eq!(Provider::from_str("x-ai").unwrap(), Provider::XAi);
         assert_eq!(Provider::from_str("X-AI").unwrap(), Provider::XAi);

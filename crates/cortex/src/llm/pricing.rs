@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn xai_cost_normalizes_every_vendor_prefix() {
         // A user who pulls a slug from xAI docs (`xai/`), OpenRouter (`x-ai/`),
-        // hermes-agent (`x.ai/`), or just types the product name (`grok/`)
+        // the dotted brand (`x.ai/`), or just types the product name (`grok/`)
         // must hit the same rate. If any prefix path silently bypasses the
         // table, cost-event attribution regresses to None for that variant.
         let base = estimate_cost_usd(Provider::XAi, "grok-4-fast", 1_000_000, 0).unwrap();

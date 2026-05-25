@@ -911,9 +911,8 @@ pub(crate) fn build_openai_request(
 /// JSON-schema keywords xAI's tool-call validator rejects with HTTP 400.
 /// Captured against `https://api.x.ai/v1/chat/completions` 2026-05-24 — every
 /// keyword here has been confirmed to produce a "schema not supported" error
-/// when present in a tool's `parameters`. The list mirrors openclaw's
-/// extensions/xai/model-compat.ts so a tool authored under either runtime
-/// reaches xAI unchanged.
+/// when present in a tool's `parameters`. OpenAI/Anthropic schemas that use
+/// these keywords reach xAI unchanged via this filter.
 const XAI_UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
     "minLength",
     "maxLength",
@@ -1664,8 +1663,8 @@ mod tests {
 
     #[test]
     fn sanitize_xai_tool_schema_strips_unsupported_keywords_recursively() {
-        // Fixture mirrors the shape openclaw confirmed xAI rejects: each
-        // unsupported keyword present at top-level, inside `properties`, and
+        // Fixture covers every shape xAI rejects: each unsupported keyword
+        // present at top-level, inside `properties`, and
         // inside nested `items`/`anyOf`. After sanitization, every banned
         // keyword must be gone everywhere AND every legitimate keyword must
         // survive — otherwise tools either 400 on xAI or stop describing
