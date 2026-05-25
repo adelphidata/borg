@@ -1,5 +1,6 @@
 mod agents_popup;
 mod app;
+mod bottom_pane;
 mod btw_popup;
 mod colors;
 mod command_popup;

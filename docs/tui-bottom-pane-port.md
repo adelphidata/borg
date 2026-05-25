@@ -163,9 +163,9 @@ When picking this up in a future session:
 
 | Phase | Status | Commit |
 |---|---|---|
-| 1. Foundation (ScrollState + this doc) | ✅ landed | _filled in by ship commit_ |
-| 2. BottomPane host skeleton | ⏳ pending | — |
-| 3. layout.rs port | ⏳ pending | — |
+| 1. Foundation (ScrollState + this doc) | ✅ landed | 2d02532e |
+| 2. BottomPane host skeleton | ✅ landed | _this commit_ |
+| 3. layout.rs port | ✅ landed | _this commit_ |
 | 4. render.rs port | ⏳ pending | — |
 | 5. TextLine editor | ⏳ pending | — |
 | 6. mod.rs (overlay state machine) | ⏳ pending | — |
