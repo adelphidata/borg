@@ -9,9 +9,9 @@ use crate::security::sanitize::{self, ThreatLevel};
 use crate::security::skill as skill_security;
 
 mod environment;
-pub use environment::{collect_required_env_vars, collect_skill_env, install_skill_deps};
 #[cfg(test)]
 use environment::format_skill_info;
+pub use environment::{collect_required_env_vars, collect_skill_env, install_skill_deps};
 
 /// How much of a skill's content to include in prompt context.
 #[derive(Debug, Clone, Copy, PartialEq)]

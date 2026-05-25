@@ -143,7 +143,7 @@ impl TokenBucket {
             // Misconfigured-off must fail closed, never silently mean
             // "unlimited" — that would turn a clumsy operator into a
             // denial-of-budget.
-            return Some(Duration::from_secs(60));
+            return Some(crate::constants::RATE_LIMIT_MISCONFIGURED_RETRY);
         }
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();

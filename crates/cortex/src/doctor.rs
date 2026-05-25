@@ -807,7 +807,7 @@ async fn check_heartbeat(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
 
                     // Stale threshold: 2x configured interval (default 1h for 30m interval)
                     let interval_secs = crate::tasks::parse_interval(&config.heartbeat.interval)
-                        .unwrap_or(std::time::Duration::from_secs(1800))
+                        .unwrap_or(crate::constants::HEARTBEAT_FALLBACK_INTERVAL)
                         .as_secs() as i64;
                     let stale_threshold = interval_secs * 2;
 

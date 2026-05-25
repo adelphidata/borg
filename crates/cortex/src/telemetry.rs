@@ -113,7 +113,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, T
             .build()?;
 
         let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-            .with_interval(std::time::Duration::from_secs(60))
+            .with_interval(crate::constants::TELEMETRY_FLUSH_INTERVAL)
             .build();
 
         let mp = SdkMeterProvider::builder()

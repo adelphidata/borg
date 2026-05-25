@@ -262,7 +262,7 @@ impl TokenBucket {
         if per_minute == 0 || burst == 0 {
             // Misconfigured to off — fail closed: zero throughput. Operators
             // who want unlimited should leave defaults alone.
-            return Some(Duration::from_secs(60));
+            return Some(crate::constants::RATE_LIMIT_MISCONFIGURED_RETRY);
         }
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();

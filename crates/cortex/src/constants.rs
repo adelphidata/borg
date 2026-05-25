@@ -540,6 +540,11 @@ pub const MAX_PROJECT_DOC_BYTES: usize = 32 * 1024;
 /// How often to write HMAC chain checkpoints (every N verified events).
 pub const HMAC_CHECKPOINT_INTERVAL: u32 = 100;
 
+/// Seconds per minute. Used by `usage.rs` and friends for relative-time
+/// formatting; the bare `60` left several callers ambiguous (RPM bucket?
+/// retry delay? minute-since?).
+pub const SECS_PER_MIN: i64 = 60;
+
 /// Seconds per hour, used for rate-limit hour bucketing.
 pub const SECS_PER_HOUR: i64 = 3600;
 
@@ -649,6 +654,25 @@ pub const MEMORY_ENTRY_WARN_TOKENS: usize = 8_000;
 /// Large entries get silently dropped from the context-window budget;
 /// failing at write time forces the caller to split into topics.
 pub const MEMORY_ENTRY_REJECT_TOKENS: usize = 20_000;
+
+// ── Telemetry & rate-limit fallbacks ──────────────────────────────
+
+/// How often the prod OTLP exporter flushes accumulated metrics. Below
+/// 60s and the collector starts complaining; above it and dashboard
+/// freshness suffers. Tests in `telemetry::tests::*` synthesize a
+/// longer interval because they don't actually export.
+pub const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// "Retry after this long" returned by the MCP + WASM-plugin rate-limit
+/// gates when the operator misconfigured `per_minute=0` or `burst=0`.
+/// Failing closed with a finite retry hint keeps the agent's
+/// fallback path running rather than silently treating `0` as
+/// "unlimited" (the historical footgun).
+pub const RATE_LIMIT_MISCONFIGURED_RETRY: Duration = Duration::from_secs(60);
+
+/// Fallback heartbeat interval when `heartbeat.interval` is unparseable.
+/// Matches the historical default ("30m × 2 = 1h staleness window").
+pub const HEARTBEAT_FALLBACK_INTERVAL: Duration = Duration::from_secs(1800);
 
 #[cfg(test)]
 mod tests {

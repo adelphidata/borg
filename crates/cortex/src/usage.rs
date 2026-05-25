@@ -52,7 +52,7 @@ pub fn clamp_days(days: u32) -> u32 {
 pub async fn format_usage_text(db: &Database, days: u32) -> Result<String> {
     let resolved = clamp_days(days);
     let now = Utc::now().timestamp();
-    let since_ts = now - (resolved as i64) * 86_400;
+    let since_ts = now - (resolved as i64) * crate::constants::SECS_PER_DAY;
 
     let summary = db.token_summary_since(since_ts).await?;
     let model_usage = db.usage_by_model_since(since_ts).await?;
@@ -172,17 +172,18 @@ fn format_since_date(ts: i64) -> String {
 }
 
 fn format_relative(now: i64, ts: i64) -> String {
+    use crate::constants::{SECS_PER_DAY, SECS_PER_HOUR, SECS_PER_MIN};
     let delta = (now - ts).max(0);
-    if delta < 60 {
+    if delta < SECS_PER_MIN {
         return "just now".to_string();
     }
-    if delta < 3_600 {
-        return format!("{}m ago", delta / 60);
+    if delta < SECS_PER_HOUR {
+        return format!("{}m ago", delta / SECS_PER_MIN);
     }
-    if delta < 86_400 {
-        return format!("{}h ago", delta / 3_600);
+    if delta < SECS_PER_DAY {
+        return format!("{}h ago", delta / SECS_PER_HOUR);
     }
-    format!("{}d ago", delta / 86_400)
+    format!("{}d ago", delta / SECS_PER_DAY)
 }
 
 fn fmt_count(n: u64) -> String {
