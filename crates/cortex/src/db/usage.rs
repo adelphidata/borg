@@ -270,15 +270,14 @@ mod tests {
         db.log_token_usage(10, 10, 20, "p", "m", Some(0.50))
             .await
             .unwrap();
-        db.log_token_usage(10, 10, 20, "p", "m", None).await.unwrap();
+        db.log_token_usage(10, 10, 20, "p", "m", None)
+            .await
+            .unwrap();
         db.log_token_usage(10, 10, 20, "p", "m", Some(0.10))
             .await
             .unwrap();
         let cost = db.monthly_total_cost().await.unwrap().expect("Some(_)");
-        assert!(
-            (cost - 0.60).abs() < 1e-9,
-            "expected 0.60, got {cost}"
-        );
+        assert!((cost - 0.60).abs() < 1e-9, "expected 0.60, got {cost}");
     }
 
     #[tokio::test]
@@ -286,7 +285,9 @@ mod tests {
         // Spec: cost_present=false must surface as None at this layer so the
         // UI can hide the cost column entirely instead of showing $0.00.
         let db = fresh_db().await;
-        db.log_token_usage(10, 10, 20, "p", "m", None).await.unwrap();
+        db.log_token_usage(10, 10, 20, "p", "m", None)
+            .await
+            .unwrap();
         assert_eq!(db.monthly_total_cost().await.unwrap(), None);
     }
 
@@ -311,7 +312,9 @@ mod tests {
         db.log_token_usage(0, 0, 40, "p", "m", None).await.unwrap();
         // total = 1000 → 100%, bucket 100.
         assert_eq!(db.monthly_budget_pct(1000).await.unwrap(), Some(100));
-        db.log_token_usage(0, 0, 9999, "p", "m", None).await.unwrap();
+        db.log_token_usage(0, 0, 9999, "p", "m", None)
+            .await
+            .unwrap();
         // Wildly over budget — still pinned at 100, never a higher value.
         assert_eq!(db.monthly_budget_pct(1000).await.unwrap(), Some(100));
     }
@@ -336,13 +339,19 @@ mod tests {
         let db = fresh_db().await;
         let empty = db.token_summary_since(0).await.unwrap();
         assert_eq!(empty.total, 0);
-        assert!(!empty.cost_present, "empty table must be cost_present=false");
+        assert!(
+            !empty.cost_present,
+            "empty table must be cost_present=false"
+        );
         assert_eq!(empty.cost, None);
 
         db.log_token_usage(10, 5, 15, "p", "m", None).await.unwrap();
         let no_cost = db.token_summary_since(0).await.unwrap();
         assert_eq!(no_cost.total, 15);
-        assert!(!no_cost.cost_present, "row without cost stays cost_present=false");
+        assert!(
+            !no_cost.cost_present,
+            "row without cost stays cost_present=false"
+        );
 
         db.log_token_usage(20, 10, 30, "p", "m", Some(0.0))
             .await

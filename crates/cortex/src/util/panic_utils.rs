@@ -33,9 +33,8 @@ mod tests {
     fn string_payload_round_trips() {
         // `panic!("{}", value)` synthesizes a String payload — the most
         // common case for formatted panics in the agent loop.
-        let payload =
-            catch_unwind(AssertUnwindSafe(|| panic!("{}", "boom string".to_string())))
-                .expect_err("panic must propagate");
+        let payload = catch_unwind(AssertUnwindSafe(|| panic!("{}", "boom string".to_string())))
+            .expect_err("panic must propagate");
         assert_eq!(panic_msg(&payload), "boom string");
     }
 

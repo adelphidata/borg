@@ -129,14 +129,19 @@ mod tests {
         // returned Err would force every caller to wrap in `or_else`
         // and obscure real errors.
         let db = Database::test_db().await;
-        let v = db.get_setting("no.such.key.exists").await.expect("query ok");
+        let v = db
+            .get_setting("no.such.key.exists")
+            .await
+            .expect("query ok");
         assert_eq!(v, None);
     }
 
     #[tokio::test]
     async fn set_get_round_trips_value() {
         let db = Database::test_db().await;
-        db.set_setting("test.key.alpha", "alpha-value").await.unwrap();
+        db.set_setting("test.key.alpha", "alpha-value")
+            .await
+            .unwrap();
         let v = db.get_setting("test.key.alpha").await.unwrap();
         assert_eq!(v.as_deref(), Some("alpha-value"));
     }

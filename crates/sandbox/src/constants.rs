@@ -177,7 +177,10 @@ mod tests {
         // All entries must be absolute — a relative path would let a
         // sandboxed child execute binaries in a cwd it controls.
         for p in STANDARD_EXEC_PATHS {
-            assert!(p.starts_with('/'), "STANDARD_EXEC_PATHS entry not absolute: {p}");
+            assert!(
+                p.starts_with('/'),
+                "STANDARD_EXEC_PATHS entry not absolute: {p}"
+            );
         }
     }
 

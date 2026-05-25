@@ -123,10 +123,7 @@ mod tests {
         db.record_doctor_run(&report(200, 3, 0, 0)).await.unwrap(); // same ran_at, newer id
         let latest = db.latest_doctor_run().await.unwrap().unwrap();
         assert_eq!(latest.ran_at, 200);
-        assert_eq!(
-            latest.pass_count, 3,
-            "newer id within same ran_at must win"
-        );
+        assert_eq!(latest.pass_count, 3, "newer id within same ran_at must win");
     }
 
     #[tokio::test]

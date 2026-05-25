@@ -260,7 +260,9 @@ mod tests {
             .await
             .expect("record xp_gain");
 
-        let out = dispatch(EvolutionCommand::Xp, &db).await.expect("dispatch xp");
+        let out = dispatch(EvolutionCommand::Xp, &db)
+            .await
+            .expect("dispatch xp");
         assert!(out.image_png.is_none());
         assert!(out.text.contains("XP Summary"), "text was: {}", out.text);
         assert!(out.text.contains("Top sources"));
@@ -273,7 +275,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_xp_empty_db_still_renders() {
         let db = Database::test_db().await;
-        let out = dispatch(EvolutionCommand::Xp, &db).await.expect("dispatch xp");
+        let out = dispatch(EvolutionCommand::Xp, &db)
+            .await
+            .expect("dispatch xp");
         assert!(out.text.contains("XP Summary"));
         assert!(out.text.contains("Recent XP"));
         assert!(out.text.contains("no recent activity"));
@@ -282,7 +286,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_card_stdout_returns_rendered_card() {
         let db = Database::test_db().await;
-        let output = dispatch(EvolutionCommand::Card { out: None }, &db).await.expect("dispatch");
+        let output = dispatch(EvolutionCommand::Card { out: None }, &db)
+            .await
+            .expect("dispatch");
         assert!(output.image_png.is_none());
         assert!(output.text.contains('\u{256D}'));
         assert!(output.text.contains('\u{2570}'));
@@ -294,7 +300,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_evolution_baseline_state_renders_header() {
         let db = Database::test_db().await;
-        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
+        let out = dispatch(EvolutionCommand::Evolution, &db)
+            .await
+            .expect("dispatch evolution");
         assert!(out.image_png.is_none());
         assert!(
             out.text.contains("Base Borg Lvl."),
@@ -311,7 +319,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_evolution_includes_hints_when_nonempty() {
         let db = Database::test_db().await;
-        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
+        let out = dispatch(EvolutionCommand::Evolution, &db)
+            .await
+            .expect("dispatch evolution");
         assert!(
             out.text.contains("Next Steps"),
             "missing Next Steps block in: {}",
@@ -322,7 +332,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_evolution_tolerates_missing_bond_and_vitals() {
         let db = Database::test_db().await;
-        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch evolution");
+        let out = dispatch(EvolutionCommand::Evolution, &db)
+            .await
+            .expect("dispatch evolution");
         assert!(!out.text.is_empty());
     }
 
@@ -335,7 +347,9 @@ mod tests {
                 .expect("record xp_gain");
         }
 
-        let out = dispatch(EvolutionCommand::Card { out: None }, &db).await.expect("dispatch");
+        let out = dispatch(EvolutionCommand::Card { out: None }, &db)
+            .await
+            .expect("dispatch");
         assert!(
             out.text.contains("Mood: Stable"),
             "expected Mood: Stable baseline in card, got: {}",
@@ -370,7 +384,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let out = dispatch(EvolutionCommand::Evolution, &db).await.expect("dispatch");
+        let out = dispatch(EvolutionCommand::Evolution, &db)
+            .await
+            .expect("dispatch");
         assert!(
             out.text.contains("Posture: Boosted"),
             "missing posture line: {}",

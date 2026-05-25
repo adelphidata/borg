@@ -44,8 +44,14 @@ mod tests {
         // route the "run pair first" hint. Lock the prefixes so a
         // refactor that re-words them breaks here, not in the UX.
         let cases: &[(PkiError, &str)] = &[
-            (PkiError::Cert("c".into()), "certificate operation failed: c"),
-            (PkiError::Parse("p".into()), "invalid certificate encoding: p"),
+            (
+                PkiError::Cert("c".into()),
+                "certificate operation failed: c",
+            ),
+            (
+                PkiError::Parse("p".into()),
+                "invalid certificate encoding: p",
+            ),
             (PkiError::Keychain("k".into()), "keychain backend error: k"),
             (PkiError::NotFound("n".into()), "not found: n"),
             (PkiError::KeyGen("g".into()), "key generation failed: g"),

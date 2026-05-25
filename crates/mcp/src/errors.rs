@@ -249,7 +249,10 @@ mod tests {
         };
         let s = url.to_string();
         assert!(s.contains("http://10.0.0.1"), "must echo URL: {s}");
-        assert!(s.contains("loopback / RFC1918 blocked"), "must explain reason: {s}");
+        assert!(
+            s.contains("loopback / RFC1918 blocked"),
+            "must explain reason: {s}"
+        );
 
         let collision = McpError::NameCollision {
             server: "github".into(),

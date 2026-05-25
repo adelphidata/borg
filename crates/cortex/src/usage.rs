@@ -366,7 +366,10 @@ mod tests {
             .await
             .unwrap();
         let out = format_usage_text(&db, 30).await.expect("format");
-        assert!(!out.contains("Cost:"), "no rate data must omit Cost section: {out}");
+        assert!(
+            !out.contains("Cost:"),
+            "no rate data must omit Cost section: {out}"
+        );
         assert!(out.contains("Tokens:"));
         assert!(out.contains("Activity:"));
     }

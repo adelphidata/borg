@@ -229,7 +229,10 @@ mod tests {
     async fn empty_registry_returns_continue() {
         let registry = HookRegistry::new();
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Continue
+        ));
     }
 
     #[tokio::test]
@@ -258,7 +261,10 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Continue
+        ));
     }
 
     #[tokio::test]
@@ -340,7 +346,10 @@ mod tests {
                 prompt_tokens: None,
             },
         };
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Continue
+        ));
     }
 
     #[tokio::test]
@@ -503,7 +512,10 @@ mod tests {
         }));
 
         let ctx = make_ctx(HookPoint::BeforeAgentStart);
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Continue));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Continue
+        ));
     }
 
     #[test]

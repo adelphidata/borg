@@ -122,12 +122,7 @@ impl Database {
 mod tests {
     use super::*;
 
-    fn ns<'a>(
-        id: &'a str,
-        name: &'a str,
-        ephemeral: bool,
-        created_at: i64,
-    ) -> NewScript<'a> {
+    fn ns<'a>(id: &'a str, name: &'a str, ephemeral: bool, created_at: i64) -> NewScript<'a> {
         NewScript {
             id,
             name,
@@ -179,7 +174,9 @@ mod tests {
     #[tokio::test]
     async fn list_scripts_returns_rows_sorted_by_name() {
         let db = Database::test_db().await;
-        db.create_script(&ns("c", "charlie", false, 1)).await.unwrap();
+        db.create_script(&ns("c", "charlie", false, 1))
+            .await
+            .unwrap();
         db.create_script(&ns("a", "alpha", false, 2)).await.unwrap();
         db.create_script(&ns("b", "bravo", false, 3)).await.unwrap();
         let rows = db.list_scripts().await.unwrap();
@@ -193,7 +190,9 @@ mod tests {
         // would silently double-count and reset the counter. Encode the
         // increment + non-null last_run contract.
         let db = Database::test_db().await;
-        db.create_script(&ns("id-x", "x", false, 1_000)).await.unwrap();
+        db.create_script(&ns("id-x", "x", false, 1_000))
+            .await
+            .unwrap();
 
         for expected_count in 1..=3 {
             db.record_script_run("id-x").await.unwrap();
@@ -222,7 +221,9 @@ mod tests {
     #[tokio::test]
     async fn delete_script_removes_row_and_is_idempotent() {
         let db = Database::test_db().await;
-        db.create_script(&ns("id-d", "delete-me", false, 1)).await.unwrap();
+        db.create_script(&ns("id-d", "delete-me", false, 1))
+            .await
+            .unwrap();
         db.delete_script("id-d").await.unwrap();
         assert!(db.get_script_by_name("delete-me").await.unwrap().is_none());
         // Idempotent — deleting a non-existent id must not error.
@@ -236,10 +237,18 @@ mod tests {
         // ephemerals (the agent might still be writing them). Encode the
         // AND condition with a 2×2 fixture.
         let db = Database::test_db().await;
-        db.create_script(&ns("e-old", "e-old", true, 100)).await.unwrap();
-        db.create_script(&ns("e-new", "e-new", true, 1_000)).await.unwrap();
-        db.create_script(&ns("p-old", "p-old", false, 100)).await.unwrap();
-        db.create_script(&ns("p-new", "p-new", false, 1_000)).await.unwrap();
+        db.create_script(&ns("e-old", "e-old", true, 100))
+            .await
+            .unwrap();
+        db.create_script(&ns("e-new", "e-new", true, 1_000))
+            .await
+            .unwrap();
+        db.create_script(&ns("p-old", "p-old", false, 100))
+            .await
+            .unwrap();
+        db.create_script(&ns("p-new", "p-new", false, 1_000))
+            .await
+            .unwrap();
 
         // cutoff = 500: only `e-old` matches both conditions.
         let deleted = db.delete_ephemeral_scripts_older_than(500).await.unwrap();
