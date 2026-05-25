@@ -34,6 +34,20 @@ impl Database {
         Ok(())
     }
 
+    /// Overwrite a session's title without touching token totals or model.
+    /// Used by the aux-LLM title generator after the first user→assistant
+    /// exchange. No-op when the session row hasn't been inserted yet.
+    pub async fn update_session_title(&self, id: &str, title: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params!(title, now, id),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Fetch a single session row by exact id. Returns `None` if absent.
     pub async fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
         let mut rows = self
@@ -669,6 +683,36 @@ mod tests {
         assert_eq!(s1.model, "claude");
         // Should not have duplicates
         assert_eq!(sessions.iter().filter(|s| s.id == "s1").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_session_title_overwrites_existing_row() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 200, 500, "gpt-4", "Original")
+            .await
+            .unwrap();
+        db.update_session_title("s1", "Auto-generated phrase")
+            .await
+            .unwrap();
+        let row = db.session_by_id("s1").await.unwrap().unwrap();
+        assert_eq!(row.title, "Auto-generated phrase");
+        // updated_at must have advanced past the original 200 timestamp —
+        // the title refresh is a real edit and replay tooling sorts by it.
+        assert!(row.updated_at > 200, "updated_at must bump on title edit");
+        // Token total + model must not be clobbered by a title-only update.
+        assert_eq!(row.total_tokens, 500);
+        assert_eq!(row.model, "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn update_session_title_noop_for_missing_row() {
+        let db = test_db().await;
+        // Must succeed silently — the title generator races session creation
+        // and we don't want a spurious error if the row hasn't landed yet.
+        db.update_session_title("does-not-exist", "ignored")
+            .await
+            .unwrap();
+        assert!(db.session_by_id("does-not-exist").await.unwrap().is_none());
     }
 
     #[tokio::test]

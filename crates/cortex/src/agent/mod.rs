@@ -40,6 +40,7 @@ mod session_manager;
 mod stream_handler;
 mod system_prompt;
 pub(crate) mod system_prompt_cache;
+mod title_generator;
 mod tool_classification;
 mod tool_execution;
 mod tool_validation;
@@ -290,6 +291,10 @@ pub struct Agent {
     /// implements this by forwarding onto the `SubscribeGoalEvents`
     /// broadcast channel; cortex never panics if it is `None`.
     pub(super) goal_event_sink: Option<Arc<dyn crate::goals::GoalEventSink>>,
+    /// One-shot flag: set after we've spawned the aux-LLM auto-title task
+    /// for this session so a multi-iteration first turn (tool calls,
+    /// continuations) doesn't spawn it repeatedly. Reset by `new_session`.
+    pub(super) auto_title_spawned: bool,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -428,6 +433,7 @@ impl Agent {
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
+            auto_title_spawned: false,
         }
     }
 
@@ -1214,11 +1220,56 @@ impl Agent {
                 if self.maybe_inject_goal_continuation(&turn_id).await {
                     IterationOutcome::NudgeAndContinue
                 } else {
+                    self.maybe_spawn_auto_title();
                     IterationOutcome::EndTurn
                 }
             }
             other => other,
         }
+    }
+
+    /// Spawn a one-shot background task that asks the auxiliary LLM for a
+    /// short, human-readable session title and writes it back to the DB +
+    /// session JSON. Runs at most once per session, only after the very
+    /// first user→assistant exchange completes, and only if a real
+    /// auxiliary LLM is wired up (`llm.aux` set). Failures `warn!`-log and
+    /// never block the turn.
+    fn maybe_spawn_auto_title(&mut self) {
+        if self.auto_title_spawned || self.turn_count != 1 {
+            return;
+        }
+        if self.config.llm.aux.is_none() {
+            // No aux client configured — fall through to the synchronous
+            // placeholder title; we don't want to burn primary-LLM credits
+            // on background niceties.
+            return;
+        }
+        let first_user = self
+            .history
+            .iter()
+            .find(|m| matches!(m.role, crate::types::Role::User))
+            .and_then(|m| m.text_content())
+            .map(str::to_string);
+        let last_assistant = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::types::Role::Assistant))
+            .and_then(|m| m.text_content())
+            .map(str::to_string);
+        let (Some(user_msg), Some(assistant_msg)) = (first_user, last_assistant) else {
+            return;
+        };
+        if user_msg.trim().is_empty() || assistant_msg.trim().is_empty() {
+            return;
+        }
+        self.auto_title_spawned = true;
+        let session_id = self.session.meta.id.clone();
+        let config = self.config.clone();
+        spawn_logged(
+            "auto-title",
+            title_generator::auto_title_session(session_id, user_msg, assistant_msg, config),
+        );
     }
 
     /// Core body of [`Self::finish_iteration`] — the original logic, kept
@@ -1965,6 +2016,7 @@ mod tests {
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
+            auto_title_spawned: false,
         };
 
         agent.maybe_refresh_skills_after_tool(
@@ -2034,6 +2086,7 @@ mod tests {
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
+            auto_title_spawned: false,
         };
 
         agent.reload_config(Config::default());
@@ -2773,6 +2826,7 @@ mod goal_integration_tests {
             llm_role: LlmRole::Primary,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
+            auto_title_spawned: false,
         }
     }
 

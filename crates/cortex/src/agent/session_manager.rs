@@ -53,6 +53,8 @@ impl Agent {
             self.session.meta.id.clone(),
             2000,
         );
+        // A fresh session gets its own one-shot auto-title pass.
+        self.auto_title_spawned = false;
 
         // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(

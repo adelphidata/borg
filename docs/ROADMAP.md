@@ -312,10 +312,6 @@ top-down by priority, not by section order.
   `memory_search` which only hits consolidated long-term entries. "What
   did I do last Tuesday?" works today only if the relevant turn was
   consolidated — live session search is a separate retrieval pass.
-- **Session title auto-generation.** `[H]` Deferred. Cheap aux-LLM call
-  after the first user turn that names the session for transcript-pager
-  navigation. Small UX win; uses the existing `llm.aux` background
-  client.
 - **Mixture-of-agents tool.** `[H]` Deferred. Query multiple models in
   parallel and synthesize a single answer. High cost; reserved for
   high-stakes single-turn use cases. Niche — defer until explicit
