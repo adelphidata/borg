@@ -618,6 +618,89 @@ mod tests {
         }
     }
 
+    // ── text_to_speech handler ─────────────────────────────────────────
+
+    /// Spec: the handler must surface "Error: ..." when the LLM omits the
+    /// required `text` arg. Missing text used to fall through to an empty
+    /// synthesize() call that returned a generic provider error — confusing
+    /// because the actionable fix is on the caller's side, not the provider.
+    #[tokio::test]
+    async fn handle_text_to_speech_missing_text_returns_error() {
+        let synth = crate::media::tts::TtsSynthesizer::empty_for_test();
+        let out = handle_text_to_speech(&json!({}), &synth).await;
+        match out {
+            ToolOutput::Text(msg) => {
+                assert!(msg.starts_with("Error:"), "expected error prefix: {msg}");
+                assert!(
+                    msg.contains("text"),
+                    "error should name missing field: {msg}"
+                );
+            }
+            other => panic!("expected Text output, got: {other:?}"),
+        }
+    }
+
+    /// Spec: when every provider in the fallback chain fails (here, the
+    /// chain is empty) the handler must produce an error string the LLM
+    /// can act on — NOT a Multimodal audio part with zero bytes. The empty
+    /// synthesizer is a deterministic stand-in for "all providers down".
+    #[tokio::test]
+    async fn handle_text_to_speech_all_providers_failed_returns_error() {
+        let synth = crate::media::tts::TtsSynthesizer::empty_for_test();
+        let out = handle_text_to_speech(&json!({"text": "hello"}), &synth).await;
+        match out {
+            ToolOutput::Text(msg) => {
+                assert!(
+                    msg.contains("TTS error"),
+                    "expected TTS error prefix: {msg}"
+                );
+            }
+            ToolOutput::Multimodal { .. } => {
+                panic!("expected Text error output, got multimodal — handler returned audio for a failed synthesis")
+            }
+        }
+    }
+
+    /// Spec: oversize input must be rejected at the synthesizer (4096-char
+    /// cap), and the handler must convert that to a Text error rather than
+    /// a half-formed audio response. Without this guard a model could
+    /// stream a multi-megabyte completion into the TTS provider and rack
+    /// up the operator's bill.
+    #[tokio::test]
+    async fn handle_text_to_speech_oversized_text_returns_error() {
+        let synth = crate::media::tts::TtsSynthesizer::empty_for_test();
+        let huge = "a".repeat(10_000);
+        let out = handle_text_to_speech(&json!({"text": huge}), &synth).await;
+        match out {
+            ToolOutput::Text(msg) => {
+                assert!(
+                    msg.contains("TTS error") && msg.to_lowercase().contains("too long"),
+                    "expected length-related TTS error, got: {msg}"
+                );
+            }
+            other => panic!("expected Text output, got: {other:?}"),
+        }
+    }
+
+    /// Spec: the `format` arg, when present, must be parsed via
+    /// `AudioFormat::from_str_lossy`. An unknown value silently falls back
+    /// to the synthesizer's default (Mp3); a known value flows through.
+    /// We can't test the success path without a live provider, but we can
+    /// check the parser the handler depends on hasn't drifted.
+    #[test]
+    fn audio_format_lossy_parser_covers_handler_inputs() {
+        use crate::media::tts::AudioFormat;
+        assert_eq!(AudioFormat::from_str_lossy("mp3"), Some(AudioFormat::Mp3));
+        assert_eq!(AudioFormat::from_str_lossy("opus"), Some(AudioFormat::Opus));
+        assert_eq!(AudioFormat::from_str_lossy("wav"), Some(AudioFormat::Wav));
+        assert_eq!(AudioFormat::from_str_lossy("flac"), Some(AudioFormat::Flac));
+        assert_eq!(AudioFormat::from_str_lossy("aac"), Some(AudioFormat::Aac));
+        // Unknown formats must produce None so the handler's `.and_then`
+        // chain falls back to the synthesizer default.
+        assert_eq!(AudioFormat::from_str_lossy("xyz"), None);
+        assert_eq!(AudioFormat::from_str_lossy(""), None);
+    }
+
     #[tokio::test]
     async fn handle_browser_invalid_action_args_returns_error() {
         // "navigate" without a "url" argument fails validate_browser_args early

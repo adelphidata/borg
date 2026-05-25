@@ -519,8 +519,11 @@ impl AudioTranscriber {
                     client: client.clone(),
                     api_key,
                     base_url: "https://api.x.ai/v1".to_string(),
-                    format: true,
-                    diarize: false,
+                    // `None` preserves the historical default (format on,
+                    // diarize off). The Option fields exist so operators
+                    // can flip either behavior per-model row.
+                    format: model_cfg.xai_stt_format.unwrap_or(true),
+                    diarize: model_cfg.xai_stt_diarize.unwrap_or(false),
                 }))
             }
             other => {
@@ -641,6 +644,129 @@ mod tests {
     fn parse_deepgram_response_missing_transcript() {
         let json = serde_json::json!({"results": {"channels": []}});
         assert!(parse_deepgram_response(&json).is_err());
+    }
+
+    /// Spec: every documented STT provider arm in
+    /// `AudioTranscriber::build_provider` must successfully construct when
+    /// its credentials are present. Mirrors `tts.rs::from_config_builds_every_provider_arm`.
+    /// `local` is gated behind the `local-stt` cargo feature and exercised
+    /// in a separate test below.
+    #[tokio::test]
+    async fn from_config_builds_every_cloud_provider_arm() {
+        use crate::config::AudioModelConfig;
+        let arms: &[(&str, &str)] = &[
+            ("openai", "BORG_STT_ARM_OPENAI"),
+            ("groq", "BORG_STT_ARM_GROQ"),
+            ("deepgram", "BORG_STT_ARM_DEEPGRAM"),
+            ("mistral", "BORG_STT_ARM_MISTRAL"),
+            ("xai", "BORG_STT_ARM_XAI"),
+        ];
+        for (_, var) in arms {
+            unsafe { std::env::set_var(var, "test-key") };
+        }
+
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = arms
+            .iter()
+            .map(|(provider, var)| AudioModelConfig {
+                provider: (*provider).to_string(),
+                model: None,
+                api_key_env: Some((*var).to_string()),
+                language: None,
+                timeout_ms: None,
+                xai_stt_format: None,
+                xai_stt_diarize: None,
+            })
+            .collect();
+
+        let transcriber = AudioTranscriber::from_config(&config)
+            .expect("transcriber must build with every cloud arm");
+        assert_eq!(
+            transcriber.entries.len(),
+            arms.len(),
+            "every arm row must produce an entry"
+        );
+        let names: Vec<&str> = transcriber
+            .entries
+            .iter()
+            .map(|e| e.provider.name())
+            .collect();
+        for (expected, _) in arms {
+            assert!(
+                names.contains(expected),
+                "expected provider {expected} in entries, got {names:?}"
+            );
+        }
+
+        for (_, var) in arms {
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    /// Spec: the xAI STT row's `xai_stt_format` and `xai_stt_diarize`
+    /// options must round-trip through serde so an operator's choice
+    /// survives DB persistence. Default-on (None) maps to format=true,
+    /// diarize=false — the historical hardcoded values.
+    #[test]
+    fn audio_model_config_xai_options_serde_round_trip() {
+        use crate::config::AudioModelConfig;
+        // Explicit Some(true)/Some(false) must round-trip.
+        let cfg = AudioModelConfig {
+            provider: "xai".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: Some(false),
+            xai_stt_diarize: Some(true),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.xai_stt_format, Some(false));
+        assert_eq!(parsed.xai_stt_diarize, Some(true));
+
+        // Default (None) round-trips as None — historical hardcoded
+        // values apply only via `unwrap_or` at the provider build site,
+        // never at the config layer.
+        let none_cfg = AudioModelConfig {
+            provider: "xai".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+        };
+        let json = serde_json::to_string(&none_cfg).unwrap();
+        let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.xai_stt_format.is_none());
+        assert!(parsed.xai_stt_diarize.is_none());
+    }
+
+    /// Spec: a config row for a provider whose API key isn't set must be
+    /// skipped silently rather than poisoning the whole chain. Drops the
+    /// matching env var to simulate a misconfigured operator setup.
+    #[tokio::test]
+    async fn from_config_skips_provider_without_api_key() {
+        use crate::config::AudioModelConfig;
+        // Pick a var name unused elsewhere so a stale value can't fake
+        // success.
+        let var = "BORG_STT_ARM_NEVER_SET";
+        unsafe { std::env::remove_var(var) };
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "openai".to_string(),
+            model: None,
+            api_key_env: Some(var.to_string()),
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+        }];
+        // No usable providers → from_config returns None.
+        assert!(AudioTranscriber::from_config(&config).is_none());
     }
 
     #[tokio::test]

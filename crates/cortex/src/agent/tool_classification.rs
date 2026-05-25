@@ -138,6 +138,12 @@ mod tests {
             "create_channel",
             "spawn_agent",
             "schedule",
+            // Cost-incurring outbound-API tools: TTS hits paid voice
+            // providers, generate_image hits DALL-E/FAL. A Plan-mode
+            // sub-agent that could call these would burn the operator's
+            // budget for "read-only" exploration — keep them blocked.
+            "text_to_speech",
+            "generate_image",
         ] {
             assert!(
                 names.contains(&required),

@@ -158,6 +158,17 @@ pub struct AudioModelConfig {
     /// Per-provider timeout override in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// xAI-only: inverse text normalization — emit punctuation, casing,
+    /// digits-as-numerals rather than raw lowercased words. Hermes
+    /// defaults this on; flip off when a downstream consumer wants the
+    /// rawer form. `None` keeps the previous hardcoded default (true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xai_stt_format: Option<bool>,
+    /// xAI-only: speaker diarization. Paid feature; off by default to
+    /// avoid surprise billing. `None` keeps the previous hardcoded
+    /// default (false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xai_stt_diarize: Option<bool>,
 }
 
 /// Audio transcription configuration with multi-provider fallback.
@@ -225,6 +236,13 @@ pub struct TtsModelConfig {
     /// name the tempfile passed in `{out_path}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_extension: Option<String>,
+    /// xAI-only: when true, insert light `[pause]` speech tags between
+    /// paragraphs and after the first sentence so Grok's TTS delivers a
+    /// more natural cadence. Defaults to `false` (sends raw text); flip
+    /// when the model is in conversational reply mode. Ignored by every
+    /// non-xAI provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xai_auto_speech_tags: Option<bool>,
 }
 
 /// Text-to-speech configuration with multi-provider fallback.

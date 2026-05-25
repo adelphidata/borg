@@ -228,6 +228,7 @@ mod tests {
             name: None,
             command: None,
             output_extension: None,
+            xai_auto_speech_tags: None,
         }];
         unsafe {
             std::env::set_var("BORG_VOICE_RS_TEST_TTS_KEY", "test-key");

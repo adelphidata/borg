@@ -722,6 +722,57 @@ mod tests {
         vl.shutdown().await;
     }
 
+    /// Spec: when Whisper hallucinates on near-silence (the classic
+    /// "Thanks for watching!" / "Subscribe to my channel" outputs that the
+    /// `HALLUCINATION_PHRASES` set in `voice_capture` enumerates), the
+    /// orchestrator must filter the transcript at `transcribe_filter` and
+    /// suppress the `VoiceEvent::Transcript` event entirely. Otherwise the
+    /// agent would receive bogus user messages every time the room goes
+    /// quiet. This guard rides the same dispatch path as a real cycle so a
+    /// future refactor that bypasses `transcribe_filter` will break it.
+    #[tokio::test]
+    async fn whisper_hallucinations_are_filtered_to_empty_transcript() {
+        let rec = Arc::new(MockRecorder::default());
+        // Three classic hallucinations followed by a real utterance. The
+        // first three must be suppressed; the fourth must surface.
+        let trans = StubTranscriber::new(vec![
+            "Thanks for watching!",
+            "Subscribe to my channel.",
+            "you",
+            "schedule a meeting tomorrow",
+        ]);
+        // limit=10 so the silent-cycle guard doesn't preempt the test
+        // before the real transcript fires (each hallucination still
+        // counts as an empty cycle in the no-speech counter).
+        let mut cfg = VoiceConfig::default();
+        cfg.no_speech_limit = 10;
+        let (vl, mut rx) = VoiceLoop::new(cfg, rec.clone(), trans);
+        vl.start_continuous().await.unwrap();
+
+        for _ in 0..4 {
+            rec.set_next_stop_path(Some(fixture_wav()));
+            rec.fire_silence();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        // Collect every Transcript that came through. Only the last
+        // utterance should appear — the three hallucinations must be
+        // dropped by `is_whisper_hallucination`.
+        let mut transcripts: Vec<String> = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
+            if let VoiceEvent::Transcript(t) = ev {
+                transcripts.push(t);
+            }
+        }
+        assert_eq!(
+            transcripts.len(),
+            1,
+            "expected exactly one transcript through the filter, got {transcripts:?}"
+        );
+        assert_eq!(transcripts[0], "schedule a meeting tomorrow");
+        vl.shutdown().await;
+    }
+
     /// Regression for the Notify lost-wakeup race: if
     /// `notify_tts_finished` fires *before* the dispatcher's TTS-wait
     /// reaches `notified().await`, the wakeup must be latched (not

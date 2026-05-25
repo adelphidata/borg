@@ -1,5 +1,6 @@
-//! Live-LLM test lane: exercises `web_fetch`, `web_search`, and `browser`
-//! against real network targets.
+//! Live-LLM test lane: exercises `web_fetch`, `web_search`, `browser`,
+//! `text_to_speech`, and the audio transcription chain against real
+//! network targets.
 //!
 //! Run with:
 //!
@@ -279,4 +280,161 @@ async fn live_browser_upload_no_input_returns_error() {
         text.contains("Error") && (text.contains("not found") || text.contains("Element")),
         "expected 'Element not found' style error: {text}"
     );
+}
+
+// ── TTS / STT live tests ─────────────────────────────────────────────────
+//
+// Provider response shapes drift over time (Edge voice catalogue,
+// MiniMax envelope, xAI endpoint moves) — exactly the failure mode the
+// live lane is designed to catch. Each test is skipped when the relevant
+// credentials are absent, so a contributor without an OpenAI/Groq key can
+// still run `cargo test --features live-llm` without spurious failures.
+
+fn env_present(var: &str) -> bool {
+    std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Spec: an OpenAI TTS call with a short, well-known phrase returns
+/// non-trivial MP3 bytes prefixed with the ID3 tag or MPEG frame sync
+/// (`0xFFFB`/`0xFFFA`/`0xFFF3`). A drift here (auth shape change, model
+/// rename, endpoint move) breaks production voice replies; this guard
+/// is the live-lane canary for that class of regression.
+#[tokio::test]
+async fn live_tts_openai_synthesizes_short_clip() {
+    require_live!("live_tts_openai_synthesizes_short_clip");
+    if !env_present("OPENAI_API_KEY") {
+        eprintln!("skipping: set OPENAI_API_KEY to run this test");
+        return;
+    }
+
+    let mut config = Config::default();
+    config.tts.enabled = true;
+    config.tts.models = vec![cortex::config::TtsModelConfig {
+        provider: "openai".to_string(),
+        model: Some("tts-1".to_string()),
+        voice: Some("alloy".to_string()),
+        api_key_env: None, // defaults to OPENAI_API_KEY
+        timeout_ms: Some(30_000),
+        name: None,
+        command: None,
+        output_extension: None,
+        xai_auto_speech_tags: None,
+    }];
+
+    let synth = cortex::media::tts::TtsSynthesizer::from_config(&config)
+        .expect("OpenAI TTS synthesizer must build with OPENAI_API_KEY set");
+    let (bytes, fmt, attempts) = synth
+        .synthesize(
+            "Hello from the borg live test lane.",
+            None,
+            Some(cortex::media::tts::AudioFormat::Mp3),
+        )
+        .await
+        .expect("OpenAI TTS synthesize should succeed");
+
+    assert_eq!(fmt, cortex::media::tts::AudioFormat::Mp3);
+    assert!(
+        bytes.len() > 1024,
+        "expected non-trivial audio payload (>1KB), got {} bytes",
+        bytes.len()
+    );
+    // MP3 file headers: either an ID3v2 tag (`ID3`) or an MPEG audio
+    // frame sync (0xFFFB / 0xFFFA / 0xFFF3). Anything else means the
+    // provider returned an error envelope or an unexpected format.
+    let head = &bytes[..bytes.len().min(4)];
+    let is_mp3 = head.starts_with(b"ID3")
+        || (head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0);
+    assert!(
+        is_mp3,
+        "response does not start with MP3 magic (first bytes: {:?})",
+        head
+    );
+    // Attempts log: exactly one entry, success, provider name "openai".
+    assert_eq!(attempts.len(), 1);
+    let attempt = &attempts[0];
+    assert_eq!(attempt.provider, "openai");
+    assert!(matches!(
+        attempt.outcome,
+        cortex::media::tts::SynthesisOutcome::Success
+    ));
+}
+
+/// Spec: a Groq Whisper transcription of a short MP3 clip we just
+/// synthesized round-trips back to a transcript that contains the
+/// expected keyword. We chain TTS → STT in one test because (a) the
+/// alternative is checking in a binary WAV asset, and (b) it doubles as
+/// a smoke test for the TTS attempt-log shape used by the agent surface.
+///
+/// Skipped when `OPENAI_API_KEY` or `GROQ_API_KEY` is absent — the test
+/// is best-effort, not a hard gate.
+#[tokio::test]
+async fn live_stt_groq_transcribes_synthesized_clip() {
+    require_live!("live_stt_groq_transcribes_synthesized_clip");
+    if !env_present("OPENAI_API_KEY") || !env_present("GROQ_API_KEY") {
+        eprintln!("skipping: needs both OPENAI_API_KEY (for TTS source) and GROQ_API_KEY");
+        return;
+    }
+
+    // Synthesize a short, distinctive utterance via OpenAI TTS so the
+    // test asset is generated fresh on every run rather than checked in.
+    let mut tts_config = Config::default();
+    tts_config.tts.enabled = true;
+    tts_config.tts.models = vec![cortex::config::TtsModelConfig {
+        provider: "openai".to_string(),
+        model: Some("tts-1".to_string()),
+        voice: Some("alloy".to_string()),
+        api_key_env: None,
+        timeout_ms: Some(30_000),
+        name: None,
+        command: None,
+        output_extension: None,
+        xai_auto_speech_tags: None,
+    }];
+    let synth = cortex::media::tts::TtsSynthesizer::from_config(&tts_config).expect("TTS build");
+    // Use an unusual-but-pronounceable phrase so Whisper's transcript
+    // contains a hard-to-confuse anchor word.
+    let utterance = "Testing borg voice integration tomorrow.";
+    let (mp3_bytes, _, _) = synth
+        .synthesize(utterance, None, Some(cortex::media::tts::AudioFormat::Mp3))
+        .await
+        .expect("OpenAI TTS for STT round-trip");
+
+    // Build a Groq Whisper transcriber.
+    let mut stt_config = Config::default();
+    stt_config.audio.enabled = true;
+    stt_config.audio.models = vec![cortex::config::AudioModelConfig {
+        provider: "groq".to_string(),
+        model: None, // default to whisper-large-v3-turbo
+        api_key_env: None,
+        language: Some("en".to_string()),
+        timeout_ms: Some(60_000),
+        xai_stt_format: None,
+        xai_stt_diarize: None,
+    }];
+    let stt = cortex::media::understanding::AudioTranscriber::from_config(&stt_config)
+        .expect("STT build");
+
+    let (transcript, attempts) = stt
+        .transcribe(&mp3_bytes, "audio/mpeg", "live_test.mp3", Some("en"))
+        .await
+        .expect("Groq Whisper transcribe should succeed");
+
+    let lower = transcript.to_ascii_lowercase();
+    // Whisper is lossy on short clips; require *at least one* of the
+    // distinctive content words to land. "Borg" + "voice" + "tomorrow"
+    // — at least one of these should make it through any reasonable
+    // transcript even with provider drift.
+    let landed = ["borg", "voice", "tomorrow"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    assert!(
+        landed,
+        "no expected keyword found in transcript {transcript:?} (attempts: {attempts:?})"
+    );
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].provider, "groq");
+    assert!(matches!(
+        attempts[0].outcome,
+        cortex::media::understanding::AttemptOutcome::Success
+    ));
 }

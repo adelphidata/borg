@@ -1410,26 +1410,26 @@ impl App<'_> {
     }
 
     fn cmd_voice_start(&mut self, mode: VoiceMode) -> Result<AppAction> {
-        if !self.config.voice.enabled {
-            self.push_system_message(
-                "voice mode is disabled. Enable it first:\n  \
-                 /settings voice.enabled true"
-                    .to_string(),
-            );
+        // Run the precheck in a pure function so the guard table is
+        // testable without spinning up an App. A `Some(msg)` here means
+        // the user gets `msg` as a system reply and the command exits;
+        // `None` means we proceed to open the mic.
+        if let Some(msg) = voice_start_precheck(&self.config, self.voice_loop.is_some()) {
+            self.push_system_message(msg);
             return Ok(AppAction::Continue);
         }
-        if self.voice_loop.is_some() {
-            self.push_system_message("voice mode is already running.".to_string());
-            return Ok(AppAction::Continue);
-        }
-
+        // Precheck guarantees `from_config` returns `Some` here. Still
+        // pattern-match (rather than `expect`/`unwrap`) to satisfy
+        // clippy's expect-used lint and surface any future regression
+        // in the precheck as a clean user-visible message rather than
+        // a panic.
         let transcriber =
             match cortex::media::understanding::AudioTranscriber::from_config(&self.config) {
                 Some(t) => std::sync::Arc::new(t),
                 None => {
                     self.push_system_message(
-                        "voice: no audio transcription provider configured.\n  \
-                         Set `audio.enabled true` and add at least one model to `audio.models`."
+                        "voice: STT provider vanished between precheck and start. \
+                     Re-run /voice on after fixing audio.* config."
                             .to_string(),
                     );
                     return Ok(AppAction::Continue);
@@ -1583,6 +1583,40 @@ impl App<'_> {
 pub(super) enum VoiceMode {
     Continuous,
     Single,
+}
+
+/// Pure precheck for `/voice on` / `/voice rec`. Returns the system-message
+/// text to surface when the command can't run; `None` means "go ahead and
+/// open the mic". Keeps the guard table out of the App so it can be tested
+/// without a full TUI harness.
+///
+/// Order matters: a disabled voice config always loses to anything else
+/// (telling the user "already running" when the feature is disabled would
+/// be a lie). The "already running" guard fires before STT checks so
+/// `voice on` while a loop is live doesn't change its mind based on
+/// transient credential availability.
+pub(super) fn voice_start_precheck(
+    config: &cortex::config::Config,
+    voice_loop_running: bool,
+) -> Option<String> {
+    if !config.voice.enabled {
+        return Some(
+            "voice mode is disabled. Enable it first:\n  \
+             /settings voice.enabled true"
+                .to_string(),
+        );
+    }
+    if voice_loop_running {
+        return Some("voice mode is already running.".to_string());
+    }
+    if cortex::media::understanding::AudioTranscriber::from_config(config).is_none() {
+        return Some(
+            "voice: no audio transcription provider configured.\n  \
+             Set `audio.enabled true` and add at least one model to `audio.models`."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Render a `HandoffStatusReply` as a 3–5 line summary card body.
@@ -2395,5 +2429,109 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["q1", "a1", "q2", "a2"]);
+    }
+
+    // ── /voice precheck ────────────────────────────────────────────────
+
+    /// Spec: with `voice.enabled = false`, `/voice on` must surface the
+    /// "voice mode is disabled" hint and exit early — regardless of
+    /// whether an STT provider is configured or a loop is already
+    /// running. This is the user-facing contract for the feature flag.
+    #[test]
+    fn voice_start_precheck_refuses_when_voice_disabled() {
+        let mut config = cortex::config::Config::default();
+        config.voice.enabled = false;
+        config.audio.enabled = true; // even with STT ready
+        let msg = voice_start_precheck(&config, false).expect("must refuse");
+        assert!(
+            msg.contains("voice mode is disabled"),
+            "expected disabled hint: {msg}"
+        );
+        assert!(
+            msg.contains("voice.enabled"),
+            "expected mention of the setting key: {msg}"
+        );
+    }
+
+    /// Spec: `/voice on` with the loop already running must say so
+    /// (rather than silently spawning a duplicate or claiming the STT
+    /// provider is missing). Disabled flag has priority; this guard runs
+    /// next.
+    #[test]
+    fn voice_start_precheck_refuses_when_already_running() {
+        let mut config = cortex::config::Config::default();
+        config.voice.enabled = true;
+        let msg = voice_start_precheck(&config, true).expect("must refuse");
+        assert!(
+            msg.contains("already running"),
+            "expected already-running message: {msg}"
+        );
+    }
+
+    /// Spec: voice mode is unusable without an STT provider; the
+    /// precheck must surface that explicitly so the operator knows where
+    /// to look. A bare config (no `audio.models`) is the realistic
+    /// not-yet-set-up shape.
+    #[test]
+    fn voice_start_precheck_refuses_when_no_stt_provider() {
+        let mut config = cortex::config::Config::default();
+        config.voice.enabled = true;
+        // audio.enabled defaults to false → AudioTranscriber::from_config
+        // returns None → precheck must flag the missing provider.
+        let msg = voice_start_precheck(&config, false).expect("must refuse");
+        assert!(
+            msg.contains("no audio transcription provider"),
+            "expected STT-missing hint: {msg}"
+        );
+        assert!(
+            msg.contains("audio.enabled") && msg.contains("audio.models"),
+            "expected actionable setting names: {msg}"
+        );
+    }
+
+    /// Spec: when voice is enabled, no loop is running, and at least one
+    /// STT provider builds successfully, the precheck must return `None`
+    /// so the caller proceeds to open the mic. This pins the happy path.
+    #[test]
+    fn voice_start_precheck_passes_with_voice_and_stt_ready() {
+        // Unique env var so this test doesn't race the cortex per-arm
+        // tests on the standard names.
+        let var = "BORG_TUI_VOICE_PRECHECK_OPENAI_KEY";
+        unsafe { std::env::set_var(var, "test-key") };
+
+        let mut config = cortex::config::Config::default();
+        config.voice.enabled = true;
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "openai".to_string(),
+            model: None,
+            api_key_env: Some(var.to_string()),
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+        }];
+
+        assert!(
+            voice_start_precheck(&config, false).is_none(),
+            "precheck should pass with voice + STT ready"
+        );
+
+        unsafe { std::env::remove_var(var) };
+    }
+
+    /// Order spec: when voice is disabled AND a loop is somehow already
+    /// flagged running, the disabled message wins. Telling a user "already
+    /// running" while the feature is off would be misleading; the
+    /// actionable fix is to flip the feature flag.
+    #[test]
+    fn voice_start_precheck_disabled_beats_already_running() {
+        let mut config = cortex::config::Config::default();
+        config.voice.enabled = false;
+        let msg = voice_start_precheck(&config, true).expect("must refuse");
+        assert!(
+            msg.contains("voice mode is disabled"),
+            "disabled message must win over already-running: got {msg}"
+        );
     }
 }
