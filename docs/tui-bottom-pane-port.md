@@ -165,7 +165,8 @@ When picking this up in a future session:
 |---|---|---|
 | 1. Foundation (ScrollState + this doc) | ✅ landed | 2d02532e |
 | 2. BottomPane host skeleton | ✅ landed | _this commit_ |
-| 3. layout.rs port | ✅ landed | _this commit_ |
+| 3. layout.rs port | ✅ landed | 1d59f003 |
+| 6. mod.rs (overlay state machine) | ✅ landed | _this commit_ |
 | 4. render.rs port | ⏳ pending | — |
 | 5. TextLine editor | ⏳ pending | — |
 | 6. mod.rs (overlay state machine) | ⏳ pending | — |
