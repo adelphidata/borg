@@ -517,7 +517,9 @@ fn style_system_line(line: &str) -> Line<'static> {
     }
 
     // Log lines: "2026-04-03T17:05:25...Z  WARN ..." or "2026-04-03T17:05:25...Z ERROR ..."
-    if trimmed.len() > 20 && trimmed.as_bytes()[0].is_ascii_digit() && trimmed[..20].contains('T') {
+    if trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && trimmed.get(..20).is_some_and(|p| p.contains('T'))
+    {
         for level in &[" ERROR ", " WARN ", " INFO ", " DEBUG ", " TRACE "] {
             if let Some(pos) = trimmed.find(level) {
                 let prefix_end = pos + level.len();
@@ -2768,5 +2770,57 @@ mod tests {
             "user input must NOT be redacted; got: {rendered:?}"
         );
         assert!(!rendered.contains("[REDACTED"));
+    }
+
+    /// `style_system_line` must be total over all UTF-8 input.
+    ///
+    /// Regression: streaming a `request_user_input` tool call whose option
+    /// labels contained `"2. Warm & Playful — Warm, ..."` panicked the TUI
+    /// at history.rs:520 because the em-dash (`—`, 3 bytes) straddled the
+    /// hard-coded byte index 20 used by the log-line heuristic. Any digit-
+    /// prefixed line with a multi-byte char crossing byte 20 will crash.
+    ///
+    /// Invariant: for any `&str`, `style_system_line` returns a `Line`
+    /// without panicking, and the joined span text equals the input
+    /// (styling splits the line into spans but never drops or corrupts it).
+    #[test]
+    fn style_system_line_handles_multibyte_at_log_heuristic_boundary() {
+        let cases: &[&str] = &[
+            // Exact reported crash: em-dash crosses byte 20.
+            "2. Warm & Playful — Warm, supportive, and a bit playful",
+            // Another em-dash straddling byte 20.
+            "1234567890123456789—tail",
+            // Real timestamped log line — must still take the heuristic path.
+            "2026-04-03T17:05:25.123Z  WARN something happened",
+            // Digit-prefixed but ≤20 bytes — heuristic must not match.
+            "1. short",
+            // Pure ASCII non-log line.
+            "hello world",
+        ];
+
+        for input in cases {
+            let line = style_system_line(input);
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(
+                joined, *input,
+                "style_system_line must preserve text exactly; input: {input:?}"
+            );
+        }
+
+        // The log-line case must actually exercise the timestamp-styling
+        // branch — i.e. produce >1 span with a header-styled prefix ending
+        // at the log level. Otherwise the fix could silently regress the
+        // heuristic into a no-op and this test would still pass.
+        let log_line = style_system_line("2026-04-03T17:05:25.123Z  WARN something happened");
+        assert!(
+            log_line.spans.len() >= 2,
+            "log-line heuristic must split into multiple spans; got {} span(s)",
+            log_line.spans.len()
+        );
+        assert!(
+            log_line.spans[0].content.contains(" WARN "),
+            "first span should include the log-level prefix; got {:?}",
+            log_line.spans[0].content
+        );
     }
 }
