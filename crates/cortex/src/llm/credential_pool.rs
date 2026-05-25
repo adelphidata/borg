@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use libsql::params;
 use rand::prelude::IndexedRandom;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -24,12 +23,14 @@ use crate::llm::llm_error::FailoverReason;
 use crate::llm::provider::Provider;
 use crate::llm::rate_limit_headers::RateLimitSnapshot;
 
-/// Hard ceiling for any cooldown duration — defends against absurd provider
-/// hints like `retry_after: 999999999` (yes, it happens).
-const COOLDOWN_MAX_SECS: u64 = 24 * 60 * 60;
-
-/// Truncate persisted error messages to keep `borg auth list` and daemon.log bounded.
-const ERROR_MESSAGE_MAX_LEN: usize = 500;
+mod builders;
+mod helpers;
+pub use builders::{
+    pool_load_config_for_provider, pool_load_config_for_provider_with_proactive,
+    try_build_from_keys,
+};
+pub use helpers::{fingerprint, is_safe_base_url};
+use helpers::{needs_refresh, random_id, truncate_error_msg, COOLDOWN_MAX_SECS};
 
 // ── Strategy / status / source ────────────────────────────────────────────
 
@@ -1828,16 +1829,6 @@ impl CredentialPool {
     }
 }
 
-/// True when `expires_at_ms` is missing or within 60 seconds of `now_ms`.
-/// Missing expiry treated as "needs refresh" so a legacy persisted row with
-/// stale state forces one round-trip rather than gambling on a dead token.
-fn needs_refresh(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
-    match expires_at_ms {
-        None => true,
-        Some(exp) => exp <= now_ms + 60_000,
-    }
-}
-
 // ── LeaseHandle ───────────────────────────────────────────────────────────
 
 /// RAII guard for an active lease. Drop decrements the per-credential
@@ -2224,203 +2215,6 @@ async fn delete_suppression(
     )
     .await?;
     Ok(())
-}
-
-// ── Small utilities ───────────────────────────────────────────────────────
-
-/// 16-hex truncated BLAKE3 of the plaintext key. Stable identifier;
-/// reveals nothing about the key (one-way + truncation).
-pub fn fingerprint(key: &str) -> String {
-    let hash = blake3::hash(key.as_bytes());
-    let full = hash.to_hex();
-    full[..16].to_string()
-}
-
-/// Validate that `url` is safe to use as a per-credential `base_url` override.
-///
-/// Accepts: `https://<any-host>` and `http://<loopback-host>`. Rejects
-/// anything else — schemes other than http(s) (file/ftp/gopher), plain
-/// `http://` to non-loopback hosts (clear-text bearer over the wire), or
-/// strings that don't parse as a URL.
-///
-/// The threat model: anyone with local-user write access to
-/// `~/.qwen/oauth_creds.json` (or a future operator-supplied custom-endpoint
-/// file) could otherwise redirect the bearer token to an attacker host on
-/// next pool reload. They already have code-exec at that point, but the
-/// validation closes the obvious "swap one URL string" vector and surfaces
-/// a clear error to the operator instead of silently exfiltrating tokens.
-pub fn is_safe_base_url(url: &str) -> bool {
-    let parsed = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    match parsed.scheme() {
-        "https" => true,
-        "http" => parsed
-            .host_str()
-            .map(|h| {
-                h == "localhost"
-                    || h == "127.0.0.1"
-                    || h == "[::1]"
-                    || h == "::1"
-                    || h.starts_with("127.")
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn random_id() -> String {
-    let mut rng = rand::rng();
-    let mut buf = [0u8; 4];
-    rng.fill(&mut buf);
-    // 8-hex (4 bytes ≈ 4.3B values). Matches the `borg auth list` ID column
-    // truncate and gives `resolve_target`'s 4-hex-prefix matcher real headroom.
-    const TBL: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(8);
-    for b in buf {
-        out.push(TBL[(b >> 4) as usize] as char);
-        out.push(TBL[(b & 0xf) as usize] as char);
-    }
-    out
-}
-
-fn truncate_error_msg(s: &str) -> String {
-    // Redact first — upstream error bodies occasionally echo the bearer
-    // token tail back, and `last_error_message` ends up on operator
-    // terminals via `borg auth list` (and into shell history).
-    let redacted = crate::security::secrets::redact_secrets(s);
-    if redacted.len() <= ERROR_MESSAGE_MAX_LEN {
-        return redacted;
-    }
-    let mut end = ERROR_MESSAGE_MAX_LEN;
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[truncated]", &redacted[..end])
-}
-
-/// Build a [`PoolLoadConfig`] from the primary `LlmConfig` plus the resolved
-/// provider. `api_keys` is resolved by the caller (which has the `SecretRef`
-/// chain) and passed in as already-plaintext entries.
-pub fn pool_load_config_for_provider(
-    provider: Provider,
-    strategy: CredentialStrategy,
-    cooldown_secs: u64,
-    max_concurrent_per_credential: u32,
-    config_entries: Vec<ConfigEntry>,
-) -> PoolLoadConfig {
-    let mut env_vars = vec![provider.default_env_var().to_string()];
-    if matches!(provider, Provider::Anthropic) {
-        // Anthropic users sometimes set both ANTHROPIC_API_KEY and
-        // CLAUDE_API_KEY; surface both so a typo doesn't dead-end the user.
-        for v in ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"] {
-            if !env_vars.contains(&v.to_string()) {
-                env_vars.push(v.to_string());
-            }
-        }
-    }
-    PoolLoadConfig {
-        strategy,
-        cooldown_secs,
-        max_concurrent_per_credential,
-        proactive_rate_limit_threshold_pct: 0,
-        proactive_rate_limit_min_window_secs: 0,
-        config_entries,
-        env_vars,
-        oauth_home: None,
-    }
-}
-
-/// Same as [`pool_load_config_for_provider`], but also threads the proactive
-/// rate-limit knobs. New callers should use this; the no-suffix variant
-/// remains for backward compatibility (it disables proactive avoidance).
-pub fn pool_load_config_for_provider_with_proactive(
-    provider: Provider,
-    strategy: CredentialStrategy,
-    cooldown_secs: u64,
-    max_concurrent_per_credential: u32,
-    proactive_rate_limit_threshold_pct: u8,
-    proactive_rate_limit_min_window_secs: u64,
-    config_entries: Vec<ConfigEntry>,
-) -> PoolLoadConfig {
-    let mut cfg = pool_load_config_for_provider(
-        provider,
-        strategy,
-        cooldown_secs,
-        max_concurrent_per_credential,
-        config_entries,
-    );
-    cfg.proactive_rate_limit_threshold_pct = proactive_rate_limit_threshold_pct;
-    cfg.proactive_rate_limit_min_window_secs = proactive_rate_limit_min_window_secs;
-    cfg
-}
-
-/// Convenience: build a pool from already-resolved plaintext keys. Skips the
-/// `api_keys`-SecretRef-resolution dance — the caller already did it (see
-/// `Config::resolve_api_keys`). Best-effort: returns `None` if the DB path
-/// can't be resolved or the load fails. Logs at WARN on failure so prod
-/// regressions are observable.
-pub async fn try_build_from_keys(
-    provider: Provider,
-    plaintext_keys: Vec<String>,
-    strategy: CredentialStrategy,
-    cooldown_secs: u64,
-    max_concurrent_per_credential: u32,
-    proactive_rate_limit_threshold_pct: u8,
-    proactive_rate_limit_min_window_secs: u64,
-) -> Option<Arc<CredentialPool>> {
-    let db_path = match crate::config::Config::db_path() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                target: "cortex::llm::credential_pool",
-                error = %e,
-                "credential pool: cannot resolve db path — falling through to legacy rotation"
-            );
-            return None;
-        }
-    };
-    let db = match Database::open_at(&db_path).await {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(
-                target: "cortex::llm::credential_pool",
-                error = %e,
-                "credential pool: cannot open DB — falling through to legacy rotation"
-            );
-            return None;
-        }
-    };
-    let config_entries: Vec<ConfigEntry> = plaintext_keys
-        .into_iter()
-        .enumerate()
-        .map(|(i, k)| ConfigEntry {
-            key: k,
-            label: None,
-            config_name: format!("llm.api_keys[{i}]"),
-        })
-        .collect();
-    let cfg = pool_load_config_for_provider_with_proactive(
-        provider,
-        strategy,
-        cooldown_secs,
-        max_concurrent_per_credential,
-        proactive_rate_limit_threshold_pct,
-        proactive_rate_limit_min_window_secs,
-        config_entries,
-    );
-    match CredentialPool::load(&db, &db_path, provider, cfg).await {
-        Ok(pool) => Some(pool),
-        Err(e) => {
-            warn!(
-                target: "cortex::llm::credential_pool",
-                error = %e,
-                "credential pool: load failed — falling through to legacy rotation"
-            );
-            None
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -3289,23 +3083,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_safe_base_url_blocks_dangerous_schemes() {
-        // Defends against an attacker who can write `~/.qwen/oauth_creds.json`
-        // pointing the bearer at their host. https is open (TLS gates the
-        // wire), http requires loopback (clear-text is fine on localhost),
-        // everything else fails closed.
-        assert!(is_safe_base_url("https://api.example.com/v1"));
-        assert!(is_safe_base_url("http://localhost:8080/v1"));
-        assert!(is_safe_base_url("http://127.0.0.1:11434/v1"));
-        assert!(is_safe_base_url("http://[::1]/v1"));
-        assert!(!is_safe_base_url("http://evil.com/exfil"));
-        assert!(!is_safe_base_url("file:///etc/passwd"));
-        assert!(!is_safe_base_url("ftp://files.example.com/"));
-        assert!(!is_safe_base_url("javascript:alert(1)"));
-        assert!(!is_safe_base_url("not-a-url"));
-        assert!(!is_safe_base_url(""));
-    }
+    // `is_safe_base_url` invariants live alongside the helper in
+    // `credential_pool::helpers::tests::is_safe_base_url_blocks_dangerous_schemes`.
 
     #[test]
     fn add_entry_resurrects_tombstoned_fingerprint() {
@@ -3494,12 +3273,8 @@ mod tests {
 
     // ── Misc ──
 
-    #[test]
-    fn fingerprint_is_stable_and_distinct() {
-        assert_eq!(fingerprint("abc"), fingerprint("abc"));
-        assert_ne!(fingerprint("abc"), fingerprint("abd"));
-        assert_eq!(fingerprint("abc").len(), 16);
-    }
+    // `fingerprint` invariants live alongside the helper in
+    // `credential_pool::helpers::tests::fingerprint_is_stable_and_short`.
 
     #[test]
     fn strategy_parses_and_roundtrips() {
@@ -3985,16 +3760,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn needs_refresh_treats_missing_expiry_as_stale() {
-        // Belt-and-suspenders: a legacy OAuth row with no expires_at_ms
-        // forces one refresh roundtrip rather than gambling on a dead token.
-        assert!(needs_refresh(None, 1_000_000));
-        // Within the 60s skew window → refresh.
-        assert!(needs_refresh(Some(1_000_000 + 30_000), 1_000_000));
-        // Outside the skew window → no refresh.
-        assert!(!needs_refresh(Some(1_000_000 + 120_000), 1_000_000));
-    }
+    // `needs_refresh` invariants live alongside the helper in
+    // `credential_pool::helpers::tests::needs_refresh_*`.
 
     #[test]
     fn oauth_seeded_credential_round_trips_through_persistence() {
