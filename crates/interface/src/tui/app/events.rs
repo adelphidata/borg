@@ -482,12 +482,9 @@ impl<'a> App<'a> {
             }
         }
         self.cells.push(HistoryCell::System { text });
-        // Install the new BottomPane overlay (Phase 7 wiring). The legacy
-        // `AppState::AwaitingInput` carousel is no longer instantiated from
-        // production — its tests still exercise the old key handler via
-        // direct state injection, but real UserInputRequest events flow
-        // through the new host now. The old struct fields remain only
-        // until Phase 7b cleanup deletes them.
+        // Install the BottomPane picker overlay. The legacy `AwaitingInput`
+        // path was removed in the Phase 7b refactor — this host is now the
+        // sole render+input surface for `request_user_input`.
         match super::super::bottom_pane::request_user_input::RequestUserInputOverlay::new_with_responder(
             questions,
             respond,

@@ -20,9 +20,6 @@ mod layout;
 mod render;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::custom_terminal::Frame;
 
@@ -478,125 +475,6 @@ impl RequestUserInputOverlay {
         }
         out
     }
-
-    /// Paint the overlay into `area` using the Phase 3 layout sections.
-    /// Minimal but functional — progress header, wrapped question, options
-    /// list with selection marker + checkbox glyph, optional notes input,
-    /// footer hints. Themes come from `crate::tui::theme` so colours match
-    /// the rest of the TUI; no new colour constants introduced here.
-    fn render_inline(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let sections = self.layout_sections(area);
-        let total = self.questions.len();
-
-        // Progress row: "Question N/Total"
-        if sections.progress_area.height > 0 {
-            let progress = Line::from(vec![Span::styled(
-                format!("Question {}/{}", self.current_idx + 1, total),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]);
-            frame.render_widget(
-                Paragraph::new(progress).wrap(Wrap { trim: false }),
-                sections.progress_area,
-            );
-        }
-
-        // Question text (wrapped earlier by layout_sections).
-        if sections.question_area.height > 0 && !sections.question_lines.is_empty() {
-            let lines: Vec<Line> = sections
-                .question_lines
-                .iter()
-                .map(|s| Line::from(Span::raw(s.clone())))
-                .collect();
-            frame.render_widget(Paragraph::new(lines), sections.question_area);
-        }
-
-        // Options list with selection + checkbox markers.
-        if sections.options_area.height > 0 {
-            let cursor = self.cursor_row();
-            let multi = self.current().multi_select;
-            let selected = &self.current_answer().selected;
-            let mut rows: Vec<Line> = Vec::new();
-            let options_len = self.current().options.len();
-            let total_rows = options_len + 1;
-            let visible = sections.options_area.height as usize;
-            let scroll_top = self.current_answer().options_state.scroll_top;
-            let end = (scroll_top + visible).min(total_rows);
-            for idx in scroll_top..end {
-                let label = if idx < options_len {
-                    self.current().options[idx].label.as_str()
-                } else {
-                    other_label()
-                };
-                let marker = if idx == cursor { "› " } else { "  " };
-                let check = if multi {
-                    if selected.contains(&idx) {
-                        "[x] "
-                    } else {
-                        "[ ] "
-                    }
-                } else {
-                    ""
-                };
-                let style = if idx == cursor {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                rows.push(Line::from(vec![
-                    Span::styled(marker.to_string(), style),
-                    Span::styled(check.to_string(), style),
-                    Span::styled(label.to_string(), style),
-                ]));
-            }
-            frame.render_widget(Paragraph::new(rows), sections.options_area);
-        }
-
-        // Notes section (when visible).
-        if sections.notes_area.height > 0 {
-            let notes = &self.current_answer().notes;
-            let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                "Notes (Tab to toggle):",
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-            lines.push(Line::from(Span::raw(
-                if notes.is_empty() && self.focus != Focus::Notes {
-                    "(empty)".to_string()
-                } else {
-                    notes.clone()
-                },
-            )));
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }),
-                sections.notes_area,
-            );
-        }
-
-        // Footer hint — single line giving the basic bindings the user
-        // needs to operate the picker. Anchored just below the overlay
-        // area when room allows; otherwise overlaid at the bottom of
-        // `area`. Phase 4 expands this into proper coloured key hints.
-        if sections.footer_lines > 0 {
-            let footer_y = area.y + area.height - 1;
-            let footer_rect = Rect {
-                x: area.x,
-                y: footer_y,
-                width: area.width,
-                height: 1,
-            };
-            let hint = "↑↓ select  Space toggle  Tab notes  Enter next/submit  Esc cancel";
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    hint,
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-                footer_rect,
-            );
-        }
-    }
 }
 
 impl BottomPaneView for RequestUserInputOverlay {
@@ -621,13 +499,10 @@ impl BottomPaneView for RequestUserInputOverlay {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Minimal in-trait render path that consumes the Phase 3
-        // `LayoutSections` directly. The parallel-session richer
-        // `render.rs` (using `ratatui::Frame`) sits as a future
-        // beautification step — borg's `App` uses `custom_terminal::Frame`
-        // throughout, so all in-tree views render through this path. When
-        // the visual layer is unified, this body becomes a thin delegator.
-        self.render_inline(frame, area);
+        // Delegates to the Phase 4 visual layer in `render.rs`, which
+        // takes a `&mut Buffer` so the call site stays Frame-agnostic.
+        // BottomPane has already issued a `Clear` over `area`.
+        self.render_ui(frame.buffer_mut(), area);
     }
 
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
@@ -974,6 +849,76 @@ mod tests {
         // Subsequent keys must report Done and not panic.
         let outcome = overlay.handle_key(key_code(KeyCode::Enter));
         assert_eq!(outcome, OverlayKeyOutcome::Done);
+    }
+
+    /// End-to-end Phase 8 integration: drive the overlay programmatically
+    /// through a multi-question batch, then serialize the answers through
+    /// cortex's `serialize_answers` and assert the JSON matches the
+    /// cortex-contract shape. This is the "works just like Codex" test —
+    /// it goes through the same code path the running app would, including
+    /// the user_note prefix, declaration order for multi-select, and the
+    /// preserved-question-order JSON output that the LLM sees.
+    #[test]
+    fn end_to_end_overlay_drives_cortex_serialize_round_trip() {
+        use cortex::tool_handlers::user_input::serialize_answers;
+        let questions = vec![q("color", "?", 2), multi_q("flavors", 3), q("size", "?", 2)];
+        let (tx, mut rx) = oneshot::channel();
+        let mut overlay =
+            RequestUserInputOverlay::new_with_responder(questions.clone(), tx).unwrap();
+
+        // Q1: pick Option 0 (single-select).
+        overlay.handle_key(key_code(KeyCode::Down));
+        overlay.handle_key(key_code(KeyCode::Enter)); // advance to Q2
+
+        // Q2: multi-select; toggle Option 2 then Option 0 (out of order)
+        // to prove declaration-order is preserved through serialization.
+        overlay.handle_key(key_char('3'));
+        overlay.handle_key(key_code(KeyCode::Char(' ')));
+        overlay.handle_key(key_char('1'));
+        overlay.handle_key(key_code(KeyCode::Char(' ')));
+        overlay.handle_key(key_code(KeyCode::Enter)); // advance to Q3
+
+        // Q3: select Option 0, open notes, type "fits well", submit.
+        overlay.handle_key(key_code(KeyCode::Down));
+        overlay.handle_key(key_code(KeyCode::Tab));
+        for ch in "fits well".chars() {
+            overlay.handle_key(key_char(ch));
+        }
+        overlay.handle_key(key_code(KeyCode::Enter)); // submits
+
+        assert!(overlay.is_done());
+        let answers = rx.try_recv().expect("submit");
+        let json = serialize_answers(&questions, &answers);
+
+        // Question order is preserved (color, flavors, size) — that's the
+        // cortex contract: the LLM gets a stable-keyed map keyed by the
+        // declared question ids.
+        let color_pos = json.find("\"color\"").expect("color key");
+        let flavors_pos = json.find("\"flavors\"").expect("flavors key");
+        let size_pos = json.find("\"size\"").expect("size key");
+        assert!(
+            color_pos < flavors_pos && flavors_pos < size_pos,
+            "serialized order must follow question declaration order, got:\n{json}"
+        );
+
+        // Multi-select payload is declaration-ordered even though toggles
+        // happened in (2, 0) order in the UI.
+        assert!(
+            json.contains(r#""flavors":{"answers":["Option 0","Option 2"]}"#),
+            "multi-select must serialize options in declaration order:\n{json}"
+        );
+
+        // Single-select with notes appends user_note: prefix.
+        assert!(
+            json.contains(r#""size":{"answers":["Option 0","user_note: fits well"]}"#),
+            "single-select with notes must round-trip with user_note prefix:\n{json}"
+        );
+
+        // Plain single-select with no notes is just the chosen label.
+        assert!(
+            json.contains(r#""color":{"answers":["Option 0"]}"#),
+            "plain single-select must be just the label:\n{json}"
+        );
     }
 
     /// Preferred option height caps at the visible-rows constant so a

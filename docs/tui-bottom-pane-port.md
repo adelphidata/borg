@@ -167,7 +167,10 @@ When picking this up in a future session:
 | 2. BottomPane host skeleton | ✅ landed | _this commit_ |
 | 3. layout.rs port | ✅ landed | 1d59f003 |
 | 6. mod.rs (overlay state machine) | ✅ landed | 5fdd3436 |
-| 7. App wiring (BottomPane host live, install on UserInputRequest, key + render integration) | ✅ landed | _this commit_ |
+| 7. App wiring (BottomPane host live, install on UserInputRequest, key + render integration) | ✅ landed | b1898a33 |
+| 7b. Refactor: render.rs → `&mut Buffer`, real `render_ui` delegation, legacy `AwaitingInput` removed (variant + handler + render path + ~390 lines of legacy tests) | ✅ landed | _this commit_ |
+| 8. E2E integration test: overlay drives cortex `serialize_answers` round-trip with declaration-order multi-select + user_note prefix | ✅ landed | _this commit_ |
+| 9. Final validate: `cargo fmt --check`, full-workspace `cargo clippy --all-targets -- -D warnings`, 1054/1054 interface tests pass | ✅ landed | _this commit_ |
 | 4. render.rs port | ⏳ pending | — |
 | 5. TextLine editor | ⏳ pending | — |
 | 6. mod.rs (overlay state machine) | ⏳ pending | — |
