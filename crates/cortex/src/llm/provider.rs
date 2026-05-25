@@ -284,12 +284,15 @@ impl Provider {
             Provider::Gemini => model.strip_prefix("google/").unwrap_or(model).to_string(),
             Provider::DeepSeek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
             Provider::Groq => model.strip_prefix("groq/").unwrap_or(model).to_string(),
-            // xAI publishes Grok slugs without a vendor prefix. Tolerate both
-            // `xai/grok-4` and the OpenRouter-style `x-ai/grok-4` so users
-            // copying slugs from either docs page hit the same endpoint.
+            // xAI publishes Grok slugs without a vendor prefix. Tolerate every
+            // common docs spelling (`xai/`, `x-ai/` OpenRouter-style, `x.ai/`
+            // the dotted form, and bare `grok/`) so a slug copy-pasted from
+            // any of those sources hits the same endpoint.
             Provider::XAi => model
                 .strip_prefix("xai/")
                 .or_else(|| model.strip_prefix("x-ai/"))
+                .or_else(|| model.strip_prefix("x.ai/"))
+                .or_else(|| model.strip_prefix("grok/"))
                 .unwrap_or(model)
                 .to_string(),
             Provider::Ollama => model.to_string(),
@@ -498,7 +501,9 @@ impl FromStr for Provider {
             "gemini" => Ok(Provider::Gemini),
             "deepseek" => Ok(Provider::DeepSeek),
             "groq" => Ok(Provider::Groq),
-            "xai" | "x-ai" | "x_ai" => Ok(Provider::XAi),
+            // `grok` and `x.ai` are common user-typed spellings — match the
+            // hermes-agent alias set so a config copy-pasted from there parses.
+            "xai" | "x-ai" | "x_ai" | "x.ai" | "grok" => Ok(Provider::XAi),
             "ollama" => Ok(Provider::Ollama),
             "claude-cli" | "claudecli" | "claude_cli" => Ok(Provider::ClaudeCli),
             "claude-code-oauth" | "claude_code_oauth" | "claudecodeoauth" => {
@@ -971,10 +976,20 @@ mod tests {
     fn xai_round_trip() {
         assert_eq!(Provider::XAi.as_str(), "xai");
         assert_eq!(Provider::from_str("xai").unwrap(), Provider::XAi);
-        // Case-insensitive + alternate spellings users might paste from docs.
+        // Case-insensitive + every documented alias users might paste:
+        //   xai / x-ai / x_ai — canonical & OpenRouter / serde flavors
+        //   x.ai             — the dotted brand name
+        //   grok             — the product name users actually type
+        // All must resolve to the same provider; if any drifts apart, a
+        // config copy-pasted from hermes-agent or xAI docs silently fails.
         assert_eq!(Provider::from_str("XAI").unwrap(), Provider::XAi);
         assert_eq!(Provider::from_str("x-ai").unwrap(), Provider::XAi);
         assert_eq!(Provider::from_str("X-AI").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("x.ai").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("X.AI").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("grok").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("Grok").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("GROK").unwrap(), Provider::XAi);
     }
 
     #[test]
@@ -1015,11 +1030,18 @@ mod tests {
     #[test]
     fn xai_normalize_model_strips_vendor_prefix() {
         assert_eq!(Provider::XAi.normalize_model("xai/grok-4"), "grok-4");
-        // Tolerate the OpenRouter-style x-ai/ prefix too — users routinely
-        // copy slugs across the two docs sites.
+        // Every documented prefix flavor — OpenRouter (`x-ai/`), dotted brand
+        // (`x.ai/`), and bare product name (`grok/`) — must strip to the same
+        // canonical slug. Drift here means a slug from one docs page silently
+        // hits the xAI endpoint with the prefix attached and 404s.
         assert_eq!(
             Provider::XAi.normalize_model("x-ai/grok-4-fast-reasoning"),
             "grok-4-fast-reasoning"
+        );
+        assert_eq!(Provider::XAi.normalize_model("x.ai/grok-4.3"), "grok-4.3");
+        assert_eq!(
+            Provider::XAi.normalize_model("grok/grok-code-fast-1"),
+            "grok-code-fast-1"
         );
         // Bare slugs pass through unchanged.
         assert_eq!(Provider::XAi.normalize_model("grok-4"), "grok-4");

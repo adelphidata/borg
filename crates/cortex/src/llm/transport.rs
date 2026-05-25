@@ -849,6 +849,20 @@ pub(crate) fn build_openai_request(
         .effective_thinking(request.model)
         .openai_reasoning_effort()
         .map(String::from);
+    // xAI rejects several JSON-schema keywords that OpenAI/Anthropic accept
+    // (`minLength`, `maxLength`, `minItems`, `maxItems`, `minContains`,
+    // `maxContains`, and top-level `strict`). Strip them from the per-tool
+    // parameter schema before the request hits the wire — otherwise the
+    // model returns 400 for any tool that uses string/array bounds.
+    let tools = request.tools.map(|ts| {
+        let mut owned: Vec<ToolDefinition> = ts.to_vec();
+        if matches!(request.provider, Provider::XAi) {
+            for tool in &mut owned {
+                sanitize_xai_tool_schema(&mut tool.function.parameters);
+            }
+        }
+        owned
+    });
     let chat_request = ChatRequest {
         model: request.model.to_string(),
         messages: if stream {
@@ -856,7 +870,7 @@ pub(crate) fn build_openai_request(
         } else {
             request.messages.to_vec()
         },
-        tools: request.tools.map(<[ToolDefinition]>::to_vec),
+        tools,
         temperature: request.llm_config.temperature,
         max_tokens: request.llm_config.max_tokens,
         stream,
@@ -892,6 +906,54 @@ pub(crate) fn build_openai_request(
         }
     }
     Ok(body)
+}
+
+/// JSON-schema keywords xAI's tool-call validator rejects with HTTP 400.
+/// Captured against `https://api.x.ai/v1/chat/completions` 2026-05-24 — every
+/// keyword here has been confirmed to produce a "schema not supported" error
+/// when present in a tool's `parameters`. The list mirrors openclaw's
+/// extensions/xai/model-compat.ts so a tool authored under either runtime
+/// reaches xAI unchanged.
+const XAI_UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minContains",
+    "maxContains",
+];
+
+/// Strip JSON-schema keywords that xAI rejects from a tool's parameter
+/// schema. Walks the schema recursively (properties, items, anyOf/oneOf/allOf,
+/// definitions/$defs). Top-level `strict: true` — emitted by tools targeting
+/// OpenAI's structured-outputs flag — is also removed so the same tool
+/// definition works on both endpoints.
+///
+/// Legitimate keywords (`type`, `properties`, `required`, `enum`, `description`,
+/// `additionalProperties`, …) are left intact.
+fn sanitize_xai_tool_schema(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            for kw in XAI_UNSUPPORTED_SCHEMA_KEYWORDS {
+                map.remove(*kw);
+            }
+            // `strict: true` is OpenAI's structured-outputs flag; xAI rejects
+            // it at the tool-definition level. Only strip the boolean — leave
+            // alternate uses (e.g. a property literally named "strict") alone.
+            if matches!(map.get("strict"), Some(serde_json::Value::Bool(_))) {
+                map.remove("strict");
+            }
+            for (_k, v) in map.iter_mut() {
+                sanitize_xai_tool_schema(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                sanitize_xai_tool_schema(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_usage_cost(value: &serde_json::Value) -> Option<String> {
@@ -1598,6 +1660,172 @@ mod tests {
             }
             _ => panic!("expected fatal auth-permanent error"),
         }
+    }
+
+    #[test]
+    fn sanitize_xai_tool_schema_strips_unsupported_keywords_recursively() {
+        // Fixture mirrors the shape openclaw confirmed xAI rejects: each
+        // unsupported keyword present at top-level, inside `properties`, and
+        // inside nested `items`/`anyOf`. After sanitization, every banned
+        // keyword must be gone everywhere AND every legitimate keyword must
+        // survive — otherwise tools either 400 on xAI or stop describing
+        // themselves correctly to every other provider that reuses this
+        // schema.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "strict": true,
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "user name",
+                },
+                "tags": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 10,
+                    "minContains": 1,
+                    "maxContains": 5,
+                    "items": {
+                        "type": "string",
+                        "minLength": 2,
+                        "enum": ["a", "b", "c"],
+                    },
+                },
+                "kind": {
+                    "anyOf": [
+                        { "type": "string", "maxLength": 8 },
+                        { "type": "null" },
+                    ]
+                }
+            },
+            "required": ["name"],
+        });
+        sanitize_xai_tool_schema(&mut schema);
+
+        // Banned keywords are removed at every nesting depth.
+        for path in [
+            "/strict",
+            "/properties/name/minLength",
+            "/properties/name/maxLength",
+            "/properties/tags/minItems",
+            "/properties/tags/maxItems",
+            "/properties/tags/minContains",
+            "/properties/tags/maxContains",
+            "/properties/tags/items/minLength",
+            "/properties/kind/anyOf/0/maxLength",
+        ] {
+            assert!(
+                schema.pointer(path).is_none(),
+                "expected {path} to be stripped but it remained: {schema}"
+            );
+        }
+        // Legitimate keywords survive — drift here would break tools on every
+        // other provider while fixing them on xAI.
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert_eq!(schema["properties"]["name"]["description"], "user name");
+        assert_eq!(schema["properties"]["tags"]["type"], "array");
+        assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["tags"]["items"]["enum"],
+            serde_json::json!(["a", "b", "c"])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+        assert_eq!(schema["properties"]["kind"]["anyOf"][1]["type"], "null");
+    }
+
+    #[test]
+    fn sanitize_xai_tool_schema_preserves_property_named_strict() {
+        // A property literally named "strict" (as opposed to the top-level
+        // boolean `strict: true` flag) is a real schema; stripping it would
+        // silently delete a user-defined field from tool inputs.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "strict": { "type": "boolean", "description": "should we enforce" }
+            }
+        });
+        sanitize_xai_tool_schema(&mut schema);
+        assert_eq!(schema["properties"]["strict"]["type"], "boolean");
+        assert_eq!(
+            schema["properties"]["strict"]["description"],
+            "should we enforce"
+        );
+    }
+
+    #[test]
+    fn build_openai_request_strips_xai_unsupported_tool_schema() {
+        // End-to-end: build_openai_request must run the xAI sanitizer when
+        // (and only when) the provider is XAi. Without this, every tool whose
+        // schema uses string/array bounds 400s on xAI — a high-impact silent
+        // regression.
+        let messages = vec![Message::user("hi")];
+        let tools = vec![crate::types::ToolDefinition::new(
+            "lookup",
+            "Look up a record",
+            serde_json::json!({
+                "type": "object",
+                "strict": true,
+                "properties": {
+                    "id": { "type": "string", "minLength": 1, "maxLength": 36 },
+                    "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 4 }
+                },
+                "required": ["id"]
+            }),
+        )];
+
+        let xai_req = TransportRequest {
+            provider: Provider::XAi,
+            model: "grok-4",
+            messages: &messages,
+            tools: Some(&tools),
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&xai_req, false).expect("xai body");
+        let params = &body["tools"][0]["function"]["parameters"];
+        assert!(
+            params.pointer("/strict").is_none(),
+            "xAI body still carries top-level strict: {body}"
+        );
+        assert!(
+            params.pointer("/properties/id/minLength").is_none(),
+            "xAI body still carries minLength: {body}"
+        );
+        assert!(
+            params.pointer("/properties/id/maxLength").is_none(),
+            "xAI body still carries maxLength: {body}"
+        );
+        assert!(
+            params.pointer("/properties/tags/maxItems").is_none(),
+            "xAI body still carries maxItems: {body}"
+        );
+        // `required` / nested `type` / property surface must survive.
+        assert_eq!(params["properties"]["id"]["type"], "string");
+        assert_eq!(params["required"], serde_json::json!(["id"]));
+
+        // The sanitizer is xAI-only: pointing the same tool at another
+        // OpenAI-compat provider must leave the schema intact. Otherwise tool
+        // validation on OpenAI / Groq / DeepSeek silently weakens for every
+        // user who happens to share a tool catalog with an xAI session.
+        let openai_req = TransportRequest {
+            provider: Provider::OpenAi,
+            model: "gpt-4.1",
+            messages: &messages,
+            tools: Some(&tools),
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&openai_req, false).expect("openai body");
+        let params = &body["tools"][0]["function"]["parameters"];
+        assert_eq!(params["strict"], true);
+        assert_eq!(params["properties"]["id"]["minLength"], 1);
+        assert_eq!(params["properties"]["id"]["maxLength"], 36);
+        assert_eq!(params["properties"]["tags"]["maxItems"], 4);
     }
 
     #[test]

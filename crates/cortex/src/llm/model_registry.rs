@@ -239,11 +239,10 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 1_000_000,
         supports_thinking: false,
     },
-    // ── xAI Grok 4 family ──
+    // ── xAI Grok family ──
     // Declared longest-slug-first for human readability; `lookup` does
     // longest-prefix matching independent of declaration order.
-    // Context windows mirror xAI's public docs (Grok 4 = 256k, Grok 4 Fast = 2M)
-    // — update when xAI revises them.
+    // Context windows mirror xAI's public docs — update when xAI revises them.
     ModelMetadata {
         slug: "grok-4-fast-reasoning",
         context_window: 2_000_000,
@@ -264,11 +263,69 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 2_000_000,
         supports_thinking: false,
     },
+    // grok-4.20 — reasoning/non-reasoning/multi-agent split. The dated `0309`
+    // revision is in the middle of the slug (`grok-4.20-0309-reasoning`), so
+    // the family entries embed the date — prefix matching needs the literal
+    // string up through the reasoning/non-reasoning/multi-agent suffix or
+    // the variant gets misclassified. Bare `grok-4.20` is the fallback for
+    // future undated slugs.
+    ModelMetadata {
+        slug: "grok-4.20-multi-agent-0309",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "grok-4.20-0309-reasoning",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "grok-4.20-0309-non-reasoning",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "grok-4.20",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "grok-4.3",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "grok-4",
         context_window: 256_000,
         max_context_window: 256_000,
         supports_thinking: true,
+    },
+    // grok-code-fast — xAI's coding-tuned reasoning model. 256k context,
+    // tool-calling first-class. Aliases (`grok-code-fast-1`, dated slugs
+    // like `grok-code-fast-1-0825`) all resolve here via prefix match.
+    ModelMetadata {
+        slug: "grok-code-fast",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    // grok-3 / grok-3-mini still exist on xAI for back-compat consumers.
+    ModelMetadata {
+        slug: "grok-3-mini",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "grok-3",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: false,
     },
     // ── DeepSeek ──
     // `deepseek-chat` is the stable alias — the underlying weights are V3.2 today.
@@ -421,6 +478,8 @@ fn strip_vendor_prefix(model: &str) -> &str {
         "ollama/",
         "xai/",
         "x-ai/",
+        "x.ai/",
+        "grok/",
         "meta-llama/",
         "mistralai/",
         "qwen/",
@@ -522,15 +581,21 @@ mod tests {
 
     #[test]
     fn grok_vendor_prefixes_strip_to_canonical_slug() {
-        // The xAI direct-provider canonical (`xai/`) and the OpenRouter-style
-        // (`x-ai/`) must both resolve to the same registry entry — otherwise
-        // a user copy-pasting from either docs page sees a different context
-        // window than what the model actually accepts.
+        // Every published xAI prefix flavor must resolve to the same registry
+        // entry — a user copy-pasting from any docs page or alias should hit
+        // the same context-window number that the model actually accepts.
         assert_eq!(lookup("xai/grok-4").unwrap().slug, "grok-4");
         assert_eq!(lookup("x-ai/grok-4").unwrap().slug, "grok-4");
+        assert_eq!(lookup("x.ai/grok-4").unwrap().slug, "grok-4");
+        assert_eq!(lookup("grok/grok-4").unwrap().slug, "grok-4");
         assert_eq!(
             lookup("xai/grok-4-fast-reasoning").unwrap().slug,
             "grok-4-fast-reasoning"
+        );
+        assert_eq!(lookup("grok/grok-4.3").unwrap().slug, "grok-4.3");
+        assert_eq!(
+            lookup("x.ai/grok-code-fast-1").unwrap().slug,
+            "grok-code-fast"
         );
     }
 
@@ -541,6 +606,56 @@ mod tests {
         // (which would silently drop them to DEFAULT_CONTEXT_WINDOW).
         assert_eq!(lookup("grok-4-0709").unwrap().slug, "grok-4");
         assert_eq!(context_window_for("grok-4-0709"), 256_000);
+        // grok-4.20 versioned slugs — the dated revision (`0309`) sits in the
+        // middle of the slug, so registry entries embed the date.
+        assert_eq!(
+            lookup("grok-4.20-0309-reasoning").unwrap().slug,
+            "grok-4.20-0309-reasoning"
+        );
+        assert_eq!(
+            lookup("grok-4.20-0309-non-reasoning").unwrap().slug,
+            "grok-4.20-0309-non-reasoning"
+        );
+        assert_eq!(
+            lookup("grok-4.20-multi-agent-0309").unwrap().slug,
+            "grok-4.20-multi-agent-0309"
+        );
+        // Bare / undated slugs fall through to the family entry.
+        assert_eq!(lookup("grok-4.20-0309").unwrap().slug, "grok-4.20");
+        assert_eq!(lookup("grok-4.20").unwrap().slug, "grok-4.20");
+        // grok-code-fast aliases — both the bare `grok-code-fast` and the
+        // dated `grok-code-fast-1-0825` must resolve to the same family.
+        assert_eq!(lookup("grok-code-fast-1").unwrap().slug, "grok-code-fast");
+        assert_eq!(
+            lookup("grok-code-fast-1-0825").unwrap().slug,
+            "grok-code-fast"
+        );
+    }
+
+    #[test]
+    fn grok_reasoning_capability_is_lookup_driven() {
+        // The reasoning/non-reasoning split shows up in supports_thinking, not
+        // just in the slug name. Locking this keeps the agent loop from
+        // wasting reasoning-effort serialization on a non-reasoning model and
+        // from skipping it on a reasoning one.
+        assert!(
+            lookup("grok-4.20-0309-reasoning")
+                .unwrap()
+                .supports_thinking
+        );
+        assert!(
+            !lookup("grok-4.20-0309-non-reasoning")
+                .unwrap()
+                .supports_thinking
+        );
+        assert!(lookup("grok-4.3").unwrap().supports_thinking);
+        assert!(lookup("grok-code-fast-1").unwrap().supports_thinking);
+        assert!(lookup("grok-4-fast-reasoning").unwrap().supports_thinking);
+        assert!(
+            !lookup("grok-4-fast-non-reasoning")
+                .unwrap()
+                .supports_thinking
+        );
     }
 
     #[test]

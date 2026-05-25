@@ -128,6 +128,72 @@ static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(
     ])
 });
 
+// xAI Grok pricing per xAI's public docs (https://docs.x.ai/docs/models).
+// Captured 2026-05-24. xAI prices in USD per million tokens; cache-read is
+// charged separately on some models but the existing OpenAI-compat
+// cost-estimation path ignores cache tokens, so only input/output land here.
+// Update when xAI revises pricing.
+static XAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
+    HashMap::from([
+        (
+            "grok-4",
+            ModelRate {
+                input_per_mtok: "5.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "grok-4-fast",
+            ModelRate {
+                input_per_mtok: "0.20",
+                output_per_mtok: "0.50",
+            },
+        ),
+        (
+            "grok-4-fast-reasoning",
+            ModelRate {
+                input_per_mtok: "0.20",
+                output_per_mtok: "0.50",
+            },
+        ),
+        (
+            "grok-4-fast-non-reasoning",
+            ModelRate {
+                input_per_mtok: "0.20",
+                output_per_mtok: "0.50",
+            },
+        ),
+        (
+            "grok-code-fast-1",
+            ModelRate {
+                input_per_mtok: "0.20",
+                output_per_mtok: "1.50",
+            },
+        ),
+        (
+            "grok-code-fast",
+            ModelRate {
+                input_per_mtok: "0.20",
+                output_per_mtok: "1.50",
+            },
+        ),
+        (
+            "grok-3",
+            ModelRate {
+                input_per_mtok: "3.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "grok-3-mini",
+            ModelRate {
+                input_per_mtok: "0.30",
+                output_per_mtok: "0.50",
+            },
+        ),
+    ])
+});
+
 static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
         (
@@ -252,6 +318,10 @@ fn normalize_model_id(model: &str) -> &str {
         .or_else(|| model.strip_prefix("anthropic/"))
         .or_else(|| model.strip_prefix("google/"))
         .or_else(|| model.strip_prefix("gemini/"))
+        .or_else(|| model.strip_prefix("xai/"))
+        .or_else(|| model.strip_prefix("x-ai/"))
+        .or_else(|| model.strip_prefix("x.ai/"))
+        .or_else(|| model.strip_prefix("grok/"))
         .unwrap_or(model)
 }
 
@@ -259,6 +329,7 @@ fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelR
     match provider {
         Provider::OpenAi => Some(&OPENAI_RATES),
         Provider::Gemini => Some(&GEMINI_RATES),
+        Provider::XAi => Some(&XAI_RATES),
         _ => None,
     }
 }
@@ -317,8 +388,25 @@ pub fn has_model_rate(provider: Provider, model: &str) -> bool {
         Provider::OpenAi => OPENAI_RATES.contains_key(normalize_model_id(model)),
         Provider::Anthropic => ANTHROPIC_RATES.contains_key(normalize_model_id(model)),
         Provider::Gemini => GEMINI_RATES.contains_key(normalize_model_id(model)),
+        Provider::XAi => XAI_RATES.contains_key(normalize_model_id(model)),
         _ => false,
     }
+}
+
+/// Shipped xAI direct models that must never silently fall out of the
+/// daemon cost-emission table.
+#[cfg(test)]
+pub fn shipped_xai_models() -> &'static [&'static str] {
+    &[
+        "grok-4",
+        "grok-4-fast",
+        "grok-4-fast-reasoning",
+        "grok-4-fast-non-reasoning",
+        "grok-code-fast",
+        "grok-code-fast-1",
+        "grok-3",
+        "grok-3-mini",
+    ]
 }
 
 /// Shipped OpenAI direct models that must never silently fall out of the
@@ -392,5 +480,64 @@ mod tests {
                 "missing Anthropic rate for {model}"
             );
         }
+    }
+
+    #[test]
+    fn xai_cost_is_deterministic_for_grok_4() {
+        // Hand-computed: grok-4 = $5/Mtok input + $15/Mtok output.
+        // 1_000 prompt × 5 / 1e6 = 0.005; 500 completion × 15 / 1e6 = 0.0075.
+        // Total = 0.0125. If the rate table is corrupted or the lookup
+        // regresses to None, this asserts the exact dollar figure rather than
+        // .is_some() — a tautological check would pass for the wrong rate.
+        let cost = estimate_cost_usd(Provider::XAi, "grok-4", 1_000, 500).unwrap();
+        assert_eq!(cost, "0.0125");
+    }
+
+    #[test]
+    fn xai_cost_for_grok_code_fast_uses_published_rates() {
+        // grok-code-fast = $0.20 input / $1.50 output per Mtok.
+        // 10_000 prompt × 0.20 / 1e6 = 0.002; 2_000 completion × 1.50 / 1e6 = 0.003.
+        let cost = estimate_cost_usd(Provider::XAi, "grok-code-fast", 10_000, 2_000).unwrap();
+        assert_eq!(cost, "0.005");
+        // The dated `-1` alias is the same family — must yield the same number.
+        let cost_alias =
+            estimate_cost_usd(Provider::XAi, "grok-code-fast-1", 10_000, 2_000).unwrap();
+        assert_eq!(cost_alias, cost);
+    }
+
+    #[test]
+    fn xai_cost_normalizes_every_vendor_prefix() {
+        // A user who pulls a slug from xAI docs (`xai/`), OpenRouter (`x-ai/`),
+        // hermes-agent (`x.ai/`), or just types the product name (`grok/`)
+        // must hit the same rate. If any prefix path silently bypasses the
+        // table, cost-event attribution regresses to None for that variant.
+        let base = estimate_cost_usd(Provider::XAi, "grok-4-fast", 1_000_000, 0).unwrap();
+        for variant in [
+            "xai/grok-4-fast",
+            "x-ai/grok-4-fast",
+            "x.ai/grok-4-fast",
+            "grok/grok-4-fast",
+        ] {
+            let got = estimate_cost_usd(Provider::XAi, variant, 1_000_000, 0).unwrap();
+            assert_eq!(got, base, "prefix {variant} produced a different cost");
+        }
+    }
+
+    #[test]
+    fn shipped_xai_models_have_rates() {
+        for model in shipped_xai_models() {
+            assert!(
+                has_model_rate(Provider::XAi, model),
+                "missing xAI rate for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_unknown_model_returns_none() {
+        // A model that's not in the table must not silently fall back to a
+        // wrong rate. Returning None signals the daemon to skip cost
+        // emission rather than emit incorrect dollars.
+        assert!(estimate_cost_usd(Provider::XAi, "grok-vapor-99", 100, 100).is_none());
     }
 }
