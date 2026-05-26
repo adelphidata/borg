@@ -69,7 +69,6 @@ pub enum GoalStatus {
     /// continuation stops until the operator resumes — distinct from
     /// [`GoalStatus::BudgetLimited`] (per-goal token budget) so the operator
     /// can tell "you spent the budget you set" from "the provider cut us off."
-    /// Mirrors codex's `ThreadGoalStatus::UsageLimited`.
     UsageLimited,
     /// Agent hit a repeated impasse (permission denial, missing external
     /// resource, persistent tool failure) and called `update_goal` with
@@ -145,14 +144,14 @@ pub struct Goal {
 }
 
 /// Hint appended to the over-limit error so the operator knows the supported
-/// workaround. Mirrors codex's `GOAL_TOO_LONG_FILE_HINT`.
+/// workaround: stash long objectives in a file and reference it from `/goal`.
 pub const OBJECTIVE_TOO_LONG_FILE_HINT: &str = "Put longer instructions in a file and refer to that file in the goal, for example: /goal follow the instructions in docs/goal.md.";
 
 /// Validate a user-provided objective. Returns the trimmed objective on
 /// success.
 ///
 /// Rejects: empty / whitespace-only / longer than [`MAX_OBJECTIVE_CHARS`]
-/// characters (Unicode scalar values, matching codex).
+/// characters (counted as Unicode scalar values).
 pub fn validate_objective(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -207,9 +206,8 @@ mod tests {
             GoalStatus::from_str("usage_limited"),
             Some(GoalStatus::UsageLimited)
         );
-        // Negative: the camelCase form codex uses on the TS protocol must
-        // not be silently accepted alongside the snake_case wire form, or
-        // we'd hide a real serialization mismatch.
+        // Negative: a camelCase form must not be silently accepted alongside
+        // the snake_case wire form, or we'd hide a real serialization mismatch.
         assert_eq!(GoalStatus::from_str("usageLimited"), None);
     }
 
@@ -245,9 +243,9 @@ mod tests {
         let too_big = "x".repeat(MAX_OBJECTIVE_CHARS + 1);
         let err = validate_objective(&too_big).unwrap_err();
         assert!(err.contains("limit is"));
-        // Operator-facing recovery hint: codex parity. Without this the user is
-        // told the limit but not what to do about it, so we'd lose the
-        // "put it in a file" affordance that makes long objectives usable.
+        // Operator-facing recovery hint must include the file-affordance.
+        // Without it the user is told the limit but not what to do about it,
+        // so we'd lose the "put it in a file" workaround for long objectives.
         assert!(
             err.contains("docs/goal.md"),
             "too-long error must include the file-hint suggestion: {err}"

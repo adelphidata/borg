@@ -20,7 +20,7 @@ use crate::session::Session;
 use crate::types::Message;
 
 /// Hard cap on input we feed to the aux LLM. Beyond this is wasted aux tokens
-/// and rarely improves the title; mirrors the upstream pattern.
+/// and rarely improves the title.
 const SNIPPET_CHAR_CAP: usize = 500;
 
 /// Hard cap on the final title length (chars). Beyond this it stops being a

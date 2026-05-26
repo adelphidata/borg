@@ -6,12 +6,12 @@
 //! parsed hunks each time a complete line is consumed, so a UI can render
 //! progress before the model has finished emitting the call.
 //!
-//! Adapted from codex's `apply-patch/src/streaming_parser.rs`. Uses parallel
-//! [`StreamHunk`] / [`StreamUpdateChunk`] types because the incremental shape
-//! is line-based (`Vec<String>`), whereas borg's `parser::Hunk` joins lines
-//! into single `search` / `replace` strings. Once the patch is complete,
-//! convert with [`to_patch_operations`] to produce the same AST that the
-//! batch parser yields, ready for `apply::apply_patch`.
+//! Uses parallel [`StreamHunk`] / [`StreamUpdateChunk`] types because the
+//! incremental shape is line-based (`Vec<String>`), whereas the batch
+//! `parser::Hunk` joins lines into single `search` / `replace` strings.
+//! Once the patch is complete, convert with [`to_patch_operations`] to
+//! produce the same AST that the batch parser yields, ready for
+//! `apply::apply_patch`.
 //!
 //! TUI integration (rendering events) is intentionally out of scope here;
 //! this module just exposes the engine.
@@ -20,9 +20,9 @@
 //!
 //! In `AddFile` mode, a content line of the form `+*** End Patch` (i.e. the
 //! LLM is adding a file that *legitimately contains the DSL end marker as
-//! data*) terminates the patch instead of being recorded as content. This
-//! matches codex's streaming behavior — header detection runs before the `+`
-//! strip — and is acceptable because real-world AddFile bodies essentially
+//! data*) terminates the patch instead of being recorded as content.
+//! Header detection runs before the `+` strip, which is acceptable
+//! because real-world AddFile bodies essentially
 //! never contain DSL sentinels. The batch parser at `parser.rs` has a
 //! lookahead-based workaround; the streaming parser cannot replicate it
 //! without buffering an entire trailing block, which would defeat the
@@ -96,7 +96,7 @@ pub enum StreamEvent {
 /// existing `apply::apply_patch` codepath can consume them unchanged.
 ///
 /// `Move File` (with explicit `src -> dst` syntax) is not produced by the
-/// streaming parser — codex's DSL uses `Update File` + `Move to:` instead, and
+/// streaming parser — the DSL uses `Update File` + `Move to:` instead, and
 /// this function returns the same shape (`UpdateFile` with `move_to: Some`).
 pub fn to_patch_operations(hunks: &[StreamHunk]) -> Vec<PatchOperation> {
     hunks

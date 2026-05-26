@@ -705,14 +705,12 @@ fn multi_hunk_update() {
     assert!(content.contains("line 3")); // untouched middle
 }
 
-// ── Test: empty `@@` chunk body surfaces actionable error end-to-end ──
-//
 // Regression guard: a malformed patch where a `@@` chunk header is followed
 // by no diff lines (here, immediately by `*** End Patch`) used to be silently
 // accepted by the batch parser, producing a no-op hunk and reporting success.
 // The agent would believe the patch landed; the file on disk would be
-// unchanged. Now parity with codex / streaming-parser: hard error, file
-// untouched, message tells the LLM exactly what went wrong.
+// unchanged. The batch and streaming parsers both now hard-error so the
+// LLM gets an actionable message and the file stays untouched.
 
 #[test]
 fn empty_chunk_body_surfaces_actionable_error() {

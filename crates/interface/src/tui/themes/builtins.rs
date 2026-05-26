@@ -4,10 +4,8 @@
 //!
 //! Color values for `default` are lifted verbatim from the previous
 //! hardcoded constants in `theme.rs`; the guard
-//! `default_matches_legacy_palette` will fail if anyone drifts the legacy
-//! look while editing this file. Color values for `mono`/`slate`/`daylight`
-//! are adapted from the hermes `/skin` palettes
-//! (`reference/hermes-agent/hermes_cli/skin_engine.py`).
+//! `default_matches_legacy_palette` will fail if anyone drifts the look
+//! while editing this file.
 
 use ratatui::style::Color;
 use std::borrow::Cow;
@@ -88,7 +86,7 @@ fn default_theme() -> Theme {
     }
 }
 
-/// Grayscale theme — adapted from hermes' `mono`.
+/// Grayscale theme.
 fn mono_theme() -> Theme {
     Theme {
         name: Cow::Borrowed("mono"),
@@ -126,7 +124,7 @@ fn mono_theme() -> Theme {
     }
 }
 
-/// Cool blue developer-focused theme — adapted from hermes' `slate`.
+/// Cool blue developer-focused theme.
 fn slate_theme() -> Theme {
     Theme {
         name: Cow::Borrowed("slate"),
@@ -160,9 +158,9 @@ fn slate_theme() -> Theme {
     }
 }
 
-/// Light-terminal theme — adapted from hermes' `daylight`. The non-bg colors
-/// are tuned for contrast against a light background; the diff *_light
-/// values stay close to GitHub's pastel diff backgrounds.
+/// Light-terminal theme. The non-bg colors are tuned for contrast against
+/// a light background; the diff *_light values stay close to GitHub's
+/// pastel diff backgrounds.
 ///
 /// Note: borg's `dim()`/diff helpers branch on the runtime
 /// `is_light_terminal()` detector, NOT on theme. If an operator activates

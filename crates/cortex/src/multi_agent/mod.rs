@@ -378,7 +378,7 @@ impl AgentControl {
     /// The child's `ExecutionPolicy` is rebuilt from scratch: the parent's
     /// deny list is preserved (a child can never escalate past denies),
     /// and the auto-approve list is gated by `agents.subagent_auto_approve`
-    /// — defaulting to deny-by-default to match hermes' safer posture.
+    /// — defaulting to deny-by-default for a safer posture.
     fn build_sub_agent_config(
         &self,
         role: Option<&AgentRole>,
@@ -1247,9 +1247,7 @@ async fn compute_tools_filter(
 ///
 /// The structured `<context trust="parent">…</context>` and
 /// `<goal>…</goal>` blocks let the child parse intent unambiguously and
-/// match hermes' `_build_child_system_prompt` format so callers (and
-/// downstream tests) can rely on the same anchors regardless of which
-/// project produced the spawn.
+/// give callers (and downstream tests) stable anchors to grep against.
 #[allow(clippy::too_many_arguments)]
 pub fn build_subagent_preamble(
     nickname: &str,
@@ -1889,14 +1887,14 @@ mod agents_feature_tests {
     }
 }
 
-/// Tests for the hermes-parity additions: `context` / `toolsets` /
+/// Tests for the sub-agent caller surface: `context` / `toolsets` /
 /// `role_kind` schema, orchestrator gating, kill switch, the dedicated
 /// preamble builder, file-write tracking, heartbeat config plumbing, and
 /// the auto-approve / delegation-model precedence chain in
-/// `build_sub_agent_config`. Each test pins a behavior the new caller
-/// surface promises — none assert on `Default`/`Clone` round-trips.
+/// `build_sub_agent_config`. Each test pins a behavior the caller surface
+/// promises — none assert on `Default`/`Clone` round-trips.
 #[cfg(test)]
-mod hermes_parity_tests {
+mod sub_agent_surface_tests {
     use super::*;
     use crate::config::{Config, MultiAgentConfig};
 
@@ -1915,10 +1913,10 @@ mod hermes_parity_tests {
     }
 
     /// `<context trust="parent">…</context>` and `<goal>…</goal>` must
-    /// land in the preamble verbatim. The block delimiters are the
-    /// hermes-parity anchor: downstream prompts and tests grep for them.
-    /// If a refactor silently drops `context` between handler and run, the
-    /// child has no way to know background facts the parent wanted to share.
+    /// land in the preamble verbatim. Downstream prompts and tests grep
+    /// for those block delimiters. If a refactor silently drops `context`
+    /// between handler and run, the child has no way to know background
+    /// facts the parent wanted to share.
     #[test]
     fn preamble_renders_context_and_goal_blocks() {
         let preamble = build_subagent_preamble(
@@ -2013,8 +2011,9 @@ mod hermes_parity_tests {
     /// Toolsets applied on top of a role allowlist must produce the
     /// intersection. A role that allows `[read_file, write_memory]` plus
     /// `toolsets: [write_memory, run_shell]` must yield exactly
-    /// `[write_memory]`. This is hermes' restrictive semantic — neither
-    /// side adds tools the other didn't already permit.
+    /// `[write_memory]`. The restrictive semantic — neither side adds
+    /// tools the other didn't already permit — keeps the child bound by
+    /// the role contract while letting per-call narrowing happen.
     #[tokio::test]
     async fn toolsets_intersect_with_role_allowlist() {
         let role = mk_role("r", Some(vec!["read_file", "write_memory"]));
@@ -2175,8 +2174,8 @@ mod hermes_parity_tests {
         );
     }
 
-    /// Auto-approve defaults to deny (hermes parity, safer posture). Only
-    /// when `agents.subagent_auto_approve` is explicitly enabled does the
+    /// Auto-approve defaults to deny (safer posture). Only when
+    /// `agents.subagent_auto_approve` is explicitly enabled does the
     /// child inherit a permissive auto-approve. Parent's deny list always
     /// carries through.
     #[test]
@@ -2341,7 +2340,7 @@ mod hermes_parity_tests {
         assert!(strings.contains("stalled"));
     }
 
-    /// `AgentRoleKind::parse` accepts hermes-style literals and falls
+    /// `AgentRoleKind::parse` accepts the documented literals and falls
     /// back to Leaf for everything else. The fallback is intentional:
     /// an LLM that types "leaf-only" or a typo'd "orchestratorr" should
     /// degrade safely rather than reject the spawn.

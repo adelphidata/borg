@@ -115,7 +115,7 @@ async fn live_browser_navigate_example_dot_com() {
 /// Positive: snapshot returns interactive elements as `@e<N>` refs, and a
 /// follow-up `click {ref: "@e0"}` resolves through the session's ref store
 /// without the model having to write a CSS selector. Then back navigates
-/// the history. The whole flow mirrors how hermes-style agents drive pages.
+/// the history.
 #[tokio::test]
 async fn live_browser_snapshot_then_ref_click_then_back() {
     require_live!("live_browser_snapshot_then_ref_click_then_back");

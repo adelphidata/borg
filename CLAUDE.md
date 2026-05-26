@@ -150,14 +150,14 @@ Model-visible tools: `get_goal` (read-only, Plan-mode OK), `create_goal`, `updat
 
 ### Multi-Agent — Sub-Agent Spawning
 
-Hermes-parity `spawn_agent` tool (`crates/cortex/src/multi_agent/`). Single-task, blocking, and batch (`tasks: [...]`) modes. The caller surface mirrors hermes' delegate tool:
+`spawn_agent` tool (`crates/cortex/src/multi_agent/`). Single-task, blocking, and batch (`tasks: [...]`) modes.
 
 - `context` — background block injected into the child's preamble under `<context trust="parent">…</context>`. Kept distinct from `message`/`goal` (rendered under `<goal>…</goal>`) so the child knows what it should *know* vs. what it should *do*. The system prompt builder is `build_subagent_preamble` in `multi_agent/mod.rs`.
 - `toolsets` — per-call allowlist intersected with the role's allowlist and `parent_tools - blocklist` in `compute_tools_filter`. `toolsets: []` legitimately means "no tools" (Some(empty) ≠ None).
 - `role_kind` — `"leaf"` (default) or `"orchestrator"`. Orchestrator re-permits `spawn_agent`/`wait_for_agent`/`close_agent` via the blocklist overlay in `assemble_delegate_blocklist`, but **only** when `agents.orchestrator_enabled` is true AND `depth + 1 < max_spawn_depth` (`can_orchestrate` predicate). Plan-mode unions every mutating tool *after* the overlay, so plan-mode children stay read-only even at orchestrator role.
 - `files_written` — child reports paths it mutated (parsed from `apply_patch` args via `extract_apply_patch_paths`) so the parent can re-read them before continuing.
 
-Config knobs (all under `agents.*`): `orchestrator_enabled`, `subagent_auto_approve` (default `false` — deny-by-default like hermes; parent's deny list always carries through), `delegation_model`/`delegation_provider` (per-spawn fallback; precedence: explicit arg > role.model > delegation_model > parent), `heartbeat_interval_secs` (default 30), `heartbeat_stale_cycles` (default 15). `AgentTreeBus` carries `Heartbeat` and `Stalled` event kinds in addition to lifecycle transitions.
+Config knobs (all under `agents.*`): `orchestrator_enabled`, `subagent_auto_approve` (default `false` — deny-by-default; parent's deny list always carries through), `delegation_model`/`delegation_provider` (per-spawn fallback; precedence: explicit arg > role.model > delegation_model > parent), `heartbeat_interval_secs` (default 30), `heartbeat_stale_cycles` (default 15). `AgentTreeBus` carries `Heartbeat` and `Stalled` event kinds in addition to lifecycle transitions.
 
 Sub-agents (`spawn_agent`) get a fresh `session_id` and intentionally do NOT inherit the parent goal. The `subagent-driven-development` bundled skill teaches the implementer → spec-reviewer → quality-reviewer loop.
 
@@ -219,7 +219,7 @@ Borg consumes external MCP servers — it does **not** expose itself as an MCP s
 
 **Plan mode trust gate.** MCP tools default to blocked in Plan mode; only tools the operator has explicitly named in per-server `tools.read_only` config are admitted. Server-advertised `annotations.readOnlyHint` is **not** trusted for this — it informs Execute-mode parallel-fanout batching only.
 
-**Operator surface.** `borg mcp {list,add,add-preset,remove,enable,disable,test}`. The `test` verb is standalone — it connects, runs `tools/list`, prints diagnostics, and exits without touching `borgd`. Built-in presets: `time`, `filesystem`, `github`, `notion` (Hermes parity). Inside the TUI, `/mcp` opens a read-only popup with the same listing `borg mcp list` produces; `/plugins` (alias `/plugin`) includes an `MCP SERVERS` section so the unified view of "things that add tools" lives in one place. All mutating verbs stay on the CLI so the env-allowlist + DNS-pinning + schema gauntlet runs in exactly one path. Kill switches: `mcp.enabled`, `mcp.disabled_servers`, `mcp.max_tools_total`. See `docs/mcp.md`.
+**Operator surface.** `borg mcp {list,add,add-preset,remove,enable,disable,test}`. The `test` verb is standalone — it connects, runs `tools/list`, prints diagnostics, and exits without touching `borgd`. Built-in presets: `time`, `filesystem`, `github`, `notion`. Inside the TUI, `/mcp` opens a read-only popup with the same listing `borg mcp list` produces; `/plugins` (alias `/plugin`) includes an `MCP SERVERS` section so the unified view of "things that add tools" lives in one place. All mutating verbs stay on the CLI so the env-allowlist + DNS-pinning + schema gauntlet runs in exactly one path. Kill switches: `mcp.enabled`, `mcp.disabled_servers`, `mcp.max_tools_total`. See `docs/mcp.md`.
 
 ### WASM Plugin Sandbox
 

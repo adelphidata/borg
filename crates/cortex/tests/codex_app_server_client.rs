@@ -1,5 +1,5 @@
-//! Stage 1 of the codex app-server runtime: end-to-end test of the JSON-RPC
-//! client against a hermetic fake `codex` binary (`src/bin/fake_codex_app_server.rs`).
+//! End-to-end test of the `codex_app_server` JSON-RPC client against a
+//! hermetic fake binary (`src/bin/fake_codex_app_server.rs`).
 //!
 //! These tests exercise the actual subprocess + stdio path — not a mock of the
 //! client's internals — so a regression in framing, request/response correlation,

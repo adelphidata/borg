@@ -493,8 +493,8 @@ impl BrowserSession {
     }
 
     /// Navigate back in the page's session history.
-    /// Returns a no-op message when there's nothing to go back to (matches
-    /// hermes' `browser_back` semantics — never errors on an empty stack).
+    /// Returns a no-op message when there's nothing to go back to — never
+    /// errors on an empty stack so the agent doesn't need to gate the call.
     #[instrument(skip_all, fields(browser.action = "back"))]
     pub async fn back(&mut self, timeout: Duration) -> Result<String> {
         self.snapshot_refs.clear();
@@ -744,8 +744,8 @@ impl BrowserSession {
 
 /// Walk the page's session history by `delta` (−1 back, +1 forward).
 /// CDP's `Page.navigateToHistoryEntry` would be more direct but requires
-/// fetching the full history first; `window.history.go()` is one round trip
-/// and matches what hermes does. Empty history is a no-op, not an error.
+/// fetching the full history first; `window.history.go()` is one round
+/// trip. Empty history is a no-op, not an error.
 async fn history_navigate(
     page: &chromiumoxide::Page,
     delta: i32,

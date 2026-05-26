@@ -280,8 +280,9 @@ pub fn strip_jsonc(input: &str) -> String {
         }
 
         if ch == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            // Line comment: consume to '\n' (but do NOT consume the newline,
-            // matching the reference implementation).
+            // Line comment: consume to '\n' (but do NOT consume the newline
+            // — the caller relies on line breaks staying in the stripped
+            // output so subsequent line-based parsing still aligns).
             match input[i..].find('\n') {
                 Some(rel) => i += rel,
                 None => i = len,
@@ -602,7 +603,7 @@ pub fn configure_detected_terminal_keybindings<E: EnvLookup>(
 }
 
 // Exposed for future onboarding / heartbeat nudges — no caller in tree yet,
-// but the parity test against the reference implementation lives here too.
+// but the dedicated unit tests below pin its semantics so a wire-up is safe.
 #[allow(dead_code)]
 pub fn should_prompt_for_terminal_setup<E: EnvLookup>(
     os: Os,

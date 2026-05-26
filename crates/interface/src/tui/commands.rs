@@ -82,7 +82,7 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             // `/theme` opens the picker; `/skin` is an alias for muscle
-            // memory from hermes' `/skin` command — same destination.
+            // memory operators may have from other tools — same destination.
             "/theme" | "/skin" => {
                 self.theme_popup.show(&self.config);
                 return Some(Ok(AppAction::Continue));

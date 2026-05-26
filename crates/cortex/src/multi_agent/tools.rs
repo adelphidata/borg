@@ -597,13 +597,13 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// `spawn_agent` schema is what the LLM sees every turn. The new
-    /// hermes-parity parameters (`context`, `toolsets`, `role_kind`) must
+    /// `spawn_agent` schema is what the LLM sees every turn. The
+    /// caller-surface parameters (`context`, `toolsets`, `role_kind`) must
     /// appear in `properties` so the model knows it can pass them. A
-    /// regression that drops one silently downgrades the tool back to
-    /// pre-parity behavior with no error.
+    /// regression that drops one silently downgrades the tool to the
+    /// minimal pre-surface behavior with no error.
     #[test]
-    fn spawn_agent_schema_advertises_hermes_parity_params() {
+    fn spawn_agent_schema_advertises_caller_surface_params() {
         let defs = tool_definitions(0, 3);
         let spawn = defs
             .iter()
@@ -631,7 +631,7 @@ mod tests {
     }
 
     /// Batch-mode `tasks[]` elements must accept the same per-task
-    /// hermes-parity fields. Without per-task `toolsets` and `context`
+    /// caller-surface fields. Without per-task `toolsets` and `context`
     /// the LLM can't differentiate sibling tasks in a fan-out — they all
     /// share the top-level context, which defeats the point of batch mode.
     #[test]
@@ -731,8 +731,8 @@ mod tests {
         assert!(err.to_string().contains("non-empty"));
     }
 
-    /// Outside Plan mode, the leaf blocklist contains the hermes default
-    /// set (memory mutation, user-input, delegation surface) and does NOT
+    /// Outside Plan mode, the leaf blocklist contains the default set
+    /// (memory mutation, user-input, delegation surface) and does NOT
     /// block mutating tools the agent normally calls.
     #[test]
     fn assemble_delegate_blocklist_default_set_outside_plan_mode() {

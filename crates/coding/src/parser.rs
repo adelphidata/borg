@@ -1261,10 +1261,10 @@ mod tests {
 
     #[test]
     fn parse_chunk_header_followed_by_eof_marker_only_rejected() {
-        // The EOF sentinel alone — with no diff lines preceding it — is the
-        // exact case codex's `parser.rs:397-403` catches. The marker sets
-        // is_end_of_file but contributes no search/replace content, so the
-        // chunk would otherwise be a no-op masquerading as success.
+        // The EOF sentinel alone — with no diff lines preceding it — must
+        // be rejected. The marker sets is_end_of_file but contributes no
+        // search/replace content, so the chunk would otherwise be a no-op
+        // masquerading as success.
         let input = "\
 *** Begin Patch
 *** Update File: f.txt
@@ -1306,10 +1306,10 @@ mod tests {
     #[test]
     fn parse_chunk_with_only_context_lines_accepted_as_noop() {
         // Positive control: a chunk that only has context lines (no `+` or
-        // `-`) is silly but legal — codex accepts it (parsed_lines > 0 from
-        // the context line). The new check guards specifically against an
-        // *empty* body, not a non-empty no-op body. Apply will treat it as
-        // a successful match-and-replace-with-same-content.
+        // `-`) is silly but legal — parsed_lines > 0 from the context line.
+        // The empty-body check guards specifically against an *empty* body,
+        // not a non-empty no-op body. Apply will treat it as a successful
+        // match-and-replace-with-same-content.
         let input = "\
 *** Begin Patch
 *** Update File: f.txt

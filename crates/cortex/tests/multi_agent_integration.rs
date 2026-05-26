@@ -1,4 +1,4 @@
-//! End-to-end integration tests for the hermes-parity sub-agent feature.
+//! End-to-end integration tests for the sub-agent caller surface.
 //!
 //! Drives `AgentControl::spawn_and_wait` against a wiremock OpenAI-shaped
 //! LLM endpoint so the full path runs: handler → controller → `run_sub_agent`
@@ -58,8 +58,8 @@ fn body_of(req: &Request) -> Value {
 }
 
 /// END-TO-END: `context` and `goal` reach the LLM as a structured
-/// preamble in the first user message. Hermes' caller contract is that
-/// the child sees these as distinct, parseable blocks — if a regression
+/// preamble in the first user message. The caller contract is that the
+/// child sees these as distinct, parseable blocks — if a regression
 /// drops or merges them, the child loses the ability to tell "background
 /// fact" from "thing to do" and downstream subagent-driven-development
 /// reviewer prompts (which grep for `<goal>`) break silently.

@@ -90,9 +90,9 @@ impl ComputerUseAction {
     }
 }
 
-/// Capture mode — hermes parity. `Vision` keeps the current behaviour (raw
-/// PNG inline). `Som` (Set-of-Marks) overlays numbered boxes the model can
-/// reference by `element_index` on the next turn. `Ax` returns the
+/// Capture mode. `Vision` keeps the current behaviour (raw PNG inline).
+/// `Som` (Set-of-Marks) overlays numbered boxes the model can reference
+/// by `element_index` on the next turn. `Ax` returns the
 /// accessibility tree as text only — for non-vision models or when the
 /// operator wants to keep image bytes out of LLM context.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -178,8 +178,8 @@ pub(crate) struct ComputerUseArgs {
     pub raise_window: Option<bool>,
 
     /// `capture` only — selects between `vision` (default, PNG inline),
-    /// `som` (image + numbered overlay), and `ax` (text-only). Mirrors
-    /// hermes' `capture(mode=...)` parity. Optional everywhere else.
+    /// `som` (image + numbered overlay), and `ax` (text-only). Optional
+    /// everywhere else.
     #[serde(default)]
     pub mode: Option<CaptureMode>,
 
@@ -1495,8 +1495,6 @@ mod tests {
         };
         assert_eq!(text, "click at (1, 2)");
     }
-
-    // ── Capture mode tests (hermes parity) ──────────────────────────
 
     /// AX mode is text-only by contract — pixels would defeat the whole
     /// "keep bytes out of LLM context" purpose. The driver method must

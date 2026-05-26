@@ -26,8 +26,7 @@ use super::protocol::{
     InboundFrame, RequestId, RpcError, METHOD_INITIALIZE, METHOD_INITIALIZED,
 };
 
-/// Minimum codex CLI version we target. Bumped in lockstep with the wire-protocol
-/// fields parsed here.
+/// Minimum app-server CLI version the wire-protocol fields below parse.
 pub const MIN_CODEX_VERSION: (u32, u32, u32) = (0, 125, 0);
 
 /// Default timeout for the `initialize` handshake.

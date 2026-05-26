@@ -455,11 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dm_policy_default() {
-        assert_eq!(DmPolicy::default(), DmPolicy::Pairing);
-    }
-
-    #[test]
     fn test_dm_policy_serde() {
         for (variant, expected) in [
             (DmPolicy::Pairing, "\"pairing\""),

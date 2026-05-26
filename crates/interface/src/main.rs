@@ -1255,27 +1255,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -- Tasks tests (using temp DB) --
-
-    #[test]
-    fn test_tasks_validate_schedule_cron() {
-        assert!(cortex::tasks::validate_schedule("cron", "0 */5 * * * *").is_ok());
-    }
-
-    #[test]
-    fn test_tasks_validate_schedule_interval() {
-        assert!(cortex::tasks::validate_schedule("interval", "30m").is_ok());
-    }
-
-    #[test]
-    fn test_tasks_validate_schedule_invalid() {
-        assert!(cortex::tasks::validate_schedule("cron", "not valid").is_err());
-    }
-
-    // -- Helper tests --
-
-    /// `commands::truncate_str` is pass-through at-or-under the limit, and
-    /// keeps `max - 1` chars + ellipsis when over.
     #[test]
     fn truncate_str_passes_through_or_appends_ellipsis() {
         assert_eq!(commands::truncate_str("hello", 10), "hello");

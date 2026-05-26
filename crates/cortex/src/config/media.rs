@@ -159,9 +159,9 @@ pub struct AudioModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// xAI-only: inverse text normalization — emit punctuation, casing,
-    /// digits-as-numerals rather than raw lowercased words. Hermes
-    /// defaults this on; flip off when a downstream consumer wants the
-    /// rawer form. `None` keeps the previous hardcoded default (true).
+    /// digits-as-numerals rather than raw lowercased words. Defaults on;
+    /// flip off when a downstream consumer wants the rawer form. `None`
+    /// keeps the previous hardcoded default (true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xai_stt_format: Option<bool>,
     /// xAI-only: speaker diarization. Paid feature; off by default to

@@ -526,47 +526,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_schedule_valid_cron() {
-        assert!(validate_schedule("cron", "0 0 9 * * * *").is_ok());
-    }
+    fn validate_schedule_accepts_and_rejects_per_spec() {
+        let future_iso = DateTime::from_timestamp(Utc::now().timestamp() + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+        let past_iso = DateTime::from_timestamp(Utc::now().timestamp() - 3600, 0)
+            .unwrap()
+            .to_rfc3339();
 
-    #[test]
-    fn validate_schedule_invalid_cron() {
-        assert!(validate_schedule("cron", "not a cron").is_err());
-    }
+        let ok_cases: &[(&str, &str)] = &[
+            ("cron", "0 0 9 * * * *"),
+            ("interval", "30m"),
+            ("once", future_iso.as_str()),
+        ];
+        let err_cases: &[(&str, &str)] = &[
+            ("cron", "not a cron"),
+            ("interval", "abc"),
+            ("once", ""),
+            ("once", past_iso.as_str()),
+            ("weekly", ""),
+        ];
 
-    #[test]
-    fn validate_schedule_valid_interval() {
-        assert!(validate_schedule("interval", "30m").is_ok());
-    }
-
-    #[test]
-    fn validate_schedule_invalid_interval() {
-        assert!(validate_schedule("interval", "abc").is_err());
-    }
-
-    #[test]
-    fn validate_schedule_once_future_iso() {
-        let future = Utc::now().timestamp() + 3600;
-        let iso = DateTime::from_timestamp(future, 0).unwrap().to_rfc3339();
-        assert!(validate_schedule("once", &iso).is_ok());
-    }
-
-    #[test]
-    fn validate_schedule_once_empty() {
-        assert!(validate_schedule("once", "").is_err());
-    }
-
-    #[test]
-    fn validate_schedule_once_past() {
-        let past = Utc::now().timestamp() - 3600;
-        let iso = DateTime::from_timestamp(past, 0).unwrap().to_rfc3339();
-        assert!(validate_schedule("once", &iso).is_err());
-    }
-
-    #[test]
-    fn validate_schedule_unknown_type() {
-        assert!(validate_schedule("weekly", "").is_err());
+        for (kind, value) in ok_cases {
+            assert!(
+                validate_schedule(kind, value).is_ok(),
+                "expected ({kind:?}, {value:?}) to validate"
+            );
+        }
+        for (kind, value) in err_cases {
+            assert!(
+                validate_schedule(kind, value).is_err(),
+                "expected ({kind:?}, {value:?}) to fail validation"
+            );
+        }
     }
 
     // ── Cron line parser tests ──

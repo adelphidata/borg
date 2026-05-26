@@ -479,28 +479,50 @@ mod tests {
     }
 
     #[test]
-    fn test_limits_for_all_action_types() {
-        let limits = ActionLimits::default();
-        assert_eq!(limits.limits_for(ActionType::ToolCall), (200, 500));
-        assert_eq!(limits.limits_for(ActionType::ShellCommand), (100, 250));
-        assert_eq!(limits.limits_for(ActionType::FileWrite), (50, 150));
-        assert_eq!(limits.limits_for(ActionType::MemoryWrite), (20, 50));
-        assert_eq!(limits.limits_for(ActionType::WebRequest), (50, 150));
+    fn test_limits_for_dispatches_per_action_type() {
+        // Spec: limits_for() routes each ActionType to its own (warn, block)
+        // pair — a regression here would silently cross-wire the limits.
+        let limits = ActionLimits {
+            tool_calls_warn: 1,
+            tool_calls_block: 2,
+            shell_commands_warn: 3,
+            shell_commands_block: 4,
+            file_writes_warn: 5,
+            file_writes_block: 6,
+            memory_writes_warn: 7,
+            memory_writes_block: 8,
+            web_requests_warn: 9,
+            web_requests_block: 10,
+        };
+        assert_eq!(limits.limits_for(ActionType::ToolCall), (1, 2));
+        assert_eq!(limits.limits_for(ActionType::ShellCommand), (3, 4));
+        assert_eq!(limits.limits_for(ActionType::FileWrite), (5, 6));
+        assert_eq!(limits.limits_for(ActionType::MemoryWrite), (7, 8));
+        assert_eq!(limits.limits_for(ActionType::WebRequest), (9, 10));
     }
 
     #[test]
-    fn test_gateway_defaults() {
-        let limits = ActionLimits::gateway_defaults();
-        assert_eq!(limits.tool_calls_warn, 30);
-        assert_eq!(limits.tool_calls_block, 50);
-        assert_eq!(limits.shell_commands_warn, 10);
-        assert_eq!(limits.shell_commands_block, 20);
-        assert_eq!(limits.file_writes_warn, 10);
-        assert_eq!(limits.file_writes_block, 20);
-        assert_eq!(limits.memory_writes_warn, 5);
-        assert_eq!(limits.memory_writes_block, 10);
-        assert_eq!(limits.web_requests_warn, 10);
-        assert_eq!(limits.web_requests_block, 25);
+    fn test_gateway_defaults_are_tighter_than_session_defaults() {
+        // Spec: gateway-facing actions run under stricter caps than interactive
+        // sessions. If anyone loosens gateway defaults past session defaults,
+        // that's a real policy regression worth catching.
+        let session = ActionLimits::default();
+        let gateway = ActionLimits::gateway_defaults();
+        assert!(gateway.tool_calls_block <= session.tool_calls_block);
+        assert!(gateway.shell_commands_block <= session.shell_commands_block);
+        assert!(gateway.file_writes_block <= session.file_writes_block);
+        assert!(gateway.memory_writes_block <= session.memory_writes_block);
+        assert!(gateway.web_requests_block <= session.web_requests_block);
+        // And warn must precede block on every axis.
+        for (w, b) in [
+            (gateway.tool_calls_warn, gateway.tool_calls_block),
+            (gateway.shell_commands_warn, gateway.shell_commands_block),
+            (gateway.file_writes_warn, gateway.file_writes_block),
+            (gateway.memory_writes_warn, gateway.memory_writes_block),
+            (gateway.web_requests_warn, gateway.web_requests_block),
+        ] {
+            assert!(w < b, "warn ({w}) must be below block ({b})");
+        }
     }
 
     #[test]

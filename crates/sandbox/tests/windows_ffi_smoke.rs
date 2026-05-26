@@ -1,4 +1,4 @@
-//! Windows FFI smoke tests — Phase 12 partial coverage.
+//! Windows FFI smoke tests.
 //!
 //! These tests exercise the actual Win32 API calls (CreatePipe,
 //! CreatePseudoConsole, CreateDesktopW, CryptProtectData, …) that

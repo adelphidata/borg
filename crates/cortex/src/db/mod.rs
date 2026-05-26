@@ -170,8 +170,8 @@ impl Database {
         // libsql's `Builder::new_local` creates the file if missing, which
         // breaks `load_from_db`'s expectation that a missing DB fails here
         // and falls through to the writer path (which runs migrations).
-        // Mirror the legacy SQLITE_OPEN_READ_ONLY behaviour by erroring out
-        // when the file doesn't exist yet.
+        // Error out explicitly when the file doesn't exist yet so the
+        // reader never spawns an empty, un-migrated DB out from under us.
         if !path.exists() {
             anyhow::bail!(
                 "no database at {} — daemon hasn't created it yet",

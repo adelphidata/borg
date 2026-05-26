@@ -1,5 +1,5 @@
 //! User theme loader: parses `<dir>/<name>.toml` and merges over the builtin
-//! `default` so partial overrides work the same way as hermes' YAML skins.
+//! `default` so partial overrides keep unspecified fields at the default.
 //!
 //! Failure policy: invalid hex / unknown keys log a warning and inherit
 //! from default for that field. A missing file returns `LoadError::NotFound`
@@ -103,8 +103,8 @@ pub fn list_user_themes(dir: &Path) -> Vec<UserThemeMeta> {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawTheme {
-    /// Accepted for hermes-skin TOML compatibility but intentionally
-    /// ignored — see `into_theme` for the file-stem-wins rationale.
+    /// Accepted on input but intentionally ignored — see `into_theme`
+    /// for the file-stem-wins rationale.
     #[serde(default, rename = "name")]
     _name: Option<String>,
     description: Option<String>,
@@ -165,10 +165,10 @@ impl RawTheme {
     /// ignored on purpose so `list_user_themes` (which reads the stem) and
     /// `load_user_theme` (which reads the file) can never disagree about
     /// what a theme is called. The TOML still accepts a `name` key so
-    /// hermes-style theme files round-trip, but it's a no-op here.
+    /// foreign theme files round-trip cleanly, but it's a no-op here.
     fn into_theme(self, name_from_file: &str) -> Theme {
-        // Inherit from builtin "default" for every unset field. Matches
-        // hermes' `_build_skin_config` semantics.
+        // Inherit from builtin "default" for every unset field so a partial
+        // override only changes the fields the operator actually set.
         let base = builtins::default_theme_static().clone();
 
         let theme_name = name_from_file.to_string();
@@ -429,11 +429,10 @@ warning = "#112233"
 
     #[test]
     fn in_file_name_field_is_ignored_in_favor_of_file_stem() {
-        // Regression guard: a hermes-style theme TOML with a `name` key
-        // must NOT make `Theme.name` disagree with the filename stem,
-        // because `list_user_themes` keys on the stem. If they could
-        // diverge, the picker would list a name the resolver couldn't
-        // find.
+        // Regression guard: a theme TOML with an in-file `name` key must
+        // NOT make `Theme.name` disagree with the filename stem, because
+        // `list_user_themes` keys on the stem. If they could diverge, the
+        // picker would list a name the resolver couldn't find.
         let dir = TempDir::new().unwrap();
         write_theme(
             dir.path(),

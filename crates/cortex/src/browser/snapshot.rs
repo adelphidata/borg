@@ -1,4 +1,4 @@
-//! Lightweight accessibility-tree snapshot, hermes `browser_snapshot` parity.
+//! Lightweight accessibility-tree snapshot for the `browser_snapshot` tool.
 //!
 //! The model navigates dense pages by asking for a `snapshot`, then targeting
 //! follow-up clicks/types by the `@e<N>` ref the snapshot assigned to each

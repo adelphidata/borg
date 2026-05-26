@@ -73,11 +73,10 @@ pub struct Palette {
     pub diff_remove_gutter_bg_light: Color,
 }
 
-/// User-facing identity strings the theme can swap. Mirrors hermes' skin
-/// `branding:` section. Intentionally minimal — only fields with real,
-/// wired-up use sites live here so a user editing a theme TOML never
-/// writes a value that quietly does nothing. Add a field here only when
-/// adding the consumer in the same PR.
+/// User-facing identity strings the theme can swap. Intentionally minimal
+/// — only fields with real, wired-up use sites live here so a user editing
+/// a theme TOML never writes a value that quietly does nothing. Add a
+/// field here only when adding the consumer in the same PR.
 ///
 /// Currently wired:
 /// - `goodbye` → `goodbye.rs` subtitle on `/quit`
@@ -90,8 +89,8 @@ pub struct Branding {
     pub help_header: Cow<'static, str>,
 }
 
-/// Spinner rendering style. Borg's existing `shimmer.rs` is a color-sweep
-/// over already-rendered text. Themes can re-color the sweep here; hermes'
+/// Spinner rendering style. The existing `shimmer.rs` is a color-sweep
+/// over already-rendered text. Themes can re-color the sweep here; a
 /// frame-rotation `faces` style is not yet implemented — the loader
 /// rejects `kind = "faces"` with a warn rather than silently mis-rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
