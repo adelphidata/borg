@@ -802,11 +802,6 @@ pub struct MultiAgentConfig {
     /// cannot themselves call `spawn_agent`. The numeric `max_spawn_depth`
     /// remains the terminal safety net.
     pub orchestrator_enabled: bool,
-    /// When `false` (default), child agents inherit only the parent's deny
-    /// list and do not auto-approve commands. When `true`, children
-    /// auto-approve every command the parent's deny list allows — useful
-    /// for unattended batch/cron flows that can't pause for any prompt.
-    pub subagent_auto_approve: bool,
     /// Optional per-spawn model override. Used when neither the role nor
     /// the `spawn_agent` call supplies an explicit `model`. Precedence:
     /// explicit arg > role.model > this > parent's model.
@@ -833,7 +828,6 @@ impl Default for MultiAgentConfig {
             max_concurrent: 3,
             delegate_timeout_secs: 600,
             orchestrator_enabled: true,
-            subagent_auto_approve: false,
             delegation_model: None,
             delegation_provider: None,
             heartbeat_interval_secs: 30,

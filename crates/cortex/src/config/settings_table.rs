@@ -210,7 +210,6 @@ define_settings! {
         "agents.max_concurrent" => agents.max_concurrent, parsed(u32);
         "agents.delegate_timeout_secs" => agents.delegate_timeout_secs, parsed(u64);
         "agents.orchestrator_enabled" => agents.orchestrator_enabled, parsed(bool);
-        "agents.subagent_auto_approve" => agents.subagent_auto_approve, parsed(bool);
         "agents.delegation_model" => agents.delegation_model, opt_string;
         "agents.delegation_provider" => agents.delegation_provider, opt_string;
         "agents.heartbeat_interval_secs" => agents.heartbeat_interval_secs, parsed(u64);

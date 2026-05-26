@@ -1,4 +1,4 @@
-use super::{AgentRole, AgentRoleKind};
+use super::AgentRole;
 use crate::db::Database;
 
 /// Built-in role definitions.
@@ -37,7 +37,6 @@ pub fn builtin_role(name: &str) -> Option<AgentRole> {
             system_instructions: None,
             tools_allowed: Some(tools.iter().map(ToString::to_string).collect()),
             max_iterations: None,
-            kind: AgentRoleKind::default(),
         })
 }
 
@@ -81,7 +80,6 @@ pub async fn load_role(name: &str) -> Option<AgentRole> {
                 system_instructions: row.system_instructions,
                 tools_allowed,
                 max_iterations: row.max_iterations.map(|v| v as u32),
-                kind: AgentRoleKind::default(),
             });
         }
     }
@@ -111,7 +109,6 @@ pub async fn list_all_roles() -> Vec<AgentRole> {
                     system_instructions: row.system_instructions,
                     tools_allowed,
                     max_iterations: row.max_iterations.map(|v| v as u32),
-                    kind: AgentRoleKind::default(),
                 });
             }
         }

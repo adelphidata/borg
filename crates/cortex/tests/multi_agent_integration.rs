@@ -458,3 +458,68 @@ async fn leaf_role_never_gets_spawn_agent_even_with_kill_switch_on() {
         "leaf child must never have spawn_agent in its tool list, even with kill switch on"
     );
 }
+
+/// REGRESSION: `agents.heartbeat_interval_secs = 0` is the explicit
+/// disable sentinel — the bus must see NO Heartbeat events for the
+/// child's whole lifetime. A previous version clamped to `max(1)` and
+/// silently produced a 1Hz tick storm instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_interval_zero_disables_events() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_text("ok"))
+                .set_delay(Duration::from_millis(2500)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut parent_cfg = test_config(&server.uri());
+    parent_cfg.agents.heartbeat_interval_secs = 0; // explicit disable
+
+    let bus = AgentTreeBus::new();
+    let mut rx = bus.subscribe();
+    let mut ctrl = AgentControl::new(&parent_cfg.agents, "parent", 0).with_bus(bus);
+
+    let (agent_id, _) = ctrl
+        .spawn_agent(
+            "any",
+            None,
+            None,
+            AgentRoleKind::Leaf,
+            None,
+            None,
+            None,
+            &parent_cfg,
+            None,
+            None,
+        )
+        .await
+        .expect("spawn");
+
+    let mut heartbeats = 0;
+    let mut stalls = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(ev)) => match ev.kind {
+                AgentTreeEventKind::Heartbeat => heartbeats += 1,
+                AgentTreeEventKind::Stalled => stalls += 1,
+                _ => {}
+            },
+            _ => continue,
+        }
+    }
+
+    let _ = ctrl.shutdown_agent(&agent_id).await;
+    assert_eq!(
+        heartbeats, 0,
+        "heartbeat_interval_secs=0 must emit zero Heartbeat events, got {heartbeats}"
+    );
+    assert_eq!(
+        stalls, 0,
+        "disabled heartbeat must also disable Stalled escalation, got {stalls}"
+    );
+}

@@ -321,7 +321,7 @@ pub async fn handle_spawn_agent(
         // pattern let a leaf task inherit a sibling orchestrator's
         // carve-out (see the mixed-batch regression test).
         let completions = agent_control
-            .spawn_batch_and_wait(tasks, parent_config, None, timeout_secs)
+            .spawn_batch_and_wait(tasks, parent_config, timeout_secs)
             .await?;
         let results: Vec<serde_json::Value> = completions
             .iter()

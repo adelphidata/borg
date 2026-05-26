@@ -68,6 +68,11 @@ impl AgentRoleKind {
 }
 
 /// Role definition for a sub-agent.
+///
+/// **Note:** delegation kind (`Leaf` / `Orchestrator`) is intentionally
+/// NOT a field on the role. It's a per-spawn overlay passed via the
+/// `role_kind` argument to `spawn_agent`. A "coder" role can be spawned
+/// as either a leaf or an orchestrator depending on the call site.
 #[derive(Debug, Clone)]
 pub struct AgentRole {
     /// Identifier for this role (e.g. "researcher", "coder").
@@ -86,9 +91,6 @@ pub struct AgentRole {
     pub tools_allowed: Option<Vec<String>>,
     /// Maximum agent loop iterations for this role.
     pub max_iterations: Option<u32>,
-    /// Delegation kind. The named role is kind-agnostic — callers of
-    /// `spawn_agent` set this from the `role_kind` parameter.
-    pub kind: AgentRoleKind,
 }
 
 /// State machine for sub-agent lifecycle.
@@ -257,10 +259,18 @@ pub struct SubAgentCompletion {
     pub status: SubAgentStatus,
     /// The sub-agent's final text output, if any.
     pub final_response: Option<String>,
-    /// File paths the child wrote (or otherwise mutated) during its run.
-    /// Surfaced to the parent's LLM so it knows which paths to re-read
-    /// before continuing — without this, a parent that read `foo.rs`
-    /// pre-spawn would carry stale content past the child's edits.
+    /// File paths the child mutated via `apply_patch` (any target —
+    /// cwd, skills, channels). Surfaced to the parent's LLM so it knows
+    /// which paths to re-read before continuing.
+    ///
+    /// **Scope limitation:** only `apply_patch` writes are tracked.
+    /// Writes via `run_shell` (`sed -i …`, redirections, in-place
+    /// formatters) are not detected — parsing arbitrary shell for write
+    /// effects is fragile, and the canonical write tool in borg is
+    /// `apply_patch`. Children that prefer shell-based edits will
+    /// surface an incomplete list; the safe response on the parent
+    /// side is to re-read any file it cares about, regardless of
+    /// whether the child's reported list includes it.
     pub files_written: Vec<String>,
 }
 
@@ -377,8 +387,12 @@ impl AgentControl {
     ///
     /// The child's `ExecutionPolicy` is rebuilt from scratch: the parent's
     /// deny list is preserved (a child can never escalate past denies),
-    /// and the auto-approve list is gated by `agents.subagent_auto_approve`
-    /// — defaulting to deny-by-default for a safer posture.
+    /// and the auto-approve list is `["*"]` (wildcard). This matches
+    /// borg's "no approval prompts" UX invariant — children must execute
+    /// without prompting since they have no UI to ask. A previous build
+    /// gated `auto_approve` on `agents.subagent_auto_approve`, but
+    /// `ExecutionPolicy::check` (policy.rs) falls through to AutoApprove
+    /// when nothing matches, making the gate a silent no-op.
     fn build_sub_agent_config(
         &self,
         role: Option<&AgentRole>,
@@ -418,16 +432,12 @@ impl AgentControl {
 
         // Sub-agent execution policy. The parent's deny list always carries
         // over so a child can never escalate past a parent's denial. The
-        // auto-approve list is operator-gated: deny-by-default unless the
-        // operator has opted in via `agents.subagent_auto_approve` (e.g. for
-        // unattended cron flows where a halt-on-confirmation deadlocks).
-        let auto_approve = if parent_config.agents.subagent_auto_approve {
-            vec!["*".to_string()]
-        } else {
-            Vec::new()
-        };
+        // auto-approve list is `["*"]` because borg's UX invariant
+        // ("No Approval Prompts" — see CLAUDE.md) requires children to
+        // execute without confirmation; there is no UI to prompt against.
+        // Catastrophic commands are still blocked at the sandbox layer.
         child_config.policy = crate::policy::ExecutionPolicy {
-            auto_approve,
+            auto_approve: vec!["*".to_string()],
             deny: parent_config.policy.deny.clone(),
         };
 
@@ -900,9 +910,14 @@ impl AgentControl {
             match tokio::time::timeout(remaining, self.completion_rx.recv()).await {
                 Ok(Some(completion)) => {
                     let completed_id = completion.agent_id.clone();
-                    // Update internal state
+                    // Update internal state. Persist files_written into
+                    // metrics.files_touched so the early-return path on
+                    // a second wait_for_agent call (or list_agents /
+                    // get_status / DB query) sees the correct list —
+                    // otherwise the next caller would read an empty Vec.
                     if let Some(handle) = self.agents.get_mut(&completed_id) {
                         handle.info.status = completion.status.clone();
+                        handle.info.metrics.files_touched = completion.files_written.clone();
                     }
                     if completed_id == agent_id {
                         return Ok(completion);
@@ -967,6 +982,7 @@ impl AgentControl {
         while let Ok(completion) = self.completion_rx.try_recv() {
             if let Some(handle) = self.agents.get_mut(&completion.agent_id) {
                 handle.info.status = completion.status.clone();
+                handle.info.metrics.files_touched = completion.files_written.clone();
             }
             completions.push(completion);
         }
@@ -1039,7 +1055,6 @@ impl AgentControl {
         &mut self,
         tasks: Vec<DelegatedTask>,
         parent_config: &Config,
-        _tools_blocklist: Option<&[&str]>,
         timeout_secs: u64,
     ) -> Result<Vec<SubAgentCompletion>> {
         let mut agent_ids: Vec<std::result::Result<String, SubAgentCompletion>> =
@@ -1329,39 +1344,82 @@ pub fn build_subagent_preamble(
 }
 
 /// True iff an `apply_patch` tool result string represents a successful
-/// application (vs. an error, plan-mode rejection, blocked-path
-/// rejection, or hook abort). The handler at
-/// `tool_handlers/filesystem/patch.rs` returns `Ok(format!("Error
-/// applying patch: …"))`, `Ok(format!("Access denied: …"))`, and other
-/// `Ok(format!("Plan mode is active …"))` strings for failures — they
-/// all return `Ok`, so we can't rely on Result variant to decide; we
-/// pattern-match on the success prefix instead.
+/// application. Allowlist of success prefixes — every failure path
+/// (`Error applying…`, `Access denied…`, `Plan mode…`, `Unknown target…`,
+/// `Rate limit…`, hook aborts) returns `Ok(format!(…))` rather than an
+/// `Err`, and the set of failure prefixes is unbounded. Matching against
+/// the known success prefix is the only safe way to gate `files_written`.
+///
+/// Success prefixes (see `format_patch_success` callers in
+/// `tool_handlers/filesystem/patch.rs`):
+///   - `"Patch applied successfully."`
+///   - `"Unified patch applied successfully."`
+///   - `"Skill patch applied successfully."`
+///   - `"Channel patch applied successfully."` (future-proof — same shape)
 fn is_apply_patch_success(result: &str) -> bool {
     let trimmed = result.trim_start();
-    // Success returns `Patch applied successfully.` (and a diff
-    // appendix). Every failure path begins with one of these sentinels.
-    !(trimmed.starts_with("Error ")
-        || trimmed.starts_with("Access denied")
-        || trimmed.starts_with("Plan mode")
-        || trimmed.starts_with("Rate limit")
-        || trimmed.is_empty())
+    // Tolerate any leading qualifier ("Patch", "Unified patch", "Skill
+    // patch", etc.) followed by "applied successfully" — that's the
+    // canonical success-prefix shape `format_patch_success` emits.
+    trimmed.contains("applied successfully")
 }
 
 /// Extract file paths from `apply_patch` tool arguments. The patch DSL
 /// uses `*** Add File:`, `*** Update File:`, `*** Delete File:` markers
-/// preceded by an optional input path. Pulled out as a free function so
-/// it can be unit-tested without spinning up an agent.
+/// preceded by an optional input path.
+///
+/// If the call uses `apply_patch_unified` with a non-`cwd` target
+/// (`target: "skills"` or `target: "channels"`), the bare patch paths
+/// are resolved relative to that target's data dir (e.g.
+/// `~/.borg/skills/<name>/SKILL.md`) so the parent's LLM gets paths it
+/// can actually re-read. Targets that can't be resolved (no HOME, weird
+/// IO error) fall through to bare paths and emit a `tracing::warn!`.
 fn extract_apply_patch_paths(args_json: &str) -> Vec<String> {
-    // Args are either {"patch": "..."} (apply_patch tool) or a raw patch
-    // string. Strip JSON wrapping if present, then scan for markers.
-    let patch_text: std::borrow::Cow<'_, str> =
+    // Args are either {"patch": "...", "target": "skills"} (unified
+    // apply_patch tool) or a raw patch string. Strip JSON wrapping if
+    // present, then scan for markers and resolve relative to target.
+    let (patch_text, base): (std::borrow::Cow<'_, str>, Option<std::path::PathBuf>) =
         match serde_json::from_str::<serde_json::Value>(args_json) {
-            Ok(v) => v
-                .get("patch")
-                .and_then(|p| p.as_str())
-                .map(|s| std::borrow::Cow::Owned(s.to_string()))
-                .unwrap_or(std::borrow::Cow::Borrowed(args_json)),
-            Err(_) => std::borrow::Cow::Borrowed(args_json),
+            Ok(v) => {
+                let patch = v
+                    .get("patch")
+                    .and_then(|p| p.as_str())
+                    .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                    .unwrap_or(std::borrow::Cow::Borrowed(args_json));
+                let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("cwd");
+                let base = match target {
+                    "cwd" => None,
+                    "skills" => match crate::config::Config::skills_dir() {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(
+                                "extract_apply_patch_paths: failed to resolve skills_dir, \
+                                 falling back to bare path: {e}"
+                            );
+                            None
+                        }
+                    },
+                    "channels" => match crate::config::Config::channels_dir() {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(
+                                "extract_apply_patch_paths: failed to resolve channels_dir, \
+                                 falling back to bare path: {e}"
+                            );
+                            None
+                        }
+                    },
+                    other => {
+                        tracing::warn!(
+                            target = other,
+                            "extract_apply_patch_paths: unknown target — falling back to bare path"
+                        );
+                        None
+                    }
+                };
+                (patch, base)
+            }
+            Err(_) => (std::borrow::Cow::Borrowed(args_json), None),
         };
 
     let mut paths = Vec::new();
@@ -1369,9 +1427,16 @@ fn extract_apply_patch_paths(args_json: &str) -> Vec<String> {
         let trimmed = line.trim_start();
         for marker in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
             if let Some(rest) = trimmed.strip_prefix(marker) {
-                let path = rest.trim().to_string();
-                if !path.is_empty() && !paths.contains(&path) {
-                    paths.push(path);
+                let raw = rest.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let resolved = match &base {
+                    Some(b) => b.join(raw).to_string_lossy().into_owned(),
+                    None => raw.to_string(),
+                };
+                if !paths.contains(&resolved) {
+                    paths.push(resolved);
                 }
             }
         }
@@ -1459,14 +1524,16 @@ fn run_sub_agent(
         };
 
         // Heartbeat: tick every `heartbeat_interval_secs` and publish a
-        // Heartbeat event on the bus. If no AgentEvent activity for
-        // `heartbeat_stale_cycles` consecutive ticks, publish a single
-        // Stalled event so the operator/TUI can intervene. Interval is
-        // clamped to ≥1s to keep the test runner sane if the config is 0.
-        let heartbeat_interval =
-            std::time::Duration::from_secs(agents_config.heartbeat_interval_secs.max(1));
+        // Heartbeat event on the bus. If no real progress (TextDelta /
+        // ToolResult) for `heartbeat_stale_cycles` consecutive ticks,
+        // publish a single Stalled event so the operator/TUI can
+        // intervene. `heartbeat_interval_secs == 0` is the explicit
+        // disable sentinel — no ticks, no events, no extra work.
+        let heartbeat_enabled = agents_config.heartbeat_interval_secs > 0;
         let stale_threshold = agents_config.heartbeat_stale_cycles.max(1);
-        let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_secs(
+            agents_config.heartbeat_interval_secs.max(1),
+        ));
         // Skip the immediate first tick — we want to wait one full interval
         // before the first heartbeat fires, not race the spawn.
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1482,8 +1549,13 @@ fn run_sub_agent(
         let mut pending_patch_paths: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        // Update the controller's snapshot to Running so heartbeat events
-        // carry the live status instead of the spawn-time PendingInit.
+        // Snapshot info with status flipped to Running for the spawn's
+        // initial heartbeat payload. NOTE: subsequent transitions in
+        // AgentControl (Paused / Errored / Shutdown) are NOT reflected
+        // here — the spawn task has no shared reference to the handle's
+        // live info. TUI subscribers needing exact live status should
+        // re-query via `list_agents` / `get_status`; heartbeats only
+        // guarantee "child is still ticking" semantics.
         let mut info = info;
         info.status = SubAgentStatus::Running;
 
@@ -1521,11 +1593,16 @@ fn run_sub_agent(
                     break;
                 }
                 event = event_rx.recv() => {
-                    // Any agent event resets the idle counter — the child is
-                    // still alive, even if we get only ToolOutputDelta noise.
-                    idle_cycles = 0;
+                    // Reset the idle counter only on real progress
+                    // signals — TextDelta (LLM produced text) and
+                    // ToolResult (a tool finished). Chatty noise like
+                    // ToolOutputDelta from a hung shell's stdout MUST
+                    // NOT reset, or a hung child that keeps streaming
+                    // stdout never trips the `Stalled` watchdog the
+                    // operator relies on.
                     match event {
                         Some(AgentEvent::TextDelta(delta)) => {
+                            idle_cycles = 0;
                             final_text.push_str(&delta);
                         }
                         Some(AgentEvent::TurnComplete) | None => {
@@ -1549,6 +1626,10 @@ fn run_sub_agent(
                             }
                         }
                         Some(AgentEvent::ToolResult { tool_call_id, name, result }) => {
+                            // ToolResult is a real progress signal — reset
+                            // idle counter even on failure (a failed tool
+                            // is still observable forward progress).
+                            idle_cycles = 0;
                             if name == "apply_patch" {
                                 if let Some(paths) = pending_patch_paths.remove(&tool_call_id) {
                                     if is_apply_patch_success(&result) {
@@ -1566,7 +1647,7 @@ fn run_sub_agent(
                         _ => {}
                     }
                 }
-                _ = heartbeat_tick.tick() => {
+                _ = heartbeat_tick.tick(), if heartbeat_enabled => {
                     if let Some(ref b) = bus {
                         b.publish(AgentTreeEventKind::Heartbeat, &info);
                     }
@@ -1908,7 +1989,6 @@ mod sub_agent_surface_tests {
             system_instructions: None,
             tools_allowed: tools_allowed.map(|v| v.into_iter().map(str::to_string).collect()),
             max_iterations: None,
-            kind: AgentRoleKind::Leaf,
         }
     }
 
@@ -2174,12 +2254,17 @@ mod sub_agent_surface_tests {
         );
     }
 
-    /// Auto-approve defaults to deny (safer posture). Only when
-    /// `agents.subagent_auto_approve` is explicitly enabled does the
-    /// child inherit a permissive auto-approve. Parent's deny list always
-    /// carries through.
+    /// Sub-agent auto_approve is unconditionally `["*"]` (borg's "No
+    /// Approval Prompts" UX invariant — children have no UI to prompt
+    /// against, so they must execute without confirmation). The parent's
+    /// deny list always carries through; catastrophic commands stop at
+    /// the sandbox layer. A previous build gated this on a config knob,
+    /// but `ExecutionPolicy::check` (policy.rs) falls through to
+    /// AutoApprove when nothing matches — the gate was a silent no-op.
+    /// This test pins the actual contract so the misleading knob can't
+    /// be reintroduced without flipping the assertion.
     #[test]
-    fn build_sub_agent_config_auto_approve_defaults_to_deny() {
+    fn build_sub_agent_config_auto_approve_is_unconditional_wildcard() {
         let mut parent = Config::default();
         parent.policy.deny = vec!["dangerous".into()];
         let cfg = MultiAgentConfig {
@@ -2188,31 +2273,16 @@ mod sub_agent_surface_tests {
             ..MultiAgentConfig::default()
         };
 
-        // Default config: subagent_auto_approve is false.
-        assert!(!parent.agents.subagent_auto_approve);
         let ctrl = AgentControl::new(&cfg, "p", 0);
         let child = ctrl.build_sub_agent_config(None, None, &parent);
-        assert!(
-            child.policy.auto_approve.is_empty(),
-            "auto_approve must default to empty (deny posture), got {:?}",
-            child.policy.auto_approve
+        assert_eq!(
+            child.policy.auto_approve,
+            vec!["*".to_string()],
+            "auto_approve must be wildcard — borg children have no UI to prompt against"
         );
         assert_eq!(
             child.policy.deny, parent.policy.deny,
             "parent deny list must always carry through"
-        );
-
-        // Flip the switch — child becomes permissive but deny still applies.
-        parent.agents.subagent_auto_approve = true;
-        let child2 = ctrl.build_sub_agent_config(None, None, &parent);
-        assert_eq!(
-            child2.policy.auto_approve,
-            vec!["*".to_string()],
-            "switch ON must produce wildcard auto_approve"
-        );
-        assert_eq!(
-            child2.policy.deny, parent.policy.deny,
-            "deny list must carry through regardless of switch"
         );
     }
 
@@ -2377,29 +2447,36 @@ mod sub_agent_surface_tests {
         );
     }
 
-    /// REGRESSION: `is_apply_patch_success` must reject every failure
-    /// prefix the apply_patch handler can emit, otherwise `files_written`
-    /// would surface paths from plan-mode-blocked, hook-aborted, or
-    /// blocked-path-rejected patches that never touched disk. Mirrors the
-    /// `Ok(format!(...))` sentinels in
-    /// `tool_handlers/filesystem/patch.rs`.
+    /// REGRESSION: `is_apply_patch_success` is an ALLOWLIST against the
+    /// success-prefix shape `format_patch_success` emits, NOT a denylist
+    /// against known failure prefixes. A previous denylist version missed
+    /// the `"Unknown target: …"` return from `handle_apply_patch_unified`
+    /// — credit went to `files_written` for a patch that touched nothing.
+    /// This test pins the allowlist semantics so a future denylist
+    /// regression (or a new failure prefix) fails fast.
     #[test]
-    fn is_apply_patch_success_only_on_real_success_strings() {
-        // Success cases — start with "Patch applied successfully."
+    fn is_apply_patch_success_uses_allowlist() {
+        // Success cases — `format_patch_success` always emits the
+        // canonical "applied successfully" anchor.
         assert!(is_apply_patch_success(
             "Patch applied successfully.\n--- diff ---"
         ));
         assert!(is_apply_patch_success(
             "Unified patch applied successfully."
         ));
+        assert!(is_apply_patch_success("Skill patch applied successfully."));
 
-        // Every failure sentinel must NOT be counted as success.
+        // Every failure sentinel must NOT be counted as success. The
+        // "Unknown target" case is the one the original denylist missed
+        // — listed first to make the regression intent obvious.
         for failure in [
+            "Unknown target: workspaze. Use: cwd, skills, channels.",
             "Error applying patch: hunk did not apply",
             "Error applying unified patch: bad context",
             "Access denied: /etc/passwd is in a blocked path",
             "Plan mode is active — apply_patch refused",
             "Rate limit reached for apply_patch",
+            "Some other unforeseen failure mode without a known prefix",
             "",    // empty is not success
             "   ", // whitespace-only is not success
         ] {
@@ -2408,6 +2485,100 @@ mod sub_agent_surface_tests {
                 "must reject failure string: {failure:?}"
             );
         }
+    }
+
+    /// REGRESSION: `extract_apply_patch_paths` must resolve relative
+    /// patch paths against the apply_patch_unified `target` so the
+    /// parent gets paths it can actually re-read. A previous version
+    /// returned bare strings, so `target: "skills"` writes surfaced
+    /// `my_skill/SKILL.md` instead of `~/.borg/skills/my_skill/SKILL.md`.
+    #[test]
+    fn extract_apply_patch_paths_resolves_skills_target_base() {
+        let args = serde_json::json!({
+            "target": "skills",
+            "patch": "*** Begin Patch\n*** Update File: my_skill/SKILL.md\n@@\n a\n-b\n+c\n*** End Patch"
+        })
+        .to_string();
+        let paths = extract_apply_patch_paths(&args);
+        assert_eq!(paths.len(), 1);
+        // The skills dir resolves via Config::skills_dir(); whatever its
+        // root, the suffix must be the patch-marker path joined to it.
+        let skills_dir = Config::skills_dir().expect("skills_dir must resolve in tests");
+        let expected = skills_dir
+            .join("my_skill/SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(paths[0], expected);
+    }
+
+    /// REGRESSION: target=cwd (or omitted) must still yield bare relative
+    /// paths — operators reading the parent's `files_written` expect the
+    /// same shape they passed to apply_patch.
+    #[test]
+    fn extract_apply_patch_paths_cwd_target_returns_bare_paths() {
+        let args = serde_json::json!({
+            "patch": "*** Update File: src/foo.rs\n*** Add File: src/bar.rs"
+        })
+        .to_string();
+        let paths = extract_apply_patch_paths(&args);
+        assert_eq!(
+            paths,
+            vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()]
+        );
+
+        // Explicit target:"cwd" same as omitted.
+        let args_cwd = serde_json::json!({
+            "target": "cwd",
+            "patch": "*** Update File: a.rs"
+        })
+        .to_string();
+        assert_eq!(
+            extract_apply_patch_paths(&args_cwd),
+            vec!["a.rs".to_string()]
+        );
+    }
+
+    /// REGRESSION: a second `wait_for_agent` against a child whose
+    /// completion was already drained must STILL return the correct
+    /// `files_written`. The early-return branch reads from
+    /// `handle.info.metrics.files_touched`; a previous version never
+    /// populated that field, so subsequent waiters got `vec![]` even
+    /// though the child mutated files. The fix persists files_written
+    /// from completion into the handle's metrics on receipt.
+    #[tokio::test]
+    async fn second_wait_for_agent_returns_persisted_files_written() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        ctrl.insert_mock_handle("agent-x", "atlas");
+
+        let tx = ctrl.test_completion_tx();
+        tx.send(SubAgentCompletion {
+            agent_id: "agent-x".to_string(),
+            nickname: "atlas".to_string(),
+            status: SubAgentStatus::Completed {
+                result: "done".to_string(),
+            },
+            final_response: Some("done".to_string()),
+            files_written: vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()],
+        })
+        .await
+        .unwrap();
+
+        let first = ctrl.wait_for_agent("agent-x", 5).await.unwrap();
+        assert_eq!(
+            first.files_written,
+            vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()]
+        );
+
+        // Handle is now in Completed state — second call hits the
+        // early-return branch. Must surface the same paths.
+        let second = ctrl.wait_for_agent("agent-x", 5).await.unwrap();
+        assert_eq!(
+            second.files_written,
+            vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()],
+            "second wait_for_agent must read the persisted files_written, \
+             not an empty Vec from a never-populated metrics field"
+        );
     }
 
     /// REGRESSION: in a mixed batch, the per-task blocklist must be
