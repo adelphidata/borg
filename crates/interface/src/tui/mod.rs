@@ -604,9 +604,11 @@ fn proto_skip_reason(skip_reason: &str, message: &str) -> heartbeat::scheduler::
         "quiet_hours" => heartbeat::scheduler::SkipReason::QuietHours,
         "duplicate_response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
         "empty_response" => heartbeat::scheduler::SkipReason::EmptyResponse,
+        "no_llm_provider" => heartbeat::scheduler::SkipReason::NoLlmProvider,
         _ => match message {
             "quiet hours" => heartbeat::scheduler::SkipReason::QuietHours,
             "duplicate response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
+            "no llm provider" => heartbeat::scheduler::SkipReason::NoLlmProvider,
             _ => heartbeat::scheduler::SkipReason::EmptyResponse,
         },
     }
@@ -2154,6 +2156,56 @@ mod tests {
             result,
             heartbeat::scheduler::HeartbeatResult::Skipped {
                 reason: heartbeat::scheduler::SkipReason::QuietHours
+            }
+        ));
+    }
+
+    /// Guards the onboarding-race UX fix: when borgd skips a heartbeat
+    /// because `llm.provider` is unset, the TUI must round-trip that skip
+    /// as `SkipReason::NoLlmProvider` so `process_heartbeat_inner` can
+    /// silently log it instead of pushing an alarming `[heartbeat error: …]`
+    /// system message. Decoding it as `EmptyResponse` would regress to the
+    /// pre-fix behavior because `EmptyResponse` is surfaced to the user.
+    #[test]
+    fn proto_heartbeat_result_maps_no_llm_provider_via_wire_field() {
+        let evt = PbHeartbeatEvent {
+            source: "session_start".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "no llm provider".to_string(),
+            duration_ms: 0.0,
+            skip_reason: "no_llm_provider".to_string(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::NoLlmProvider
+            }
+        ));
+    }
+
+    /// Older-daemon compat for the same skip: if borgd doesn't yet stamp
+    /// the wire field, the message-string fallback must still classify it
+    /// as `NoLlmProvider` rather than slipping into the
+    /// `_ => EmptyResponse` arm (which would re-surface the toast).
+    #[test]
+    fn proto_heartbeat_result_falls_back_to_message_for_no_llm_provider() {
+        let evt = PbHeartbeatEvent {
+            source: "session_start".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "no llm provider".to_string(),
+            duration_ms: 0.0,
+            skip_reason: String::new(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::NoLlmProvider
             }
         ));
     }

@@ -85,6 +85,9 @@ pub enum SkipReason {
     EmptyResponse,
     /// Agent response was identical to the previous heartbeat.
     DuplicateResponse,
+    /// No LLM provider is configured — heartbeat has nothing to call.
+    /// Onboarding-not-done, provider cleared, or all credentials revoked.
+    NoLlmProvider,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -93,6 +96,7 @@ impl std::fmt::Display for SkipReason {
             Self::QuietHours => write!(f, "quiet hours"),
             Self::EmptyResponse => write!(f, "empty response"),
             Self::DuplicateResponse => write!(f, "duplicate response"),
+            Self::NoLlmProvider => write!(f, "no llm provider"),
         }
     }
 }

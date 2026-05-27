@@ -436,6 +436,26 @@ pub async fn execute_heartbeat_turn(
     static LAST_HASH: AtomicU64 = AtomicU64::new(0);
     static LAST_HASH_TIME: AtomicU64 = AtomicU64::new(0);
 
+    // No LLM provider = no possible turn. Skip cleanly instead of letting the
+    // agent loop bail with a loud `Failed { "No LLM provider selected" }` —
+    // the most common cause is the onboarding race (provider just written to
+    // the DB but the ConfigWatcher's 3s poll hasn't refreshed this backend's
+    // snapshot yet), and a "heartbeat errored during first-run" toast is
+    // exactly the wrong first impression. Also catches deliberately-unset
+    // and credential-revoked states.
+    if config
+        .llm
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return HeartbeatResult::Skipped {
+            reason: SkipReason::NoLlmProvider,
+        };
+    }
+
     let started = Instant::now();
 
     let mut config = config.clone();
@@ -572,6 +592,7 @@ fn skip_reason_wire(reason: &SkipReason) -> &'static str {
         SkipReason::QuietHours => "quiet_hours",
         SkipReason::EmptyResponse => "empty_response",
         SkipReason::DuplicateResponse => "duplicate_response",
+        SkipReason::NoLlmProvider => "no_llm_provider",
     }
 }
 
@@ -822,6 +843,10 @@ mod tests {
         assert_eq!(
             skip_reason_wire(&SkipReason::EmptyResponse),
             "empty_response"
+        );
+        assert_eq!(
+            skip_reason_wire(&SkipReason::NoLlmProvider),
+            "no_llm_provider"
         );
         assert_eq!(
             skip_reason_wire(&SkipReason::DuplicateResponse),

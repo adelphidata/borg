@@ -10,7 +10,7 @@ The heartbeat system enables proactive check-ins -- the agent can reach out to y
 2. At each interval tick (or cron fire), the agent sends a prompt to the LLM with its personality, memory context, and HEARTBEAT.md checklist
 3. If the LLM has something useful to say, it responds; otherwise it returns an empty message
 4. `borgd` publishes heartbeat lifecycle events; the TUI subscribes and renders heartbeat messages in cyan as a `[heartbeat]` prefix
-5. Duplicate and empty responses are suppressed
+5. Duplicate and empty responses are suppressed; heartbeats also skip cleanly (`skip_reason="no_llm_provider"`) when `llm.provider` is unset, so the onboarding-race window before the ConfigWatcher's 3 s poll catches up never surfaces as a `[heartbeat error: …]` toast
 6. Responses can be delivered to messaging channels (Telegram, Slack, Discord)
 
 ## Configuration

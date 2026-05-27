@@ -610,8 +610,13 @@ impl<'a> App<'a> {
                                 "[heartbeat: nothing to report ({reason})]"
                             ));
                         }
-                        SkipReason::QuietHours => {
-                            // Don't spam the TUI with quiet hours skips
+                        SkipReason::QuietHours | SkipReason::NoLlmProvider => {
+                            // Configured-state skips — neither is an error nor
+                            // something the user can act on from a toast. Log
+                            // only. `NoLlmProvider` is the onboarding-race
+                            // path: first heartbeat fires before the
+                            // ConfigWatcher poll picks up the just-set
+                            // provider.
                             tracing::debug!("Heartbeat skipped: {reason}");
                         }
                     }
