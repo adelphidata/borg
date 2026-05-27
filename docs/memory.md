@@ -232,7 +232,12 @@ borg settings set memory.openviking.account "acme"
 
 If the chosen provider's credentials are missing at daemon startup, the
 registry falls back to `native` with a one-shot `tracing::warn!` in
-`daemon.log` — Borg always boots.
+`daemon.log` — Borg always boots. Tool results from `write_memory` and
+`read_memory` are prefixed with a one-line `[note] memory.provider=…
+is unconfigured; this call used the native SQLite store.` so the
+operator (and the model) see that the write didn't reach the selected
+external store. The notice is suppressed when the operator actually
+selected `native`.
 
 ### Consolidation
 

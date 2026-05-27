@@ -29,34 +29,56 @@ pub async fn handle_write_memory(args: &serde_json::Value, config: &Config) -> R
     // Strip .md extension for DB entry names (backward compat with old tool calls)
     let name = filename.strip_suffix(".md").unwrap_or(filename);
 
-    // Native keeps the legacy free-function path verbatim so behavior +
-    // error messages are byte-identical for the default install.
-    if matches!(config.memory.provider, MemoryProviderKind::Native) {
-        return write_memory_db(name, content, mode, scope).await;
-    }
+    // Dispatch on the resolved provider, not the config kind. If the
+    // operator selected an external provider but it's unconfigured, the
+    // registry returns Native — in that case we still want the legacy
+    // direct path (byte-identical errors) plus a fallback notice so the
+    // operator isn't silently writing to the wrong store.
     let prov = provider::from_config(config);
+    if prov.name() == "native" {
+        let result = write_memory_db(name, content, mode, scope).await?;
+        return Ok(prepend_fallback_notice(config, prov.name(), result));
+    }
     let ctx = MemCtx::from_config(config);
     write_guarded(prov.as_ref(), &ctx, scope, name, content, mode)
         .await
-        .map_err(|e| anyhow::anyhow!(e.user_message()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 pub async fn handle_read_memory(args: &serde_json::Value, config: &Config) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let name = filename.strip_suffix(".md").unwrap_or(filename);
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    if matches!(config.memory.provider, MemoryProviderKind::Native) {
-        return read_memory_db_or_not_found(name, scope).await;
-    }
     let prov = provider::from_config(config);
+    if prov.name() == "native" {
+        let result = read_memory_db_or_not_found(name, scope).await?;
+        return Ok(prepend_fallback_notice(config, prov.name(), result));
+    }
     let ctx = MemCtx::from_config(config);
     match prov
         .read(&ctx, scope, name)
         .await
-        .map_err(|e| anyhow::anyhow!(e.user_message()))?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
     {
         Some(entry) => Ok(entry.content),
         None => Ok(format!("Memory entry '{name}' not found.")),
+    }
+}
+
+/// Prepend a one-line `[note]` to the tool result when the operator
+/// selected an external provider but the registry fell back to native —
+/// otherwise the LLM and operator both see successful tool returns with
+/// no signal that writes are landing in the wrong store. The notice is
+/// suppressed when the operator actually selected native.
+fn prepend_fallback_notice(config: &Config, resolved_name: &str, body: String) -> String {
+    let selected = config.memory.provider;
+    if resolved_name == "native" && !matches!(selected, MemoryProviderKind::Native) {
+        format!(
+            "[note] memory.provider={selected} is unconfigured; this call used the native SQLite store. \
+             Run `borg settings get memory.{selected}.api_key` to verify credentials.\n{body}"
+        )
+    } else {
+        body
     }
 }
 
@@ -190,10 +212,13 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     let max_results = optional_u64_param(args, "max_results", 5) as usize;
     let min_score = optional_f64_param(args, "min_score", 0.2) as f32;
 
-    // External providers route through the trait and short-circuit before
-    // the hybrid FTS/vector path below.
-    if !matches!(config.memory.provider, MemoryProviderKind::Native) {
-        let prov = provider::from_config(config);
+    // Dispatch on the resolved provider, not the config kind, so a
+    // fallback-to-native (external selected but unconfigured) takes the
+    // inline native path instead of re-entering through the trait —
+    // otherwise `NativeProvider::search` would call back into this
+    // function and recurse forever.
+    let prov = provider::from_config(config);
+    if prov.name() != "native" {
         let ctx = MemCtx::from_config(config);
         let hits = prov
             .search(
@@ -205,12 +230,9 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!(e.user_message()))?;
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         return Ok(format_hits(&hits));
     }
-
-    let vector_weight = config.memory.embeddings.vector_weight;
-    let bm25_weight = config.memory.embeddings.bm25_weight;
 
     let sources = parse_sources(args);
     let search_memory = sources.contains(&"memory".to_string());
@@ -227,10 +249,52 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     }
 
     let mut all_results = if search_memory {
-        search_knowledge_files(config, query, max_results * 2, min_score)?
+        native_memory_search(config, &db, query, max_results, min_score).await?
     } else {
         Vec::new()
     };
+
+    all_results.truncate(max_results);
+    let memory_block = format_search_results(&all_results);
+
+    let body = if search_messages {
+        // Combined search: append message-FTS hits after memory results.
+        let hits = db.messages_fts_search(query, max_results).await?;
+        if !hits.is_empty() {
+            let mut combined = memory_block;
+            if !combined.is_empty() && combined != "No matching memories found." {
+                combined.push_str("\n\n");
+            } else {
+                combined.clear();
+            }
+            combined.push_str(&format_message_fts_hits(&hits));
+            combined
+        } else {
+            memory_block
+        }
+    } else {
+        memory_block
+    };
+    Ok(prepend_fallback_notice(config, "native", body))
+}
+
+/// Typed hybrid FTS+vector memory search across the resolved scopes and
+/// any markdown knowledge files. Returns ranked, MMR-reranked results
+/// pre-truncated to `max_results * 3` before re-rank, then to a caller-
+/// controlled cap. This is the structured surface both
+/// [`handle_memory_search`] and [`crate::memory::provider::NativeProvider`]
+/// consume — keeping the formatter as the only string-producing boundary.
+pub(crate) async fn native_memory_search(
+    config: &Config,
+    db: &Database,
+    query: &str,
+    max_results: usize,
+    min_score: f32,
+) -> Result<Vec<embeddings::SearchResult>> {
+    let vector_weight = config.memory.embeddings.vector_weight;
+    let bm25_weight = config.memory.embeddings.bm25_weight;
+
+    let mut all_results = search_knowledge_files(config, query, max_results * 2, min_score)?;
     let scopes = resolved_memory_scopes(config);
 
     // Pre-compute query embedding once for all scopes
@@ -251,7 +315,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     for scope in &scopes {
         all_results.extend(
             search_scope(
-                &db,
+                db,
                 scope,
                 query,
                 query_embedding.as_deref(),
@@ -321,24 +385,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         all_results = reordered.into_iter().map(|i| original[i].clone()).collect();
     }
 
-    all_results.truncate(max_results);
-    let memory_block = format_search_results(&all_results);
-
-    if search_messages {
-        // Combined search: append message-FTS hits after memory results.
-        let hits = db.messages_fts_search(query, max_results).await?;
-        if !hits.is_empty() {
-            let mut combined = memory_block;
-            if !combined.is_empty() && combined != "No matching memories found." {
-                combined.push_str("\n\n");
-            } else {
-                combined.clear();
-            }
-            combined.push_str(&format_message_fts_hits(&hits));
-            return Ok(combined);
-        }
-    }
-    Ok(memory_block)
+    Ok(all_results)
 }
 
 /// Parse the optional `sources` array. Defaults to `["memory"]` when absent

@@ -4,7 +4,7 @@ Borg is an AI personal assistant agent built in Rust. The agent writes its own t
 
 ## Prerequisites
 
-- **LLM provider**: any one of — `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, Azure OpenAI (`AZURE_OPENAI_API_KEY` or Entra ID), AWS Bedrock (AWS credential chain), Google Vertex AI (service account or metadata server); a running Ollama instance (no key needed); or the `claude` Code CLI installed on PATH (uses your existing Claude subscription, no API key needed)
+- **LLM provider**: any one of — `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`, Azure OpenAI (`AZURE_OPENAI_API_KEY` or Entra ID), AWS Bedrock (AWS credential chain), Google Vertex AI (service account or metadata server); a running Ollama instance (no key needed); or the `claude` Code CLI installed on PATH (uses your existing Claude subscription, no API key needed)
 - **Linux**: `bwrap` (bubblewrap) for tool sandboxing — install via your package manager
 - **macOS**: `sandbox-exec` is included with the OS
 
@@ -46,6 +46,8 @@ export GEMINI_API_KEY="..."
 export DEEPSEEK_API_KEY="..."
 # or
 export GROQ_API_KEY="..."
+# or
+export XAI_API_KEY="..."
 # or Azure OpenAI
 export AZURE_OPENAI_API_KEY="..."
 # or Bedrock
@@ -66,7 +68,7 @@ This launches an interactive wizard that walks you through setup:
 
 1. **Welcome** — Your name + agent name
 2. **Security** — Security warning acknowledgment (required)
-3. **Provider** — Select LLM provider (OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, Ollama, Claude Code CLI)
+3. **Provider** — Select LLM provider (OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, Claude Code CLI)
 4. **Model** — Select model for the chosen provider
 5. **API Key** — Enter API key (auto-detects existing keys)
 6. **Channels** — Configure messaging channels (Telegram, Slack, Discord, etc.)
@@ -143,7 +145,7 @@ borg service status     # check service status
 | `borg providers …` | Manage LLM providers (BYO endpoints, rate-card refresh) |
 | `borg client-token …` | Manage bearer tokens for OpenAI-compat HTTP / MCP HTTP |
 | `borg webhook …` | Manage signed webhook definitions for `/v1/webhook/{name}` |
-| `borg mcp` | Run Borg as a Model Context Protocol (MCP) server |
+| `borg mcp list/add/add-preset/remove/enable/disable/test` | Manage external MCP servers; bare `borg mcp` runs Borg as a read-only MCP server over stdio |
 | `borg pair` / `borg revoke` | Pair / revoke a remote device over the mTLS bootstrap socket |
 | `borg audit` | Verify integrity of the audit chain |
 | `borg backup` / `borg restore` | Create / verify / restore a `BORG_HOME` backup tarball |
@@ -152,7 +154,7 @@ borg service status     # check service status
 | `borg available` | Disable auto-reply |
 | `borg stop` / `borg restart` | Daemon lifecycle |
 | `borg service install/uninstall/status` | System service management |
-| `borg migrate` | Migrate settings from Hermes Agent or OpenClaw |
+| `borg migrate` | Import settings from a supported upstream agent |
 | `borg update` | Update borg to the latest released version (`--prerelease`/`-p` for experimental builds, `--check`/`-c` to dry-run) |
 | `borg uninstall` | Delete all Borg data |
 

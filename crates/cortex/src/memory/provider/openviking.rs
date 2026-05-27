@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    ConsolidationOutcome, MemCtx, MemoryEntry, MemoryError, MemoryProvider, SearchHit, SearchQuery,
+    urlencode, ConsolidationOutcome, MemCtx, MemoryEntry, MemoryError, MemoryProvider, SearchHit,
+    SearchQuery,
 };
 use crate::config::media::OpenVikingSettings;
 use crate::memory::WriteMode;
@@ -94,15 +95,23 @@ impl OpenVikingProvider {
         }
     }
 
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.api_key)
+    }
+
+    // Caller-supplied `scope` / `name` are percent-encoded into the path
+    // so a value containing `/`, `?`, `#`, or `..` cannot escape the
+    // configured `account/user/agent/` namespace (path traversal) or
+    // smuggle a query string.
     fn note_url(&self, scope: &str, name: &str) -> String {
         format!(
             "{}/v1/notes/{}/{}/{}/{}/{}",
             self.endpoint.trim_end_matches('/'),
-            self.account,
-            self.user,
-            self.agent,
-            scope,
-            name
+            urlencode(&self.account),
+            urlencode(&self.user),
+            urlencode(&self.agent),
+            urlencode(scope),
+            urlencode(name),
         )
     }
 
@@ -110,10 +119,10 @@ impl OpenVikingProvider {
         format!(
             "{}/v1/notes/{}/{}/{}/{}?list=1",
             self.endpoint.trim_end_matches('/'),
-            self.account,
-            self.user,
-            self.agent,
-            scope
+            urlencode(&self.account),
+            urlencode(&self.user),
+            urlencode(&self.agent),
+            urlencode(scope),
         )
     }
 
@@ -121,45 +130,17 @@ impl OpenVikingProvider {
         format!("{}/v1/search", self.endpoint.trim_end_matches('/'))
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, MemoryError> {
-        req.header("Authorization", format!("Bearer {}", self.api_key))
+    async fn send_raw(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, MemoryError> {
+        req.header("Authorization", self.auth_header())
             .send()
             .await
             .map_err(|e| MemoryError::Transport {
                 provider: PROVIDER_NAME,
                 detail: e.to_string(),
             })
-    }
-
-    async fn send_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> Result<T, MemoryError> {
-        let resp = self
-            .send(req.header("Content-Type", "application/json"))
-            .await?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
-            provider: PROVIDER_NAME,
-            detail: e.to_string(),
-        })?;
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes);
-            let stripped = body.replace(&self.api_key, "<redacted>");
-            let redacted = crate::security::secrets::redact_secrets(&stripped);
-            return Err(MemoryError::Backend {
-                provider: PROVIDER_NAME,
-                detail: format!(
-                    "{}: {}",
-                    status.as_u16(),
-                    redacted.chars().take(400).collect::<String>()
-                ),
-            });
-        }
-        serde_json::from_slice(&bytes).map_err(|e| MemoryError::Backend {
-            provider: PROVIDER_NAME,
-            detail: format!("response decode failed: {e}"),
-        })
     }
 }
 
@@ -233,9 +214,13 @@ impl MemoryProvider for OpenVikingProvider {
                 WriteMode::Append => "append",
             },
         };
-        let _: serde_json::Value = self
-            .send_json(self.client.put(self.note_url(scope, name)).json(&body))
-            .await?;
+        let _: serde_json::Value = super::send_json(
+            self.client.put(self.note_url(scope, name)).json(&body),
+            PROVIDER_NAME,
+            &self.auth_header(),
+            &self.api_key,
+        )
+        .await?;
         Ok(())
     }
 
@@ -246,7 +231,7 @@ impl MemoryProvider for OpenVikingProvider {
         name: &str,
     ) -> Result<Option<MemoryEntry>, MemoryError> {
         let resp = self
-            .send(self.client.get(self.note_url(scope, name)))
+            .send_raw(self.client.get(self.note_url(scope, name)))
             .await?;
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -286,9 +271,13 @@ impl MemoryProvider for OpenVikingProvider {
             "user": self.user,
             "agent": self.agent,
         });
-        let resp: SearchPayload = self
-            .send_json(self.client.post(self.search_url()).json(&body))
-            .await?;
+        let resp: SearchPayload = super::send_json(
+            self.client.post(self.search_url()).json(&body),
+            PROVIDER_NAME,
+            &self.auth_header(),
+            &self.api_key,
+        )
+        .await?;
         Ok(resp
             .hits
             .into_iter()
@@ -312,9 +301,13 @@ impl MemoryProvider for OpenVikingProvider {
     }
 
     async fn list(&self, _ctx: &MemCtx<'_>, scope: &str) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let resp: ListPayload = self
-            .send_json(self.client.get(self.list_url(scope)))
-            .await?;
+        let resp: ListPayload = super::send_json(
+            self.client.get(self.list_url(scope)),
+            PROVIDER_NAME,
+            &self.auth_header(),
+            &self.api_key,
+        )
+        .await?;
         Ok(resp
             .notes
             .into_iter()
@@ -334,7 +327,7 @@ impl MemoryProvider for OpenVikingProvider {
         name: &str,
     ) -> Result<bool, MemoryError> {
         let resp = self
-            .send(self.client.delete(self.note_url(scope, name)))
+            .send_raw(self.client.delete(self.note_url(scope, name)))
             .await?;
         match resp.status() {
             StatusCode::OK | StatusCode::NO_CONTENT => Ok(true),
@@ -356,7 +349,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn note_url_encodes_scope_and_name() {
+    fn note_url_percent_encodes_scope_and_name() {
+        // Regression guard: caller-supplied scope/name must never escape
+        // the configured account/user/agent namespace. `..` and `/` in a
+        // scope value previously produced an unencoded URL that path-
+        // normalised into a different tenant's namespace.
         let p = OpenVikingProvider {
             client: super::super::http_client(),
             endpoint: "http://x".into(),
@@ -365,7 +362,25 @@ mod tests {
             user: "u".into(),
             agent: "borg".into(),
         };
-        let u = p.note_url("project:abc", "notes");
-        assert_eq!(u, "http://x/v1/notes/acct/u/borg/project:abc/notes");
+        assert_eq!(
+            p.note_url("project:abc", "notes"),
+            "http://x/v1/notes/acct/u/borg/project%3Aabc/notes"
+        );
+        // Path-segment slashes in the scope must be encoded so the
+        // server can't normalise the URL into a different tenant.
+        let traversal = p.note_url("../../other-acct/other-user/borg/global", "exfil");
+        assert!(
+            !traversal.contains("/../"),
+            "scope traversal must be percent-encoded, got {traversal}"
+        );
+        assert!(
+            traversal.ends_with("/exfil"),
+            "name segment must remain the terminal path segment, got {traversal}"
+        );
+        let with_query = p.note_url("global", "notes?force=1");
+        assert!(
+            !with_query.contains('?'),
+            "name with `?` must be encoded, got {with_query}"
+        );
     }
 }

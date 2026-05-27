@@ -102,7 +102,7 @@ async fn write_guarded_enforces_token_cap_uniformly() {
     let err = write_guarded(&m0, &ctx, "global", "x", &big, WriteMode::Overwrite)
         .await
         .expect_err("token cap must reject oversize payload");
-    let msg = err.user_message();
+    let msg = err.to_string();
     assert!(
         msg.contains("over the") && msg.contains("token cap"),
         "operator-facing message should explain the cap; got: {msg}"
@@ -167,6 +167,56 @@ fn resolve_returns_native_by_default() {
     assert_eq!(resolve(&cfg).name(), "native");
 }
 
+#[tokio::test]
+async fn handle_memory_search_with_unconfigured_external_does_not_recurse() {
+    // Regression for the dispatch-on-resolved-provider fix: a config
+    // selecting `Mem0` with no credentials previously caused
+    // `handle_memory_search` -> `NativeProvider::search` ->
+    // `handle_memory_search` -> ... unbounded recursion, because the
+    // tool handler dispatched on `config.memory.provider` while the
+    // registry quietly fell back to Native. The fix dispatches on the
+    // resolved provider's `name()`. This test fails on the pre-fix
+    // code with a stack overflow.
+    registry::reset_warn_once_for_tests();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("BORG_DATA_DIR", tmp.path());
+    let mut cfg = Config::default();
+    cfg.memory.provider = MemoryProviderKind::Mem0;
+    // No api_key set → registry falls back to Native.
+    let result = crate::tool_handlers::handle_memory_search(
+        &serde_json::json!({"query": "anything", "max_results": 1}),
+        &cfg,
+    )
+    .await
+    .expect("native fallback search must complete without recursion");
+    // We don't care about the contents — only that it returned cleanly.
+    // (A stack overflow would abort the process, not produce a value.)
+    let _ = result;
+}
+
+#[tokio::test]
+async fn handle_write_memory_with_unconfigured_external_prepends_fallback_notice() {
+    // Regression for the silent-fallback fix: when an operator selects
+    // mem0 but never sets the api_key, writes silently land in local
+    // SQLite. The handler must prepend a `[note]` line so the LLM and
+    // operator can see the misconfiguration.
+    registry::reset_warn_once_for_tests();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("BORG_DATA_DIR", tmp.path());
+    let mut cfg = Config::default();
+    cfg.memory.provider = MemoryProviderKind::Mem0;
+    let result = crate::tool_handlers::handle_write_memory(
+        &serde_json::json!({"filename": "test.md", "content": "hello"}),
+        &cfg,
+    )
+    .await
+    .expect("native fallback write must succeed");
+    assert!(
+        result.contains("[note]") && result.contains("mem0 is unconfigured"),
+        "fallback notice must be prepended; got: {result}"
+    );
+}
+
 // ── Mem0 HTTP fixture ──
 
 #[tokio::test]
@@ -196,6 +246,81 @@ async fn mem0_write_posts_auth_header_and_metadata_key() {
     // if anyone changes the metadata key format, `search()` silently
     // misroutes hits.
     assert_eq!(key, "project:abc/notes");
+}
+
+#[tokio::test]
+async fn mem0_append_concatenates_with_existing_content() {
+    // Regression: Mem0's REST API has no native append — `POST
+    // /v1/memories/` always creates a new memory. The provider must
+    // emulate borg's append semantics by reading the existing entry
+    // and POSTing the joined content as a fresh overwrite, otherwise
+    // appends silently become sibling entries and `read_memory`
+    // returns only the latest payload.
+    let server = MockServer::start().await;
+    // The append flow must first call /v1/memories/search/ to fetch
+    // the prior entry, then POST /v1/memories/ with the concatenated
+    // payload. Wire both.
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/search/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"memory": "alpha", "metadata": {"borg_key": "global/note"}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = mem0::Mem0Provider::for_tests(server.uri());
+    prov.write(&ctx, "global", "note", "beta", WriteMode::Append)
+        .await
+        .expect("append write succeeds");
+    let received = server.received_requests().await.unwrap();
+    let post = received
+        .iter()
+        .find(|r| r.url.path() == "/v1/memories/")
+        .expect("POST /v1/memories/ must fire");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).expect("json body");
+    let content = body["messages"][0]["content"].as_str().expect("content");
+    assert!(
+        content.contains("alpha") && content.contains("beta"),
+        "append must POST concatenated content; got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn mem0_list_synthesizes_name_for_server_extracted_facts() {
+    // Mem0's server-side fact extraction creates rows without a
+    // `borg_key` metadata field — those rows MUST still show up in
+    // `list`, otherwise selecting Mem0 hides exactly the content
+    // the operator picked Mem0 for.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/memories/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": "abcdef1234567890", "memory": "user likes dark mode", "metadata": {}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = mem0::Mem0Provider::for_tests(server.uri());
+    let entries = prov.list(&ctx, "global").await.expect("list succeeds");
+    assert_eq!(entries.len(), 1, "server-extracted fact must be visible");
+    assert_eq!(entries[0].content, "user likes dark mode");
+    assert!(
+        entries[0].name.starts_with("mem0-"),
+        "synthesised name should be prefixed with `mem0-`; got: {}",
+        entries[0].name
+    );
 }
 
 #[tokio::test]
@@ -412,8 +537,10 @@ fn mem0_not_configured_error_is_stable_and_does_not_leak_resolver_detail() {
     // value it failed to read).
     let settings = Mem0Settings {
         api_key: Some(
-            serde_json::from_value(serde_json::json!({"source": "env", "var": "BORG_TEST_NEVER_SET_XYZ_ABC"}))
-                .unwrap(),
+            serde_json::from_value(
+                serde_json::json!({"source": "env", "var": "BORG_TEST_NEVER_SET_XYZ_ABC"}),
+            )
+            .unwrap(),
         ),
         ..Mem0Settings::default()
     };
@@ -433,8 +560,10 @@ fn mem0_not_configured_error_is_stable_and_does_not_leak_resolver_detail() {
 fn honcho_not_configured_does_not_leak_resolver_detail() {
     let settings = HonchoSettings {
         api_key: Some(
-            serde_json::from_value(serde_json::json!({"source": "env", "var": "BORG_TEST_NEVER_SET_XYZ_ABC"}))
-                .unwrap(),
+            serde_json::from_value(
+                serde_json::json!({"source": "env", "var": "BORG_TEST_NEVER_SET_XYZ_ABC"}),
+            )
+            .unwrap(),
         ),
         app_id: Some("app".into()),
         ..HonchoSettings::default()

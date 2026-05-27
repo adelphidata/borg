@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    ConsolidationOutcome, MemCtx, MemoryEntry, MemoryError, MemoryProvider, SearchHit, SearchQuery,
+    urlencode, ConsolidationOutcome, MemCtx, MemoryEntry, MemoryError, MemoryProvider, SearchHit,
+    SearchQuery,
 };
 use crate::config::media::Mem0Settings;
 use crate::memory::WriteMode;
@@ -98,6 +99,10 @@ impl Mem0Provider {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
+    fn auth_header(&self) -> String {
+        format!("Token {}", self.api_key)
+    }
+
     fn borg_key(scope: &str, name: &str) -> String {
         format!("{scope}/{name}")
     }
@@ -106,42 +111,7 @@ impl Mem0Provider {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, MemoryError> {
-        let resp = req
-            .header("Authorization", format!("Token {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .map_err(|e| MemoryError::Transport {
-                provider: PROVIDER_NAME,
-                detail: e.to_string(),
-            })?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
-            provider: PROVIDER_NAME,
-            detail: e.to_string(),
-        })?;
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes);
-            // Two-pass redaction: strip the literal api_key first (catches
-            // verbatim echoes), then run the workspace-wide secret scrubber
-            // so bearer prefixes, refresh tokens, or other echoed secrets
-            // don't leak into the tool-output stream.
-            let stripped = body.replace(&self.api_key, "<redacted>");
-            let redacted = crate::security::secrets::redact_secrets(&stripped);
-            return Err(MemoryError::Backend {
-                provider: PROVIDER_NAME,
-                detail: format!(
-                    "{} {}: {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or(""),
-                    redacted.chars().take(400).collect::<String>()
-                ),
-            });
-        }
-        serde_json::from_slice(&bytes).map_err(|e| MemoryError::Backend {
-            provider: PROVIDER_NAME,
-            detail: format!("response decode failed: {e}"),
-        })
+        super::send_json(req, PROVIDER_NAME, &self.auth_header(), &self.api_key).await
     }
 }
 
@@ -205,22 +175,36 @@ impl MemoryProvider for Mem0Provider {
 
     async fn write(
         &self,
-        _ctx: &MemCtx<'_>,
+        ctx: &MemCtx<'_>,
         scope: &str,
         name: &str,
         content: &str,
         mode: WriteMode,
     ) -> Result<(), MemoryError> {
+        // Mem0's POST always creates a new memory — the server has no
+        // contract for an "append" mode. Preserve borg's append semantics
+        // (concatenate to existing) by reading the prior entry and
+        // submitting the joined content as a fresh overwrite. Without
+        // this, append writes silently become sibling entries and
+        // read_memory returns only the latest payload.
+        let resolved_content: String = match mode {
+            WriteMode::Overwrite => content.to_string(),
+            WriteMode::Append => match self.read(ctx, scope, name).await? {
+                Some(existing) if !existing.content.is_empty() => {
+                    format!("{}\n{}", existing.content, content)
+                }
+                _ => content.to_string(),
+            },
+        };
         let metadata = json!({
             "borg_key": Self::borg_key(scope, name),
             "scope": scope,
             "name": name,
-            "mode": match mode { WriteMode::Append => "append", WriteMode::Overwrite => "overwrite" },
         });
         let body = WriteRequest {
             messages: vec![Mem0Message {
                 role: "user",
-                content,
+                content: &resolved_content,
             }],
             user_id: &self.user_id,
             metadata,
@@ -306,19 +290,31 @@ impl MemoryProvider for Mem0Provider {
         let url = format!(
             "{}?user_id={}",
             self.url("/v1/memories/"),
-            urlencoding(&self.user_id)
+            urlencode(&self.user_id)
         );
         let resp: ListResponse = self.send_json(self.client.get(url)).await?;
         Ok(resp
             .results
             .into_iter()
             .filter_map(|row| {
-                let key = row
-                    .metadata
-                    .get("borg_key")
-                    .and_then(|v| v.as_str())?
-                    .to_string();
-                let (row_scope, row_name) = key.split_once('/')?;
+                // Rows written through borg carry an explicit `borg_key`
+                // metadata field shaped as `"{scope}/{name}"`. Rows
+                // created by Mem0's server-side fact extraction don't,
+                // and would otherwise be invisible to `list` — defeating
+                // the point of selecting Mem0. Synthesise a
+                // `(scope=global, name=mem0-<id-prefix>)` key for those
+                // so distilled facts surface alongside operator writes.
+                let (row_scope, row_name) =
+                    match row.metadata.get("borg_key").and_then(|v| v.as_str()) {
+                        Some(key) => match key.split_once('/') {
+                            Some((s, n)) => (s.to_string(), n.to_string()),
+                            None => ("global".to_string(), key.to_string()),
+                        },
+                        None => {
+                            let suffix: String = row.id.chars().take(8).collect();
+                            ("global".to_string(), format!("mem0-{suffix}"))
+                        }
+                    };
                 if row_scope != scope {
                     return None;
                 }
@@ -327,10 +323,9 @@ impl MemoryProvider for Mem0Provider {
                         .ok()
                         .map(|dt| dt.timestamp())
                 });
-                let _ = row.id;
                 Some(MemoryEntry {
-                    scope: row_scope.to_string(),
-                    name: row_name.to_string(),
+                    scope: row_scope,
+                    name: row_name,
                     content: row.memory,
                     updated_at_epoch: updated,
                 })
@@ -381,32 +376,9 @@ impl MemoryProvider for Mem0Provider {
     }
 }
 
-/// Minimal URL encoder for user-id passthrough — covers the legal id charset
-/// (alphanumerics + `_`/`-`) plus the few characters we explicitly want to
-/// pass through. Avoids pulling in `urlencoding` as a new dep.
-fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urlencoding_handles_special_chars() {
-        assert_eq!(urlencoding("a b"), "a%20b");
-        assert_eq!(urlencoding("foo@bar"), "foo%40bar");
-        assert_eq!(urlencoding("normal-id_42"), "normal-id_42");
-    }
 
     #[test]
     fn borg_key_format_is_stable() {

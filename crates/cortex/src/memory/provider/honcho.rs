@@ -92,6 +92,10 @@ impl HonchoProvider {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.api_key)
+    }
+
     fn session_path(&self, scope: &str) -> String {
         format!(
             "/v1/apps/{}/users/{}/sessions/{}",
@@ -105,44 +109,31 @@ impl HonchoProvider {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, MemoryError> {
-        let resp = req
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .map_err(|e| MemoryError::Transport {
-                provider: PROVIDER_NAME,
-                detail: e.to_string(),
-            })?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
-            provider: PROVIDER_NAME,
-            detail: e.to_string(),
-        })?;
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes);
-            let stripped = body.replace(&self.api_key, "<redacted>");
-            let redacted = crate::security::secrets::redact_secrets(&stripped);
-            return Err(MemoryError::Backend {
-                provider: PROVIDER_NAME,
-                detail: format!(
-                    "{}: {}",
-                    status.as_u16(),
-                    redacted.chars().take(400).collect::<String>()
-                ),
-            });
-        }
-        serde_json::from_slice(&bytes).map_err(|e| MemoryError::Backend {
-            provider: PROVIDER_NAME,
-            detail: format!("response decode failed: {e}"),
-        })
+        super::send_json(req, PROVIDER_NAME, &self.auth_header(), &self.api_key).await
     }
 }
 
 /// Stable session id for a given scope. We use a single session per
 /// scope so message lookup by entry-name metadata stays bounded.
+///
+/// The encoding must be injective: `project:abc` and `project-abc` were
+/// previously colliding under a naive `replace(':', "-")` because both
+/// mapped to `borg-project-abc`, which means writes to one scope landed
+/// in the other's session. We escape `_` first (so the escape marker
+/// itself can't be confused with literal input) and then map `:` to
+/// `_c`. Hyphens pass through untouched — they're already legal in
+/// Honcho session ids and the most common scope character.
 fn session_id(scope: &str) -> String {
-    format!("borg-{}", scope.replace(':', "-"))
+    let mut out = String::with_capacity(scope.len() + 4);
+    out.push_str("borg-");
+    for c in scope.chars() {
+        match c {
+            '_' => out.push_str("__"),
+            ':' => out.push_str("_c"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -202,21 +193,45 @@ impl MemoryProvider for HonchoProvider {
         content: &str,
         _mode: WriteMode,
     ) -> Result<(), MemoryError> {
-        // Best-effort idempotent session create — 409 conflicts are fine.
+        // Best-effort idempotent session create — 409 conflicts are fine,
+        // but other failures (401, transport errors, 5xx) should surface
+        // a breadcrumb. Otherwise the follow-up POST fails with a
+        // confusing "session not found" 404 and the real cause is lost.
         let create_url = format!(
             "{}/v1/apps/{}/users/{}/sessions/",
             self.base_url.trim_end_matches('/'),
             self.app_id,
             self.peer_id
         );
-        let _ = self
+        match self
             .client
             .post(&create_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", self.auth_header())
             .header("Content-Type", "application/json")
             .json(&json!({ "id": session_id(scope) }))
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() && status.as_u16() != 409 {
+                    tracing::warn!(
+                        "honcho session create returned {} for {} \
+                         — subsequent message write may 404",
+                        status.as_u16(),
+                        session_id(scope)
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "honcho session create transport error for {}: {} \
+                     — subsequent message write may 404",
+                    session_id(scope),
+                    e
+                );
+            }
+        }
 
         let body = MessageWrite {
             content,
@@ -243,21 +258,32 @@ impl MemoryProvider for HonchoProvider {
         ctx: &MemCtx<'_>,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>, MemoryError> {
-        let url = self.url(&format!(
-            "{}/dialectic/",
-            self.session_path(ctx.default_scope)
-        ));
-        let body = json!({ "query": query.query, "limit": query.max_results });
-        let resp: DialecticResponse = self.send_json(self.client.post(url).json(&body)).await?;
-        let mut hits: Vec<SearchHit> = resp
-            .citations
-            .into_iter()
-            .filter_map(|c| {
-                let scope = c
+        // Honcho's session model is per-scope, so a single dialectic call
+        // only sees the messages in one session. Borg's native search
+        // enumerates every resolved scope (`global` + per-project) and
+        // merges — match that surface here so multi-scope deployments
+        // don't silently lose hits outside `default_scope`.
+        let scopes = crate::memory::resolved_memory_scopes(ctx.config);
+        let mut hits: Vec<SearchHit> = Vec::new();
+        const SYNTHESIZED_SCORE: f32 = 0.5;
+        for scope in &scopes {
+            let url = self.url(&format!("{}/dialectic/", self.session_path(scope)));
+            let body = json!({ "query": query.query, "limit": query.max_results });
+            let resp: DialecticResponse =
+                match self.send_json(self.client.post(url).json(&body)).await {
+                    Ok(r) => r,
+                    Err(MemoryError::Backend { detail, .. }) if detail.starts_with("404") => {
+                        // Scope's session doesn't exist yet — not an error.
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+            for c in resp.citations {
+                let cite_scope = c
                     .metadata
                     .get("borg_scope")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(ctx.default_scope)
+                    .unwrap_or(scope)
                     .to_string();
                 let name = c
                     .metadata
@@ -265,29 +291,34 @@ impl MemoryProvider for HonchoProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or("honcho")
                     .to_string();
-                let score = c.score.unwrap_or(0.5).clamp(0.0, 1.0);
+                let score = c.score.unwrap_or(SYNTHESIZED_SCORE).clamp(0.0, 1.0);
                 if score < query.min_score {
-                    return None;
+                    continue;
                 }
-                Some(SearchHit {
-                    scope,
+                hits.push(SearchHit {
+                    scope: cite_scope,
                     name,
                     snippet: c.content,
                     score,
-                })
-            })
-            .collect();
-        // If citations were empty but the dialectic produced an answer,
-        // surface it as a single synthesized hit so the agent still gets
-        // signal.
-        if hits.is_empty() && !resp.answer.is_empty() {
-            hits.push(SearchHit {
-                scope: ctx.default_scope.to_string(),
-                name: "honcho-dialectic".to_string(),
-                snippet: resp.answer,
-                score: 0.5,
-            });
+                });
+            }
+            // Per-scope synthesized-answer fallback when this scope has no
+            // citations but the dialectic returned a useful answer.
+            if !resp.answer.is_empty() && SYNTHESIZED_SCORE >= query.min_score {
+                hits.push(SearchHit {
+                    scope: scope.clone(),
+                    name: "honcho-dialectic".to_string(),
+                    snippet: resp.answer,
+                    score: SYNTHESIZED_SCORE,
+                });
+            }
         }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(query.max_results);
         Ok(hits)
     }
 
@@ -355,10 +386,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_id_replaces_colons() {
+    fn session_id_escapes_colons_distinctly_from_hyphens() {
         // The colon in `project:abc` would break Honcho's path-segment
-        // routing — pin the replacement.
+        // routing if left literal; previously `replace(':', "-")` collided
+        // `project:abc` with `project-abc`. Pin both the encoding shape
+        // and the non-collision invariant.
         assert_eq!(session_id("global"), "borg-global");
-        assert_eq!(session_id("project:abc"), "borg-project-abc");
+        assert_eq!(session_id("project:abc"), "borg-project_cabc");
+        assert_eq!(session_id("project-abc"), "borg-project-abc");
+        assert_ne!(
+            session_id("project:abc"),
+            session_id("project-abc"),
+            "colon-scope and hyphen-scope must produce distinct session ids"
+        );
+    }
+
+    #[test]
+    fn session_id_is_injective_under_underscore_input() {
+        // Underscores in scope names must survive the escape — otherwise
+        // a scope containing `_c` could collide with one containing `:`.
+        assert_ne!(session_id("foo_cbar"), session_id("foo:bar"));
+        assert_eq!(session_id("foo_bar"), "borg-foo__bar");
     }
 }

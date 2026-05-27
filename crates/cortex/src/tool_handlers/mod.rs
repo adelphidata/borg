@@ -75,6 +75,7 @@ pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) ->
 // ── Re-exports ──
 
 // Memory
+pub(crate) use memory::native_memory_search;
 pub use memory::{
     format_search_results, handle_memory_search, handle_read_memory, handle_write_memory,
 };

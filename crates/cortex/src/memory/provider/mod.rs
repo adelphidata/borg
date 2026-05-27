@@ -26,6 +26,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -125,15 +126,6 @@ pub enum MemoryError {
     Invariant(String),
 }
 
-impl MemoryError {
-    /// Render to the same human-readable string the legacy free-function
-    /// path returned, so a provider swap doesn't change tool-output shape
-    /// for the LLM.
-    pub fn user_message(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Outcome of a consolidation pass. External providers run their own
 /// consolidation server-side, so the trait surface is "did we do work here
 /// or delegate?" — useful to the daemon scheduler so it can skip the
@@ -147,31 +139,19 @@ pub enum ConsolidationOutcome {
     Delegated,
 }
 
-/// Storage-agnostic context passed on every call. Carries the resolved
-/// scope so the provider doesn't need to peek at `Config` itself, and
-/// the running `Config` so impls that respect `memory.embeddings.*` knobs
-/// (Native) can still reach them.
+/// Storage-agnostic context passed on every call. Carries the running
+/// `Config` so impls can reach `memory.embeddings.*` knobs (Native) or
+/// enumerate `resolved_memory_scopes` (Honcho).
 #[derive(Debug)]
 pub struct MemCtx<'a> {
     /// Active config (read-only).
     pub config: &'a Config,
-    /// Primary scope for this call (`"global"` unless the caller overrides).
-    pub default_scope: &'a str,
 }
 
 impl<'a> MemCtx<'a> {
-    /// Construct a ctx for the configured `memory_scope` (or `"global"`).
+    /// Construct a ctx from the active config.
     pub fn from_config(config: &'a Config) -> Self {
-        let default_scope = config
-            .memory
-            .memory_scope
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("global");
-        Self {
-            config,
-            default_scope,
-        }
+        Self { config }
     }
 }
 
@@ -316,6 +296,69 @@ pub(crate) fn http_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Send an authenticated JSON request and decode the response. Shared by
+/// every external provider — collapses the three near-identical send_json
+/// impls and centralises the two-pass secret redaction (literal api_key
+/// strip → `redact_secrets`). `auth_header` is the full `Authorization`
+/// value (e.g. `"Token abc"` or `"Bearer abc"`); `api_key` is passed
+/// separately so it can be stripped from error bodies before
+/// the workspace redactor runs.
+pub(crate) async fn send_json<T: for<'de> Deserialize<'de>>(
+    req: reqwest::RequestBuilder,
+    provider: &'static str,
+    auth_header: &str,
+    api_key: &str,
+) -> Result<T, MemoryError> {
+    let resp = req
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| MemoryError::Transport {
+            provider,
+            detail: e.to_string(),
+        })?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
+        provider,
+        detail: e.to_string(),
+    })?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes);
+        let stripped = body.replace(api_key, "<redacted>");
+        let redacted = crate::security::secrets::redact_secrets(&stripped);
+        return Err(MemoryError::Backend {
+            provider,
+            detail: format!(
+                "{}: {}",
+                status.as_u16(),
+                redacted.chars().take(400).collect::<String>()
+            ),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|e| MemoryError::Backend {
+        provider,
+        detail: format!("response decode failed: {e}"),
+    })
+}
+
+/// Percent-encode a URL path segment or query-parameter value. RFC 3986
+/// unreserved set passes through; everything else is `%HH`-encoded.
+/// Shared so each provider's URL builder can defend against `/`, `?`,
+/// `#`, and `..` in caller-supplied scope/name strings.
+pub(crate) fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Build an `Arc<dyn MemoryProvider>` from config. Wraps [`resolve`] so

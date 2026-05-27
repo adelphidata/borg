@@ -215,7 +215,7 @@ enum Commands {
     },
     /// Set the agent back to available mode (stops auto-replying)
     Available,
-    /// Migrate settings from Hermes Agent or OpenClaw
+    /// Import settings from a supported upstream agent
     Migrate {
         #[command(subcommand)]
         action: Option<MigrateSubcommand>,
