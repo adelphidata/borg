@@ -474,39 +474,56 @@ mod tests {
             .expect("supervisor stuck")
             .expect("supervisor task panicked");
 
-        // The on_degraded callback spawns a tokio task to do the writes;
-        // yield until it lands or fail loudly.
-        let mut wrote = false;
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if db
-                .get_meta(GATEWAY_UNRECOVERABLE_KEY)
-                .await
-                .unwrap()
-                .as_deref()
-                == Some("1")
-            {
-                wrote = true;
-                break;
-            }
-        }
+        // Callback runs synchronously inside the supervisor task before
+        // spawning the meta writes, so the flag must be set by the time
+        // the supervisor handle resolves. Assert this first — if the
+        // callback never fired, the meta-key checks below would also
+        // fail but with a misleading message.
         assert!(
             callback_fired.load(std::sync::atomic::Ordering::SeqCst),
             "on_degraded callback must fire when supervisor escalates"
         );
+
+        // The on_degraded callback spawns a tokio task to do the writes;
+        // wait on the augmenter's actual signal (both meta keys land
+        // AND the 1h grace has elapsed). Bounded by an explicit
+        // timeout so failures read as "callback writes never landed"
+        // rather than "polled N times and gave up".
+        let app_cfg = Config::default();
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if check_gateway_unrecoverable(&app_cfg, Some(&db))
+                    .await
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         assert!(
-            wrote,
-            "callback must land GATEWAY_UNRECOVERABLE_KEY=1 in the DB"
+            observed.is_ok(),
+            "augmenter must observe the supervisor-driven meta writes and fire within 2s"
         );
 
-        // Final integration assertion: the augmenter, given the test DB
-        // the callback wrote to, must now report the unrecoverable
-        // state. This is the property an operator actually feels.
-        let app_cfg = Config::default();
+        // Pin both meta keys explicitly so a future augmenter change
+        // that started accepting one key without the other can't mask
+        // a regression here.
+        assert_eq!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "GATEWAY_UNRECOVERABLE_KEY must be set to \"1\""
+        );
         assert!(
-            check_gateway_unrecoverable(&app_cfg, Some(&db)).await.is_some(),
-            "augmenter must observe the supervisor-driven meta writes and fire"
+            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
+                .await
+                .unwrap()
+                .is_some(),
+            "GATEWAY_UNRECOVERABLE_AT_KEY must be populated"
         );
     }
 

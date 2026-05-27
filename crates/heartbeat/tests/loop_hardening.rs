@@ -296,9 +296,12 @@ fn run_loops_wrap_each_iteration_in_catch_unwind() {
     // The matching panic-arm in run_interval/run_cron consumes the
     // catch_unwind payload, logs it, and falls through to the next
     // iteration. Removing this arm turns a caught panic into a Stop.
+    // Require BOTH loops to keep it — a single substring match would
+    // pass if only one of run_interval/run_cron had the arm.
+    let payload_arms = src.matches("Err(payload) =>").count();
     assert!(
-        src.contains("Err(payload) =>") && src.contains("panic_msg(&payload)"),
-        "iteration panic arm must log via panic_msg and continue the loop"
+        payload_arms >= 2 && src.contains("panic_msg(&payload)"),
+        "both run_interval and run_cron must consume the catch_unwind payload via Err(payload) => panic_msg(&payload); found {payload_arms} arms"
     );
 }
 
