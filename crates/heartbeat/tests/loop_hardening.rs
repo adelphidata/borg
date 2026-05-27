@@ -267,6 +267,41 @@ async fn liveness_handle_observes_updates_made_by_running_loop() {
     cancel.cancel();
 }
 
+/// Source-grep guard for an invariant types cannot express: each
+/// `run_interval` / `run_cron` iteration body is wrapped in
+/// `AssertUnwindSafe(...).catch_unwind()` so a panic inside the
+/// iteration becomes a logged backoff instead of a task death. This
+/// is layer 1 of the three-layer safety net documented in
+/// `docs/daemon-supervision.md`; without it, every iteration panic
+/// would escape to the supervisor, burn a restart, and risk tripping
+/// the degraded-state cap on transient bugs.
+///
+/// Precedent for the source-grep pattern: the TUI mouse-capture
+/// guards in `crates/interface/src/tui/mod.rs` and `app.rs` use the
+/// same `include_str!` approach for a structurally-equivalent
+/// invariant. Do not weaken — if the wrapper is renamed/refactored,
+/// update this guard with the new pattern rather than deleting it.
+#[test]
+fn run_loops_wrap_each_iteration_in_catch_unwind() {
+    let src = include_str!("../src/scheduler.rs");
+    assert!(
+        src.contains("AssertUnwindSafe(self.interval_iteration(")
+            && src.contains(".catch_unwind()"),
+        "run_interval must wrap interval_iteration in AssertUnwindSafe().catch_unwind() — defense layer 1 of docs/daemon-supervision.md"
+    );
+    assert!(
+        src.contains("AssertUnwindSafe(self.cron_iteration("),
+        "run_cron must wrap cron_iteration in AssertUnwindSafe().catch_unwind() — defense layer 1 of docs/daemon-supervision.md"
+    );
+    // The matching panic-arm in run_interval/run_cron consumes the
+    // catch_unwind payload, logs it, and falls through to the next
+    // iteration. Removing this arm turns a caught panic into a Stop.
+    assert!(
+        src.contains("Err(payload) =>") && src.contains("panic_msg(&payload)"),
+        "iteration panic arm must log via panic_msg and continue the loop"
+    );
+}
+
 /// Reload-induced quiet-hours change still goes through after the
 /// hardening refactor — guards against the iteration-extraction
 /// accidentally breaking the apply_config path.

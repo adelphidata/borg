@@ -414,6 +414,102 @@ mod tests {
         );
     }
 
+    /// End-to-end: a supervised subsystem with the gateway's
+    /// degrade-callback wiring must, after exceeding `max_restarts`,
+    /// land the two meta keys the augmenter reads. This closes the
+    /// chain "supervisor escalates" → "on_degraded fires" →
+    /// "write_gateway_unrecoverable_meta lands the keys" →
+    /// "augmenter observes them" — none of which is covered by the
+    /// individual round-trip / supervisor-escalation tests in
+    /// isolation. The test substitutes an in-memory DB for production's
+    /// `Database::open()` so we don't need the daemon's real data dir,
+    /// but exercises the same code path otherwise.
+    #[tokio::test]
+    async fn gateway_degrade_marks_unrecoverable_meta() {
+        // Shared Arc so the on_degraded closure can write into the same
+        // in-memory DB the assertions read from. `Arc<Database>` matches
+        // the production `DbHandle` shape — the supervisor needs it for
+        // its own activity-log writes.
+        let db = Arc::new(in_memory_db().await);
+        let cancel = CancellationToken::new();
+        let cb_db = db.clone();
+
+        // Track that the callback actually ran — otherwise an assertion
+        // that the meta keys are absent could equally mean "callback
+        // didn't fire" or "callback ran but wrote the wrong keys", and
+        // we want the failure mode unambiguous.
+        let callback_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_fired_inner = callback_fired.clone();
+
+        let cfg = SupervisorConfig {
+            name: "gateway",
+            max_restarts: 2,
+            restart_window: Duration::from_secs(60),
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            on_degraded: Some(Box::new(move || {
+                callback_fired_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Mirror production's mark_gateway_unrecoverable: a
+                // sync callback that spawns the async writes onto the
+                // current runtime. We capture the test DB instead of
+                // calling Database::open().
+                let cb_db = cb_db.clone();
+                tokio::spawn(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                        - 2 * 60 * 60; // 2h ago — past the augmenter's 1h grace
+                    write_gateway_unrecoverable_meta(&cb_db, now).await;
+                });
+            })),
+        };
+
+        let handle = spawn_supervised(cfg, cancel.clone(), db.clone(), move || async move {
+            Err::<(), _>(anyhow::anyhow!("gateway always crashes"))
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("supervisor stuck")
+            .expect("supervisor task panicked");
+
+        // The on_degraded callback spawns a tokio task to do the writes;
+        // yield until it lands or fail loudly.
+        let mut wrote = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if db
+                .get_meta(GATEWAY_UNRECOVERABLE_KEY)
+                .await
+                .unwrap()
+                .as_deref()
+                == Some("1")
+            {
+                wrote = true;
+                break;
+            }
+        }
+        assert!(
+            callback_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "on_degraded callback must fire when supervisor escalates"
+        );
+        assert!(
+            wrote,
+            "callback must land GATEWAY_UNRECOVERABLE_KEY=1 in the DB"
+        );
+
+        // Final integration assertion: the augmenter, given the test DB
+        // the callback wrote to, must now report the unrecoverable
+        // state. This is the property an operator actually feels.
+        let app_cfg = Config::default();
+        assert!(
+            check_gateway_unrecoverable(&app_cfg, Some(&db)).await.is_some(),
+            "augmenter must observe the supervisor-driven meta writes and fire"
+        );
+    }
+
     /// Flag without a timestamp (simulating mid-write death) must NOT
     /// instantly fire — the augmenter falls back to `now`, so the 1h
     /// grace re-arms cleanly.

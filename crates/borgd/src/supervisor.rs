@@ -694,6 +694,158 @@ mod tests {
         let _ = victim.await;
     }
 
+    /// Boundary guard: the escalation predicate is `restart_count >
+    /// max_restarts`, not `>=`. A subsystem that crashes exactly
+    /// `max_restarts` times then recovers must NOT enter degraded
+    /// state. Flipping `>` to `>=` in `supervised_loop` would silently
+    /// shrink the cap from "N+1 strikes" to "N strikes" — operator-
+    /// visible behavior change with no test catching it.
+    #[tokio::test]
+    async fn does_not_escalate_at_exactly_max_restarts() {
+        let db = test_db().await;
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+
+        // max_restarts=3 — supervisor escalates on the 4th restart entry,
+        // not the 3rd. We fail exactly 3 times then succeed: 3 restart
+        // entries land in the sliding window, the predicate evaluates
+        // `3 > 3` (false), the 4th attempt's clean exit ends the loop.
+        let handle = spawn_supervised(
+            fast_cfg("boundary-test", 3),
+            cancel.clone(),
+            db.clone(),
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    if n < 3 {
+                        Err::<(), _>(anyhow::anyhow!("transient fail {n}"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("supervisor stuck")
+            .expect("supervisor task panicked");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            4,
+            "expected exactly 4 attempts (3 fails + 1 success), got {}",
+            attempts.load(Ordering::SeqCst)
+        );
+
+        // No degraded-state activity row should exist.
+        let degrade_rows: Vec<_> = read_activity(&db, Some("error"), Some("subsystem"))
+            .await
+            .into_iter()
+            .filter(|r| r.message.contains("degraded"))
+            .collect();
+        assert!(
+            degrade_rows.is_empty(),
+            "no degraded row should be written when restart count equals max_restarts: {degrade_rows:?}"
+        );
+
+        // No issue_state row either.
+        let stmt = db
+            .conn()
+            .prepare(
+                "SELECT issue_key FROM maintenance_issue_state WHERE issue_key = ?1",
+            )
+            .await
+            .expect("prepare issue_state lookup");
+        let mut rows = stmt
+            .query([libsql::Value::from("Subsystem:boundary-test")])
+            .await
+            .expect("query issue_state");
+        assert!(
+            rows.next().await.expect("fetch row").is_none(),
+            "no issue_state row should be inserted at the boundary"
+        );
+    }
+
+    /// A panicking `on_degraded` callback must NOT prevent the degraded-
+    /// state log + `maintenance_issue_state` writes that happen BEFORE
+    /// the callback, and must not crash the supervisor task itself.
+    /// Without `catch_unwind` around the callback invocation, a bad
+    /// callback would propagate the panic, swallow the supervisor's
+    /// clean shutdown, and (depending on the runtime) abort the daemon.
+    #[tokio::test]
+    async fn on_degraded_callback_panic_does_not_break_supervisor_shutdown() {
+        let db = test_db().await;
+        let cancel = CancellationToken::new();
+        let callback_fired = Arc::new(AtomicU32::new(0));
+        let callback_fired_inner = callback_fired.clone();
+
+        let cfg = SupervisorConfig {
+            name: "callback-panic-test",
+            max_restarts: 2,
+            restart_window: Duration::from_secs(60),
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            on_degraded: Some(Box::new(move || {
+                callback_fired_inner.fetch_add(1, Ordering::SeqCst);
+                panic!("callback intentionally panicked");
+            })),
+        };
+
+        let handle = spawn_supervised(cfg, cancel.clone(), db.clone(), move || async move {
+            Err::<(), _>(anyhow::anyhow!("always fails"))
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("supervisor stuck — callback panic must not block shutdown")
+            .expect("supervisor task itself panicked — catch_unwind on callback failed");
+
+        assert_eq!(
+            callback_fired.load(Ordering::SeqCst),
+            1,
+            "on_degraded must be invoked exactly once on escalation"
+        );
+
+        // Degraded activity row still written despite the callback panic.
+        let degrade_rows: Vec<_> = read_activity(&db, Some("error"), Some("subsystem"))
+            .await
+            .into_iter()
+            .filter(|r| r.message.contains("degraded"))
+            .collect();
+        assert_eq!(
+            degrade_rows.len(),
+            1,
+            "degraded row must persist even when on_degraded panics, got {}",
+            degrade_rows.len()
+        );
+
+        // maintenance_issue_state row still written.
+        let stmt = db
+            .conn()
+            .prepare(
+                "SELECT last_status FROM maintenance_issue_state WHERE issue_key = ?1",
+            )
+            .await
+            .expect("prepare issue_state lookup");
+        let mut rows = stmt
+            .query([libsql::Value::from("Subsystem:callback-panic-test")])
+            .await
+            .expect("query issue_state");
+        let row = rows
+            .next()
+            .await
+            .expect("fetch")
+            .expect("issue_state row must exist even when callback panics");
+        assert_eq!(
+            row.get::<String>(0).expect("last_status"),
+            "fail",
+            "issue_state row must be promoted to fail status"
+        );
+    }
+
     #[tokio::test]
     async fn clean_exit_does_not_respawn() {
         let db = test_db().await;
