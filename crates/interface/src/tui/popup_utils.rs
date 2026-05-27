@@ -34,7 +34,6 @@ pub fn popup_area(area: Rect) -> Rect {
 }
 
 /// Render a popup frame with a bordered block and title. Returns the inner area.
-/// Clears the background, draws the border, and returns the usable inner rect.
 pub fn render_popup_frame(frame: &mut Frame, popup_area: Rect, title: &str) -> Rect {
     frame.render_widget(Clear, popup_area);
 

@@ -36,10 +36,8 @@ use std::time::{Duration, Instant};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// `Database` is now `Send + Sync` (libsql connection is internally `Arc`'d),
-/// so subsystems share access through a plain `Arc`. The legacy
-/// `Arc<Mutex<Database>>` wrapper became dead weight once the SQL layer
-/// went async.
+/// `Database` is `Send + Sync` (libsql connection is internally `Arc`'d),
+/// so subsystems share access through a plain `Arc`.
 pub type DbHandle = Arc<Database>;
 
 async fn try_log(db: &DbHandle, level: &str, category: &str, message: &str) {
@@ -56,8 +54,7 @@ async fn try_observe_issue(db: &DbHandle, key: &str, ts: i64, status: &str) {
 
 /// Knobs for one supervised subsystem. Every field has a default
 /// suitable for borgd's long-running daemon tasks; override only
-/// when there's a concrete reason (e.g., the gateway's historic
-/// 5-restarts-with-exp-backoff that pre-dated this module).
+/// when there's a concrete reason.
 pub struct SupervisorConfig {
     /// Subsystem name surfaced in logs, activity_log rows, and the
     /// `maintenance_issue_state` key. Stable across daemon restarts —
@@ -77,10 +74,10 @@ pub struct SupervisorConfig {
     pub max_backoff: Duration,
     /// Optional callback fired exactly once when the subsystem enters
     /// degraded state (max_restarts exceeded). Used by the gateway to
-    /// stamp the legacy `gateway_unrecoverable` meta keys the
-    /// heartbeat augmenter reads. Errors inside the callback are
-    /// caught and logged so a panicking callback can't mask the
-    /// degradation event itself.
+    /// stamp the `gateway_unrecoverable` meta keys the heartbeat
+    /// augmenter reads. Errors inside the callback are caught and
+    /// logged so a panicking callback can't mask the degradation event
+    /// itself.
     pub on_degraded: Option<Box<dyn Fn() + Send + Sync>>,
 }
 

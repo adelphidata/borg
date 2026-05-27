@@ -14,16 +14,122 @@ pub use types::{CheckStatus, DiagnosticCheck, DiagnosticReport, RemediationKind}
 /// Used by the TUI to show progressive output.
 #[derive(Default)]
 pub struct DiagnosticRunner {
-    /// Current step index.
+    /// Current cursor into [`STEPS`].
     step: usize,
 }
-
-const STEP_COUNT: usize = 17;
 
 /// Max acceptable gap between memory entries and indexed embeddings before
 /// the doctor escalates to a warning. Below this threshold the gap is the
 /// normal write/embed race window — the next embed pass closes it.
 const EMBEDDING_LAG_WARN_THRESHOLD: usize = 5;
+
+/// The ordered diagnostic groups. Adding a check is one entry here plus the
+/// matching arm in [`StepKind::run`] — no parallel index switch to keep in
+/// sync. Order is operator-visible in `borg doctor` output.
+const STEPS: &[StepKind] = &[
+    StepKind::Provider,
+    StepKind::Secrets,
+    StepKind::Sandbox,
+    StepKind::Skills,
+    StepKind::Memory,
+    StepKind::Embeddings,
+    StepKind::Data,
+    StepKind::Gateway,
+    StepKind::Heartbeat,
+    StepKind::Budget,
+    StepKind::PromptCache,
+    StepKind::Plugins,
+    StepKind::Browser,
+    StepKind::Agents,
+    StepKind::Security,
+    StepKind::SupplyChain,
+    StepKind::HostAudit,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    Provider,
+    Secrets,
+    Sandbox,
+    Skills,
+    Memory,
+    Embeddings,
+    Data,
+    Gateway,
+    Heartbeat,
+    Budget,
+    PromptCache,
+    Plugins,
+    Browser,
+    Agents,
+    Security,
+    SupplyChain,
+    HostAudit,
+}
+
+impl StepKind {
+    /// Operator-visible label rendered in the TUI / CLI report.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "Provider",
+            Self::Secrets => "Secrets",
+            Self::Sandbox => "Sandbox",
+            Self::Skills => "Skills",
+            Self::Memory => "Memory",
+            Self::Embeddings => "Embeddings",
+            Self::Data => "Data",
+            Self::Gateway => "Gateway",
+            Self::Heartbeat => "Heartbeat",
+            Self::Budget => "Budget",
+            Self::PromptCache => "Prompt Cache",
+            Self::Plugins => "Plugins",
+            Self::Browser => "Browser",
+            Self::Agents => "Agents",
+            Self::Security => "Security",
+            Self::SupplyChain => "Supply Chain",
+            Self::HostAudit => "Host Audit",
+        }
+    }
+
+    /// Whether this step runs for the given config. Returning `false` skips
+    /// the step entirely — neither `peek_label` nor `next_step` surface it.
+    fn enabled(self, config: &Config) -> bool {
+        match self {
+            Self::HostAudit => config.security.host_audit,
+            _ => true,
+        }
+    }
+
+    /// When `true`, a step that produced zero `DiagnosticCheck` rows is
+    /// dropped silently (no header in the output). Host Audit uses this
+    /// because "platform doesn't apply" yields an empty result on macOS
+    /// and printing a bare header would mislead operators.
+    const fn suppress_when_empty(self) -> bool {
+        matches!(self, Self::HostAudit)
+    }
+
+    async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+        match self {
+            Self::Provider => check_provider(config, checks),
+            Self::Secrets => check_secrets(config, checks),
+            Self::Sandbox => check_sandbox(checks),
+            Self::Skills => check_skills(config, checks).await,
+            Self::Memory => check_memory(checks).await,
+            Self::Embeddings => check_embeddings(config, checks).await,
+            Self::Data => check_data_dir(checks).await,
+            Self::Gateway => check_gateway(config, checks),
+            Self::Heartbeat => check_heartbeat(config, checks).await,
+            Self::Budget => check_budget(config, checks).await,
+            Self::PromptCache => check_prompt_cache(config, checks).await,
+            Self::Plugins => check_plugins(checks).await,
+            Self::Browser => check_browser(config, checks),
+            Self::Agents => check_agents(config, checks).await,
+            Self::Security => check_config_security(config, checks),
+            Self::SupplyChain => check_supply_chain(checks),
+            Self::HostAudit => crate::host_audit::run_host_security_checks(checks),
+        }
+    }
+}
 
 impl DiagnosticRunner {
     /// Create a new diagnostic runner starting at step 0.
@@ -31,125 +137,37 @@ impl DiagnosticRunner {
         Self::default()
     }
 
-    /// Returns the label of the next step without running it, or `None` if done.
+    /// Returns the label of the next step that would run for `config`,
+    /// skipping any disabled steps. Returns `None` when no more steps will
+    /// run. Note: this can't predict the [`StepKind::suppress_when_empty`]
+    /// case — Host Audit's label is returned even when the actual run will
+    /// drop empty output. Preserves prior behavior.
     pub fn peek_label(&self, config: &Config) -> Option<&'static str> {
-        match self.step {
-            0 => Some("Provider"),
-            1 => Some("Secrets"),
-            2 => Some("Sandbox"),
-            3 => Some("Skills"),
-            4 => Some("Memory"),
-            5 => Some("Embeddings"),
-            6 => Some("Data"),
-            7 => Some("Gateway"),
-            8 => Some("Heartbeat"),
-            9 => Some("Budget"),
-            10 => Some("Prompt Cache"),
-            11 => Some("Plugins"),
-            12 => Some("Browser"),
-            13 => Some("Agents"),
-            14 => Some("Security"),
-            15 => Some("Supply Chain"),
-            16 if config.security.host_audit => Some("Host Audit"),
-            16 => None,
-            _ => None,
-        }
+        STEPS[self.step..]
+            .iter()
+            .find(|kind| kind.enabled(config))
+            .map(|kind| kind.label())
     }
 
-    /// Run the next check group. Returns `None` when all groups are done.
+    /// Run the next enabled step. Returns `None` when all steps are done.
     pub async fn next_step(
         &mut self,
         config: &Config,
     ) -> Option<(&'static str, Vec<DiagnosticCheck>)> {
-        if self.step >= STEP_COUNT {
-            return None;
+        while self.step < STEPS.len() {
+            let kind = STEPS[self.step];
+            self.step += 1;
+            if !kind.enabled(config) {
+                continue;
+            }
+            let mut checks = Vec::new();
+            kind.run(config, &mut checks).await;
+            if kind.suppress_when_empty() && checks.is_empty() {
+                continue;
+            }
+            return Some((kind.label(), checks));
         }
-        let mut checks = Vec::new();
-        let label = match self.step {
-            0 => {
-                check_provider(config, &mut checks);
-                "Provider"
-            }
-            1 => {
-                check_secrets(config, &mut checks);
-                "Secrets"
-            }
-            2 => {
-                check_sandbox(&mut checks);
-                "Sandbox"
-            }
-            3 => {
-                check_skills(config, &mut checks).await;
-                "Skills"
-            }
-            4 => {
-                check_memory(&mut checks).await;
-                "Memory"
-            }
-            5 => {
-                check_embeddings(config, &mut checks).await;
-                "Embeddings"
-            }
-            6 => {
-                check_data_dir(&mut checks).await;
-                "Data"
-            }
-            7 => {
-                check_gateway(config, &mut checks);
-                "Gateway"
-            }
-            8 => {
-                check_heartbeat(config, &mut checks).await;
-                "Heartbeat"
-            }
-            9 => {
-                check_budget(config, &mut checks).await;
-                "Budget"
-            }
-            10 => {
-                check_prompt_cache(config, &mut checks).await;
-                "Prompt Cache"
-            }
-            11 => {
-                check_plugins(&mut checks).await;
-                "Plugins"
-            }
-            12 => {
-                check_browser(config, &mut checks);
-                "Browser"
-            }
-            13 => {
-                check_agents(config, &mut checks).await;
-                "Agents"
-            }
-            14 => {
-                check_config_security(config, &mut checks);
-                "Security"
-            }
-            15 => {
-                check_supply_chain(&mut checks);
-                "Supply Chain"
-            }
-            16 => {
-                if config.security.host_audit {
-                    crate::host_audit::run_host_security_checks(&mut checks);
-                    self.step += 1;
-                    return if checks.is_empty() {
-                        None
-                    } else {
-                        Some(("Host Audit", checks))
-                    };
-                } else {
-                    self.step += 1;
-                    return None;
-                }
-            }
-            _ => {
-                return None;
-            }
-        };
-        self.step += 1;
-        Some((label, checks))
+        None
     }
 }
 

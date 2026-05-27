@@ -1359,12 +1359,6 @@ them."#
     }
 }
 
-// ---------------------------------------------------------------------------
-// Back-compat shims for legacy callers (history.rs, markdown.rs).
-// Pre-port API took a `&str` and returned `Vec<Cow<'_, str>>`; new internal
-// callers should prefer `adaptive_wrap_line` / `word_wrap_line` directly.
-// ---------------------------------------------------------------------------
-
 /// Wrap `text` to `width` columns. URL-aware: if the input contains a URL-like
 /// token, switch to `WordSeparator::AsciiSpace` + `WordSplitter::NoHyphenation`
 /// + `break_words: false` so the URL stays on one line.

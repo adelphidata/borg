@@ -324,8 +324,6 @@ pub async fn run_and_broadcast(
 
     let (status, message, skip_reason) = match result {
         HeartbeatResult::Ran { message, .. } => {
-            // Deliver to configured channels (matches legacy
-            // `daemon_heartbeat_turn` in service/mod.rs).
             deliver_to_channels(config, &message).await;
             ("ran", message, None)
         }
@@ -427,10 +425,9 @@ fn publish_scheduler_result(bus: &HeartbeatBus, source: HeartbeatSource, result:
 /// return a structured outcome. The session_key is stable per source so
 /// scheduled and session-start heartbeats reuse their respective histories.
 ///
-/// Mirrors the legacy `crates/cli/src/service/mod.rs::execute_heartbeat_turn`
-/// but never constructs an `Agent` directly — everything routes through the
-/// SessionRegistry so hooks (vitals, evolution, …) fire the same way they do
-/// for user-driven turns. The dedup window and zero-info filter are identical.
+/// Routes through the SessionRegistry rather than constructing an `Agent`
+/// directly, so hooks (vitals, evolution, …) fire the same way they do for
+/// user-driven turns.
 pub async fn execute_heartbeat_turn(
     executor: &dyn SessionExecutor,
     config: &Config,

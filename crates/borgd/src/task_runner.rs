@@ -35,10 +35,7 @@ pub(crate) fn is_silent_response(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Spawn a single scheduled-task execution. Mirrors the cli's
-/// `service::spawn_task_execution` — keeps the execution body identical so
-/// behavior doesn't drift between the legacy in-cli path and the new
-/// in-borgd path.
+/// Spawn a single scheduled-task execution.
 pub async fn spawn_task_execution(
     task: cortex::db::ScheduledTaskRow,
     run_id: i64,
@@ -763,12 +760,11 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
 
 /// Execute a `task_type="heartbeat"` row.
 ///
-/// Unified dispatch path that replaces the legacy `crates/heartbeat/`
-/// parallel scheduler. The dispatcher claims the row the same way as any
-/// other scheduled task; by the time we get here the
-/// `bypass_quiet_hours_once` flag on `task` has already been consumed and
-/// reset in DB by `claim_due_tasks`. We use the captured value off `task`
-/// to decide whether quiet-hour / min-interval gates are skipped.
+/// The dispatcher claims the row the same way as any other scheduled
+/// task; by the time we get here the `bypass_quiet_hours_once` flag on
+/// `task` has already been consumed and reset in DB by `claim_due_tasks`.
+/// We use the captured value off `task` to decide whether quiet-hour /
+/// min-interval gates are skipped.
 ///
 /// Suppression layers (in order):
 ///   1. Quiet hours / min-interval — recorded as `task_runs(status='success', result=<reason>)`
@@ -942,8 +938,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
 
     // Doctor's `check_heartbeat` reads `activity_log` to detect a stalled
     // scheduler — a missing entry would surface as "no heartbeat activity
-    // recorded" even on a healthy fire. Mirror what the legacy
-    // `run_and_broadcast` did so the unified path stays observable.
+    // recorded" even on a healthy fire.
     crate::heartbeat::log_heartbeat_activity(
         crate::heartbeat::HeartbeatSource::Scheduled,
         "ran",

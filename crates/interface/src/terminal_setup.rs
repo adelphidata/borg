@@ -845,8 +845,6 @@ mod tests {
         assert_eq!(dir, None);
     }
 
-    // ---- strip_jsonc --------------------------------------------------
-
     #[test]
     fn strip_jsonc_strips_line_comments() {
         let s = strip_jsonc("// comment\n[{\"key\":\"shift+enter\"}]");
@@ -900,8 +898,6 @@ mod tests {
         let v: Value = serde_json::from_str(&stripped).unwrap();
         assert_eq!(v, json!([{"text": "a\"b // not a comment"}]));
     }
-
-    // ---- configure: happy path ---------------------------------------
 
     fn keybindings_path_for(terminal: SupportedTerminal, os: Os, home: &Path) -> PathBuf {
         vscode_style_config_dir(terminal.app_name(), os, &MapEnv::new(), home)
@@ -1003,8 +999,6 @@ mod tests {
             Some("user.somethingElse")
         );
     }
-
-    // ---- conflict detection ------------------------------------------
 
     #[test]
     fn configure_reports_conflict_on_cmd_z_with_overlapping_when() {
@@ -1137,8 +1131,6 @@ mod tests {
         assert!(result.success, "msg: {}", result.message);
     }
 
-    // ---- backup + idempotence ----------------------------------------
-
     #[test]
     fn configure_backs_up_existing_file_before_writing() {
         let env = MapEnv::new();
@@ -1202,8 +1194,6 @@ mod tests {
         assert_eq!(fs.writes().get(&path).cloned().unwrap(), written_before);
     }
 
-    // ---- error surfaces ----------------------------------------------
-
     #[test]
     fn configure_surfaces_read_permission_error() {
         let env = MapEnv::new();
@@ -1244,8 +1234,6 @@ mod tests {
         // File untouched.
         assert_eq!(fs.write_count(), 1);
     }
-
-    // ---- SSH guard ----------------------------------------------------
 
     #[test]
     fn configure_refuses_ssh_connection() {
@@ -1295,8 +1283,6 @@ mod tests {
         assert!(!result.success);
     }
 
-    // ---- auto-detect --------------------------------------------------
-
     #[test]
     fn detected_configure_uses_cursor_path_when_cursor_detected() {
         let env = MapEnv::new().with("CURSOR_TRACE_ID", "x");
@@ -1327,8 +1313,6 @@ mod tests {
         assert!(!result.success);
         assert!(result.message.contains("Supported"));
     }
-
-    // ---- should_prompt -----------------------------------------------
 
     #[test]
     fn should_prompt_true_when_detected_and_file_missing() {
@@ -1389,8 +1373,6 @@ mod tests {
             &fs,
         ));
     }
-
-    // ---- parse_terminal_setup_target ---------------------------------
 
     #[test]
     fn parse_target_empty_and_auto_yield_none() {

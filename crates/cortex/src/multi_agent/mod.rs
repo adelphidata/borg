@@ -616,111 +616,34 @@ impl AgentControl {
         // Spawn tokio task
         let (input_tx, input_rx) = mpsc::channel::<String>(16);
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
         let is_paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
-        let is_paused_task = is_paused.clone();
-        let pause_notify_task = pause_notify.clone();
-        let completion_tx = self.completion_tx.clone();
-        let semaphore = self.semaphore.clone();
-        let agent_id_clone = agent_id.clone();
-        let nickname_clone = chosen_nickname.clone();
-        let message_owned = message.to_string();
-        let context_owned = context.map(str::to_string);
-        let fork_context_owned: Option<Vec<crate::types::Message>> =
-            fork_context.map(<[crate::types::Message]>::to_vec);
-        let agents_config = parent_config.agents.clone();
         let tools_filter =
             compute_tools_filter(role.as_ref(), toolsets, tools_blocklist, parent_config).await;
-        let bus = self.bus.clone();
-        let info_clone = info.clone();
 
-        let join_handle = tokio::spawn(async move {
-            // Acquire semaphore permit
-            let _permit = match semaphore.acquire().await {
-                Ok(p) => p,
-                Err(_) => {
-                    if completion_tx
-                        .send(SubAgentCompletion {
-                            agent_id: agent_id_clone,
-                            nickname: nickname_clone,
-                            status: SubAgentStatus::Errored {
-                                error: "Semaphore closed".to_string(),
-                            },
-                            final_response: None,
-                            files_written: Vec::new(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::debug!("sub-agent completion receiver dropped");
-                    }
-                    return;
-                }
-            };
-
-            let files_written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let result = run_sub_agent(
-                agent_id_clone.clone(),
-                nickname_clone.clone(),
-                child_config,
-                child_depth,
-                max_spawn_depth,
-                agents_config,
-                message_owned,
-                context_owned,
-                role,
-                role_kind,
-                fork_context_owned,
-                input_rx,
-                cancel_clone,
-                is_paused_task,
-                pause_notify_task,
-                tools_filter,
-                files_written.clone(),
-                bus.clone(),
-                info_clone,
-            )
-            .await;
-
-            let files_written_vec = files_written.lock().map(|g| g.clone()).unwrap_or_default();
-
-            let (status, final_response) = match result {
-                Ok(response) => (
-                    SubAgentStatus::Completed {
-                        result: response.clone(),
-                    },
-                    Some(response),
-                ),
-                Err(e) => (
-                    SubAgentStatus::Errored {
-                        error: e.to_string(),
-                    },
-                    None,
-                ),
-            };
-
-            // Update DB
-            if let Ok(db) = crate::db::Database::open().await {
-                if let Err(e) = db.update_sub_agent_status(&agent_id_clone, &status).await {
-                    tracing::warn!(%agent_id_clone, "failed to update sub-agent status: {e}");
-                }
-            }
-
-            if completion_tx
-                .send(SubAgentCompletion {
-                    agent_id: agent_id_clone,
-                    nickname: nickname_clone,
-                    status,
-                    final_response,
-                    files_written: files_written_vec,
-                })
-                .await
-                .is_err()
-            {
-                tracing::debug!("sub-agent completion receiver dropped");
-            }
-        });
+        let spawn_ctx = SubAgentSpawn {
+            agent_id: agent_id.clone(),
+            nickname: chosen_nickname.clone(),
+            config: child_config,
+            depth: child_depth,
+            max_spawn_depth,
+            agents_config: parent_config.agents.clone(),
+            message: message.to_string(),
+            context: context.map(str::to_string),
+            role,
+            role_kind,
+            fork_context: fork_context.map(<[crate::types::Message]>::to_vec),
+            input_rx,
+            cancel: cancel.clone(),
+            is_paused: is_paused.clone(),
+            pause_notify: pause_notify.clone(),
+            tools_filter,
+            bus: self.bus.clone(),
+            info: info.clone(),
+            semaphore: self.semaphore.clone(),
+            completion_tx: self.completion_tx.clone(),
+        };
+        let join_handle = tokio::spawn(run_sub_agent_task(spawn_ctx));
 
         // Store handle
         let handle = SubAgentHandle {
@@ -1442,6 +1365,147 @@ fn extract_apply_patch_paths(args_json: &str) -> Vec<String> {
         }
     }
     paths
+}
+
+/// Bundle of state captured by [`run_sub_agent_task`]. Lives only between
+/// `spawn_agent`'s setup and the tokio task taking ownership — exists so the
+/// spawn site can move 20 named fields into the task with a single `let _ =`
+/// instead of an opaque `async move {}` closure that hides what gets cloned
+/// vs. moved.
+struct SubAgentSpawn {
+    agent_id: String,
+    nickname: String,
+    config: Config,
+    depth: u32,
+    max_spawn_depth: u32,
+    agents_config: crate::config::MultiAgentConfig,
+    message: String,
+    context: Option<String>,
+    role: Option<AgentRole>,
+    role_kind: AgentRoleKind,
+    fork_context: Option<Vec<crate::types::Message>>,
+    input_rx: mpsc::Receiver<String>,
+    cancel: CancellationToken,
+    is_paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
+    tools_filter: Option<Vec<String>>,
+    bus: Option<AgentTreeBus>,
+    info: SubAgentInfo,
+    semaphore: Arc<Semaphore>,
+    completion_tx: mpsc::Sender<SubAgentCompletion>,
+}
+
+/// Driver for the tokio task `spawn_agent` creates. Acquires the concurrency
+/// permit, runs the agent loop, then ships the terminal status (plus any
+/// `apply_patch` file paths the child mutated) back to the parent via
+/// `completion_tx`. Send failures are logged but never panic — the parent
+/// may have shut down the receiver.
+async fn run_sub_agent_task(spawn: SubAgentSpawn) {
+    let SubAgentSpawn {
+        agent_id,
+        nickname,
+        config,
+        depth,
+        max_spawn_depth,
+        agents_config,
+        message,
+        context,
+        role,
+        role_kind,
+        fork_context,
+        input_rx,
+        cancel,
+        is_paused,
+        pause_notify,
+        tools_filter,
+        bus,
+        info,
+        semaphore,
+        completion_tx,
+    } = spawn;
+
+    let _permit = match semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            if completion_tx
+                .send(SubAgentCompletion {
+                    agent_id,
+                    nickname,
+                    status: SubAgentStatus::Errored {
+                        error: "Semaphore closed".to_string(),
+                    },
+                    final_response: None,
+                    files_written: Vec::new(),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!("sub-agent completion receiver dropped");
+            }
+            return;
+        }
+    };
+
+    let files_written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let result = run_sub_agent(
+        agent_id.clone(),
+        nickname.clone(),
+        config,
+        depth,
+        max_spawn_depth,
+        agents_config,
+        message,
+        context,
+        role,
+        role_kind,
+        fork_context,
+        input_rx,
+        cancel,
+        is_paused,
+        pause_notify,
+        tools_filter,
+        files_written.clone(),
+        bus,
+        info,
+    )
+    .await;
+
+    let files_written_vec = files_written.lock().map(|g| g.clone()).unwrap_or_default();
+
+    let (status, final_response) = match result {
+        Ok(response) => (
+            SubAgentStatus::Completed {
+                result: response.clone(),
+            },
+            Some(response),
+        ),
+        Err(e) => (
+            SubAgentStatus::Errored {
+                error: e.to_string(),
+            },
+            None,
+        ),
+    };
+
+    if let Ok(db) = crate::db::Database::open().await {
+        if let Err(e) = db.update_sub_agent_status(&agent_id, &status).await {
+            tracing::warn!(%agent_id, "failed to update sub-agent status: {e}");
+        }
+    }
+
+    if completion_tx
+        .send(SubAgentCompletion {
+            agent_id,
+            nickname,
+            status,
+            final_response,
+            files_written: files_written_vec,
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!("sub-agent completion receiver dropped");
+    }
 }
 
 /// Run a sub-agent task. Returns the final text response.
