@@ -49,6 +49,18 @@ define_settings! {
         "sandbox.enabled" => sandbox.enabled, parsed(bool);
 
         // ── Memory ──
+        // memory.provider handled in custom_apply (FromStr enum).
+        "memory.mem0.organization" => memory.mem0.organization, opt_string;
+        "memory.mem0.project" => memory.mem0.project, opt_string;
+        "memory.mem0.base_url" => memory.mem0.base_url, opt_string;
+        "memory.mem0.user_id" => memory.mem0.user_id, opt_string;
+        "memory.honcho.app_id" => memory.honcho.app_id, opt_string;
+        "memory.honcho.base_url" => memory.honcho.base_url, opt_string;
+        "memory.honcho.peer_id" => memory.honcho.peer_id, opt_string;
+        "memory.openviking.endpoint" => memory.openviking.endpoint, opt_string;
+        "memory.openviking.account" => memory.openviking.account, opt_string;
+        "memory.openviking.user" => memory.openviking.user, opt_string;
+        "memory.openviking.agent" => memory.openviking.agent, opt_string;
         "memory.max_context_tokens" => memory.max_context_tokens, nonzero(usize);
         "memory.flush_before_compaction" => memory.flush_before_compaction, parsed(bool);
         "memory.flush_min_messages" => memory.flush_min_messages, parsed(usize);
@@ -438,6 +450,54 @@ define_settings! {
             let kind: crate::config::VerifierKind = value.parse()?;
             s.security.verifier = kind;
             Ok(format!("{key} = {kind}"))
+        };
+
+        // memory.provider: FromStr enum (native | mem0 | honcho | openviking).
+        // Default `native`. Selecting an external provider with missing
+        // credentials falls back to native at resolve-time with a warn
+        // so the agent always boots; here we just persist the chosen
+        // string verbatim.
+        "memory.provider" => |s, key, value| {
+            let kind: crate::config::media::MemoryProviderKind = value.parse()?;
+            s.memory.provider = kind;
+            Ok(format!("{key} = {kind}"))
+        };
+
+        // memory.mem0.api_key / memory.honcho.api_key /
+        // memory.openviking.api_key: optional JSON SecretRef. Empty string
+        // clears to None. Same shape as `llm.api_key` above.
+        "memory.mem0.api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.memory.mem0.api_key = None;
+            } else {
+                s.memory.mem0.api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "memory.honcho.api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.memory.honcho.api_key = None;
+            } else {
+                s.memory.honcho.api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "memory.openviking.api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.memory.openviking.api_key = None;
+            } else {
+                s.memory.openviking.api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
         };
 
         // security.kek_backend: FromStr enum (auto | os_keychain | file).

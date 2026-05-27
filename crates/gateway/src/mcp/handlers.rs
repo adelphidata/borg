@@ -56,7 +56,15 @@ impl ReadOnlyToolHandler for MemorySearchHandler {
 }
 
 /// `read_memory` — fetch a long-term memory entry by name.
-pub struct ReadMemoryHandler;
+pub struct ReadMemoryHandler {
+    config: Config,
+}
+
+impl ReadMemoryHandler {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+}
 
 #[async_trait]
 impl ReadOnlyToolHandler for ReadMemoryHandler {
@@ -78,7 +86,7 @@ impl ReadOnlyToolHandler for ReadMemoryHandler {
     }
 
     async fn call(&self, arguments: serde_json::Value) -> Result<serde_json::Value, McpError> {
-        cortex::tool_handlers::handle_read_memory(&arguments)
+        cortex::tool_handlers::handle_read_memory(&arguments, &self.config)
             .await
             .map(serde_json::Value::String)
             .map_err(|e| McpError::internal(format!("read_memory failed: {e}")))
@@ -205,7 +213,7 @@ impl ReadOnlyToolHandler for ListHandler {
 pub fn build_read_only_tools(config: Config) -> Vec<Box<dyn ReadOnlyToolHandler>> {
     vec![
         Box::new(MemorySearchHandler::new(config.clone())),
-        Box::new(ReadMemoryHandler),
+        Box::new(ReadMemoryHandler::new(config.clone())),
         Box::new(WebFetchHandler::new(config.clone())),
         Box::new(WebSearchHandler::new(config.clone())),
         Box::new(ListHandler::new(config)),

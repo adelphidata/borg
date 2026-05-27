@@ -7,8 +7,11 @@ use crate::db::MemoryEntryRow;
 use crate::memory::tokenizer::estimate_tokens;
 use crate::security::sanitize::escape_xml_attr;
 
-mod injection;
+pub(crate) mod injection;
 pub use injection::{scan_for_injection, InjectionCategory};
+
+/// Pluggable memory backend trait + bundled native/mem0/honcho/openviking impls.
+pub mod provider;
 
 /// BM25 ranking over an FTS candidate set.
 pub mod bm25;

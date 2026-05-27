@@ -633,7 +633,9 @@ impl Agent {
                 )
                 .await
             }
-            crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args).await,
+            crate::tool::Tool::ReadMemory(args) => {
+                crate::tool::read_memory::handle(args, &self.config).await
+            }
             crate::tool::Tool::MemorySearch(args) => {
                 crate::tool::memory_search::handle(args, &self.config).await
             }
@@ -848,7 +850,7 @@ pub(super) async fn dispatch_parallel_safe_tool(
             Some(ctx) => crate::tool::read_file::handle_with_context(args, config, ctx),
             None => crate::tool::read_file::handle(args, config),
         },
-        crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args)
+        crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args, config)
             .await
             .map(ToolOutput::Text),
         crate::tool::Tool::MemorySearch(args) => crate::tool::memory_search::handle(args, config)

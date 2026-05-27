@@ -1,10 +1,12 @@
 use anyhow::Result;
 use tracing::instrument;
 
+use crate::config::media::MemoryProviderKind;
 use crate::config::Config;
 use crate::db::Database;
 use crate::memory::embeddings;
 use crate::memory::mmr;
+use crate::memory::provider::{self, format_hits, write_guarded, MemCtx, SearchQuery};
 use crate::memory::{
     read_memory_db_or_not_found, resolved_memory_scopes, search_knowledge_files, write_memory_db,
     WriteMode,
@@ -15,7 +17,7 @@ use super::{
     require_str_param,
 };
 
-pub async fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
+pub async fn handle_write_memory(args: &serde_json::Value, config: &Config) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let content = require_str_param(args, "content")?;
     let mode = if optional_bool_param(args, "append", false) {
@@ -26,14 +28,36 @@ pub async fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
     let scope = optional_str_param(args, "scope").unwrap_or("global");
     // Strip .md extension for DB entry names (backward compat with old tool calls)
     let name = filename.strip_suffix(".md").unwrap_or(filename);
-    write_memory_db(name, content, mode, scope).await
+
+    // Native keeps the legacy free-function path verbatim so behavior +
+    // error messages are byte-identical for the default install.
+    if matches!(config.memory.provider, MemoryProviderKind::Native) {
+        return write_memory_db(name, content, mode, scope).await;
+    }
+    let prov = provider::from_config(config);
+    let ctx = MemCtx::from_config(config);
+    write_guarded(prov.as_ref(), &ctx, scope, name, content, mode)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.user_message()))
 }
 
-pub async fn handle_read_memory(args: &serde_json::Value) -> Result<String> {
+pub async fn handle_read_memory(args: &serde_json::Value, config: &Config) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let name = filename.strip_suffix(".md").unwrap_or(filename);
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    read_memory_db_or_not_found(name, scope).await
+    if matches!(config.memory.provider, MemoryProviderKind::Native) {
+        return read_memory_db_or_not_found(name, scope).await;
+    }
+    let prov = provider::from_config(config);
+    let ctx = MemCtx::from_config(config);
+    match prov
+        .read(&ctx, scope, name)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.user_message()))?
+    {
+        Some(entry) => Ok(entry.content),
+        None => Ok(format!("Memory entry '{name}' not found.")),
+    }
 }
 
 /// Chunk metadata: (snippet, start_line, end_line).
@@ -165,6 +189,26 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     let query = require_str_param(args, "query")?;
     let max_results = optional_u64_param(args, "max_results", 5) as usize;
     let min_score = optional_f64_param(args, "min_score", 0.2) as f32;
+
+    // External providers route through the trait and short-circuit before
+    // the hybrid FTS/vector path below.
+    if !matches!(config.memory.provider, MemoryProviderKind::Native) {
+        let prov = provider::from_config(config);
+        let ctx = MemCtx::from_config(config);
+        let hits = prov
+            .search(
+                &ctx,
+                &SearchQuery {
+                    query: query.to_string(),
+                    max_results,
+                    min_score,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.user_message()))?;
+        return Ok(format_hits(&hits));
+    }
+
     let vector_weight = config.memory.embeddings.vector_weight;
     let bm25_weight = config.memory.embeddings.bm25_weight;
 
@@ -491,22 +535,25 @@ mod tests {
 
     #[test]
     fn handle_write_memory_missing_filename_errors() {
+        let cfg = Config::default();
         let args = serde_json::json!({"content": "hi"});
-        let err = handle_write_memory(&args).unwrap_err().to_string();
+        let err = handle_write_memory(&args, &cfg).unwrap_err().to_string();
         assert!(err.contains("filename"), "got: {err}");
     }
 
     #[test]
     fn handle_write_memory_missing_content_errors() {
+        let cfg = Config::default();
         let args = serde_json::json!({"filename": "x.md"});
-        let err = handle_write_memory(&args).unwrap_err().to_string();
+        let err = handle_write_memory(&args, &cfg).unwrap_err().to_string();
         assert!(err.contains("content"), "got: {err}");
     }
 
     #[test]
     fn handle_read_memory_missing_filename_errors() {
+        let cfg = Config::default();
         let args = serde_json::json!({});
-        let err = handle_read_memory(&args).unwrap_err().to_string();
+        let err = handle_read_memory(&args, &cfg).unwrap_err().to_string();
         assert!(err.contains("filename"), "got: {err}");
     }
 
@@ -516,35 +563,35 @@ mod tests {
     fn handle_write_and_read_roundtrip_global() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BORG_DATA_DIR", tmp.path());
+        let cfg = Config::default();
 
         let args = serde_json::json!({
             "filename": "note.md",
             "content": "alpha",
         });
-        let msg = handle_write_memory(&args).expect("write global");
-        // `.md` is stripped before storage (backward compat with old tool calls),
-        // so the confirmation message echoes the bare entry name.
+        let msg = handle_write_memory(&args, &cfg).expect("write global");
         assert!(msg.contains("note"), "got: {msg}");
 
-        let read =
-            handle_read_memory(&serde_json::json!({"filename": "note.md"})).expect("read global");
+        let read = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg)
+            .expect("read global");
         assert_eq!(read.trim(), "alpha");
 
         // Append mode accumulates.
-        handle_write_memory(&serde_json::json!({
-            "filename": "note.md",
-            "content": "beta",
-            "append": true,
-        }))
+        handle_write_memory(
+            &serde_json::json!({
+                "filename": "note.md",
+                "content": "beta",
+                "append": true,
+            }),
+            &cfg,
+        )
         .expect("append global");
-        let read2 = handle_read_memory(&serde_json::json!({"filename": "note.md"}))
+        let read2 = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg)
             .expect("read after append");
         assert!(read2.contains("alpha"));
         assert!(read2.contains("beta"));
 
-        // Reading a missing file returns a friendly "not found" message rather
-        // than an error.
-        let missing = handle_read_memory(&serde_json::json!({"filename": "missing.md"}))
+        let missing = handle_read_memory(&serde_json::json!({"filename": "missing.md"}), &cfg)
             .expect("read missing");
         assert!(missing.contains("not found"), "got: {missing}");
 

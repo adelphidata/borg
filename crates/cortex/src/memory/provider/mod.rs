@@ -1,0 +1,325 @@
+//! Pluggable memory provider abstraction.
+//!
+//! Borg's default `MemoryConfig::provider = Native` keeps the existing
+//! SQLite-backed two-tier memory (working + long-term `memory_entries`) as
+//! the source of truth. Operators who want fact extraction, dialectic
+//! retrieval, or a hierarchical context store can flip `memory.provider`
+//! to one of the bundled external providers ([`mem0`], [`honcho`],
+//! [`openviking`]) — the three model-visible tools (`write_memory`,
+//! `read_memory`, `memory_search`) and the per-turn `<active_memory>`
+//! injection then route through the chosen provider.
+//!
+//! Scope caveat: the stable-prefix `<long_term_memory>` block in the
+//! system prompt still loads from the local SQLite store regardless of
+//! provider. External-provider content reaches the model through
+//! `<active_memory>` (per-turn search) and on-demand via `read_memory` /
+//! `memory_search`. Routing the prefix block through the trait is
+//! tracked under "Memory provider — full prompt-block routing" in
+//! `docs/ROADMAP.md`.
+//!
+//! Invariants common to every backend (prompt-injection scan + 20k-token
+//! cap) live in [`write_guarded`] so each impl gets them for free. The
+//! trait surface stays minimal; the elegance comes from keeping shared
+//! safety once at the dispatch site.
+//!
+//! See `docs/memory.md` for the operator-facing surface.
+
+use anyhow::Result;
+use async_trait::async_trait;
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::constants::{MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
+use crate::memory::injection::scan_for_injection;
+use crate::memory::tokenizer::estimate_tokens;
+use crate::memory::WriteMode;
+
+pub mod honcho;
+pub mod mem0;
+pub mod native;
+pub mod openviking;
+pub mod registry;
+
+#[cfg(test)]
+mod tests;
+
+pub use native::NativeProvider;
+pub use registry::resolve;
+
+/// A single memory entry as returned by a provider. The shape is intentionally
+/// minimal — every backend can populate `scope`, `name`, and `content`;
+/// `updated_at_epoch` is optional because not every cloud store exposes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntry {
+    /// Logical scope (`"global"`, `"project:abc"`, …).
+    pub scope: String,
+    /// Hierarchical key inside the scope.
+    pub name: String,
+    /// Stored markdown content.
+    pub content: String,
+    /// Last-update unix epoch seconds, when the backend supplies it.
+    pub updated_at_epoch: Option<i64>,
+}
+
+/// A single search hit. Score is normalized to `[0.0, 1.0]` so the dispatch
+/// layer can merge hits across stores without per-provider rescaling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    /// Scope of the hit (`"global"`, `"project:abc"`, …).
+    pub scope: String,
+    /// Name of the matched entry.
+    pub name: String,
+    /// Snippet to render to the LLM.
+    pub snippet: String,
+    /// Normalized score in `[0.0, 1.0]`.
+    pub score: f32,
+}
+
+/// Parameters for a search call. Borg's existing `memory_search` tool
+/// supplies `max_results` and `min_score`; both are passed through so the
+/// provider can choose whether to honor them server-side.
+#[derive(Debug, Clone)]
+pub struct SearchQuery {
+    /// Free-form query text.
+    pub query: String,
+    /// Caller-requested cap on returned hits.
+    pub max_results: usize,
+    /// Minimum normalized score; provider implementations may ignore.
+    pub min_score: f32,
+}
+
+/// Errors a provider may surface. Kept narrow so the dispatch layer can map
+/// to user-facing messages without leaking transport details.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryError {
+    /// The chosen provider is missing required credentials. Surfaces as a
+    /// hard fail in `write_memory` so the operator sees the misconfiguration
+    /// immediately; the [`resolve`] factory pre-empts this for the prompt
+    /// path by falling back to Native.
+    #[error("memory provider '{provider}' is not configured: {detail}")]
+    NotConfigured {
+        /// Provider name (e.g. `"mem0"`).
+        provider: &'static str,
+        /// Operator-actionable hint.
+        detail: String,
+    },
+    /// Backend rejected the request — auth, quota, or schema. Detail is
+    /// already secret-redacted by the calling impl.
+    #[error("memory provider '{provider}' rejected request: {detail}")]
+    Backend {
+        /// Provider name.
+        provider: &'static str,
+        /// Already-redacted detail string.
+        detail: String,
+    },
+    /// Transport failure (timeout, DNS, TLS, etc.).
+    #[error("memory provider '{provider}' transport failure: {detail}")]
+    Transport {
+        /// Provider name.
+        provider: &'static str,
+        /// Already-redacted detail string.
+        detail: String,
+    },
+    /// Invariant violation surfaced from [`write_guarded`].
+    #[error("{0}")]
+    Invariant(String),
+}
+
+impl MemoryError {
+    /// Render to the same human-readable string the legacy free-function
+    /// path returned, so a provider swap doesn't change tool-output shape
+    /// for the LLM.
+    pub fn user_message(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// Outcome of a consolidation pass. External providers run their own
+/// consolidation server-side, so the trait surface is "did we do work here
+/// or delegate?" — useful to the daemon scheduler so it can skip the
+/// expensive seeded-agent path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationOutcome {
+    /// The provider performed local consolidation; the seeded agent loop
+    /// ran. Used by [`NativeProvider`].
+    Local,
+    /// The provider delegates consolidation to a remote service.
+    Delegated,
+}
+
+/// Storage-agnostic context passed on every call. Carries the resolved
+/// scope so the provider doesn't need to peek at `Config` itself, and
+/// the running `Config` so impls that respect `memory.embeddings.*` knobs
+/// (Native) can still reach them.
+#[derive(Debug)]
+pub struct MemCtx<'a> {
+    /// Active config (read-only).
+    pub config: &'a Config,
+    /// Primary scope for this call (`"global"` unless the caller overrides).
+    pub default_scope: &'a str,
+}
+
+impl<'a> MemCtx<'a> {
+    /// Construct a ctx for the configured `memory_scope` (or `"global"`).
+    pub fn from_config(config: &'a Config) -> Self {
+        let default_scope = config
+            .memory
+            .memory_scope
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("global");
+        Self {
+            config,
+            default_scope,
+        }
+    }
+}
+
+/// The trait every memory backend implements. Async-trait keeps the
+/// surface clean; impls hold their own clients in `Arc<…>` and own
+/// concurrency themselves.
+#[async_trait]
+pub trait MemoryProvider: Send + Sync {
+    /// Stable name surfaced in errors and `borg doctor`.
+    fn name(&self) -> &'static str;
+
+    /// Write or append a single memory entry. Callers should use
+    /// [`write_guarded`] rather than calling this directly so the
+    /// injection-scan + size cap fire uniformly.
+    async fn write(
+        &self,
+        ctx: &MemCtx<'_>,
+        scope: &str,
+        name: &str,
+        content: &str,
+        mode: WriteMode,
+    ) -> Result<(), MemoryError>;
+
+    /// Fetch a single entry by `scope` + `name`. Returns `Ok(None)` on miss.
+    async fn read(
+        &self,
+        ctx: &MemCtx<'_>,
+        scope: &str,
+        name: &str,
+    ) -> Result<Option<MemoryEntry>, MemoryError>;
+
+    /// Hybrid search across the active scopes for the chosen backend.
+    async fn search(
+        &self,
+        ctx: &MemCtx<'_>,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>, MemoryError>;
+
+    /// List all entries in `scope`. Used by `/memory` inspection surfaces.
+    async fn list(&self, ctx: &MemCtx<'_>, scope: &str) -> Result<Vec<MemoryEntry>, MemoryError>;
+
+    /// Delete an entry. `Ok(false)` for a no-op miss; `Ok(true)` on success.
+    async fn delete(&self, ctx: &MemCtx<'_>, scope: &str, name: &str) -> Result<bool, MemoryError>;
+
+    /// Run the long-term-memory consolidation pass for this backend.
+    /// External providers typically return [`ConsolidationOutcome::Delegated`]
+    /// because the service consolidates server-side.
+    async fn consolidate(&self, _ctx: &MemCtx<'_>) -> Result<ConsolidationOutcome, MemoryError> {
+        Ok(ConsolidationOutcome::Delegated)
+    }
+}
+
+/// Common-path guard wrapper for [`MemoryProvider::write`]. Every backend
+/// gets the same prompt-injection scan and 20k-token cap — defined once
+/// here so a new provider can't silently skip either invariant.
+///
+/// Mirrors the legacy `write_memory_db` behavior (`memory::write_memory_db`)
+/// so swapping providers doesn't change failure messages.
+pub async fn write_guarded(
+    provider: &dyn MemoryProvider,
+    ctx: &MemCtx<'_>,
+    scope: &str,
+    name: &str,
+    content: &str,
+    mode: WriteMode,
+) -> Result<String, MemoryError> {
+    scan_for_injection(content).map_err(|e| MemoryError::Invariant(e.to_string()))?;
+    let projected = match mode {
+        WriteMode::Overwrite => estimate_tokens(content),
+        WriteMode::Append => {
+            // Best-effort prefix size: external providers may not expose
+            // a pre-write read. We log + treat as 0 rather than `.ok()`
+            // silently — a transient HTTP failure here could otherwise
+            // admit a payload that blows past the 20k cap on the server.
+            // The operator gets a breadcrumb; the cap stays as a backstop.
+            let existing = match provider.read(ctx, scope, name).await {
+                Ok(Some(entry)) => estimate_tokens(&entry.content),
+                Ok(None) => 0,
+                Err(e) => {
+                    tracing::warn!(
+                        "write_guarded append: pre-read of {scope}/{name} failed: {e}; \
+                         token cap will only count new payload"
+                    );
+                    0
+                }
+            };
+            existing + estimate_tokens(content)
+        }
+    };
+    if projected >= MEMORY_ENTRY_REJECT_TOKENS {
+        return Err(MemoryError::Invariant(format!(
+            "memory entry '{name}' (scope {scope}) would be ~{projected} tokens, \
+             over the {MEMORY_ENTRY_REJECT_TOKENS}-token cap. Split into multiple topic \
+             entries — oversized entries get silently dropped from the context window."
+        )));
+    }
+    if projected >= MEMORY_ENTRY_WARN_TOKENS {
+        tracing::warn!(
+            "memory entry {scope}/{name} is ~{projected} tokens — approaching \
+             the {MEMORY_ENTRY_REJECT_TOKENS}-token cap; consider splitting"
+        );
+    }
+    provider.write(ctx, scope, name, content, mode).await?;
+    Ok(format!("Written to memory: {name} (scope: {scope})"))
+}
+
+/// Convenience: format a vec of [`SearchHit`] using the same shape the
+/// legacy `format_search_results` produces. Keeps tool-output stable
+/// regardless of provider.
+pub fn format_hits(hits: &[SearchHit]) -> String {
+    if hits.is_empty() {
+        return "No matching memories found.".to_string();
+    }
+    let mut output = String::new();
+    for (i, h) in hits.iter().enumerate() {
+        let label = if h.scope == "global" || h.scope.is_empty() {
+            h.name.clone()
+        } else {
+            format!("{}/{}", h.scope, h.name)
+        };
+        let snippet: String = h.snippet.chars().take(500).collect();
+        output.push_str(&format!(
+            "[{}] {} (score: {:.2})\n> {}\n\n",
+            i + 1,
+            label,
+            h.score,
+            snippet
+        ));
+    }
+    output.trim_end().to_string()
+}
+
+/// Shared `reqwest::Client` builder for the three external providers.
+/// Sets the user-agent + a 20s default timeout. Centralised so a future
+/// telemetry/cookie/policy change only needs editing once. Falls back to
+/// `Client::new()` on the (effectively impossible) builder failure path —
+/// `reqwest::Client::new()` itself uses the same defaults, so the worst
+/// case is "no custom user-agent" rather than a panic.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("borg/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Build an `Arc<dyn MemoryProvider>` from config. Wraps [`resolve`] so
+/// callers don't have to import the registry module.
+pub fn from_config(config: &Config) -> Arc<dyn MemoryProvider> {
+    resolve(config)
+}

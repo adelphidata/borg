@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::tool_handlers;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,8 +24,8 @@ impl ReadMemoryArgs {
     }
 }
 
-pub(crate) async fn handle(args: &ReadMemoryArgs) -> Result<String> {
-    tool_handlers::handle_read_memory(&args.to_value()).await
+pub(crate) async fn handle(args: &ReadMemoryArgs, config: &Config) -> Result<String> {
+    tool_handlers::handle_read_memory(&args.to_value(), config).await
 }
 
 #[cfg(test)]

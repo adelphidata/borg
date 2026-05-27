@@ -175,6 +175,8 @@ Two-tier: short-term (session, in-memory) + long-term (`memory_entries` table). 
 - Consolidation tasks: nightly 3 AM extracts to long-term; weekly 4 AM Sunday dedupes.
 - System prompt: `<long_term_memory trust="stored">` (stable prefix), `<working_memory>` (dynamic suffix). Token est. via `tiktoken-rs`.
 
+**Pluggable providers.** `memory.provider` (default `native`) selects the backend for `write_memory` / `read_memory` / `memory_search`. Bundled external impls: `mem0`, `honcho`, `openviking` — each a `MemoryProvider` trait impl in `crates/cortex/src/memory/provider/`. Every provider passes through the same `write_guarded` wrapper, so the prompt-injection scan + 20k-token cap fire uniformly regardless of backend. Missing external-provider credentials at startup fall back to `native` with a one-shot `tracing::warn!` — borg always boots. Consolidation passes short-circuit to "delegated" when a non-native provider is active. See `docs/memory.md`.
+
 ### Skills
 
 SKILL.md + YAML frontmatter teaching CLI tool usage via `run_shell`. Built-ins embedded via `include_str!` in `crates/cortex/skills/`. User skills at `~/.borg/skills/<name>/` override built-ins. Progressive loading: metadata always; full body within budget. Requirements (bins/env) checked at load. Credentials injected as env vars into `run_shell`.

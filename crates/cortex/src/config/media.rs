@@ -384,10 +384,130 @@ impl Default for ToolsConfig {
     }
 }
 
+/// Selectable memory backend. `Native` is the in-process SQLite store;
+/// external variants are bundled cloud providers wired through
+/// [`crate::memory::provider`]. Mirrors the `KekBackend` pattern so the
+/// `borg settings set memory.provider <name>` ergonomics match the rest
+/// of the codebase. Missing credentials at runtime fall back to `Native`
+/// with a one-shot `tracing::warn!` so the agent always boots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderKind {
+    /// Built-in two-tier (working + long-term `memory_entries`) store.
+    #[default]
+    Native,
+    /// Cloud agent-memory service with server-side fact extraction.
+    Mem0,
+    /// Cloud agent-memory service with peer/session model + dialectic Q&A.
+    Honcho,
+    /// Hierarchical context store with a `viking://` URI scheme.
+    Openviking,
+}
+
+impl FromStr for MemoryProviderKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" | "sqlite" | "default" => Ok(Self::Native),
+            "mem0" => Ok(Self::Mem0),
+            "honcho" => Ok(Self::Honcho),
+            "openviking" | "open_viking" | "open-viking" | "viking" => Ok(Self::Openviking),
+            other => anyhow::bail!(
+                "Unknown memory provider '{other}'. Valid: native, mem0, honcho, openviking"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for MemoryProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Native => "native",
+            Self::Mem0 => "mem0",
+            Self::Honcho => "honcho",
+            Self::Openviking => "openviking",
+        })
+    }
+}
+
+/// Mem0 provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mem0Settings {
+    /// API key (resolved through `${SECRET:NAME}` placeholders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// Optional organization id (for multi-tenant deployments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Optional project id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Override base URL — defaults to the public endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Default user id passed to the service. Falls back to the OS user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+/// Honcho provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HonchoSettings {
+    /// API key (resolved through `${SECRET:NAME}` placeholders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// App id (logical container in Honcho's data model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// Override base URL — defaults to the public endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Peer id (defaults to the OS user).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+}
+
+/// OpenViking provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenVikingSettings {
+    /// Endpoint URL. No public default; required when the provider is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// API key (resolved through `${SECRET:NAME}` placeholders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// Account namespace component.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// User namespace component.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Agent namespace component (defaults to `"borg"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
 /// Configuration for the memory system (loading, embeddings, scoping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
+    /// Backend powering `write_memory` / `read_memory` / `memory_search`
+    /// and the `<long_term_memory>` prompt block. Defaults to [`MemoryProviderKind::Native`].
+    #[serde(default)]
+    pub provider: MemoryProviderKind,
+    /// Mem0 provider settings (only consulted when `provider = mem0`).
+    #[serde(default)]
+    pub mem0: Mem0Settings,
+    /// Honcho provider settings (only consulted when `provider = honcho`).
+    #[serde(default)]
+    pub honcho: HonchoSettings,
+    /// OpenViking provider settings (only consulted when `provider = openviking`).
+    #[serde(default)]
+    pub openviking: OpenVikingSettings,
     /// Maximum tokens allocated for memory context in the system prompt.
     pub max_context_tokens: usize,
     /// Embedding and semantic search configuration.
@@ -451,6 +571,10 @@ impl Default for ActiveInjectionConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            provider: MemoryProviderKind::default(),
+            mem0: Mem0Settings::default(),
+            honcho: HonchoSettings::default(),
+            openviking: OpenVikingSettings::default(),
             max_context_tokens: 8000,
             embeddings: EmbeddingsConfig::default(),
             memory_scope: None,

@@ -123,7 +123,28 @@ pub fn is_consolidation_task_id(task_id: &str) -> bool {
 }
 
 /// Run both consolidation passes synchronously using the real agent loop.
+///
+/// When `memory.provider` is non-native, the external service handles
+/// consolidation server-side; we skip the seeded-agent loop and return a
+/// delegated report so the daemon scheduler doesn't burn LLM budget on a
+/// no-op.
 pub async fn run_dream(config: &crate::config::Config) -> Result<DreamReport> {
+    use crate::config::media::MemoryProviderKind;
+    if !matches!(config.memory.provider, MemoryProviderKind::Native) {
+        return Ok(DreamReport {
+            nightly_completed: true,
+            weekly_completed: true,
+            nightly_summary: format!(
+                "delegated to {} (server-side consolidation)",
+                config.memory.provider
+            ),
+            weekly_summary: format!(
+                "delegated to {} (server-side consolidation)",
+                config.memory.provider
+            ),
+            ..DreamReport::default()
+        });
+    }
     let db = crate::db::Database::open().await?;
     let nightly = run_pass(config, ConsolidationPass::Nightly).await?;
     let weekly = run_pass(config, ConsolidationPass::Weekly).await?;

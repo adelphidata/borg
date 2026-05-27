@@ -279,6 +279,55 @@ top-down by priority, not by section order.
   have to bridge via webhook plus their own MTA. Highest-reach channel
   gap in the current native set.
 
+### Memory provider — full prompt-block routing
+
+The v1 `MemoryProvider` trait ships routing for the three model-visible
+memory tools (`write_memory`, `read_memory`, `memory_search`) and the
+per-turn `<active_memory>` block, but the stable-prefix
+`<long_term_memory>` block still loads from local SQLite regardless of
+provider (`load_memory_context_db_scoped_with` in
+`crates/cortex/src/memory/mod.rs`). When `memory.provider = mem0|honcho|
+openviking`, external-provider content reaches the model via the
+per-turn search path; the prefix block is empty until a fresh
+consolidation populates the local store. Closing this means adding a
+`MemoryProvider::prompt_block(max_tokens) -> String` method (Native
+delegates to the existing scoped loader; externals format their own
+hits into `<memory_entry>` XML), caching the result per turn so the
+HTTP cost doesn't compound with system-prompt cache misses, and
+wiring `agent/prompt_assembly.rs::load_memory*` to dispatch through it.
+
+### Memory providers — additional integrations
+
+The pluggable `MemoryProvider` trait ships with three external backends
+(`mem0`, `honcho`, `openviking`) plus the default `native` SQLite store.
+The following candidates were considered for v1 and deferred — each is
+a single-file impl under `crates/cortex/src/memory/provider/` plus a
+`MemoryProviderKind` variant, modelled on the three that already ship.
+
+- **Hindsight.** Hybrid local + cloud knowledge graph with multi-strategy
+  retrieval (vector, BM25, graph traversal) and a `reflect` endpoint
+  that synthesizes across hits. Tools surface as `retain` / `recall` /
+  `reflect` rather than write/read/search; mapping onto Borg's existing
+  three model-visible tools needs an extra metadata field per write.
+- **Holographic / HRR-based stores.** Entity-resolution-first stores
+  (holographic reduced representations, fact graphs with trust scoring
+  + temporal decay). Adds an entity-resolution dependency and a more
+  expansive tool surface (`add` / `search` / `probe` / `related` /
+  `reason` / `contradict` / `update` / `remove` / `list`). Worth
+  revisiting if knowledge-graph memory becomes a measured win over the
+  hybrid vector+BM25 native path.
+- **Self-hosted vector DB adapters.** Direct adapters to Qdrant /
+  Weaviate / Pinecone / pgvector would let an operator point Borg at
+  an existing org-wide vector store rather than the bundled SQLite
+  embeddings. Lower-level than the current external providers — those
+  are agent-memory services that do their own embedding; this would
+  be embeddings-only with Borg's existing chunker + ranker reused.
+- **Letta (MemGPT) / Zep.** Two well-known agent-memory services not
+  surveyed in v1. Mem0 and Honcho cover overlapping ground; revisit if
+  operator demand surfaces specifics neither bundled provider covers
+  (e.g. Letta's hierarchical memory levels, Zep's enriched session
+  summaries).
+
 ### Context & memory
 
 - **Mid-turn context compression with "Active Task" framing.** `[H]`

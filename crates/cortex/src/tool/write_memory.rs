@@ -53,7 +53,7 @@ pub(crate) async fn handle(
     caches: &mut SystemPromptCache,
 ) -> Result<String> {
     let value = args.to_value();
-    let result = tool_handlers::handle_write_memory(&value).await;
+    let result = tool_handlers::handle_write_memory(&value, config).await;
 
     if result.is_ok() {
         let scope = args.scope.as_deref().unwrap_or("global");

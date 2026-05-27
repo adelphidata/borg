@@ -160,6 +160,101 @@ Reviews the day’s session output, extracts durable facts, and appends or creat
 
 Reviews long-term memory for duplicates, stale information, and merge opportunities, and prunes the embedding cache.
 
+## Pluggable memory providers
+
+Borg's long-term memory tier routes through a `MemoryProvider` trait. The
+three model-visible tools (`write_memory`, `read_memory`, `memory_search`)
+and the per-turn `<active_memory>` injection block use the chosen provider.
+The stable-prefix `<long_term_memory>` block in the system prompt currently
+still loads from local SQLite regardless of provider — see the "Memory
+provider — full prompt-block routing" entry in `docs/ROADMAP.md`. External
+provider content still reaches the model via `<active_memory>` (per-turn
+hybrid search) and on-demand via `read_memory` / `memory_search`.
+
+The default is `native` — the SQLite-backed store described above.
+Operators can swap in an external agent-memory service via:
+
+```sh
+borg settings set memory.provider mem0
+```
+
+Available providers:
+
+| Provider     | Storage                                     | When to pick it |
+|--------------|---------------------------------------------|-----------------|
+| `native`     | SQLite at `~/.borg/borg.db`                 | Default. Offline, deterministic, no third-party dependency. |
+| `mem0`       | Cloud service with server-side fact extraction | You want the model's writes distilled into facts automatically and shared across devices. |
+| `honcho`     | Cloud service with peer/session model + dialectic Q&A | You want a chat-history-aware memory layer that exposes a Q&A endpoint over your past turns. |
+| `openviking` | Self-hosted or cloud hierarchical context store | You want a `viking://account/user/agent/scope/name` URI scheme and operator-controlled deployment. |
+
+Switching providers does **not** migrate existing data. The native SQLite
+store remains intact while another provider is active; flipping back via
+`borg settings unset memory.provider` returns to it instantly.
+
+### Shared invariants
+
+Every provider — including external ones — sees the same:
+
+- **Prompt-injection scan** before each write (override phrases, exfil,
+  invisible Unicode). External providers cannot accept a tainted payload
+  even if the upstream service would.
+- **20,000-token write cap.** Oversized entries are rejected at the
+  dispatch layer, not silently dropped at prompt-loading time.
+- **No-approval-prompts UX.** Tool calls execute through the chosen
+  provider with the same blocking-on-error semantics as the native path.
+- **Plan-mode gating.** `write_memory` stays blocked in Plan mode
+  regardless of provider; `read_memory` and `memory_search` are allowed.
+
+These live in `crates/cortex/src/memory/provider/mod.rs::write_guarded`
+so a new provider impl cannot bypass them.
+
+### Configuration
+
+```sh
+# Pick the backend (any of: native, mem0, honcho, openviking)
+borg settings set memory.provider mem0
+
+# Mem0 — set the API key (resolved through the secret-ref shape used
+# elsewhere in the config; `${SECRET:NAME}` placeholders work)
+borg settings set memory.mem0.api_key '{"env":"MEM0_API_KEY"}'
+borg settings set memory.mem0.organization "acme"        # optional
+borg settings set memory.mem0.user_id "alice"            # optional, falls back to $USER
+
+# Honcho
+borg settings set memory.honcho.api_key '{"env":"HONCHO_API_KEY"}'
+borg settings set memory.honcho.app_id "borg"
+
+# OpenViking (self-hosted endpoint required)
+borg settings set memory.openviking.endpoint "https://openviking.internal"
+borg settings set memory.openviking.api_key '{"env":"OPENVIKING_KEY"}'
+borg settings set memory.openviking.account "acme"
+```
+
+If the chosen provider's credentials are missing at daemon startup, the
+registry falls back to `native` with a one-shot `tracing::warn!` in
+`daemon.log` — Borg always boots.
+
+### Consolidation
+
+The nightly / weekly consolidation passes are skipped when an external
+provider is active. Those services consolidate server-side; running the
+seeded-agent loop locally would burn LLM budget for no effect. The
+`/heal` and `borg poke` paths surface a "delegated to <provider>" line
+so operators can confirm the skip is intentional.
+
+### Adding more providers
+
+The trait is intentionally small (`write` / `read` / `search` / `list` /
+`delete` / `consolidate`). Adding a new backend means dropping a file
+under `crates/cortex/src/memory/provider/`, wiring a variant into
+`MemoryProviderKind`, and registering credential keys in
+`config/settings_table.rs`. Tests should follow the wiremock fixtures
+in `provider/tests.rs` — pin the request shape your impl sends, not
+canned response data.
+
+Candidates we considered but didn't ship in v1 are tracked in
+`docs/ROADMAP.md` under "Memory providers — additional integrations".
+
 ## IDENTITY.md
 
 `IDENTITY.md` is not part of the general memory stores. It is loaded at the front of the system prompt and defines the assistant’s persistent personality and behavior.
