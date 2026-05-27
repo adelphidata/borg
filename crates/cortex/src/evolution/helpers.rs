@@ -101,8 +101,14 @@ pub fn compute_mood(evo: &EvolutionState, vitals: &VitalsState, bond: &BondState
         return Mood::Strained;
     }
 
-    // No dominant archetype yet: drifting.
+    // No dominant archetype yet. "Drifting" implies prior motion that hasn't
+    // settled on a direction — only honest *after* real activity. At fresh
+    // install (no XP, no events recorded) the agent hasn't had a chance to
+    // form an identity, so report Stable instead.
     if evo.dominant_archetype.is_none() {
+        if evo.total_events == 0 && evo.total_xp == 0 {
+            return Mood::Stable;
+        }
         return Mood::Drifting;
     }
 
@@ -521,6 +527,55 @@ mod tests {
         let vitals = mk_vitals(80);
         let bond = mk_bond(50);
         assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Focused);
+    }
+
+    /// Fresh-install evolution state: no XP, no events, no archetype — what
+    /// the daemon hands the TUI immediately after onboarding.
+    fn mk_fresh_evo_state() -> EvolutionState {
+        EvolutionState {
+            stage: Stage::Base,
+            level: 0,
+            total_xp: 0,
+            xp_to_next_level: 0,
+            dominant_archetype: None,
+            evolution_name: None,
+            evolution_description: None,
+            archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
+            total_events: 0,
+            chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
+        }
+    }
+
+    #[test]
+    fn mood_stable_at_fresh_install_not_drifting() {
+        // Regression: just-onboarded users were shown "mood: drifting"
+        // because the absence of a dominant archetype was treated as
+        // ambiguous motion. At zero events / zero XP the agent hasn't
+        // moved at all — Stable is the honest read.
+        let evo = mk_fresh_evo_state();
+        let vitals = mk_vitals(40); // baseline()
+        let bond = mk_bond(0);
+        assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Stable);
+    }
+
+    #[test]
+    fn mood_drifting_after_activity_without_dominance() {
+        // Inverse guard: once real activity has been recorded but no
+        // archetype has emerged as dominant, "drifting" is the correct
+        // read — don't let the fresh-install fix swallow this case.
+        let mut evo = mk_fresh_evo_state();
+        evo.total_events = 5;
+        evo.total_xp = 10;
+        let vitals = mk_vitals(60); // above strain threshold
+        let bond = mk_bond(10);
+        assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Drifting);
     }
 
     #[test]
