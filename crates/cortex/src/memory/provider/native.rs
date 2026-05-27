@@ -18,7 +18,6 @@ use crate::memory::WriteMode;
 pub struct NativeProvider;
 
 impl NativeProvider {
-    /// Build a fresh instance.
     pub fn new() -> Self {
         Self
     }

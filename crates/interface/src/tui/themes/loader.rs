@@ -97,10 +97,6 @@ pub fn list_user_themes(dir: &Path) -> Vec<UserThemeMeta> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// TOML deserialization helpers.
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Default, Deserialize)]
 struct RawTheme {
     /// Accepted on input but intentionally ignored — see `into_theme`

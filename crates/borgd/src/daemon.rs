@@ -782,7 +782,6 @@ mod tests {
         // the unlink-first step.
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("borgd.sock");
-        // Drop a stale file at the path.
         std::fs::write(&socket, b"stale").expect("seed stale");
         let _listener = bind_uds(&socket).expect("bind despite stale file");
         // After bind, the path is a socket, not a regular file.

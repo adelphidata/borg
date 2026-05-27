@@ -111,7 +111,6 @@ pub fn replay_events_with_key(key: &[u8], events: &[BondEvent]) -> BondState {
             continue;
         }
 
-        // Apply delta
         score = (score + event.score_delta).clamp(0, 100);
     }
 

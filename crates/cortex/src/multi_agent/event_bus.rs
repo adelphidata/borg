@@ -96,7 +96,6 @@ pub struct AgentTreeBus {
 }
 
 impl AgentTreeBus {
-    /// Create a new bus.
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(BUS_CAPACITY);
         Self {

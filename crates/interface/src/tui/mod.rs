@@ -1936,19 +1936,6 @@ mod tests {
     /// paths that emit ANSI to the terminal will break native text selection.
     const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
 
-    // ------------------------------------------------------------------------
-    // Post-install message composition
-    //
-    // Regression guard tied to a real user complaint: the UI previously said
-    // "Gateway restarted." (noise — moved to tracing::info!) and
-    // "Approve senders with: /pairing approve <CODE>" (confusing — didn't
-    // explain the user must DM the bot first to generate the code).
-    // ------------------------------------------------------------------------
-
-    // ------------------------------------------------------------------------
-    // /update outcome formatting
-    // ------------------------------------------------------------------------
-
     #[test]
     fn format_check_outcome_already_up_to_date() {
         let msg = format_check_outcome("0.5.0", "0.5.0");
@@ -2171,16 +2158,9 @@ mod tests {
         ));
     }
 
-    // The EnableAlternateScroll/DisableAlternateScroll command escape tests
-    // moved to `tui_lifecycle.rs` along with the structs themselves. The
-    // source-level forbidden-mode guards below cover the same invariants
-    // for this module.
-
-    // ------------------------------------------------------------------------
-    // Source-level guards — read this file and app.rs via include_str! and
-    // assert no forbidden mode appears in CODE (comments are allowed to
-    // reference them; they must, to document why they're forbidden).
-    // ------------------------------------------------------------------------
+    // Source-level guards: read this file and app.rs via include_str! and
+    // assert no forbidden mode appears in CODE. Comments may reference the
+    // modes — they must, to document why each is forbidden.
 
     /// Strip line comments AND the `#[cfg(test)] mod tests { ... }` module
     /// from a Rust source string. This lets us search code-only (i.e.,
@@ -2345,9 +2325,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------------
-    // Inline-viewport guards — Track B refactor.
-    // ------------------------------------------------------------------------
+    // Inline-viewport guards: terminal owns scrollback, App must not track it.
 
     #[test]
     fn render_rs_does_not_import_scrollbar() {

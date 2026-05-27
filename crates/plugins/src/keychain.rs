@@ -322,16 +322,13 @@ mod tests {
         // Clean up first in case of prior failed run
         remove(service, account);
 
-        // Store
         store(service, account, value).expect("store should succeed on Windows");
 
-        // Check exists
         assert!(
             check(service, account),
             "credential should exist after store"
         );
 
-        // Clean up
         remove(service, account);
         assert!(
             !check(service, account),

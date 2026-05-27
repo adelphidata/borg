@@ -35,7 +35,6 @@ pub struct ChatQueue {
 }
 
 impl ChatQueue {
-    /// Create a new chat queue with the given message handler.
     pub fn new(handler: MessageHandler) -> Self {
         Self {
             senders: Arc::new(Mutex::new(HashMap::new())),

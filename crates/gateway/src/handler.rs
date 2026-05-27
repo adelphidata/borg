@@ -1188,7 +1188,6 @@ async fn process_message(
             warn!("Failed to enqueue delivery for channel '{channel_name}': {e}");
         }
 
-        // Send with retry
         match retry::send_with_retry(&executor, &outbound_str, &blocked_paths, &retry_policy).await
         {
             RetryOutcome::Success(_) => {

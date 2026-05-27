@@ -153,7 +153,8 @@ impl Pki for PkiSvc {
             g.insert_paired_device(&new_fp, &device_label, "{}", &principal.id, serial)
                 .await
                 .map_err(|e| Status::internal(format!("update paired device: {e}")))?;
-            // Mark the old cert renewed.
+            // Best-effort revoke of the old fingerprint; the new cert is already
+            // paired above, so a failure here doesn't compromise the renewal.
             let _ = g
                 .add_revoked_fingerprint(&principal.fingerprint, Some("renewed"))
                 .await;

@@ -262,22 +262,18 @@ fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
                 _ => None,
             }
         }
-        "message_start" | "message_delta" => {
-            // Check for usage data
-            event.usage.map(|usage| {
-                StreamEvent::Usage(crate::llm::UsageData {
-                    prompt_tokens: usage.input_tokens.unwrap_or(0),
-                    completion_tokens: usage.output_tokens.unwrap_or(0),
-                    total_tokens: usage.input_tokens.unwrap_or(0)
-                        + usage.output_tokens.unwrap_or(0),
-                    cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-                    cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                    provider: "claude-cli".to_string(),
-                    model: String::new(),
-                    provider_cost_usd: None,
-                })
+        "message_start" | "message_delta" => event.usage.map(|usage| {
+            StreamEvent::Usage(crate::llm::UsageData {
+                prompt_tokens: usage.input_tokens.unwrap_or(0),
+                completion_tokens: usage.output_tokens.unwrap_or(0),
+                total_tokens: usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0),
+                cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                provider: "claude-cli".to_string(),
+                model: String::new(),
+                provider_cost_usd: None,
             })
-        }
+        }),
         "result" => {
             if event.subtype.as_deref() == Some("error") {
                 Some(StreamEvent::Error(
@@ -472,7 +468,6 @@ pub async fn stream_claude_cli(
         }
     }
 
-    // Wait for process to finish
     let status = child.wait().await.map_err(|e| LlmError::Retryable {
         source: anyhow::anyhow!("claude CLI wait error: {e}"),
         retry_after: None,

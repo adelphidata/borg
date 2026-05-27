@@ -578,10 +578,8 @@ impl AgentControl {
         fork_context: Option<&[crate::types::Message]>,
         tools_blocklist: Option<&[&str]>,
     ) -> Result<(String, String)> {
-        // Validate limits
         self.validate_spawn_limits()?;
 
-        // Generate ID and nickname
         let agent_id = uuid::Uuid::new_v4().to_string();
         let chosen_nickname = match nickname {
             Some(n) => n.to_string(),
@@ -592,7 +590,6 @@ impl AgentControl {
             .map_or("default", |r| r.name.as_str())
             .to_string();
 
-        // Build config
         let child_config =
             self.build_sub_agent_config(role.as_ref(), model_override, parent_config);
 
@@ -600,7 +597,6 @@ impl AgentControl {
         let max_spawn_depth = self.max_spawn_depth;
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        // Prepare info and record in DB
         let info = self
             .prepare_sub_agent_info(
                 &agent_id,
@@ -793,7 +789,6 @@ impl AgentControl {
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
 
-        // Check if already completed
         if let Some(handle) = self.agents.get(agent_id) {
             match &handle.info.status {
                 SubAgentStatus::Completed { .. }
@@ -814,7 +809,8 @@ impl AgentControl {
             }
         }
 
-        // Check buffered completions first (from previous wait_for_agent calls)
+        // Drain any buffered completion left by a previous wait_for_agent call
+        // that received this agent's completion while waiting for another.
         if let Some(idx) = self
             .completion_buffer
             .iter()
@@ -823,7 +819,6 @@ impl AgentControl {
             return Ok(self.completion_buffer.remove(idx));
         }
 
-        // Poll completion channel until we get the one we want
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -879,7 +874,6 @@ impl AgentControl {
         handle.info.ended_at = Some(chrono::Utc::now().timestamp());
         let info_clone = handle.info.clone();
 
-        // Update DB
         match crate::db::Database::open().await {
             Ok(db) => {
                 if let Err(e) = db

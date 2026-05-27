@@ -63,8 +63,6 @@ pub struct HourlyRateLimiter {
 }
 
 impl HourlyRateLimiter {
-    /// Create a new rate limiter.
-    ///
     /// - `total_cap`: if set, max total events per hour across all types
     /// - `positive_cap`: if set, max positive-delta events per hour
     pub fn new(total_cap: Option<u32>, positive_cap: Option<u32>) -> Self {

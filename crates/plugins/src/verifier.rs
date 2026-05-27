@@ -22,7 +22,6 @@ pub struct VerifyResult {
 pub fn verify(def: &PluginDef, data_dir: &std::path::Path) -> VerifyResult {
     let id = def.id.to_string();
 
-    // Check binaries
     for bin in def.required_bins {
         if which::which(bin).is_err() {
             return VerifyResult {
@@ -33,7 +32,7 @@ pub fn verify(def: &PluginDef, data_dir: &std::path::Path) -> VerifyResult {
         }
     }
 
-    // Check that files exist (skip for native integrations — they have no template files)
+    // Native integrations have no template files — only credential checks apply.
     if !def.is_native && !crate::installer::is_installed(def, data_dir) {
         return VerifyResult {
             id,
@@ -42,7 +41,6 @@ pub fn verify(def: &PluginDef, data_dir: &std::path::Path) -> VerifyResult {
         };
     }
 
-    // Check credentials are available (via env or keychain)
     for cred in def.required_credentials {
         if cred.is_optional {
             continue;

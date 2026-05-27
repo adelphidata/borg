@@ -28,16 +28,14 @@ pub async fn install(
     )
     .await;
 
-    // 1. Check prerequisites
     check_prerequisites(def)?;
 
-    // 2. Write template files (skip for native integrations)
+    // Native integrations have no template files — credentials only.
     if !def.is_native {
         send_event(progress_tx, InstallEvent::WritingFiles { id: id.clone() }).await;
         write_templates(def, data_dir)?;
     }
 
-    // 3. Store credentials in keychain
     let service = def.service_name();
     for (key, value) in credentials {
         send_event(
@@ -61,13 +59,10 @@ pub async fn install(
         .await;
     }
 
-    // 4. Make shell scripts executable
     make_scripts_executable(def, data_dir)?;
 
-    // 5. Compute file hashes for integrity verification
     let file_hashes = compute_file_hashes(def, data_dir);
 
-    // 6. Build credential entries
     let credential_entries = credentials
         .iter()
         .map(|(key, _)| {
@@ -80,8 +75,8 @@ pub async fn install(
         })
         .collect();
 
-    // 7. Post-install hooks (plugin-specific — e.g., iMessage seeds the
-    //    Messages-DB cursor once Full Disk Access is confirmed).
+    // Post-install hooks (e.g., iMessage seeds the Messages-DB cursor
+    // once Full Disk Access is confirmed).
     let notes = match def.post_install {
         Some(hook) => hook(data_dir.to_path_buf()).await,
         None => Vec::new(),
@@ -98,7 +93,6 @@ pub async fn install(
 
 /// Uninstall a plugin: delete files and keychain entries.
 pub fn uninstall(def: &PluginDef, data_dir: &std::path::Path) -> Result<()> {
-    // Remove template files (skip for native integrations)
     if !def.is_native {
         let first_tmpl = def.templates.first().context("no templates")?;
         let dir_name = first_tmpl

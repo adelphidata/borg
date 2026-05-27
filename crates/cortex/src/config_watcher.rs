@@ -41,7 +41,7 @@ impl ConfigWatcher {
         })
     }
 
-    /// Get a clone of the watch receiver for sharing with agents/gateway.
+    /// Watch receiver shared with agents/gateway for live config updates.
     pub fn subscribe(&self) -> watch::Receiver<Config> {
         self.rx.clone()
     }
@@ -53,7 +53,7 @@ impl ConfigWatcher {
         let _ = self.notify_tx.try_send(config);
     }
 
-    /// Get a cloneable sender for notifying config changes from other components.
+    /// Cloneable sender that other components use to push config changes.
     pub fn notify_sender(&self) -> mpsc::Sender<Config> {
         self.notify_tx.clone()
     }

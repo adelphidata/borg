@@ -121,7 +121,6 @@ pub struct TypingHandle {
 }
 
 impl TypingHandle {
-    /// Create a new typing handle from a stop signal sender and task handle.
     pub fn new(
         stop_tx: tokio::sync::oneshot::Sender<()>,
         join: tokio::task::JoinHandle<()>,

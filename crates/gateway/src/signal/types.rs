@@ -231,7 +231,6 @@ pub struct JsonRpcRequest {
 }
 
 impl JsonRpcRequest {
-    /// Create a new JSON-RPC request with an auto-generated ID.
     pub fn new(method: &str, params: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),

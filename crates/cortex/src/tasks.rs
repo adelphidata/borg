@@ -408,7 +408,6 @@ pub fn parse_cron_line(line: &str) -> Result<(String, String)> {
     let cron_5 = parts[..5].join(" ");
     let command = parts[5].trim().to_string();
     let cron_7 = convert_5_to_7_field(&cron_5);
-    // Validate
     Schedule::from_str(&cron_7).with_context(|| format!("Invalid cron expression: {cron_5}"))?;
     Ok((cron_7, command))
 }

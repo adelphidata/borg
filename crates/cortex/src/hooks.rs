@@ -131,7 +131,6 @@ impl Default for HookRegistry {
 }
 
 impl HookRegistry {
-    /// Create an empty hook registry.
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }

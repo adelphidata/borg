@@ -33,7 +33,6 @@ pub struct TeamsStream<'a> {
 }
 
 impl<'a> TeamsStream<'a> {
-    /// Create a new streaming session for a Teams conversation.
     pub fn new(
         client: &'a TeamsClient,
         service_url: &str,

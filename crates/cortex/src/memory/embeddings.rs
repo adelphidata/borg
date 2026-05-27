@@ -340,7 +340,6 @@ pub async fn generate_embedding_cached(
 
     let cache_model = provider.cache_model_key();
 
-    // Check cache
     if let Some(ref db) = db {
         if let Ok(Some((cached_bytes, _dim))) = db
             .get_cached_embedding(&provider.endpoint, &cache_model, &hash)

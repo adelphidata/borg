@@ -17,7 +17,6 @@ pub fn verify_discord_signature(
     body: &str,
     public_key_hex: &str,
 ) -> Result<()> {
-    // Parse the public key from hex
     let key_bytes = hex::decode(public_key_hex)
         .map_err(|e| anyhow::anyhow!("Invalid Discord public key hex: {e}"))?;
     let key_array: [u8; 32] = key_bytes
@@ -39,7 +38,6 @@ pub fn verify_discord_signature(
         "X-Signature-Timestamp",
     )?;
 
-    // Parse the signature from hex
     let sig_bytes =
         hex::decode(signature_hex).map_err(|e| anyhow::anyhow!("Invalid signature hex: {e}"))?;
     let sig_array: [u8; 64] = sig_bytes

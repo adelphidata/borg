@@ -134,7 +134,6 @@ fn bond_get_last_hmac() {
     let hmac = db.get_last_bond_event_hmac().unwrap();
     assert_eq!(hmac, "0");
 
-    // Add an event
     let now = chrono::Utc::now().timestamp();
     let h1 =
         crate::bond::compute_event_hmac(b"borg-bond-chain-v1", "0", "tool_success", 1, "test", now);
@@ -142,7 +141,6 @@ fn bond_get_last_hmac() {
         .unwrap();
     assert_eq!(db.get_last_bond_event_hmac().unwrap(), h1);
 
-    // Add another
     let h2 = crate::bond::compute_event_hmac(
         b"borg-bond-chain-v1",
         &h1,
@@ -582,7 +580,6 @@ fn hmac_checkpoint_write_and_read() {
     let cp = db.load_latest_hmac_checkpoint("vitals").unwrap();
     assert!(cp.is_none());
 
-    // Save a checkpoint
     db.save_hmac_checkpoint("vitals", 42, "prev_abc", "state_hash_123")
         .unwrap();
     let cp = db.load_latest_hmac_checkpoint("vitals").unwrap().unwrap();

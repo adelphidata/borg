@@ -72,7 +72,6 @@ pub fn compress_image(
         return Ok((base64_data.to_string(), mime_type.to_string()));
     }
 
-    // Load image
     let img = image::ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
         .map_err(|e| anyhow::anyhow!("failed to guess image format: {e}"))?

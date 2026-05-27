@@ -73,7 +73,6 @@ pub struct ChannelHealthRegistry {
 }
 
 impl ChannelHealthRegistry {
-    /// Create an empty health registry.
     pub fn new() -> Self {
         Self::default()
     }

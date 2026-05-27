@@ -296,10 +296,8 @@ pub async fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Re
     let script_dir = scripts_dir.join(name);
     std::fs::create_dir_all(&script_dir)?;
 
-    // Apply patch
     match coding::apply_patch_to_dir(patch, &script_dir) {
         Ok(affected) => {
-            // Compute HMAC
             let key = get_or_create_hmac_key()?;
             let hmac = compute_directory_hmac(&key, &script_dir)?;
             let now = chrono::Utc::now().timestamp();
@@ -454,7 +452,6 @@ pub async fn delete_script(db: &Database, name: &str) -> Result<String> {
     // Remove DB entry first (safer: orphaned files are benign, orphaned DB rows are not)
     db.delete_script(&script.id).await?;
 
-    // Remove files
     let scripts_dir = Config::scripts_dir()?;
     let script_dir = scripts_dir.join(name);
     if script_dir.exists() {

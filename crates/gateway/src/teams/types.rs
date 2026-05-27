@@ -159,7 +159,6 @@ pub struct ReplyActivity {
 }
 
 impl ReplyActivity {
-    /// Create a new message reply activity.
     pub fn message(text: impl Into<String>) -> Self {
         Self {
             activity_type: "message".to_string(),

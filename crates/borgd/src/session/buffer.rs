@@ -30,7 +30,7 @@ pub struct SequencedBuffer {
 }
 
 impl SequencedBuffer {
-    /// Build a fresh buffer with sequence 0 and no events.
+    /// New buffer with empty ring and a fresh broadcast channel.
     pub fn new() -> Self {
         let (bcast, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {

@@ -421,6 +421,7 @@ fn run_windows_sandbox_trampoline(argv_after_subcommand: &[String]) -> u32 {
 }
 
 async fn async_main() -> Result<()> {
+    // Missing .env is the common case — silent best-effort load.
     let _ = dotenvy::dotenv();
     // Also load .env from the data directory (~/.borg/.env)
     if let Ok(data_dir) = cortex::config::Config::data_dir() {
@@ -785,6 +786,7 @@ fn harden_data_dir(data_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     if data_dir.exists() {
         let perms = std::fs::Permissions::from_mode(0o700);
+        // Best-effort: chmod failure (e.g. read-only FS) is not fatal to startup.
         let _ = std::fs::set_permissions(data_dir, perms);
     }
 }

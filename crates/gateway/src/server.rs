@@ -145,14 +145,13 @@ impl GatewayServer {
 
         let registry = ChannelRegistry::new()?;
 
-        // Initialize health registry
         let mut health_reg = ChannelHealthRegistry::new();
         for channel in registry.all_channels() {
             health_reg.register(&channel.manifest.name);
         }
         let health = Arc::new(RwLock::new(health_reg));
 
-        // Initialize rate limiter (0 = disabled)
+        // 0 disables the limiter entirely (operator opt-out, not a default).
         let rate_limiter = if gateway_config.rate_limit_per_minute > 0 {
             Some(Arc::new(Mutex::new(SlidingWindowLimiter::new(
                 gateway_config.rate_limit_per_minute,
@@ -162,7 +161,6 @@ impl GatewayServer {
             None
         };
 
-        // Initialize channel clients
         let (telegram_client, telegram_bot_username, telegram_secret) =
             crate::channel::channel_init::init_telegram(&self.config).await;
         let telegram_dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
@@ -204,7 +202,6 @@ impl GatewayServer {
         let tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>> =
             crate::voice::configured_tts_synthesizer(&self.config).map(Arc::new);
 
-        // Build native channel registry for unified webhook dispatch
         let native_channels = {
             let mut reg = NativeChannelRegistry::new();
             if let Some(ref client) = telegram_client {
@@ -370,7 +367,6 @@ impl GatewayServer {
             }
         }
 
-        // Spawn delivery drain loop
         let drain_shutdown = self.shutdown.clone();
         let drain_state = state.clone();
         let drain_health = health.clone();
@@ -532,7 +528,6 @@ impl GatewayServer {
             }
         }
 
-        // Spawn Signal SSE inbound loop
         if let Some(ref sig_client) = signal_client {
             info!("Starting Signal SSE inbound loop");
             let sse_client = sig_client.clone();
@@ -546,7 +541,8 @@ impl GatewayServer {
                     let health = sse_health.clone();
                     let client = sse_client.clone();
                     Box::pin(async move {
-                        // Send typing indicator
+                        // Best-effort typing indicator; failure is a UX hint only,
+                        // never blocks the agent response below.
                         let _ = client
                             .send_typing(Some(&recipient), group_id.as_deref())
                             .await;
@@ -576,7 +572,6 @@ impl GatewayServer {
                                 if let Err(e) = send_result {
                                     warn!("Failed to send Signal response: {e}");
                                 }
-                                // Send read receipt for the original message
                                 if let Some(ref mid) = inbound.message_id {
                                     if let Ok(ts) = mid.parse::<i64>() {
                                         if let Err(e) =
@@ -616,7 +611,6 @@ impl GatewayServer {
             });
         }
 
-        // Spawn poll loops for poll-mode channels
         let mut poll_handles = Vec::new();
         for channel in state.registry.all_channels() {
             if channel.manifest.settings.mode != ChannelMode::Poll {
@@ -907,7 +901,6 @@ async fn readyz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     let mut checks = serde_json::Map::new();
     let mut ready = true;
 
-    // Check database connectivity
     match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
         Ok(_) => {
             checks.insert("database".into(), serde_json::json!("ok"));
@@ -921,11 +914,9 @@ async fn readyz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         }
     }
 
-    // Check that at least one channel is registered (script-based + native)
     let channel_count = state.registry.list_channels().len() + state.native_channels.list().len();
     checks.insert("channels".into(), serde_json::json!(channel_count));
 
-    // Check LLM provider is configured
     let provider_ok = state.config.llm.provider.is_some()
         || !state.config.llm.api_key_env.is_empty()
         || std::env::var("OPENROUTER_API_KEY").is_ok()

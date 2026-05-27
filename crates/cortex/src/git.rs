@@ -129,7 +129,6 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
 /// 5. `git commit-tree <tree> -p HEAD -m "borg ghost snapshot"` (create commit)
 #[instrument(skip_all)]
 pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
-    // Check if repo has any commits
     let has_head = run_git(&["rev-parse", "HEAD"], repo_root).await.is_ok();
 
     let tmp_index = tempfile::NamedTempFile::new().context("create temp index")?;

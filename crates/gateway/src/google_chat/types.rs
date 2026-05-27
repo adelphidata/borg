@@ -155,7 +155,6 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
-    /// Create a new text response.
     pub fn new(text: impl Into<String>) -> Self {
         Self { text: text.into() }
     }

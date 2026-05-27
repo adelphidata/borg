@@ -57,7 +57,7 @@ pub struct ScriptedBackend {
 }
 
 impl ScriptedBackend {
-    /// Build a new backend with the given `session_id` and per-turn closure.
+    /// New backend; `script` runs once per turn to produce the event stream.
     pub fn new<F>(id: impl Into<String>, script: F) -> Arc<Self>
     where
         F: Send

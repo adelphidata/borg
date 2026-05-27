@@ -28,7 +28,6 @@ pub struct ChallengeThrottle {
 }
 
 impl ChallengeThrottle {
-    /// Create a new throttle with the given cooldown duration.
     pub fn new(cooldown: Duration) -> Self {
         Self {
             entries: HashMap::new(),

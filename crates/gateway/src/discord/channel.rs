@@ -39,7 +39,6 @@ pub struct DiscordChannel {
 }
 
 impl DiscordChannel {
-    /// Create a new Discord native channel.
     pub fn new(
         client: Arc<DiscordClient>,
         public_key: Option<String>,

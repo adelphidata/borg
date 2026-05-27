@@ -85,7 +85,6 @@ fn is_path_blocked(path: &str, blocked_paths: &[String]) -> bool {
         .collect();
 
     for blocked in blocked_paths {
-        // Check if any path component matches or starts with the blocked pattern
         for component in &components {
             if *component == blocked.as_str() || component.starts_with(&format!("{blocked}/")) {
                 return true;

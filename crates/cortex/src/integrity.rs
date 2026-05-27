@@ -112,7 +112,6 @@ mod tests {
             .await
             .expect("insert cust");
 
-        // Create files
         let tools_dir = data_dir.join("tools").join("pkg");
         std::fs::create_dir_all(&tools_dir).expect("create dirs");
         std::fs::write(tools_dir.join("tool.toml"), "name = \"test\"").expect("write");
