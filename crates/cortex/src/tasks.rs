@@ -472,17 +472,22 @@ mod tests {
 
     #[test]
     fn calculate_next_run_cron() {
-        let next = calculate_next_run("cron", "0 0 9 * * * *", "local").unwrap();
-        assert!(next.is_some());
-        assert!(next.unwrap() > Utc::now().timestamp());
+        // Daily 9 AM cron — next fire is within the next 24h.
+        let now = Utc::now().timestamp();
+        let next = calculate_next_run("cron", "0 0 9 * * * *", "local")
+            .unwrap()
+            .expect("valid cron resolves");
+        assert!(next > now && next <= now + 86_400 + 60);
     }
 
     #[test]
     fn calculate_next_run_interval() {
-        let next = calculate_next_run("interval", "1h", "local").unwrap();
-        assert!(next.is_some());
-        let expected_min = Utc::now().timestamp() + 3500; // ~1h minus tolerance
-        assert!(next.unwrap() > expected_min);
+        // 1h interval lands within ±1 minute of now + 3600s.
+        let now = Utc::now().timestamp();
+        let next = calculate_next_run("interval", "1h", "local")
+            .unwrap()
+            .expect("valid interval resolves");
+        assert!((next - (now + 3600)).abs() <= 60);
     }
 
     #[test]

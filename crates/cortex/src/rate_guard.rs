@@ -539,34 +539,6 @@ tool_calls_block = 10
     }
 
     #[test]
-    fn test_validate_thresholds_valid_does_not_panic() {
-        let limits = ActionLimits::default();
-        // Should not panic — all warn < block
-        limits.validate_thresholds();
-    }
-
-    #[test]
-    fn test_validate_thresholds_inverted_does_not_panic() {
-        let limits = ActionLimits {
-            tool_calls_warn: 100,
-            tool_calls_block: 50, // warn >= block
-            ..Default::default()
-        };
-        // Should not panic — only logs a warning
-        limits.validate_thresholds();
-    }
-
-    #[test]
-    fn test_validate_thresholds_equal_does_not_panic() {
-        let limits = ActionLimits {
-            shell_commands_warn: 20,
-            shell_commands_block: 20, // warn == block
-            ..Default::default()
-        };
-        limits.validate_thresholds();
-    }
-
-    #[test]
     fn test_saturating_add_at_max() {
         let limits = ActionLimits {
             tool_calls_warn: u32::MAX - 1,

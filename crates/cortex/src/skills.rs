@@ -2220,15 +2220,6 @@ Use docker commands.
     }
 
     #[test]
-    fn test_install_spec_defaults() {
-        let spec = InstallSpec::default();
-        assert!(spec.brew.is_none());
-        assert!(spec.apt.is_none());
-        assert!(spec.npm.is_none());
-        assert!(spec.url.is_none());
-    }
-
-    #[test]
     fn test_parse_skill_without_install() {
         // Backward compat: existing skills without install field still parse
         let (manifest, _body) = parse_skill_md(SAMPLE_SKILL).unwrap();

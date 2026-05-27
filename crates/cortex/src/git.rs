@@ -295,20 +295,13 @@ mod tests {
 
     #[test]
     fn find_repo_root_from_subdir() {
+        // Walking up from a nested src/ should resolve to the same repo root
+        // as walking up from cwd — the function climbs until it finds .git.
         let cwd = std::env::current_dir().unwrap();
-        let sub = cwd.join("crates").join("core").join("src");
-        if sub.exists() {
-            let root = find_repo_root(&sub);
-            assert!(root.is_some());
-        }
-    }
-
-    #[test]
-    fn find_repo_root_none_at_filesystem_root() {
-        let root = find_repo_root(Path::new("/"));
-        // /tmp usually isn't in a git repo
-        // This might actually find one on some systems, so just don't panic
-        let _ = root;
+        let root_from_cwd = find_repo_root(&cwd).expect("cwd is inside the repo");
+        let sub = cwd.join("crates").join("cortex").join("src");
+        let root_from_sub = find_repo_root(&sub).expect("subdir resolves to same root");
+        assert_eq!(root_from_cwd, root_from_sub);
     }
 
     #[test]

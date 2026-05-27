@@ -716,9 +716,8 @@ mod tests {
 
     #[test]
     fn extract_retry_hint_with_seconds() {
-        let hint = extract_retry_hint("Rate limit: retry after 30 seconds");
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("30"));
+        let hint = extract_retry_hint("Rate limit: retry after 30 seconds").expect("hint parsed");
+        assert!(hint.contains("30"));
     }
 
     #[test]

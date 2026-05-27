@@ -306,6 +306,8 @@ mod tests {
 
     #[test]
     fn deepseek_via_openrouter_resolves() {
-        assert!(estimate_cost("deepseek/deepseek-r1", 1000, 1000).is_some());
+        // 1000 * 0.55/1M + 1000 * 2.19/1M = 0.00055 + 0.00219 = 0.00274
+        let c = estimate_cost("deepseek/deepseek-r1", 1000, 1000).expect("known model");
+        assert!((c - 0.00274).abs() < 1e-9);
     }
 }
