@@ -47,6 +47,86 @@ pub(super) static SETUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     parse_template("\n<first_conversation>\n{{ setup }}\n</first_conversation>\n")
 });
 
+/// Result of one pass of the SETUP.md lifecycle.
+pub(super) struct SetupInjection {
+    /// Raw SETUP.md content to render through `SETUP_TEMPLATE`.
+    pub content: String,
+    /// True exactly once per SETUP.md instance — on the turn the marker
+    /// file was just created. Drives the one-shot tool-stripping in
+    /// `prompt_assembly`.
+    pub first_turn: bool,
+}
+
+/// Drive the SETUP.md lifecycle for one turn of `build_system_prompt`.
+///
+/// Behavior:
+/// - If SETUP.md is absent, return `None` (nothing to inject — onboarding
+///   was retired previously, or never happened).
+/// - If `onboarding_complete` is true, retire SETUP.md and its marker
+///   from disk and return `None`. The agent has shaped its identity, so
+///   first-conversation rules no longer apply.
+/// - Otherwise read SETUP.md and return its content. Atomically create
+///   the marker; `first_turn` is true only on the call that created it.
+///
+/// This decouples the two responsibilities the previous "rename → read
+/// → delete" pattern bundled: tool suppression (one-shot) and rule
+/// persistence (multi-turn). The marker — not SETUP.md's existence — is
+/// now the "we've already done turn-1 suppression" signal.
+pub(super) async fn consume_setup_template(
+    data_dir: &std::path::Path,
+    onboarding_complete: bool,
+) -> Option<SetupInjection> {
+    let setup_path = data_dir.join(crate::constants::SETUP_FILE);
+    let marker_path = data_dir.join(crate::constants::SETUP_FIRST_TURN_MARKER_FILE);
+
+    if !tokio::fs::try_exists(&setup_path).await.unwrap_or(false) {
+        return None;
+    }
+
+    if onboarding_complete {
+        if let Err(e) = tokio::fs::remove_file(&setup_path).await {
+            tracing::warn!("Failed to retire SETUP.md: {e}");
+        }
+        // Best-effort marker cleanup; ENOENT is fine.
+        if let Err(e) = tokio::fs::remove_file(&marker_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Failed to remove SETUP first-turn marker: {e}");
+            }
+        }
+        return None;
+    }
+
+    let content = match tokio::fs::read_to_string(&setup_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read SETUP.md: {e}");
+            return None;
+        }
+    };
+
+    // Atomic `create_new` is the synchronization primitive: exactly one
+    // call across concurrent sessions succeeds, the rest see
+    // `AlreadyExists` and treat the turn as non-first.
+    let first_turn = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            tracing::warn!("Failed to create SETUP first-turn marker: {e}");
+            false
+        }
+    };
+
+    Some(SetupInjection {
+        content,
+        first_turn,
+    })
+}
+
 const COLLAB_MODE_EXECUTE: &str = include_str!("../../templates/collaboration_mode/execute.md");
 const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
 
@@ -196,26 +276,39 @@ impl Agent {
         system.push_str(&self.build_environment_section().await);
         system.push_str(&self.build_scheduled_tasks_section().await);
 
-        // Inject first-conversation instructions from SETUP.md (created during onboarding)
+        // Inject first-conversation instructions from SETUP.md (created
+        // during onboarding). The template stays on disk for the entire
+        // first conversation and is retired only when the agent has
+        // shaped its identity in long-term memory — otherwise the
+        // request_user_input / choice-list rules would evaporate between
+        // turn 1 and turn 2 and the model would default to prose menus.
         if let Ok(data_dir) = crate::config::Config::data_dir() {
-            let setup_path = data_dir.join("SETUP.md");
-            // Atomically rename to prevent duplicate injection from concurrent sessions
-            let consumed = setup_path.with_extension("md.consumed");
-            if tokio::fs::rename(&setup_path, &consumed).await.is_ok() {
-                if let Ok(setup) = tokio::fs::read_to_string(&consumed).await {
+            // Cheap stat first — the DB lookup for the onboarding-complete
+            // signal only matters while SETUP.md still lives. Post-retirement
+            // every install pays one stat per turn instead of opening libsql.
+            let setup_path = data_dir.join(crate::constants::SETUP_FILE);
+            if tokio::fs::try_exists(&setup_path).await.unwrap_or(false) {
+                let onboarding_complete = crate::memory::identity_in_long_term_memory().await;
+                if let Some(outcome) =
+                    consume_setup_template(&data_dir, onboarding_complete).await
+                {
                     system.push_str(
                         &SETUP_TEMPLATE
-                            .render([("setup", setup.as_str())])
+                            .render([("setup", outcome.content.as_str())])
                             .context("setup template render failed")?,
                     );
-                    // Signal to the agent turn: on this turn we must not offer
-                    // tools to the model. SETUP.md forbids first-message tool
-                    // calls in prose, but that is not sufficient for weak
-                    // instruction-following models (e.g. Grok-4.20 emits a
-                    // malformed `write_memory` call anyway).
-                    self.setup_just_consumed = true;
+                    if outcome.first_turn {
+                        // Signal to the agent turn: on this turn we must
+                        // not offer tools to the model. SETUP.md forbids
+                        // first-message tool calls in prose, but that is
+                        // not sufficient for weak instruction-following
+                        // models (e.g. Grok-4.20 emits a malformed
+                        // `write_memory` call anyway). Subsequent turns
+                        // keep SETUP.md in context but unblock tools so
+                        // the model can call `request_user_input`.
+                        self.setup_just_consumed = true;
+                    }
                 }
-                let _ = tokio::fs::remove_file(&consumed).await;
             }
         }
 

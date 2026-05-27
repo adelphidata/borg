@@ -513,14 +513,27 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         }
         Err(e) => tracing::warn!(error = %e, "session-start vitals fetch failed"),
     }
-    // Auto-trigger first conversation if SETUP.md exists (fresh onboarding),
-    // otherwise fire a throttled proactive greeting that reuses the heartbeat
-    // pipeline. Throttle is shared with the scheduled heartbeat via the
-    // persisted `heartbeat.last_fired_at` setting so we don't double-nudge.
-    let setup_exists = Config::data_dir()
-        .map(|d| d.join("SETUP.md").exists())
+    // Auto-trigger first conversation only on the very first turn after
+    // onboarding. SETUP.md now survives the entire first conversation
+    // (it's retired only when the agent shapes its IDENTITY in long-term
+    // memory), so SETUP.md's existence alone would re-fire this greeting
+    // on every TUI restart mid-onboarding. The
+    // `SETUP_FIRST_TURN_MARKER_FILE` is created atomically by
+    // `consume_setup_template` on the first injection — its *absence*
+    // alongside a still-present SETUP.md is the real "fresh boot, turn 1
+    // hasn't run yet" signal. Otherwise fire a throttled proactive
+    // greeting that reuses the heartbeat pipeline. Throttle is shared
+    // with the scheduled heartbeat via the persisted
+    // `heartbeat.last_fired_at` setting so we don't double-nudge.
+    let first_boot_pending = Config::data_dir()
+        .map(|d| {
+            d.join(cortex::constants::SETUP_FILE).exists()
+                && !d
+                    .join(cortex::constants::SETUP_FIRST_TURN_MARKER_FILE)
+                    .exists()
+        })
         .unwrap_or(false);
-    if setup_exists {
+    if first_boot_pending {
         app.queued_messages.push_back(app::QueuedMessage {
             text: "Hello! I just finished onboarding.".to_string(),
             images: Vec::new(),

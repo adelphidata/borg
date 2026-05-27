@@ -258,11 +258,16 @@ pub struct Agent {
     /// re-summarizing from scratch. Populated either by the current
     /// session's compactions or by scanning loaded history on resume.
     pub(super) previous_summary: Option<String>,
-    /// True for exactly one turn: set when `SETUP.md` was just consumed during
-    /// system-prompt assembly. The turn that consumed it must not offer tools
-    /// to the model (SETUP.md forbids first-message tool calls but weak models
-    /// ignore the prompt instruction). Reset after the prompt is built and the
-    /// tool list is selected.
+    /// True for exactly one turn: set on the call that first injected
+    /// `SETUP.md` and atomically created the `SETUP.md.first_turn_done`
+    /// marker. The turn that consumed it must not offer tools to the
+    /// model (SETUP.md forbids first-message tool calls but weak models
+    /// ignore the prompt instruction). Reset after the prompt is built
+    /// and the tool list is selected. Subsequent turns of the same
+    /// first-conversation keep SETUP.md injected (marker already
+    /// exists → flag stays false → tools are available so the agent can
+    /// call `request_user_input`); SETUP.md is retired only once an
+    /// `IDENTITY` entry exists in long-term memory.
     pub(super) setup_just_consumed: bool,
     /// Tracks runs of identical consecutive tool calls within a turn —
     /// drives the exponential-backoff-then-block ladder. Reset at the

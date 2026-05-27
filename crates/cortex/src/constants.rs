@@ -342,6 +342,19 @@ pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 /// Heartbeat checklist filename under the data directory.
 pub const HEARTBEAT_FILE: &str = "HEARTBEAT.md";
 
+/// First-conversation instructions filename under the data directory.
+/// Written by onboarding, consumed by `agent::build_system_prompt`, and
+/// retired once the agent has shaped its identity in long-term memory.
+pub const SETUP_FILE: &str = "SETUP.md";
+
+/// Sibling marker created atomically by `consume_setup_template` on the
+/// very first injection of `SETUP_FILE`. Its presence signals "turn-1
+/// tool stripping already fired" so subsequent turns keep SETUP injected
+/// but allow tools. Also gates the TUI's one-shot "I just finished
+/// onboarding" auto-greeting so it doesn't refire on every restart
+/// during the first conversation.
+pub const SETUP_FIRST_TURN_MARKER_FILE: &str = "SETUP.md.first_turn_done";
+
 // ── Agent reply tokens ────────────────────────────────────────────
 
 /// Token the agent emits when it has nothing to say (heartbeat acks, silent replies).

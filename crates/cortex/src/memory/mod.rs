@@ -198,6 +198,38 @@ pub async fn list_memory_entries(scope: &str) -> Result<Vec<crate::db::MemoryEnt
     db.list_memory_entries(scope).await
 }
 
+/// True when the agent has written a non-empty `IDENTITY` entry into
+/// long-term memory (global scope). This is the signal that onboarding's
+/// first conversation has produced a real identity and the SETUP.md
+/// first-conversation rules can be retired.
+///
+/// The `.md` suffix is stripped by the `write_memory` tool handler
+/// (`tool_handlers/memory.rs`), so the row name is `"IDENTITY"`. Errors
+/// opening the DB return `false` rather than propagating — a failed
+/// lookup must not block the prompt build.
+pub async fn identity_in_long_term_memory() -> bool {
+    match crate::db::Database::open().await {
+        Ok(db) => identity_in_long_term_memory_with_db(&db).await,
+        Err(e) => {
+            tracing::warn!("identity_in_long_term_memory: DB open failed: {e}");
+            false
+        }
+    }
+}
+
+/// DB-passing form of [`identity_in_long_term_memory`] for tests that use
+/// an in-memory `Database::test_db()`.
+pub async fn identity_in_long_term_memory_with_db(db: &crate::db::Database) -> bool {
+    match db.get_memory_entry("global", "IDENTITY").await {
+        Ok(Some(row)) => !row.content.trim().is_empty(),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("identity_in_long_term_memory: query failed: {e}");
+            false
+        }
+    }
+}
+
 /// Look up `entry`'s estimated token count in `cache`. Returns the cached
 /// value if present, otherwise computes via BPE. Persisting newly-computed
 /// values is the responsibility of [`prime_token_cache`] (async pre-pass).

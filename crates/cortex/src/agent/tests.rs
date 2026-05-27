@@ -528,58 +528,201 @@ async fn dispatch_parallel_safe_tool_invalid_json_returns_text() {
 // -- SETUP template tests --
 //
 // The two `setup_template_*` template-rendering tests live alongside
-// `SETUP_TEMPLATE` in `agent::system_prompt`. The filesystem-lifecycle
-// tests below stay here because they don't touch the template itself.
+// `SETUP_TEMPLATE` in `agent::system_prompt`. The lifecycle tests below
+// exercise `consume_setup_template`, the real driver used by
+// `build_system_prompt`.
 
-#[test]
-fn setup_file_lifecycle_atomic_consume() {
-    // Simulates the atomic rename → read → delete lifecycle from build_system_prompt
+#[tokio::test]
+async fn setup_absent_returns_none() {
+    // No SETUP.md on disk → nothing to inject. The pre-onboarding and
+    // post-retirement steady states both look like this.
     let tmp = tempfile::tempdir().unwrap();
-    let setup_path = tmp.path().join("SETUP.md");
-    let consumed_path = setup_path.with_extension("md.consumed");
-
-    // Write SETUP.md
-    std::fs::write(&setup_path, "# First Boot\nTest content").unwrap();
-    assert!(setup_path.exists());
-
-    // Atomic rename (simulates line 732)
-    assert!(std::fs::rename(&setup_path, &consumed_path).is_ok());
-    assert!(!setup_path.exists());
-    assert!(consumed_path.exists());
-
-    // Read consumed file (simulates line 733)
-    let content = std::fs::read_to_string(&consumed_path).unwrap();
-    assert!(content.contains("First Boot"));
-
-    // Delete consumed file (simulates line 740)
-    std::fs::remove_file(&consumed_path).unwrap();
-    assert!(!consumed_path.exists());
-    assert!(!setup_path.exists());
+    let outcome = super::system_prompt::consume_setup_template(tmp.path(), false).await;
+    assert!(outcome.is_none());
 }
 
-#[test]
-fn setup_file_missing_does_not_inject() {
-    // If SETUP.md doesn't exist, rename fails and nothing is injected
+#[tokio::test]
+async fn setup_persists_across_turns_until_identity_written() {
+    // Spec: SETUP.md must remain in the system prompt for the entire
+    // first conversation. Turn 1 sets `first_turn = true` (drives the
+    // one-shot tool-stripping); turn 2 keeps the content but flips
+    // `first_turn` to false so tools come back online.
     let tmp = tempfile::tempdir().unwrap();
     let setup_path = tmp.path().join("SETUP.md");
-    let consumed_path = setup_path.with_extension("md.consumed");
+    std::fs::write(&setup_path, "# First Boot\nRules.").unwrap();
 
-    assert!(std::fs::rename(&setup_path, &consumed_path).is_err());
+    let turn1 = super::system_prompt::consume_setup_template(tmp.path(), false)
+        .await
+        .expect("turn 1 must inject SETUP.md");
+    assert!(turn1.content.contains("First Boot"));
+    assert!(turn1.first_turn, "turn 1 must be marked first_turn");
+    assert!(
+        setup_path.exists(),
+        "SETUP.md must survive turn 1 for turn 2 to re-inject"
+    );
+    assert!(
+        tmp.path().join("SETUP.md.first_turn_done").exists(),
+        "marker file must exist after turn 1"
+    );
+
+    let turn2 = super::system_prompt::consume_setup_template(tmp.path(), false)
+        .await
+        .expect("turn 2 must still inject SETUP.md while onboarding incomplete");
+    assert!(turn2.content.contains("First Boot"));
+    assert!(
+        !turn2.first_turn,
+        "turn 2 must not re-trigger tool suppression"
+    );
 }
 
-#[test]
-fn setup_file_not_injected_twice() {
-    // After first consumption, file is gone — second attempt is a no-op
+#[tokio::test]
+async fn setup_retired_when_identity_in_long_term_memory() {
+    // Spec: once the agent has shaped its identity (an IDENTITY entry
+    // exists in long-term memory), the first-conversation rules no
+    // longer apply. SETUP.md and its marker must be deleted from disk
+    // and the helper must return `None`.
     let tmp = tempfile::tempdir().unwrap();
     let setup_path = tmp.path().join("SETUP.md");
-    let consumed_path = setup_path.with_extension("md.consumed");
+    let marker_path = tmp.path().join("SETUP.md.first_turn_done");
+    std::fs::write(&setup_path, "rules").unwrap();
+    std::fs::write(&marker_path, "").unwrap();
 
-    std::fs::write(&setup_path, "content").unwrap();
-    std::fs::rename(&setup_path, &consumed_path).unwrap();
-    std::fs::remove_file(&consumed_path).unwrap();
+    let outcome = super::system_prompt::consume_setup_template(tmp.path(), true).await;
+    assert!(outcome.is_none(), "retirement must suppress injection");
+    assert!(!setup_path.exists(), "SETUP.md must be deleted on retire");
+    assert!(!marker_path.exists(), "marker must be deleted on retire");
+}
 
-    // Second attempt — file is gone
-    assert!(std::fs::rename(&setup_path, &consumed_path).is_err());
+#[tokio::test]
+async fn setup_retirement_is_idempotent() {
+    // Spec: post-retirement, every subsequent build is a no-op. The
+    // helper must not error if SETUP.md is already gone, regardless of
+    // the `onboarding_complete` flag.
+    let tmp = tempfile::tempdir().unwrap();
+    let with_flag = super::system_prompt::consume_setup_template(tmp.path(), true).await;
+    let without_flag = super::system_prompt::consume_setup_template(tmp.path(), false).await;
+    assert!(with_flag.is_none());
+    assert!(without_flag.is_none());
+}
+
+#[tokio::test]
+async fn setup_first_turn_marker_is_load_bearing() {
+    // Spec: tool stripping fires exactly once per SETUP.md instance.
+    // If the marker exists before SETUP.md is consumed (e.g. a stale
+    // marker survived a crashed retirement), `first_turn` must be
+    // false — the new SETUP.md should not re-trigger tool suppression
+    // based on filename alone.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("SETUP.md"), "rules").unwrap();
+    std::fs::write(tmp.path().join("SETUP.md.first_turn_done"), "").unwrap();
+
+    let outcome = super::system_prompt::consume_setup_template(tmp.path(), false)
+        .await
+        .expect("still must inject while onboarding incomplete");
+    assert!(
+        !outcome.first_turn,
+        "pre-existing marker must veto first_turn so tools stay available"
+    );
+}
+
+#[tokio::test]
+async fn setup_first_turn_is_exclusive_across_concurrent_callers() {
+    // Spec: tool stripping is a one-shot side effect of the very first
+    // SETUP.md injection. Two sessions racing into `build_system_prompt`
+    // must not both think they're turn 1 — `create_new` is the
+    // synchronization primitive, and a future "simplify" that swaps it
+    // for plain `write` would silently regress this invariant.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("SETUP.md"), "rules").unwrap();
+    let (a, b) = tokio::join!(
+        super::system_prompt::consume_setup_template(tmp.path(), false),
+        super::system_prompt::consume_setup_template(tmp.path(), false),
+    );
+    let first_turn_count = [&a, &b]
+        .iter()
+        .filter(|o| o.as_ref().is_some_and(|i| i.first_turn))
+        .count();
+    assert_eq!(
+        first_turn_count, 1,
+        "exactly one concurrent caller may see first_turn = true"
+    );
+    // Both still get the content — re-injection is the point.
+    assert!(a.unwrap().content.contains("rules"));
+    assert!(b.unwrap().content.contains("rules"));
+}
+
+#[tokio::test]
+async fn setup_content_reread_each_turn_picks_up_mutations() {
+    // Spec: SETUP.md is the source of truth for first-conversation
+    // rules. The new design re-reads on every turn so an operator (or a
+    // template-upgrade path) can land changes mid-flight. This test
+    // pins that contract — caching the content from turn 1 would
+    // silently break it.
+    let tmp = tempfile::tempdir().unwrap();
+    let setup_path = tmp.path().join("SETUP.md");
+    std::fs::write(&setup_path, "v1 rules").unwrap();
+
+    let turn1 = super::system_prompt::consume_setup_template(tmp.path(), false)
+        .await
+        .expect("turn 1 must inject");
+    assert!(turn1.content.contains("v1"));
+
+    std::fs::write(&setup_path, "v2 rules").unwrap();
+    let turn2 = super::system_prompt::consume_setup_template(tmp.path(), false)
+        .await
+        .expect("turn 2 must still inject");
+    assert!(
+        turn2.content.contains("v2"),
+        "mid-conversation SETUP.md edits must reach the system prompt"
+    );
+}
+
+#[tokio::test]
+async fn identity_in_long_term_memory_with_db_distinguishes_states() {
+    // Spec: only a non-empty global/IDENTITY entry counts as completed
+    // onboarding. Missing rows and whitespace-only content must not
+    // flip the signal — otherwise SETUP.md would retire prematurely and
+    // the agent would lose the first-conversation rules mid-flow.
+    use crate::db::Database;
+    use crate::memory::identity_in_long_term_memory_with_db;
+
+    let db = Database::test_db().await;
+
+    assert!(
+        !identity_in_long_term_memory_with_db(&db).await,
+        "no row → onboarding not complete"
+    );
+
+    db.upsert_memory_entry("global", "IDENTITY", "   \n  ")
+        .await
+        .unwrap();
+    assert!(
+        !identity_in_long_term_memory_with_db(&db).await,
+        "whitespace-only content does not count as identity shaped"
+    );
+
+    db.upsert_memory_entry(
+        "global",
+        "IDENTITY",
+        "# Borg\nWry, direct, biases toward small reversible changes.",
+    )
+    .await
+    .unwrap();
+    assert!(
+        identity_in_long_term_memory_with_db(&db).await,
+        "real content → onboarding complete"
+    );
+
+    // A non-global scope must not trip the signal — multi-tenant
+    // installs could otherwise leak retirement across users.
+    db.upsert_memory_entry("project:abc", "IDENTITY", "filled")
+        .await
+        .unwrap();
+    db.delete_memory_entry("global", "IDENTITY").await.unwrap();
+    assert!(
+        !identity_in_long_term_memory_with_db(&db).await,
+        "non-global scope must not count"
+    );
 }
 
 // -- should_nudge_for_response --

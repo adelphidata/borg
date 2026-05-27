@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use std::str::FromStr;
 
 use cortex::config::Config;
-use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
+use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE, SETUP_FILE};
 use cortex::llm::provider::Provider;
 use cortex::security::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
@@ -623,7 +623,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     }
 
     // Write SETUP.md for first conversation instructions
-    let setup_path = data_dir.join("SETUP.md");
+    let setup_path = data_dir.join(SETUP_FILE);
     if !setup_path.exists() {
         let setup_content = generate_setup(&result.agent_name, &result.user_name);
         if let Err(e) = atomic_write(&setup_path, &setup_content) {

@@ -738,7 +738,7 @@ fn init_data_dir() -> Result<()> {
 
             // Auto-launch TUI for the first conversation (check before daemon
             // start to avoid printing output that flashes between terminal modes)
-            let setup_path = data_dir.join("SETUP.md");
+            let setup_path = data_dir.join(cortex::constants::SETUP_FILE);
             let will_auto_launch = setup_path.exists() && std::io::stdin().is_terminal();
 
             // Auto-start daemon service after successful onboarding (non-fatal).
