@@ -1830,3 +1830,424 @@ async fn jsonrpc_error_envelope_surfaces_as_dispatch_error() {
         "error chain must name the tool that failed; got: {chain}"
     );
 }
+
+#[tokio::test]
+async fn rate_limit_fails_closed_when_per_minute_or_burst_is_zero() {
+    // Spec: a misconfiguration of `rate_limit_per_minute=0` or
+    // `rate_limit_burst=0` must refuse every call rather than silently
+    // applying a permissive default. The fail-closed behaviour matches the
+    // WASM plugin sandbox's token bucket — both untrusted-code paths
+    // share one rule.
+    //
+    // Table-driven: each tuple is `(per_minute, burst)`. All three
+    // configurations must refuse the very first call.
+    for (per_min, burst) in &[(0u32, 0u32), (60u32, 0u32), (0u32, 10u32)] {
+        let _g = begin_test();
+
+        let transport = ScriptedTransport::new();
+        {
+            let mut h = transport.handlers.lock().unwrap();
+            h.insert(
+                methods::INITIALIZE.into(),
+                Box::new(|_| initialize_result()),
+            );
+            h.insert(
+                methods::TOOLS_LIST.into(),
+                Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+            );
+            h.insert(
+                methods::TOOLS_CALL.into(),
+                Box::new(|_| text_call_result("pong")),
+            );
+        }
+
+        let cfg = enabled_config();
+        let sc = server_config(vec![], *per_min, *burst);
+        mcp_clients::testing::install_session("s", &sc, &cfg, Box::new(transport))
+            .await
+            .expect("install");
+
+        let err = mcp_clients::try_execute_tool("mcp_s_ping", &json!({}))
+            .await
+            .expect_err(&format!(
+                "(per_minute={per_min}, burst={burst}) must refuse first call"
+            ));
+        let msg = format!("{err}").to_ascii_lowercase();
+        assert!(
+            msg.contains("rate"),
+            "(per_minute={per_min}, burst={burst}) error must name rate-limiting; got: {err}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_truncation_kicks_in_above_max_response_bytes_cap() {
+    // Spec: per-call response size cap is enforced before redaction +
+    // wrapping. A hostile/buggy server cannot dump an unbounded blob into
+    // the LLM context this way. Without this, a single tool call could
+    // exhaust the model's context window.
+    let _g = begin_test();
+
+    let huge = "X".repeat(200_000);
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("blob", well_formed_schema())])),
+        );
+        let body = huge.clone();
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(move |_| text_call_result(&body)),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    cfg.mcp.max_response_bytes = 4_096; // small enough that 200 KiB is truncated
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("s", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let out = mcp_clients::try_execute_tool("mcp_s_blob", &json!({}))
+        .await
+        .expect("dispatch should succeed even when truncated")
+        .expect("non-MCP fallback path returned None");
+
+    assert!(
+        out.contains("[truncated]"),
+        "truncated response must include the [truncated] marker so the LLM \
+         knows the output was clipped; got len {} prefix {:?}",
+        out.len(),
+        &out[..out.len().min(120)],
+    );
+    // The wrapped envelope adds ~120 bytes of XML — the inner payload
+    // must be near the cap, not the original 200 KiB.
+    assert!(
+        out.len() < 200_000,
+        "truncation didn't shrink the payload; got len {}",
+        out.len(),
+    );
+}
+
+// ── OTEL-style event capture ───────────────────────────────────────────────
+//
+// Borg projects MCP metrics through `tracing::info!(target: "borg.mcp", ...)`
+// events (the borgd OTEL layer maps these into the instruments documented in
+// `docs/mcp.md`). The tests below install a process-wide subscriber that
+// records every `borg.mcp` event into a vec so assertions can verify the
+// metric was actually emitted.
+
+#[derive(Clone, Debug, Default)]
+struct CapturedEvent {
+    event: String,
+    server: String,
+    tool: String,
+    outcome: String,
+}
+
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<Mutex<Vec<CapturedEvent>>>);
+
+impl CapturedEvents {
+    fn snapshot(&self) -> Vec<CapturedEvent> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+struct CapturingLayer(CapturedEvents);
+
+impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "borg.mcp" {
+            return;
+        }
+        // Capture the structured fields we care about by walking the event's
+        // values. A simple visitor pattern — tracing's API requires the dance.
+        #[derive(Default)]
+        struct V {
+            event: String,
+            server: String,
+            tool: String,
+            outcome: String,
+        }
+        impl tracing::field::Visit for V {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let s = format!("{value:?}").trim_matches('"').to_string();
+                match field.name() {
+                    "event" => self.event = s,
+                    "server" => self.server = s,
+                    "tool" => self.tool = s,
+                    "outcome" => self.outcome = s,
+                    _ => {}
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "event" => self.event = value.into(),
+                    "server" => self.server = value.into(),
+                    "tool" => self.tool = value.into(),
+                    "outcome" => self.outcome = value.into(),
+                    _ => {}
+                }
+            }
+        }
+        let mut v = V::default();
+        event.record(&mut v);
+        self.0 .0.lock().unwrap().push(CapturedEvent {
+            event: v.event,
+            server: v.server,
+            tool: v.tool,
+            outcome: v.outcome,
+        });
+    }
+}
+
+/// Install a global tracing subscriber whose only job is to capture every
+/// `borg.mcp` event. Idempotent: returns the shared capture buffer on every
+/// call, so tests share one subscriber across the test binary. (Trying to
+/// install per-test fails because `set_global_default` is one-shot.)
+fn captured_events() -> CapturedEvents {
+    use tracing_subscriber::layer::SubscriberExt;
+    static CAPTURED: OnceLock<CapturedEvents> = OnceLock::new();
+    let events = CAPTURED.get_or_init(|| {
+        let events = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer(events.clone()));
+        // Panic on conflict — silently degrading to a no-op capture would
+        // let metric assertions pass on empty data, hiding real
+        // regressions. If a future lib-side init installs a subscriber,
+        // this test binary must be rearranged (e.g. tracing_subscriber's
+        // reload Layer) rather than silently lose coverage.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("metric tests require sole control of the tracing subscriber");
+        events
+    });
+    events.clone()
+}
+
+#[tokio::test]
+async fn execute_emits_otel_event_with_outcome_label() {
+    // Spec: every MCP tool dispatch emits exactly one `borg.mcp` event with
+    // `event="execute"` and `outcome` ∈ {"success","error"}. The borgd
+    // OTEL layer projects this into `borg.mcp.executes_total{outcome=…}`.
+    // Without the event the production metric is silently zero — operators
+    // see no traffic and assume MCP isn't being used.
+    let _g = begin_test();
+    let events = captured_events();
+    let before = events.snapshot().len();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(|_| text_call_result("pong")),
+        );
+    }
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("metricsrv", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let _ = mcp_clients::try_execute_tool("mcp_metricsrv_ping", &json!({}))
+        .await
+        .expect("dispatch")
+        .expect("non-MCP fallback");
+
+    let snap = events.snapshot();
+    let new: Vec<_> = snap.iter().skip(before).cloned().collect();
+    // We expect at least: tools_listed (during install) + execute. We
+    // assert on the execute event because that's the dispatch-time metric
+    // operators actually look at.
+    let exec = new
+        .iter()
+        .find(|e| e.event == "execute" && e.server == "metricsrv" && e.outcome == "success")
+        .unwrap_or_else(|| {
+            panic!("no successful execute event captured; saw: {new:?}",);
+        });
+    assert_eq!(exec.tool, "mcp_metricsrv_ping");
+
+    let listed = new
+        .iter()
+        .find(|e| e.event == "tools_listed" && e.server == "metricsrv");
+    assert!(
+        listed.is_some(),
+        "tools_listed event missing after install; saw: {new:?}",
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_dispatch_emits_otel_rate_limited_event() {
+    // Spec: a refused dispatch must emit `event=rate_limited` so the borgd
+    // OTEL layer can increment `borg.mcp.rate_limited_total{server}`. The
+    // existing audit row covers the operator's incident-response surface;
+    // the metric covers the dashboard surface.
+    let _g = begin_test();
+    let events = captured_events();
+    let before = events.snapshot().len();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+        );
+    }
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 0, 0); // fail-closed config
+    mcp_clients::testing::install_session("ratelim", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let _ = mcp_clients::try_execute_tool("mcp_ratelim_ping", &json!({}))
+        .await
+        .expect_err("must refuse");
+
+    let snap = events.snapshot();
+    let new: Vec<_> = snap.iter().skip(before).cloned().collect();
+    assert!(
+        new.iter()
+            .any(|e| e.event == "rate_limited" && e.server == "ratelim"),
+        "expected a rate_limited event for server 'ratelim'; saw: {new:?}",
+    );
+}
+
+#[tokio::test]
+async fn max_response_bytes_zero_falls_back_to_default_not_unbounded() {
+    // Spec: a misconfigured `mcp.max_response_bytes=0` must NOT silently
+    // disable the cap. Mirrors the rate-limit fail-closed-on-zero rule —
+    // "0" in config is operator intent to tighten, not loosen. Without
+    // this, a single typo bypasses the whole response-size guard.
+    let _g = begin_test();
+
+    let huge = "X".repeat(2_000_000); // 2 MiB — past the default 1 MiB cap
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("blob", well_formed_schema())])),
+        );
+        let body = huge.clone();
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(move |_| text_call_result(&body)),
+        );
+    }
+
+    let mut cfg = enabled_config();
+    cfg.mcp.max_response_bytes = 0; // the misconfiguration
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("s", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let out = mcp_clients::try_execute_tool("mcp_s_blob", &json!({}))
+        .await
+        .expect("dispatch")
+        .expect("non-MCP fallback");
+
+    // Default cap is 1 MiB; the 2 MiB payload must be truncated.
+    assert!(
+        out.contains("[truncated]"),
+        "max_response_bytes=0 must NOT disable the cap — payload should be \
+         truncated; output len was {}",
+        out.len(),
+    );
+    assert!(
+        out.len() < 2_000_000,
+        "cap was disabled (output is full 2 MiB); got len {}",
+        out.len(),
+    );
+}
+
+#[tokio::test]
+async fn server_initiated_request_refusal_does_not_break_subsequent_dispatch() {
+    // Spec (B4 integration): when a server interleaves a server-initiated
+    // request (sampling/createMessage, …) into the response stream during
+    // a `tools/call`, the session layer must refuse it AND the dispatch
+    // must complete normally. The refusal lives at the protocol layer; the
+    // cortex supervisor drains the refusal list and emits audit rows. We
+    // can't easily assert the audit row here (no global AuditWriter
+    // installed in these tests), but we CAN assert the dispatch succeeds
+    // and the LLM sees the wrapped tool result.
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("echo", well_formed_schema())])),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(|_| text_call_result("pong")),
+        );
+    }
+    // Push a server-initiated `sampling/createMessage` request into the
+    // pending notifications slot so the next `send()` flushes it into
+    // inbound — exactly the path a hostile real server would use.
+    let notifications = transport.notifications();
+    notifications.lock().unwrap().push_back(Message {
+        jsonrpc: Some("2.0".into()),
+        id: Some(9001),
+        method: Some(mcp::session::SAMPLING_CREATE_MESSAGE.into()),
+        result: None,
+        error: None,
+        params: Some(json!({"messages": []})),
+    });
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("s", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let out = mcp_clients::try_execute_tool("mcp_s_echo", &json!({}))
+        .await
+        .expect("dispatch succeeded despite refused server request")
+        .expect("non-MCP fallback");
+    assert!(
+        out.contains("pong"),
+        "tool result missing despite refusal; got: {out}",
+    );
+    assert!(
+        out.contains("<mcp_tool_result"),
+        "tool result must still be wrapped in the trust envelope; got: {out}",
+    );
+}

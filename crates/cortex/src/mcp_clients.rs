@@ -63,6 +63,34 @@ static BUCKETS: OnceLock<Mutex<HashMap<String, TokenBucket>>> = OnceLock::new();
 /// can hot-reload by reseating the map.
 static SERVER_LIMITS: OnceLock<Mutex<HashMap<String, ServerLimits>>> = OnceLock::new();
 
+/// Global per-response byte cap. Read on every dispatch and written by
+/// [`initialize`] / [`reload_from_config`]. Atomic because dispatch is on
+/// the hot path and contending on a Mutex for a single `usize` would hurt.
+static MAX_RESPONSE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1024 * 1024);
+
+/// Floor on `mcp.max_response_bytes`. A value of 0 in config is treated as
+/// "use the default" rather than "no cap" — the latter would defeat the
+/// whole point of the truncation guard. Mirrors the rate-limit
+/// fail-closed-on-zero convention at [`try_consume_rate_token`].
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Resolve the operator-configured `max_response_bytes` to the value the
+/// dispatch path should actually use. Centralises the
+/// "0 means default, not unbounded" rule so every `MAX_RESPONSE_BYTES.store`
+/// call site applies it uniformly.
+fn resolve_max_response_bytes(configured: usize) -> usize {
+    if configured == 0 {
+        tracing::warn!(
+            "mcp.max_response_bytes=0 is invalid (would disable the cap); \
+             falling back to default {DEFAULT_MAX_RESPONSE_BYTES}",
+        );
+        DEFAULT_MAX_RESPONSE_BYTES
+    } else {
+        configured
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ServerLimits {
     rate_limit_per_minute: u32,
@@ -433,6 +461,14 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             }),
         )
         .await;
+        tracing::info!(
+            target: "borg.mcp",
+            event = "rate_limited",
+            server = %tool.server,
+            tool = %tool.full_name,
+            retry_after_secs = retry_secs,
+            "mcp tool call rate-limited",
+        );
         return Err(anyhow!(
             "MCP server '{server}' is rate-limited; retry in {retry_secs:.1}s",
             server = tool.server
@@ -476,6 +512,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     let raw_text = match tokio::time::timeout(outer_deadline, reply_rx).await {
         Ok(Ok(Ok(text))) => text,
         Ok(Ok(Err(e))) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
             crate::db::try_emit_global(
                 crate::db::audit_events::MCP_TOOL_EXECUTED,
                 &tool.server,
@@ -483,11 +520,23 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                     "server": &tool.server,
                     "tool": &tool.full_name,
                     "success": false,
-                    "duration_ms": start.elapsed().as_millis() as u64,
+                    "duration_ms": duration_ms,
                     "error": e.to_string(),
                 }),
             )
             .await;
+            // OTEL-style structured event — `borg.mcp.executes_total{outcome="error"}`
+            // plus the error message for correlation with logs.
+            tracing::info!(
+                target: "borg.mcp",
+                event = "execute",
+                server = %tool.server,
+                tool = %tool.full_name,
+                outcome = "error",
+                duration_ms,
+                error = %e,
+                "mcp tool execution failed",
+            );
             return Err(e.context(format!("MCP tool '{}' failed", tool.full_name)));
         }
         Ok(Err(_canceled)) => {
@@ -505,6 +554,49 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         }
     };
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Response size cap. Hostile/buggy servers cannot dump an unbounded
+    // blob into the LLM context: we truncate before redaction + wrapping
+    // and surface the truncation as an audit row so operators can see why
+    // an output looks clipped. The cap is read once per call from the
+    // global atomic — see `MAX_RESPONSE_BYTES` (set via
+    // `resolve_max_response_bytes`, which floors a misconfigured 0 to the
+    // default rather than disabling the guard).
+    let cap = MAX_RESPONSE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let raw_text = if raw_text.len() > cap {
+        let original_bytes = raw_text.len();
+        // UTF-8-safe truncation: walk back to the previous char boundary
+        // so we never split a multi-byte sequence and emit invalid UTF-8.
+        let mut cut = cap;
+        while cut > 0 && !raw_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut t = raw_text;
+        t.truncate(cut);
+        t.push_str("\n…[truncated]");
+        crate::db::try_emit_global(
+            crate::db::audit_events::MCP_RESPONSE_TRUNCATED,
+            &tool.server,
+            &serde_json::json!({
+                "server": &tool.server,
+                "tool": &tool.full_name,
+                "original_bytes": original_bytes,
+                "truncated_to_bytes": cut,
+                "cap_bytes": cap,
+            }),
+        )
+        .await;
+        tracing::warn!(
+            server = %tool.server,
+            tool = %tool.full_name,
+            original_bytes,
+            cap,
+            "MCP response truncated by per-call cap",
+        );
+        t
+    } else {
+        raw_text
+    };
 
     // Untrusted-input pipeline. Order matters: redact first so the
     // injection scan and the wrapper both see scrubbed text.
@@ -584,6 +676,23 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     )
     .await;
 
+    // OTEL-style structured event. The borgd tracing-opentelemetry layer
+    // (if installed) projects this into the `borg.mcp.executes_total` and
+    // `borg.mcp.execute_duration_ms` instruments documented in
+    // `docs/mcp.md`. Off-daemon contexts (CLI, tests) get the same data via
+    // plain log output.
+    tracing::info!(
+        target: "borg.mcp",
+        event = "execute",
+        server = %tool.server,
+        tool = %tool.full_name,
+        outcome = "success",
+        duration_ms,
+        threat_level = threat_label,
+        redaction_hits,
+        "mcp tool executed",
+    );
+
     Ok(Some(wrapped))
 }
 
@@ -598,6 +707,10 @@ pub async fn initialize(config: &Config) -> Result<()> {
     let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(config.mcp.max_tools_total));
     reg.set_global_cap(config.mcp.max_tools_total);
     set_disabled_servers(&config.mcp.disabled_servers);
+    MAX_RESPONSE_BYTES.store(
+        resolve_max_response_bytes(config.mcp.max_response_bytes),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let builtin = builtin_tool_names();
     let builtin_refs: Vec<&str> = builtin.to_vec();
@@ -617,10 +730,11 @@ pub async fn initialize(config: &Config) -> Result<()> {
             // chain so operators don't have to grep logs to see why their
             // configured servers aren't contributing tools.
             crate::db::try_emit_global(
-                crate::db::audit_events::MCP_SCHEMA_REJECTED,
+                crate::db::audit_events::MCP_SERVER_FAILED,
                 server_name,
                 &serde_json::json!({
                     "server": server_name,
+                    "phase": "initialize",
                     "reason": format!("start_server failed: {e}"),
                 }),
             )
@@ -693,6 +807,10 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
     let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(config.mcp.max_tools_total));
     reg.set_global_cap(config.mcp.max_tools_total);
     set_disabled_servers(&config.mcp.disabled_servers);
+    MAX_RESPONSE_BYTES.store(
+        resolve_max_response_bytes(config.mcp.max_response_bytes),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     for name in &to_remove {
         // Dropping the sender closes the actor's receiver — the task exits
@@ -737,10 +855,11 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                 let err_msg = e.to_string();
                 tracing::warn!(server = %name, error = %err_msg, "MCP reload: server failed to start");
                 crate::db::try_emit_global(
-                    crate::db::audit_events::MCP_SCHEMA_REJECTED,
+                    crate::db::audit_events::MCP_SERVER_FAILED,
                     &name,
                     &serde_json::json!({
                         "server": name,
+                        "phase": "reload",
                         "reason": format!("reload start_server failed: {err_msg}"),
                     }),
                 )
@@ -781,7 +900,30 @@ async fn start_server(
         allow_plaintext_http: config.mcp.allow_plaintext_http,
         allow_local_network: config.mcp.allow_local_network,
     };
-    let transport = open_transport(&manifest, policy).await?;
+    let transport = match open_transport(&manifest, policy).await {
+        Ok(t) => t,
+        Err(e) => {
+            // OTEL-style transport_errors_total breakdown: kind labels the
+            // class of failure (DNS, TLS, IO, refused). The exact string
+            // comes from the underlying McpError Display impl, so the
+            // metrics layer can aggregate by the leading word.
+            let transport_label = match &manifest.transport {
+                mcp::manifest::Transport::Stdio { .. } => "stdio",
+                mcp::manifest::Transport::Http { .. } => "streamable-http",
+                mcp::manifest::Transport::Sse { .. } => "sse",
+            };
+            tracing::warn!(
+                target: "borg.mcp",
+                event = "transport_error",
+                server = %server_name,
+                transport = transport_label,
+                kind = "open",
+                error = %e,
+                "mcp transport open failed",
+            );
+            return Err(e);
+        }
+    };
     let mut session = SessionActor::new(&manifest, transport);
 
     tokio::time::timeout(manifest.connect_timeout, session.handshake())
@@ -794,11 +936,45 @@ async fn start_server(
         .await
         .map_err(|e| anyhow!("tools/list failed for server '{server_name}': {e}"))?;
 
+    tracing::info!(
+        target: "borg.mcp",
+        event = "tools_listed",
+        server = %server_name,
+        count = discovered.tools.len(),
+        "mcp tools/list completed",
+    );
+
     let outcomes =
         reg.replace_server_tools(server_name, &discovered.tools, &manifest.tools, builtin);
-    audit_rejections(server_name, &outcomes).await;
+    audit_registrations(server_name, &outcomes).await;
 
     record_limits(server_name, server_cfg);
+
+    // Operator-visible "this server is live" signal — paired with
+    // `MCP_SERVER_FAILED` for terminal failures and with per-tool
+    // `MCP_TOOL_REGISTERED` rows below in `audit_registrations`.
+    let registered_tools: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            ToolRegistrationOutcome::Registered { full_name } => Some(full_name.as_str()),
+            _ => None,
+        })
+        .collect();
+    crate::db::try_emit_global(
+        crate::db::audit_events::MCP_SERVER_STARTED,
+        server_name,
+        &serde_json::json!({
+            "server": server_name,
+            "transport": match &manifest.transport {
+                mcp::manifest::Transport::Stdio { .. } => "stdio",
+                mcp::manifest::Transport::Http { .. } => "streamable-http",
+                mcp::manifest::Transport::Sse { .. } => "sse",
+            },
+            "registered_tools": registered_tools,
+            "registered_count": registered_tools.len(),
+        }),
+    )
+    .await;
 
     let (tx, rx) = mpsc::channel::<SessionCmd>(32);
     {
@@ -883,9 +1059,20 @@ async fn open_transport(
     }
 }
 
-async fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
+async fn audit_registrations(server_name: &str, outcomes: &[ToolRegistrationOutcome]) {
     for o in outcomes {
         match o {
+            ToolRegistrationOutcome::Registered { full_name } => {
+                crate::db::try_emit_global(
+                    crate::db::audit_events::MCP_TOOL_REGISTERED,
+                    server_name,
+                    &serde_json::json!({
+                        "server": server_name,
+                        "tool": full_name,
+                    }),
+                )
+                .await;
+            }
             ToolRegistrationOutcome::Rejected { original, reason } => {
                 crate::db::try_emit_global(
                     crate::db::audit_events::MCP_SCHEMA_REJECTED,
@@ -925,8 +1112,7 @@ async fn audit_rejections(server_name: &str, outcomes: &[ToolRegistrationOutcome
                     "MCP tool name collision — not registered",
                 );
             }
-            ToolRegistrationOutcome::FilteredOut { .. }
-            | ToolRegistrationOutcome::Registered { .. } => {}
+            ToolRegistrationOutcome::FilteredOut { .. } => {}
         }
     }
 }
@@ -946,9 +1132,20 @@ async fn run_session_task(
                 args,
                 reply,
             } => {
-                let result = session
-                    .call_tool(&original_name, args)
-                    .await
+                let raw_result = session.call_tool(&original_name, args).await;
+                // Classify transport-level failures so the session tears down
+                // cleanly rather than looping with a wedged transport. The
+                // streamable-HTTP transport surfaces 404-on-stale-session-id
+                // as `TransportClosed`; without a teardown here the next
+                // dispatch would POST without the session id, the server
+                // would reject every subsequent `tools/call`, and the LLM
+                // would see opaque "no live session" errors until the daemon
+                // restarted. Marking the session dead drops it from
+                // `SESSION_TX` so future dispatches fail fast and the
+                // operator sees one clear error per call.
+                let transport_dead =
+                    matches!(&raw_result, Err(mcp::errors::McpError::TransportClosed(_)));
+                let result = raw_result
                     .map(|(text, _raw)| text)
                     .map_err(|e| anyhow!("{e}"));
                 // Best-effort send — caller may have dropped its receiver
@@ -960,6 +1157,23 @@ async fn run_session_task(
                         tool = %original_name,
                         "MCP reply channel closed before send — caller likely timed out",
                     );
+                }
+
+                // Drain refused server-initiated requests (sampling, roots,
+                // …). The protocol layer already replied with -32601; we
+                // emit one audit row per refusal so an operator can SEE that
+                // a server tried to drive the borg LLM. Silence here would
+                // hide a determined hostile peer.
+                for (method, _id) in session.drain_refused_server_requests() {
+                    crate::db::try_emit_global(
+                        crate::db::audit_events::MCP_SAMPLING_REFUSED,
+                        &server_name,
+                        &serde_json::json!({
+                            "server": &server_name,
+                            "method": method,
+                        }),
+                    )
+                    .await;
                 }
 
                 // Drain notifications that arrived during the call. A
@@ -983,7 +1197,7 @@ async fn run_session_task(
                                 &filter,
                                 &builtin_refs,
                             );
-                            audit_rejections(&server_name, &outcomes).await;
+                            audit_registrations(&server_name, &outcomes).await;
                             tracing::debug!(
                                 server = %server_name,
                                 count = discovered.tools.len(),
@@ -999,11 +1213,40 @@ async fn run_session_task(
                         }
                     }
                 }
+
+                // Transport-level failure (e.g. streamable-HTTP 404 on a
+                // stale session id). Tear down: remove our sender from the
+                // global map and drop the session. Future dispatches will
+                // fail fast with "no live session" — an operator-readable
+                // error — instead of looping with a wedged transport.
+                // Re-init requires the operator to `borg settings set` or
+                // restart the daemon; auto-reconnect lives in a follow-up.
+                if transport_dead {
+                    tracing::warn!(
+                        server = %server_name,
+                        "MCP transport closed; tearing down session (re-init requires daemon restart)",
+                    );
+                    crate::db::try_emit_global(
+                        crate::db::audit_events::MCP_SERVER_FAILED,
+                        &server_name,
+                        &serde_json::json!({
+                            "server": &server_name,
+                            "phase": "runtime",
+                            "reason": "transport closed mid-session",
+                        }),
+                    )
+                    .await;
+                    if let Ok(mut map) = session_map().lock() {
+                        map.remove(&server_name);
+                    }
+                    registry.drop_server(&server_name);
+                    break;
+                }
             }
         }
     }
-    // Receiver closed — likely shutdown. Drop the session; its Drop will
-    // close the transport.
+    // Receiver closed (clean shutdown) or transport_dead break above. The
+    // session's Drop closes the transport.
     tracing::debug!(server = %server_name, "MCP session task exiting");
 }
 
@@ -1064,6 +1307,10 @@ pub mod testing {
         let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(cfg.mcp.max_tools_total));
         reg.set_global_cap(cfg.mcp.max_tools_total);
         set_disabled_servers(&cfg.mcp.disabled_servers);
+        MAX_RESPONSE_BYTES.store(
+            resolve_max_response_bytes(cfg.mcp.max_response_bytes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let manifest = server_cfg.resolve_to_manifest(server_name, cfg)?;
         let mut session = SessionActor::new(&manifest, transport);
@@ -1076,6 +1323,14 @@ pub mod testing {
             .await
             .map_err(|e| anyhow!("tools/list failed for server '{server_name}': {e}"))?;
 
+        tracing::info!(
+            target: "borg.mcp",
+            event = "tools_listed",
+            server = %server_name,
+            count = discovered.tools.len(),
+            "mcp tools/list completed",
+        );
+
         let builtin = builtin_tool_names();
         let builtin_refs: Vec<&str> = builtin.to_vec();
         let outcomes = reg.replace_server_tools(
@@ -1084,7 +1339,7 @@ pub mod testing {
             &manifest.tools,
             &builtin_refs,
         );
-        audit_rejections(server_name, &outcomes).await;
+        audit_registrations(server_name, &outcomes).await;
         record_limits(server_name, server_cfg);
 
         let (tx, rx) = mpsc::channel::<SessionCmd>(32);

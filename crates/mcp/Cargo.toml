@@ -25,6 +25,10 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+axum = { workspace = true }
+# The default workspace `tokio` enables `full`; the integration-test
+# fixtures need `signal` for graceful shutdown which is included.
+tokio = { workspace = true }
 
 [lints]
 workspace = true

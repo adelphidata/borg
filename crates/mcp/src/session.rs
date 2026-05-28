@@ -13,12 +13,23 @@ use crate::errors::{McpError, Result};
 use crate::manifest::ServerManifest;
 use crate::protocol::{
     methods, render_call_result, ClientCapabilities, ClientInfo, InitializeParams,
-    InitializeResult, Message, Request, ToolCallResult, ToolsListResult,
+    InitializeResult, Message, Request, RpcError, ToolCallResult, ToolsListResult, JSONRPC_VERSION,
 };
 use crate::transport::Transport;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::Instant;
+
+/// JSON-RPC "method not found". We use this code for every server-initiated
+/// request because borg consumes MCP — it does not implement sampling, roots,
+/// or any other server-driven RPC.
+const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+
+/// MCP method name for server-initiated sampling. We refuse this explicitly
+/// (and audit the refusal) so a hostile server cannot use Borg's LLM to
+/// generate text on its behalf — exactly the wrong direction for the trust
+/// model documented in `docs/mcp.md`.
+pub const SAMPLING_CREATE_MESSAGE: &str = "sampling/createMessage";
 
 /// What a session reports after a `tools/list` round-trip.
 #[derive(Debug, Clone)]
@@ -55,6 +66,11 @@ pub struct SessionActor {
     /// True iff we've already logged a notification-overflow warning this
     /// session. Avoids log spam from a sustained flood.
     notification_overflow_logged: bool,
+    /// Server-initiated requests refused this session, keyed by method.
+    /// Populated by the request-loop's "not found" path; the supervisor
+    /// reads + drains this so it can emit one audit row per (server, method)
+    /// without growing the cortex layer's blast radius.
+    refused_server_requests: Vec<(String, u64)>,
 }
 
 impl SessionActor {
@@ -69,7 +85,16 @@ impl SessionActor {
             call_timeout: manifest.call_timeout,
             pending_notifications: std::collections::VecDeque::new(),
             notification_overflow_logged: false,
+            refused_server_requests: Vec::new(),
         }
+    }
+
+    /// Drain the list of refused server-initiated requests since the last
+    /// drain. The cortex supervisor uses this to write
+    /// `MCP_SAMPLING_REFUSED` audit rows; the protocol layer doesn't have
+    /// access to the audit writer (and shouldn't).
+    pub fn drain_refused_server_requests(&mut self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.refused_server_requests)
     }
 
     /// Perform the `initialize` handshake and send the `notifications/initialized`
@@ -222,6 +247,50 @@ impl SessionActor {
                             self.server_name
                         ))),
                     };
+                }
+                Some(other_id) if msg.method.is_some() => {
+                    // Server-initiated request (id + method both set).
+                    // Borg is an MCP *consumer* — we don't implement
+                    // sampling, roots, or any other server-driven RPC. Reply
+                    // with -32601 (Method not found) so the server learns
+                    // immediately rather than hanging waiting for a result.
+                    //
+                    // Without this branch the loop would fall into the
+                    // "stale response" path below and silently drop the
+                    // request, which on a determined / buggy server can
+                    // produce a hang plus a confusing protocol error later.
+                    //
+                    // We also record the refusal so the cortex supervisor
+                    // can emit an `mcp_sampling_refused` audit row.
+                    let method = msg.method.clone().unwrap_or_default();
+                    let err = RpcError {
+                        code: JSONRPC_METHOD_NOT_FOUND,
+                        message: format!("method '{method}' is not implemented by this client"),
+                        data: None,
+                    };
+                    let reply = json!({
+                        "jsonrpc": JSONRPC_VERSION,
+                        "id": other_id,
+                        "error": err,
+                    });
+                    // Best-effort: if the transport is already broken we'll
+                    // catch it on the next iteration's recv. Don't unwind
+                    // mid-call just because the refusal write failed.
+                    if let Err(e) = self.transport.send(reply).await {
+                        tracing::warn!(
+                            server = %self.server_name,
+                            method = %method,
+                            error = %e,
+                            "failed to send method-not-found refusal for server-initiated request",
+                        );
+                    } else {
+                        tracing::info!(
+                            server = %self.server_name,
+                            method = %method,
+                            "refused server-initiated MCP request",
+                        );
+                        self.refused_server_requests.push((method, other_id));
+                    }
                 }
                 Some(other_id) => {
                     // Stale response from a previous timed-out call. Log + ignore.
@@ -402,6 +471,80 @@ mod tests {
         let mut session = SessionActor::new(&manifest(), transport);
         let err = session.handshake().await.unwrap_err();
         assert!(matches!(err, McpError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn server_initiated_sampling_request_is_refused_with_method_not_found() {
+        // Spec: borg consumes MCP. A server that sends an unsolicited
+        // `sampling/createMessage` request (or any other server-initiated
+        // RPC) must receive a JSON-RPC -32601 reply, and the refusal must
+        // be drained by the supervisor so it can audit it. The wrong
+        // behavior — silently dropping the request — lets a hostile server
+        // hang waiting for a result it will never get, and hides the
+        // attempt from the operator's audit trail.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+
+        // First inbound message: a server-initiated `sampling/createMessage`
+        // request (id+method both set). The session should refuse this and
+        // keep looping for the actual initialize response.
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(9001),
+            method: Some(SAMPLING_CREATE_MESSAGE.into()),
+            result: None,
+            error: None,
+            params: Some(json!({"messages": []})),
+        });
+        // Second: the actual initialize result, so the handshake completes.
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            })),
+            error: None,
+            params: None,
+        });
+
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake should succeed");
+
+        let sent_guard = sent.lock().unwrap();
+        // We expect three outbound frames: initialize, refusal-for-9001,
+        // initialized-notification. Order: initialize first, then the
+        // refusal (sent while waiting for response 1), then initialized
+        // after the response arrives.
+        assert!(
+            sent_guard.len() >= 3,
+            "expected initialize + refusal + initialized, got {sent_guard:?}",
+        );
+        let refusal = sent_guard
+            .iter()
+            .find(|v| v.get("id").and_then(Value::as_u64) == Some(9001))
+            .expect("no refusal frame addressed to the server's request id");
+        let err = refusal
+            .get("error")
+            .expect("refusal frame must carry a JSON-RPC error object");
+        assert_eq!(
+            err.get("code").and_then(Value::as_i64),
+            Some(-32601),
+            "refusal must use the JSON-RPC method-not-found code (-32601), got {err:?}",
+        );
+        drop(sent_guard);
+
+        let drained = session.drain_refused_server_requests();
+        assert_eq!(
+            drained.len(),
+            1,
+            "supervisor must see exactly one refused server request, got {drained:?}",
+        );
+        assert_eq!(drained[0].0, SAMPLING_CREATE_MESSAGE);
+        assert_eq!(drained[0].1, 9001);
     }
 
     #[tokio::test]

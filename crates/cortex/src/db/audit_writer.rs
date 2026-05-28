@@ -62,6 +62,12 @@ pub mod audit_events {
     pub const MCP_TOOL_EXECUTED: &str = "mcp_tool_executed";
     pub const MCP_RATE_LIMITED: &str = "mcp_rate_limited";
     pub const MCP_SCHEMA_REJECTED: &str = "mcp_schema_rejected";
+    pub const MCP_SERVER_STARTED: &str = "mcp_server_started";
+    pub const MCP_SERVER_FAILED: &str = "mcp_server_failed";
+    pub const MCP_TOOL_REGISTERED: &str = "mcp_tool_registered";
+    pub const MCP_RESPONSE_TRUNCATED: &str = "mcp_response_truncated";
+    pub const MCP_SAMPLING_REFUSED: &str = "mcp_sampling_refused";
+    pub const MCP_BLOCKED_PATH_ATTEMPT: &str = "mcp_blocked_path_attempt";
 }
 
 #[derive(Clone)]

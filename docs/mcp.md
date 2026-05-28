@@ -151,29 +151,33 @@ Each server has a token-bucket rate limit (`rate_limit_per_minute`, `rate_limit_
 | `mcp.enabled = false` | Skip all MCP init; tool catalog returns empty; dispatcher refuses MCP names |
 | `mcp.disabled_servers = ["<id>", …]` | Hide a specific server's tools live (no daemon restart needed) |
 | `mcp.max_tools_total` | Global ceiling on total MCP tool count (default 128) |
-| `mcp.allow_plaintext_http` | Allow `http://` URLs (default false) |
-| `mcp.allow_local_network` | Allow loopback / RFC1918 / link-local resolution (default false) |
+| `mcp.allow_plaintext_http` | Allow `http://` URLs (default false). Cloud-metadata FQDNs (`metadata.google.internal`, `metadata.goog`) stay refused even with this on |
+| `mcp.allow_local_network` | Allow loopback / RFC1918 / link-local resolution (default false). Cloud-metadata FQDNs stay refused even with this on |
+| `mcp.max_response_bytes` | Per-`tools/call` response size cap (default 1 MiB). Output beyond this is truncated before redaction/wrapping; an `mcp_response_truncated` audit row is written |
 
 A live `borg settings set mcp.disabled_servers=["bad-actor"]` removes that server's tools from the agent catalog on the next turn, even if a connected session is still open. Followed by `borg mcp remove bad-actor` to make it permanent.
 
 ## Audit & telemetry
 
-Hash-chained audit events (via the same `AuditWriter` as the WASM plugin sandbox):
+Hash-chained audit events (via the same `AuditWriter` as the WASM plugin sandbox). Constant names live in `crates/cortex/src/db/audit_writer.rs::audit_events::*`:
 
-- `mcp_server_started` / `mcp_server_failed`
-- `mcp_tool_registered` / `mcp_schema_rejected` (with `reason`)
-- `mcp_tool_called` (server, tool, args_hash, duration, outcome)
-- `mcp_rate_limited`
-- `mcp_blocked_path_attempt`
-- `mcp_response_truncated`
+- `mcp_server_started` / `mcp_server_failed` (lifecycle: handshake success / terminal failure)
+- `mcp_tool_registered` / `mcp_schema_rejected` (per-tool: accepted / rejected with `reason`)
+- `mcp_tool_executed` (server, tool, success, duration_ms, threat_level, redaction_hits, [error])
+- `mcp_rate_limited` (server, tool, retry_after_secs, limit_per_minute, burst)
+- `mcp_response_truncated` (server, tool, original_bytes, truncated_to_bytes, cap_bytes) — fires when output exceeds `mcp.max_response_bytes`
+- `mcp_sampling_refused` (server, method) — fires when the server sends an unsolicited `sampling/createMessage` (or any other server-initiated RPC) and the client replies with JSON-RPC `-32601`
+- `mcp_blocked_path_attempt` — reserved for the filesystem-preset path-filter audit row (not yet emitted; preset filtering happens at the `fs_read`/`fs_write` boundary)
 
-OTEL metrics:
+OTEL-style structured events under target `borg.mcp` (`tracing::info!` / `tracing::warn!`). The borgd tracing-opentelemetry layer projects these into:
 
-- `borg.mcp.executes_total{server,tool,outcome}`
-- `borg.mcp.execute_duration_ms{server,tool}`
-- `borg.mcp.tools_listed_total{server}`
-- `borg.mcp.rate_limited_total{server}`
-- `borg.mcp.transport_errors_total{server,transport,kind}`
+- `borg.mcp.executes_total{server,tool,outcome}` — `event="execute"`, `outcome` ∈ `success`/`error`
+- `borg.mcp.execute_duration_ms{server,tool}` — `duration_ms` field on the same `event="execute"` record
+- `borg.mcp.tools_listed_total{server}` — `event="tools_listed"`, `count`
+- `borg.mcp.rate_limited_total{server}` — `event="rate_limited"`, `retry_after_secs`
+- `borg.mcp.transport_errors_total{server,transport,kind}` — `event="transport_error"`, `transport` ∈ `stdio`/`streamable-http`/`sse`, `kind` ∈ `open`/…
+
+Off-daemon contexts (CLI one-shots, tests) read the same data straight out of the log stream.
 
 ## Operator runbook
 
@@ -194,7 +198,8 @@ borg settings set 'mcp.servers.<id>.tools.read_only=["search","read_resource"]'
 ## Design notes
 
 - **No OAuth (yet).** Phase 1 supports `Authorization: Bearer …` headers. OAuth 2.1 PKCE with dynamic client registration and loopback callback is sketched out in the source but not wired — it lights up when a real server demands it.
-- **No sampling.** Server-initiated LLM calls (the `sampling` capability) are refused with `not_supported`. Letting an untrusted server steer Borg's LLM is exactly the wrong direction for the threat model.
+- **No sampling — actively refused.** Server-initiated requests (`sampling/createMessage`, `roots/list`, anything else) are answered with JSON-RPC `-32601` (Method not found) inside `crates/mcp/src/session.rs`. The refusal is also drained by the cortex supervisor and surfaces as an `mcp_sampling_refused` audit row so an operator can SEE that a server tried to drive borg's LLM. Letting an untrusted server steer Borg's LLM is exactly the wrong direction for the threat model.
+- **`Mcp-Session-Id` resumability** is supported by the streamable-HTTP transport. The transport captures the server-emitted `Mcp-Session-Id` on first response, echoes it on every subsequent POST, refreshes on rotation, and drops the cached id on a 404 so the supervisor can transparently re-initialize. Without this, a server-side restart would loop forever sending invalid session ids.
 - **No resources/prompts in the catalog.** Phase 1 surfaces `tools` only; resources and prompts are deferred. The protocol layer parses them; the cortex adapter does not yet expose them.
 
 ## See also

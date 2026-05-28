@@ -57,15 +57,15 @@ pub struct HttpConfig {
     pub policy: HttpPolicy,
 }
 
-/// Domain names that always count as local regardless of DNS resolution.
-/// Cloud metadata services that don't necessarily route to RFC1918 space.
-const FORBIDDEN_HOSTNAMES: &[&str] = &[
-    "localhost",
-    "ip6-localhost",
-    "ip6-loopback",
-    "metadata.google.internal",
-    "metadata.goog",
-];
+/// Loopback hostname aliases that resolve to local interfaces. Refused
+/// unless the operator opts in via `allow_local_network=true`.
+const LOOPBACK_HOSTNAMES: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
+
+/// Hostnames that are refused unconditionally — flipping
+/// `allow_local_network=true` must NOT silently unlock SSRF to cloud
+/// metadata endpoints. These FQDNs have no legitimate intranet use case
+/// for borg.
+const ALWAYS_FORBIDDEN_HOSTNAMES: &[&str] = &["metadata.google.internal", "metadata.goog"];
 
 /// Parse `url` and check the scheme + literal host against the policy.
 ///
@@ -86,18 +86,40 @@ pub fn check_url_syntactic(url: &str, policy: &HttpPolicy) -> Result<Url> {
         });
     }
 
-    if !policy.allow_local_network {
-        if let Some(host) = parsed.host() {
-            if host_is_local_literal(&host) {
-                return Err(McpError::UrlRefused {
-                    url: url.to_string(),
-                    reason: UrlRefusalReason::LocalNetworkBlocked,
-                });
-            }
+    if let Some(host) = parsed.host() {
+        // Cloud-metadata FQDNs (and `localhost` aliases) are refused
+        // unconditionally — flipping `allow_local_network=true` for a
+        // legitimate intranet server must NOT simultaneously unlock SSRF
+        // to GCP/AWS/Azure IMDS. The RFC1918 / loopback IP-literal checks
+        // below still honor `allow_local_network` because operators
+        // legitimately need to talk to their own subnet.
+        if host_is_always_forbidden(&host) {
+            return Err(McpError::UrlRefused {
+                url: url.to_string(),
+                reason: UrlRefusalReason::LocalNetworkBlocked,
+            });
+        }
+        if !policy.allow_local_network && host_is_local_literal(&host) {
+            return Err(McpError::UrlRefused {
+                url: url.to_string(),
+                reason: UrlRefusalReason::LocalNetworkBlocked,
+            });
         }
     }
 
     Ok(parsed)
+}
+
+/// True if the hostname is on the always-refused list — cloud-metadata
+/// FQDNs that have no legitimate intranet use case. Refused even when
+/// `allow_local_network=true`. The IMDS IP literal (169.254.169.254) is
+/// caught separately by the RFC1918 / link-local IP check.
+fn host_is_always_forbidden(host: &url::Host<&str>) -> bool {
+    if let url::Host::Domain(name) = host {
+        let n = name.to_ascii_lowercase();
+        return ALWAYS_FORBIDDEN_HOSTNAMES.contains(&n.as_str());
+    }
+    false
 }
 
 /// A URL that has been checked against policy *and* had its DNS resolution
@@ -179,7 +201,7 @@ fn host_is_local_literal(host: &url::Host<&str>) -> bool {
     match host {
         url::Host::Domain(name) => {
             let n = name.to_ascii_lowercase();
-            FORBIDDEN_HOSTNAMES.contains(&n.as_str())
+            LOOPBACK_HOSTNAMES.contains(&n.as_str())
         }
         url::Host::Ipv4(ip) => ip_is_local(IpAddr::V4(*ip)),
         url::Host::Ipv6(ip) => ip_is_local(IpAddr::V6(*ip)),
@@ -246,26 +268,48 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         headers: config.headers,
         server_name: config.server_name,
         inbox: VecDeque::new(),
+        session_id: None,
     })
 }
+
+/// Header carrying the resumable session id, per the MCP streamable-HTTP
+/// spec. The server may emit this on `initialize` (or later); we echo it on
+/// every subsequent request. A server that returns 404 after the id was
+/// once valid invalidates our cached id and we re-initialize transparently.
+pub const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// Connected HTTP transport.
 ///
 /// Streamable HTTP MCP responses can contain multiple JSON-RPC messages in
 /// one body (e.g. a response plus a `tools/list_changed` notification). We
 /// buffer them in `inbox` and drain via `recv`.
+///
+/// `session_id` holds the most recent `Mcp-Session-Id` echoed by the server;
+/// it is sent on every outbound request so the server can route us back to
+/// the same session state. On `404 Not Found` the cached id is dropped and
+/// `send` returns `TransportClosed` — the cortex session task tears the
+/// session down so the operator sees one clear failure rather than a
+/// wedged transport that keeps POSTing without the header. Auto-reconnect
+/// (calling `start_server` again on a torn-down session) is a follow-up.
 pub struct HttpTransport {
     client: Client,
     url: Url,
     headers: HashMap<String, String>,
     server_name: String,
     inbox: VecDeque<Message>,
+    session_id: Option<String>,
 }
 
 impl HttpTransport {
     /// Server name, for diagnostics.
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// The cached `Mcp-Session-Id`, if the server has emitted one. Surfaced
+    /// for tests + diagnostics; production code should not poke at it.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 }
 
@@ -283,6 +327,14 @@ impl Transport for HttpTransport {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
+        // Echo back any `Mcp-Session-Id` the server has previously assigned
+        // us. Per MCP streamable-HTTP spec this is how a resumable session
+        // routes a follow-up request back to its state. Without this echo
+        // every request reads from a cold session and `tools/list_changed`
+        // notifications can't be honored across reconnects.
+        if let Some(sid) = &self.session_id {
+            req = req.header(MCP_SESSION_ID_HEADER, sid);
+        }
         let resp = req.json(&msg).send().await.map_err(|e| {
             McpError::TransportClosed(format!("{}: http send failed: {e}", self.server_name))
         })?;
@@ -297,6 +349,23 @@ impl Transport for HttpTransport {
                 truncate(&body, 200)
             )));
         }
+        // 404 with a stale session id means "session not found, re-init."
+        // Drop the cached id and surface a TransportClosed so the supervisor
+        // (one level up) discards this transport and opens a fresh one.
+        // Without this branch a server-side restart would loop forever
+        // sending invalid session ids.
+        if status == reqwest::StatusCode::NOT_FOUND && self.session_id.is_some() {
+            tracing::info!(
+                server = %self.server_name,
+                "MCP session id rejected (404); will re-initialize",
+            );
+            self.session_id = None;
+            return Err(McpError::TransportClosed(format!(
+                "{}: session id invalidated (404); transport torn down — \
+                 re-init requires daemon restart",
+                self.server_name
+            )));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(McpError::TransportClosed(format!(
@@ -305,6 +374,21 @@ impl Transport for HttpTransport {
                 status.as_u16(),
                 truncate(&body, 200)
             )));
+        }
+
+        // Capture / refresh the session id from the response headers. The
+        // server may emit it on `initialize` or rotate it later; we always
+        // adopt the most recently seen value.
+        if let Some(hv) = resp.headers().get(MCP_SESSION_ID_HEADER) {
+            if let Ok(s) = hv.to_str() {
+                if self.session_id.as_deref() != Some(s) {
+                    tracing::debug!(
+                        server = %self.server_name,
+                        "adopted Mcp-Session-Id from server",
+                    );
+                }
+                self.session_id = Some(s.to_string());
+            }
         }
 
         let body = resp.bytes().await.map_err(|e| {

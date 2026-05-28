@@ -42,6 +42,14 @@ pub struct McpConfig {
     /// Per-server config, keyed by operator-chosen server name.
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
+    /// Per-`tools/call` response size cap (bytes). Output beyond this is
+    /// truncated before the redaction + trust-wrap pipeline and an
+    /// `mcp_response_truncated` audit row is written. A hostile or buggy
+    /// server cannot dump an unbounded blob into the LLM context this way.
+    /// Default: 1 MiB — matches the WASM plugin sandbox's `max_output_bytes`
+    /// ceiling so the two untrusted-code paths share one budget.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
 }
 
 impl Default for McpConfig {
@@ -53,12 +61,17 @@ impl Default for McpConfig {
             allow_local_network: false,
             disabled_servers: Vec::new(),
             servers: HashMap::new(),
+            max_response_bytes: default_max_response_bytes(),
         }
     }
 }
 
 fn default_max_tools_total() -> usize {
     mcp::registry::DEFAULT_GLOBAL_TOOL_CAP
+}
+
+fn default_max_response_bytes() -> usize {
+    1024 * 1024
 }
 
 /// Per-server config.

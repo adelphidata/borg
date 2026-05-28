@@ -273,6 +273,7 @@ define_settings! {
         "mcp.allow_local_network" => mcp.allow_local_network, parsed(bool);
         "mcp.disabled_servers" => mcp.disabled_servers, json;
         "mcp.servers" => mcp.servers, json;
+        "mcp.max_response_bytes" => mcp.max_response_bytes, parsed(usize);
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
