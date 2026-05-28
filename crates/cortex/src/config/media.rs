@@ -169,6 +169,15 @@ pub struct AudioModelConfig {
     /// default (false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xai_stt_diarize: Option<bool>,
+    /// `provider = "custom"`-only: shell command template that consumes an
+    /// audio file and writes the transcript to stdout. Template tokens:
+    /// `{audio_file}` (path to a temp WAV/MP3 the runtime writes), and
+    /// `{language}` (the language hint after shell-token validation, empty
+    /// when unset). The token allowlist mirrors the TTS side
+    /// (`media::tts::validate_voice_id`) so a hostile model can't escape
+    /// the shell. Required when `provider = "custom"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// Audio transcription configuration with multi-provider fallback.

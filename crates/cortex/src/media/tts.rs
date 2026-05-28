@@ -116,7 +116,7 @@ trait TtsProvider: Send + Sync {
 /// like `en-US.male.1` still pass. A separate `..` rejection closes
 /// path-traversal: `voice = ".."` would otherwise let a model pivot
 /// ElevenLabs' `/v1/text-to-speech/{voice}` to a sibling endpoint.
-fn validate_voice_id(voice: &str) -> Result<()> {
+pub(crate) fn validate_voice_id(voice: &str) -> Result<()> {
     if voice.is_empty() {
         bail!("voice id is empty");
     }
@@ -195,6 +195,7 @@ fn elevenlabs_format(fmt: AudioFormat) -> &'static str {
 struct ElevenLabsTtsProvider {
     client: Client,
     api_key: String,
+    base_url: String,
     default_model: String,
 }
 
@@ -203,7 +204,11 @@ impl TtsProvider for ElevenLabsTtsProvider {
     async fn synthesize(&self, req: &SynthesisRequest<'_>) -> Result<Vec<u8>> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         validate_voice_id(&req.voice).context("ElevenLabs voice id")?;
-        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{}", req.voice);
+        let url = format!(
+            "{}/v1/text-to-speech/{}",
+            self.base_url.trim_end_matches('/'),
+            req.voice
+        );
 
         let body = serde_json::json!({
             "text": req.text,
@@ -1016,6 +1021,32 @@ impl TtsSynthesizer {
         }
     }
 
+    /// Test-only constructor that wires a single OpenAI-compatible provider
+    /// at an operator-supplied `base_url` — typically a `wiremock::MockServer`
+    /// uri. Lets handler tests exercise the happy path (Multimodal audio
+    /// response, byte length, MIME) without depending on a real cloud API
+    /// key. Production code MUST go through `from_config`.
+    #[cfg(test)]
+    pub(crate) fn single_openai_for_test(base_url: String, api_key: String) -> Self {
+        Self {
+            entries: vec![TtsProviderEntry {
+                provider: Box::new(OpenAiTtsProvider {
+                    client: Client::new(),
+                    api_key,
+                    base_url,
+                    default_model: "tts-1".to_string(),
+                }),
+                model: None,
+                voice: Some("alloy".to_string()),
+                timeout: Some(Duration::from_secs(5)),
+            }],
+            default_voice: "alloy".to_string(),
+            default_format: AudioFormat::Mp3,
+            max_text_length: 4096,
+            default_timeout: Duration::from_secs(5),
+        }
+    }
+
     /// Build TTS engine from config. Returns None if disabled or no providers available.
     pub fn from_config(config: &Config) -> Option<Self> {
         if !config.tts.enabled {
@@ -1088,6 +1119,7 @@ impl TtsSynthesizer {
                 Some(Box::new(ElevenLabsTtsProvider {
                     client: client.clone(),
                     api_key,
+                    base_url: "https://api.elevenlabs.io".to_string(),
                     default_model: "eleven_multilingual_v2".to_string(),
                 }))
             }
@@ -2143,5 +2175,261 @@ mod tests {
         // either. (We don't try to delete it on success because we expect
         // it to never be created.)
         assert!(!std::path::Path::new("/tmp/borg_pwned_should_never_appear").exists());
+    }
+
+    // ── Wiremock-backed provider HTTP tests ──
+    //
+    // Until these existed, every cloud TTS provider could regress its
+    // wire protocol (method, path, auth header, body shape) without a
+    // single test failing. We bypass `from_config` and instantiate
+    // providers directly so we can pin `base_url` at the mock URI —
+    // production callers still go through `from_config`.
+
+    use wiremock::matchers::{body_json_string, header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_synth_request<'a>(text: &'a str, voice: &str) -> SynthesisRequest<'a> {
+        SynthesisRequest {
+            text,
+            voice: voice.to_string(),
+            format: AudioFormat::Mp3,
+            model: None,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_tts_provider_returns_audio_bytes_on_success() {
+        let server = MockServer::start().await;
+        let audio_payload = b"\xff\xfb\x90\x00mock-mp3-bytes";
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/speech"))
+            .and(header("authorization", "Bearer sk-mock"))
+            .and(header("content-type", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(audio_payload.to_vec(), "audio/mpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiTtsProvider {
+            client: Client::new(),
+            api_key: "sk-mock".to_string(),
+            base_url: server.uri(),
+            default_model: "tts-1".to_string(),
+        };
+        let bytes = provider
+            .synthesize(&make_synth_request("hello", "alloy"))
+            .await
+            .expect("OpenAI TTS success");
+        assert_eq!(bytes, audio_payload);
+    }
+
+    #[tokio::test]
+    async fn openai_tts_provider_surfaces_429_with_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiTtsProvider {
+            client: Client::new(),
+            api_key: "sk-mock".to_string(),
+            base_url: server.uri(),
+            default_model: "tts-1".to_string(),
+        };
+        let err = provider
+            .synthesize(&make_synth_request("hello", "alloy"))
+            .await
+            .expect_err("429 must surface");
+        let msg = format!("{err}");
+        assert!(msg.contains("OpenAI"), "missing provider: {msg}");
+        assert!(msg.contains("429"), "missing status: {msg}");
+        assert!(msg.contains("rate limited"), "missing body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn openai_tts_provider_sends_voice_and_text_in_request_body() {
+        // Asserts the wire-shape isn't quietly changed (no field renames,
+        // no missing voice). The mock would 500 if the body shape drifts.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/speech"))
+            .and(body_json_string(
+                serde_json::json!({
+                    "model": "tts-1",
+                    "input": "hi",
+                    "voice": "nova",
+                    "response_format": "mp3",
+                })
+                .to_string(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OK".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiTtsProvider {
+            client: Client::new(),
+            api_key: "sk".to_string(),
+            base_url: server.uri(),
+            default_model: "tts-1".to_string(),
+        };
+        let bytes = provider
+            .synthesize(&make_synth_request("hi", "nova"))
+            .await
+            .expect("body shape must match");
+        assert_eq!(bytes, b"OK");
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_tts_provider_returns_audio_bytes_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/text-to-speech/voice_abc"))
+            .and(header("xi-api-key", "el-mock-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"eleven-audio".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = ElevenLabsTtsProvider {
+            client: Client::new(),
+            api_key: "el-mock-key".to_string(),
+            base_url: server.uri(),
+            default_model: "eleven_multilingual_v2".to_string(),
+        };
+        let bytes = provider
+            .synthesize(&make_synth_request("hello", "voice_abc"))
+            .await
+            .expect("ElevenLabs success");
+        assert_eq!(bytes, b"eleven-audio");
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_tts_provider_surfaces_401_with_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/text-to-speech/voice_abc"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = ElevenLabsTtsProvider {
+            client: Client::new(),
+            api_key: "wrong".to_string(),
+            base_url: server.uri(),
+            default_model: "eleven_multilingual_v2".to_string(),
+        };
+        let err = provider
+            .synthesize(&make_synth_request("hello", "voice_abc"))
+            .await
+            .expect_err("401 must surface");
+        let msg = format!("{err}");
+        assert!(msg.contains("ElevenLabs"), "missing provider: {msg}");
+        assert!(msg.contains("401"), "missing status: {msg}");
+        assert!(msg.contains("bad key"), "missing body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_tts_provider_rejects_path_traversal_voice_pre_flight() {
+        // The voice id is spliced into the URL path. A "..", "../admin"
+        // etc. attempt must be rejected before reqwest builds the URL,
+        // so the test does NOT need a wiremock — validate_voice_id
+        // fires first. Mirrors the standalone validate_voice_id_rejects
+        // tests but at the provider boundary.
+        let provider = ElevenLabsTtsProvider {
+            client: Client::new(),
+            api_key: "k".to_string(),
+            base_url: "http://unused.invalid".to_string(),
+            default_model: "eleven_multilingual_v2".to_string(),
+        };
+        for bad in ["..", "../admin", "voice/../escape", "voice id"] {
+            let err = provider
+                .synthesize(&make_synth_request("hello", bad))
+                .await
+                .expect_err(&format!("voice {bad:?} must be rejected"));
+            assert!(
+                format!("{err}").to_lowercase().contains("voice"),
+                "expected voice-id rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    /// Spec: the TTS fallback chain must move on to the next provider
+    /// when the first one fails, and the `SynthesisAttempt` log must
+    /// record both attempts in order so observability can show what
+    /// was tried.
+    #[tokio::test]
+    async fn tts_fallback_chain_advances_past_failing_provider() {
+        let server_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        // The `name()` returned by each provider must differ so the
+        // fallback log discriminates them. Use OpenAI as primary,
+        // ElevenLabs as secondary — different paths, different provider
+        // names in the attempt log.
+        let server_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/text-to-speech/alloy"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secondary-audio".to_vec()))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let synthesizer = TtsSynthesizer {
+            entries: vec![
+                TtsProviderEntry {
+                    provider: Box::new(OpenAiTtsProvider {
+                        client: Client::new(),
+                        api_key: "k1".to_string(),
+                        base_url: server_a.uri(),
+                        default_model: "tts-1".to_string(),
+                    }),
+                    model: None,
+                    voice: Some("alloy".to_string()),
+                    timeout: Some(Duration::from_secs(5)),
+                },
+                TtsProviderEntry {
+                    provider: Box::new(ElevenLabsTtsProvider {
+                        client: Client::new(),
+                        api_key: "k2".to_string(),
+                        base_url: server_b.uri(),
+                        default_model: "eleven_multilingual_v2".to_string(),
+                    }),
+                    model: None,
+                    voice: Some("alloy".to_string()),
+                    timeout: Some(Duration::from_secs(5)),
+                },
+            ],
+            default_voice: "alloy".to_string(),
+            default_format: AudioFormat::Mp3,
+            max_text_length: 4096,
+            default_timeout: Duration::from_secs(5),
+        };
+        let (bytes, _fmt, attempts) = synthesizer
+            .synthesize("hello", None, None)
+            .await
+            .expect("fallback must succeed");
+        assert_eq!(bytes, b"secondary-audio");
+        assert_eq!(attempts.len(), 2, "both attempts must be recorded");
+        assert_eq!(attempts[0].provider, "openai");
+        assert!(
+            matches!(attempts[0].outcome, SynthesisOutcome::Failed(_)),
+            "primary attempt must be marked failed"
+        );
+        assert_eq!(attempts[1].provider, "elevenlabs");
+        assert!(matches!(attempts[1].outcome, SynthesisOutcome::Success));
     }
 }

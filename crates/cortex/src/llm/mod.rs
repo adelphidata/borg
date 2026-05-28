@@ -465,6 +465,23 @@ fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap
 /// Missing fields surface as a clear config error rather than a runtime
 /// 400 from Azure — `LlmClient::new` invokes this at construction time
 /// for `Provider::AzureOpenAi`.
+/// Compose an Ollama OpenAI-compatible endpoint from a host or host+path
+/// string (the ecosystem convention is `OLLAMA_HOST=http://10.0.0.5:11434`,
+/// scheme optional). Already-suffixed inputs are returned unchanged so an
+/// operator pasting the full URL from existing docs keeps working.
+pub(crate) fn compose_ollama_url(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    if trimmed.contains("/v1/chat/completions") {
+        return trimmed.to_string();
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    format!("{with_scheme}/v1/chat/completions")
+}
+
 pub(crate) fn compose_azure_openai_url(cfg: &crate::config::LlmConfig) -> anyhow::Result<String> {
     let resource = cfg
         .azure_resource
@@ -613,6 +630,23 @@ impl LlmClient {
                 vertex::compose_anthropic_url(&llm_config, &model, true)?;
             } else {
                 llm_config.base_url = Some(vertex::compose_gemini_url(&llm_config)?);
+            }
+        }
+        // Ollama ecosystem convention: `OLLAMA_HOST` is a host[:port] string.
+        // When the operator sets it but hasn't pinned `llm.base_url`, compose
+        // the OpenAI-compat endpoint so a remote Ollama just works.
+        if provider == Provider::Ollama
+            && llm_config
+                .base_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
+            if let Some(host) = std::env::var("OLLAMA_HOST")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                llm_config.base_url = Some(compose_ollama_url(&host));
             }
         }
 
@@ -2144,3 +2178,46 @@ impl LlmClient {
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
+
+#[cfg(test)]
+mod ollama_url_tests {
+    use super::compose_ollama_url;
+
+    #[test]
+    fn compose_ollama_url_accepts_host_only() {
+        // Ecosystem convention: `OLLAMA_HOST=10.0.0.5:11434` must work
+        // without forcing the operator to remember the OpenAI-compat path.
+        assert_eq!(
+            compose_ollama_url("10.0.0.5:11434"),
+            "http://10.0.0.5:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compose_ollama_url_preserves_explicit_scheme() {
+        // HTTPS-fronted Ollama (Tailscale Funnel, Caddy, etc.) must not
+        // be silently downgraded to plaintext.
+        assert_eq!(
+            compose_ollama_url("https://ollama.tailnet.example"),
+            "https://ollama.tailnet.example/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compose_ollama_url_passes_through_fully_qualified_url() {
+        // Operators copy-pasting the full endpoint from existing docs
+        // should not get a doubled `/v1/chat/completions` suffix.
+        let url = "http://localhost:11434/v1/chat/completions";
+        assert_eq!(compose_ollama_url(url), url);
+    }
+
+    #[test]
+    fn compose_ollama_url_strips_trailing_slash_before_append() {
+        // Both `http://h:11434` and `http://h:11434/` must produce the
+        // same canonical endpoint — otherwise we'd POST to a doubled `//`.
+        assert_eq!(
+            compose_ollama_url("http://h:11434/"),
+            "http://h:11434/v1/chat/completions"
+        );
+    }
+}

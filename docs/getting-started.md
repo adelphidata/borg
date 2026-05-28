@@ -158,6 +158,63 @@ borg service status     # check service status
 | `borg update` | Update borg to the latest released version (`--prerelease`/`-p` for experimental builds, `--check`/`-c` to dry-run) |
 | `borg uninstall` | Delete all Borg data |
 
+## Running fully local (no cloud keys)
+
+Borg's STT/TTS/LLM layers all support a local-first stack. The pieces below
+require no API keys — point each subsystem at the right local endpoint and
+everything stays on-device.
+
+**LLM (Ollama or any OpenAI-compatible local server — e.g. llama.cpp's `server`).**
+
+```sh
+# Default Ollama on localhost — no settings needed.
+borg settings set llm.provider ollama
+borg settings set llm.model "gemma3:4b"
+
+# Remote Ollama or non-default port — set OLLAMA_HOST or llm.base_url.
+export OLLAMA_HOST=http://10.0.0.5:11434          # scheme optional
+# or:
+borg settings set llm.base_url http://10.0.0.5:11434/v1/chat/completions
+
+# llama.cpp / vLLM / LM Studio — use the `custom` provider with the
+# OpenAI-compatible base_url published by the server.
+borg settings set llm.provider custom
+borg settings set llm.base_url http://localhost:8080/v1/chat/completions
+borg settings set llm.model "gemma-3-4b-it"
+```
+
+**TTS (Piper / Edge / a `custom` shell template for Qwen3-TTS, XTTS, etc.).**
+
+```toml
+# `tts.providers` in borg settings — append a row:
+[[tts.providers]]
+provider = "custom"
+command  = "python -m qwen3_tts --text-file {text_file} --voice {voice} --out {out_path}"
+default_voice    = "en_US-female-1"
+output_extension = "wav"
+```
+
+`{text_file}`, `{voice}`, `{out_path}` are substituted before `sh -c` runs.
+The `voice` argument is allowlisted to `[A-Za-z0-9_.-]` so a hostile LLM
+can't escape into the shell.
+
+**STT (whisper.cpp / Parakeet / faster-whisper / MLX-whisper — anything that
+takes an audio file and prints the transcript).**
+
+```toml
+[[audio.models]]
+provider         = "custom"
+command          = "parakeet-asr --audio {audio_file} --language {language} --output -"
+language         = "en"
+```
+
+The command's stdout is the transcript. `{language}` is validated with the
+same allowlist as TTS `{voice}`.
+
+The `whisper-rs` binding is still available as a built-in `local` STT
+provider, but it requires the `local-stt` cargo feature. The `custom`
+provider needs no build-time choice — any binary on `PATH` works.
+
 ## What happens when you chat
 
 1. Your message is added to the conversation history

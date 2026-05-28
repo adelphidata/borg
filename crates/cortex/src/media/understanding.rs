@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-#[cfg(feature = "local-stt")]
 use anyhow::Context;
 use anyhow::{bail, Result};
 use reqwest::Client;
@@ -127,6 +126,7 @@ impl TranscriptionProvider for WhisperProvider {
 struct DeepgramProvider {
     client: Client,
     api_key: String,
+    base_url: String,
     default_model: String,
 }
 
@@ -134,7 +134,7 @@ struct DeepgramProvider {
 impl TranscriptionProvider for DeepgramProvider {
     async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
-        let mut url = format!("https://api.deepgram.com/v1/listen?model={model}");
+        let mut url = format!("{}/v1/listen?model={model}", self.base_url);
         if let Some(ref lang) = req.language {
             url.push_str(&format!("&language={lang}"));
         }
@@ -346,6 +346,118 @@ impl TranscriptionProvider for XaiSttProvider {
     }
 }
 
+// ── Custom STT Provider (local CLI via shell template) ──
+
+/// Custom STT — shells out to an operator-defined command template.
+/// Template tokens: `{audio_file}` (path to a temp file holding the input
+/// audio bytes) and `{language}` (validated language hint, empty if unset).
+/// The command writes the transcript to stdout. Mirrors `CustomTtsProvider`
+/// so any local CLI inference tool (Parakeet, faster-whisper, MLX-whisper,
+/// `whisper.cpp`'s `main` binary, etc.) becomes a one-config-line install
+/// without needing whisper-rs's heavy C++ build path.
+struct CustomSttProvider {
+    name: String,
+    /// Command template with `{audio_file}` and (optional) `{language}`.
+    command_template: String,
+    /// Extension to give the temp audio file; some CLIs sniff by extension.
+    audio_extension: String,
+}
+
+#[async_trait::async_trait]
+impl TranscriptionProvider for CustomSttProvider {
+    async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
+        let template = self.command_template.clone();
+        let ext = self.audio_extension.clone();
+        let audio_bytes = req.audio_bytes.to_vec();
+        let language = req.language.clone().unwrap_or_default();
+        let timeout = req.timeout;
+
+        tokio::task::spawn_blocking(move || {
+            custom_transcribe(&template, &audio_bytes, &ext, &language, timeout)
+        })
+        .await
+        .context("custom stt task panicked")?
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn custom_transcribe(
+    template: &str,
+    audio_bytes: &[u8],
+    extension: &str,
+    language: &str,
+    timeout: Duration,
+) -> Result<String> {
+    use std::io::{Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    // `{language}` is substituted into the shell template via plain string
+    // replacement before `sh -c`, so a hostile model supplying
+    // `language = "$(rm -rf ~)"` would otherwise execute arbitrary shell.
+    // Same trust boundary as `CustomTtsProvider`'s voice id — reuse the
+    // validator rather than duplicating the regex.
+    if !language.is_empty() {
+        crate::media::tts::validate_voice_id(language).context("custom STT language hint")?;
+    }
+
+    let mut audio_file = tempfile::Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile()?;
+    audio_file.write_all(audio_bytes)?;
+    audio_file.flush()?;
+    let audio_path = audio_file.path().to_string_lossy().into_owned();
+
+    let cmd_str = template
+        .replace("{audio_file}", &audio_path)
+        .replace("{language}", language);
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn custom stt")?;
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("custom stt timed out after {timeout:?}");
+        }
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        s.read_to_string(&mut stdout)?;
+    }
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        s.read_to_string(&mut stderr)?;
+    }
+
+    if !status.success() {
+        bail!(
+            "custom stt exited with {status}: {}",
+            stderr.trim().chars().take(400).collect::<String>()
+        );
+    }
+
+    let transcript = stdout.trim();
+    if transcript.is_empty() {
+        bail!("custom stt produced empty transcript");
+    }
+    Ok(transcript.to_string())
+}
+
 /// Parse Deepgram JSON response to extract transcript text.
 pub fn parse_deepgram_response(json: &serde_json::Value) -> Result<String> {
     json["results"]["channels"]
@@ -461,6 +573,7 @@ impl AudioTranscriber {
                 Some(Box::new(DeepgramProvider {
                     client: client.clone(),
                     api_key,
+                    base_url: "https://api.deepgram.com".to_string(),
                     default_model: "nova-3".to_string(),
                 }))
             }
@@ -524,6 +637,39 @@ impl AudioTranscriber {
                     // can flip either behavior per-model row.
                     format: model_cfg.xai_stt_format.unwrap_or(true),
                     diarize: model_cfg.xai_stt_diarize.unwrap_or(false),
+                }))
+            }
+            // Local CLI shell-template. Unblocks Parakeet, faster-whisper,
+            // MLX-whisper, and any other ASR binary without forcing the
+            // operator to wrap it in an HTTP server first. No API key —
+            // skip only when the template is missing (operator error).
+            "custom" => {
+                let template = model_cfg
+                    .command
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())?;
+                if !template.contains("{audio_file}") {
+                    warn!(
+                        "STT provider 'custom' is missing `{{audio_file}}` in its command \
+                         template; skipping"
+                    );
+                    return None;
+                }
+                let ext = match model_cfg
+                    .model
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
+                    Some("mp3") => "mp3".to_string(),
+                    Some("flac") => "flac".to_string(),
+                    Some("ogg") => "ogg".to_string(),
+                    _ => "wav".to_string(),
+                };
+                Some(Box::new(CustomSttProvider {
+                    name: "custom".to_string(),
+                    command_template: template.to_string(),
+                    audio_extension: ext,
                 }))
             }
             other => {
@@ -677,6 +823,7 @@ mod tests {
                 timeout_ms: None,
                 xai_stt_format: None,
                 xai_stt_diarize: None,
+                command: None,
             })
             .collect();
 
@@ -720,6 +867,7 @@ mod tests {
             timeout_ms: None,
             xai_stt_format: Some(false),
             xai_stt_diarize: Some(true),
+            command: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
@@ -737,6 +885,7 @@ mod tests {
             timeout_ms: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
+            command: None,
         };
         let json = serde_json::to_string(&none_cfg).unwrap();
         let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
@@ -764,8 +913,164 @@ mod tests {
             timeout_ms: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
+            command: None,
         }];
         // No usable providers → from_config returns None.
+        assert!(AudioTranscriber::from_config(&config).is_none());
+    }
+
+    /// Spec: `custom` STT provider executes the operator's shell template
+    /// and returns stdout as the transcript. Uses `cat` so the test stays
+    /// hermetic (no Parakeet / faster-whisper / Python deps to install).
+    #[tokio::test]
+    async fn custom_stt_runs_shell_template_and_returns_stdout() {
+        use crate::config::AudioModelConfig;
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        // Test payloads are short; drop the floor so size validation
+        // doesn't short-circuit before the provider runs.
+        config.audio.min_file_size = 1;
+        // `cat {audio_file}` echoes the audio bytes back as the transcript.
+        // We feed UTF-8 in, so the round-trip works for assertion purposes.
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(5_000),
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some("cat {audio_file}".to_string()),
+        }];
+
+        let transcriber =
+            AudioTranscriber::from_config(&config).expect("custom STT must build");
+        let payload = b"parakeet would put real text here";
+        let (text, attempts) = transcriber
+            .transcribe(payload, "audio/wav", "test.wav", None)
+            .await
+            .expect("custom STT transcribe");
+        assert_eq!(text, "parakeet would put real text here");
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(attempts[0].outcome, AttemptOutcome::Success));
+        assert_eq!(attempts[0].provider, "custom");
+    }
+
+    /// Spec: a hostile `language` hint containing shell metacharacters
+    /// must be rejected before substitution. Otherwise a model-supplied
+    /// `language = "en$(touch /tmp/borg-pwn)"` would let the LLM run
+    /// arbitrary shell. Mirrors `tts.rs::custom_synthesize_rejects_shell_metachars_in_voice`.
+    #[tokio::test]
+    async fn custom_stt_rejects_shell_metachars_in_language() {
+        use crate::config::AudioModelConfig;
+        // Marker file the injection would touch if validation failed.
+        let marker = std::env::temp_dir().join("borg-stt-injection-check");
+        let _ = std::fs::remove_file(&marker);
+
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.min_file_size = 1;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            // Vector tries to break out of the template into a real shell
+            // command. Validation must reject before `sh -c` runs.
+            language: Some(format!("en$(touch {})", marker.display())),
+            timeout_ms: Some(5_000),
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            // Template references `{audio_file}` so build_provider accepts
+            // it; the language-validation check fires at transcribe time.
+            command: Some("cat {audio_file}".to_string()),
+        }];
+        let transcriber =
+            AudioTranscriber::from_config(&config).expect("custom STT must build");
+
+        let result = transcriber
+            .transcribe(b"ignored", "audio/wav", "x.wav", None)
+            .await;
+        assert!(result.is_err(), "injection vector must error");
+        assert!(
+            !marker.exists(),
+            "shell command ran despite language validation — security regression"
+        );
+    }
+
+    /// Spec: an empty-transcript stdout must surface as an error so the
+    /// fallback chain can try the next provider rather than silently
+    /// committing a blank transcription.
+    #[tokio::test]
+    async fn custom_stt_empty_stdout_errors() {
+        use crate::config::AudioModelConfig;
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.min_file_size = 1;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(5_000),
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            // Command that exits 0 with no stdout — silent ASR failure.
+            command: Some("true # consume {audio_file}".to_string()),
+        }];
+        let transcriber =
+            AudioTranscriber::from_config(&config).expect("custom STT must build");
+        let err = transcriber
+            .transcribe(b"some-audio", "audio/wav", "x.wav", None)
+            .await
+            .expect_err("empty transcript must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("All transcription providers failed"),
+            "expected fallback-chain failure summary, got: {msg}"
+        );
+    }
+
+    /// Spec: a config row with `provider = "custom"` but missing `command`
+    /// must be skipped (operator misconfiguration) rather than panicking
+    /// or substituting a default that runs arbitrary user state.
+    #[test]
+    fn custom_stt_without_command_template_is_skipped() {
+        use crate::config::AudioModelConfig;
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: None,
+        }];
+        // No other providers in the chain → from_config returns None.
+        assert!(AudioTranscriber::from_config(&config).is_none());
+    }
+
+    /// Spec: a `command` template missing the `{audio_file}` placeholder
+    /// is operator error — the CLI would have nothing to transcribe.
+    /// Surface as "skip" so the fallback chain can recover, not as a
+    /// hard panic at build time.
+    #[test]
+    fn custom_stt_command_without_audio_file_token_is_skipped() {
+        use crate::config::AudioModelConfig;
+        let mut config = crate::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some("echo hello".to_string()),
+        }];
         assert!(AudioTranscriber::from_config(&config).is_none());
     }
 
@@ -801,5 +1106,296 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    // ── Wiremock-backed provider HTTP tests ──
+    //
+    // These exercise the actual `reqwest` request shape (method, path,
+    // auth header, multipart form fields) against a `MockServer`. Until
+    // they existed, every cloud STT provider could regress its wire
+    // protocol without a single test failing. We bypass `from_config`
+    // and instantiate providers directly so we can pin `base_url` at
+    // the mock URL — production callers still go through `from_config`.
+
+    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_request<'a>(audio: &'a [u8]) -> TranscriptionRequest<'a> {
+        TranscriptionRequest {
+            audio_bytes: audio,
+            mime_type: "audio/wav".to_string(),
+            filename: "clip.wav".to_string(),
+            model: None,
+            language: None,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn whisper_provider_returns_transcript_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer sk-mock-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "hello from mock"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = WhisperProvider {
+            client: Client::new(),
+            api_key: "sk-mock-key".to_string(),
+            base_url: server.uri(),
+            default_model: "whisper-1".to_string(),
+            provider_name: "openai".to_string(),
+        };
+        let transcript = provider
+            .transcribe(&make_request(b"audio-bytes"))
+            .await
+            .expect("mocked success");
+        assert_eq!(transcript, "hello from mock");
+    }
+
+    #[tokio::test]
+    async fn whisper_provider_surfaces_5xx_with_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream busy"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = WhisperProvider {
+            client: Client::new(),
+            api_key: "sk".to_string(),
+            base_url: server.uri(),
+            default_model: "whisper-1".to_string(),
+            provider_name: "openai".to_string(),
+        };
+        let err = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect_err("503 must surface");
+        let msg = format!("{err}");
+        // The fallback chain reads the provider's error string to decide
+        // whether to retry the next provider, so the status + provider
+        // name need to actually be in the message.
+        assert!(msg.contains("openai"), "missing provider name: {msg}");
+        assert!(msg.contains("503"), "missing status: {msg}");
+        assert!(msg.contains("upstream busy"), "missing body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn whisper_provider_errors_on_missing_text_field() {
+        // OpenAI/Groq sometimes return 200 with an unexpected payload
+        // shape on partial outages. Treat that as a failed attempt so
+        // the chain falls over to the next provider rather than
+        // returning an empty transcript to the user.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"unrelated": 1})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = WhisperProvider {
+            client: Client::new(),
+            api_key: "sk".to_string(),
+            base_url: server.uri(),
+            default_model: "whisper-1".to_string(),
+            provider_name: "openai".to_string(),
+        };
+        let err = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect_err("missing text must error");
+        assert!(format!("{err}").contains("Whisper"));
+    }
+
+    #[tokio::test]
+    async fn deepgram_provider_returns_transcript_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/listen"))
+            .and(header("authorization", "Token dg-mock-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": {"channels": [{"alternatives": [{"transcript": "from deepgram"}]}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            client: Client::new(),
+            api_key: "dg-mock-token".to_string(),
+            base_url: server.uri(),
+            default_model: "nova-3".to_string(),
+        };
+        let transcript = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect("deepgram success");
+        assert_eq!(transcript, "from deepgram");
+    }
+
+    #[tokio::test]
+    async fn deepgram_provider_surfaces_500_with_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/listen"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("deepgram-down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            client: Client::new(),
+            api_key: "k".to_string(),
+            base_url: server.uri(),
+            default_model: "nova-3".to_string(),
+        };
+        let err = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect_err("500 must surface");
+        let msg = format!("{err}");
+        assert!(msg.contains("Deepgram"), "missing provider: {msg}");
+        assert!(msg.contains("500"), "missing status: {msg}");
+        assert!(msg.contains("deepgram-down"), "missing body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn xai_stt_provider_returns_transcript_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/stt"))
+            .and(header("authorization", "Bearer xai-mock-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "hi xai"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = XaiSttProvider {
+            client: Client::new(),
+            api_key: "xai-mock-key".to_string(),
+            // xAI's base is `…/v1`, the provider appends `/stt`.
+            base_url: format!("{}/v1", server.uri()),
+            format: true,
+            diarize: false,
+        };
+        let transcript = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect("xai success");
+        assert_eq!(transcript, "hi xai");
+    }
+
+    #[tokio::test]
+    async fn xai_stt_provider_surfaces_4xx_with_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/stt"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = XaiSttProvider {
+            client: Client::new(),
+            api_key: "xai-mock-key".to_string(),
+            // xAI's base is `…/v1`, the provider appends `/stt`.
+            base_url: format!("{}/v1", server.uri()),
+            format: true,
+            diarize: false,
+        };
+        let err = provider
+            .transcribe(&make_request(b"audio"))
+            .await
+            .expect_err("401 must surface");
+        let msg = format!("{err}");
+        assert!(msg.contains("401"), "missing status: {msg}");
+    }
+
+    /// Spec: the fallback chain in `AudioTranscriber::transcribe` must move
+    /// on to the next provider when the first one fails, and the
+    /// `TranscriptionAttempt` log must record both attempts in order so
+    /// downstream observability can show what was tried.
+    #[tokio::test]
+    async fn fallback_chain_advances_past_failing_provider() {
+        // Server returns 503 on the first endpoint, 200 on the second.
+        let server_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("primary down"))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        let server_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "secondary served it"})),
+            )
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let transcriber = AudioTranscriber {
+            entries: vec![
+                ProviderEntry {
+                    provider: Box::new(WhisperProvider {
+                        client: Client::new(),
+                        api_key: "k1".to_string(),
+                        base_url: server_a.uri(),
+                        default_model: "whisper-1".to_string(),
+                        provider_name: "primary".to_string(),
+                    }),
+                    model: None,
+                    language: None,
+                    timeout: Some(Duration::from_secs(5)),
+                },
+                ProviderEntry {
+                    provider: Box::new(WhisperProvider {
+                        client: Client::new(),
+                        api_key: "k2".to_string(),
+                        base_url: server_b.uri(),
+                        default_model: "whisper-1".to_string(),
+                        provider_name: "secondary".to_string(),
+                    }),
+                    model: None,
+                    language: None,
+                    timeout: Some(Duration::from_secs(5)),
+                },
+            ],
+            max_file_size: 20 * 1024 * 1024,
+            min_file_size: 1,
+            default_language: None,
+            default_timeout: Duration::from_secs(5),
+        };
+
+        let (text, attempts) = transcriber
+            .transcribe(b"audio-bytes", "audio/wav", "x.wav", None)
+            .await
+            .expect("fallback must succeed once secondary returns 200");
+        assert_eq!(text, "secondary served it");
+        assert_eq!(attempts.len(), 2, "both attempts must be recorded");
+        assert_eq!(attempts[0].provider, "primary");
+        assert!(
+            matches!(attempts[0].outcome, AttemptOutcome::Failed(_)),
+            "primary attempt must be marked failed"
+        );
+        assert_eq!(attempts[1].provider, "secondary");
+        assert!(matches!(attempts[1].outcome, AttemptOutcome::Success));
     }
 }

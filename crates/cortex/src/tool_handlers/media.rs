@@ -661,6 +661,73 @@ mod tests {
         }
     }
 
+    /// Spec: when synthesis succeeds, the handler must return a
+    /// `Multimodal` output carrying (a) a one-line text summary that
+    /// includes the byte length and MIME, and (b) an `AudioBase64`
+    /// content part with the provider's audio bytes base64-encoded and
+    /// the correct MIME label. Until this test existed, every handler
+    /// test asserted on an error branch — a regression that returned
+    /// e.g. `ToolOutput::Text` on success would have shipped.
+    #[tokio::test]
+    async fn handle_text_to_speech_returns_multimodal_audio_on_success() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let audio_payload = b"\xff\xfb\x90\x00mock-handler-mp3".to_vec();
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(audio_payload.clone(), "audio/mpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let synth = crate::media::tts::TtsSynthesizer::single_openai_for_test(
+            server.uri(),
+            "sk-handler-test".to_string(),
+        );
+        let out = handle_text_to_speech(&json!({"text": "hello world"}), &synth).await;
+
+        match out {
+            ToolOutput::Multimodal { text, parts } => {
+                assert!(text.contains("mp3"), "summary missing extension: {text}");
+                assert!(
+                    text.contains(&audio_payload.len().to_string()),
+                    "summary missing byte count: {text}"
+                );
+                assert!(
+                    text.contains("audio/mpeg"),
+                    "summary missing MIME: {text}"
+                );
+                assert_eq!(parts.len(), 1, "expected exactly one audio part");
+                match &parts[0] {
+                    ContentPart::AudioBase64 { media } => {
+                        assert_eq!(media.mime_type, "audio/mpeg");
+                        assert_eq!(
+                            media.filename.as_deref(),
+                            Some("speech.mp3"),
+                            "filename must reflect chosen format"
+                        );
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(&media.data)
+                            .expect("audio data must be valid base64");
+                        assert_eq!(
+                            decoded, audio_payload,
+                            "decoded audio must match provider bytes"
+                        );
+                    }
+                    other => panic!("expected AudioBase64 part, got: {other:?}"),
+                }
+            }
+            ToolOutput::Text(msg) => {
+                panic!("expected Multimodal on success, got Text: {msg}");
+            }
+        }
+    }
+
     /// Spec: oversize input must be rejected at the synthesizer (4096-char
     /// cap), and the handler must convert that to a Text error rather than
     /// a half-formed audio response. Without this guard a model could

@@ -410,6 +410,7 @@ async fn live_stt_groq_transcribes_synthesized_clip() {
         timeout_ms: Some(60_000),
         xai_stt_format: None,
         xai_stt_diarize: None,
+        command: None,
     }];
     let stt = cortex::media::understanding::AudioTranscriber::from_config(&stt_config)
         .expect("STT build");

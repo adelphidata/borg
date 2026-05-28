@@ -2510,6 +2510,7 @@ mod tests {
             timeout_ms: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
+            command: None,
         }];
 
         assert!(
