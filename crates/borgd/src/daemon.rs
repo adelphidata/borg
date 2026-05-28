@@ -388,6 +388,56 @@ pub async fn run(cfg: Config) -> Result<()> {
         )
         .await;
 
+    // Bootstrap MCP sessions before serving any traffic. `initialize`
+    // returns `Ok(())` immediately when `mcp.enabled = false`, and on
+    // per-server connect failures it logs + writes `mcp_server_failed`
+    // audit rows without aborting daemon start — borg always boots.
+    //
+    // Without this call, configured MCP servers stay dark until an
+    // operator triggers the explicit `reload_from_config` admin RPC.
+    // That was the actual symptom: `mcp.enabled=true` + `borg mcp test`
+    // succeeded standalone (test path is hermetic), but the LLM never
+    // saw `mcp_*` tools because no session was ever installed in the
+    // daemon process.
+    //
+    // Hot-reload runs in a spawned task: when the operator flips
+    // `mcp.enabled` / `mcp.disabled_servers` / `mcp.servers` we
+    // re-`reload_from_config` so the diff lands without a daemon
+    // restart.
+    {
+        let mcp_cfg = initial_core_config.clone();
+        if let Err(e) = cortex::mcp_clients::initialize(&mcp_cfg).await {
+            tracing::warn!(error = %e, "mcp_clients::initialize failed (continuing without MCP)");
+        }
+        let mut rx = config_watcher.subscribe();
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                let next = rx.borrow().clone();
+                match cortex::mcp_clients::reload_from_config(&next).await {
+                    Ok(report) => {
+                        if !report.added.is_empty()
+                            || !report.removed.is_empty()
+                            || !report.failed.is_empty()
+                        {
+                            tracing::info!(
+                                added = ?report.added,
+                                removed = ?report.removed,
+                                unchanged = report.unchanged,
+                                failed = ?report.failed,
+                                total_tools = report.total_tools,
+                                "mcp_clients: hot-reload applied",
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "mcp_clients hot-reload failed"),
+                }
+            }
+        });
+    }
+
     // Wire shutdown-signal forwarding now that the audit writer is available.
     // `forward_signals_to` blocks on the first signal, emits DAEMON_STOP, and
     // then broadcasts the shutdown so listeners drain.
