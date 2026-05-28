@@ -34,7 +34,7 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 80% via `cargo llvm-cov --fail-under-lines 80`.
 
-**Live-LLM lane (opt-in).** `web_fetch` / `web_search` / `browser` real-network tests in `crates/cortex/tests/live_network_integration.rs`, gated by `live-llm` feature + `BORG_ALLOW_LIVE_TESTS=1`. Default `cargo test` stays hermetic.
+**Live-LLM lane (opt-in).** `web_fetch` / `web_search` / `browser` real-network tests in `crates/cortex/tests/live_network_integration.rs`, gated by `live-llm` feature + `BORG_ALLOW_LIVE_TESTS=1`. **Live-MCP lane (opt-in).** Real stdio MCP servers (today: `uvx mcp-server-time`) in `crates/mcp/tests/live_mcp.rs`, gated by `live-mcp` feature + `BORG_ALLOW_LIVE_TESTS=1`. Default `cargo test` stays hermetic.
 
 LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude Code CLI.
 

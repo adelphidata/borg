@@ -4238,6 +4238,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
+ "chrono",
  "eventsource-stream",
  "futures",
  "futures-util",

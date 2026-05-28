@@ -1341,6 +1341,32 @@ pub mod testing {
         );
         audit_registrations(server_name, &outcomes).await;
         record_limits(server_name, server_cfg);
+        // Mirror the production `start_server` ordering: registrations →
+        // limits → SERVER_STARTED. Keeping ordering identical means a
+        // future audit emit inside `record_limits` (e.g. limit-snapshot
+        // row) lands in the same position in both code paths.
+        let registered_tools: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ToolRegistrationOutcome::Registered { full_name } => Some(full_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        crate::db::try_emit_global(
+            crate::db::audit_events::MCP_SERVER_STARTED,
+            server_name,
+            &serde_json::json!({
+                "server": server_name,
+                "transport": match &manifest.transport {
+                    mcp::manifest::Transport::Stdio { .. } => "stdio",
+                    mcp::manifest::Transport::Http { .. } => "streamable-http",
+                    mcp::manifest::Transport::Sse { .. } => "sse",
+                },
+                "registered_tools": registered_tools,
+                "registered_count": registered_tools.len(),
+            }),
+        )
+        .await;
 
         let (tx, rx) = mpsc::channel::<SessionCmd>(32);
         {

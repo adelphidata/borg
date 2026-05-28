@@ -597,4 +597,51 @@ mod tests {
             r.pins
         );
     }
+
+    #[test]
+    fn always_forbidden_hostnames_refused_even_when_local_network_allowed() {
+        // The unconditional SSRF list (cloud-metadata FQDNs) must NOT be
+        // unlocked when an operator flips `allow_local_network=true` for a
+        // legitimate intranet need. A regression that conflated the two
+        // lists would re-open the GCP IMDS escape hatch.
+        let permissive = HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        };
+        for url in [
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.goog/foo",
+        ] {
+            let err = check_url_syntactic(url, &permissive).unwrap_err();
+            match err {
+                McpError::UrlRefused {
+                    reason: UrlRefusalReason::LocalNetworkBlocked,
+                    ..
+                } => {}
+                e => panic!(
+                    "expected LocalNetworkBlocked (unconditional) for {url}, got {e:?}",
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn imds_ip_literal_admitted_by_syntactic_layer_when_local_network_allowed() {
+        // Spec pin (syntactic layer only): the IMDS IP literal
+        // 169.254.169.254 sits in link-local space, which `allow_local_network`
+        // legitimately unlocks for operators talking to their own subnet.
+        // Domain hosts in the cloud-metadata FQDN list stay refused
+        // unconditionally (see `always_forbidden_hostnames_…`), but the
+        // matching IP literal does NOT. This asymmetry is intentional —
+        // operators must use the kill switch / URL allowlist (not the
+        // local-network policy) to keep IMDS out — and it deserves a
+        // tracking note in the user-facing settings docs. This test pins
+        // the syntactic gate's behavior only; deeper layers may still
+        // refuse and that would not break this assertion.
+        let permissive = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true,
+        };
+        check_url_syntactic("https://169.254.169.254/", &permissive).unwrap();
+    }
 }

@@ -29,6 +29,13 @@ axum = { workspace = true }
 # The default workspace `tokio` enables `full`; the integration-test
 # fixtures need `signal` for graceful shutdown which is included.
 tokio = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+# Opt-in lane that talks to real MCP servers (e.g. `uvx mcp-server-time`).
+# Gated by both this feature AND `BORG_ALLOW_LIVE_TESTS=1` so a default
+# `cargo test` stays hermetic. Mirrors `cortex`'s `live-llm` lane.
+live-mcp = []
 
 [lints]
 workspace = true
