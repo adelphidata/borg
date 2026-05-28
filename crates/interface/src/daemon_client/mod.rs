@@ -72,6 +72,23 @@ use tonic::Streaming;
 #[allow(unused_imports)]
 pub use connect::connect_or_spawn;
 
+/// Turn a goal-RPC `tonic::Status` into an `anyhow::Error` that preserves both
+/// the daemon's specific message AND the gRPC code. `.context("…failed")?`
+/// would chain the Status inside anyhow but its outer `Display` — what the
+/// TUI footer shows — drops both. Without this, users see "Admin.SetGoal
+/// {Replace} failed" with no clue the daemon actually said "no active
+/// session — start a turn first" and no way to tell `FailedPrecondition`
+/// (terminal, user-visible) from `Unavailable` (transient, retry).
+fn goal_rpc_err(op: &str, status: &tonic::Status) -> anyhow::Error {
+    let code = status.code();
+    let msg = status.message();
+    if msg.is_empty() {
+        anyhow!("{op} failed ({code:?})")
+    } else {
+        anyhow!("{op} failed ({code:?}): {msg}")
+    }
+}
+
 /// Lightweight handle wrapping a tonic channel + the four primary clients.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
@@ -1272,6 +1289,9 @@ impl DaemonClient {
         Ok(())
     }
 
+    // Goal RPC wrappers — see `goal_rpc_err` (top of file) for why these use
+    // `map_err` instead of `.context()`.
+
     /// Read the goal for `session_id`. Empty `session_id` resolves to the
     /// most-recently-active session (matches the TUI's "current session"
     /// semantics). Returns the wire `GoalDetail`; callers check `present`
@@ -1283,7 +1303,7 @@ impl DaemonClient {
                 session_id: session_id.to_string(),
             })
             .await
-            .context("Admin.GetGoal failed")?
+            .map_err(|s| goal_rpc_err("Admin.GetGoal", &s))?
             .into_inner())
     }
 
@@ -1305,7 +1325,7 @@ impl DaemonClient {
                 status: String::new(),
             })
             .await
-            .context("Admin.SetGoal{Create} failed")?
+            .map_err(|s| goal_rpc_err("Admin.SetGoal{Create}", &s))?
             .into_inner())
     }
 
@@ -1328,7 +1348,7 @@ impl DaemonClient {
                 status: String::new(),
             })
             .await
-            .context("Admin.SetGoal{Replace} failed")?
+            .map_err(|s| goal_rpc_err("Admin.SetGoal{Replace}", &s))?
             .into_inner())
     }
 
@@ -1346,7 +1366,7 @@ impl DaemonClient {
                 status: status.to_string(),
             })
             .await
-            .context("Admin.SetGoal{SetStatus} failed")?
+            .map_err(|s| goal_rpc_err("Admin.SetGoal{SetStatus}", &s))?
             .into_inner())
     }
 
@@ -1357,7 +1377,7 @@ impl DaemonClient {
                 session_id: session_id.to_string(),
             })
             .await
-            .context("Admin.ClearGoal failed")?;
+            .map_err(|s| goal_rpc_err("Admin.ClearGoal", &s))?;
         Ok(())
     }
 
@@ -1372,7 +1392,7 @@ impl DaemonClient {
                 session_id: session_id.to_string(),
             })
             .await
-            .context("Admin.PauseGoalOnInterrupt failed")?
+            .map_err(|s| goal_rpc_err("Admin.PauseGoalOnInterrupt", &s))?
             .into_inner())
     }
 
@@ -1877,5 +1897,47 @@ impl DaemonClient {
             .await
             .context("Admin.SetCredentialStrategy failed")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod goal_rpc_err_tests {
+    use super::goal_rpc_err;
+
+    #[test]
+    fn preserves_daemon_message_for_user_visibility() {
+        // The bug we're guarding against: `.context("Admin.SetGoal{Replace}
+        // failed")?` chained the tonic Status inside anyhow but only the
+        // outer label rendered in the TUI footer. Users saw the opaque
+        // "Admin.SetGoal{Replace} failed" instead of the actual reason.
+        let status =
+            tonic::Status::failed_precondition("set_goal: no active session — start a turn first");
+        let err = goal_rpc_err("Admin.SetGoal{Replace}", &status);
+        let display = format!("{err}");
+        assert!(
+            display.contains("Admin.SetGoal{Replace}"),
+            "must keep the operation label, got: {display}"
+        );
+        assert!(
+            display.contains("no active session"),
+            "must include the daemon's specific message, got: {display}"
+        );
+        assert!(
+            display.contains("FailedPrecondition"),
+            "must include the gRPC code so callers can distinguish \
+             transient vs terminal failures, got: {display}"
+        );
+    }
+
+    #[test]
+    fn includes_code_when_message_empty() {
+        let status = tonic::Status::new(tonic::Code::Unavailable, "");
+        let err = goal_rpc_err("Admin.GetGoal", &status);
+        let display = format!("{err}");
+        assert!(display.contains("Admin.GetGoal"));
+        assert!(
+            display.contains("Unavailable"),
+            "must include the code, got: {display}"
+        );
     }
 }

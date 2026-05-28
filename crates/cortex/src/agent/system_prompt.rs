@@ -289,8 +289,7 @@ impl Agent {
             let setup_path = data_dir.join(crate::constants::SETUP_FILE);
             if tokio::fs::try_exists(&setup_path).await.unwrap_or(false) {
                 let onboarding_complete = crate::memory::identity_in_long_term_memory().await;
-                if let Some(outcome) =
-                    consume_setup_template(&data_dir, onboarding_complete).await
+                if let Some(outcome) = consume_setup_template(&data_dir, onboarding_complete).await
                 {
                     system.push_str(
                         &SETUP_TEMPLATE

@@ -225,6 +225,76 @@ async fn set_goal_create_rejects_duplicate() {
     );
 }
 
+/// Positive: SetGoal{Replace} with an empty session_id on a fresh DB
+/// autocreates a session row and inserts the goal against it. Regression
+/// for the `/goal: set failed — Admin.SetGoal{Replace} failed` failure
+/// users hit on a freshly-launched TUI before any turn had run.
+#[tokio::test]
+async fn set_goal_replace_autocreates_session_when_none_exists() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    // Pre-condition: no sessions exist in the fresh DB.
+    let pre = Database::open().await.unwrap();
+    assert_eq!(
+        pre.list_sessions(10).await.unwrap().len(),
+        0,
+        "harness must start with no sessions"
+    );
+
+    // Act: Replace with empty session_id — used to fail with
+    // failed_precondition "no active session — start a turn first".
+    let detail = admin
+        .set_goal(GoalMutation {
+            session_id: String::new(),
+            op: GoalOp::Replace as i32,
+            objective: "ship the goal indicator".into(),
+            token_budget_present: false,
+            token_budget: 0,
+            status: String::new(),
+        })
+        .await
+        .expect("Replace on empty session_id must succeed")
+        .into_inner();
+
+    assert!(detail.present, "returned goal must be present");
+    assert_eq!(detail.objective, "ship the goal indicator");
+    assert_eq!(detail.status, "active");
+    assert!(
+        !detail.session_id.is_empty(),
+        "daemon must return the autocreated session_id, got: {detail:?}"
+    );
+
+    // A `sessions` row now exists, with the same id the goal points at.
+    let post = Database::open().await.unwrap();
+    let sessions = post.list_sessions(10).await.unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exactly one autocreated session, got: {sessions:?}"
+    );
+    assert_eq!(
+        sessions[0].id, detail.session_id,
+        "autocreated session id must match the goal's session_id"
+    );
+
+    // A follow-up GetGoal with empty session_id resolves to the same row.
+    let fetched = admin
+        .get_goal(GoalRef {
+            session_id: String::new(),
+        })
+        .await
+        .expect("get_goal must surface the autocreated row")
+        .into_inner();
+    assert!(fetched.present);
+    assert_eq!(fetched.session_id, detail.session_id);
+    assert_eq!(fetched.objective, "ship the goal indicator");
+}
+
 /// Positive: SetGoal{Replace} regenerates `goal_id` even when a row already
 /// exists, and resets accounting. Also tests the "create on empty" branch.
 #[tokio::test]

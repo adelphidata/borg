@@ -204,6 +204,36 @@ fn server_config(read_only: Vec<&str>, per_min: u32, burst: u32) -> McpServerCon
     }
 }
 
+/// Build a stdio-typed config with custom per-server `tools.max` and an
+/// explicit `call_timeout_ms`. The base helper hard-codes both so tests
+/// targeting the per-server cap or timeout invariants need a tailored
+/// builder rather than munging the struct in-line.
+fn server_config_tuned(
+    per_server_max: usize,
+    call_timeout_ms: u64,
+    include: Vec<&str>,
+    exclude: Vec<&str>,
+) -> McpServerConfig {
+    McpServerConfig {
+        enabled: true,
+        transport: TransportSpec::Stdio {
+            command: "/bin/false".into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+        connect_timeout_ms: 5_000,
+        call_timeout_ms,
+        rate_limit_per_minute: 60,
+        rate_limit_burst: 10,
+        tools: ToolFilter {
+            include: include.into_iter().map(String::from).collect(),
+            exclude: exclude.into_iter().map(String::from).collect(),
+            read_only: vec![],
+            max: per_server_max,
+        },
+    }
+}
+
 fn enabled_config() -> Config {
     let mut cfg = Config::default();
     cfg.mcp = McpConfig {
@@ -1318,5 +1348,485 @@ async fn reload_tears_down_everything_when_mcp_disabled() {
     assert!(
         mcp_clients::tool_definitions().is_empty(),
         "global kill switch must drain tool_definitions"
+    );
+}
+
+/// Spec: `tools.include` is an exhaustive allowlist (whitelist semantics —
+/// see `ToolFilter::admits`). The cortex install path must thread the
+/// filter through to the registry so a server advertising `search`,
+/// `delete`, and `nuke` with `tools.include = ["search"]` registers
+/// exactly `mcp_s_search`. Real-world failure: a regression in cortex
+/// stops threading `manifest.tools` and the registry sees an empty
+/// filter — `delete` and `nuke` silently rejoin the LLM-visible set
+/// even though the operator opted them out. Also pins that the
+/// post-install registry status reflects only the admitted tool
+/// (no shadow entries hiding under filter drops).
+#[tokio::test]
+async fn tools_include_allowlist_is_exhaustive() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| {
+                tools_list(&[
+                    ("search", well_formed_schema()),
+                    ("delete", well_formed_schema()),
+                    ("nuke", well_formed_schema()),
+                ])
+            }),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 2_000, vec!["search"], vec![]);
+    mcp_clients::testing::install_session("s", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["mcp_s_search".to_string()],
+        "include must be exhaustive; got {names:?}"
+    );
+
+    // Filter drops are not audit-emitted (only schema-rejects/collisions
+    // are); a regression that emits them anyway would surface here as a
+    // surprise audit row. Either direction is informative.
+    let audited_rejects: Vec<String> = mcp_clients::testing::rejected_for("s")
+        .into_iter()
+        .map(|(o, _)| o)
+        .collect();
+    assert!(
+        !audited_rejects.contains(&"delete".to_string())
+            && !audited_rejects.contains(&"nuke".to_string()),
+        "filter drops must not show up as schema/collision audit rejections; \
+         got {audited_rejects:?}"
+    );
+
+    // And — the gate the LLM actually sees — neither of the filtered tools
+    // is dispatchable.
+    let blocked = mcp_clients::try_execute_tool("mcp_s_delete", &json!({}))
+        .await
+        .expect("non-mcp short-circuit ok");
+    assert!(
+        blocked.is_none(),
+        "filtered-out tool must not be dispatchable; got Some(_)"
+    );
+}
+
+/// Spec: `tools.exclude` is a denylist applied only when `tools.include`
+/// is empty (include wins; verified by the allowlist test above and the
+/// unit test in `crates/mcp/src/manifest.rs`). A server advertising
+/// `read`, `write` with `exclude = ["write"]` must surface only
+/// `mcp_x_read`. Failure mode: regression in cortex stops threading the
+/// filter and `write` reaches the LLM — the kind of silent re-widening
+/// that defeats the operator's denylist.
+#[tokio::test]
+async fn tools_exclude_blocks_listed_when_include_empty() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| {
+                tools_list(&[
+                    ("read", well_formed_schema()),
+                    ("write", well_formed_schema()),
+                ])
+            }),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 2_000, vec![], vec!["write"]);
+    mcp_clients::testing::install_session("x", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["mcp_x_read".to_string()],
+        "exclude must drop `write`; got {names:?}"
+    );
+}
+
+/// Spec: per-server `tools.max` is independent of `mcp.max_tools_total`.
+/// With the global cap unrestrictive (128) and a server-level cap of 2,
+/// a server advertising 4 valid tools must register exactly 2 — and the
+/// other 2 must surface as audit rejections naming the per-server cap.
+/// Failure mode: cortex passes the global cap into `ToolFilter::max` (or
+/// vice-versa); the per-server cap would silently widen to the global
+/// cap and the per-server knob in `borg mcp add --max-tools` would be a
+/// no-op. The global-cap test pins the global path; this one pins the
+/// independent per-server path.
+#[tokio::test]
+async fn per_server_tools_max_caps_independently_of_global() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| {
+                tools_list(&[
+                    ("a", well_formed_schema()),
+                    ("b", well_formed_schema()),
+                    ("c", well_formed_schema()),
+                    ("d", well_formed_schema()),
+                ])
+            }),
+        );
+    }
+
+    // Global cap stays at the default (128) — the per-server cap of 2
+    // is what must bite. If the test starts to fail because the global
+    // cap suddenly wins, the bug is that the two knobs were collapsed.
+    let cfg = enabled_config();
+    let sc = server_config_tuned(2, 2_000, vec![], vec![]);
+    mcp_clients::testing::install_session("p", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "per-server tools.max=2 must hold; got {names:?}"
+    );
+
+    let rejected = mcp_clients::testing::rejected_for("p");
+    assert_eq!(
+        rejected.len(),
+        2,
+        "two tools must be rejected by the per-server cap; got {rejected:?}"
+    );
+    for (_orig, reason) in &rejected {
+        let r = reason.to_ascii_lowercase();
+        assert!(
+            r.contains("cap") || r.contains("per-server") || r.contains("server"),
+            "rejection reason must name the per-server cap, not the global one; got: {reason}"
+        );
+    }
+}
+
+/// Spec: the schema gauntlet rejects tools whose `inputSchema.properties`
+/// exceeds `MAX_PROPERTIES` (64). The existing oversize/$ref test covers
+/// two of the rejection reasons; this case pins the third — a hostile
+/// server enumerating thousands of fields to balloon the LLM context per
+/// turn — and confirms the rejection is audited so the operator sees why
+/// the tool vanished. Failure mode: a regression that compares against a
+/// different field, or off-by-one at exactly 64+1.
+#[tokio::test]
+async fn schema_gauntlet_drops_tools_with_too_many_properties() {
+    let _g = begin_test();
+
+    // 65 properties (exactly one over the cap) — pins the boundary so a
+    // future widening of MAX_PROPERTIES forces the test author to revisit.
+    let over_cap_count = mcp::registry::MAX_PROPERTIES + 1;
+    let mut props = serde_json::Map::new();
+    for i in 0..over_cap_count {
+        props.insert(format!("p{i}"), json!({"type": "string"}));
+    }
+    let bloated = json!({ "type": "object", "properties": props });
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        let well = well_formed_schema();
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(move |_| tools_list(&[("good", well.clone()), ("bloated", bloated.clone())])),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("q", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["mcp_q_good".to_string()],
+        "only the well-formed tool should survive; got {names:?}"
+    );
+
+    let rejected = mcp_clients::testing::rejected_for("q");
+    let bloated_reject = rejected.iter().find(|(orig, _)| orig == "bloated");
+    let (_, reason) = bloated_reject.expect("bloated tool must surface as audit rejection");
+    let r = reason.to_ascii_lowercase();
+    assert!(
+        r.contains("propert"),
+        "rejection reason must mention properties; got: {reason}"
+    );
+}
+
+/// Spec: a tool whose root `inputSchema` is not a JSON object (or whose
+/// `type` field is not `"object"`) is rejected — every MCP tool call's
+/// argument shape must be a JSON object at the root. Failure mode: a
+/// hostile server advertises `inputSchema: "ignored"` and the registry
+/// admits it; later the LLM passes object-shaped args that the server
+/// interprets however it likes, including ignoring them entirely.
+#[tokio::test]
+async fn schema_gauntlet_drops_non_object_root_schemas() {
+    let _g = begin_test();
+
+    let string_root = json!("not-a-schema-object");
+    let typed_string_root = json!({ "type": "string" });
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        let well = well_formed_schema();
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(move |_| {
+                tools_list(&[
+                    ("good", well.clone()),
+                    ("scalar_root", string_root.clone()),
+                    ("typed_string", typed_string_root.clone()),
+                ])
+            }),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("nr", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let names: Vec<String> = mcp_clients::tool_definitions()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["mcp_nr_good".to_string()],
+        "only the well-formed tool should survive; got {names:?}"
+    );
+
+    let rejected = mcp_clients::testing::rejected_for("nr");
+    let originals: Vec<String> = rejected.iter().map(|(o, _)| o.clone()).collect();
+    assert!(
+        originals.contains(&"scalar_root".to_string())
+            && originals.contains(&"typed_string".to_string()),
+        "both non-object-root tools must be rejected; got {rejected:?}"
+    );
+}
+
+/// Spec: `call_timeout_ms` bounds the wall-clock spent waiting on a
+/// single `tools/call` response. A wedged server (transport never emits
+/// a reply for the call) must NOT starve the agent loop — the cortex
+/// dispatcher surfaces a clean timeout error so the LLM sees a failure
+/// and can move on. The inner per-call timeout fires well before the
+/// outer watchdog (`call_timeout + 5s`), so the inner is the one we
+/// must trip here. Failure mode: a regression that disconnects
+/// `call_timeout_ms` from `manifest.call_timeout` would let a hung tool
+/// call hold the actor indefinitely.
+#[tokio::test]
+async fn call_timeout_ms_surfaces_clean_timeout_error_on_wedged_server() {
+    let _g = begin_test();
+
+    // The transport answers INITIALIZE + TOOLS_LIST but deliberately has
+    // no handler for TOOLS_CALL — the request arrives, no response is
+    // ever enqueued, and the session must time out via tokio's clock
+    // rather than hang forever.
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("ping", well_formed_schema())])),
+        );
+        // No TOOLS_CALL handler — recv() will loop until the timeout fires.
+    }
+
+    let cfg = enabled_config();
+    // 200ms is generous enough that scheduling jitter on busy CI doesn't
+    // misfire, but tight enough that a real regression (no timeout) would
+    // hang the whole test process until the outer harness kills it.
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 200, vec![], vec![]);
+    mcp_clients::testing::install_session("t", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    let start = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        mcp_clients::try_execute_tool("mcp_t_ping", &json!({})),
+    )
+    .await
+    .expect("test-level guard fired — call_timeout did not bound the wait");
+    let elapsed = start.elapsed();
+
+    let err = outcome.expect_err("wedged server must surface an error, not Ok");
+    // anyhow flattens the cause chain with `{:#}`; bare `to_string` only
+    // shows the outermost context, so the timeout cause from the inner
+    // `McpError::Timeout` would be invisible without it.
+    let err_display = format!("{err:#}");
+    assert!(
+        err_display.to_ascii_lowercase().contains("timeout"),
+        "error chain must name the timeout (got: {err_display})"
+    );
+    // The inner per-call timeout fires at ~200ms; the outer watchdog is
+    // call_timeout + 5s, so a < 2s wall-clock proves the inner timer is
+    // doing the work. If a regression disabled the inner timer, the
+    // outer watchdog would catch it at ~5.2s and this bound would fail
+    // first.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "inner per-call timeout must fire well before the outer watchdog; \
+         observed {elapsed:?}",
+    );
+}
+
+/// Spec: a server returning a JSON-RPC error envelope for `tools/call`
+/// (e.g. `{"error": {"code": -32601, "message": "method not found"}}`)
+/// is a protocol failure — the cortex dispatcher must surface an `Err`
+/// rather than wrapping the error text inside `<mcp_tool_result>` as
+/// though it were a successful response. Failure mode: a `Some(error)`
+/// branch that silently maps the error to a string and wraps it would
+/// make protocol-level failures look like normal tool output to the
+/// LLM, including misclassifying transient transport errors as data.
+#[tokio::test]
+async fn jsonrpc_error_envelope_surfaces_as_dispatch_error() {
+    let _g = begin_test();
+
+    // Custom transport: send() inspects the outbound request; for
+    // TOOLS_CALL it pushes a JSON-RPC error envelope (not a result).
+    struct ErrTransport {
+        inbound: Arc<Mutex<VecDeque<Message>>>,
+        eof: Arc<Mutex<bool>>,
+    }
+    #[async_trait]
+    impl Transport for ErrTransport {
+        async fn send(&mut self, msg: Value) -> Result<(), mcp::errors::McpError> {
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = msg.get("id").and_then(|i| i.as_u64());
+            if let Some(id) = id {
+                let reply = match method {
+                    methods::INITIALIZE => Message {
+                        jsonrpc: Some("2.0".into()),
+                        id: Some(id),
+                        method: None,
+                        result: Some(initialize_result()),
+                        error: None,
+                        params: None,
+                    },
+                    methods::TOOLS_LIST => Message {
+                        jsonrpc: Some("2.0".into()),
+                        id: Some(id),
+                        method: None,
+                        result: Some(tools_list(&[("ping", well_formed_schema())])),
+                        error: None,
+                        params: None,
+                    },
+                    methods::TOOLS_CALL => Message {
+                        jsonrpc: Some("2.0".into()),
+                        id: Some(id),
+                        method: None,
+                        result: None,
+                        error: Some(mcp::protocol::RpcError {
+                            code: -32601,
+                            message: "method not found".into(),
+                            data: None,
+                        }),
+                        params: None,
+                    },
+                    _ => return Ok(()),
+                };
+                self.inbound.lock().unwrap().push_back(reply);
+            }
+            Ok(())
+        }
+        async fn recv(&mut self) -> Result<Option<Message>, mcp::errors::McpError> {
+            loop {
+                if let Some(m) = self.inbound.lock().unwrap().pop_front() {
+                    return Ok(Some(m));
+                }
+                if *self.eof.lock().unwrap() {
+                    return Ok(None);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        async fn close(&mut self) -> Result<(), mcp::errors::McpError> {
+            *self.eof.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    let transport = Box::new(ErrTransport {
+        inbound: Arc::new(Mutex::new(VecDeque::new())),
+        eof: Arc::new(Mutex::new(false)),
+    });
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("e", &sc, &cfg, transport)
+        .await
+        .expect("install");
+
+    let err = mcp_clients::try_execute_tool("mcp_e_ping", &json!({}))
+        .await
+        .expect_err("protocol error must surface as dispatch Err, not Ok");
+
+    // Use the full anyhow chain — the dispatcher wraps the inner
+    // `McpError::Protocol("method not found")` in a "MCP tool 'X' failed"
+    // context, and bare `to_string` would only show the outer line.
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("method not found"),
+        "error chain must propagate the server's RPC message; got: {chain}"
+    );
+    assert!(
+        chain.contains("mcp_e_ping"),
+        "error chain must name the tool that failed; got: {chain}"
     );
 }

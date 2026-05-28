@@ -1,6 +1,9 @@
+mod duration;
 mod events;
 mod key_handlers;
 mod render;
+
+use duration::fmt_compact_duration;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -201,6 +204,9 @@ pub struct GoalUiEvent {
     pub kind: String,
     /// Status of the goal after the mutation, or `None` for kind=cleared.
     pub status: Option<cortex::goals::GoalStatus>,
+    /// Goal creation time as unix seconds. The footer subtracts this from
+    /// `now` to render an elapsed-time tag like `(1h)`. `None` for `cleared`.
+    pub started_at: Option<i64>,
 }
 
 pub struct BtwResult {
@@ -531,6 +537,10 @@ pub struct App<'a> {
     /// reacts within ~100ms of a daemon-side mutation. `None` until the
     /// initial `GetGoal` seed completes (or when no goal is set).
     pub goal_status: Option<cortex::goals::GoalStatus>,
+    /// Goal `created_at` (unix seconds). The footer subtracts from `now` to
+    /// produce the elapsed-time tag like `(1h)`. `None` mirrors
+    /// `goal_status == None`.
+    pub goal_started_at: Option<i64>,
     /// Active voice-mode loop. `Some` while `/voice on` or `/voice rec`
     /// is in flight; cleared on `/voice off` and `SilentLimitReached`.
     /// See `crates/cortex/src/media/voice_loop.rs`.
@@ -634,6 +644,7 @@ impl<'a> App<'a> {
             toasts: super::toast::ToastStack::new(),
             client,
             goal_status: None,
+            goal_started_at: None,
             voice_loop: None,
             voice_rx: None,
             voice_status: None,
@@ -652,13 +663,20 @@ impl<'a> App<'a> {
     }
 
     /// Apply a goal-lifecycle update streamed from the daemon. Updates the
-    /// cached `goal_status` field so the footer hint re-renders on the next
+    /// cached goal fields so the footer indicator re-renders on the next
     /// frame.
     pub fn apply_goal_event(&mut self, evt: GoalUiEvent) {
         if evt.kind == cortex::goals::event_kind::CLEARED {
             self.goal_status = None;
+            self.goal_started_at = None;
         } else {
             self.goal_status = evt.status;
+            // Only overwrite when the event carries a fresh started_at —
+            // mutations like `set_budget` don't change it and shouldn't
+            // reset the elapsed-time tag.
+            if evt.started_at.is_some() {
+                self.goal_started_at = evt.started_at;
+            }
         }
     }
 

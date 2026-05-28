@@ -526,24 +526,11 @@ impl<'a> App<'a> {
             }
         }
 
-        // Goal-state hint. Surfaces the two cases the operator most needs to
-        // notice — Paused (Ralph loop is dormant; user needs to `/goal
-        // resume`) and BudgetLimited (auto-continuation stopped; user needs
-        // to bump the budget or wrap up). Active and Complete are silent
-        // because the regular tooling already makes them visible (the agent
-        // is mid-turn or the goal is done). Pushed onto `hints` so it
-        // participates in priority-based fitting when the terminal narrows.
-        match self.goal_status {
-            Some(cortex::goals::GoalStatus::Paused) => hints.push(FooterHint {
-                text: "Goal paused (/goal resume)".into(),
-                priority: 80,
-            }),
-            Some(cortex::goals::GoalStatus::BudgetLimited) => hints.push(FooterHint {
-                text: "Goal budget reached".into(),
-                priority: 75,
-            }),
-            _ => {}
-        }
+        // The bottom-right goal indicator (rendered below) replaces the
+        // older left-side `Goal paused` / `Goal budget reached` hints —
+        // both states are now reflected by the right-aligned `/goal …`
+        // widget alongside elapsed time. Other goal states (Active,
+        // Complete, Blocked, UsageLimited) stay silent in the left rail.
 
         let pct = self.compute_context_pct();
         let pct_style = if pct >= 95 {
@@ -554,17 +541,80 @@ impl<'a> App<'a> {
             theme::dim()
         };
 
-        // Reserve room for ` ctx NN%  •  ` on the left so hints can fit.
+        let goal_tag = self.compose_goal_indicator();
+
+        // Reserve room for ` ctx NN%  •  ` on the left so hints can fit,
+        // and for the right-aligned goal tag (when present) so the fitter
+        // doesn't push past it.
         let prefix = format!(" ctx {pct}%");
         let prefix_w = UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(HINT_SEP);
+        let goal_w = goal_tag.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
+        // Pad-before-goal so the indicator never butts up against a hint.
+        let goal_reserve = if goal_w > 0 {
+            goal_w + UnicodeWidthStr::width(HINT_SEP)
+        } else {
+            0
+        };
         let total_w = area.width as usize;
-        let available = total_w.saturating_sub(prefix_w);
+        let available = total_w
+            .saturating_sub(prefix_w)
+            .saturating_sub(goal_reserve);
         let left = fit_footer_hints(hints, available);
         let line = Line::from(vec![
             Span::styled(prefix, pct_style),
             Span::styled(format!("{HINT_SEP}{left}"), theme::dim()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+
+        // Right-aligned goal indicator. Hidden when the terminal is too
+        // narrow to fit it after the prefix + at least one separator.
+        if let Some(tag) = goal_tag {
+            let tag_w = UnicodeWidthStr::width(tag.as_str()) as u16;
+            if tag_w > 0 && area.width > tag_w {
+                let right_area = Rect {
+                    x: area.x + area.width - tag_w,
+                    y: area.y,
+                    width: tag_w,
+                    height: area.height,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(tag, theme::dim()))),
+                    right_area,
+                );
+            }
+        }
+    }
+
+    /// Compose the bottom-right `/goal <state> (<elapsed>)` indicator from
+    /// cached goal state. Returns `None` when no goal is set or the status
+    /// isn't one of the rendered states.
+    ///
+    /// Elapsed time uses wall-clock `chrono::Utc::now()` (not `Instant`)
+    /// so the tag is correct across daemon restarts where the goal row
+    /// outlives the process. Clock-jump effects: forward jumps inflate
+    /// the tag (cosmetic), backward jumps clamp to `0s` via `.max(0)`.
+    fn compose_goal_indicator(&self) -> Option<String> {
+        use cortex::goals::GoalStatus;
+        let status = self.goal_status?;
+        // Explicit per-variant arms (no `_ =>`) so a new GoalStatus
+        // variant forces a deliberate decision here rather than silently
+        // hiding the indicator.
+        let label = match status {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::BudgetLimited => "budget hit",
+            // Suppressed states: the goal is either already resolved
+            // (Complete) or the agent is actively handling the condition
+            // (Blocked, UsageLimited) — a passive footer tag would be noise.
+            GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::Complete => return None,
+        };
+        let started_at = self.goal_started_at?;
+        let now = chrono::Utc::now().timestamp();
+        let elapsed = (now - started_at).max(0);
+        Some(format!(
+            "/goal {label} ({})",
+            super::fmt_compact_duration(elapsed)
+        ))
     }
 
     pub(super) fn compute_queue_preview_height(&self, area_width: u16) -> u16 {
@@ -1614,5 +1664,82 @@ mod tests {
         let lines = build_queue_preview_lines(&q, 60);
         assert!(lines.is_empty());
         assert_eq!(compute_queue_preview_height_for(&q, 60), 0);
+    }
+
+    // ── Bottom-right goal indicator (compose_goal_indicator) ────────────────
+    //
+    // Tests the pure composition path. The layout step (right-aligned
+    // Paragraph) is mechanical ratatui; testing that adds no signal beyond
+    // what these assertions on the composed string already give us.
+
+    #[test]
+    fn goal_indicator_hidden_when_no_goal() {
+        let app = make_app();
+        assert!(
+            app.compose_goal_indicator().is_none(),
+            "no goal set → no indicator"
+        );
+    }
+
+    #[test]
+    fn goal_indicator_active_shows_compact_elapsed() {
+        let mut app = make_app();
+        app.goal_status = Some(cortex::goals::GoalStatus::Active);
+        // Pin started_at to 1 hour ago — the fmt helper rounds down to "1h".
+        let now = chrono::Utc::now().timestamp();
+        app.goal_started_at = Some(now - 3600);
+        let tag = app.compose_goal_indicator().expect("indicator");
+        assert_eq!(tag, "/goal active (1h)");
+    }
+
+    #[test]
+    fn goal_indicator_paused_uses_paused_label() {
+        let mut app = make_app();
+        app.goal_status = Some(cortex::goals::GoalStatus::Paused);
+        let now = chrono::Utc::now().timestamp();
+        app.goal_started_at = Some(now - 90); // 1m elapsed
+        let tag = app.compose_goal_indicator().expect("indicator");
+        assert_eq!(tag, "/goal paused (1m)");
+    }
+
+    #[test]
+    fn goal_indicator_budget_limited_uses_short_label() {
+        let mut app = make_app();
+        app.goal_status = Some(cortex::goals::GoalStatus::BudgetLimited);
+        let now = chrono::Utc::now().timestamp();
+        app.goal_started_at = Some(now - 45); // 45s elapsed
+        let tag = app.compose_goal_indicator().expect("indicator");
+        assert_eq!(tag, "/goal budget hit (45s)");
+    }
+
+    #[test]
+    fn goal_indicator_suppressed_for_silent_states() {
+        // Complete / Blocked / UsageLimited are not surfaced as a passive
+        // footer tag — the goal is either done or the agent is actively
+        // handling the condition.
+        for state in [
+            cortex::goals::GoalStatus::Complete,
+            cortex::goals::GoalStatus::Blocked,
+            cortex::goals::GoalStatus::UsageLimited,
+        ] {
+            let mut app = make_app();
+            app.goal_status = Some(state);
+            app.goal_started_at = Some(0);
+            assert!(
+                app.compose_goal_indicator().is_none(),
+                "status {state:?} must be silent in the footer"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_indicator_hidden_without_started_at() {
+        // Defensive: a status set without started_at (shouldn't happen
+        // post-fix, but protect against drift) renders nothing rather than
+        // showing a misleading "(0s)" tag stuck at zero forever.
+        let mut app = make_app();
+        app.goal_status = Some(cortex::goals::GoalStatus::Active);
+        app.goal_started_at = None;
+        assert!(app.compose_goal_indicator().is_none());
     }
 }

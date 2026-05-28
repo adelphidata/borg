@@ -2045,12 +2045,23 @@ impl Admin for AdminSvc {
         let bus = self.goal_bus_handle();
         let outcome = async {
             let db = Database::open().await.map_err(SetGoalError::Internal)?;
-            let session_id = resolve_goal_session_id(&db, &session_id_req)
-                .await
-                .map_err(SetGoalError::Internal)?
-                .ok_or_else(|| {
-                    SetGoalError::Precondition("no active session — start a turn first".into())
-                })?;
+            // Create/Replace autocreate a session when none exists so `/goal
+            // <text>` works on a freshly-launched TUI without forcing the user
+            // to send a message first. Status/budget mutations still require
+            // an existing goal row, so they use the strict resolver below.
+            let session_id = match op {
+                GoalMutationOp::Create | GoalMutationOp::Replace => {
+                    resolve_or_create_goal_session_id(&db, &session_id_req)
+                        .await
+                        .map_err(SetGoalError::Internal)?
+                }
+                _ => resolve_goal_session_id(&db, &session_id_req)
+                    .await
+                    .map_err(SetGoalError::Internal)?
+                    .ok_or_else(|| {
+                        SetGoalError::Precondition("no active session — start a turn first".into())
+                    })?,
+            };
             match op {
                 GoalMutationOp::Unspecified => unreachable!(),
                 GoalMutationOp::Create => {
@@ -2561,7 +2572,7 @@ use helpers::{
     open_settings_resolver, opt_if_non_negative_i32, opt_if_not_empty, opt_if_positive_i64,
     pairing_row_to_proto, parse_snapshot_payload, pool_provider_matches, pooled_to_proto,
     process_entry_to_proto, require_provider_match, resolve_agent_session_id,
-    resolve_goal_session_id, scheduled_task_row_to_proto, snapshot_row_to_pb, snapshot_to_reply,
-    sub_agent_row_to_pb, task_run_row_to_proto, update_task_status, ApiKeyRouting, SetGoalError,
-    SetGoalOutcome,
+    resolve_goal_session_id, resolve_or_create_goal_session_id, scheduled_task_row_to_proto,
+    snapshot_row_to_pb, snapshot_to_reply, sub_agent_row_to_pb, task_run_row_to_proto,
+    update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome,
 };

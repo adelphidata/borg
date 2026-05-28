@@ -267,6 +267,26 @@ impl AgentBackend {
         agent.set_steer_channel(steer_rx);
 
         let session_id = agent.session().meta.id.clone();
+
+        // Materialize the `sessions` row immediately so RPCs that resolve
+        // "the latest session" (e.g. Admin.SetGoal with empty session_id)
+        // hit a real row from the very first frame of the TUI. Without
+        // this, `messages` rows get written under `session_id` but the
+        // `sessions` table stays empty until something else (handoff,
+        // fork, export) materializes a row — and `/goal foo` from a
+        // fresh TUI fails with "no active session". Idempotent upsert,
+        // so resume paths re-touch the existing row without clobbering it.
+        if let Ok(db) = cortex::db::Database::open().await {
+            let now = chrono::Utc::now().timestamp();
+            let model = agent.config().llm.model.clone();
+            if let Err(e) = db
+                .upsert_session(&session_id, now, now, 0, &model, "")
+                .await
+            {
+                tracing::warn!(session_id = %session_id, error = %e, "upsert_session on open failed");
+            }
+        }
+
         Ok(Arc::new(Self {
             session_id,
             agent: Mutex::new(agent),

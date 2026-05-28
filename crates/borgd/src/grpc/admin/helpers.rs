@@ -278,6 +278,30 @@ pub(super) async fn resolve_goal_session_id(
     Ok(db.list_sessions(1).await?.into_iter().next().map(|r| r.id))
 }
 
+/// Resolver for the `Create` / `Replace` goal arms. Same as
+/// [`resolve_goal_session_id`] when a session exists, but autocreates a
+/// fresh anonymous session row when none does — defensive fallback for
+/// headless callers (`borg ask`, custom gRPC clients) that may set a goal
+/// without ever opening a SessionHost.
+///
+/// The TUI path doesn't hit this fallback because `AgentBackend::new`
+/// upserts a `sessions` row on open, so `list_sessions(1)` returns the
+/// real session id from the very first frame. The orphan-session footgun
+/// — autocreate id ≠ the id `messages.session_id` later uses — is
+/// avoided as a result.
+pub(super) async fn resolve_or_create_goal_session_id(
+    db: &cortex::db::Database,
+    requested: &str,
+) -> anyhow::Result<String> {
+    if let Some(id) = resolve_goal_session_id(db, requested).await? {
+        return Ok(id);
+    }
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.upsert_session(&new_id, now, now, 0, "", "").await?;
+    Ok(new_id)
+}
+
 /// Convert the core goal struct to its wire projection. `Option<i64>` budget
 /// is encoded as `(present, value)` so the proto can distinguish "no
 /// budget" from "budget == 0" (which `validate_budget` rejects anyway, but

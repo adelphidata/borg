@@ -405,6 +405,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                         .send(crate::tui::app::GoalUiEvent {
                             kind: cortex::goals::event_kind::STATUS_CHANGED.to_string(),
                             status,
+                            started_at: Some(detail.created_at),
                         })
                         .await;
                 }
@@ -413,6 +414,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                         .send(crate::tui::app::GoalUiEvent {
                             kind: cortex::goals::event_kind::CLEARED.to_string(),
                             status: None,
+                            started_at: None,
                         })
                         .await;
                 }
@@ -437,15 +439,15 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                     next = stream.message() => {
                         match next {
                             Ok(Some(evt)) => {
-                                let status = evt
-                                    .goal
-                                    .as_ref()
-                                    .filter(|g| g.present)
+                                let present = evt.goal.as_ref().filter(|g| g.present);
+                                let status = present
                                     .and_then(|g| cortex::goals::GoalStatus::from_str(&g.status));
+                                let started_at = present.map(|g| g.created_at);
                                 if goal_ui_tx
                                     .send(crate::tui::app::GoalUiEvent {
                                         kind: evt.kind,
                                         status,
+                                        started_at,
                                     })
                                     .await
                                     .is_err()
