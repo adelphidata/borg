@@ -617,9 +617,7 @@ mod tests {
                     reason: UrlRefusalReason::LocalNetworkBlocked,
                     ..
                 } => {}
-                e => panic!(
-                    "expected LocalNetworkBlocked (unconditional) for {url}, got {e:?}",
-                ),
+                e => panic!("expected LocalNetworkBlocked (unconditional) for {url}, got {e:?}",),
             }
         }
     }

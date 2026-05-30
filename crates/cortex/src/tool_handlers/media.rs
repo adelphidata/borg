@@ -678,8 +678,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(wm_path("/v1/audio/speech"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(audio_payload.clone(), "audio/mpeg"),
+                ResponseTemplate::new(200).set_body_raw(audio_payload.clone(), "audio/mpeg"),
             )
             .expect(1)
             .mount(&server)
@@ -698,10 +697,7 @@ mod tests {
                     text.contains(&audio_payload.len().to_string()),
                     "summary missing byte count: {text}"
                 );
-                assert!(
-                    text.contains("audio/mpeg"),
-                    "summary missing MIME: {text}"
-                );
+                assert!(text.contains("audio/mpeg"), "summary missing MIME: {text}");
                 assert_eq!(parts.len(), 1, "expected exactly one audio part");
                 match &parts[0] {
                     ContentPart::AudioBase64 { media } => {

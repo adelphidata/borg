@@ -253,7 +253,9 @@ async fn mcp_audit_chain_records_server_started_registered_rejected_and_executed
     assert!(
         !server_started.is_empty(),
         "at least one MCP_SERVER_STARTED row expected, got types {:?}",
-        rows.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>()
+        rows.iter()
+            .map(|r| r.event_type.as_str())
+            .collect::<Vec<_>>()
     );
     let payload: Value = serde_json::from_str(&server_started[0].event_json).expect("payload");
     assert_eq!(payload["server"], "audit");
@@ -298,8 +300,14 @@ async fn mcp_audit_chain_records_server_started_registered_rejected_and_executed
         .filter_map(|r| serde_json::from_str::<Value>(&r.event_json).ok())
         .filter_map(|v| v["tool"].as_str().map(str::to_string))
         .collect();
-    assert!(reject_tools.contains(&"too_big".to_string()), "{reject_tools:?}");
-    assert!(reject_tools.contains(&"uses_ref".to_string()), "{reject_tools:?}");
+    assert!(
+        reject_tools.contains(&"too_big".to_string()),
+        "{reject_tools:?}"
+    );
+    assert!(
+        reject_tools.contains(&"uses_ref".to_string()),
+        "{reject_tools:?}"
+    );
     for row in &rejected {
         let v: Value = serde_json::from_str(&row.event_json).expect("payload");
         assert!(

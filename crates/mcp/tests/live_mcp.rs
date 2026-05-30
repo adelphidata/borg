@@ -58,10 +58,7 @@ fn time_manifest() -> ServerManifest {
         tools: ToolFilter {
             include: vec![],
             exclude: vec![],
-            read_only: vec![
-                "get_current_time".into(),
-                "convert_time".into(),
-            ],
+            read_only: vec!["get_current_time".into(), "convert_time".into()],
             max: ToolFilter::DEFAULT_MAX,
         },
     }
@@ -138,9 +135,8 @@ async fn live_mcp_server_time_stdio_round_trip() {
         .get("datetime")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("tool result missing `datetime` string field: {parsed}"));
-    chrono::DateTime::parse_from_rfc3339(datetime_str).unwrap_or_else(|e| {
-        panic!("`datetime` field is not RFC3339: {datetime_str:?} (err {e})")
-    });
+    chrono::DateTime::parse_from_rfc3339(datetime_str)
+        .unwrap_or_else(|e| panic!("`datetime` field is not RFC3339: {datetime_str:?} (err {e})"));
 
     // Second call to exercise multi-request stdio framing. A regression
     // that lost the per-request id correlation would surface here as a

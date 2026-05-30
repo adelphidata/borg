@@ -22,9 +22,9 @@ pub(crate) fn render(template: &str, placeholders: &[(&str, &str)]) -> String {
             i += 2;
             continue;
         }
-        if rest.starts_with('{') {
-            if let Some(end_rel) = rest[1..].find('}') {
-                let name = &rest[1..end_rel + 1];
+        if let Some(after_brace) = rest.strip_prefix('{') {
+            if let Some(end_rel) = after_brace.find('}') {
+                let name = &after_brace[..end_rel];
                 if let Some((_, value)) = placeholders.iter().find(|(key, _)| *key == name) {
                     let quote = active_shell_quote(template, i);
                     out.push_str(&quote_for_context(value, quote));
@@ -34,10 +34,8 @@ pub(crate) fn render(template: &str, placeholders: &[(&str, &str)]) -> String {
             }
         }
 
-        let ch = rest
-            .chars()
-            .next()
-            .expect("loop invariant: rest is non-empty while i < len");
+        // `i < template.len()` guarantees a remaining char; advance one char.
+        let Some(ch) = rest.chars().next() else { break };
         out.push(ch);
         i += ch.len_utf8();
     }

@@ -322,10 +322,7 @@ mod tests {
 
         // A different sender is unaffected (proves the cap is per-sender, not global).
         let bob = queue
-            .enqueue(
-                "chan:bob:0".to_string(),
-                Box::pin(async {}),
-            )
+            .enqueue("chan:bob:0".to_string(), Box::pin(async {}))
             .await;
         assert!(bob, "bob's first session must be accepted");
 

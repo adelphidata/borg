@@ -751,9 +751,7 @@ mod tests {
         // No issue_state row either.
         let stmt = db
             .conn()
-            .prepare(
-                "SELECT issue_key FROM maintenance_issue_state WHERE issue_key = ?1",
-            )
+            .prepare("SELECT issue_key FROM maintenance_issue_state WHERE issue_key = ?1")
             .await
             .expect("prepare issue_state lookup");
         let mut rows = stmt
@@ -822,9 +820,7 @@ mod tests {
         // maintenance_issue_state row still written.
         let stmt = db
             .conn()
-            .prepare(
-                "SELECT last_status FROM maintenance_issue_state WHERE issue_key = ?1",
-            )
+            .prepare("SELECT last_status FROM maintenance_issue_state WHERE issue_key = ?1")
             .await
             .expect("prepare issue_state lookup");
         let mut rows = stmt

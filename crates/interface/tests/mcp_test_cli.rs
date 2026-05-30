@@ -31,7 +31,10 @@ fn borg_exe() -> PathBuf {
 /// Spawn `borg <args...>` against the given data dir. Returns
 /// (status, stdout, stderr). 30s wallclock cap so a wedged child fails
 /// the test instead of hanging CI.
-fn run_borg(data_dir: &std::path::Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+fn run_borg(
+    data_dir: &std::path::Path,
+    args: &[&str],
+) -> (std::process::ExitStatus, String, String) {
     let mut child = Command::new(borg_exe())
         .args(args)
         .env("BORG_DATA_DIR", data_dir)
@@ -155,8 +158,8 @@ fn mcp_test_cli_surfaces_kill_switch_missing_server_and_handshake_failure() {
     // the timeout-specific phrasing or the generic "handshake failed"
     // wrapper, but nothing looser — a loose `contains("handshake")` would
     // greenlight a future banner like "skipping handshake because…".
-    let handshake_signal = combined.contains("handshake timed out")
-        || combined.contains("handshake failed");
+    let handshake_signal =
+        combined.contains("handshake timed out") || combined.contains("handshake failed");
     assert!(
         handshake_signal,
         "expected handshake/transport error in CLI output, got:\nstdout:{stdout}\nstderr:{stderr}",

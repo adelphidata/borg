@@ -22,8 +22,7 @@ pub const SETTING_LAST_WEEKLY: &str = "consolidation.last_weekly";
 /// Settings key for tracking the last identity-backfill ATTEMPT (not success).
 /// Recorded regardless of outcome so a transcript that's genuinely too sparse
 /// for the aux LLM to act on doesn't get retried every single nightly.
-const SETTING_LAST_IDENTITY_BACKFILL_ATTEMPT: &str =
-    "consolidation.last_identity_backfill_attempt";
+const SETTING_LAST_IDENTITY_BACKFILL_ATTEMPT: &str = "consolidation.last_identity_backfill_attempt";
 
 /// Cool-down after a backfill attempt. Three days is long enough that a
 /// hopeless never-onboarded shell isn't paying aux-LLM tokens every 24h,
@@ -563,10 +562,7 @@ async fn maybe_backfill_identity(
 /// check alone would fire even after the user wiped IDENTITY deliberately
 /// without removing SETUP.md. Together they target precisely "onboarding
 /// happened but never produced an identity."
-async fn should_backfill_identity(
-    db: &crate::db::Database,
-    data_dir: &std::path::Path,
-) -> bool {
+async fn should_backfill_identity(db: &crate::db::Database, data_dir: &std::path::Path) -> bool {
     if super::identity_in_long_term_memory_with_db(db).await {
         return false;
     }
@@ -808,12 +804,9 @@ mod backfill_tests {
             .await
             .unwrap();
         let seeded = chrono::Utc::now().timestamp() - 60; // 1 minute ago
-        db.set_setting(
-            SETTING_LAST_IDENTITY_BACKFILL_ATTEMPT,
-            &seeded.to_string(),
-        )
-        .await
-        .unwrap();
+        db.set_setting(SETTING_LAST_IDENTITY_BACKFILL_ATTEMPT, &seeded.to_string())
+            .await
+            .unwrap();
 
         let config = crate::config::Config::default();
         maybe_backfill_identity(&config, &db, dir.path())
