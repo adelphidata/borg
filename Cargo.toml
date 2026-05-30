@@ -73,7 +73,7 @@ libsql = { version = "0.9", default-features = false, features = ["core", "encry
 # Revisit when the workspace rust-toolchain bumps past 1.90.
 roaring = "=0.11.2"
 scraper = "0.22"
-pdf-extract = "0.7"
+pdf-extract = "0.10"
 shellexpand = "3"
 sha2 = "0.10"
 hmac = "0.12"
@@ -82,10 +82,10 @@ tower = { version = "0.5", features = ["limit"] }
 tracing-appender = "0.2"
 throbber-widgets-tui = "0.9"
 ignore = "0.4"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace", "metrics"] }
-opentelemetry-otlp = { version = "0.31", features = ["trace", "metrics", "grpc-tonic"] }
-tracing-opentelemetry = "0.32"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 chromiumoxide = { version = "0.9", default-features = false }
 notify = "7"
 image = "0.25"

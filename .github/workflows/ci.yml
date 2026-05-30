@@ -106,7 +106,7 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lib --bins --fail-under-lines 80 --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v5
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -135,7 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2
+      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823 # v2.0.19
 
   # Windows-only sandbox surface (CreateRestrictedToken, anonymous-pipe
   # SpawnRequest IPC, job objects, mitigation policies, isolated desktop,
