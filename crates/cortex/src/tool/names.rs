@@ -60,6 +60,49 @@ pub const GOOGLE_CALENDAR: &str = "google_calendar";
 pub const NOTION: &str = "notion";
 pub const LINEAR: &str = "linear";
 
+/// Built-in tool names that external tool sources (MCP servers, WASM plugins)
+/// may not shadow. A registered tool whose name collides with one of these is
+/// filtered out at definition time and rejected at dispatch, so the LLM never
+/// sees two competing schemas for the same name.
+///
+/// This is the single source of truth — both [`crate::mcp_clients`] and
+/// [`crate::wasm_plugins`] reference it, so adding a new built-in tool only
+/// requires extending this list (and is guarded by
+/// `builtin_tool_names_includes_dispatcher_critical_names`).
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    WRITE_MEMORY,
+    READ_MEMORY,
+    MEMORY_SEARCH,
+    LIST,
+    APPLY_PATCH,
+    RUN_SHELL,
+    READ_FILE,
+    LIST_DIR,
+    WEB_FETCH,
+    WEB_SEARCH,
+    SCHEDULE,
+    MANAGE_TASKS,
+    MANAGE_CRON,
+    BROWSER,
+    GENERATE_IMAGE,
+    TEXT_TO_SPEECH,
+    REQUEST_USER_INPUT,
+    APPLY_SKILL_PATCH,
+    CREATE_CHANNEL,
+    LIST_SKILLS,
+    LIST_CHANNELS,
+    LIST_AGENTS,
+    SPAWN_AGENT,
+    SEND_TO_AGENT,
+    WAIT_FOR_AGENT,
+    CLOSE_AGENT,
+    MANAGE_ROLES,
+    GMAIL,
+    GOOGLE_CALENDAR,
+    NOTION,
+    LINEAR,
+];
+
 /// Helper macro for action-based tool dispatch.
 ///
 /// Extracts the `"action"` parameter and dispatches to the matching handler.

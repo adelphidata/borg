@@ -107,45 +107,10 @@ enum SessionCmd {
     },
 }
 
-/// Built-in tool names the registry must avoid colliding with. Hard-coded
-/// here to avoid pulling `wasm_plugins`'s private helper across module
-/// boundaries; the list mirrors the one in
-/// `crate::wasm_plugins::builtin_tool_names`.
-fn builtin_tool_names() -> Vec<&'static str> {
-    use crate::tool::names;
-    vec![
-        names::WRITE_MEMORY,
-        names::READ_MEMORY,
-        names::MEMORY_SEARCH,
-        names::LIST,
-        names::APPLY_PATCH,
-        names::RUN_SHELL,
-        names::READ_FILE,
-        names::LIST_DIR,
-        names::WEB_FETCH,
-        names::WEB_SEARCH,
-        names::SCHEDULE,
-        names::MANAGE_TASKS,
-        names::MANAGE_CRON,
-        names::BROWSER,
-        names::GENERATE_IMAGE,
-        names::TEXT_TO_SPEECH,
-        names::REQUEST_USER_INPUT,
-        names::APPLY_SKILL_PATCH,
-        names::CREATE_CHANNEL,
-        names::LIST_SKILLS,
-        names::LIST_CHANNELS,
-        names::LIST_AGENTS,
-        names::SPAWN_AGENT,
-        names::SEND_TO_AGENT,
-        names::WAIT_FOR_AGENT,
-        names::CLOSE_AGENT,
-        names::MANAGE_ROLES,
-        names::GMAIL,
-        names::GOOGLE_CALENDAR,
-        names::NOTION,
-        names::LINEAR,
-    ]
+/// Built-in tool names the registry must avoid colliding with. Single source
+/// of truth lives in [`crate::tool::names::BUILTIN_TOOL_NAMES`].
+fn builtin_tool_names() -> &'static [&'static str] {
+    crate::tool::names::BUILTIN_TOOL_NAMES
 }
 
 use crate::rate_limit::TokenBucket;

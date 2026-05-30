@@ -130,46 +130,10 @@ pub const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
 /// emit `wasm_plugin_resealed` so the operator sees the migration happened.
 pub const LEGACY_HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac";
 
-/// Names of built-in tools — WASM plugins may not shadow them.
-///
-/// Keep in sync with `crate::tool::names`. A WASM plugin advertising a tool
-/// whose name collides with a built-in is filtered out at definition time and
-/// rejected at dispatch time, so the LLM never sees two competing schemas for
-/// the same name.
+/// Names of built-in tools — WASM plugins may not shadow them. Single source
+/// of truth lives in [`crate::tool::names::BUILTIN_TOOL_NAMES`].
 fn builtin_tool_names() -> &'static [&'static str] {
-    &[
-        names::WRITE_MEMORY,
-        names::READ_MEMORY,
-        names::MEMORY_SEARCH,
-        names::LIST,
-        names::APPLY_PATCH,
-        names::RUN_SHELL,
-        names::READ_FILE,
-        names::LIST_DIR,
-        names::WEB_FETCH,
-        names::WEB_SEARCH,
-        names::SCHEDULE,
-        names::MANAGE_TASKS,
-        names::MANAGE_CRON,
-        names::BROWSER,
-        names::GENERATE_IMAGE,
-        names::TEXT_TO_SPEECH,
-        names::REQUEST_USER_INPUT,
-        names::APPLY_SKILL_PATCH,
-        names::CREATE_CHANNEL,
-        names::LIST_SKILLS,
-        names::LIST_CHANNELS,
-        names::LIST_AGENTS,
-        names::SPAWN_AGENT,
-        names::SEND_TO_AGENT,
-        names::WAIT_FOR_AGENT,
-        names::CLOSE_AGENT,
-        names::MANAGE_ROLES,
-        names::GMAIL,
-        names::GOOGLE_CALENDAR,
-        names::NOTION,
-        names::LINEAR,
-    ]
+    names::BUILTIN_TOOL_NAMES
 }
 
 /// True if `name` collides with a built-in, ASCII-case-insensitively.
