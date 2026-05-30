@@ -3,8 +3,8 @@
 //! Spawned at daemon startup. Every hour (and once at boot) calls
 //! [`cortex::budgets::BudgetEngine::reset_if_due`] to advance any budget
 //! whose period has elapsed and write a `budget_reset` event. Failures log
-//! a `tracing::warn!` and the loop continues — the daemon must never be
-//! killed by a budget tick error (CLAUDE.md error-handling invariant).
+//! a `tracing::warn!` and the loop continues — a budget tick error must
+//! never kill the daemon.
 
 use std::time::Duration;
 
@@ -13,9 +13,8 @@ use cortex::db::Database;
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 
-/// Hourly cadence. Picked by `approvals.md` — daily resets only need to be
-/// detected with hour-grain precision since the user-visible effect of a
-/// reset is "agent unpauses" and an hour of latency is acceptable.
+/// Hourly cadence. Daily resets only need hour-grain precision — the
+/// user-visible effect ("agent unpauses") tolerates up to an hour of latency.
 const TICK_INTERVAL_SECS: u64 = 3600;
 
 /// Spawn the reset loop. Returns immediately; the task runs until the

@@ -348,7 +348,6 @@ async fn resolve_session_and_commands(
         .await
         .context("Failed to resolve channel session")?;
 
-    // Log inbound message
     if let Err(e) = db
         .log_channel_message(
             channel_name,
@@ -468,7 +467,8 @@ async fn resolve_session_and_commands(
         });
     }
 
-    // Check for slash commands before creating agent (use original text for commands)
+    // Slash-command dispatch runs against original (un-prepped) text so command
+    // parsing isn't broken by mention-stripping or quote-extraction.
     if let Some(response) = crate::commands::try_handle_command(
         &inbound.text,
         &db,

@@ -437,7 +437,8 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
         .with_context(|| format!("Failed to rename current binary to {}", backup.display()))?;
 
     if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
-        // Attempt to restore backup
+        // Best-effort rollback: if restore also fails the operator's binary is
+        // already at `backup` — surface the original copy error so they can recover.
         let _ = std::fs::rename(&backup, &current_exe);
         return Err(e).context("Failed to install new binary");
     }

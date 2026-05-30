@@ -198,10 +198,8 @@ impl SessionActor {
 
     async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let id = self.next_id;
-        // wrapping_add is conservative — at 1M calls/sec wrap takes ~580k
-        // years. The earlier `.max(1)` was a tell that we'd thought about
-        // wrap but only half-covered it; for now we accept the unreachable
-        // wrap and drop the misleading floor.
+        // wrapping_add: at 1M calls/sec, u64 wrap takes ~580k years; the
+        // wrap branch is unreachable in any real session lifetime.
         self.next_id = self.next_id.wrapping_add(1);
 
         let req = Request::new(id, method, params);

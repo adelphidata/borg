@@ -444,8 +444,6 @@ mod tests {
         }
     }
 
-    // ── format_friendly_error tests ──
-
     #[test]
     fn friendly_rate_limit() {
         let msg =
@@ -539,8 +537,6 @@ mod tests {
         assert!(!msg.contains("DOCTYPE"));
     }
 
-    // ── strip_html tests ──
-
     #[test]
     fn strip_html_detects_doctype() {
         assert_eq!(
@@ -561,8 +557,6 @@ mod tests {
             "(HTML error page)"
         );
     }
-
-    // ── extract_provider_name tests ──
 
     #[test]
     fn extract_provider_anthropic() {
@@ -616,8 +610,6 @@ mod tests {
         assert_eq!(extract_provider_name("some error"), None);
     }
 
-    // ── extract_transport_detail tests ──
-
     #[test]
     fn transport_detail_connection_refused() {
         assert_eq!(
@@ -663,8 +655,6 @@ mod tests {
         assert_eq!(extract_transport_detail("broken pipe"), None);
     }
 
-    // ── ErrorCategory display tests ──
-
     #[test]
     fn error_category_display() {
         assert_eq!(ErrorCategory::RateLimit.to_string(), "rate_limit");
@@ -679,8 +669,6 @@ mod tests {
         assert_eq!(ErrorCategory::Timeout.to_string(), "timeout");
         assert_eq!(ErrorCategory::Unknown.to_string(), "unknown");
     }
-
-    // ── Edge cases ──
 
     #[test]
     fn empty_error_classifies_as_unknown() {
@@ -725,8 +713,6 @@ mod tests {
         let hint = extract_retry_hint("please wait a moment");
         assert!(hint.is_none());
     }
-
-    // ── format_error_with_context tests ──
 
     #[test]
     fn context_tui_rate_limit_suggests_model_switch() {

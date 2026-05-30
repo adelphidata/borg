@@ -94,6 +94,8 @@ impl CostEventSink for CostEventBus {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(inner) = current {
+            // `send` errs only when no subscribers exist — cost emission is
+            // best-effort by design, so silent drop is correct here.
             let _ = inner.tx.send(event);
         }
     }

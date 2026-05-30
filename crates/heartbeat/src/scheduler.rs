@@ -155,7 +155,7 @@ pub struct HeartbeatScheduler {
 }
 
 impl HeartbeatScheduler {
-    /// Create a new scheduler with the given config, timezone, and poke signal receiver.
+    /// Build a scheduler bound to the given config/timezone and listening on `poke_rx`.
     pub fn new(config: HeartbeatConfig, timezone: Tz, poke_rx: mpsc::Receiver<()>) -> Self {
         let quiet_hours = Self::parse_quiet_hours(&config);
         Self {

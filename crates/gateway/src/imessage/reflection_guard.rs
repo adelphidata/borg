@@ -4,11 +4,11 @@
 ///
 /// Returns the name of the detected marker, or None if clean.
 pub fn detect_reflected_content(text: &str) -> Option<&'static str> {
-    // Build a view of the text with code blocks masked out
+    // Mask code blocks so a user legitimately quoting `<thinking>` in a
+    // fenced snippet doesn't trip the reflection heuristic.
     let regions = non_code_regions(text);
 
     for region in &regions {
-        // Check each pattern against non-code text
         if region.contains("#####") {
             return Some("internal separator");
         }

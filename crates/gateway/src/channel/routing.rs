@@ -121,7 +121,6 @@ fn apply_binding(
 ) -> ResolvedRoute {
     let mut config = base_config.clone();
 
-    // Build a deterministic binding ID for session isolation
     let binding_id = format!(
         "bind:{}:{}:{}",
         binding.channel,

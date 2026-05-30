@@ -1196,11 +1196,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Edge cases ──
-
     #[test]
     fn parse_add_file_empty_content() {
-        // Add file with no + lines produces empty content
         let input = "\
 *** Begin Patch
 *** Add File: empty.txt

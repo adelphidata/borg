@@ -243,7 +243,9 @@ impl Capability for CapabilitySvc {
 
         let client_id = self.router.register(advertise.capabilities, out_tx.clone());
 
-        // Send AdvertiseAck.
+        // AdvertiseAck send only fails if the client has already dropped the
+        // stream — there's nothing left to recover, the spawn below will
+        // observe the close and deregister.
         let _ = out_tx
             .send(ServerMessage {
                 kind: Some(SKind::AdvertiseAck(AdvertiseAck { client_id })),

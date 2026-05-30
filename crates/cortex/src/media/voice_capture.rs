@@ -250,8 +250,6 @@ pub fn write_wav(samples: &[i16], sample_rate_hz: u32) -> Result<PathBuf> {
     Ok(path)
 }
 
-// ─── Whisper hallucination filter ──────────────────────────────────────────
-
 static HALLUCINATION_PHRASES: std::sync::OnceLock<HashSet<&'static str>> =
     std::sync::OnceLock::new();
 static HALLUCINATION_REPEAT_RE: std::sync::OnceLock<Option<Regex>> = std::sync::OnceLock::new();
@@ -319,8 +317,6 @@ pub fn is_whisper_hallucination(transcript: &str) -> bool {
     }
     repeat_re().map(|r| r.is_match(&cleaned)).unwrap_or(false)
 }
-
-// ─── Recorder trait + actor implementation ─────────────────────────────────
 
 /// Recorder API consumed by `voice_loop`. The trait lets tests inject a
 /// fake without spinning up `cpal`.
@@ -481,8 +477,6 @@ impl Drop for AudioRecorder {
     }
 }
 
-// ─── Audio environment preflight ────────────────────────────────────────────
-//
 // `cpal::default_host().default_input_device()` returning `None` is the
 // generic failure mode; the value of this preflight is converting it into a
 // platform-specific remediation string the user can act on directly.
@@ -776,8 +770,6 @@ fn resample_i16(samples: &[i16], _channels: u16, ratio: f32) -> Vec<i16> {
     }
     out
 }
-
-// ─── Mock recorder for tests ───────────────────────────────────────────────
 
 /// Test-only recorder. Captures the `on_silence` callback so tests can
 /// fire silence on demand and inspect lifecycle calls.

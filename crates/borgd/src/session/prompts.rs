@@ -139,9 +139,8 @@ mod tests {
 
     #[test]
     fn unknown_prompt_id_is_an_error_not_a_silent_drop() {
-        // Real failure mode: a misrouted PromptResponse should be visible to
-        // callers, never silently swallowed (CLAUDE.md "no silent error
-        // swallowing").
+        // Real failure mode: a misrouted PromptResponse must surface to
+        // callers, never get silently swallowed.
         let reg = PromptRegistry::default();
         let err = reg.respond("nope", "true").expect_err("must fail");
         assert!(err.contains("unknown prompt_id"));

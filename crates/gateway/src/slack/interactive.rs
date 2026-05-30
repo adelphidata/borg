@@ -158,9 +158,8 @@ fn block_actions_outcome(payload: InteractionPayload) -> InteractiveOutcome {
 
 /// Escape XML special characters so untrusted Slack-payload values can't
 /// break out of the structured `<interactive .../>` / `<input .../>` tags
-/// the agent prompt embeds them in. CLAUDE.md "Prompt Injection Defense /
-/// context segregation (XML trust boundaries)" treats this as a hard
-/// invariant — `value` and free-form text inputs are user-controlled.
+/// the agent prompt embeds them in. Hard XML trust-boundary invariant —
+/// `value` and free-form text inputs are user-controlled.
 fn xml_attr_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {

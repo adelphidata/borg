@@ -70,12 +70,13 @@ impl ChatQueue {
             return;
         }
 
-        // Spawn a new consumer for this chat
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let handler = self.handler.clone();
         let cleanup_senders = self.senders.clone();
 
-        // Send the first message before spawning the consumer
+        // Send the first message before spawning the consumer so we surface
+        // capacity-exhaustion errors synchronously instead of through a
+        // task that's about to exit.
         if tx.send(msg).await.is_err() {
             warn!("Failed to enqueue first message for chat {chat_id}");
             return;

@@ -21,7 +21,6 @@ fn resolve_editor() -> String {
 pub fn open_external_editor(initial_text: &str) -> Result<String> {
     let editor = resolve_editor();
 
-    // Create a temp file with initial content
     let mut tmpfile = tempfile::Builder::new()
         .prefix("borg-")
         .suffix(".md")

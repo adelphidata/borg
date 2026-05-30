@@ -79,8 +79,8 @@ pub const SAFE_ENV_VARS: &[&str] = &[
 pub const SAFE_ENV_VARS: &[&str] = &["PATH", "TEMP", "TMP"];
 
 /// Standard system paths whose binaries a sandboxed script may invoke
-/// (`cat`, `grep`, `curl`, etc.). Used to widen Seatbelt's `process-exec`
-/// rule beyond just the runtime binary.
+/// (`cat`, `grep`, `curl`, etc.). Widens Seatbelt's `process-exec` rule
+/// beyond just the runtime binary.
 pub const STANDARD_EXEC_PATHS: &[&str] =
     &["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 

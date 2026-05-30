@@ -1293,11 +1293,9 @@ impl TtsSynthesizer {
     }
 }
 
-// ─── Markdown stripping for TTS ─────────────────────────────────────────────
-//
 // Spoken markdown noise ("asterisk asterisk bold asterisk asterisk") destroys
-// the listening experience. Mirrors `_strip_markdown_for_tts` in
-// for Rust-side completeness: `__bold__`, `_italic_`, and `~~strikethrough~~`.
+// the listening experience, so strip `**bold**`, `__bold__`, `*italic*`,
+// `_italic_`, `~~strike~~`, code, links, and block markers before TTS.
 //
 // Application order matters:
 // 1. Fenced code blocks first — their bodies may contain other markdown.

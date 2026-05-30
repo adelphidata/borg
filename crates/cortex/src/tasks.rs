@@ -13,14 +13,10 @@ use crate::db::{Database, ScheduledTaskRow};
 /// isn't rejected as in-the-past.
 const FUTURE_TIMESTAMP_GRACE_SECS: i64 = 60;
 
-// ── Task status constants ──
-
 pub const TASK_STATUS_ACTIVE: &str = "active";
 pub const TASK_STATUS_PAUSED: &str = "paused";
 pub const TASK_STATUS_CANCELLED: &str = "cancelled";
 pub const TASK_STATUS_COMPLETED: &str = "completed";
-
-// ── Run status constants ──
 
 pub const RUN_STATUS_RUNNING: &str = "running";
 pub const RUN_STATUS_SUCCESS: &str = "success";
@@ -30,8 +26,6 @@ pub const RUN_STATUS_FAILED: &str = "failed";
 /// stuck retry). The run is not replayed — we just audit the miss and
 /// reset `next_run` to the next valid fire time.
 pub const RUN_STATUS_MISSED: &str = "missed";
-
-// ── Schedule type constants ──
 
 /// One-shot task: runs once at `next_run`, then marked completed.
 pub const SCHEDULE_TYPE_ONCE: &str = "once";
@@ -565,8 +559,6 @@ mod tests {
         }
     }
 
-    // ── Cron line parser tests ──
-
     #[test]
     fn convert_5_to_7_field_basic() {
         assert_eq!(convert_5_to_7_field("*/5 * * * *"), "0 */5 * * * * *");
@@ -606,8 +598,6 @@ mod tests {
         let (_, cmd) = parse_cron_line("0 0 * * * echo hello world").unwrap();
         assert_eq!(cmd, "echo hello world");
     }
-
-    // ── Retry logic tests ──
 
     #[test]
     fn retry_delay_secs_escalates() {

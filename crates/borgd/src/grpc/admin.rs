@@ -978,8 +978,8 @@ impl Admin for AdminSvc {
     //
     // Single sentinel: settings-table key `onboarded` set to "true". The cli
     // used to write this directly via `Database::open()`; routing through
-    // the daemon ensures one writer (matches CLAUDE.md's no-multi-writer rule)
-    // and lets the daemon's settings cache stay in sync after onboarding.
+    // the daemon ensures one writer and lets its settings cache stay in sync
+    // after onboarding.
 
     async fn get_onboarding_state(
         &self,
@@ -2492,9 +2492,8 @@ impl Admin for AdminSvc {
 
     /// Stream tree-lifecycle events. Returns `Unimplemented` until the
     /// [`cortex::multi_agent::AgentTreeBus`] is wired into the daemon
-    /// session executor. An immediately-closed stream would let clients
-    /// confuse "no events yet" with "not wired" — the CLAUDE.md
-    /// "report success only if it succeeded" rule applies to streams too.
+    /// session executor — an immediately-closed stream would let clients
+    /// confuse "no events yet" with "not wired".
     async fn subscribe_agent_tree_events(
         &self,
         _req: Request<SessionRef>,

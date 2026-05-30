@@ -1,9 +1,6 @@
 //! `Admin.SendApprovalGreeting` — generate and deliver a one-shot personalized
 //! greeting after a manual sender approval.
 //!
-//! Mirrors `crates/cli/src/service/mod.rs::send_approval_greeting` but lives
-//! in the daemon so the cli no longer needs to construct an `Agent` for this.
-//!
 //! On any failure (LLM down, channel API error, empty response) we fall back
 //! to the stock static notification via `cortex::pairing::send_approval_notification`.
 

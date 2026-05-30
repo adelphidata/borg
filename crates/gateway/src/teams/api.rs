@@ -47,7 +47,6 @@ impl TeamsClient {
 
     /// Get a valid OAuth2 access token, fetching a new one if the cache is empty or expired.
     pub async fn get_token(&self) -> Result<String> {
-        // Check cache first
         {
             let cache = self
                 .token_cache

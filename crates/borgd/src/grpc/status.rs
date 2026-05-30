@@ -20,7 +20,7 @@ use tonic::{Request, Response, Status as TStatus};
 pub struct StatusSvc;
 
 impl StatusSvc {
-    /// Construct a new Status service.
+    /// Stateless Status RPC implementation.
     pub fn new() -> Self {
         Self
     }

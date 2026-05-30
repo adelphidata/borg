@@ -953,8 +953,6 @@ mod tests {
         assert!(!dir.path().join("delete.txt").exists());
     }
 
-    // ── New tests for ported features ──
-
     #[test]
     fn move_file_operation() {
         let dir = TempDir::new().unwrap();

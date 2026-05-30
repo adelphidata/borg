@@ -1,10 +1,9 @@
 //! Synchronous-to-async bridge for the `interface` crate.
 //!
-//! `cortex::db::Database::open()` and the rest of the DB surface are async
-//! after the libsql port. Many of our call sites (CLI subcommand handlers,
-//! TUI slash-command dispatchers, popup callbacks) are still sync — they
-//! run from inside `#[tokio::main]` but the function signatures themselves
-//! are not async.
+//! `cortex::db::Database::open()` and the rest of the DB surface are async.
+//! Many of our call sites (CLI subcommand handlers, TUI slash-command
+//! dispatchers, popup callbacks) are still sync — they run from inside
+//! `#[tokio::main]` but the function signatures themselves are not async.
 //!
 //! `block_on` is the standard bridge: when we're already on a runtime it
 //! uses `block_in_place` to release the worker thread and drives the

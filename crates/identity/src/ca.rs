@@ -27,7 +27,9 @@ pub struct RootCa {
 pub struct ServerCertParams<'a> {
     /// Subject CN, e.g. `"borgd"`.
     pub common_name: &'a str,
-    /// DNS names to embed in SAN.
+    /// DNS names to embed in SAN. Default install uses only `localhost`;
+    /// exposing borgd beyond loopback requires adding the operator's
+    /// hostname here before mTLS handshakes will succeed.
     pub san_dns: &'a [String],
     /// Validity in days.
     pub validity_days: u32,

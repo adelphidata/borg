@@ -1,9 +1,5 @@
 //! Daemon-side orchestration: spawn gateway, heartbeat scheduler, scheduled-task
 //! dispatcher, watchdog, lock refresh — all in one place.
-//!
-//! Called from [`crate::daemon::run`] (production) and from the cli's
-//! `service::run_daemon` shim — the latter remains until the legacy entry
-//! points are fully retired.
 
 use crate::goal_bus::GoalEventBus;
 use crate::heartbeat::HeartbeatTrigger;

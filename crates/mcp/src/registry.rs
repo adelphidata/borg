@@ -14,8 +14,8 @@
 //!   opts in via `tools.read_only`).
 //!
 //! Supervisor lifecycle (spawn / reconnect / supervise) is intentionally
-//! *not* in this module — it belongs in `crates/borgd/src/mcp_supervisor.rs`
-//! so it can `spawn_supervised`.
+//! *not* in this module — it lives in `cortex::mcp_clients` so it can use
+//! the cortex-side audit writer and `spawn_supervised`.
 
 use crate::errors::SchemaRejectionReason;
 use crate::manifest::ToolFilter;
@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Acquire a write lock, logging once if the lock was poisoned and
-/// recovering the inner state. Per CLAUDE.md's no-silent-swallowing
-/// invariant, a poison event means another thread panicked while holding
-/// the lock — at minimum we surface that in the trace stream so the
-/// operator can correlate it with whatever else broke.
+/// recovering the inner state. A poison event means another thread
+/// panicked while holding the lock — we surface that in the trace stream
+/// so the operator can correlate it with whatever else broke (rather than
+/// silently swallowing it).
 fn write_recovering<'a, T>(lock: &'a RwLock<T>, name: &'static str) -> RwLockWriteGuard<'a, T> {
     match lock.write() {
         Ok(g) => g,

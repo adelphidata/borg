@@ -343,7 +343,7 @@ pub fn find_by_id(id: &str) -> Option<&'static PluginDef> {
     CATALOG.iter().find(|c| c.id == id)
 }
 
-/// Get all entries for a given category.
+/// All plugins matching `category`, preserving catalog order.
 pub fn by_category(category: Category) -> Vec<&'static PluginDef> {
     CATALOG.iter().filter(|c| c.category == category).collect()
 }

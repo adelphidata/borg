@@ -199,10 +199,7 @@ pub fn stop_playback() {
     }
 }
 
-// ─── Beep synthesis ─────────────────────────────────────────────────────────
-//
-// Mirrors `play_beep` —
-// 880 Hz single beep on record start, 660 Hz double beep on record stop.
+// Beep cues: 880 Hz single beep on record start, 660 Hz double beep on record stop.
 // The reference implementation synthesizes these inline; we cache to `$TMPDIR/borg_voice/` once
 // per process so playback is a cheap `afplay`/`ffplay`/`aplay` invocation.
 //

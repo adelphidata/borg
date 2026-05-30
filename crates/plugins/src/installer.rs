@@ -261,9 +261,8 @@ fn remove_credential(service: &str, key: &str) {
 ///
 /// Reads the macOS Messages database (`~/Library/Messages/chat.db`) via libsql
 /// in unencrypted-open mode. We never write to chat.db — the SELECTs below are
-/// the only statements issued, which is the application-boundary read-only
-/// enforcement called out in the migration plan (libsql has no
-/// `SQLITE_OPEN_READ_ONLY` open-flag equivalent).
+/// the only statements issued (libsql has no `SQLITE_OPEN_READ_ONLY` open-flag
+/// equivalent, so read-only is enforced at the application boundary).
 pub(crate) fn imessage_post_install(
     data_dir: std::path::PathBuf,
 ) -> crate::catalog::PostInstallFuture {

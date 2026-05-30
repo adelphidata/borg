@@ -48,10 +48,10 @@ mod tests {
     use super::*;
 
     /// Slack's `EventDeduplicator` differs from the other channels by holding
-    /// **two independent keyspaces**: `event_id` and `(channel, ts)`. Per
-    /// CLAUDE.md, only the slack-specific invariant — that the two axes do
-    /// not cross-pollute — is worth testing here; generic first-seen / LRU
-    /// behavior is covered by `BoundedDedup` tests upstream.
+    /// **two independent keyspaces**: `event_id` and `(channel, ts)`. Only the
+    /// slack-specific invariant — that the two axes do not cross-pollute — is
+    /// worth testing here; generic first-seen / LRU behavior is covered by
+    /// `BoundedDedup` tests upstream.
     #[test]
     fn event_id_and_channel_ts_keyspaces_are_independent() {
         let mut dedup = EventDeduplicator::new();

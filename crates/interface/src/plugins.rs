@@ -298,7 +298,6 @@ pub fn add_plugin(name: &str) -> Result<()> {
             }
         }
 
-        // Print pairing hint for native channels
         if cortex::pairing::channel_to_prefix(name).is_some() {
             let agent_name = config.user.agent_name.as_deref().unwrap_or("Borg");
             let display = cortex::pairing::channel_display_name(name);

@@ -91,11 +91,11 @@ impl RpcError {
     /// as auth so the supervisor stops retrying (a wrong-classification
     /// false-positive is safer than a credential-spamming retry loop).
     ///
-    /// Tightened (vs an earlier draft) to require either a JSON-RPC code in
-    /// the auth range *or* a message substring that's unambiguous about
-    /// credentials. The word "permission" alone is dropped: servers use it
-    /// for `tools/call` runtime errors like "missing required permission
-    /// scope" which are recoverable per-call, not credential failures.
+    /// Requires either a JSON-RPC code in the auth range *or* a message
+    /// substring unambiguous about credentials. "permission" alone is NOT
+    /// classified as auth — servers use it for `tools/call` runtime errors
+    /// like "missing required permission scope" which are recoverable
+    /// per-call, not credential failures.
     pub fn looks_like_auth(&self) -> bool {
         const AUTH_CODES: &[i32] = &[-32001, -32002, -32003];
         if AUTH_CODES.contains(&self.code) {

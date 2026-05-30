@@ -222,6 +222,10 @@ pub struct VerifiedWasmPackage {
 }
 
 /// Validate and verify a plugin package before installation.
+///
+/// Gauntlet order matters: manifest parse → SHA-256 pin → Ed25519 signature
+/// → static WASM walk → HMAC seal. Each gate's failure mode is "refuse
+/// install" with the most specific diagnostic; do not reorder.
 pub fn verify_package(
     manifest_json: &[u8],
     signature_b64: &str,

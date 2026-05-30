@@ -194,8 +194,6 @@ mod tests {
         assert_eq!(partial_tag_overlap("text"), 0);
     }
 
-    // ---- thinking-tag tests (added with thinking-block scrubber) ----
-
     #[test]
     fn strip_thinking_tags_basic() {
         let input = "Hello <thinking>secret reasoning</thinking> world";
@@ -254,8 +252,6 @@ mod tests {
         // `<` alone counts as a 1-char partial regardless of which tag.
         assert_eq!(partial_tag_overlap("text<"), 1);
     }
-
-    // ---- negative tests: only the exact tag names are stripped ----
 
     #[test]
     fn thinking_filter_streaming_split_close_tag() {

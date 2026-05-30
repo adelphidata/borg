@@ -36,7 +36,7 @@ pub struct SessionQueue {
 }
 
 impl SessionQueue {
-    /// Create a new queue with the given concurrency limit for total active agent invocations.
+    /// Build a queue capped at `max_concurrent` simultaneously-executing agent turns.
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             senders: Arc::new(Mutex::new(HashMap::new())),
@@ -167,7 +167,6 @@ async fn session_consumer(
                     }
                 };
 
-                // Execute all coalesced work items sequentially
                 for work in batch {
                     work.await;
                 }
@@ -325,9 +324,7 @@ mod tests {
         let bob = queue
             .enqueue(
                 "chan:bob:0".to_string(),
-                Box::pin(async {
-                    // no-op
-                }),
+                Box::pin(async {}),
             )
             .await;
         assert!(bob, "bob's first session must be accepted");

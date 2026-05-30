@@ -35,8 +35,6 @@ use serde::Deserialize;
 
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
-// ─────────────────────── Config schema ───────────────────────
-
 #[derive(Debug, Default, Deserialize)]
 struct HooksFile {
     #[serde(default)]
@@ -62,8 +60,7 @@ enum HookHandlerConfig {
     },
 }
 
-// ─────────────────────── Event-name mapping ───────────────────────
-
+// Claude Code-compatible event names; keep in sync if HookPoint variants change.
 const EVENT_NAMES: &[(&str, HookPoint)] = &[
     ("SessionStart", HookPoint::SessionStart),
     ("SessionEnd", HookPoint::SessionEnd),
@@ -87,8 +84,6 @@ fn event_name_for_point(point: HookPoint) -> &'static str {
         .map(|(n, _)| *n)
         .unwrap_or("Unknown")
 }
-
-// ─────────────────────── ScriptHook ───────────────────────
 
 /// A hook defined in `~/.borg/hooks.json` that runs a shell command on a lifecycle event.
 pub struct ScriptHook {
@@ -312,8 +307,6 @@ impl std::fmt::Debug for ScriptHook {
     }
 }
 
-// ─────────────────────── Helpers ───────────────────────
-
 fn compile_matcher(raw: Option<&str>) -> Result<Option<Regex>, regex::Error> {
     match raw {
         None => Ok(None),
@@ -397,8 +390,6 @@ fn drain_streams(child: &mut std::process::Child) {
         }
     }
 }
-
-// ─────────────────────── Tests ───────────────────────
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {

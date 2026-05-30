@@ -45,14 +45,14 @@ impl EchoCache {
     pub fn is_echo(&mut self, text: &str, message_id: Option<i64>) -> bool {
         self.prune();
 
-        // Check by message ID first (strongest signal)
+        // Message-ID match is the strongest signal — text-hash is a fallback
+        // for AppleScript paths that don't surface a numeric guid.
         if let Some(id) = message_id {
             if self.id_entries.contains_key(&id) {
                 return true;
             }
         }
 
-        // Check by text hash
         let hash = text_hash(text);
         self.text_entries.contains_key(&hash)
     }

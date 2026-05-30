@@ -1647,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_load_replays_history_with_spec_message_kinds() {
-        // B3 regression: persisted history must replay as ACP-spec
+        // Regression guard: persisted history must replay as ACP-spec
         // `user_message_chunk` / `agent_message_chunk` updates — never the
         // legacy non-spec `history_message` kind. Internal tags must be
         // stripped on the way out (translator-only — upstream callers

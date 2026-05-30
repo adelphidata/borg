@@ -338,7 +338,7 @@ fn parse_when_requirements(when: &str) -> WhenRequirements {
     let mut forbidden = HashSet::new();
 
     // Tokens: optional leading `!`, then identifier consisting of ASCII
-    // alphanumerics / `_` / `.`. The reference impl uses /!?[A-Za-z_][\w.]*/.
+    // alphanumerics / `_` / `.` (regex equivalent: /!?[A-Za-z_][\w.]*/).
     let bytes = when.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

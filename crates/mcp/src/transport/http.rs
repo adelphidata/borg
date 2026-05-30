@@ -31,9 +31,8 @@ use url::Url;
 
 /// Policy knobs that the transport enforces on every outbound request.
 ///
-/// Sourced from the cortex-side `McpConfig`; defaults below match the
-/// security-first defaults declared in the plan: `https` only, no
-/// loopback / RFC1918.
+/// Sourced from the cortex-side `McpConfig`; secure-by-default — `https`
+/// only, no loopback / RFC1918.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HttpPolicy {
     /// If false (default), URLs must be `https://`.

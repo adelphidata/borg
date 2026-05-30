@@ -376,7 +376,6 @@ pub fn generate_config(
     let api_key_line = if provider.uses_aws_credential_chain() {
         "# Uses the AWS credential chain (env/profile/role)\n# bedrock_region = \"us-east-1\"  # uncomment to override AWS_REGION / AWS_DEFAULT_REGION".to_string()
     } else if !provider.requires_api_key() {
-        // Keyless providers (e.g., Ollama) — no API key config needed
         "# No API key required for local provider\n# base_url = \"http://localhost:11434/v1/chat/completions\"  # uncomment to override".to_string()
     } else if use_keychain {
         keychain_api_key_toml(provider_id)?
@@ -544,12 +543,10 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     // Clean up any leftover temp files from a prior failed attempt
     cleanup_tmp_files(&data_dir);
 
-    // Create directory structure
     for sub in BORG_SUBDIRS {
         std::fs::create_dir_all(data_dir.join(sub))?;
     }
 
-    // Install bundled skills to filesystem
     match cortex::skills::install_default_skills(&data_dir) {
         Ok(_) => {}
         Err(e) => eprintln!("  Warning: failed to install default skills: {e}"),
@@ -599,7 +596,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     })
     .context("Failed to persist onboarding settings via daemon")?;
 
-    // Write IDENTITY.md (skip if already exists)
     let identity_path = data_dir.join(IDENTITY_FILE);
     if !identity_path.exists() {
         let identity_content = generate_identity(&result.agent_name, &result.user_name);
@@ -609,7 +605,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         }
     }
 
-    // Write MEMORY.md with owner name seeded (skip if already exists)
     let memory_path = data_dir.join(MEMORY_INDEX_FILE);
     if !memory_path.exists() {
         let memory_content = format!(
@@ -622,7 +617,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         }
     }
 
-    // Write SETUP.md for first conversation instructions
     let setup_path = data_dir.join(SETUP_FILE);
     if !setup_path.exists() {
         let setup_content = generate_setup(&result.agent_name, &result.user_name);
@@ -632,7 +626,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         }
     }
 
-    // Store API key based on chosen storage method
     if let Some(ref api_key) = result.api_key {
         if use_keychain {
             match store_in_keychain(&result.provider, api_key) {
@@ -668,7 +661,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         }
     }
 
-    // Install selected channel plugins
     if result.channels.is_empty() {
         println!(
             "  No channels connected. Add one later with `borg add <name>` (e.g. `borg add telegram`)."

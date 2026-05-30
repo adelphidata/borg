@@ -1309,7 +1309,7 @@ mod tests {
         // Final exec is borgd. dbus-run-session waits on whatever its
         // child PID becomes after `exec`.
         assert!(content.contains("exec /usr/local/bin/borgd"));
-        // Hard guards against the B2/B3 regressions from the review.
+        // Hard guards against regressions in the secure-mode unit-file shape.
         assert!(
             !content.contains("--replace"),
             "must not use --replace; it daemonizes and dbus-run-session exits"

@@ -16,8 +16,6 @@ use crate::llm::llm_error::{FailoverReason, LlmError};
 use crate::llm::StreamEvent;
 use crate::types::{Message, MessageContent, Role, ToolDefinition};
 
-// ── CLI Detection ──
-
 /// Find the `claude` CLI binary on the system.
 ///
 /// Checks `CLAUDE_CLI_PATH` env var first, then falls back to PATH lookup.
@@ -134,8 +132,6 @@ fn read_keychain_credentials() -> Option<ClaudeCredential> {
     parse_credentials_json(json.trim())
 }
 
-// ── Model Alias Mapping ──
-
 /// Map a model identifier to the short alias the `claude` CLI expects for `--model`.
 ///
 /// The CLI accepts both long IDs (`claude-sonnet-4-6`) and short aliases (`sonnet`) in
@@ -161,8 +157,6 @@ pub fn normalize_cli_model(model: &str) -> String {
         _ => model.to_string(),
     }
 }
-
-// ── JSONL Stream Types ──
 
 /// Top-level event from `claude --output-format stream-json`.
 #[derive(Debug, Deserialize)]
@@ -291,8 +285,6 @@ fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
     }
 }
 
-// ── Message Assembly ──
-
 /// Assembled prompt with separated system and user content.
 struct AssembledPrompt {
     /// System messages concatenated, passed via --append-system-prompt.
@@ -342,8 +334,6 @@ fn assemble_prompt(messages: &[Message]) -> AssembledPrompt {
         user: user_parts.join("\n\n"),
     }
 }
-
-// ── Subprocess Streaming ──
 
 /// Stream a response from the Claude CLI subprocess.
 ///
@@ -431,6 +421,8 @@ pub async fn stream_claude_cli(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                // Best-effort kill on cancel — child may have already exited; the Done
+                // event signals receiver, which may itself be dropped during shutdown.
                 let _ = child.kill().await;
                 let _ = tx.send(StreamEvent::Done).await;
                 return Ok(());
@@ -487,13 +479,9 @@ pub async fn stream_claude_cli(
     Ok(())
 }
 
-// ── Tests ──
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Credential Parsing ──
 
     #[test]
     fn parse_valid_credentials() {
@@ -570,8 +558,6 @@ mod tests {
         };
         assert!(expired_cred.is_expired());
     }
-
-    // ── JSONL Parsing ──
 
     #[test]
     fn parse_text_delta() {
@@ -672,8 +658,6 @@ mod tests {
         assert!(parse_jsonl_event(line).is_none());
     }
 
-    // ── Message Assembly ──
-
     #[test]
     fn assemble_simple_user_message() {
         let msgs = vec![Message::user("Hello, Claude!")];
@@ -712,8 +696,6 @@ mod tests {
         assert!(prompt.user.is_empty());
         assert!(prompt.system.is_empty());
     }
-
-    // ── Model Alias Mapping ──
 
     #[test]
     fn normalize_cli_model_long_ids_to_short() {

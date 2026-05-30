@@ -20,14 +20,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-/// Service name passed to the OS keychain.
+/// Service name passed to the OS keychain. Shared across every PKI account
+/// (`ca-key`, `server-cert-key`, paired-device keys); the account name —
+/// not the service — distinguishes entries, so this constant must stay
+/// stable across borg versions or existing installs lose their keys.
 pub const SERVICE: &str = "borg-pki";
 
 /// Trait abstracting the keychain so tests can substitute an in-memory store.
 pub trait KekStore: Send + Sync {
     /// Store `secret` under `account`. Replaces any existing value.
     fn put(&self, account: &str, secret: &[u8]) -> Result<(), PkiError>;
-    /// Retrieve the secret previously stored under `account`.
+    /// Retrieve the secret stored under `account`.
     fn get(&self, account: &str) -> Result<Vec<u8>, PkiError>;
     /// Remove the secret under `account`. No-op if absent.
     fn delete(&self, account: &str) -> Result<(), PkiError>;
@@ -38,7 +41,7 @@ pub trait KekStore: Send + Sync {
 pub struct KeychainStore;
 
 impl KeychainStore {
-    /// Construct a new keychain-backed store.
+    /// New OS-keychain-backed store.
     pub fn new() -> Self {
         Self
     }
@@ -82,7 +85,7 @@ pub struct MemoryKekStore {
 }
 
 impl MemoryKekStore {
-    /// Build an empty in-memory store.
+    /// Empty in-memory store.
     pub fn new() -> Self {
         Self::default()
     }

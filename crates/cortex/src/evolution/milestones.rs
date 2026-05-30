@@ -1,4 +1,4 @@
-//! Sub-evolution milestone detection for the V2 surface.
+//! Sub-evolution milestone detection.
 //!
 //! Compares pre/post evolution state (plus bond + event history) and returns
 //! any newly-unlocked milestones. Callers are responsible for emitting the

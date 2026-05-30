@@ -582,8 +582,6 @@ mod tests {
         found.unwrap_or_else(|| panic!("missing metric: {name}"))
     }
 
-    // ---------------- init_telemetry ----------------
-
     #[test]
     fn init_telemetry_off_yields_no_layer_and_no_export() {
         // Spec: with both flags off, init returns no tracing layer AND
@@ -603,8 +601,6 @@ mod tests {
         m.agent_turns.add(1, &[]);
         m.gateway_duration.record(0.42, &[]);
     }
-
-    // ---------------- BorgMetrics ----------------
 
     #[test]
     fn borg_metrics_emit_under_centralized_names() {
@@ -684,8 +680,6 @@ mod tests {
             .any(|_| true);
         assert!(!any, "noop metrics leaked into global provider");
     }
-
-    // ---------------- wasm_metrics ----------------
 
     #[test]
     fn wasm_record_execute_success_emits_executes_and_duration_only() {

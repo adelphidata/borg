@@ -1,8 +1,4 @@
 //! Native channel send helpers used by heartbeat + approval greeting.
-//!
-//! Mirrors the small set of channel delivery primitives that live in
-//! `crates/cli/src/service/mod.rs::send_to_channel`. Kept here so the daemon's
-//! lifecycle paths don't need to reach into cli internals.
 
 use anyhow::{anyhow, Result};
 use cortex::config::Config;

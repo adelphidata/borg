@@ -111,14 +111,11 @@ pub struct GatewayServer {
 }
 
 impl GatewayServer {
-    /// Create a new gateway server with the given config and shutdown token.
+    /// Construct the gateway server.
     ///
-    /// `executor` is the daemon's `SessionExecutorHandle`: when present, it
-    /// is installed as the process-wide handle so inbound channel messages
-    /// route through `borgd::session::SessionRegistry`. When `None`, inbound
-    /// agent invocations short-circuit with an error — the legacy
-    /// in-process spawns from `cli` pass `None` and will eventually go
-    /// away.
+    /// When `executor` is `Some`, it is installed as the process-wide handle so
+    /// inbound channel messages route through `borgd::session::SessionRegistry`;
+    /// when `None`, agent invocations short-circuit with an error.
     pub fn new(
         config: Config,
         shutdown: CancellationToken,
@@ -260,7 +257,6 @@ impl GatewayServer {
             reg
         };
 
-        // Log native channel init summary
         {
             let native_list = native_channels.list();
             if native_list.is_empty() {
@@ -315,7 +311,9 @@ impl GatewayServer {
             .merge(build_generic_webhook_router(&self.config))
             .merge(build_mcp_http_router(&self.config));
 
-        // Check if a gateway is already running on this port before attempting to bind
+        // Probe before bind: another borgd already serving this port is an
+        // idempotent no-op (parent will park on `shutdown`), avoiding a
+        // confusing AddrInUse on supervisord-style double-starts.
         let probe_ok = async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
@@ -358,7 +356,8 @@ impl GatewayServer {
             .await;
         }
 
-        // Replay unfinished deliveries from previous run
+        // Crash-recovery: rows left in `sending` from the prior process are
+        // demoted to `pending` so the drain loop retries them.
         if let Ok(db) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
             match db.replay_unfinished().await {
                 Ok(0) => {}

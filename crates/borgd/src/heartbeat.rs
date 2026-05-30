@@ -253,7 +253,7 @@ pub fn spawn(
     // a parallel in-process timer here would double-fire on every tick. The
     // trigger-channel loop below is preserved so TUI-initiated SessionStart
     // greetings (which still need executor context) work.
-    let _ = config; // signature preserved for callers
+    let _ = config;
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
     let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
 

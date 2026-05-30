@@ -1,13 +1,8 @@
 //! Scheduled-task dispatcher loop.
 //!
-//! Watches `task_runs` / `scheduled_tasks` tables and fires due tasks. This
-//! mirrors the dispatcher embedded in `crates/cli/src/service/mod.rs::run_daemon`
-//! — pulled out so `borgd` can run it without going through the legacy cli
-//! path.
-//!
-//! Task execution itself (LLM call, command spawn, maintenance sweep) is
-//! delegated back to the cli's `service::*` helpers via `borgd::run_legacy`.
-//! This module is the loop body only.
+//! Watches `task_runs` / `scheduled_tasks` and fires due tasks. Loop body only —
+//! task execution (LLM call, command spawn, maintenance sweep) is delegated to
+//! the `service::*` helpers via `borgd::run_legacy`.
 
 use crate::maintenance::sweep;
 use crate::paths::tick_lock_path;
@@ -126,6 +121,8 @@ pub async fn run(
     let mut lock_refresh_failures: u32 = 0;
 
     loop {
+        // `biased` ensures shutdown wins over a coincident tick, so SIGTERM
+        // drains within one interval rather than running one final dispatch.
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {

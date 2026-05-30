@@ -397,9 +397,6 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     async fn test_db() -> DbHandle {
-        // The DbHandle is now a plain `Arc<Database>` — libsql's connection is
-        // internally Arc'd, so the Mutex wrapper that pre-dated the async DB
-        // is no longer needed.
         Arc::new(Database::test_db().await)
     }
 

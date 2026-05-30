@@ -6,9 +6,8 @@
 //! - The `Tui` wrapper around `custom_terminal::Terminal` that drives inline-viewport
 //!   rendering, history flushing, and alt-screen transitions for full-screen popups.
 //!
-//! It is intentionally narrower than the upstream reference: borg has its own event loop,
-//! frame ticking, signal handling, suspension, and notification stack, so those subsystems
-//! are not ported here.
+//! Event loop, frame ticking, signal handling, suspension, and notification stack live
+//! elsewhere; this module owns terminal modes and the inline-viewport wrapper only.
 
 use std::fmt;
 use std::io::stdout;

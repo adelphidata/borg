@@ -155,7 +155,6 @@ pub async fn augment_with_links(
     let mut augmented = text.to_string();
     let mut fetched_urls = Vec::new();
 
-    // Fetch all links concurrently
     let futures: Vec<_> = urls
         .iter()
         .map(|url| fetch_link_content(url, config.max_chars_per_link, config.timeout_ms))

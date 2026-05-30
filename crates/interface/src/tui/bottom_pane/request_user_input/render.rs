@@ -5,11 +5,9 @@
 //! `RequestUserInputOverlay::layout_sections`; this module only decides
 //! *what pixels go where* once the rects are handed to it.
 //!
-//! Adapted-not-verbatim port from the reference TUI: the reference render
-//! shares helpers across a dozen popups; here we inline the small bits we
-//! need (option-row line construction, footer hint composition) and skip
-//! features that aren't wired (the unanswered-confirmation overlay, the
-//! richer composer-backed notes editor).
+//! Helpers are inlined per-popup rather than shared (option-row line
+//! construction, footer hint composition); the unanswered-confirmation
+//! overlay and composer-backed notes editor are intentionally absent.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -23,8 +21,7 @@ use super::display_width;
 use super::other_label;
 use super::{Focus, RequestUserInputOverlay};
 
-/// `›` chevron marker drawn on the selected option row. Matches the
-/// reference TUI's single-byte selection cue (see `theme::CHEVRON`).
+/// `›` chevron marker drawn on the selected option row (see `theme::CHEVRON`).
 const SELECTION_MARKER: &str = theme::CHEVRON;
 /// Filled checkbox glyph for a chosen multi-select option.
 const MULTI_SELECTED: &str = "[x]";

@@ -7,12 +7,15 @@
 use std::time::{Duration, Instant};
 
 /// Maximum delay between consecutive chars to be considered part of a paste burst.
+/// Windows uses a looser threshold because its console event dispatch has
+/// coarser timing granularity than Unix terminals.
 #[cfg(not(windows))]
 const BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
 #[cfg(windows)]
 const BURST_CHAR_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Idle timeout before flushing buffered paste content.
+/// Windows uses a longer timeout to match the looser per-char threshold above.
 #[cfg(not(windows))]
 const BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 #[cfg(windows)]

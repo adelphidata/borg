@@ -27,19 +27,11 @@ pub struct SandboxPolicy {
 /// A command with its arguments, ready for execution (possibly sandbox-wrapped).
 ///
 /// The optional `_resources` field carries OS handles or other RAII
-/// guards whose lifetime must outlive `Command::spawn()`. The current
-/// user is the Windows trampoline: `wrap_windows` allocates
-/// an anonymous pipe, writes the framed `SpawnRequest` into it, marks
-/// the read-end inheritable, embeds that handle's value on the
-/// trampoline argv, and stashes the parent's copy here. The Drop
-/// impl on the contained guard closes the parent's handle table entry
-/// once the caller is done spawning. On non-Windows platforms the
-/// field is always `None`.
-///
-/// Type-erasing via `Arc<dyn Any + Send + Sync>` keeps `SandboxCommand`
-/// platform-neutral (no Win32 types leak into the cross-platform API)
-/// and `Clone`-able (Arc clone shares the same drop guard, so the
-/// handle stays open until the last clone drops).
+/// guards whose lifetime must outlive `Command::spawn()` — the Windows
+/// trampoline stashes its parent-side pipe handle here so the Drop
+/// impl closes it after the caller has spawned the child. Type-erased
+/// via `Arc<dyn Any>` so no Win32 types leak into the cross-platform
+/// API and clones share the same drop guard.
 #[derive(Default)]
 pub struct SandboxCommand {
     /// The program to execute.
@@ -223,9 +215,7 @@ impl SandboxPolicy {
     /// **Fails closed** on every error path. Both `current_exe()` failure
     /// (corrupt install, deleted-exe race, symlink games) and trampoline-
     /// argv construction failure return a `cmd.exe /c exit 1` stub rather
-    /// than running unsandboxed. CLAUDE.md `Critical Invariants — Error
-    /// Handling` is explicit: "if we report success to the user, it MUST
-    /// actually succeed" — silent un-sandboxing on a path-resolution
+    /// than running unsandboxed — silent un-sandboxing on a path-resolution
     /// failure would let a local attacker who can perturb `current_exe()`
     /// resolution win a free sandbox bypass.
     fn wrap_windows(

@@ -2,8 +2,8 @@
 //!
 //! These functions take combinations of evolution, vitals, and bond state
 //! and return UX-facing signals (momentum, mood, readiness, hints) used by
-//! the V2 surfaces (`/evolution`, `/xp`, ambient header). They are pure —
-//! they never hit the database or record new events.
+//! `/evolution`, `/xp`, and the ambient header. They are pure — they never
+//! hit the database or record new events.
 
 use std::collections::HashMap;
 
