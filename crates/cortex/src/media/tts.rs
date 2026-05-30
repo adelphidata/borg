@@ -617,8 +617,9 @@ pub fn apply_xai_auto_speech_tags(text: &str) -> String {
     // character into `$2` and stitch it back into the replacement —
     // semantically identical to `\s+(?=\S)` but NFA-compatible.
     #[allow(clippy::expect_used)]
-    static FIRST_SENTENCE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)^(.{12,120}?[.!?…])\s+(\S)").expect("first_sentence regex"));
+    static FIRST_SENTENCE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)^(.{12,120}?[.!?…])\s+(\S)").expect("first_sentence regex")
+    });
     #[allow(clippy::expect_used)]
     static EXTRA_WS: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\s{2,}").expect("extra_ws regex"));

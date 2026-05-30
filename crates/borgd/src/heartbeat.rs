@@ -742,25 +742,40 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> 
 async fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {
     let db = cortex::db::Database::open().await?;
     let approved = db.list_approved_senders(Some(channel_name)).await?;
-    if approved.is_empty() {
-        return Ok(Vec::new());
+    let approved_ids: Vec<String> = approved.into_iter().map(|s| s.sender_id).collect();
+    Ok(resolve_recipients_for_channel(
+        config.heartbeat.recipients.get(channel_name),
+        approved_ids,
+    ))
+}
+
+/// Decide which approved sender IDs receive a heartbeat for one channel.
+///
+/// Pure (no DB) so the precedence rules are unit-testable:
+/// - no approved senders → nobody;
+/// - override contains `"*"` → every approved sender;
+/// - non-empty override → approved senders also present in the override,
+///   in override order;
+/// - no override (or an empty one) → just the first approved sender.
+fn resolve_recipients_for_channel(
+    override_ids: Option<&Vec<String>>,
+    approved_ids: Vec<String>,
+) -> Vec<String> {
+    if approved_ids.is_empty() {
+        return Vec::new();
     }
-    let override_list = config.heartbeat.recipients.get(channel_name);
-    let result = match override_list {
-        Some(ids) if ids.iter().any(|s| s == "*") => {
-            approved.into_iter().map(|s| s.sender_id).collect()
-        }
+    match override_ids {
+        Some(ids) if ids.iter().any(|s| s == "*") => approved_ids,
         Some(ids) if !ids.is_empty() => {
-            let approved_set: std::collections::HashSet<String> =
-                approved.into_iter().map(|s| s.sender_id).collect();
+            let approved_set: std::collections::HashSet<&str> =
+                approved_ids.iter().map(String::as_str).collect();
             ids.iter()
                 .filter(|id| approved_set.contains(id.as_str()))
                 .cloned()
                 .collect()
         }
-        _ => approved.into_iter().take(1).map(|s| s.sender_id).collect(),
-    };
-    Ok(result)
+        _ => approved_ids.into_iter().take(1).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1004,5 +1019,62 @@ mod tests {
             },
             &config,
         ));
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn recipients_no_override_takes_first_approved() {
+        // No override → exactly the first approved sender (not all of them),
+        // so a heartbeat doesn't fan out to everyone by default.
+        let approved = ids(&["alice", "bob", "carol"]);
+        assert_eq!(
+            resolve_recipients_for_channel(None, approved),
+            ids(&["alice"])
+        );
+    }
+
+    #[test]
+    fn recipients_empty_override_takes_first_approved() {
+        // An empty override is treated like no override.
+        let empty: Vec<String> = Vec::new();
+        let approved = ids(&["alice", "bob"]);
+        assert_eq!(
+            resolve_recipients_for_channel(Some(&empty), approved),
+            ids(&["alice"])
+        );
+    }
+
+    #[test]
+    fn recipients_wildcard_override_takes_all_approved() {
+        let over = ids(&["*"]);
+        let approved = ids(&["alice", "bob", "carol"]);
+        assert_eq!(
+            resolve_recipients_for_channel(Some(&over), approved),
+            ids(&["alice", "bob", "carol"])
+        );
+    }
+
+    #[test]
+    fn recipients_explicit_override_intersects_with_approved() {
+        // Override names a subset; unapproved ids in the override are dropped
+        // (can't message someone who never approved), and order follows the
+        // override list.
+        let over = ids(&["carol", "mallory", "alice"]);
+        let approved = ids(&["alice", "bob", "carol"]);
+        assert_eq!(
+            resolve_recipients_for_channel(Some(&over), approved),
+            ids(&["carol", "alice"])
+        );
+    }
+
+    #[test]
+    fn recipients_no_approved_senders_is_empty_even_with_wildcard() {
+        // A wildcard override cannot conjure recipients out of an empty
+        // approved list.
+        let over = ids(&["*"]);
+        assert!(resolve_recipients_for_channel(Some(&over), Vec::new()).is_empty());
     }
 }
