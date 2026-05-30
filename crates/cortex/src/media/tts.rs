@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -597,43 +597,41 @@ fn xai_text_has_speech_tags(text: &str) -> bool {
 /// (12–120 chars terminated by `.`/`!`/`?`/`…`). Final cleanup collapses
 /// any double-spaces the transform introduced.
 pub fn apply_xai_auto_speech_tags(text: &str) -> String {
+    // These four patterns are compile-time-constant literals, so a compile
+    // failure is a programmer bug at static-init time, not a runtime risk —
+    // same convention as `md_regexes` below. Hoisting them to `LazyLock`
+    // compiles each once rather than on every call.
+    #[allow(clippy::expect_used)]
+    // Paragraph break → explicit pause marker. `(?s)` lets `.` match any
+    // newline-inclusive whitespace run between the two `\n`s.
+    static PARAGRAPH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)\n\s*\n+").expect("paragraph regex"));
+    #[allow(clippy::expect_used)]
+    static SINGLE_NL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\s*\n\s*").expect("single_nl regex"));
+    // First-sentence boundary: at least 12 chars, at most 120, ending in
+    // `.`/`!`/`?`/`…` and followed by more text. The window prevents a
+    // very short greeting ("Hi.") or a wall-of-text paragraph from getting
+    // an awkward post-first-sentence pause. The `regex` crate does not
+    // support lookaheads, so we capture the following non-whitespace
+    // character into `$2` and stitch it back into the replacement —
+    // semantically identical to `\s+(?=\S)` but NFA-compatible.
+    #[allow(clippy::expect_used)]
+    static FIRST_SENTENCE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)^(.{12,120}?[.!?…])\s+(\S)").expect("first_sentence regex"));
+    #[allow(clippy::expect_used)]
+    static EXTRA_WS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\s{2,}").expect("extra_ws regex"));
+
     let clean = text.trim();
     if clean.is_empty() || xai_text_has_speech_tags(clean) {
         return text.to_string();
     }
-    // Paragraph break → explicit pause marker. `(?s)` lets `.` match any
-    // newline-inclusive whitespace run between the two `\n`s. Compile
-    // failures bubble to the caller as the unchanged text — the same
-    // degrade-rather-than-panic policy as elsewhere in this file.
-    let paragraph = match Regex::new(r"(?s)\n\s*\n+") {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
-    };
-    let single_nl = match Regex::new(r"\s*\n\s*") {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
-    };
-    // First-sentence boundary: at least 12 chars, at most 120, ending in
-    // `.`/`!`/`?`/`…` and followed by more text. The window prevents a
-    // very short greeting ("Hi.") or a wall-of-text paragraph from
-    // getting an awkward post-first-sentence pause. The `regex` crate
-    // does not support lookaheads, so we capture the following
-    // non-whitespace character into `$2` and stitch it back into the
-    // replacement — semantically identical to `\s+(?=\S)` but
-    // NFA-compatible.
-    let first_sentence = match Regex::new(r"(?s)^(.{12,120}?[.!?…])\s+(\S)") {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
-    };
-    let extra_ws = match Regex::new(r"\s{2,}") {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
-    };
 
-    let mut out = paragraph.replace_all(clean, " [pause] ").into_owned();
-    out = single_nl.replace_all(&out, " ").into_owned();
-    out = first_sentence.replace(&out, "$1 [pause] $2").into_owned();
-    out = extra_ws.replace_all(&out, " ").into_owned();
+    let mut out = PARAGRAPH.replace_all(clean, " [pause] ").into_owned();
+    out = SINGLE_NL.replace_all(&out, " ").into_owned();
+    out = FIRST_SENTENCE.replace(&out, "$1 [pause] $2").into_owned();
+    out = EXTRA_WS.replace_all(&out, " ").into_owned();
     out.trim().to_string()
 }
 
