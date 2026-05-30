@@ -21,6 +21,16 @@ pub const PEER_KIND_DIRECT: &str = "direct";
 /// Peer kind for group/channel messages.
 pub const PEER_KIND_GROUP: &str = "group";
 
+/// HTTP timeout for the daemon-internal `/internal/poke` request.
+/// Why: this is a loopback call to our own gateway; 5s is generous for a
+/// local round-trip while still bounding a hung handler.
+pub const INTERNAL_POKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tick cadence for the per-session inactivity monitor loop.
+/// Why: 1s gives second-resolution checks against the (config-driven)
+/// inactivity warning/notify/timeout thresholds without busy-spinning.
+pub const INACTIVITY_MONITOR_TICK: Duration = Duration::from_secs(1);
+
 // ── Telegram ──────────────────────────────────────────────────────
 
 /// Telegram API base URL.

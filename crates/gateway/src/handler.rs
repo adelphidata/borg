@@ -15,7 +15,9 @@ use cortex::security::validation::{sanitize_filename, sanitize_thread_id};
 use crate::constants::MAX_THREAD_ID_LEN;
 
 use crate::channel::registry::RegisteredChannel;
-use crate::constants::{DEFAULT_BINDING_ID, PEER_KIND_GROUP};
+use crate::constants::{
+    DEFAULT_BINDING_ID, INACTIVITY_MONITOR_TICK, INTERNAL_POKE_TIMEOUT, PEER_KIND_GROUP,
+};
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
 use crate::message_processing::chunker;
@@ -407,7 +409,7 @@ async fn resolve_session_and_commands(
         );
         let response = match reqwest::Client::new()
             .post(&poke_url)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(INTERNAL_POKE_TIMEOUT)
             .send()
             .await
         {
@@ -581,7 +583,7 @@ async fn collect_agent_response(
 
     // Tick once a second to re-evaluate elapsed time. Cheap and avoids the
     // bookkeeping of recreating sleep futures on every event.
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(INACTIVITY_MONITOR_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
