@@ -404,15 +404,12 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   only respond on the channel that invoked it. Enforced by the
   existing `gateway.bindings` + `dm_policy` allowlists so the agent
   cannot reach senders the operator hasn't authorized.
-- **Standalone `transcribe_audio` tool.** `[H]` Deferred.
-  Agent-callable speech-to-text on arbitrary audio (file path, URL,
-  or base64) via the existing `llm.aux` client (Whisper / Gemini
-  STT). Distinct from the per-channel inbound voice transcription
-  tracked under "Telegram voice follow-through" and from the Voice
-  Call channel's realtime STT — those are channel-scoped; this is a
-  general-purpose tool for voice memos, meeting recordings, and
-  user-supplied audio attachments. Multimodal-in is currently
-  asymmetric vs `text_to_speech` on the output side.
+- **Standalone `transcribe_audio` tool.** `[D]` Done for local files.
+  Agent-callable speech-to-text now accepts a local audio path and uses
+  the same `audio.models` fallback chain as gateway voice transcription,
+  including xAI/Grok, OpenAI/Groq Whisper, Mistral, Deepgram, local, and
+  command-backed providers. URL/base64 ingestion remains deferred until
+  it can share the normal URL policy and media-size gates.
 
 ### MCP & external integrations
 
@@ -670,11 +667,13 @@ roughly by ROI — each is independent.
 - **Voice Call channel.** `[I]` Twilio/Telnyx/Plivo realtime voice
   with streaming STT/TTS (Deepgram, ElevenLabs, OpenAI/xAI realtime).
   Borg has Twilio SMS but no voice path.
-- **TTS/STT provider matrix.** `[I]` Grow beyond the single
-  `text_to_speech` tool to a provider matrix — TTS: Edge,
-  OpenAI, ElevenLabs v3, Gemini, Azure, Inworld, Volcengine, xAI,
-  DeepInfra, MiniMax, local CLI, MLX; STT: Deepgram, ElevenLabs
-  Scribe, Mistral, Whisper-local. Provider routing per channel/agent.
+- **TTS/STT provider matrix.** `[I]` Borg has a shared
+  `audio.models`/`tts.models` provider matrix for local voice, gateway
+  voice, `text_to_speech`, and `transcribe_audio`: Edge, OpenAI,
+  ElevenLabs, Gemini, MiniMax, Mistral, xAI/Grok, Piper, local, and
+  command-backed local engines. Remaining work: Azure/Inworld/
+  Volcengine/DeepInfra/ElevenLabs Scribe and per-channel provider
+  routing.
 
 ### Networking & deployment
 

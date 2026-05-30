@@ -51,6 +51,7 @@ pub fn mutating_tool_names() -> &'static [&'static str] {
         "send_to_agent",
         "spawn_agent",
         "text_to_speech",
+        "transcribe_audio",
         "update_goal",
         "wait_for_agent",
         "write_memory",
@@ -64,8 +65,8 @@ pub(crate) fn classify_action(tool_name: &str) -> ActionType {
         "apply_patch" | "apply_skill_patch" | "create_channel" => ActionType::FileWrite,
         "write_memory" => ActionType::MemoryWrite,
         "memory_search" | "read_memory" => ActionType::ToolCall,
-        "web_fetch" | "web_search" | "browser" | "text_to_speech" | "generate_image"
-        | "vision_analyze" => ActionType::WebRequest,
+        "web_fetch" | "web_search" | "browser" | "text_to_speech" | "transcribe_audio"
+        | "generate_image" | "vision_analyze" => ActionType::WebRequest,
         _ => ActionType::ToolCall,
     }
 }
@@ -92,6 +93,7 @@ mod tests {
             ("web_search", ActionType::WebRequest),
             ("browser", ActionType::WebRequest),
             ("text_to_speech", ActionType::WebRequest),
+            ("transcribe_audio", ActionType::WebRequest),
             ("generate_image", ActionType::WebRequest),
             ("vision_analyze", ActionType::WebRequest),
         ];
@@ -143,6 +145,7 @@ mod tests {
             // sub-agent that could call these would burn the operator's
             // budget for "read-only" exploration — keep them blocked.
             "text_to_speech",
+            "transcribe_audio",
             "generate_image",
         ] {
             assert!(

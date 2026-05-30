@@ -48,6 +48,7 @@ pub(crate) mod request_user_input;
 pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod text_to_speech;
+pub(crate) mod transcribe_audio;
 pub(crate) mod update_goal;
 pub(crate) mod video_analyze;
 pub(crate) mod vision_analyze;
@@ -71,6 +72,7 @@ pub(crate) use request_user_input::RequestUserInputArgs;
 pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
+pub(crate) use transcribe_audio::TranscribeAudioArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
 pub(crate) use video_analyze::VideoAnalyzeArgs;
 pub(crate) use vision_analyze::VisionAnalyzeArgs;
@@ -119,6 +121,7 @@ pub(crate) enum Tool {
     Browser(BrowserArgs),
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
+    TranscribeAudio(TranscribeAudioArgs),
     VisionAnalyze(VisionAnalyzeArgs),
     VideoAnalyze(VideoAnalyzeArgs),
     ComputerUse(ComputerUseArgs),
@@ -207,6 +210,7 @@ impl Tool {
             tn::BROWSER => Tool::Browser(from(tn::BROWSER, args)?),
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
+            tn::TRANSCRIBE_AUDIO => Tool::TranscribeAudio(from(tn::TRANSCRIBE_AUDIO, args)?),
             tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
             tn::VIDEO_ANALYZE => Tool::VideoAnalyze(from(tn::VIDEO_ANALYZE, args)?),
             tn::COMPUTER_USE => Tool::ComputerUse(from(tn::COMPUTER_USE, args)?),
@@ -254,6 +258,7 @@ impl Tool {
             Tool::Browser(_) => tn::BROWSER,
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
+            Tool::TranscribeAudio(_) => tn::TRANSCRIBE_AUDIO,
             Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
             Tool::VideoAnalyze(_) => tn::VIDEO_ANALYZE,
             Tool::ComputerUse(_) => tn::COMPUTER_USE,
@@ -300,6 +305,7 @@ impl Tool {
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::TranscribeAudio(_)
             | Tool::ComputerUse(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
@@ -352,6 +358,7 @@ impl Tool {
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::TranscribeAudio(_)
             | Tool::CreateGoal(_)
             | Tool::UpdateGoal(_)
             | Tool::SpawnAgent(_)
@@ -387,6 +394,7 @@ impl Tool {
             Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) => ToolGroup::Scheduling,
             Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::TranscribeAudio(_)
             | Tool::VisionAnalyze(_)
             | Tool::VideoAnalyze(_)
             | Tool::ComputerUse(_) => ToolGroup::Media,
@@ -521,6 +529,7 @@ mod tests {
             ),
             (tn::GENERATE_IMAGE, json!({"prompt":"a cat"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
+            (tn::TRANSCRIBE_AUDIO, json!({"path":"clip.wav"})),
             (
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
@@ -620,6 +629,7 @@ mod tests {
             ),
             (tn::GENERATE_IMAGE, json!({"prompt":"x"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
+            (tn::TRANSCRIBE_AUDIO, json!({"path":"clip.wav"})),
             (
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),

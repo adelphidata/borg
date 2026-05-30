@@ -55,6 +55,10 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
     ),
     (tool_names::TEXT_TO_SPEECH, "Convert text to speech audio"),
     (
+        tool_names::TRANSCRIBE_AUDIO,
+        "Transcribe a local audio file to text",
+    ),
+    (
         tool_names::VISION_ANALYZE,
         "Describe or answer questions about a remote image",
     ),
@@ -169,6 +173,31 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["text"]
+            }),
+        ));
+    }
+
+    if config.audio.enabled {
+        defs.push(ToolDefinition::new(
+            tool_names::TRANSCRIBE_AUDIO,
+            "Transcribe a local audio file using the configured STT provider chain. Respects workspace boundaries, blocked paths, and audio size limits.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Local audio file path (relative to cwd, absolute, or ~)"
+                    },
+                    "mime_type": {
+                        "type": "string",
+                        "description": "Optional MIME type override, e.g. audio/wav"
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Optional language hint, e.g. en"
+                    }
+                },
+                "required": ["path"]
             }),
         ));
     }

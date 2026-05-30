@@ -26,6 +26,7 @@ pub const MANAGE_CRON: &str = "manage_cron";
 pub const BROWSER: &str = "browser";
 pub const GENERATE_IMAGE: &str = "generate_image";
 pub const TEXT_TO_SPEECH: &str = "text_to_speech";
+pub const TRANSCRIBE_AUDIO: &str = "transcribe_audio";
 pub const VISION_ANALYZE: &str = "vision_analyze";
 pub const VIDEO_ANALYZE: &str = "video_analyze";
 pub const COMPUTER_USE: &str = "computer_use";
@@ -86,6 +87,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     BROWSER,
     GENERATE_IMAGE,
     TEXT_TO_SPEECH,
+    TRANSCRIBE_AUDIO,
     REQUEST_USER_INPUT,
     APPLY_SKILL_PATCH,
     CREATE_CHANNEL,

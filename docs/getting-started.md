@@ -186,17 +186,17 @@ borg settings set llm.model "gemma-3-4b-it"
 **TTS (Piper / Edge / a `custom` shell template for Qwen3-TTS, XTTS, etc.).**
 
 ```toml
-# `tts.providers` in borg settings — append a row:
-[[tts.providers]]
-provider = "custom"
-command  = "python -m qwen3_tts --text-file {text_file} --voice {voice} --out {out_path}"
-default_voice    = "en_US-female-1"
+# `tts.models` in borg settings — append a row:
+[[tts.models]]
+provider         = "custom"
+command          = "python -m qwen3_tts --text-file {text_file} --voice {voice} --out {out_path}"
+voice            = "en_US-female-1"
 output_extension = "wav"
 ```
 
-`{text_file}`, `{voice}`, `{out_path}` are substituted before `sh -c` runs.
-The `voice` argument is allowlisted to `[A-Za-z0-9_.-]` so a hostile LLM
-can't escape into the shell.
+`{text_file}`/`{input_path}`, `{voice}`, and `{out_path}`/`{output_path}` are
+substituted before `sh -c` runs. The `voice` argument is allowlisted to
+`[A-Za-z0-9_.-]` so a hostile LLM can't escape into the shell.
 
 **STT (whisper.cpp / Parakeet / faster-whisper / MLX-whisper — anything that
 takes an audio file and prints the transcript).**
@@ -208,12 +208,35 @@ command          = "parakeet-asr --audio {audio_file} --language {language} --ou
 language         = "en"
 ```
 
-The command's stdout is the transcript. `{language}` is validated with the
-same allowlist as TTS `{voice}`.
+The command can write the transcript to stdout or `{output_path}`.
+`{audio_file}` and `{input_path}` both point at the temporary audio file;
+`{language}` is validated with the same allowlist as TTS `{voice}`.
 
 The `whisper-rs` binding is still available as a built-in `local` STT
 provider, but it requires the `local-stt` cargo feature. The `custom`
 provider needs no build-time choice — any binary on `PATH` works.
+
+## Grok STT/TTS
+
+Borg uses the same `audio.models` and `tts.models` provider rows for xAI
+Grok voice. Configure `XAI_API_KEY`, then set:
+
+```sh
+borg settings set audio.enabled true
+borg settings set audio.language en
+borg settings set audio.models '[{"provider":"xai","language":"en"}]'
+
+borg settings set tts.enabled true
+borg settings set tts.models '[{"provider":"xai","voice":"eve","language":"en"}]'
+
+borg settings set voice.enabled true
+borg settings set voice.auto_tts true
+```
+
+Optional xAI row fields include `base_url`, `xai_stt_format`,
+`xai_stt_diarize`, `sample_rate_hz`, `bit_rate`, and
+`xai_auto_speech_tags`. Borg keeps these in the normal settings table rather
+than a separate per-provider config file.
 
 ## What happens when you chat
 
