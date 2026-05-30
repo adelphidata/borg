@@ -667,8 +667,7 @@ async fn try_backfill_identity(
     agent.inject_history_message(crate::types::Message::system(IDENTITY_BACKFILL_SYSTEM));
 
     let prompt = format!(
-        "{}\n\n<transcript>\n{}\n</transcript>\n\nWrite IDENTITY.md now if the transcript supports it.",
-        IDENTITY_BACKFILL_PROMPT_PREFIX, transcript
+        "{IDENTITY_BACKFILL_PROMPT_PREFIX}\n\n<transcript>\n{transcript}\n</transcript>\n\nWrite IDENTITY.md now if the transcript supports it."
     );
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
