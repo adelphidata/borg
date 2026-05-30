@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -238,47 +238,7 @@ async fn guard_state() -> WasmGuardState {
     }
 }
 
-/// Per-plugin token bucket. Tokens accrue at `per_minute / 60` per second up
-/// to `burst` and one is consumed per dispatch. Refused calls return a
-/// `WasmRateLimited` to the caller, emit an audit row, and never reach the
-/// wasmtime sandbox.
-struct TokenBucket {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(initial: f64) -> Self {
-        Self {
-            tokens: initial,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Refill the bucket against wall-clock and try to consume one token.
-    /// Returns `None` on success, or `Some(retry_after)` on refusal so the
-    /// caller can surface a sensible message to the LLM.
-    fn try_consume(&mut self, per_minute: u32, burst: u32) -> Option<Duration> {
-        if per_minute == 0 || burst == 0 {
-            // Misconfigured to off — fail closed: zero throughput. Operators
-            // who want unlimited should leave defaults alone.
-            return Some(crate::constants::RATE_LIMIT_MISCONFIGURED_RETRY);
-        }
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let refill = elapsed * (f64::from(per_minute) / 60.0);
-        self.tokens = (self.tokens + refill).min(f64::from(burst));
-        self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            None
-        } else {
-            let deficit = 1.0 - self.tokens;
-            let seconds_to_one = deficit / (f64::from(per_minute) / 60.0);
-            Some(Duration::from_secs_f64(seconds_to_one.max(0.001)))
-        }
-    }
-}
+use crate::rate_limit::TokenBucket;
 
 fn rate_buckets() -> &'static Mutex<HashMap<String, TokenBucket>> {
     static BUCKETS: OnceLock<Mutex<HashMap<String, TokenBucket>>> = OnceLock::new();
@@ -751,34 +711,7 @@ mod tests {
         assert!(!is_builtin_tool_name(""));
     }
 
-    #[test]
-    fn token_bucket_refuses_after_burst_and_refills() {
-        // Reasonable defaults: 60/min = 1/sec, burst 2. First two consume
-        // succeed, third refuses. This locks the math down so an off-by-one
-        // in the refill formula surfaces immediately.
-        let mut bucket = TokenBucket::new(2.0);
-        assert!(bucket.try_consume(60, 2).is_none(), "first take succeeds");
-        assert!(bucket.try_consume(60, 2).is_none(), "second take succeeds");
-        let denial = bucket
-            .try_consume(60, 2)
-            .expect("third take must be refused");
-        // Refill at 1/sec, deficit ≈ 1 token, so retry_after ≈ 1s. Allow
-        // wide slack — clock noise can shave a few ms either way.
-        assert!(
-            denial.as_secs_f64() > 0.5 && denial.as_secs_f64() < 2.0,
-            "retry_after should be ~1s, got {denial:?}",
-        );
-    }
-
-    #[test]
-    fn token_bucket_zero_config_fails_closed() {
-        // Setting per_minute=0 must NOT silently mean "unlimited" — that would
-        // turn a clumsy operator into a denial-of-budget. Burst=0 likewise.
-        let mut bucket = TokenBucket::new(10.0);
-        assert!(bucket.try_consume(0, 10).is_some());
-        let mut bucket = TokenBucket::new(10.0);
-        assert!(bucket.try_consume(60, 0).is_some());
-    }
+    // TokenBucket refill/fail-closed math is covered in `crate::rate_limit`.
 
     #[test]
     fn guard_state_filters_by_plugin_id_and_publisher_key() {

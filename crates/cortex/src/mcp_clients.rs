@@ -148,46 +148,7 @@ fn builtin_tool_names() -> Vec<&'static str> {
     ]
 }
 
-/// Per-server token bucket, copied verbatim from
-/// [`crate::wasm_plugins`]'s implementation (same math, same
-/// fail-closed-on-zero behaviour, same return shape).
-struct TokenBucket {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(initial: f64) -> Self {
-        Self {
-            tokens: initial,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Returns `None` on success (one token consumed) or
-    /// `Some(retry_after)` on refusal.
-    fn try_consume(&mut self, per_minute: u32, burst: u32) -> Option<Duration> {
-        if per_minute == 0 || burst == 0 {
-            // Misconfigured-off must fail closed, never silently mean
-            // "unlimited" — that would turn a clumsy operator into a
-            // denial-of-budget.
-            return Some(crate::constants::RATE_LIMIT_MISCONFIGURED_RETRY);
-        }
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let refill = elapsed * (f64::from(per_minute) / 60.0);
-        self.tokens = (self.tokens + refill).min(f64::from(burst));
-        self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            None
-        } else {
-            let deficit = 1.0 - self.tokens;
-            let seconds_to_one = deficit / (f64::from(per_minute) / 60.0);
-            Some(Duration::from_secs_f64(seconds_to_one.max(0.001)))
-        }
-    }
-}
+use crate::rate_limit::TokenBucket;
 
 fn buckets() -> &'static Mutex<HashMap<String, TokenBucket>> {
     BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1441,51 +1402,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rate_bucket_refuses_after_burst() {
-        // Spec invariant: with per_minute=60 and burst=2, the third call
-        // within ~0s must be refused. Locks the math against an off-by-one
-        // refill regression.
-        let mut b = TokenBucket::new(2.0);
-        assert!(b.try_consume(60, 2).is_none());
-        assert!(b.try_consume(60, 2).is_none());
-        assert!(b.try_consume(60, 2).is_some());
-    }
-
-    #[test]
-    fn rate_bucket_zero_fails_closed() {
-        // Spec invariant: per_minute=0 must NOT mean unlimited.
-        let mut b = TokenBucket::new(10.0);
-        assert!(b.try_consume(0, 10).is_some());
-        let mut b = TokenBucket::new(10.0);
-        assert!(b.try_consume(60, 0).is_some());
-    }
-
-    #[test]
-    fn rate_bucket_refills_over_time() {
-        // Spec invariant: a bucket that has been drained refills at
-        // `per_minute / 60` tokens per second up to `burst`. An off-by-one
-        // in the refill math (e.g. dropping the elapsed-seconds multiplier)
-        // would silently turn the bucket into either "never refills" or
-        // "always full" — both observable only when a real operator hits
-        // the limit, where the failure looks like a flaky network rather
-        // than a configuration regression.
-        //
-        // `60 per minute, burst = 1` is one token per second. After
-        // draining, sleeping 1.1s must restore at least one token; the
-        // next `try_consume` must return `None`.
-        let mut b = TokenBucket::new(1.0);
-        assert!(b.try_consume(60, 1).is_none(), "initial token");
-        assert!(
-            b.try_consume(60, 1).is_some(),
-            "second call must be refused — burst is 1"
-        );
-        std::thread::sleep(Duration::from_millis(1_100));
-        assert!(
-            b.try_consume(60, 1).is_none(),
-            "after 1.1s the bucket must have refilled at least one token"
-        );
-    }
+    // TokenBucket refill/fail-closed math is covered in `crate::rate_limit`.
 
     #[test]
     fn builtin_tool_names_includes_dispatcher_critical_names() {

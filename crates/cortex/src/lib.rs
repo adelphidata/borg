@@ -143,6 +143,8 @@ pub mod project_doc;
 pub mod providers;
 /// Per-session rate limiting for tool calls and actions.
 pub mod rate_guard;
+/// Shared token-bucket rate limiter (per-MCP-server, per-WASM-plugin throttles).
+pub mod rate_limit;
 /// Script management for user-created tools.
 pub mod scripts;
 /// Trust-boundary cluster: sanitize, secrets (detection + resolution),
