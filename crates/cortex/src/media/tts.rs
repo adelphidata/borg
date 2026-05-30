@@ -558,6 +558,8 @@ struct XaiTtsProvider {
     base_url: String,
     default_voice: String,
     default_language: String,
+    default_sample_rate_hz: u32,
+    default_bit_rate: u32,
     /// When true, run replies through `apply_xai_auto_speech_tags`
     /// before synthesis so Grok inserts a natural pause between the
     /// opening sentence and the body. Off by default (raw text); flip
@@ -573,11 +575,12 @@ fn xai_text_has_speech_tags(text: &str) -> bool {
     // Inline tags: `[pause]`, `[laugh]`, `[breath]`, `[uh]`, `[um]`.
     // Wrapping tags: `<whisper>...</whisper>`, `<soft>...`, `<loud>...`,
     // `<singing>...`, `<laugh-speak>...`, `<emphasis>...`.
-    static INLINE: &[&str] = &["[pause]", "[laugh]", "[breath]", "[uh]", "[um]"];
+    static INLINE: &[&str] = &["[pause]", "[laugh]", "[breath]", "[uh]", "[um]", "[sigh]"];
     static WRAPPING: &[&str] = &[
         "<whisper",
         "<soft",
         "<loud",
+        "<slow",
         "<singing",
         "<laugh-speak",
         "<emphasis",
@@ -661,8 +664,16 @@ impl TtsProvider for XaiTtsProvider {
         });
         // Only send output_format when not the documented default
         // (mp3 + 24kHz + 128kbps).
-        if matches!(req.format, AudioFormat::Wav) {
-            body["output_format"] = serde_json::json!({"codec": "wav", "sample_rate": 24_000});
+        let is_wav = matches!(req.format, AudioFormat::Wav);
+        if is_wav || self.default_sample_rate_hz != 24_000 || self.default_bit_rate != 128_000 {
+            let mut output_format = serde_json::json!({
+                "codec": if is_wav { "wav" } else { "mp3" },
+                "sample_rate": self.default_sample_rate_hz,
+            });
+            if !is_wav {
+                output_format["bit_rate"] = serde_json::json!(self.default_bit_rate);
+            }
+            body["output_format"] = output_format;
         }
 
         let resp = self
@@ -883,15 +894,15 @@ fn piper_synthesize(model_path: &Path, text: &str, timeout: Duration) -> Result<
 // ── Custom TTS Provider ──
 
 /// Custom TTS — shells out to an operator-defined command template.
-/// Template tokens: `{text_file}` (path to a file containing the input
-/// text), `{voice}`, `{out_path}`. Returns whatever bytes the command
-/// writes to `{out_path}`. Configured via the `provider: custom` row
-/// in `tts.providers` with a `command` template.
+/// Template tokens include `{text_file}`/`{input_path}`, `{voice}`,
+/// `{out_path}`/`{output_path}`, `{format}`, `{model}`, and `{speed}`.
+/// Returns whatever bytes the command writes to `{out_path}`.
 struct CustomTtsProvider {
     name: String,
-    /// Command template with `{text_file}`, `{voice}`, `{out_path}`.
+    /// Command template with custom TTS placeholders.
     command_template: String,
     default_voice: String,
+    default_model: String,
     output_extension: String,
 }
 
@@ -905,11 +916,12 @@ impl TtsProvider for CustomTtsProvider {
         };
         let template = self.command_template.clone();
         let ext = self.output_extension.clone();
+        let model = self.default_model.clone();
         let text = req.text.to_string();
         let timeout = req.timeout;
 
         tokio::task::spawn_blocking(move || {
-            custom_synthesize(&template, &text, &voice, &ext, timeout)
+            custom_synthesize(&template, &text, &voice, &ext, &model, timeout)
         })
         .await
         .context("custom tts task panicked")?
@@ -925,17 +937,15 @@ fn custom_synthesize(
     text: &str,
     voice: &str,
     extension: &str,
+    model: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     use std::io::Write as _;
     use std::process::Command;
 
-    // `{voice}` is substituted into the shell template via plain string
-    // replacement before `sh -c`, so a hostile model supplying
-    // `voice = "$(rm -rf ~)"` would otherwise execute arbitrary shell.
-    // Reject anything outside the strict alphanumeric-plus-`-._` set
-    // before substitution. Empty `voice` is allowed (operator templates
-    // that don't reference `{voice}` legitimately leave it unset).
+    // Reject anything outside the strict alphanumeric-plus-`-._` set before
+    // rendering the shell template. Empty `voice` is allowed (operator
+    // templates that don't reference `{voice}` legitimately leave it unset).
     if !voice.is_empty() {
         validate_voice_id(voice).context("custom TTS voice id")?;
     }
@@ -951,10 +961,20 @@ fn custom_synthesize(
         .tempfile()?;
     let out_path = out_file.path().to_string_lossy().into_owned();
 
-    let cmd_str = template
-        .replace("{text_file}", &text_path)
-        .replace("{voice}", voice)
-        .replace("{out_path}", &out_path);
+    let cmd_str = crate::media::shell_template::render(
+        template,
+        &[
+            ("text_file", &text_path),
+            ("input_path", &text_path),
+            ("text_path", &text_path),
+            ("voice", voice),
+            ("out_path", &out_path),
+            ("output_path", &out_path),
+            ("format", extension),
+            ("model", model),
+            ("speed", "1.0"),
+        ],
+    );
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -989,6 +1009,7 @@ struct TtsProviderEntry {
     model: Option<String>,
     voice: Option<String>,
     timeout: Option<Duration>,
+    max_text_length: usize,
 }
 
 /// Main TTS engine with multi-provider fallback.
@@ -1038,6 +1059,7 @@ impl TtsSynthesizer {
                 model: None,
                 voice: Some("alloy".to_string()),
                 timeout: Some(Duration::from_secs(5)),
+                max_text_length: 4096,
             }],
             default_voice: "alloy".to_string(),
             default_format: AudioFormat::Mp3,
@@ -1063,6 +1085,13 @@ impl TtsSynthesizer {
                     model: model_cfg.model.clone(),
                     voice: model_cfg.voice.clone(),
                     timeout: model_cfg.timeout_ms.map(Duration::from_millis),
+                    max_text_length: model_cfg.max_text_length.unwrap_or_else(|| {
+                        provider_default_max_text_length(
+                            &model_cfg.provider,
+                            model_cfg.model.as_deref(),
+                        )
+                        .unwrap_or(tts.max_text_length)
+                    }),
                 }),
                 None => {
                     debug!("Skipping TTS provider '{}': no API key", model_cfg.provider);
@@ -1105,8 +1134,11 @@ impl TtsSynthesizer {
                 Some(Box::new(OpenAiTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.openai.com".to_string(),
-                    default_model: "tts-1".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.openai.com".to_string()),
+                    default_model: "gpt-4o-mini-tts".to_string(),
                 }))
             }
             "elevenlabs" => {
@@ -1118,7 +1150,10 @@ impl TtsSynthesizer {
                 Some(Box::new(ElevenLabsTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.elevenlabs.io".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.elevenlabs.io".to_string()),
                     default_model: "eleven_multilingual_v2".to_string(),
                 }))
             }
@@ -1140,7 +1175,9 @@ impl TtsSynthesizer {
                 Some(Box::new(GeminiTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                    base_url: model_cfg.base_url.clone().unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com/v1beta".to_string()
+                    }),
                     default_model: "gemini-2.5-flash-preview-tts".to_string(),
                     default_voice: "Kore".to_string(),
                 }))
@@ -1158,7 +1195,10 @@ impl TtsSynthesizer {
                 Some(Box::new(MiniMaxTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.minimax.io/v1/t2a_v2".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.minimax.io/v1/t2a_v2".to_string()),
                     default_model: "speech-02-hd".to_string(),
                     default_voice: "English_expressive_narrator".to_string(),
                     group_id,
@@ -1171,9 +1211,17 @@ impl TtsSynthesizer {
                 Some(Box::new(XaiTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.x.ai/v1".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
                     default_voice: "eve".to_string(),
-                    default_language: "en".to_string(),
+                    default_language: model_cfg
+                        .language
+                        .clone()
+                        .unwrap_or_else(|| "en".to_string()),
+                    default_sample_rate_hz: model_cfg.sample_rate_hz.unwrap_or(24_000),
+                    default_bit_rate: model_cfg.bit_rate.unwrap_or(128_000),
                     auto_speech_tags: model_cfg.xai_auto_speech_tags.unwrap_or(false),
                 }))
             }
@@ -1188,8 +1236,11 @@ impl TtsSynthesizer {
                 Some(Box::new(MistralTtsProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.mistral.ai".to_string(),
-                    default_model: "voxtral-mini-latest".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
+                    default_model: "voxtral-mini-tts-2603".to_string(),
                     default_voice: "Alloy".to_string(),
                 }))
             }
@@ -1204,15 +1255,22 @@ impl TtsSynthesizer {
                     voices_dir,
                 }))
             }
-            // Custom shell-template provider. Operator-supplied command
-            // gets text in a tempfile + voice + output path substituted.
-            "custom" => {
+            // Command-backed providers: `custom` plus named local engines
+            // (e.g. kittentts, neutts) that stay outside the Rust binary and
+            // shell out to an operator-supplied command. They share one
+            // construction path — the only difference is the default `name`,
+            // which falls back to the provider string when unset.
+            "custom" | "kittentts" | "neutts" => {
                 let command_template = model_cfg.command.as_deref()?.to_string();
-                let provider_name = model_cfg.name.as_deref().unwrap_or("custom").to_string();
+                let provider_name = model_cfg
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| model_cfg.provider.clone());
                 Some(Box::new(CustomTtsProvider {
                     name: provider_name,
                     command_template,
                     default_voice: model_cfg.voice.clone().unwrap_or_default(),
+                    default_model: model_cfg.model.clone().unwrap_or_default(),
                     output_extension: model_cfg
                         .output_extension
                         .clone()
@@ -1237,12 +1295,21 @@ impl TtsSynthesizer {
         if text.is_empty() {
             bail!("Text is empty");
         }
-
-        if text.len() > self.max_text_length {
+        // Largest per-provider cap, floored at the configured global limit so
+        // an empty/short chain still rejects obviously oversized input. Each
+        // provider re-checks its own cap below; this is just the fast reject.
+        let max_allowed = self
+            .entries
+            .iter()
+            .map(|entry| entry.max_text_length)
+            .max()
+            .unwrap_or(0)
+            .max(self.max_text_length);
+        if text.len() > max_allowed {
             bail!(
                 "Text too long: {} characters (maximum: {})",
                 text.len(),
-                self.max_text_length
+                max_allowed
             );
         }
 
@@ -1250,6 +1317,19 @@ impl TtsSynthesizer {
         let mut attempts = Vec::new();
 
         for entry in &self.entries {
+            if text.len() > entry.max_text_length {
+                attempts.push(SynthesisAttempt {
+                    provider: entry.provider.name().to_string(),
+                    model: entry.model.clone(),
+                    outcome: SynthesisOutcome::Failed(format!(
+                        "text too long: {} characters (maximum for {}: {})",
+                        text.len(),
+                        entry.provider.name(),
+                        entry.max_text_length
+                    )),
+                });
+                continue;
+            }
             let voice_id = voice
                 .map(String::from)
                 .or_else(|| entry.voice.clone())
@@ -1289,6 +1369,30 @@ impl TtsSynthesizer {
         }
 
         bail!("All TTS providers failed ({} attempted)", attempts.len())
+    }
+}
+
+fn provider_default_max_text_length(provider: &str, model: Option<&str>) -> Option<usize> {
+    match provider {
+        "edge" => Some(5_000),
+        "openai" => Some(4_096),
+        "xai" => Some(15_000),
+        "minimax" => Some(10_000),
+        "mistral" => Some(4_000),
+        "gemini" => Some(5_000),
+        "piper" | "custom" => Some(5_000),
+        "neutts" | "kittentts" => Some(2_000),
+        "elevenlabs" => match model.unwrap_or("eleven_multilingual_v2") {
+            "eleven_v3" | "eleven_ttv_v3" => Some(5_000),
+            "eleven_flash_v2" => Some(30_000),
+            "eleven_flash_v2_5" => Some(40_000),
+            "eleven_multilingual_v2"
+            | "eleven_multilingual_v1"
+            | "eleven_english_sts_v2"
+            | "eleven_english_sts_v1" => Some(10_000),
+            _ => Some(10_000),
+        },
+        _ => None,
     }
 }
 
@@ -1961,6 +2065,11 @@ mod tests {
             voice: None,
             api_key_env: None,
             timeout_ms: None,
+            base_url: None,
+            language: None,
+            sample_rate_hz: None,
+            bit_rate: None,
+            max_text_length: None,
             name: None,
             command: None,
             output_extension: None,
@@ -1995,6 +2104,8 @@ mod tests {
             ("xai", Some("BORG_TTS_ARM_XAI")),
             ("mistral", Some("BORG_TTS_ARM_MISTRAL")),
             ("piper", None),
+            ("kittentts", None),
+            ("neutts", None),
             ("custom", None),
         ];
         for (_, var) in arms {
@@ -2013,6 +2124,11 @@ mod tests {
                 voice: None,
                 api_key_env: var.map(|v| v.to_string()),
                 timeout_ms: None,
+                base_url: None,
+                language: None,
+                sample_rate_hz: None,
+                bit_rate: None,
+                max_text_length: None,
                 name: None,
                 // Only the `custom` arm requires a command template — the
                 // others ignore it. Setting it unconditionally is harmless.
@@ -2040,6 +2156,8 @@ mod tests {
             "xai",
             "mistral",
             "piper",
+            "kittentts",
+            "neutts",
             "custom",
         ] {
             assert!(
@@ -2069,6 +2187,11 @@ mod tests {
             voice: Some("test".to_string()),
             api_key_env: None,
             timeout_ms: None,
+            base_url: None,
+            language: None,
+            sample_rate_hz: None,
+            bit_rate: None,
+            max_text_length: None,
             name: Some("missing-command".to_string()),
             command: None,
             output_extension: None,
@@ -2158,6 +2281,7 @@ mod tests {
             "hello",
             injection,
             "wav",
+            "",
             Duration::from_millis(500),
         );
         assert!(
@@ -2172,6 +2296,20 @@ mod tests {
         // either. (We don't try to delete it on success because we expect
         // it to never be created.)
         assert!(!std::path::Path::new("/tmp/borg_pwned_should_never_appear").exists());
+    }
+
+    #[test]
+    fn custom_synthesize_renders_model_and_quoted_path_placeholders() {
+        let output = custom_synthesize(
+            "test {model} = local-model && cp '{text_file}' '{out_path}'",
+            "hello custom model",
+            "",
+            "wav",
+            "local-model",
+            Duration::from_millis(500),
+        )
+        .expect("custom synthesize should copy the text payload");
+        assert_eq!(output, b"hello custom model");
     }
 
     // ── Wiremock-backed provider HTTP tests ──
@@ -2204,8 +2342,7 @@ mod tests {
             .and(header("authorization", "Bearer sk-mock"))
             .and(header("content-type", "application/json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(audio_payload.to_vec(), "audio/mpeg"),
+                ResponseTemplate::new(200).set_body_raw(audio_payload.to_vec(), "audio/mpeg"),
             )
             .expect(1)
             .mount(&server)
@@ -2397,6 +2534,7 @@ mod tests {
                     model: None,
                     voice: Some("alloy".to_string()),
                     timeout: Some(Duration::from_secs(5)),
+                    max_text_length: 4096,
                 },
                 TtsProviderEntry {
                     provider: Box::new(ElevenLabsTtsProvider {
@@ -2408,6 +2546,7 @@ mod tests {
                     model: None,
                     voice: Some("alloy".to_string()),
                     timeout: Some(Duration::from_secs(5)),
+                    max_text_length: 10_000,
                 },
             ],
             default_voice: "alloy".to_string(),

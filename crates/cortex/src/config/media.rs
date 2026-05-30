@@ -144,7 +144,8 @@ impl Default for BrowserConfig {
 /// Single transcription provider entry (cloud API or local CLI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioModelConfig {
-    /// Provider name: "openai", "groq", "deepgram".
+    /// Provider name: "openai", "groq", "deepgram", "mistral", "xai",
+    /// "local", or "custom".
     pub provider: String,
     /// Model name (e.g. "whisper-1", "nova-3").
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +159,11 @@ pub struct AudioModelConfig {
     /// Per-provider timeout override in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Optional provider API base URL override. Kept on the model row so
+    /// OpenAI-compatible local/proxy STT endpoints don't need a second
+    /// config surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// xAI-only: inverse text normalization — emit punctuation, casing,
     /// digits-as-numerals rather than raw lowercased words. Defaults on;
     /// flip off when a downstream consumer wants the rawer form. `None`
@@ -170,12 +176,11 @@ pub struct AudioModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xai_stt_diarize: Option<bool>,
     /// `provider = "custom"`-only: shell command template that consumes an
-    /// audio file and writes the transcript to stdout. Template tokens:
-    /// `{audio_file}` (path to a temp WAV/MP3 the runtime writes), and
-    /// `{language}` (the language hint after shell-token validation, empty
-    /// when unset). The token allowlist mirrors the TTS side
-    /// (`media::tts::validate_voice_id`) so a hostile model can't escape
-    /// the shell. Required when `provider = "custom"`.
+    /// audio file and writes the transcript to stdout or `{output_path}`.
+    /// Template tokens: `{audio_file}`/`{input_path}`, `{output_path}`,
+    /// `{output_dir}`, `{format}`, `{language}`, and `{model}`.
+    /// `{language}` uses the same strict token validation as TTS voice IDs
+    /// so a hostile model cannot smuggle shell flags through the hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -219,9 +224,10 @@ impl Default for AudioConfig {
 /// Single TTS provider entry in the fallback chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsModelConfig {
-    /// Provider name: "openai", "elevenlabs".
+    /// Provider name: "edge", "openai", "elevenlabs", "gemini", "minimax",
+    /// "xai", "mistral", "piper", "kittentts", "neutts", or "custom".
     pub provider: String,
-    /// Model name (e.g. "tts-1", "tts-1-hd", "eleven_multilingual_v2").
+    /// Model name (e.g. "gpt-4o-mini-tts", "eleven_multilingual_v2").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Voice identifier (e.g. "alloy", "nova", or ElevenLabs voice ID).
@@ -233,12 +239,29 @@ pub struct TtsModelConfig {
     /// Per-provider timeout override in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Optional provider API base URL override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Optional language hint for providers that require one (xAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional output sample-rate hint for providers that expose it (xAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate_hz: Option<u32>,
+    /// Optional output bit-rate hint for providers that expose it (xAI MP3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_rate: Option<u32>,
+    /// Per-provider maximum input text length. If unset, Borg uses a
+    /// provider-specific default matching the documented provider limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_text_length: Option<usize>,
     /// Custom provider name suffix (provider: "custom" rows can ship
     /// multiple distinct entries — `name = "piper-en"` etc).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Shell command template for `provider = "custom"`. Tokens:
-    /// `{text_file}`, `{voice}`, `{out_path}`.
+    /// Shell command template for command-backed providers. Tokens:
+    /// `{text_file}`/`{input_path}`, `{voice}`, `{out_path}`/`{output_path}`,
+    /// `{format}`, `{model}`, and `{speed}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Output extension for custom providers (default `"wav"`). Used to

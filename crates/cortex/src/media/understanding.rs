@@ -308,11 +308,12 @@ impl TranscriptionProvider for XaiSttProvider {
             .mime_str(&req.mime_type)?;
 
         let mut form = reqwest::multipart::Form::new().part("file", file_part);
-        if let Some(ref lang) = req.language {
-            form = form.text("language", lang.clone());
-        }
         if self.format {
+            let lang = req.language.clone().unwrap_or_else(|| "en".to_string());
+            form = form.text("language", lang);
             form = form.text("format", "true");
+        } else if let Some(ref lang) = req.language {
+            form = form.text("language", lang.clone());
         }
         if self.diarize {
             form = form.text("diarize", "true");
@@ -349,16 +350,18 @@ impl TranscriptionProvider for XaiSttProvider {
 // ── Custom STT Provider (local CLI via shell template) ──
 
 /// Custom STT — shells out to an operator-defined command template.
-/// Template tokens: `{audio_file}` (path to a temp file holding the input
-/// audio bytes) and `{language}` (validated language hint, empty if unset).
-/// The command writes the transcript to stdout. Mirrors `CustomTtsProvider`
-/// so any local CLI inference tool (Parakeet, faster-whisper, MLX-whisper,
-/// `whisper.cpp`'s `main` binary, etc.) becomes a one-config-line install
-/// without needing whisper-rs's heavy C++ build path.
+/// Template tokens include `{audio_file}`/`{input_path}`, `{output_path}`,
+/// `{language}`, and `{model}`. The command can write the transcript to stdout
+/// or `{output_path}`. Mirrors `CustomTtsProvider` so any local CLI inference
+/// tool (Parakeet, faster-whisper, MLX-whisper, `whisper.cpp`'s `main` binary,
+/// etc.) becomes a one-config-line install without needing whisper-rs's heavy
+/// C++ build path.
 struct CustomSttProvider {
     name: String,
-    /// Command template with `{audio_file}` and (optional) `{language}`.
+    /// Command template with custom STT placeholders.
     command_template: String,
+    /// Optional local model identifier/path exposed as `{model}`.
+    model: String,
     /// Extension to give the temp audio file; some CLIs sniff by extension.
     audio_extension: String,
 }
@@ -368,12 +371,13 @@ impl TranscriptionProvider for CustomSttProvider {
     async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
         let template = self.command_template.clone();
         let ext = self.audio_extension.clone();
+        let model = self.model.clone();
         let audio_bytes = req.audio_bytes.to_vec();
         let language = req.language.clone().unwrap_or_default();
         let timeout = req.timeout;
 
         tokio::task::spawn_blocking(move || {
-            custom_transcribe(&template, &audio_bytes, &ext, &language, timeout)
+            custom_transcribe(&template, &audio_bytes, &ext, &language, &model, timeout)
         })
         .await
         .context("custom stt task panicked")?
@@ -389,16 +393,15 @@ fn custom_transcribe(
     audio_bytes: &[u8],
     extension: &str,
     language: &str,
+    model: &str,
     timeout: Duration,
 ) -> Result<String> {
     use std::io::{Read as _, Write as _};
     use std::process::{Command, Stdio};
 
-    // `{language}` is substituted into the shell template via plain string
-    // replacement before `sh -c`, so a hostile model supplying
-    // `language = "$(rm -rf ~)"` would otherwise execute arbitrary shell.
     // Same trust boundary as `CustomTtsProvider`'s voice id — reuse the
-    // validator rather than duplicating the regex.
+    // validator rather than letting model-supplied language hints become
+    // arbitrary shell flags or paths.
     if !language.is_empty() {
         crate::media::tts::validate_voice_id(language).context("custom STT language hint")?;
     }
@@ -409,10 +412,25 @@ fn custom_transcribe(
     audio_file.write_all(audio_bytes)?;
     audio_file.flush()?;
     let audio_path = audio_file.path().to_string_lossy().into_owned();
-
-    let cmd_str = template
-        .replace("{audio_file}", &audio_path)
-        .replace("{language}", language);
+    let out_file = tempfile::Builder::new().suffix(".txt").tempfile()?;
+    let out_path = out_file.path().to_string_lossy().into_owned();
+    let out_dir = out_file
+        .path()
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+    let cmd_str = crate::media::shell_template::render(
+        template,
+        &[
+            ("audio_file", &audio_path),
+            ("input_path", &audio_path),
+            ("output_path", &out_path),
+            ("output_dir", &out_dir),
+            ("format", "txt"),
+            ("language", language),
+            ("model", model),
+        ],
+    );
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -451,7 +469,12 @@ fn custom_transcribe(
         );
     }
 
-    let transcript = stdout.trim();
+    let transcript_from_file = std::fs::read_to_string(out_file.path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let stdout_trimmed = stdout.trim();
+    let transcript = transcript_from_file.as_deref().unwrap_or(stdout_trimmed);
     if transcript.is_empty() {
         bail!("custom stt produced empty transcript");
     }
@@ -548,7 +571,10 @@ impl AudioTranscriber {
                 Some(Box::new(WhisperProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.openai.com".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.openai.com".to_string()),
                     default_model: "whisper-1".to_string(),
                     provider_name: "openai".to_string(),
                 }))
@@ -559,7 +585,10 @@ impl AudioTranscriber {
                 Some(Box::new(WhisperProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.groq.com/openai".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.groq.com/openai".to_string()),
                     default_model: "whisper-large-v3-turbo".to_string(),
                     provider_name: "groq".to_string(),
                 }))
@@ -573,7 +602,10 @@ impl AudioTranscriber {
                 Some(Box::new(DeepgramProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.deepgram.com".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.deepgram.com".to_string()),
                     default_model: "nova-3".to_string(),
                 }))
             }
@@ -590,7 +622,10 @@ impl AudioTranscriber {
                 Some(Box::new(WhisperProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.mistral.ai".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
                     default_model: "voxtral-mini-latest".to_string(),
                     provider_name: "mistral".to_string(),
                 }))
@@ -631,7 +666,10 @@ impl AudioTranscriber {
                 Some(Box::new(XaiSttProvider {
                     client: client.clone(),
                     api_key,
-                    base_url: "https://api.x.ai/v1".to_string(),
+                    base_url: model_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
                     // `None` preserves the historical default (format on,
                     // diarize off). The Option fields exist so operators
                     // can flip either behavior per-model row.
@@ -648,9 +686,9 @@ impl AudioTranscriber {
                     .command
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())?;
-                if !template.contains("{audio_file}") {
+                if !template.contains("{audio_file}") && !template.contains("{input_path}") {
                     warn!(
-                        "STT provider 'custom' is missing `{{audio_file}}` in its command \
+                        "STT provider 'custom' is missing `{{audio_file}}` or `{{input_path}}` in its command \
                          template; skipping"
                     );
                     return None;
@@ -669,6 +707,7 @@ impl AudioTranscriber {
                 Some(Box::new(CustomSttProvider {
                     name: "custom".to_string(),
                     command_template: template.to_string(),
+                    model: model_cfg.model.clone().unwrap_or_default(),
                     audio_extension: ext,
                 }))
             }
@@ -821,6 +860,7 @@ mod tests {
                 api_key_env: Some((*var).to_string()),
                 language: None,
                 timeout_ms: None,
+                base_url: None,
                 xai_stt_format: None,
                 xai_stt_diarize: None,
                 command: None,
@@ -865,6 +905,7 @@ mod tests {
             api_key_env: None,
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: Some(false),
             xai_stt_diarize: Some(true),
             command: None,
@@ -883,6 +924,7 @@ mod tests {
             api_key_env: None,
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             command: None,
@@ -911,6 +953,7 @@ mod tests {
             api_key_env: Some(var.to_string()),
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             command: None,
@@ -934,17 +977,17 @@ mod tests {
         // We feed UTF-8 in, so the round-trip works for assertion purposes.
         config.audio.models = vec![AudioModelConfig {
             provider: "custom".to_string(),
-            model: None,
+            model: Some("wav".to_string()),
             api_key_env: None,
             language: None,
             timeout_ms: Some(5_000),
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
-            command: Some("cat {audio_file}".to_string()),
+            command: Some("test {model} = wav && cat '{audio_file}'".to_string()),
         }];
 
-        let transcriber =
-            AudioTranscriber::from_config(&config).expect("custom STT must build");
+        let transcriber = AudioTranscriber::from_config(&config).expect("custom STT must build");
         let payload = b"parakeet would put real text here";
         let (text, attempts) = transcriber
             .transcribe(payload, "audio/wav", "test.wav", None)
@@ -978,14 +1021,14 @@ mod tests {
             // command. Validation must reject before `sh -c` runs.
             language: Some(format!("en$(touch {})", marker.display())),
             timeout_ms: Some(5_000),
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             // Template references `{audio_file}` so build_provider accepts
             // it; the language-validation check fires at transcribe time.
             command: Some("cat {audio_file}".to_string()),
         }];
-        let transcriber =
-            AudioTranscriber::from_config(&config).expect("custom STT must build");
+        let transcriber = AudioTranscriber::from_config(&config).expect("custom STT must build");
 
         let result = transcriber
             .transcribe(b"ignored", "audio/wav", "x.wav", None)
@@ -1012,13 +1055,13 @@ mod tests {
             api_key_env: None,
             language: None,
             timeout_ms: Some(5_000),
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             // Command that exits 0 with no stdout — silent ASR failure.
             command: Some("true # consume {audio_file}".to_string()),
         }];
-        let transcriber =
-            AudioTranscriber::from_config(&config).expect("custom STT must build");
+        let transcriber = AudioTranscriber::from_config(&config).expect("custom STT must build");
         let err = transcriber
             .transcribe(b"some-audio", "audio/wav", "x.wav", None)
             .await
@@ -1044,6 +1087,7 @@ mod tests {
             api_key_env: None,
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             command: None,
@@ -1067,6 +1111,7 @@ mod tests {
             api_key_env: None,
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             command: Some("echo hello".to_string()),

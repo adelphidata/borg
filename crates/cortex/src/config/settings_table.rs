@@ -236,6 +236,11 @@ define_settings! {
         // ── Audio ──
         "audio.enabled" => audio.enabled, parsed(bool);
         "audio.models" => audio.models, json_count("models");
+        "audio.max_file_size" => audio.max_file_size, parsed(u64);
+        "audio.min_file_size" => audio.min_file_size, parsed(u64);
+        "audio.language" => audio.language, opt_string;
+        "audio.timeout_ms" => audio.timeout_ms, parsed(u64);
+        "audio.echo_transcript" => audio.echo_transcript, parsed(bool);
 
         // ── Media ──
         "media.max_image_bytes" => media.max_image_bytes, parsed(usize);
@@ -753,6 +758,8 @@ define_settings! {
         // — Voice —
         "tts.enabled" => "TTS provider enabled", Bool, "Voice";
         "tts.auto_mode" => "TTS on gateway replies", Bool, "Voice";
+        "audio.enabled" => "STT provider enabled", Bool, "Voice";
+        "audio.echo_transcript" => "Echo STT transcript", Bool, "Voice";
         "voice.enabled" => "Allow /voice", Bool, "Voice";
         "voice.auto_tts" => "Speak agent replies", Bool, "Voice";
         "voice.auto_submit" => "Auto-submit transcript", Bool, "Voice";

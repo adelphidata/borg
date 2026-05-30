@@ -2508,6 +2508,7 @@ mod tests {
             api_key_env: Some(var.to_string()),
             language: None,
             timeout_ms: None,
+            base_url: None,
             xai_stt_format: None,
             xai_stt_diarize: None,
             command: None,
