@@ -41,7 +41,7 @@ use protocols::admin::{
     TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
@@ -50,14 +50,14 @@ use tonic::{Request, Response, Status as TStatus};
 /// Admin service implementation.
 pub struct AdminSvc {
     registry: SessionRegistry,
-    heartbeat_trigger_tx: Mutex<Option<mpsc::Sender<HeartbeatTrigger>>>,
-    shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
-    heartbeat_bus: Mutex<Option<HeartbeatBus>>,
-    executor: Mutex<Option<Arc<DaemonSessionExecutor>>>,
-    config_notify_tx: Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
-    process_registry: Mutex<Option<ProcessRegistry>>,
-    goal_bus: Mutex<Option<GoalEventBus>>,
-    tunnel_supervisor: Mutex<Option<TunnelSupervisor>>,
+    heartbeat_trigger_tx: WiredSlot<mpsc::Sender<HeartbeatTrigger>>,
+    shutdown_tx: WiredSlot<broadcast::Sender<()>>,
+    heartbeat_bus: WiredSlot<HeartbeatBus>,
+    executor: WiredSlot<Arc<DaemonSessionExecutor>>,
+    config_notify_tx: WiredSlot<mpsc::Sender<cortex::config::Config>>,
+    process_registry: WiredSlot<ProcessRegistry>,
+    goal_bus: WiredSlot<GoalEventBus>,
+    tunnel_supervisor: WiredSlot<TunnelSupervisor>,
 }
 
 impl AdminSvc {
@@ -65,14 +65,14 @@ impl AdminSvc {
     pub fn new(registry: SessionRegistry) -> Self {
         Self {
             registry,
-            heartbeat_trigger_tx: Mutex::new(None),
-            shutdown_tx: Mutex::new(None),
-            heartbeat_bus: Mutex::new(None),
-            executor: Mutex::new(None),
-            config_notify_tx: Mutex::new(None),
-            process_registry: Mutex::new(None),
-            goal_bus: Mutex::new(None),
-            tunnel_supervisor: Mutex::new(None),
+            heartbeat_trigger_tx: WiredSlot::empty(),
+            shutdown_tx: WiredSlot::empty(),
+            heartbeat_bus: WiredSlot::empty(),
+            executor: WiredSlot::empty(),
+            config_notify_tx: WiredSlot::empty(),
+            process_registry: WiredSlot::empty(),
+            goal_bus: WiredSlot::empty(),
+            tunnel_supervisor: WiredSlot::empty(),
         }
     }
 
@@ -81,100 +81,67 @@ impl AdminSvc {
     /// set — the operator should see "tunnel not wired" rather than a
     /// silent success.
     pub fn with_tunnel_supervisor(self, sup: TunnelSupervisor) -> Self {
-        *self
-            .tunnel_supervisor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sup);
+        self.tunnel_supervisor.set(sup);
         self
     }
 
     fn tunnel_supervisor_handle(&self) -> Option<TunnelSupervisor> {
-        self.tunnel_supervisor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.tunnel_supervisor.get()
     }
 
     /// Wire the goal-event broadcast bus. `Admin.SubscribeGoalEvents` reads
     /// from this; the four goal RPC handlers and the agent loop publish
     /// into it via [`GoalEventBus::publish`] / [`GoalEventBus::as_sink`].
     pub fn with_goal_bus(self, bus: GoalEventBus) -> Self {
-        *self
-            .goal_bus
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bus);
+        self.goal_bus.set(bus);
         self
     }
 
     fn goal_bus_handle(&self) -> Option<GoalEventBus> {
-        self.goal_bus
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.goal_bus.get()
     }
 
     /// Wire the daemon-side subprocess registry. `Admin.GetSubprocesses`
     /// and `Admin.SetSubprocessPinned` rely on this; Admin.Heal also
     /// folds the registry into the maintenance sweep when present.
     pub fn with_process_registry(self, reg: ProcessRegistry) -> Self {
-        *self
-            .process_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reg);
+        self.process_registry.set(reg);
         self
     }
 
     fn process_registry_handle(&self) -> Option<ProcessRegistry> {
-        self.process_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.process_registry.get()
     }
 
     /// Wire a heartbeat trigger channel. `Admin.Poke` and
     /// `Admin.TriggerHeartbeat` enqueue requests on it.
     pub fn with_heartbeat_trigger_sender(self, tx: mpsc::Sender<HeartbeatTrigger>) -> Self {
-        *self
-            .heartbeat_trigger_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        self.heartbeat_trigger_tx.set(tx);
         self
     }
 
     /// Wire the daemon's shutdown broadcaster — `Admin.Shutdown` sends `()`.
     pub fn with_shutdown_sender(self, tx: broadcast::Sender<()>) -> Self {
-        *self
-            .shutdown_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        self.shutdown_tx.set(tx);
         self
     }
 
     /// Wire the heartbeat broadcast bus —
     /// `Admin.SubscribeHeartbeatEvents` reads from it.
     pub fn with_heartbeat_bus(self, bus: HeartbeatBus) -> Self {
-        *self
-            .heartbeat_bus
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bus);
+        self.heartbeat_bus.set(bus);
         self
     }
 
     /// Wire the session executor used by `Admin.SendApprovalGreeting`.
     pub fn with_executor(self, executor: Arc<DaemonSessionExecutor>) -> Self {
-        *self
-            .executor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executor);
+        self.executor.set(executor);
         self
     }
 
     /// Wire the config watcher notifier used after setting changes.
     pub fn with_config_notify_sender(self, tx: mpsc::Sender<cortex::config::Config>) -> Self {
-        *self
-            .config_notify_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        self.config_notify_tx.set(tx);
         self
     }
 }
@@ -186,14 +153,7 @@ impl Admin for AdminSvc {
         // turn runs on the existing `DaemonSessionExecutor` (with hooks, vitals,
         // evolution wiring). The unified dispatcher (`task_type="heartbeat"`)
         // owns *scheduled* firings only.
-        let tx = {
-            let g = self
-                .heartbeat_trigger_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        match tx {
+        match self.heartbeat_trigger_tx.get() {
             Some(tx) => {
                 tx.send(HeartbeatTrigger {
                     source: HeartbeatSource::Scheduled,
@@ -220,15 +180,10 @@ impl Admin for AdminSvc {
                 req.source
             ))
         })?;
-        let tx = {
-            let g = self
-                .heartbeat_trigger_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        let tx =
-            tx.ok_or_else(|| TStatus::failed_precondition("no heartbeat scheduler is wired"))?;
+        let tx = self
+            .heartbeat_trigger_tx
+            .get()
+            .ok_or_else(|| TStatus::failed_precondition("no heartbeat scheduler is wired"))?;
         // TriggerHeartbeat (both Scheduled and SessionStart) routes through
         // the in-process channel for executor-backed turns. The new
         // task_type="heartbeat" dispatcher fires scheduled cadence only.
@@ -287,14 +242,7 @@ impl Admin for AdminSvc {
     }
 
     async fn shutdown(&self, _req: Request<Empty>) -> Result<Response<Empty>, TStatus> {
-        let tx = {
-            let g = self
-                .shutdown_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        match tx {
+        match self.shutdown_tx.get() {
             Some(tx) => {
                 // broadcast::send returns Err only when no receivers are live
                 // — reporting Ok in that case would lie about the requested
@@ -795,14 +743,9 @@ impl Admin for AdminSvc {
                 "channel and sender_id are required",
             ));
         }
-        let executor = {
-            let g = self
-                .executor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        let executor = executor
+        let executor = self
+            .executor
+            .get()
             .ok_or_else(|| TStatus::failed_precondition("approval greeting executor not wired"))?;
         // Fire-and-forget so the caller doesn't block on an LLM turn.
         let channel = req.channel;
@@ -827,14 +770,10 @@ impl Admin for AdminSvc {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Self::SubscribeHeartbeatEventsStream>, TStatus> {
-        let bus = {
-            let g = self
-                .heartbeat_bus
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        let bus = bus.ok_or_else(|| TStatus::failed_precondition("heartbeat bus not wired"))?;
+        let bus = self
+            .heartbeat_bus
+            .get()
+            .ok_or_else(|| TStatus::failed_precondition("heartbeat bus not wired"))?;
         let mut sub = bus.subscribe();
         let (tx, rx) = mpsc::channel::<Result<PbHeartbeatEvent, TStatus>>(16);
         tokio::spawn(async move {
@@ -2573,5 +2512,5 @@ use helpers::{
     process_entry_to_proto, require_provider_match, resolve_agent_session_id,
     resolve_goal_session_id, resolve_or_create_goal_session_id, scheduled_task_row_to_proto,
     snapshot_row_to_pb, snapshot_to_reply, sub_agent_row_to_pb, task_run_row_to_proto,
-    update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome,
+    update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome, WiredSlot,
 };

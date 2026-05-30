@@ -19,6 +19,37 @@
 
 use std::sync::Mutex;
 
+/// A daemon dependency wired into [`super::AdminSvc`] after construction via a
+/// `with_*` builder. Centralizes the poison-tolerant lock dance that every
+/// wired slot would otherwise repeat for its setter and getter.
+///
+/// Reads clone the value out (`T: Clone`); a slot stays `None` until wired, and
+/// the matching RPC returns `FailedPrecondition` ("not wired") in that case.
+pub(super) struct WiredSlot<T>(Mutex<Option<T>>);
+
+impl<T: Clone> WiredSlot<T> {
+    /// An unwired slot.
+    pub(super) fn empty() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Wire (or replace) the value.
+    pub(super) fn set(&self, value: T) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+    }
+
+    /// Clone the wired value out, or `None` if not yet wired.
+    pub(super) fn get(&self) -> Option<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 use protocols::admin::{
     AgentEntry as PbAgentEntry, AgentMetrics as PbAgentMetrics,
     AgentSnapshotRef as PbAgentSnapshotRef, AmbientStatus, ApprovedSender, CredentialEntry, Empty,
@@ -340,15 +371,9 @@ pub(super) fn process_entry_to_proto(entry: ProcessEntry) -> PbSubprocess {
 }
 
 pub(super) async fn notify_runtime_config_reload(
-    config_notify_tx: &Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
+    config_notify_tx: &WiredSlot<mpsc::Sender<cortex::config::Config>>,
 ) {
-    let tx = {
-        let guard = config_notify_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.clone()
-    };
-    let Some(tx) = tx else {
+    let Some(tx) = config_notify_tx.get() else {
         return;
     };
     match cortex::config::Config::load_from_db().await {
