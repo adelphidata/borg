@@ -290,7 +290,10 @@ mod tests {
         enforce_tool_result_share_limit(&mut history, 1000, 0.5);
         let result = history[2].text_content().unwrap();
         assert!(result.len() < huge.len(), "result should be truncated");
-        assert!(result.contains("truncated"));
+        assert!(
+            result.contains("omitted"),
+            "truncation marker should disclose omitted output: {result}"
+        );
     }
 
     #[test]
@@ -346,12 +349,13 @@ mod tests {
             after < before / 2,
             "compaction pipeline must materially shrink history ({before} -> {after})",
         );
-        // Tool results must have been mutated — either truncated or replaced
-        // by a compaction marker. If neither, the pipeline didn't run.
+        // Tool results must have been mutated — either truncated (the marker
+        // discloses "omitted" output) or replaced by a compaction marker. If
+        // neither, the pipeline didn't run.
         let any_mutated = history
             .iter()
             .filter_map(|m| m.text_content())
-            .any(|t| t.contains("truncated") || t.contains("compacted"));
+            .any(|t| t.contains("omitted") || t.contains("compacted"));
         assert!(
             any_mutated,
             "expected at least one tool result to be truncated or compacted",
