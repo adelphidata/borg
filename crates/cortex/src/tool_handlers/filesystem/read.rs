@@ -169,7 +169,10 @@ pub fn handle_read_file_with_context(
         });
     }
 
-    // Text file: read with line numbers
+    // Text file: read raw content (no line-number gutter). Emitting a per-line
+    // gutter costs input tokens on every line for orientation the model rarely
+    // needs — edits anchor on exact content + patch context markers, not line
+    // numbers. The partial-read footer below preserves line orientation.
     let content = if let Some(bridge) = bridge
         .as_ref()
         .filter(|bridge| bridge.supports_read_text_file())
@@ -209,9 +212,9 @@ pub fn handle_read_file_with_context(
     };
 
     let mut output = String::new();
-    for (i, line) in lines[start..end].iter().enumerate() {
-        let line_no = start + i + 1;
-        output.push_str(&format!("{line_no:>6}\t{line}\n"));
+    for line in &lines[start..end] {
+        output.push_str(line);
+        output.push('\n');
     }
 
     // Truncate if too long (safe for multi-byte UTF-8)
@@ -335,14 +338,19 @@ mod tests {
     }
 
     #[test]
-    fn handle_read_file_text_with_line_numbers() {
+    fn handle_read_file_text_raw_no_gutter() {
         let config = Config::default();
-        let result = handle_read_file(&json!({"path": "Cargo.toml", "limit": 3}), &config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "fn main() {\n    let x = 1;\n    foo(x);\n").unwrap();
+        let result =
+            handle_read_file(&json!({"path": path.to_string_lossy()}), &config).unwrap();
         match result {
             ToolOutput::Text(s) => {
-                assert!(s.contains("     1\t"), "should have line numbers");
-                assert!(s.contains("     2\t"));
-                assert!(s.contains("     3\t"));
+                // Raw content, byte-for-byte: no line-number gutter, no leading
+                // spaces, no tab separator.
+                assert_eq!(s, "fn main() {\n    let x = 1;\n    foo(x);\n");
+                assert!(!s.contains('\t'), "must not emit a tab gutter");
             }
             _ => panic!("expected Text"),
         }
@@ -351,17 +359,25 @@ mod tests {
     #[test]
     fn handle_read_file_offset_limit() {
         let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, "alpha\nbravo\ncharlie\ndelta\n").unwrap();
         let result = handle_read_file(
-            &json!({"path": "Cargo.toml", "offset": 2, "limit": 2}),
+            &json!({"path": path.to_string_lossy(), "offset": 2, "limit": 2}),
             &config,
         )
         .unwrap();
         match result {
             ToolOutput::Text(s) => {
-                assert!(!s.contains("     1\t"), "should not include line 1");
-                assert!(s.contains("     2\t"), "should start at line 2");
-                assert!(s.contains("     3\t"), "should include line 3");
-                assert!(!s.contains("     4\t"), "should stop at limit");
+                // Lines 2-3 only, raw, followed by the partial-read footer that
+                // preserves line orientation now that the gutter is gone.
+                assert!(s.starts_with("bravo\ncharlie\n"), "should return lines 2-3: {s}");
+                assert!(!s.contains("alpha"), "should not include line 1");
+                assert!(!s.contains("delta"), "should stop at limit");
+                assert!(
+                    s.contains("[showing lines 2–3 of 4]"),
+                    "partial-read footer should report the window: {s}"
+                );
             }
             _ => panic!("expected Text"),
         }
