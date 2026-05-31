@@ -343,12 +343,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sample.rs");
         std::fs::write(&path, "fn main() {\n    let x = 1;\n    foo(x);\n").unwrap();
-        let result =
-            handle_read_file(&json!({"path": path.to_string_lossy()}), &config).unwrap();
+        let result = handle_read_file(&json!({"path": path.to_string_lossy()}), &config).unwrap();
         match result {
             ToolOutput::Text(s) => {
-                // Raw content, byte-for-byte: no line-number gutter, no leading
-                // spaces, no tab separator.
+                // Raw line content, no line-number gutter: no leading spaces,
+                // no tab separator. (Line endings are normalized to `\n`, as
+                // they were before the gutter was dropped — not a byte-for-byte
+                // copy of arbitrary CRLF / trailing-newline variations.)
                 assert_eq!(s, "fn main() {\n    let x = 1;\n    foo(x);\n");
                 assert!(!s.contains('\t'), "must not emit a tab gutter");
             }
@@ -371,7 +372,10 @@ mod tests {
             ToolOutput::Text(s) => {
                 // Lines 2-3 only, raw, followed by the partial-read footer that
                 // preserves line orientation now that the gutter is gone.
-                assert!(s.starts_with("bravo\ncharlie\n"), "should return lines 2-3: {s}");
+                assert!(
+                    s.starts_with("bravo\ncharlie\n"),
+                    "should return lines 2-3: {s}"
+                );
                 assert!(!s.contains("alpha"), "should not include line 1");
                 assert!(!s.contains("delta"), "should stop at limit");
                 assert!(

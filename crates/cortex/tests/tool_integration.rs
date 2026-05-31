@@ -265,8 +265,9 @@ fn read_file_returns_raw_content() {
         ToolOutput::Multimodal { text, .. } => text.as_str(),
     };
 
-    // Raw, byte-for-byte: no line-number gutter, no tab separator. Dropping the
+    // Raw line content: no line-number gutter, no tab separator. Dropping the
     // gutter is the input-token saving; edits anchor on content, not line nums.
+    // (Line endings are normalized to `\n`, as the gutter path also did.)
     assert_eq!(text, "line one\nline two\nline three\n", "got: {text}");
     assert!(!text.contains('\t'), "must not emit a tab gutter: {text}");
 }

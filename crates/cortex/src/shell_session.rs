@@ -116,6 +116,13 @@ impl ShellSessionRegistry {
         let mut inner = self.lock();
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
         let id = format!("sh-{}", inner.next_id);
+        // Ids are monotonic (u64); a collision would mean a wrap past a still-live
+        // session — practically unreachable, but assert the invariant rather than
+        // silently `insert`-overwriting (and thus killing) a live session.
+        debug_assert!(
+            !inner.sessions.contains_key(&id),
+            "shell session id {id} collided with a live session"
+        );
         inner.sessions.insert(
             id.clone(),
             Session {
@@ -166,7 +173,10 @@ impl ShellSessionRegistry {
             .get_mut(id)
             .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
         let (new, new_len) = {
-            let buf = session.output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let buf = session
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (buf[session.polled_offset..].to_string(), buf.len())
         };
         session.polled_offset = new_len;
@@ -237,7 +247,9 @@ fn spawn_drain(
 
 fn append(output: &Arc<Mutex<String>>, bytes: &[u8]) {
     let chunk = String::from_utf8_lossy(bytes);
-    let mut buf = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut buf = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     buf.push_str(&chunk);
 }
 
@@ -285,7 +297,10 @@ mod tests {
 
         reg.write_stdin(&id, "hello\n").await.expect("write");
         let out = poll_until(&reg, &id, "hello").await;
-        assert!(out.contains("hello"), "echoed stdin should surface: {out:?}");
+        assert!(
+            out.contains("hello"),
+            "echoed stdin should surface: {out:?}"
+        );
 
         reg.kill(&id).await.expect("kill");
         assert!(!reg.contains(&id), "killed session is gone");
@@ -308,7 +323,10 @@ mod tests {
         reg.write_stdin(&id, "second\n").await.expect("write");
         let out = poll_until(&reg, &id, "second").await;
         assert!(out.contains("second"));
-        assert!(!out.contains("first"), "poll must not re-emit old output: {out:?}");
+        assert!(
+            !out.contains("first"),
+            "poll must not re-emit old output: {out:?}"
+        );
 
         reg.kill(&id).await.expect("kill");
     }

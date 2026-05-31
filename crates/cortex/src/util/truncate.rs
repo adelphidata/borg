@@ -17,9 +17,7 @@ pub fn truncate_output(text: &str, max_tokens: usize) -> String {
     if max_tokens == 0 {
         let total_lines = text.lines().count();
         let total_tokens = approx_token_count(text);
-        return format!(
-            "[output truncated — {total_tokens} tokens / {total_lines} lines omitted]"
-        );
+        return format!("[output truncated — {total_tokens} tokens / {total_lines} lines omitted]");
     }
 
     let max_bytes = max_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN);

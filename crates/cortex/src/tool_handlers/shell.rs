@@ -902,9 +902,6 @@ mod tests {
         let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("unknown action returns Ok with a message");
-        assert!(
-            result.contains("Unknown run_shell action"),
-            "got: {result}"
-        );
+        assert!(result.contains("Unknown run_shell action"), "got: {result}");
     }
 }
