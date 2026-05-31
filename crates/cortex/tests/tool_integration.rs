@@ -247,10 +247,10 @@ fn read_file_and_list_dir_refuse_blocked_paths() {
     }
 }
 
-// ── Test: read_file with line numbers ──
+// ── Test: read_file returns raw content (no line-number gutter) ──
 
 #[test]
-fn read_file_with_line_numbers() {
+fn read_file_returns_raw_content() {
     let tmp = common::test_tempdir();
     let file = tmp.path().join("test.txt");
     fs::write(&file, "line one\nline two\nline three\n").expect("write file");
@@ -265,15 +265,10 @@ fn read_file_with_line_numbers() {
         ToolOutput::Multimodal { text, .. } => text.as_str(),
     };
 
-    // Output format is "{line_no:>6}\t{line}\n" (e.g. "     1\tline one")
-    assert!(
-        text.contains("1\tline one"),
-        "Expected line-numbered output, got: {text}"
-    );
-    assert!(
-        text.contains("3\tline three"),
-        "Expected all lines in output"
-    );
+    // Raw, byte-for-byte: no line-number gutter, no tab separator. Dropping the
+    // gutter is the input-token saving; edits anchor on content, not line nums.
+    assert_eq!(text, "line one\nline two\nline three\n", "got: {text}");
+    assert!(!text.contains('\t'), "must not emit a tab gutter: {text}");
 }
 
 // ── Test: list_dir not a directory ──
