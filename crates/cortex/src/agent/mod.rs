@@ -66,9 +66,6 @@ pub(crate) fn spawn_logged(
     });
 }
 
-/// Max tokens for tool output before truncation (head + tail preserved).
-const TOOL_OUTPUT_MAX_TOKENS: usize = constants::TOOL_OUTPUT_MAX_TOKENS;
-
 /// Maximum number of parallel tool calls allowed in a single LLM response.
 /// Prevents OOM from malformed stream events with huge indices.
 pub(super) const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;

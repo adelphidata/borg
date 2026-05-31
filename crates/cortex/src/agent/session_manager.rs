@@ -21,7 +21,7 @@ use crate::types::Message;
 use crate::util::truncate::truncate_output;
 
 use super::tool_validation::has_unresolved_tool_calls;
-use super::{Agent, TOOL_OUTPUT_MAX_TOKENS};
+use super::Agent;
 
 impl Agent {
     /// Restore a session's history into this agent.
@@ -170,7 +170,10 @@ impl Agent {
 
     /// Truncate and optionally redact secrets from raw tool output.
     pub(super) fn truncate_and_redact(&self, raw: &str) -> String {
-        self.maybe_redact(truncate_output(raw, TOOL_OUTPUT_MAX_TOKENS))
+        self.maybe_redact(truncate_output(
+            raw,
+            self.config.conversation.tool_output_max_tokens,
+        ))
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.

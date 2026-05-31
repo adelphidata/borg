@@ -16,7 +16,10 @@ const APPROX_BYTES_PER_TOKEN: usize = constants::APPROX_BYTES_PER_TOKEN;
 pub fn truncate_output(text: &str, max_tokens: usize) -> String {
     if max_tokens == 0 {
         let total_lines = text.lines().count();
-        return format!("[output truncated — {total_lines} lines omitted]");
+        let total_tokens = approx_token_count(text);
+        return format!(
+            "[output truncated — {total_tokens} tokens / {total_lines} lines omitted]"
+        );
     }
 
     let max_bytes = max_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN);
@@ -39,12 +42,13 @@ pub fn truncate_output(text: &str, max_tokens: usize) -> String {
     let omitted_bytes = suffix_start - prefix_end;
     let omitted_tokens =
         omitted_bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN;
+    let total_tokens = approx_token_count(text);
 
     let prefix = &text[..prefix_end];
     let suffix = &text[suffix_start..];
 
     format!(
-        "{prefix}\n\n…[{omitted_tokens} tokens truncated, {total_lines} total lines]…\n\n{suffix}"
+        "{prefix}\n\n…[head+tail of {total_tokens} tokens / {total_lines} total lines; {omitted_tokens} tokens omitted]…\n\n{suffix}"
     )
 }
 
@@ -141,11 +145,35 @@ mod tests {
         let text = "a".repeat(1000); // 1000 bytes = ~250 tokens
         let result = truncate_output(&text, 50); // 50 tokens = 200 bytes budget
         assert!(result.len() < text.len());
-        assert!(result.contains("truncated"));
+        assert!(result.contains("omitted"));
         // Should start with 'a's (prefix preserved)
         assert!(result.starts_with("aaa"));
         // Should end with 'a's (suffix preserved)
         assert!(result.ends_with("aaa"));
+    }
+
+    #[test]
+    fn discloses_pre_truncation_total_size() {
+        // 1000 bytes ≈ 250 tokens before truncation. The marker must surface the
+        // original total so the model knows how much it isn't seeing, not just
+        // the omitted slice.
+        let text = "a".repeat(1000);
+        let result = truncate_output(&text, 50);
+        assert!(
+            result.contains(&format!("{} tokens", approx_token_count(&text))),
+            "marker should disclose the original total token count: {result}"
+        );
+    }
+
+    #[test]
+    fn zero_budget_discloses_total_tokens() {
+        let text = "a".repeat(1000);
+        let result = truncate_output(&text, 0);
+        assert!(result.contains("omitted"));
+        assert!(
+            result.contains(&format!("{} tokens", approx_token_count(&text))),
+            "zero-budget marker should disclose the original total: {result}"
+        );
     }
 
     #[test]
@@ -162,7 +190,7 @@ mod tests {
         let result = truncate_output(&text, 20);
         // Should be valid UTF-8 (this would panic if we split a char)
         assert!(result.is_char_boundary(0));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("omitted"));
     }
 
     #[test]

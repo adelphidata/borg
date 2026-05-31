@@ -30,7 +30,7 @@ use std::time::Duration;
 // ── Tier A: User-facing (also config keys) ──────────────────────────
 
 /// Max tokens for tool output before truncation (head + tail preserved).
-pub const TOOL_OUTPUT_MAX_TOKENS: usize = 4000;
+pub const TOOL_OUTPUT_MAX_TOKENS: usize = 10_000;
 
 /// Token budget for skill metadata + instruction context in the system
 /// prompt. Default cap for `SkillsConfig::max_context_tokens`; also the

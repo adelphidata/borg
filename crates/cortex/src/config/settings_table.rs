@@ -727,6 +727,7 @@ define_settings! {
         "llm.thinking" => "Thinking level", Select, "Conversation";
         "conversation.show_thinking" => "Show reasoning", Bool, "Conversation";
         "conversation.max_iterations" => "Max agent steps", Uint, "Conversation";
+        "conversation.tool_output_max_tokens" => "Tool output cap (tokens)", Uint, "Conversation";
         "conversation.concurrent_tools.enabled" => "Parallel tools", Bool, "Conversation";
 
         // — Memory & Skills —

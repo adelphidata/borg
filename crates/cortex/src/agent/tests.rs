@@ -1225,3 +1225,29 @@ async fn make_llm_client_still_rejects_missing_provider_on_turn() {
          render a `/settings` hint; got: {msg}",
     );
 }
+
+#[tokio::test]
+async fn tool_output_truncation_honors_configured_cap() {
+    // Regression guard for a dead-wired setting: `truncate_and_redact` must read
+    // `conversation.tool_output_max_tokens`, not a hardcoded constant. The input
+    // below (~500 tokens) sits well under the 10k default but far above the
+    // 10-token cap set here — so this test only passes if the config is actually
+    // consulted. Against the previous hardcoded path it would not truncate.
+    let mut config = Config::default();
+    config.conversation.tool_output_max_tokens = 10;
+    let agent = Agent::new(config, BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+
+    let raw = "abcd ".repeat(400); // 2000 bytes ≈ 500 tokens
+    let out = agent.truncate_and_redact(&raw);
+
+    assert!(
+        out.len() < raw.len(),
+        "configured cap of 10 tokens must truncate a ~500-token output"
+    );
+    assert!(
+        out.contains("omitted"),
+        "truncated output must carry the disclosure marker: {out}"
+    );
+}
