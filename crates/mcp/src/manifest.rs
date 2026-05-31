@@ -59,6 +59,9 @@ pub enum Transport {
         headers: HashMap<String, String>,
         /// Optional structured auth that the transport may handle specially.
         auth: HttpAuth,
+        /// Optional client certificate presented during the TLS handshake
+        /// (mutual TLS). `None` for the common server-auth-only case.
+        client_identity: Option<ClientIdentity>,
     },
     /// Server-Sent Events flavour of MCP HTTP.
     Sse {
@@ -68,7 +71,22 @@ pub enum Transport {
         headers: HashMap<String, String>,
         /// Optional structured auth.
         auth: HttpAuth,
+        /// Optional client certificate for mutual TLS (see [`Transport::Http`]).
+        client_identity: Option<ClientIdentity>,
     },
+}
+
+/// A client certificate + private key presented during the TLS handshake so a
+/// server requiring mutual TLS accepts the connection. Paths are resolved
+/// (tilde-expanded, absolute) by the time they reach the transport; the PEM is
+/// loaded at connect time so a missing/invalid file fails fast.
+#[derive(Debug, Clone)]
+pub struct ClientIdentity {
+    /// Path to the client certificate PEM. May also contain the private key
+    /// (combined PEM), in which case `key_path` is `None`.
+    pub cert_path: String,
+    /// Path to the private key PEM when it lives in a separate file.
+    pub key_path: Option<String>,
 }
 
 /// HTTP auth flavour. Supports None (use `headers` directly) and

@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+use crate::fs_atomic::UTF8_BOM;
 use crate::parser::{Hunk, Patch, PatchOperation};
 use crate::seek_sequence::{find_nearest_context, seek_sequence, MatchOutcome};
 
@@ -128,8 +129,17 @@ enum FileSnapshot {
 }
 
 enum CommitAction {
-    Write { path: String, content: String },
-    Delete { path: String },
+    Write {
+        path: String,
+        content: String,
+        /// Whether the original on-disk file began with a UTF-8 BOM that must
+        /// be re-prepended when this content is written. Content is held
+        /// BOM-free in memory so hunk matching stays exact.
+        had_bom: bool,
+    },
+    Delete {
+        path: String,
+    },
 }
 
 struct PreparedPatch {
@@ -183,6 +193,9 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                         actions.push(CommitAction::Write {
                             path: path.clone(),
                             content: content.clone(),
+                            // New-file content is written verbatim; any BOM the
+                            // patch itself carries is already in `content`.
+                            had_bom: false,
                         });
                         affected.added.push(path.clone());
                         let from = if previous.is_some() {
@@ -216,7 +229,7 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                     }
                 }
 
-                let original = match virtual_file_state(path, base_dir, &overlay) {
+                let original_raw = match virtual_file_state(path, base_dir, &overlay) {
                     Ok(Some(content)) => content,
                     Ok(None) => {
                         errors.push(format!("Cannot update non-existent file: {path}"));
@@ -227,6 +240,11 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                         continue;
                     }
                 };
+
+                // Strip a leading BOM so hunk context matches a BOM-prefixed
+                // file's first line; re-prepend it on write below.
+                let (had_bom, original_body) = crate::fs_atomic::split_bom(&original_raw);
+                let original = original_body.to_string();
 
                 let updated = match apply_hunks(&original, hunks, path) {
                     Ok(content) => content,
@@ -267,6 +285,8 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                     actions.push(CommitAction::Write {
                         path: dest.clone(),
                         content: updated.clone(),
+                        // A moved file inherits the source file's BOM.
+                        had_bom,
                     });
                     if dest != path {
                         actions.push(CommitAction::Delete { path: path.clone() });
@@ -296,6 +316,7 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                     actions.push(CommitAction::Write {
                         path: path.clone(),
                         content: updated.clone(),
+                        had_bom,
                     });
                     affected.modified.push(path.clone());
                     diffs.push(render_unified_diff(
@@ -374,7 +395,11 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
     let result = (|| -> Result<()> {
         for action in &prepared.actions {
             match action {
-                CommitAction::Write { path, content } => {
+                CommitAction::Write {
+                    path,
+                    content,
+                    had_bom,
+                } => {
                     let full_path = base_dir.join(path);
                     reject_symlink(&full_path)
                         .with_context(|| format!("Symlink check failed for {path}"))?;
@@ -382,7 +407,15 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
                         std::fs::create_dir_all(parent)
                             .with_context(|| format!("Failed to create directory for {path}"))?;
                     }
-                    std::fs::write(&full_path, content)
+                    let bytes = if *had_bom {
+                        let mut buf = String::with_capacity(content.len() + UTF8_BOM.len_utf8());
+                        buf.push(UTF8_BOM);
+                        buf.push_str(content);
+                        buf.into_bytes()
+                    } else {
+                        content.clone().into_bytes()
+                    };
+                    crate::fs_atomic::atomic_write(&full_path, &bytes)
                         .with_context(|| format!("Failed to write {path}"))?;
                     info!("Wrote file: {path}");
                 }
@@ -1852,5 +1885,75 @@ EOF";
             "expected two grouped hunks, got diff: {}",
             result.diff
         );
+    }
+
+    #[test]
+    fn update_matches_through_leading_bom_and_preserves_it() {
+        // A file authored on Windows starts with a UTF-8 BOM. The patch's first
+        // context line ("old line") has no BOM, so without BOM-aware matching
+        // the hunk would fail to locate. After the edit the BOM must survive.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bom.txt");
+        std::fs::write(&path, "\u{FEFF}old line\nkeep\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "bom.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("old line", "new line")],
+        }]);
+
+        apply_patch(&patch, dir.path()).expect("hunk must match through the BOM");
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            raw.starts_with(b"\xef\xbb\xbf"),
+            "BOM must be preserved on write, got bytes: {raw:?}"
+        );
+        let text = String::from_utf8(raw).unwrap();
+        assert_eq!(text, "\u{FEFF}new line\nkeep\n");
+    }
+
+    #[test]
+    fn update_without_bom_does_not_introduce_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "old line\nkeep\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "plain.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("old line", "new line")],
+        }]);
+
+        apply_patch(&patch, dir.path()).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.starts_with(b"\xef\xbb\xbf"),
+            "a BOM must not be invented for a file that never had one"
+        );
+        assert_eq!(String::from_utf8(raw).unwrap(), "new line\nkeep\n");
+    }
+
+    #[test]
+    fn moved_file_inherits_source_bom() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "\u{FEFF}source\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "src.txt".to_string(),
+            move_to: Some("dest.txt".to_string()),
+            hunks: vec![simple_hunk("source", "SOURCE")],
+        }]);
+
+        apply_patch(&patch, dir.path()).unwrap();
+
+        assert!(!dir.path().join("src.txt").exists());
+        let raw = std::fs::read(dir.path().join("dest.txt")).unwrap();
+        assert!(
+            raw.starts_with(b"\xef\xbb\xbf"),
+            "moved file should carry the source BOM, got: {raw:?}"
+        );
+        assert_eq!(String::from_utf8(raw).unwrap(), "\u{FEFF}SOURCE\n");
     }
 }

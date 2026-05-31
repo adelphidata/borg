@@ -74,6 +74,16 @@ pub(crate) struct AddArgs {
     #[arg(long)]
     pub auth: Option<String>,
 
+    /// Client certificate PEM (HTTP / SSE only) presented for mutual TLS. `~`
+    /// is expanded. May be a combined cert+key PEM, in which case `--client-key`
+    /// is omitted.
+    #[arg(long)]
+    pub client_cert: Option<String>,
+
+    /// Client private key PEM (HTTP / SSE only), when separate from the cert.
+    #[arg(long, requires = "client_cert")]
+    pub client_key: Option<String>,
+
     /// Initial handshake timeout (ms).
     #[arg(long, default_value_t = 60_000)]
     pub connect_timeout_ms: u64,
@@ -354,10 +364,24 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
              drop the explicit Authorization header to resolve the ambiguity"
         );
     }
+    let client_cert = args.client_cert.clone();
+    let client_key = args.client_key.clone();
     Ok(if is_sse {
-        TransportSpec::Sse { url, headers, auth }
+        TransportSpec::Sse {
+            url,
+            headers,
+            auth,
+            client_cert,
+            client_key,
+        }
     } else {
-        TransportSpec::Http { url, headers, auth }
+        TransportSpec::Http {
+            url,
+            headers,
+            auth,
+            client_cert,
+            client_key,
+        }
     })
 }
 
@@ -546,6 +570,8 @@ fn preset_to_config(name: &str, fs_root: Option<&str>) -> Result<McpServerConfig
                 url: "https://mcp.notion.com/mcp".into(),
                 headers: HashMap::new(),
                 auth: HttpAuthSpec::None,
+                client_cert: None,
+                client_key: None,
             },
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
@@ -671,6 +697,8 @@ mod tests {
             rate_limit_per_minute: 1,
             rate_limit_burst: 1,
             max_tools: 1,
+            client_cert: None,
+            client_key: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -697,6 +725,8 @@ mod tests {
             rate_limit_per_minute: 1,
             rate_limit_burst: 1,
             max_tools: 1,
+            client_cert: None,
+            client_key: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -725,6 +755,8 @@ mod tests {
             rate_limit_per_minute: 1,
             rate_limit_burst: 1,
             max_tools: 1,
+            client_cert: None,
+            client_key: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -753,6 +785,8 @@ mod tests {
             rate_limit_per_minute: 1,
             rate_limit_burst: 1,
             max_tools: 1,
+            client_cert: None,
+            client_key: None,
             force: false,
         };
         let t = build_transport(&args).unwrap();
@@ -790,6 +824,8 @@ mod tests {
             rate_limit_per_minute: 1,
             rate_limit_burst: 1,
             max_tools: 1,
+            client_cert: None,
+            client_key: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();

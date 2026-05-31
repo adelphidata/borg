@@ -952,7 +952,12 @@ async fn open_transport(
             let t = mcp::transport::stdio::spawn(cfg, stderr_sink).await?;
             Ok(Box::new(t))
         }
-        mcp::manifest::Transport::Http { url, headers, auth } => {
+        mcp::manifest::Transport::Http {
+            url,
+            headers,
+            auth,
+            client_identity,
+        } => {
             let mut headers = headers.clone();
             if let mcp::manifest::HttpAuth::Bearer { token } = auth {
                 headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -963,11 +968,17 @@ async fn open_transport(
                 headers,
                 timeout: manifest.call_timeout,
                 policy,
+                client_identity: client_identity.clone(),
             };
             let t = mcp::transport::http::open(cfg).await?;
             Ok(Box::new(t))
         }
-        mcp::manifest::Transport::Sse { url, headers, auth } => {
+        mcp::manifest::Transport::Sse {
+            url,
+            headers,
+            auth,
+            client_identity,
+        } => {
             let mut headers = headers.clone();
             if let mcp::manifest::HttpAuth::Bearer { token } = auth {
                 headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -978,6 +989,7 @@ async fn open_transport(
                 headers,
                 timeout: manifest.call_timeout,
                 policy,
+                client_identity: client_identity.clone(),
             };
             let t = mcp::transport::sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))
@@ -1426,6 +1438,8 @@ mod tests {
                     url: "https://example.com/mcp".to_string(),
                     headers: HashMap::new(),
                     auth: Default::default(),
+                    client_cert: None,
+                    client_key: None,
                 },
                 connect_timeout_ms: 60_000,
                 call_timeout_ms: 120_000,
@@ -1458,6 +1472,8 @@ mod tests {
                     url: "https://sse.example.com/".to_string(),
                     headers: HashMap::new(),
                     auth: Default::default(),
+                    client_cert: None,
+                    client_key: None,
                 },
                 connect_timeout_ms: 60_000,
                 call_timeout_ms: 120_000,

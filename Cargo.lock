@@ -4274,6 +4274,7 @@ dependencies = [
  "futures",
  "futures-util",
  "pretty_assertions",
+ "rcgen",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

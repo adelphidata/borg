@@ -30,6 +30,7 @@ axum = { workspace = true }
 # fixtures need `signal` for graceful shutdown which is included.
 tokio = { workspace = true }
 chrono = { workspace = true }
+rcgen = { workspace = true }
 
 [features]
 # Opt-in lane that talks to real MCP servers (e.g. `uvx mcp-server-time`).

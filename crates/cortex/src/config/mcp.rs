@@ -146,6 +146,13 @@ pub enum TransportSpec {
         /// Optional structured auth.
         #[serde(default)]
         auth: HttpAuthSpec,
+        /// Path to a client certificate PEM for mutual TLS. `~` is expanded.
+        /// May be a combined cert+key PEM, in which case `client_key` is unset.
+        #[serde(default)]
+        client_cert: Option<String>,
+        /// Path to the client private key PEM, when separate from `client_cert`.
+        #[serde(default)]
+        client_key: Option<String>,
     },
     /// Server-Sent Events flavour of MCP HTTP.
     Sse {
@@ -157,6 +164,12 @@ pub enum TransportSpec {
         /// Optional structured auth.
         #[serde(default)]
         auth: HttpAuthSpec,
+        /// Path to a client certificate PEM for mutual TLS (see [`TransportSpec::Http`]).
+        #[serde(default)]
+        client_cert: Option<String>,
+        /// Path to the client private key PEM, when separate from `client_cert`.
+        #[serde(default)]
+        client_key: Option<String>,
     },
 }
 
@@ -195,15 +208,29 @@ impl McpServerConfig {
                 args: args.clone(),
                 env: resolve_secret_map(env, cfg, "env")?,
             },
-            TransportSpec::Http { url, headers, auth } => mcp::manifest::Transport::Http {
+            TransportSpec::Http {
+                url,
+                headers,
+                auth,
+                client_cert,
+                client_key,
+            } => mcp::manifest::Transport::Http {
                 url: url.clone(),
                 headers: resolve_secret_map(headers, cfg, "headers")?,
                 auth: resolve_auth(auth, cfg)?,
+                client_identity: resolve_client_identity(client_cert, client_key)?,
             },
-            TransportSpec::Sse { url, headers, auth } => mcp::manifest::Transport::Sse {
+            TransportSpec::Sse {
+                url,
+                headers,
+                auth,
+                client_cert,
+                client_key,
+            } => mcp::manifest::Transport::Sse {
                 url: url.clone(),
                 headers: resolve_secret_map(headers, cfg, "headers")?,
                 auth: resolve_auth(auth, cfg)?,
+                client_identity: resolve_client_identity(client_cert, client_key)?,
             },
         };
         Ok(mcp::manifest::ServerManifest {
@@ -215,6 +242,29 @@ impl McpServerConfig {
             rate_limit_burst: self.rate_limit_burst,
             tools: self.tools.clone(),
         })
+    }
+}
+
+/// Build the wire-level [`mcp::manifest::ClientIdentity`] from the operator's
+/// `client_cert` / `client_key` paths. Tilde-expands both paths so `~/certs/...`
+/// works; the PEM bytes are not read here — the transport loads them at connect
+/// time so a missing/invalid file fails fast against the real connection. A
+/// `client_key` without a `client_cert` is a config error (the cert is what's
+/// presented; the key alone is meaningless).
+fn resolve_client_identity(
+    client_cert: &Option<String>,
+    client_key: &Option<String>,
+) -> Result<Option<mcp::manifest::ClientIdentity>> {
+    match (client_cert, client_key) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => bail!(
+            "mcp server config sets `client_key` without `client_cert` — \
+             provide the client certificate path (or a combined cert+key PEM)"
+        ),
+        (Some(cert), key) => Ok(Some(mcp::manifest::ClientIdentity {
+            cert_path: crate::util::unix_ext::expand_tilde(cert),
+            key_path: key.as_ref().map(|k| crate::util::unix_ext::expand_tilde(k)),
+        })),
     }
 }
 
@@ -444,5 +494,98 @@ mod tests {
         assert_eq!(m.call_timeout, Duration::from_millis(30_000));
         assert_eq!(m.rate_limit_per_minute, 120);
         assert_eq!(m.rate_limit_burst, 20);
+    }
+
+    #[test]
+    fn http_transport_deserializes_client_cert_and_key() {
+        // The mTLS knobs must round-trip through serde with the rest of the
+        // HTTP transport. Exercises the `#[serde(default)]` fields.
+        let json = serde_json::json!({
+            "type": "http",
+            "url": "https://mcp.example.com/mcp",
+            "client_cert": "/etc/borg/client.crt",
+            "client_key": "/etc/borg/client.key",
+        });
+        let spec: TransportSpec = serde_json::from_value(json).unwrap();
+        match spec {
+            TransportSpec::Http {
+                client_cert,
+                client_key,
+                ..
+            } => {
+                assert_eq!(client_cert.as_deref(), Some("/etc/borg/client.crt"));
+                assert_eq!(client_key.as_deref(), Some("/etc/borg/client.key"));
+            }
+            other => panic!("expected Http transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_to_manifest_carries_client_identity_with_tilde_expansion() {
+        // The cortex→mcp seam must thread the cert/key into the wire manifest
+        // (a previous version silently dropped them) and expand `~` so a
+        // home-relative cert path actually resolves.
+        let server = McpServerConfig {
+            enabled: true,
+            transport: TransportSpec::Http {
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuthSpec::None,
+                client_cert: Some("~/certs/client.pem".to_string()),
+                client_key: Some("~/certs/client.key".to_string()),
+            },
+            connect_timeout_ms: 60_000,
+            call_timeout_ms: 120_000,
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+            tools: mcp::manifest::ToolFilter::default(),
+        };
+        let m = server
+            .resolve_to_manifest("mtls", &Config::default())
+            .unwrap();
+        let home = dirs::home_dir().unwrap();
+        match m.transport {
+            mcp::manifest::Transport::Http {
+                client_identity: Some(id),
+                ..
+            } => {
+                assert_eq!(
+                    id.cert_path,
+                    home.join("certs/client.pem").to_string_lossy()
+                );
+                assert_eq!(
+                    id.key_path.as_deref(),
+                    Some(home.join("certs/client.key").to_string_lossy().as_ref())
+                );
+            }
+            other => panic!("expected Http transport with client identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_key_without_cert_is_rejected() {
+        let server = McpServerConfig {
+            enabled: true,
+            transport: TransportSpec::Http {
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuthSpec::None,
+                client_cert: None,
+                client_key: Some("/etc/borg/client.key".to_string()),
+            },
+            connect_timeout_ms: 60_000,
+            call_timeout_ms: 120_000,
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+            tools: mcp::manifest::ToolFilter::default(),
+        };
+        let err = server
+            .resolve_to_manifest("bad", &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("client_key") && err.contains("client_cert"),
+            "error should explain the missing cert: {err}"
+        );
     }
 }

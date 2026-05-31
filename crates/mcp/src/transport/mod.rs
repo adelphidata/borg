@@ -51,7 +51,12 @@ pub async fn open(
             let t = stdio::spawn(cfg, sink).await?;
             Ok(Box::new(t))
         }
-        TransportSpec::Http { url, headers, auth } => {
+        TransportSpec::Http {
+            url,
+            headers,
+            auth,
+            client_identity,
+        } => {
             let mut headers = headers.clone();
             if let HttpAuth::Bearer { token } = auth {
                 headers.insert("Authorization".into(), format!("Bearer {token}"));
@@ -62,11 +67,17 @@ pub async fn open(
                 headers,
                 timeout: manifest.call_timeout,
                 policy,
+                client_identity: client_identity.clone(),
             };
             let t = http::open(cfg).await?;
             Ok(Box::new(t))
         }
-        TransportSpec::Sse { url, headers, auth } => {
+        TransportSpec::Sse {
+            url,
+            headers,
+            auth,
+            client_identity,
+        } => {
             let mut headers = headers.clone();
             if let HttpAuth::Bearer { token } = auth {
                 headers.insert("Authorization".into(), format!("Bearer {token}"));
@@ -77,6 +88,7 @@ pub async fn open(
                 headers,
                 timeout: manifest.call_timeout,
                 policy,
+                client_identity: client_identity.clone(),
             };
             let t = sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))

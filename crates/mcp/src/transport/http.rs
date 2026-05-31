@@ -54,6 +54,8 @@ pub struct HttpConfig {
     pub timeout: Duration,
     /// Policy gates.
     pub policy: HttpPolicy,
+    /// Optional client certificate for mutual TLS. Loaded at connect time.
+    pub client_identity: Option<crate::manifest::ClientIdentity>,
 }
 
 /// Loopback hostname aliases that resolve to local interfaces. Refused
@@ -243,6 +245,7 @@ fn ip_is_local(ip: IpAddr) -> bool {
 pub(crate) fn build_client(
     timeout: Duration,
     pins: &[(String, Vec<SocketAddr>)],
+    client_identity: Option<&crate::manifest::ClientIdentity>,
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .timeout(timeout)
@@ -250,9 +253,38 @@ pub(crate) fn build_client(
     for (host, addrs) in pins {
         builder = builder.resolve_to_addrs(host, addrs);
     }
+    if let Some(identity) = client_identity {
+        builder = builder.identity(load_client_identity(identity)?);
+    }
     builder
         .build()
         .map_err(|e| McpError::Connect(format!("reqwest build failed: {e}")))
+}
+
+/// Load a client certificate + key into a `reqwest::Identity` for mutual TLS.
+///
+/// reqwest expects a single PEM containing both the certificate chain and the
+/// private key; when the key lives in a separate file we concatenate them. Any
+/// missing file or malformed PEM fails fast with a `Connect` error rather than
+/// silently downgrading to no client cert.
+fn load_client_identity(identity: &crate::manifest::ClientIdentity) -> Result<reqwest::Identity> {
+    let mut pem = std::fs::read(&identity.cert_path).map_err(|e| {
+        McpError::Connect(format!(
+            "failed to read client certificate '{}': {e}",
+            identity.cert_path
+        ))
+    })?;
+    if let Some(key_path) = &identity.key_path {
+        let key = std::fs::read(key_path).map_err(|e| {
+            McpError::Connect(format!("failed to read client key '{key_path}': {e}"))
+        })?;
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(&key);
+    }
+    reqwest::Identity::from_pem(&pem)
+        .map_err(|e| McpError::Connect(format!("invalid client identity PEM: {e}")))
 }
 
 /// Open an HTTP MCP transport. Resolves DNS, validates every resolved IP
@@ -260,7 +292,11 @@ pub(crate) fn build_client(
 /// the reqwest connector for DNS-rebinding resistance.
 pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
     let resolved = resolve_endpoint(&config.url, &config.policy).await?;
-    let client = build_client(config.timeout, &resolved.pins)?;
+    let client = build_client(
+        config.timeout,
+        &resolved.pins,
+        config.client_identity.as_ref(),
+    )?;
     Ok(HttpTransport {
         client,
         url: resolved.url,
@@ -640,5 +676,96 @@ mod tests {
             allow_local_network: true,
         };
         check_url_syntactic("https://169.254.169.254/", &permissive).unwrap();
+    }
+
+    /// Generate a throwaway self-signed cert + key PEM pair for mTLS tests.
+    fn self_signed_pem() -> (String, String) {
+        let cert = rcgen::generate_simple_self_signed(vec!["client.test".to_string()])
+            .expect("generate self-signed cert");
+        (cert.cert.pem(), cert.key_pair.serialize_pem())
+    }
+
+    #[test]
+    fn build_client_with_separate_cert_and_key_succeeds() {
+        // A valid client cert + key in separate PEM files must build a usable
+        // reqwest client (the mTLS identity is accepted by reqwest's rustls
+        // backend). This exercises the cert+key concatenation path.
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = self_signed_pem();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+
+        let identity = crate::manifest::ClientIdentity {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: Some(key_path.to_string_lossy().into_owned()),
+        };
+        build_client(Duration::from_secs(5), &[], Some(&identity))
+            .expect("valid client identity should build a client");
+    }
+
+    #[test]
+    fn build_client_with_combined_cert_key_pem_succeeds() {
+        // reqwest also accepts a single PEM holding both cert and key; with no
+        // separate key file the bytes are used as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = self_signed_pem();
+        let combined = format!("{cert_pem}{key_pem}");
+        let combined_path = dir.path().join("combined.pem");
+        std::fs::write(&combined_path, combined).unwrap();
+
+        let identity = crate::manifest::ClientIdentity {
+            cert_path: combined_path.to_string_lossy().into_owned(),
+            key_path: None,
+        };
+        build_client(Duration::from_secs(5), &[], Some(&identity))
+            .expect("combined cert+key PEM should build a client");
+    }
+
+    #[test]
+    fn build_client_missing_cert_file_fails_fast() {
+        // A configured-but-absent cert must surface a Connect error rather than
+        // silently downgrading to no client certificate.
+        let identity = crate::manifest::ClientIdentity {
+            cert_path: "/nonexistent/borg-test/client.crt".to_string(),
+            key_path: None,
+        };
+        let err = build_client(Duration::from_secs(5), &[], Some(&identity))
+            .expect_err("missing cert file must error");
+        match err {
+            McpError::Connect(msg) => assert!(
+                msg.contains("failed to read client certificate"),
+                "unexpected message: {msg}"
+            ),
+            e => panic!("expected Connect error, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn build_client_malformed_pem_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("garbage.pem");
+        std::fs::write(&cert_path, "not a pem file").unwrap();
+        let identity = crate::manifest::ClientIdentity {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: None,
+        };
+        let err = build_client(Duration::from_secs(5), &[], Some(&identity))
+            .expect_err("malformed PEM must error");
+        match err {
+            McpError::Connect(msg) => assert!(
+                msg.contains("invalid client identity PEM"),
+                "unexpected message: {msg}"
+            ),
+            e => panic!("expected Connect error, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn build_client_without_identity_still_builds() {
+        // Regression guard: the common server-auth-only path (no client cert)
+        // must keep working after the mTLS plumbing was added.
+        build_client(Duration::from_secs(5), &[], None).expect("no-identity client should build");
     }
 }

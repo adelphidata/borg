@@ -29,6 +29,7 @@
 )]
 
 pub mod apply;
+pub mod fs_atomic;
 pub mod invocation;
 pub mod parser;
 mod seek_sequence;

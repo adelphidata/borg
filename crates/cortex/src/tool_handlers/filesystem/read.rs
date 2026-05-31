@@ -68,13 +68,13 @@ pub fn handle_read_file_with_context(
     {
         match ctx.resolve_path_maybe_missing(raw_path) {
             Ok(p) => p,
-            Err(_) => return Ok(ToolOutput::Text(format!("File not found: {raw_path}"))),
+            Err(_) => return Ok(ToolOutput::Text(not_found_message(ctx, raw_path))),
         }
     } else {
         match ctx.resolve_existing_path(raw_path) {
             Ok(p) => p,
             Err(_) => {
-                return Ok(ToolOutput::Text(format!("File not found: {raw_path}")));
+                return Ok(ToolOutput::Text(not_found_message(ctx, raw_path)));
             }
         }
     };
@@ -84,7 +84,7 @@ pub fn handle_read_file_with_context(
             .as_ref()
             .is_some_and(|bridge| bridge.supports_read_text_file())
     {
-        return Ok(ToolOutput::Text(format!("File not found: {raw_path}")));
+        return Ok(ToolOutput::Text(not_found_message(ctx, raw_path)));
     }
 
     if canonical.is_dir() {
@@ -235,6 +235,22 @@ pub fn handle_read_file_with_context(
     Ok(ToolOutput::Text(output))
 }
 
+/// Build a "file not found" message that surfaces the *resolved* absolute path
+/// when it differs from the raw input. A relative path resolves against the
+/// execution context's workspace cwd (not the process cwd), so when a worktree
+/// or remote session sets a different cwd, reporting only the relative path
+/// hides where the agent actually looked. Showing the resolved path makes a
+/// wrong-cwd mismatch visible instead of silent.
+fn not_found_message(ctx: &ExecutionContext, raw_path: &str) -> String {
+    if let Ok(resolved) = ctx.resolve_path_maybe_missing(raw_path) {
+        let resolved = resolved.to_string_lossy();
+        if resolved != raw_path {
+            return format!("File not found: {raw_path} (resolved: {resolved})");
+        }
+    }
+    format!("File not found: {raw_path}")
+}
+
 /// Map a file extension to its MIME type.
 fn mime_for_extension(ext: &str) -> &'static str {
     match ext {
@@ -370,6 +386,31 @@ mod tests {
         let result = handle_read_file(&json!({"path": "."}), &config).unwrap();
         match result {
             ToolOutput::Text(s) => assert!(s.contains("directory")),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn handle_read_file_missing_reports_resolved_absolute_path() {
+        // A relative path resolves against the execution context's workspace
+        // cwd, which can differ from the process cwd (worktree / remote
+        // session). The not-found message must surface that resolved absolute
+        // path so a wrong-cwd lookup is visible, not just the bare relative name.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let result =
+            handle_read_file_with_context(&json!({"path": "ghost.txt"}), &config, &ctx).unwrap();
+        match result {
+            ToolOutput::Text(s) => {
+                assert!(s.contains("not found"), "got: {s}");
+                assert!(
+                    s.contains(root.to_string_lossy().as_ref()),
+                    "resolved absolute path missing from: {s}"
+                );
+                assert!(s.contains("ghost.txt"), "raw path missing from: {s}");
+            }
             _ => panic!("expected Text"),
         }
     }

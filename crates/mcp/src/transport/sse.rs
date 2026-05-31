@@ -34,6 +34,8 @@ pub struct SseConfig {
     pub timeout: Duration,
     /// Policy gates.
     pub policy: HttpPolicy,
+    /// Optional client certificate for mutual TLS. Loaded at connect time.
+    pub client_identity: Option<crate::manifest::ClientIdentity>,
 }
 
 /// Connected SSE transport.
@@ -72,7 +74,11 @@ impl SseTransport {
 pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTransport> {
     let sse_resolved = resolve_endpoint(&config.url, &config.policy).await?;
     let sse_url = sse_resolved.url.clone();
-    let client = build_client(config.timeout, &sse_resolved.pins)?;
+    let client = build_client(
+        config.timeout,
+        &sse_resolved.pins,
+        config.client_identity.as_ref(),
+    )?;
 
     let mut req = client
         .get(sse_url.clone())
@@ -150,7 +156,11 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
     // pin lists is safe.
     let mut combined_pins = sse_resolved.pins.clone();
     combined_pins.extend(post_resolved.pins);
-    let client = build_client(config.timeout, &combined_pins)?;
+    let client = build_client(
+        config.timeout,
+        &combined_pins,
+        config.client_identity.as_ref(),
+    )?;
 
     // Spawn the pump for the remaining lifetime of the stream.
     let server_name_pump = config.server_name.clone();

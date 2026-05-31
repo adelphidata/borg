@@ -144,6 +144,7 @@ fn config(url: String) -> HttpConfig {
             allow_plaintext_http: true,
             allow_local_network: true,
         },
+        client_identity: None,
     }
 }
 

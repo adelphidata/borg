@@ -262,6 +262,8 @@ mod tests {
                     url: "https://example.com/mcp".to_string(),
                     headers: HashMap::new(),
                     auth: Default::default(),
+                    client_cert: None,
+                    client_key: None,
                 },
                 true,
             ),

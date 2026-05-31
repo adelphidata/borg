@@ -111,7 +111,17 @@ pub fn handle_apply_patch_with_context(
         coding::apply_patch_to_dir(patch_text, cwd)
     };
     match outcome {
-        Ok(result) => Ok(format_patch_success("Patch applied successfully.", &result)),
+        Ok(result) => {
+            let mut msg = format_patch_success("Patch applied successfully.", &result);
+            if !has_non_relative {
+                // Relative patch paths resolved against the workspace cwd (not
+                // the process cwd). Surface the base so a worktree/cwd mismatch
+                // — files silently landing in the wrong checkout — is visible
+                // rather than hidden behind bare relative names.
+                msg.push_str(&format!("\n\nResolved against: {}", cwd.display()));
+            }
+            Ok(msg)
+        }
         Err(e) => {
             // Ghost-commit rollback (M3): if the cwd is inside a git repo
             // and we snapshotted before the failed patch attempt, restore
@@ -1002,6 +1012,33 @@ mod tests {
         // direct path"). Confirm the helper does not error or panic.
         let dir = tempfile::tempdir().unwrap();
         assert!(ghost_snapshot_for(dir.path()).is_none());
+    }
+
+    #[test]
+    fn apply_patch_relative_success_reports_resolved_cwd() {
+        // Relative patch paths resolve against the workspace cwd, which can
+        // differ from the process cwd in a worktree/remote session. The success
+        // message must surface the resolved base so files silently landing in
+        // the wrong checkout become visible.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Patch applied successfully"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains(root.to_string_lossy().as_ref()),
+            "resolved cwd missing from: {result}"
+        );
+        assert!(
+            root.join("created.txt").exists(),
+            "relative path should have been written under the workspace cwd"
+        );
     }
 
     #[test]
