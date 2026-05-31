@@ -24,6 +24,11 @@ Treat the task as a sequence of concrete steps:
 - Execute step by step, verifying along the way.
 - Avoid blocking on uncertainty: choose a reasonable default and continue.
 
+## Editing discipline
+- Default to ASCII when editing or creating files; introduce non-ASCII only when the content clearly calls for it.
+- Never revert or undo changes you did not make unless the user explicitly asks.
+- Never run destructive git commands (`git reset --hard`, `git checkout -- <path>`, force-push) unless the user explicitly requests them.
+
 ## Reporting progress
 - Provide updates that map to the work (what changed, what was verified, what remains).
 - If something fails, report what failed, what you tried, and what you will do next.
