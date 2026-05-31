@@ -117,6 +117,21 @@ pub async fn handle_run_shell_with_context(
     skill_env_allowlist: Option<&std::collections::HashSet<String>>,
     ctx: &ExecutionContext,
 ) -> Result<String> {
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("run");
+
+    // Session-control actions drive an already-running persistent session via
+    // the process-global registry. They carry no command and add no approval
+    // prompt — the command was policy-checked when the session was started.
+    match action {
+        "run" | "start" => {}
+        "write_stdin" | "poll" | "kill" => return handle_session_action(action, args).await,
+        other => {
+            return Ok(format!(
+                "Unknown run_shell action '{other}'. Valid: run, start, write_stdin, poll, kill."
+            ))
+        }
+    }
+
     let command = args["command"].as_str().context("Missing 'command'")?;
     let timeout_ms = args
         .get("timeout_ms")
@@ -138,9 +153,11 @@ pub async fn handle_run_shell_with_context(
     // verified patch path. The shell binary `apply_patch` doesn't exist on
     // `$PATH`, so running it raw fails; we also lose blocked-path
     // enforcement, vitals classification, and ghost-commit undo.
-    if let Some(patch_text) = coding::maybe_extract_apply_patch_from_shell(command) {
-        let patch_args = serde_json::json!({ "patch": patch_text });
-        return crate::tool_handlers::filesystem::handle_apply_patch(&patch_args, config);
+    if action == "run" {
+        if let Some(patch_text) = coding::maybe_extract_apply_patch_from_shell(command) {
+            let patch_args = serde_json::json!({ "patch": patch_text });
+            return crate::tool_handlers::filesystem::handle_apply_patch(&patch_args, config);
+        }
     }
 
     match policy.check(command) {
@@ -184,6 +201,19 @@ pub async fn handle_run_shell_with_context(
     let (shell, shell_flag) = ("/bin/sh", "-c");
     #[cfg(windows)]
     let (shell, shell_flag) = ("cmd.exe", "/C");
+
+    if action == "start" {
+        return start_session(
+            ctx,
+            config,
+            &filtered_creds,
+            command,
+            workdir.as_deref(),
+            shell,
+            shell_flag,
+        )
+        .await;
+    }
 
     if want_tty {
         if ctx.enforce_workspace_root() {
@@ -276,6 +306,107 @@ pub async fn handle_run_shell_with_context(
                 Err(e)
             }
         }
+    }
+}
+
+/// Message returned when a persistent-session action is requested but no
+/// session registry is installed (CLI/REPL/test — no running daemon).
+fn no_session_registry_msg() -> String {
+    "Persistent shell sessions require the borg daemon. Use action=run (the default) \
+     to execute a single self-contained command instead."
+        .to_string()
+}
+
+/// Launch a persistent interactive session: spawn the shell with piped
+/// stdin/stdout/stderr, register it with the subprocess registry (for
+/// `borg status` visibility + auto-reap) and the session registry, and return
+/// the `session_id` the model drives with write_stdin/poll/kill.
+#[allow(clippy::too_many_arguments)]
+async fn start_session(
+    ctx: &ExecutionContext,
+    config: &Config,
+    filtered_creds: &std::collections::HashMap<String, String>,
+    command: &str,
+    workdir: Option<&std::path::Path>,
+    shell: &str,
+    shell_flag: &str,
+) -> Result<String> {
+    let Some(sessions) = crate::shell_session::global() else {
+        return Ok(no_session_registry_msg());
+    };
+
+    let cwd_path = workdir.unwrap_or(ctx.workspace_cwd()).to_path_buf();
+    let (program, full_args) =
+        wrap_run_shell_for_sandbox(ctx, config, shell, shell_flag, command, &cwd_path);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&full_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.current_dir(&cwd_path);
+    crate::security::env_allowlist::apply_filtered_env(&mut cmd, filtered_creds);
+
+    let child = cmd
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to spawn shell session")?;
+
+    // Mirror the one-shot path: register the PID so the session is visible to
+    // `borg status` / `/doctor` and reachable by the self-healing sweep. The
+    // guard is moved into the session and finalized on `kill`.
+    let guard = ctx.process_registry().and_then(|reg| {
+        child.id().map(|pid| {
+            reg.register(
+                pid,
+                crate::process_registry::ProcessKind::RunShell,
+                command,
+                ctx.session_id().map(str::to_string),
+            )
+        })
+    });
+
+    let id = sessions.register(child, guard);
+    Ok(format!(
+        "Started shell session {id}. Drive it with run_shell: action=write_stdin \
+         (session_id={id}, stdin=…) to send input, action=poll (session_id={id}) to read new \
+         output, action=kill (session_id={id}) to stop."
+    ))
+}
+
+/// Handle the session-control actions (`write_stdin` / `poll` / `kill`) against
+/// the process-global session registry. Returns an explanatory message (as a
+/// normal tool result, not an error) when the session is unknown or no
+/// registry is installed, so the agent loop treats it as recoverable.
+async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result<String> {
+    let Some(sessions) = crate::shell_session::global() else {
+        return Ok(no_session_registry_msg());
+    };
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .context("Missing 'session_id' for a session action")?;
+
+    match action {
+        "write_stdin" => {
+            let stdin = args.get("stdin").and_then(|v| v.as_str()).unwrap_or("");
+            match sessions.write_stdin(session_id, stdin).await {
+                Ok(()) => Ok(format!(
+                    "Wrote {} bytes to session {session_id}. Use action=poll to read output.",
+                    stdin.len()
+                )),
+                Err(e) => Ok(e.to_string()),
+            }
+        }
+        "poll" => match sessions.poll(session_id) {
+            Ok(out) if out.is_empty() => Ok(format!("[no new output from session {session_id}]")),
+            Ok(out) => Ok(out),
+            Err(e) => Ok(e.to_string()),
+        },
+        "kill" => match sessions.kill(session_id).await {
+            Ok(()) => Ok(format!("Killed session {session_id}.")),
+            Err(e) => Ok(e.to_string()),
+        },
+        _ => unreachable!("handle_session_action only dispatched for session verbs"),
     }
 }
 
@@ -718,6 +849,62 @@ mod tests {
         assert!(
             result.contains("PATH="),
             "PATH must survive the filter for shells to be usable: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitting_action_runs_one_shot_as_before() {
+        // Backward-compat fence: with no `action`, the handler must run the
+        // command to completion and return the one-shot shape — exactly the
+        // pre-session behavior.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "printf 'ok\\n'" });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("one-shot run");
+        assert!(result.contains("Exit code: 0"), "got: {result}");
+        assert!(result.contains("--- stdout ---"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn session_actions_without_daemon_report_requirement() {
+        // No session registry is installed in the test binary (no daemon), so
+        // every persistent-session verb must degrade to an explanatory message
+        // — never panic, never silently no-op.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        for args in [
+            serde_json::json!({ "action": "start", "command": "cat" }),
+            serde_json::json!({ "action": "poll", "session_id": "sh-1" }),
+            serde_json::json!({ "action": "write_stdin", "session_id": "sh-1", "stdin": "x" }),
+            serde_json::json!({ "action": "kill", "session_id": "sh-1" }),
+        ] {
+            let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+                .await
+                .expect("session action returns Ok with a message");
+            assert!(
+                result.contains("require the borg daemon"),
+                "expected daemon-required message for {args}, got: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_action_is_reported_not_executed() {
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "action": "frobnicate", "command": "echo hi" });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("unknown action returns Ok with a message");
+        assert!(
+            result.contains("Unknown run_shell action"),
+            "got: {result}"
         );
     }
 }

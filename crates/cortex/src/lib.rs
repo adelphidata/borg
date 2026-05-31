@@ -152,6 +152,8 @@ pub mod scripts;
 pub mod security;
 /// Session management and persistence.
 pub mod session;
+/// Persistent interactive shell sessions for `run_shell` (start/write/poll/kill).
+pub mod shell_session;
 /// Session transcript indexing for searchable conversations.
 pub mod session_indexer;
 /// Shared per-turn payload types crossing the gateway ↔ daemon boundary.

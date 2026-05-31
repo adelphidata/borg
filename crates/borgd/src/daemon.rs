@@ -152,6 +152,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     // find it without threading parameters through the dispatcher.
     let process_registry = cortex::process_registry::ProcessRegistry::new();
     cortex::process_registry::install_global(process_registry.clone());
+    // Process-global registry for persistent interactive shell sessions
+    // (`run_shell` action=start/write_stdin/poll/kill). Sessions outlive any
+    // single tool call's ExecutionContext, so the handler reaches them through
+    // this global; uninstalled outside the daemon, where sessions degrade to a
+    // "requires daemon" message.
+    cortex::shell_session::install_global(cortex::shell_session::ShellSessionRegistry::new());
     // Single goal-event bus shared by the orchestrator's session executor,
     // the SessionFactory used for `Session.Open` connections, and the Admin
     // RPC layer — so every mutation path (agent loop, four goal RPCs, the
