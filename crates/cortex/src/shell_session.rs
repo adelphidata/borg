@@ -166,7 +166,7 @@ impl ShellSessionRegistry {
             .get_mut(id)
             .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
         let (new, new_len) = {
-            let buf = session.output.lock().unwrap_or_else(|p| p.into_inner());
+            let buf = session.output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (buf[session.polled_offset..].to_string(), buf.len())
         };
         session.polled_offset = new_len;
@@ -237,7 +237,7 @@ fn spawn_drain(
 
 fn append(output: &Arc<Mutex<String>>, bytes: &[u8]) {
     let chunk = String::from_utf8_lossy(bytes);
-    let mut buf = output.lock().unwrap_or_else(|p| p.into_inner());
+    let mut buf = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     buf.push_str(&chunk);
 }
 
