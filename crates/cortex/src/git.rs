@@ -13,6 +13,137 @@ use tracing::instrument;
 /// Timeout for git subprocess calls.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Disable a repository's filesystem monitor: `core.fsmonitor` can name a
+/// program git spawns on index/status operations, so an untrusted tree must
+/// not get to pick it while we snapshot.
+const FSMONITOR_OVERRIDE: &str = "core.fsmonitor=false";
+/// Route hooks (including `post-index-change`, which fires on `add`/`read-tree`)
+/// to a null path so a repository can't execute its own hook scripts.
+#[cfg(windows)]
+const HOOKS_OVERRIDE: &str = "core.hooksPath=NUL";
+#[cfg(not(windows))]
+const HOOKS_OVERRIDE: &str = "core.hooksPath=/dev/null";
+
+/// Matches the config keys for executable content filter drivers. A repository
+/// that configures `filter.<name>.clean`/`.smudge`/`.process` can run arbitrary
+/// commands during `git add` / worktree checkout; we discover and neutralize
+/// them rather than letting them fire.
+pub(crate) const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|smudge|process)$";
+
+/// Config `-c` overrides prepended to every git invocation so a repository's
+/// own configuration can't execute code while we operate inside its tree.
+pub(crate) fn hardened_prelude() -> [&'static str; 4] {
+    ["-c", FSMONITOR_OVERRIDE, "-c", HOOKS_OVERRIDE]
+}
+
+/// Parse `git config --null --name-only --get-regexp` output (NUL-separated
+/// keys) into the set of filter driver prefixes, e.g. `filter.lfs.clean` →
+/// `filter.lfs`.
+pub(crate) fn parse_filter_drivers(stdout: &str) -> Vec<String> {
+    let mut drivers: Vec<String> = stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .filter_map(|key| {
+            key.strip_suffix(".clean")
+                .or_else(|| key.strip_suffix(".smudge"))
+                .or_else(|| key.strip_suffix(".process"))
+        })
+        .map(str::to_string)
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    drivers
+}
+
+/// For each discovered filter driver, build config overrides that blank its
+/// executable entries and drop the `required` flag (so blanking can't turn a
+/// required filter into a hard error).
+pub(crate) fn build_filter_override_env(drivers: &[String]) -> Vec<(String, String)> {
+    drivers
+        .iter()
+        .flat_map(|d| {
+            [
+                (format!("{d}.clean"), String::new()),
+                (format!("{d}.smudge"), String::new()),
+                (format!("{d}.process"), String::new()),
+                (format!("{d}.required"), "false".to_string()),
+            ]
+        })
+        .collect()
+}
+
+/// Encode config key/value overrides as the `GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<i>` / `GIT_CONFIG_VALUE_<i>` environment form, which git
+/// applies with higher precedence than repository config.
+pub(crate) fn git_config_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
+    if overrides.is_empty() {
+        return Vec::new();
+    }
+    let mut env = Vec::with_capacity(overrides.len() * 2 + 1);
+    env.push(("GIT_CONFIG_COUNT".to_string(), overrides.len().to_string()));
+    for (i, (k, v)) in overrides.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.clone()));
+    }
+    env
+}
+
+/// Discover the repository's configured executable filter drivers and return
+/// the `GIT_CONFIG_*` env entries that neutralize them. Best-effort: discovery
+/// failures log and yield no overrides (the hardening prelude still applies).
+async fn filter_neutralizing_env(cwd: &Path) -> Vec<(String, String)> {
+    let result = tokio::time::timeout(
+        GIT_COMMAND_TIMEOUT,
+        tokio::process::Command::new("git")
+            .args(filter_discovery_argv())
+            .current_dir(cwd)
+            .output(),
+    )
+    .await;
+    let stdout = match result {
+        // `--get-regexp` exits 1 when nothing matches — that's the common case.
+        Ok(Ok(o)) if o.status.success() || o.status.code() == Some(1) => o.stdout,
+        Ok(Ok(o)) => {
+            tracing::warn!(
+                "git filter-driver discovery failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Vec::new();
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("git filter-driver discovery failed to spawn: {e}");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!("git filter-driver discovery timed out");
+            return Vec::new();
+        }
+    };
+    neutralizing_env_from_stdout(&String::from_utf8_lossy(&stdout))
+}
+
+/// Argv (hardening prelude included) that lists a repository's configured
+/// executable filter drivers. Shared by the async and sync neutralization
+/// paths so the discovery command lives in exactly one place.
+pub(crate) fn filter_discovery_argv() -> Vec<&'static str> {
+    let mut argv: Vec<&str> = hardened_prelude().to_vec();
+    argv.extend([
+        "config",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        EXECUTABLE_FILTER_CONFIG_PATTERN,
+    ]);
+    argv
+}
+
+/// Map `git config --get-regexp` discovery stdout to the `GIT_CONFIG_*` env
+/// entries that neutralize every discovered filter driver. Shared by the async
+/// and sync paths so the parse/encode chain isn't duplicated.
+pub(crate) fn neutralizing_env_from_stdout(stdout: &str) -> Vec<(String, String)> {
+    git_config_env(&build_filter_override_env(&parse_filter_drivers(stdout)))
+}
+
 /// Directories excluded from ghost snapshots (build artifacts, deps, caches).
 const IGNORED_DIR_NAMES: &[&str] = &[
     "node_modules",
@@ -70,18 +201,31 @@ pub fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Run a git command with timeout, returns stdout on success.
-#[instrument(skip_all, fields(git.args = ?args))]
 async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
-    let output = tokio::time::timeout(
-        GIT_COMMAND_TIMEOUT,
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output(),
-    )
-    .await
-    .context("git command timed out")?
-    .context("failed to execute git")?;
+    run_git_inner(args, cwd, &[]).await
+}
+
+/// Shared git runner. Always prepends [`hardened_prelude`] so a repository's
+/// own `core.fsmonitor`/hooks can't execute while we work in its tree, and
+/// applies any `extra_env` (e.g. `GIT_INDEX_FILE`, filter-neutralizing
+/// `GIT_CONFIG_*` entries).
+#[instrument(name = "run_git", skip_all, fields(git.args = ?args))]
+async fn run_git_inner(
+    args: &[&str],
+    cwd: &Path,
+    extra_env: &[(String, String)],
+) -> Result<String> {
+    let mut argv: Vec<&str> = hardened_prelude().to_vec();
+    argv.extend_from_slice(args);
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(&argv).current_dir(cwd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = tokio::time::timeout(GIT_COMMAND_TIMEOUT, cmd.output())
+        .await
+        .context("git command timed out")?
+        .context("failed to execute git")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -158,13 +302,17 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         .map(PathBuf::from)
         .collect();
 
+    // `add`/`read-tree` would otherwise run repo-configured content filters
+    // (`filter.<name>.clean`/`.process`) against an untrusted tree.
+    let filter_env = filter_neutralizing_env(repo_root).await;
+
     if has_head {
-        run_git_with_index(&tmp_path, &["read-tree", "HEAD"], repo_root).await?;
+        run_git_with_index(&tmp_path, &["read-tree", "HEAD"], repo_root, &filter_env).await?;
     }
 
-    run_git_with_index(&tmp_path, &["add", "--all"], repo_root).await?;
+    run_git_with_index(&tmp_path, &["add", "--all"], repo_root, &filter_env).await?;
 
-    let tree_id = run_git_with_index(&tmp_path, &["write-tree"], repo_root).await?;
+    let tree_id = run_git_with_index(&tmp_path, &["write-tree"], repo_root, &filter_env).await?;
 
     let parent_id = if has_head {
         Some(run_git(&["rev-parse", "HEAD"], repo_root).await?)
@@ -190,8 +338,10 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
 /// Restore working tree to match a ghost commit.
 #[instrument(skip_all)]
 pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Result<()> {
-    // Restore all tracked files from the ghost commit
-    run_git(
+    // Restore all tracked files from the ghost commit. Worktree checkout runs
+    // `filter.<name>.smudge`/`.process` drivers, so neutralize them too.
+    let filter_env = filter_neutralizing_env(repo_root).await;
+    run_git_inner(
         &[
             "restore",
             "--source",
@@ -201,6 +351,7 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
             ".",
         ],
         repo_root,
+        &filter_env,
     )
     .await?;
 
@@ -252,31 +403,18 @@ pub fn format_git_context(ctx: &GitContext) -> String {
     out
 }
 
-/// Run a git command with a custom GIT_INDEX_FILE environment variable.
-#[instrument(skip_all, fields(git.args = ?args))]
-async fn run_git_with_index(index_path: &str, args: &[&str], cwd: &Path) -> Result<String> {
-    let output = tokio::time::timeout(
-        GIT_COMMAND_TIMEOUT,
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_INDEX_FILE", index_path)
-            .output(),
-    )
-    .await
-    .context("git command timed out")?
-    .context("failed to execute git")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "git {} (custom index) failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Run a git command against a custom `GIT_INDEX_FILE`, optionally with
+/// filter-neutralizing config so an untrusted tree's content filters can't run
+/// during index mutation.
+async fn run_git_with_index(
+    index_path: &str,
+    args: &[&str],
+    cwd: &Path,
+    filter_env: &[(String, String)],
+) -> Result<String> {
+    let mut env = vec![("GIT_INDEX_FILE".to_string(), index_path.to_string())];
+    env.extend_from_slice(filter_env);
+    run_git_inner(args, cwd, &env).await
 }
 
 #[cfg(test)]
@@ -510,6 +648,173 @@ mod tests {
         assert!(
             recorded.iter().any(|s| s == "run_git"),
             "expected 'run_git' span, got: {recorded:?}"
+        );
+    }
+
+    // --- Repo-configured code-execution hardening ---------------------------
+
+    #[test]
+    fn hardened_prelude_disables_fsmonitor_and_hooks() {
+        // These exact flags are the security invariant: fsmonitor and hooks are
+        // the two repo-config code-execution vectors on the plumbing we run.
+        let prelude = hardened_prelude();
+        assert_eq!(prelude[0], "-c");
+        assert_eq!(prelude[1], "core.fsmonitor=false");
+        assert_eq!(prelude[2], "-c");
+        assert!(
+            prelude[3].starts_with("core.hooksPath="),
+            "hooks must be routed to a null path, got {:?}",
+            prelude[3]
+        );
+        // Null target must not point back at a usable directory.
+        assert!(prelude[3] == "core.hooksPath=/dev/null" || prelude[3] == "core.hooksPath=NUL");
+    }
+
+    #[test]
+    fn parse_filter_drivers_extracts_unique_prefixes() {
+        let stdout = "filter.lfs.clean\0filter.lfs.process\0filter.evil.smudge\0other.key\0";
+        let drivers = parse_filter_drivers(stdout);
+        assert_eq!(
+            drivers,
+            vec!["filter.evil".to_string(), "filter.lfs".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_filter_drivers_empty_input() {
+        assert!(parse_filter_drivers("").is_empty());
+        assert!(parse_filter_drivers("\0\0").is_empty());
+    }
+
+    #[test]
+    fn build_filter_override_env_blanks_executable_entries() {
+        let env = build_filter_override_env(&["filter.evil".to_string()]);
+        // clean/smudge/process blanked, required forced off.
+        assert!(env.contains(&("filter.evil.clean".to_string(), String::new())));
+        assert!(env.contains(&("filter.evil.smudge".to_string(), String::new())));
+        assert!(env.contains(&("filter.evil.process".to_string(), String::new())));
+        assert!(env.contains(&("filter.evil.required".to_string(), "false".to_string())));
+    }
+
+    #[test]
+    fn git_config_env_encodes_count_and_pairs() {
+        let overrides = vec![
+            ("filter.x.clean".to_string(), String::new()),
+            ("filter.x.required".to_string(), "false".to_string()),
+        ];
+        let env = git_config_env(&overrides);
+        assert_eq!(env[0], ("GIT_CONFIG_COUNT".to_string(), "2".to_string()));
+        assert_eq!(
+            env[1],
+            ("GIT_CONFIG_KEY_0".to_string(), "filter.x.clean".to_string())
+        );
+        assert_eq!(env[2], ("GIT_CONFIG_VALUE_0".to_string(), String::new()));
+        assert_eq!(
+            env[3],
+            (
+                "GIT_CONFIG_KEY_1".to_string(),
+                "filter.x.required".to_string()
+            )
+        );
+        assert_eq!(
+            env[4],
+            ("GIT_CONFIG_VALUE_1".to_string(), "false".to_string())
+        );
+    }
+
+    #[test]
+    fn git_config_env_empty_is_empty() {
+        assert!(git_config_env(&[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn init_repo_with_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                // Isolate from the developer's global/system git config so the
+                // fixture is deterministic.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("spawn git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@borg.test"]);
+        run(&["config", "user.name", "borg-test"]);
+        std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-qm", "init"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_ghost_commit_neutralizes_repo_clean_filter() {
+        // A malicious repo configures a content filter that runs a command when
+        // `git add` stages a matching file. The ghost-snapshot path must not let
+        // that command execute.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+
+        let sentinel = dir.join("PWNED");
+        let clean_cmd = format!("sh -c 'touch \"{}\"; cat'", sentinel.display());
+        let ok = std::process::Command::new("git")
+            .args(["config", "filter.evil.clean", &clean_cmd])
+            .current_dir(dir)
+            .status()
+            .expect("spawn git")
+            .success();
+        assert!(ok, "configuring filter failed");
+        std::fs::write(dir.join(".gitattributes"), "a.txt filter=evil\n").unwrap();
+        // Dirty the tracked file so `add --all` re-stages it (runs the filter).
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+        let result = create_ghost_commit(dir).await;
+        assert!(result.is_ok(), "snapshot should still succeed: {result:?}");
+        assert!(
+            !sentinel.exists(),
+            "repo-configured clean filter must not execute during ghost snapshot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_ghost_commit_ignores_repo_hooks_path() {
+        // A repo points core.hooksPath at a dir whose post-index-change hook
+        // writes a sentinel. read-tree/add must not run it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+
+        let hooks_dir = dir.join("evil-hooks");
+        std::fs::create_dir(&hooks_dir).unwrap();
+        let sentinel = dir.join("HOOK_RAN");
+        let hook = hooks_dir.join("post-index-change");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["config", "core.hooksPath", &hooks_dir.to_string_lossy()])
+            .current_dir(dir)
+            .status()
+            .expect("spawn git")
+            .success();
+        assert!(ok, "configuring hooksPath failed");
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+        let result = create_ghost_commit(dir).await;
+        assert!(result.is_ok(), "snapshot should still succeed: {result:?}");
+        assert!(
+            !sentinel.exists(),
+            "repo-configured hook must not execute during ghost snapshot"
         );
     }
 }

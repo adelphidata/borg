@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +35,10 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::process_registry::ProcessGuard;
+
+/// Grace period between SIGTERM and SIGKILL when terminating a session, giving
+/// the process tree a chance to run its own cleanup before the hard kill.
+const KILL_GRACE: Duration = Duration::from_millis(300);
 
 /// Process-global session registry. The daemon installs one at startup so the
 /// `run_shell` handler can reach it across turns without threading a handle
@@ -57,6 +62,10 @@ struct Session {
     /// The child handle, kept for `kill`. `kill_on_drop` is set at spawn so a
     /// dropped session also terminates the process.
     child: Child,
+    /// The child's PID, captured at registration. On Unix the child leads its
+    /// own process group (PGID == PID), so `kill` signals the whole group.
+    /// `None` if the child had already exited before we could read it.
+    pid: Option<u32>,
     /// Child stdin, behind an async mutex so `write_stdin` can `.await` the
     /// write without holding the registry's std mutex across an await point.
     /// `None` once stdin has been taken/closed.
@@ -106,7 +115,14 @@ impl ShellSessionRegistry {
     /// output. Takes ownership of the child's stdio pipes. Returns the
     /// generated session id (`sh-<n>`). The caller is responsible for having
     /// spawned `child` with piped stdin/stdout/stderr and `kill_on_drop(true)`.
+    ///
+    /// On Unix the caller MUST also spawn with `process_group(0)` so the child
+    /// leads its own group (PGID == PID): [`Self::kill`] signals the whole group
+    /// via `killpg`, which is only safe — and only reaches descendants — when
+    /// that holds. Without it, `kill` would signal an unrelated group, so it
+    /// instead falls back to signaling just the direct child.
     pub fn register(&self, mut child: Child, guard: Option<ProcessGuard>) -> String {
+        let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
@@ -127,6 +143,7 @@ impl ShellSessionRegistry {
             id.clone(),
             Session {
                 child,
+                pid,
                 stdin: Arc::new(AsyncMutex::new(stdin)),
                 output,
                 polled_offset: 0,
@@ -183,8 +200,9 @@ impl ShellSessionRegistry {
         Ok(new)
     }
 
-    /// Terminate a session: abort its drain task, kill the child, and finalize
-    /// the subprocess-registry guard. Errors if the session is unknown.
+    /// Terminate a session: abort its drain task, kill the child's whole
+    /// process group, reap it, and finalize the subprocess-registry guard.
+    /// Errors if the session is unknown.
     pub async fn kill(&self, id: &str) -> Result<()> {
         let session = {
             let mut inner = self.lock();
@@ -192,12 +210,59 @@ impl ShellSessionRegistry {
         };
         let mut session = session.ok_or_else(|| anyhow!("no such shell session: {id}"))?;
         session.drain.abort();
-        // Best-effort: the child may already have exited.
-        let _ = session.child.start_kill();
+        terminate_child(&mut session.child, session.pid).await;
         if let Some(g) = session.guard.take() {
             g.killed();
         }
         Ok(())
+    }
+}
+
+/// Terminate a session child and reap it so no zombie or descendant leaks.
+///
+/// On Unix the child leads its own process group (set via `process_group(0)`
+/// at spawn), so we signal the entire group: SIGTERM, a short grace period for
+/// the tree to clean up, then SIGKILL if anything is still alive. Without the
+/// group signal, a bare child kill would orphan whatever the shell spawned.
+/// This is best-effort against cooperative descendants: a child that calls
+/// `setsid()`/`setpgid()` to leave the group escapes the signal.
+async fn terminate_child(child: &mut Child, pid: Option<u32>) {
+    #[cfg(not(unix))]
+    let _ = pid;
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let pgid = pid as i32;
+        signal_group(pgid, libc::SIGTERM);
+        if tokio::time::timeout(KILL_GRACE, child.wait())
+            .await
+            .is_err()
+        {
+            // Still running after the grace period — hard-kill the group, and
+            // also SIGKILL the direct child by PID. The direct kill is the
+            // backstop if the child wasn't a group leader (then the group
+            // signal was a no-op): it guarantees the `wait` below can't block
+            // forever even when the `process_group(0)` contract was not met.
+            signal_group(pgid, libc::SIGKILL);
+            let _ = child.start_kill();
+        }
+        // Reap the direct child regardless of which signal ended it.
+        let _ = child.wait().await;
+        return;
+    }
+    // Non-Unix, or PID unavailable: best-effort direct kill + reap.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Send `sig` to every process in `pgid`. Best-effort: `ESRCH` (group already
+/// gone) and other failures are ignored — the caller's `wait` reaps the child.
+#[cfg(unix)]
+fn signal_group(pgid: i32, sig: i32) {
+    // SAFETY: FFI call to `killpg`. `pgid` is our own child's process group
+    // (the child leads its group via `process_group(0)` at spawn), so we never
+    // signal an unrelated group. A non-zero return (e.g. ESRCH) is ignored.
+    unsafe {
+        libc::killpg(pgid, sig);
     }
 }
 
@@ -261,12 +326,15 @@ mod tests {
     use tokio::process::Command;
 
     /// Spawn `cat` (echoes stdin to stdout line-by-line) as a session.
+    /// Mirrors the production spawn contract documented on [`register`]:
+    /// `process_group(0)` so `kill`'s group signal reaches the child.
     fn spawn_cat(reg: &ShellSessionRegistry) -> String {
         let child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
+            .process_group(0)
             .spawn()
             .expect("spawn cat");
         reg.register(child, None)
@@ -370,6 +438,56 @@ mod tests {
         assert!(reg.poll("sh-404").is_err());
         assert!(reg.write_stdin("sh-404", "x").await.is_err());
         assert!(reg.kill("sh-404").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_terminates_descendant_process_group() {
+        // A session whose command backgrounds a long-lived grandchild. Killing
+        // the session must take down the whole process group, not just the
+        // direct child — otherwise the `sleep` leaks.
+        let reg = ShellSessionRegistry::new();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & echo $!; wait")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0) // mirror the production spawn: child leads its group
+            .spawn()
+            .expect("spawn sh");
+        let id = reg.register(child, None);
+
+        // The shell echoes the backgrounded grandchild's PID.
+        let out = poll_until(&reg, &id, "\n").await;
+        let gpid: i32 = out
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("expected a grandchild pid, got {out:?}"));
+        // SAFETY: signal 0 only probes for existence; no signal is delivered.
+        assert_eq!(
+            unsafe { libc::kill(gpid, 0) },
+            0,
+            "descendant should be alive before kill"
+        );
+
+        reg.kill(&id).await.expect("kill");
+
+        // The descendant must be reaped shortly after the session is killed.
+        let mut dead = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "descendant pid {gpid} survived session kill — process group leaked"
+        );
     }
 
     #[cfg(unix)]

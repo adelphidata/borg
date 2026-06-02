@@ -353,6 +353,11 @@ async fn start_session(
         .stderr(std::process::Stdio::piped());
     cmd.current_dir(&cwd_path);
     crate::security::env_allowlist::apply_filtered_env(&mut cmd, filtered_creds);
+    // Lead a new process group so `kill` can signal the whole tree (the shell
+    // plus anything it spawned), not just the direct child — otherwise an
+    // interrupted session can leak descendants and their sandbox bookkeeping.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let child = cmd
         .kill_on_drop(true)
@@ -455,11 +460,21 @@ fn wrap_run_shell_for_sandbox(
         // is permitted; strict boundary enforcement is filesystem-scoped.
         network: true,
         fs_read: vec![workspace_root_str.clone()],
-        fs_write: vec![workspace_root_str],
+        fs_write: vec![workspace_root_str.clone()],
         deny_read: Vec::new(),
         deny_write: Vec::new(),
         allowed_domains: Vec::new(),
     }
+    // Enforce configured blocked_paths as sandbox deny rules so a shell command
+    // can't read e.g. `~/.env` or `<workspace>/credentials` — the allow-list
+    // scoping alone permits broad reads, and the hardcoded sensitive-home denies
+    // don't cover operator-configured entries. NOTE: deny-read here is enforced
+    // by Seatbelt (macOS) / the Windows backend; bwrap (Linux) currently honors
+    // only deny_write, so the read side is unenforced on Linux today.
+    .with_blocked_paths_denied(
+        &config.security.blocked_paths,
+        std::slice::from_ref(&workspace_root_str),
+    )
     .configured(&config.security.blocked_paths);
     let wrapped = policy.wrap_command(shell, &bare_args, cwd);
     (wrapped.program, wrapped.args)

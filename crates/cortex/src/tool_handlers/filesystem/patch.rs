@@ -172,14 +172,18 @@ fn ghost_snapshot_for(cwd: &std::path::Path) -> Option<DiskGhostSnapshot> {
 }
 
 fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSnapshot> {
-    let has_head = run_git_sync(repo_root, &["rev-parse", "HEAD"], None).is_ok();
+    let has_head = run_git_sync(repo_root, &["rev-parse", "HEAD"], &[]).is_ok();
     let tmp_index = tempfile::NamedTempFile::new()?;
     let tmp_path = tmp_index.path().to_string_lossy().to_string();
-    let env_index = Some(("GIT_INDEX_FILE", tmp_path.as_str()));
+    // Index env plus filter-neutralizing config: `add`/`read-tree` would
+    // otherwise run repo-configured `filter.<name>.clean`/`.process` drivers
+    // against an untrusted tree.
+    let mut index_env = vec![("GIT_INDEX_FILE".to_string(), tmp_path)];
+    index_env.extend(filter_neutralizing_env_sync(repo_root));
     let untracked = run_git_sync(
         repo_root,
         &["ls-files", "--others", "--exclude-standard"],
-        None,
+        &[],
     )
     .unwrap_or_default();
     let preexisting_untracked: Vec<std::path::PathBuf> = untracked
@@ -188,19 +192,19 @@ fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSna
         .map(std::path::PathBuf::from)
         .collect();
     if has_head {
-        run_git_sync(repo_root, &["read-tree", "HEAD"], env_index)?;
+        run_git_sync(repo_root, &["read-tree", "HEAD"], &index_env)?;
     }
-    run_git_sync(repo_root, &["add", "--all"], env_index)?;
-    let tree_id = run_git_sync(repo_root, &["write-tree"], env_index)?;
+    run_git_sync(repo_root, &["add", "--all"], &index_env)?;
+    let tree_id = run_git_sync(repo_root, &["write-tree"], &index_env)?;
     let mut commit_args: Vec<&str> =
         vec!["commit-tree", &tree_id, "-m", "borg disk-apply-patch ghost"];
     let head_parent;
     if has_head {
-        head_parent = run_git_sync(repo_root, &["rev-parse", "HEAD"], None)?;
+        head_parent = run_git_sync(repo_root, &["rev-parse", "HEAD"], &[])?;
         commit_args.push("-p");
         commit_args.push(head_parent.as_str());
     }
-    let commit_id = run_git_sync(repo_root, &commit_args, None)?;
+    let commit_id = run_git_sync(repo_root, &commit_args, &[])?;
     Ok(DiskGhostSnapshot {
         repo_root: repo_root.to_path_buf(),
         commit_id,
@@ -209,6 +213,8 @@ fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSna
 }
 
 fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
+    // Worktree checkout runs `filter.<name>.smudge`/`.process` drivers.
+    let filter_env = filter_neutralizing_env_sync(&snapshot.repo_root);
     run_git_sync(
         &snapshot.repo_root,
         &[
@@ -219,12 +225,12 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
             "--",
             ".",
         ],
-        None,
+        &filter_env,
     )?;
     let current = run_git_sync(
         &snapshot.repo_root,
         &["ls-files", "--others", "--exclude-standard"],
-        None,
+        &[],
     )
     .unwrap_or_default();
     for line in current.lines() {
@@ -249,10 +255,41 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: Option<(&str, &str)>) -> Result<String> {
+/// Discover repo-configured executable content filters and return the
+/// `GIT_CONFIG_*` env that neutralizes them. Best-effort: discovery failures
+/// yield no overrides (the hardening prelude still applies).
+fn filter_neutralizing_env_sync(repo_root: &std::path::Path) -> Vec<(String, String)> {
+    let output = std::process::Command::new("git")
+        .args(crate::git::filter_discovery_argv())
+        .current_dir(repo_root)
+        .output();
+    match output {
+        // `--get-regexp` exits 1 when nothing matches — the common case.
+        Ok(o) if o.status.success() || o.status.code() == Some(1) => {
+            crate::git::neutralizing_env_from_stdout(&String::from_utf8_lossy(&o.stdout))
+        }
+        Ok(o) => {
+            tracing::warn!(
+                "git filter-driver discovery failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!("git filter-driver discovery failed to spawn: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: &[(String, String)]) -> Result<String> {
+    // Prepend the hardening prelude so a repository's own `core.fsmonitor`/hooks
+    // can't execute while we operate inside its tree.
+    let mut argv: Vec<&str> = crate::git::hardened_prelude().to_vec();
+    argv.extend_from_slice(args);
     let mut cmd = std::process::Command::new("git");
-    cmd.args(args).current_dir(cwd);
-    if let Some((k, v)) = env {
+    cmd.args(&argv).current_dir(cwd);
+    for (k, v) in env {
         cmd.env(k, v);
     }
     let output = cmd

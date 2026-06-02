@@ -435,6 +435,28 @@ mod tests {
     }
 
     #[test]
+    fn configured_blocked_path_becomes_deny_rule() {
+        // `.env` is NOT one of the hardcoded SENSITIVE_HOME_PATHS, so without
+        // routing blocked_paths through with_blocked_paths_denied it would be
+        // readable inside a workspace. The profile must deny it once wired.
+        let policy = SandboxPolicy {
+            fs_read: vec!["/ws".to_string()],
+            fs_write: vec!["/ws".to_string()],
+            ..Default::default()
+        }
+        .with_blocked_paths_denied(&[".env".to_string()], &["/ws".to_string()]);
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
+        assert!(
+            profile.contains("(deny file-read* (subpath \"/ws/.env\"))"),
+            "configured blocked path must deny reads:\n{profile}"
+        );
+        assert!(
+            profile.contains("(deny file-write* (subpath \"/ws/.env\"))"),
+            "configured blocked path must deny writes:\n{profile}"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_deny_read_path() {
         let policy = SandboxPolicy {
             deny_read: vec!["/foo\"))\n(allow default)".to_string()],

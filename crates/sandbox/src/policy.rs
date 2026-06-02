@@ -135,6 +135,45 @@ impl SandboxPolicy {
         self
     }
 
+    /// Resolve component-style `blocked_paths` (e.g. `.env`, `credentials`) into
+    /// concrete deny subpaths anchored at the **top level** of `$HOME` and each
+    /// of `roots`, adding them to both `deny_read` and `deny_write`.
+    ///
+    /// This is intentionally narrower than the tool-level matcher: `is_path_blocked`
+    /// blocks an entry as a path *component at any depth*, which an OS sandbox
+    /// `(deny … (subpath …))` rule can't express. We anchor each entry one level
+    /// under home and the workspace root (`~/.env`, `<workspace>/.env`, …), which
+    /// covers the common locations as defense in depth on top of the allow-list
+    /// scoping — it does NOT cover nested copies like `<workspace>/src/.env`.
+    ///
+    /// Enforcement is also platform-dependent: Seatbelt (macOS) and the Windows
+    /// backend emit deny-read rules, but bwrap (Linux) currently enforces only
+    /// `deny_write` (see `bubblewrap.rs`), so the read side is unenforced there.
+    pub fn with_blocked_paths_denied(mut self, blocked_paths: &[String], roots: &[String]) -> Self {
+        let mut anchors: Vec<String> = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            anchors.push(home.to_string_lossy().into_owned());
+        }
+        anchors.extend(roots.iter().cloned());
+
+        for entry in blocked_paths {
+            let entry = entry.trim_matches('/');
+            if entry.is_empty() {
+                continue;
+            }
+            for anchor in &anchors {
+                let full = format!("{}/{entry}", anchor.trim_end_matches('/'));
+                if !self.deny_read.contains(&full) {
+                    self.deny_read.push(full.clone());
+                }
+                if !self.deny_write.contains(&full) {
+                    self.deny_write.push(full);
+                }
+            }
+        }
+        self
+    }
+
     /// Expand `~` to the user's home directory in all paths, consuming self.
     pub fn with_tildes_expanded(mut self) -> Self {
         self.fs_read = expand_tilde_paths(&self.fs_read);
@@ -521,6 +560,70 @@ mod tests {
         assert_eq!(applied.fs_write, vec!["/tmp/out".to_string()]);
         assert_eq!(applied.deny_read, vec!["/secret".to_string()]);
         assert_eq!(applied.deny_write, vec!["/protected".to_string()]);
+    }
+
+    #[test]
+    fn blocked_paths_denied_anchors_under_roots() {
+        let policy = SandboxPolicy {
+            fs_read: vec!["/ws".into()],
+            fs_write: vec!["/ws".into()],
+            ..Default::default()
+        }
+        .with_blocked_paths_denied(
+            &[".env".to_string(), "credentials".to_string()],
+            &["/ws".to_string()],
+        );
+
+        // Workspace-root anchoring is deterministic regardless of $HOME.
+        for expected in ["/ws/.env", "/ws/credentials"] {
+            assert!(
+                policy.deny_read.contains(&expected.to_string()),
+                "deny_read missing {expected}: {:?}",
+                policy.deny_read
+            );
+            assert!(
+                policy.deny_write.contains(&expected.to_string()),
+                "deny_write missing {expected}: {:?}",
+                policy.deny_write
+            );
+        }
+        // Home anchoring applies when a home dir is resolvable.
+        if let Some(home) = dirs::home_dir() {
+            let home_env = format!("{}/.env", home.to_string_lossy());
+            assert!(
+                policy.deny_read.contains(&home_env),
+                "deny_read missing home-anchored {home_env}: {:?}",
+                policy.deny_read
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_paths_denied_skips_empty_and_dedups() {
+        let policy = SandboxPolicy::default().with_blocked_paths_denied(
+            &[
+                "".to_string(),
+                "/".to_string(),
+                ".env".to_string(),
+                ".env".to_string(),
+            ],
+            &["/ws".to_string(), "/ws/".to_string()],
+        );
+        let count = policy
+            .deny_read
+            .iter()
+            .filter(|p| p.as_str() == "/ws/.env")
+            .count();
+        assert_eq!(
+            count, 1,
+            "duplicate anchors must collapse: {:?}",
+            policy.deny_read
+        );
+        assert!(
+            !policy.deny_read.iter().any(|p| p.ends_with("/")),
+            "empty/root blocked entries must be skipped: {:?}",
+            policy.deny_read
+        );
     }
 
     #[test]
