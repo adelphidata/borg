@@ -22,13 +22,11 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
 /// header so collectors can stitch the HTTP call to the agent span. Inert when
 /// telemetry is disabled or there is no recording span (no header is added).
 fn with_trace_context(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    // `HeaderMap::new()` doesn't allocate and merging an empty map is a no-op,
+    // so this stays cheap when telemetry is off (no traceparent injected).
     let mut headers = reqwest::header::HeaderMap::new();
     crate::telemetry::propagation::inject_current_context(&mut headers);
-    if headers.is_empty() {
-        req
-    } else {
-        req.headers(headers)
-    }
+    req.headers(headers)
 }
 
 /// A single search result from any provider.

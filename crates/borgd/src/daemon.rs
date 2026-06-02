@@ -77,6 +77,9 @@ pub struct Config {
     pub borg_home: PathBuf,
     /// Optional loopback TCP listen address (e.g. `127.0.0.1:8009`).
     pub listen_tcp: Option<String>,
+    /// Config loaded once in `main` (for telemetry init) and threaded here to
+    /// avoid a second DB open + decrypt at the start of `run`.
+    pub core_config: CoreConfig,
 }
 
 /// Bind a Unix Domain Socket at `path` with owner-only (mode 0600) permissions.
@@ -125,13 +128,16 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     tracing::info!(socket = %socket_path.display(), "borgd listening on UDS");
 
-    let initial_core_config = CoreConfig::load_from_db().await.unwrap_or_default();
+    // Loaded once in `main` and threaded through `cfg` — no second DB decrypt.
+    let initial_core_config = cfg.core_config.clone();
     let config_watcher =
         ConfigWatcher::start(initial_core_config.clone()).context("start config watcher")?;
     // Real instruments when `telemetry.metrics_enabled` (bound to the global
     // meter provider installed in `main`); a true noop otherwise.
     let metrics = BorgMetrics::from_config(&initial_core_config);
-    metrics.record_lifecycle_start("borgd");
+    // RAII: records the `borgd` lifecycle start now and the shutdown on drop
+    // (when `run` returns), keeping the start/shutdown counters balanced.
+    let _lifecycle = cortex::telemetry::LifecycleGuard::new(metrics.clone(), "borgd");
     let cost_event_bus = CostEventBus::new(&initial_core_config, metrics.clone());
     let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(cost_event_bus.clone());
     {
@@ -638,7 +644,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             .context("UDS server")?;
     }
 
-    metrics.record_lifecycle_shutdown("borgd");
+    // `_lifecycle` drop records the shutdown counter as this scope unwinds.
     tracing::info!("borgd shutdown complete");
     Ok(())
 }

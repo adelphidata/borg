@@ -28,8 +28,6 @@ use std::io::IsTerminal;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 // Action enums and their dispatch live in `commands/<name>.rs`; the `Cli`
@@ -539,19 +537,11 @@ async fn async_main() -> Result<()> {
                 .with_target(false)
                 .with_ansi(false)
                 .with_writer(non_blocking);
-            tracing_subscriber::registry()
-                .with(otel_layers)
-                .with(env_filter)
-                .with(fmt_layer)
-                .init();
+            cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
         } else {
             _guard = None;
             let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
-            tracing_subscriber::registry()
-                .with(otel_layers)
-                .with(env_filter)
-                .with(fmt_layer)
-                .init();
+            cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
         }
     }
 

@@ -283,7 +283,9 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     }
 
     let metrics = BorgMetrics::from_config(&config);
-    metrics.record_lifecycle_start("tui");
+    // RAII: records the `tui` lifecycle start now and the shutdown when this
+    // session scope ends (incl. error/early-exit), so starts/shutdowns balance.
+    let _lifecycle = cortex::telemetry::LifecycleGuard::new(metrics.clone(), "tui");
 
     // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,
     // activity, bond, evolution, budget, script), and config watcher all live

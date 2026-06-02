@@ -89,6 +89,47 @@ impl Drop for TelemetryGuard {
 /// Type alias for a boxed tracing layer compatible with Registry.
 pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
 
+/// Install the global `tracing` subscriber from the OTel layers, an env
+/// filter, and a fmt layer. Centralizes the registry composition so each
+/// binary (`borg`, `borgd`) does not hand-roll it. The `EnvFilter` is a global
+/// filter, so it gates the OTel exporters and the fmt sink alike regardless of
+/// layer order. All inputs are boxed `Layer<Registry>`, so they attach
+/// directly to the registry as siblings.
+pub fn install_subscriber(
+    mut layers: Vec<BoxedLayer>,
+    env_filter: tracing_subscriber::EnvFilter,
+    fmt_layer: BoxedLayer,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    layers.push(Box::new(env_filter));
+    layers.push(fmt_layer);
+    tracing_subscriber::registry().with(layers).init();
+}
+
+/// RAII guard that records a harness boot on construction and a graceful
+/// shutdown on drop, so the `borg.lifecycle.{starts,shutdowns}` counters stay
+/// balanced without each harness having to remember a paired shutdown call.
+/// Hold it for the lifetime of the harness (`borgd` daemon, TUI session).
+pub struct LifecycleGuard {
+    metrics: BorgMetrics,
+    harness: &'static str,
+}
+
+impl LifecycleGuard {
+    /// Record a `start` for `harness` now; the matching `shutdown` fires on drop.
+    pub fn new(metrics: BorgMetrics, harness: &'static str) -> Self {
+        metrics.record_lifecycle_start(harness);
+        Self { metrics, harness }
+    }
+}
+
+impl Drop for LifecycleGuard {
+    fn drop(&mut self) {
+        self.metrics.record_lifecycle_shutdown(self.harness);
+    }
+}
+
 /// Initializes the OpenTelemetry export pipeline from `config`.
 ///
 /// Returns the `tracing` layers that must be added to the subscriber (a span
@@ -755,6 +796,29 @@ mod tests {
             attr_value(&start_attrs, "harness").as_deref(),
             Some("borgd")
         );
+    }
+
+    #[test]
+    fn lifecycle_guard_records_start_then_shutdown_on_drop() {
+        // Spec: the RAII guard emits a start on construction and a matching
+        // shutdown on drop, so a harness that holds it cannot leave the
+        // counters imbalanced. Before drop: 1 start, 0 shutdowns; after: 1/1.
+        let (provider, meter, exporter) = test_metrics();
+        let m = BorgMetrics::from_meter(&meter);
+
+        let guard = LifecycleGuard::new(m.clone(), "tui");
+        let mid = collect(&provider, &exporter);
+        assert_eq!(u64_sum_for(&mid, names::LIFECYCLE_STARTS), 1);
+        assert!(
+            !has_metric(&mid, names::LIFECYCLE_SHUTDOWNS),
+            "shutdown must not fire before the guard drops"
+        );
+
+        drop(guard);
+        let after = collect(&provider, &exporter);
+        assert_eq!(u64_sum_for(&after, names::LIFECYCLE_SHUTDOWNS), 1);
+        let attrs = sole_sum_attrs(&after, names::LIFECYCLE_SHUTDOWNS);
+        assert_eq!(attr_value(&attrs, "harness").as_deref(), Some("tui"));
     }
 
     #[test]

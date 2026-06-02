@@ -41,17 +41,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    use tracing_subscriber::prelude::*;
-
     let args = Args::parse();
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     // Point config/DB resolution at the resolved home so telemetry settings
     // load from the same database the daemon will use.
     std::env::set_var("BORG_HOME", &home);
 
-    // Initialize the OpenTelemetry export pipeline before installing the
-    // subscriber. Off by default; `telemetry.{tracing,metrics,logs}_enabled`
-    // opt in. The guard must outlive the daemon so exporters flush on exit.
+    // Load config once here (for telemetry init) and thread it into the daemon
+    // so it isn't re-decrypted from the DB a second time. Off by default;
+    // `telemetry.{tracing,metrics,logs}_enabled` opt in. The guard must outlive
+    // the daemon so exporters flush on exit.
     let core_config = cortex::config::Config::load_from_db()
         .await
         .unwrap_or_default();
@@ -62,11 +61,11 @@ async fn main() -> Result<()> {
         });
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
-        .with(otel_layers)
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    cortex::telemetry::install_subscriber(
+        otel_layers,
+        env_filter,
+        Box::new(tracing_subscriber::fmt::layer()),
+    );
 
     if args.insecure_tcp {
         tracing::warn!(
@@ -86,6 +85,7 @@ async fn main() -> Result<()> {
     daemon::run(daemon::Config {
         borg_home: home,
         listen_tcp: args.listen,
+        core_config,
     })
     .await
 }
