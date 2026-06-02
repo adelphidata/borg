@@ -30,8 +30,37 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
+use super::conpty::{install_pseudoconsole, OwnedPseudoConsole};
 use super::desktop::{create_isolated as create_isolated_desktop, OwnedDesktop};
 use super::mitigation::{default_mitigation_flags, install_default_mitigations, AttributeList};
+
+/// How the spawned child's standard streams are wired.
+///
+/// `Copy` so it can be inspected (`matches!`) and consumed in the same
+/// function without an explicit clone — every variant is either a
+/// fieldless marker or holds only `Copy` handle/reference values.
+#[derive(Clone, Copy)]
+pub enum SpawnStdio<'a> {
+    /// Inherit the trampoline's own std handles. Tier 1 non-interactive
+    /// path — output flows straight to the operator's terminal/pipe.
+    Inherit,
+    /// Use caller-supplied handles (the Tier 2 runner's anonymous-pipe
+    /// ends). The handles MUST already be marked inheritable by the
+    /// caller, since the child inherits them via `bInheritHandles=TRUE`.
+    Handles {
+        /// Child's stdin source.
+        stdin: HANDLE,
+        /// Child's stdout sink.
+        stdout: HANDLE,
+        /// Child's stderr sink.
+        stderr: HANDLE,
+    },
+    /// Drive stdio through a pseudo-console (interactive / ConPTY). The
+    /// child's stdio is the PTY, so `STARTF_USESTDHANDLES` is omitted and
+    /// `bInheritHandles` is `FALSE` — the pseudo-console attribute is the
+    /// only stdio wiring.
+    Pty(&'a OwnedPseudoConsole),
+}
 
 /// Owning handle to a spawned process + its main thread + the
 /// containing job object. Dropping closes all three handles. With
@@ -60,6 +89,14 @@ impl SpawnedChild {
     /// Process ID of the spawned child.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Borrowed process HANDLE. Used by the Tier 2 runner's control
+    /// thread to `TerminateProcess` on a `Terminate` frame. The handle
+    /// remains owned by this `SpawnedChild`; the caller must not close
+    /// it and must not use it after this `SpawnedChild` drops.
+    pub fn process_handle(&self) -> HANDLE {
+        self.process
     }
 
     /// Block until the child exits and return its exit code.
@@ -167,9 +204,13 @@ fn push_quoted(out: &mut String, arg: &str) {
     out.push('"');
 }
 
-/// Spawn `program + args` under `token`, inheriting the trampoline's
-/// stdio. Caller passes `cwd` (working directory; null = inherit) and
+/// Spawn `program + args` under `token` with the requested `stdio`
+/// wiring. Caller passes `cwd` (working directory; null = inherit) and
 /// optionally a UTF-16 environment block (null = inherit parent env).
+///
+/// `stdio` selects the stdio path: inherit the trampoline's handles
+/// (Tier 1 non-interactive), use caller-supplied pipe handles (the
+/// Tier 2 runner), or drive a pseudo-console (interactive / ConPTY).
 ///
 /// # Safety
 ///
@@ -177,13 +218,16 @@ fn push_quoted(out: &mut String, arg: &str) {
 /// for the duration of this call. The function calls
 /// `CreateProcessAsUserW`, which dereferences the handle to set up the
 /// child process's primary token; an invalid or already-closed handle
-/// is undefined behavior at the kernel boundary.
+/// is undefined behavior at the kernel boundary. For
+/// [`SpawnStdio::Handles`] / [`SpawnStdio::Pty`], the supplied handles /
+/// pseudo-console must outlive this call.
 pub unsafe fn spawn_with_token(
     token: HANDLE,
     program: &str,
     args: &[String],
     cwd: Option<&std::path::Path>,
     env_block: Option<&[u16]>,
+    stdio: SpawnStdio<'_>,
 ) -> io::Result<SpawnedChild> {
     let mut cmdline = build_command_line(program, args);
     let cwd_w: Option<Vec<u16>> = cwd.map(|p| {
@@ -193,29 +237,29 @@ pub unsafe fn spawn_with_token(
             .collect()
     });
 
-    // SAFETY: STD_*_HANDLE are documented constants; GetStdHandle
-    // returns the trampoline's inherited handles which we want the
-    // child to share.
-    let (stdin_h, stdout_h, stderr_h) = unsafe {
-        (
-            GetStdHandle(STD_INPUT_HANDLE),
-            GetStdHandle(STD_OUTPUT_HANDLE),
-            GetStdHandle(STD_ERROR_HANDLE),
-        )
-    };
-
-    // Build the extended startup info, with a one-entry attribute list
-    // carrying the mitigation policy. The attribute list and the
+    // Build the extended startup info. The attribute list carries the
+    // mitigation policy always, plus the pseudo-console attribute on the
+    // PTY path (hence two slots there). The attribute list and the
     // flags_storage `u64` MUST stay on this stack frame until
     // CreateProcessAsUserW returns — UpdateProcThreadAttribute stores
     // pointers into them, not copies.
-    let mut attr_list = AttributeList::new(1)?;
+    let attr_count = if matches!(stdio, SpawnStdio::Pty(_)) {
+        2
+    } else {
+        1
+    };
+    let mut attr_list = AttributeList::new(attr_count)?;
     let mitigation_flags: u64 = default_mitigation_flags();
     // SAFETY: mitigation_flags lives on this stack frame until after
     // the CreateProcessAsUserW call below; attr_list outlives it for
     // the same reason. install_default_mitigations stashes the
     // pointer into the kernel-managed attribute list.
     unsafe { install_default_mitigations(&mut attr_list, &mitigation_flags) }?;
+    if let SpawnStdio::Pty(pty) = stdio {
+        // SAFETY: pty outlives this call (borrowed for the function);
+        // the HPCON it installs is consumed by CreateProcessAsUserW.
+        unsafe { install_pseudoconsole(&mut attr_list, pty) }?;
+    }
 
     // Isolated desktop. Holds its UTF-16 name buffer alive for the
     // duration of CreateProcessAsUserW (kernel reads STARTUPINFO
@@ -224,12 +268,50 @@ pub unsafe fn spawn_with_token(
 
     let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    siex.StartupInfo.hStdInput = stdin_h;
-    siex.StartupInfo.hStdOutput = stdout_h;
-    siex.StartupInfo.hStdError = stderr_h;
     siex.StartupInfo.lpDesktop = desktop.lp_desktop();
     siex.lpAttributeList = attr_list.as_ptr();
+
+    // Wire stdio per the requested mode. The PTY path deliberately omits
+    // STARTF_USESTDHANDLES: the pseudo-console attribute is the child's
+    // stdio, and inheriting handles on top would confuse the console
+    // host. Inherit/Handles set explicit std handles and require
+    // bInheritHandles=TRUE so the child receives them.
+    let inherit_handles = match stdio {
+        SpawnStdio::Inherit => {
+            // SAFETY: STD_*_HANDLE are documented constants; GetStdHandle
+            // returns the trampoline's handles which we want the child
+            // to share.
+            let (stdin_h, stdout_h, stderr_h) = unsafe {
+                (
+                    GetStdHandle(STD_INPUT_HANDLE),
+                    GetStdHandle(STD_OUTPUT_HANDLE),
+                    GetStdHandle(STD_ERROR_HANDLE),
+                )
+            };
+            siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            siex.StartupInfo.hStdInput = stdin_h;
+            siex.StartupInfo.hStdOutput = stdout_h;
+            siex.StartupInfo.hStdError = stderr_h;
+            TRUE
+        }
+        SpawnStdio::Handles {
+            stdin,
+            stdout,
+            stderr,
+        } => {
+            siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            siex.StartupInfo.hStdInput = stdin;
+            siex.StartupInfo.hStdOutput = stdout;
+            siex.StartupInfo.hStdError = stderr;
+            TRUE
+        }
+        SpawnStdio::Pty(_) => {
+            // No STARTF_USESTDHANDLES; the pseudo-console attribute
+            // installed above is the child's stdio. Per Microsoft's
+            // ConPTY guidance, bInheritHandles is FALSE on this path.
+            FALSE
+        }
+    };
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -267,7 +349,7 @@ pub unsafe fn spawn_with_token(
             cmdline.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
-            TRUE,
+            inherit_handles,
             creation_flags,
             env_ptr,
             cwd_ptr,

@@ -386,6 +386,13 @@ fn main() -> Result<()> {
             let exit_code = run_windows_sandbox_trampoline(&argv[2..]);
             std::process::exit(exit_code as i32);
         }
+        // Tier 2 elevated runner: launched as the sandbox account via
+        // CreateProcessWithLogonW. Same pre-tokio/clap short-circuit so
+        // the runner never spins up the agent.
+        if argv.get(1).map(String::as_str) == Some(sandbox::windows::RUNNER_SUBCOMMAND) {
+            let exit_code = run_windows_sandbox_runner(&argv[2..]);
+            std::process::exit(exit_code as i32);
+        }
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -415,6 +422,28 @@ fn run_windows_sandbox_trampoline(argv_after_subcommand: &[String]) -> u32 {
         Ok(code) => code,
         Err(e) => {
             eprintln!("borg sandbox trampoline: {e}");
+            1
+        }
+    }
+}
+
+/// Body of the `__windows-sandbox-runner` subcommand (Tier 2). Parses
+/// `--pipe <name>`, connects back to the operator's named pipe, brokers
+/// the sandboxed child, and returns its exit code. Fails closed on any
+/// argv or pipe error.
+#[cfg(target_os = "windows")]
+fn run_windows_sandbox_runner(argv_after_subcommand: &[String]) -> u32 {
+    let pipe = match sandbox::windows::extract_runner_pipe_arg(argv_after_subcommand) {
+        Ok(p) => p.to_string(),
+        Err(e) => {
+            eprintln!("borg sandbox runner: {e}");
+            return 1;
+        }
+    };
+    match sandbox::windows::runtime::run_elevated_runner(&pipe) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("borg sandbox runner: {e}");
             1
         }
     }

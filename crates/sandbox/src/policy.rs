@@ -333,7 +333,11 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     use std::path::Path;
 
+    // Used by the linux + generic-fallback tests; unused on the windows
+    // cfg (which uses inline paths), so allow dead_code there rather than
+    // splintering the cfg further.
     #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
     const TEST_TOOL_DIR: &str = "/tmp/tool";
 
     #[cfg(target_os = "linux")]

@@ -22,19 +22,20 @@
 //!
 //! # SDDL
 //!
-//! The pipe's security descriptor grants `FILE_GENERIC_READ |
-//! FILE_GENERIC_WRITE` to the *creating user* only. A different-user
-//! local process cannot `CreateFileW` the pipe at all, even if it
-//! guesses the name. Combined with the nonce in the name, this gives
-//! caller authentication without needing a separate handshake.
+//! The pipe's security descriptor (built in
+//! [`super::runner_client::create_control_server`]) is a single-ACE DACL
+//! granting full access to the sandbox account SID only, so a
+//! different-principal local process cannot `CreateFileW` the pipe at
+//! all even if it guesses the name. Combined with the nonce in the name
+//! and the connecting-PID check, this authenticates the caller without a
+//! separate handshake.
 //!
 //! # Status
 //!
-//! This module ships the type definitions and name-generation helpers;
-//! the actual `CreateNamedPipeW` / `ConnectNamedPipe` / `WriteFile`
-//! plumbing is Tier 2 operational code (TODO — see ROADMAP "Tier 2
-//! elevated backend"). The types here are the contract subsequent
-//! work plugs into.
+//! This module ships the pipe name-generation helper; the
+//! `CreateNamedPipeW` / `ConnectNamedPipe` / framed-IO plumbing lives in
+//! [`super::runner_client`] (operator side) and [`super::runner_pipe`]
+//! (runner side).
 
 /// Per-spawn random nonce embedded in the pipe name. 96 bits of
 /// entropy from the rand RNG — collision-resistant against a
@@ -60,15 +61,6 @@ pub fn pipe_name(server_pid: u32) -> String {
     }
     format!(r"\\.\pipe\borg-sandbox-{server_pid}-{hex}")
 }
-
-/// SDDL for the named-pipe security descriptor. Grants generic
-/// read+write to the creating user (`OW` — owner) only; everyone else
-/// is implicitly denied.
-///
-/// `D:` = DACL section, `(A;;GA;;;OW)` = ALLOW the owner all generic
-/// rights (read + write + execute, which on a named pipe collapse to
-/// read+write). No other ACEs means no other principal has access.
-pub const PIPE_OWNER_ONLY_SDDL: &str = "D:(A;;GA;;;OW)";
 
 #[cfg(test)]
 mod tests {

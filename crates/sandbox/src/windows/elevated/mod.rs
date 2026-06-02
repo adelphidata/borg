@@ -27,21 +27,53 @@
 //! mirrors `security.kek_backend = auto` — no operator-visible
 //! breakage if the elevated setup is incomplete or rolled back.
 //!
-//! # Status — scaffolding only
+//! # Privilege model
 //!
-//! The code in this directory lays out the module structure,
-//! the on-disk `setup.json` schema, the named-pipe message protocol,
-//! and the auto-promote detection logic. The operational paths
-//! (`NetUserAdd` to create accounts, `LogonUserW` to obtain a sandbox-
-//! account primary token, `CreateProcessAsUserW` with that token) are
-//! marked TODO. `mode::detect()` *will* return `Tier::Tier2` whenever
-//! a valid `setup.json` is present — but until the operational FFI
-//! lands, the spawn path itself (via `wfp::install_offline_outbound_block`
-//! and the named-pipe runner client) returns `ErrorKind::Unsupported`
-//! and the trampoline falls back to Tier 1 anyway. The safe state is
-//! preserved by the spawn path, not by the detector.
+//! The runner is launched *as the sandbox account* via
+//! `CreateProcessWithLogonW` (in [`runner_client`]), which a non-admin
+//! operator can do with the account password (unsealed from DPAPI at
+//! spawn time). The runner — already running as the sandbox account —
+//! then spawns the wrapped command with the Tier 1 hardening stack
+//! (restricted token + cap-SID DACLs + job + mitigations) layered on
+//! top. This avoids needing `SeAssignPrimaryTokenPrivilege` /
+//! `SeIncreaseQuotaPrivilege`, which `CreateProcessAsUserW` would
+//! require of the operator and a non-admin operator lacks.
+//!
+//! # Fail-safe fallback
+//!
+//! `runtime::run_inner` falls back to Tier 1 only when a Tier 2 session
+//! fails *before* the child is launched ([`runner_client::SessionError`]
+//! distinguishes pre- from post-spawn). A post-spawn failure propagates
+//! rather than re-running the command, so a non-idempotent command is
+//! never double-executed.
+//!
+//! # Status — implemented; awaiting real-host validation
+//!
+//! All operational paths are implemented (account provisioning, WFP
+//! filters, the elevated runner + named-pipe IPC, ConPTY). What remains
+//! is hands-on enforcement validation on an admin Windows VM — see the
+//! "Windows sandbox — real-host validation pass" item in `docs/ROADMAP.md`.
 
 pub mod account;
+/// `borg service install --windows-sandbox` orchestration (accounts +
+/// sealed creds + WFP + setup.json). Cross-platform shell; Windows FFI.
+pub mod install;
+/// Framed message protocol for the operator ⇄ elevated-runner conversation.
+/// Cross-platform (pure data + framing); driven by the Windows-only
+/// `runner_pipe` / `runner_client` transports.
+pub mod ipc_runner;
 pub mod mode;
 pub mod named_pipe;
 pub mod setup;
+
+/// Operator-side client that launches the runner and streams the session.
+#[cfg(target_os = "windows")]
+pub mod runner_client;
+/// Runner-side named-pipe server + child broker.
+#[cfg(target_os = "windows")]
+pub mod runner_pipe;
+
+/// Sandbox-account provisioning. The strong-password generator is
+/// cross-platform (unit-tested everywhere); the `NetUserAdd` / LSA FFI
+/// that creates accounts is gated to Windows inside the module.
+pub mod provision;

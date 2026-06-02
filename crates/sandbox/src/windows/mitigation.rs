@@ -54,6 +54,11 @@ use windows_sys::Win32::System::Threading::{
 /// the attribute value. Mirroring the constants is one of those "the
 /// other option is depending on a future SDK revision" trade-offs;
 /// the SDK semantics are stable per Windows ABI guarantees.
+//
+// The literals mirror the SDK's documented DWORD64 bit positions (e.g.
+// `0x00000001_0000_0000` = the high-DWORD policy area); the deliberate
+// 8-4-4 grouping tracks that layout, so silence the equal-group lint.
+#[allow(clippy::unusual_byte_groupings)]
 mod flags {
     pub const DEP_ENABLE: u64 = 0x01;
     pub const DEP_ATL_THUNK_ENABLE: u64 = 0x02;

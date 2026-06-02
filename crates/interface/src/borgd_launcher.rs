@@ -676,6 +676,45 @@ pub fn uninstall_service() -> Result<()> {
     result
 }
 
+/// Provision the Tier 2 Windows sandbox (`--windows-sandbox`). Creates
+/// the sandbox accounts, seals their passwords, installs the WFP
+/// outbound block, and writes `setup.json`. Requires an elevated
+/// (Administrator) terminal.
+#[cfg(target_os = "windows")]
+pub fn install_windows_sandbox() -> Result<()> {
+    let installed_at = chrono::Local::now().to_rfc3339();
+    sandbox::windows::elevated::install::install_windows_sandbox(&installed_at)
+        .context("install Windows Tier 2 sandbox")?;
+    println!(
+        "Windows Tier 2 sandbox installed (BorgSandboxOnline / BorgSandboxOffline). \
+         The daemon auto-promotes to Tier 2 on next launch."
+    );
+    Ok(())
+}
+
+/// Non-Windows: `--windows-sandbox` is unsupported.
+#[cfg(not(target_os = "windows"))]
+pub fn install_windows_sandbox() -> Result<()> {
+    anyhow::bail!("--windows-sandbox is only supported on Windows")
+}
+
+/// Tear down the Tier 2 Windows sandbox (`--windows-sandbox` on
+/// uninstall). Removes WFP rules, the sandbox accounts, sealed
+/// credentials, and `setup.json`.
+#[cfg(target_os = "windows")]
+pub fn uninstall_windows_sandbox() -> Result<()> {
+    sandbox::windows::elevated::install::uninstall_windows_sandbox()
+        .context("uninstall Windows Tier 2 sandbox")?;
+    println!("Windows Tier 2 sandbox removed; the daemon falls back to Tier 1.");
+    Ok(())
+}
+
+/// Non-Windows: `--windows-sandbox` is unsupported.
+#[cfg(not(target_os = "windows"))]
+pub fn uninstall_windows_sandbox() -> Result<()> {
+    anyhow::bail!("--windows-sandbox is only supported on Windows")
+}
+
 /// Best-effort: kill any other `borg` / `borgd` processes (other than this
 /// PID). Used during uninstall to prevent a still-running daemon from
 /// recreating `~/.borg/` after we delete it.

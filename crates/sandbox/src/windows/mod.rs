@@ -39,11 +39,17 @@
 //! It does NOT defeat an *active* same-session same-integrity attacker
 //! who can `OpenProcess(PROCESS_DUP_HANDLE, ...)` on the parent borg
 //! process and `DuplicateHandle` the read-end. Default Windows ACLs
-//! allow that. The elevated-runner named-pipe transport closes
-//! that gap by authenticating the caller via the pipe's security
-//! descriptor — until then, treat same-session same-integrity isolation
-//! as a soft boundary that the OS sandbox layer (restricted token +
-//! DACL) is the real defense against.
+//! allow that. The Tier 2 elevated-runner named-pipe transport narrows
+//! that gap with two checks: the pipe's security descriptor gates *who*
+//! may open it (a single-ACE DACL granting only the sandbox account —
+//! see `runner_client::create_control_server`), and
+//! `GetNamedPipeClientProcessId` verifies *which* process connected (the
+//! runner the operator just launched). The pipe is single-instance, so a
+//! racing impostor either fails the SD check or the PID check and the
+//! session fails closed (Tier 1 fallback). On Tier 1 (no named pipe),
+//! treat same-session same-integrity isolation as a soft boundary that
+//! the OS sandbox layer (restricted token + DACL) is the real defense
+//! against.
 
 use crate::policy::{SandboxCommand, SandboxPolicy};
 
@@ -71,7 +77,9 @@ pub mod process;
 pub mod runtime;
 #[cfg(target_os = "windows")]
 pub mod token;
-#[cfg(target_os = "windows")]
+/// Windows Filtering Platform network blocking. The filter *specs* are
+/// cross-platform data (unit-tested on every runner); the `Fwpm*` FFI
+/// that installs them is gated to Windows inside the module.
 pub mod wfp;
 
 /// Hidden subcommand name dispatched by `crates/interface/src/main.rs`
@@ -85,6 +93,43 @@ pub const SPAWN_SUBCOMMAND: &str = "__windows-sandbox-spawn";
 /// pipe read-end. The trampoline reads its [`ipc::SpawnRequest`] off
 /// that handle.
 pub const REQUEST_PIPE_ARG: &str = "--request-pipe";
+
+/// Encode `s` as a null-terminated UTF-16 buffer for the `*W` Win32
+/// APIs. Shared by the elevated-backend modules so the null-terminator
+/// idiom lives in one place.
+#[cfg(target_os = "windows")]
+pub(crate) fn wide_nul(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Hidden subcommand for the Tier 2 elevated runner. The operator-side
+/// trampoline launches `borg.exe __windows-sandbox-runner --pipe <name>`
+/// *as the sandbox account* via `CreateProcessWithLogonW`; the runner
+/// connects back to the named pipe and brokers the sandboxed child.
+pub const RUNNER_SUBCOMMAND: &str = "__windows-sandbox-runner";
+
+/// Argument name carrying the runner's named-pipe path.
+pub const RUNNER_PIPE_ARG: &str = "--pipe";
+
+/// Extract the value following `--pipe` from the runner subcommand's
+/// argv (the slice *after* the `__windows-sandbox-runner` token).
+/// Platform-neutral so the argv-shape contract is testable everywhere;
+/// fails closed on any structural mismatch.
+pub fn extract_runner_pipe_arg(argv: &[String]) -> Result<&str, TrampolineError> {
+    let Some(first) = argv.first() else {
+        return Err(TrampolineError::MissingValue(RUNNER_PIPE_ARG));
+    };
+    if first != RUNNER_PIPE_ARG {
+        return Err(TrampolineError::UnknownArg(first.clone()));
+    }
+    argv.get(1)
+        .map(String::as_str)
+        .ok_or(TrampolineError::MissingValue(RUNNER_PIPE_ARG))
+}
 
 /// Build the trampoline command for a Windows sandboxed launch.
 ///
@@ -264,6 +309,50 @@ mod tests {
             Err(TrampolineError::MissingValue(s)) => assert_eq!(s, REQUEST_PIPE_ARG),
             other => panic!("expected MissingValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_runner_pipe_arg_finds_value() {
+        // Spec: the Tier 2 runner reads its pipe path from `--pipe N`.
+        // A drift in this contract would leave the runner unable to
+        // connect back to the operator.
+        let argv = vec![
+            RUNNER_PIPE_ARG.to_string(),
+            r"\\.\pipe\borg-sandbox-1-abcdef".to_string(),
+        ];
+        assert_eq!(
+            extract_runner_pipe_arg(&argv).unwrap(),
+            r"\\.\pipe\borg-sandbox-1-abcdef"
+        );
+    }
+
+    #[test]
+    fn extract_runner_pipe_arg_missing_value_errors() {
+        // Spec: `--pipe` with no value must fail closed, not connect to
+        // an empty/garbage pipe name.
+        let argv = vec![RUNNER_PIPE_ARG.to_string()];
+        match extract_runner_pipe_arg(&argv) {
+            Err(TrampolineError::MissingValue(s)) => assert_eq!(s, RUNNER_PIPE_ARG),
+            other => panic!("expected MissingValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_runner_pipe_arg_rejects_unknown_flag() {
+        // Spec: an unexpected leading flag fails closed rather than
+        // being silently ignored (same discipline as the spawn argv).
+        let argv = vec!["--evil".to_string(), "x".to_string()];
+        match extract_runner_pipe_arg(&argv) {
+            Err(TrampolineError::UnknownArg(s)) => assert_eq!(s, "--evil"),
+            other => panic!("expected UnknownArg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_and_runner_subcommands_are_distinct() {
+        // Spec: the main-binary dispatcher routes on these exact tokens;
+        // if they ever collided, one path would shadow the other.
+        assert_ne!(SPAWN_SUBCOMMAND, RUNNER_SUBCOMMAND);
     }
 
     #[test]

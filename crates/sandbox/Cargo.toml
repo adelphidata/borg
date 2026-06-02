@@ -20,9 +20,24 @@ which = { workspace = true }
 # actually run; macOS/Linux builds compile the same code paths through
 # the test suite.
 rand = { workspace = true }
+# Compact wire encoding for binary stdio payloads in the Tier 2 elevated-
+# runner IPC protocol (elevated::ipc_runner). Cross-platform — the
+# protocol module is unit-tested on every runner, not just Windows.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# The Windows FFI smoke test (`tests/windows_ffi_smoke.rs`) constructs a
+# real anonymous pipe directly to round-trip the runner protocol over
+# kernel I/O. Integration tests can't see regular [dependencies], so the
+# minimal feature slice is mirrored here.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
+] }
 
 # Tier 1 Windows sandbox runtime (restricted token + DACL ACEs +
 # CreateProcessAsUserW). Pulled in only when targeting Windows so the
@@ -46,6 +61,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
+    # Tier 2 elevated backend:
+    #   NetUserAdd / NetLocalGroupAddMembers (account provisioning)
+    "Win32_NetworkManagement_NetManagement",
+    #   LsaOpenPolicy / LsaAddAccountRights (logon-right grants),
+    #   CreateProcessWithLogonW (launch runner as the sandbox account)
+    "Win32_Security_Authentication_Identity",
+    #   FwpmEngineOpen0 takes a SEC_WINNT_AUTH_IDENTITY_W (Rpc module)
+    "Win32_System_Rpc",
 ] }
 
 [lints]

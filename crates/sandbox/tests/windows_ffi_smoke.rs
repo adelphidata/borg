@@ -30,14 +30,31 @@
 //!   the GH-actions sandbox doesn't necessarily allow.
 //! - **WFP filter installation.** Requires admin; GitHub-hosted
 //!   Windows runners run unelevated.
-//! - **Sandbox-account `LogonUserW`.** Requires the sandbox accounts
-//!   to exist (`borg service install --windows-sandbox` is the
-//!   prerequisite, and that subcommand doesn't ship yet).
+//! - **Sandbox-account provisioning + `CreateProcessWithLogonW`.**
+//!   `borg service install --windows-sandbox` needs admin (NetUserAdd /
+//!   LSA rights), which GH runners lack. Exercised in the documented
+//!   real-host validation pass (see ROADMAP).
+//! - **WFP enforcement.** Installing filters needs admin; the WFP
+//!   round-trip test below *skips* (loudly) when not elevated rather
+//!   than failing, so it runs on a real host but no-ops in CI.
 
 #![cfg(target_os = "windows")]
+// Integration-test files aren't wrapped in `#[cfg(test)]`, so clippy's
+// expect/unwrap restrictions (denied workspace-wide for production code)
+// fire here unlike in `#[cfg(test)]` unit modules. `expect`/`unwrap` and
+// literal-bool asserts are the normal idiom for smoke tests.
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::bool_assert_comparison
+)]
 
 use sandbox::policy::SandboxPolicy;
-use sandbox::windows::{conpty, desktop, dpapi, ipc, pipe};
+use sandbox::windows::elevated::ipc_runner::{self, Message, OutputStream};
+use sandbox::windows::mitigation::{
+    default_mitigation_flags, install_default_mitigations, AttributeList,
+};
+use sandbox::windows::{conpty, desktop, dpapi, ipc, pipe, wfp};
 use std::path::PathBuf;
 
 #[test]
@@ -155,4 +172,123 @@ fn end_to_end_trampoline_argv_shape_includes_pipe_handle() {
     assert_eq!(parsed.program, "python3");
     assert_eq!(parsed.args, args);
     assert_eq!(parsed.tool_dir, std::path::Path::new(r"C:\tools\test"));
+}
+
+#[test]
+fn pseudoconsole_attribute_installs_into_real_attribute_list() {
+    // Spec: the ConPTY spawn path adds PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+    // to a two-slot attribute list alongside the mitigation policy. This
+    // drives the real `InitializeProcThreadAttributeList` +
+    // `UpdateProcThreadAttribute` FFI without spawning a process — a
+    // wrong attribute id, size, or value type would surface here as an
+    // Err from UpdateProcThreadAttribute rather than a confusing
+    // CreateProcess failure at runtime.
+    let pty = conpty::OwnedPseudoConsole::new().expect("ConPTY create");
+    let mut list = AttributeList::new(2).expect("attribute list");
+    let flags = default_mitigation_flags();
+    // SAFETY: flags + list live across the calls; pty outlives the list.
+    unsafe {
+        install_default_mitigations(&mut list, &flags).expect("mitigation attribute");
+        conpty::install_pseudoconsole(&mut list, &pty).expect("pseudoconsole attribute");
+    }
+    // Reaching here means both attributes were accepted by the kernel.
+    drop(list);
+    drop(pty);
+}
+
+#[test]
+fn ipc_runner_frames_round_trip_through_a_real_anonymous_pipe() {
+    // Spec: the Tier 2 runner protocol must survive real ReadFile/
+    // WriteFile on a kernel pipe, not just in-memory Cursors. We reuse
+    // the Tier 1 `pipe::send` to obtain a genuine anonymous-pipe read
+    // handle, wrap it as a RawPipe, and round-trip an Output frame —
+    // exercising the base64 + length-prefix framing over real I/O.
+    use sandbox::windows::elevated::runner_pipe::RawPipe;
+    use std::io::Write;
+
+    // Create a real kernel anonymous pipe and frame an Output message
+    // through the runner's RawPipe Read/Write impls (ReadFile/WriteFile)
+    // end to end.
+    let (read_raw, write_raw) = make_anon_pipe();
+    let mut writer = RawPipe(write_raw);
+    let mut reader = RawPipe(read_raw);
+    let payload: Vec<u8> = (0..=255u8).collect();
+    ipc_runner::write_frame(
+        &mut writer,
+        &Message::Output {
+            stream: OutputStream::Stdout,
+            data: payload.clone(),
+        },
+    )
+    .expect("write_frame over real pipe");
+    writer.flush().ok();
+    // Close the write end so the reader sees a clean EOF after the frame
+    // (RawPipe is a non-owning Copy view; closing the OS handle is what
+    // matters).
+    close_handle(write_raw);
+    match ipc_runner::read_frame(&mut reader).expect("read_frame over real pipe") {
+        Message::Output { stream, data } => {
+            assert_eq!(stream, OutputStream::Stdout);
+            assert_eq!(data, payload, "binary payload corrupted over real pipe");
+        }
+        other => panic!("expected Output, got {other:?}"),
+    }
+    close_handle(read_raw);
+}
+
+#[test]
+fn wfp_install_uninstall_round_trips_when_elevated_else_skips() {
+    // Spec: on an elevated host the WFP provider/sublayer/filters install
+    // and uninstall cleanly for a real SID (LocalSystem here). On an
+    // unelevated host (GH runners) FwpmEngineOpen0 returns ACCESS_DENIED;
+    // we SKIP with a logged reason rather than fail — but any *other*
+    // error (a bad struct layout, wrong field, missing feature) still
+    // fails the test, so this never silently passes on an FFI bug.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    let sid = "S-1-5-18"; // LocalSystem — always a valid SID to bind to.
+    match wfp::install_offline_outbound_block(sid) {
+        Ok(()) => {
+            // Elevated path: must also uninstall cleanly, and a second
+            // uninstall must be idempotent (tolerates not-found).
+            wfp::uninstall_offline_outbound_block().expect("WFP uninstall");
+            wfp::uninstall_offline_outbound_block().expect("WFP uninstall is idempotent");
+        }
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            eprintln!("SKIP wfp round-trip: not elevated (ACCESS_DENIED from WFP engine)");
+        }
+        Err(e) => panic!("WFP install failed with a non-permission error (FFI bug?): {e}"),
+    }
+}
+
+/// Create an anonymous pipe and return `(read, write)` raw handles.
+fn make_anon_pipe() -> (
+    windows_sys::Win32::Foundation::HANDLE,
+    windows_sys::Win32::Foundation::HANDLE,
+) {
+    use std::ptr;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: 0,
+    };
+    let mut r = ptr::null_mut();
+    let mut w = ptr::null_mut();
+    let ok = unsafe { CreatePipe(&mut r, &mut w, &sa, 0) };
+    assert!(
+        ok != 0,
+        "CreatePipe failed: {}",
+        std::io::Error::last_os_error()
+    );
+    (r, w)
+}
+
+fn close_handle(h: windows_sys::Win32::Foundation::HANDLE) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    if !h.is_null() {
+        unsafe {
+            CloseHandle(h);
+        }
+    }
 }

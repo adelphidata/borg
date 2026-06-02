@@ -467,84 +467,75 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   `borg setup <section>`. Today onboarding is one linear flow.
 ### Security & sandboxing
 
-- **Windows sandbox — validate Tier 1 on a real host.** Tier 1+
-  (restricted token + DACL ACEs + `CreateProcessAsUserW`, plus
+- **Windows sandbox — real-host validation pass (code complete).**
+  Tier 1 (restricted token + DACL ACEs + `CreateProcessAsUserW`,
   anonymous-pipe `SpawnRequest` IPC, job-object
   `KILL_ON_JOB_CLOSE` containment, `ProcThreadAttributeList`
-  mitigation policies, per-spawn isolated desktop, HKDF-derived
-  stable per-workspace cap SIDs, and structured audit events) ports
-  cleanly to the Windows target and the `windows-sandbox` CI job
-  now runs the `windows_ffi_smoke` integration test (real
-  `CreatePipe` / `CreateDesktopW` / `CryptProtectData` /
-  `CreatePseudoConsole`) on every PR. The remaining gap is the
-  full end-to-end policy-enforcement check: spin up a Windows VM,
-  set `sandbox.enabled = true`, ask the agent to `run_shell`
-  something that reads `~\.ssh\fake_file` (assert `Access is
-  denied`) and that writes to the workspace (assert success). This
-  requires HKCU + admin context the GH-actions Windows runners
-  don't provide. Until that pass happens, treat the sandbox as
-  in-development and recommend operators run with
-  `sandbox.enabled = false` if they hit issues.
-- **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users +
-  DPAPI + caller-authenticating named-pipe IPC).** Scaffolding
-  shipped, operational FFI pending. What is in place:
-  - `crates/sandbox/src/windows/elevated/` — module structure,
-    `BorgSandboxOffline` / `BorgSandboxOnline` account names +
-    selection logic, `setup.json` schema with version detection,
-    Tier 1↔Tier 2 `mode::detect()` auto-promote, named-pipe naming +
-    owner-only SDDL constants.
-  - `crates/sandbox/src/windows/dpapi.rs` — full `CryptProtectData` /
-    `CryptUnprotectData` seal/unseal with `CRYPTPROTECT_LOCAL_MACHINE`.
-  - `crates/sandbox/src/windows/wfp.rs` — provider/sublayer GUIDs,
-    install/uninstall function signatures. Body returns
-    `io::ErrorKind::Unsupported`.
-  - Auto-fallback: with no `setup.json`, `mode::detect()` returns
-    `Tier1`. Tier 2 is strictly additive.
+  mitigation policies, per-spawn isolated desktop, cap SIDs, audit
+  events) AND Tier 2 (elevated runner + sandbox accounts + WFP +
+  ConPTY, below) are now fully implemented and cross-compile clean to
+  `x86_64-pc-windows-gnu`; the `windows-sandbox` CI lane runs the
+  `windows_ffi_smoke` integration tests (real `CreatePipe` /
+  `CreateDesktopW` / `CryptProtectData` / `CreatePseudoConsole` /
+  `UpdateProcThreadAttribute(PSEUDOCONSOLE)` / WFP round-trip when
+  elevated) on every PR. The **only** remaining gap is hands-on
+  enforcement validation on a real Windows VM with admin — it cannot
+  run on GH-actions runners (no admin, no usable HKCU, no
+  pre-provisioned accounts). Until that pass happens, treat the
+  sandbox as in-development and recommend operators run with
+  `sandbox.enabled = false` if they hit issues. Validation checklist:
+  - Tier 1: `sandbox.enabled = true`, no `setup.json`; `run_shell`
+    reading `~\.ssh\fake_file` returns `Access is denied`, writing to
+    the workspace succeeds; an interactive `run_shell` drives the
+    ConPTY path while a captured (piped) call uses inherited stdio
+    unchanged.
+  - Tier 2: `borg service install --windows-sandbox` (elevated)
+    creates `BorgSandboxOnline`/`BorgSandboxOffline`, seals their
+    DPAPI creds, installs the WFP filters, writes `setup.json`;
+    spawns route through the runner; under Offline `curl example.com`
+    fails (WFP), under Online it succeeds; deny-path read returns
+    `Access is denied`. `borg service uninstall --windows-sandbox`
+    removes accounts, filters, creds, and `setup.json`.
+  - Then strike the "in-development" caveat and recommend
+    `sandbox.enabled = true` as the default.
+  - Follow-up (defense-in-depth, non-blocking): zeroize the
+    sandbox-account password buffers (`provision::generate_account_password`
+    output, the unsealed `String` in `runner_client::load_account_password`,
+    and the wide buffer passed to `CreateProcessWithLogonW`) so the
+    plaintext doesn't linger on the heap after use.
 
-  What remains:
-  - `borg service install --windows-sandbox` clap subcommand (UAC
-    prompt, account creation, WFP install, setup.json write).
-  - `NetUserAdd` / `NetLocalGroupAddMembers` / privilege grants
-    (`SeBatchLogonRight`; `SeDenyInteractiveLogonRight` /
-    `SeDenyNetworkLogonRight`).
-  - Elevated runner binary (new `borgd-sandbox-runner` bin or
-    sub-bin of `borgd`): `LogonUserW(LOGON32_LOGON_BATCH)` →
-    `CreateProcessAsUserW` under the sandbox account, brokering
-    `SpawnRequest`s over the SDDL-authenticated named pipe.
-  - Operational body for
-    `wfp::install_offline_outbound_block` /
-    `wfp::uninstall_offline_outbound_block` —
-    `FwpmEngineOpen0` + transactional `FwpmProviderAdd0` /
-    `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2 (V4 + V6) with
-    `FWPM_CONDITION_ALE_USER_ID == offline_sid` + `BLOCK` action +
-    `PERSISTENT | BOOTTIME` flags.
-  - Trampoline routing: in `build_trampoline_command`, call
-    `elevated::mode::detect()` and dispatch to the runner over the
-    named pipe when `Tier2`; keep the current anonymous-pipe path
-    as the Tier 1 fallback.
-- **Windows sandbox — ConPTY wire-up.** Scaffolding shipped,
-  spawn integration pending.
-  `crates/sandbox/src/windows/conpty.rs` provides
-  `OwnedPseudoConsole` (RAII `CreatePseudoConsole` +
-  `ClosePseudoConsole`, with input/output pipe parent-side handles
-  exposed). What remains: replace `STARTF_USESTDHANDLES` in
-  `process::spawn_with_token` with the
-  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute, spawn a tokio
-  task that pumps bytes between the PTY's parent-side pipes and the
-  trampoline's stdin/stdout/stderr, and handle SIGWINCH-style resize
-  (`ResizePseudoConsole` on terminal-size change). Defer until a
-  Windows VM is available — the change touches every sandboxed-tool
-  invocation, and a regression here breaks `run_shell` on Windows.
-- **Windows sandbox — full real-host validation pass.** Once the
-  three preceding bullets land, the remaining work is a
-  documented hands-on validation on a real Windows VM with admin
-  rights: run `borg service install --windows-sandbox`, exercise
-  the trampoline end-to-end against both `BorgSandboxOnline` and
-  `BorgSandboxOffline`, assert WFP enforcement (`curl example.com`
-  fails under Offline, succeeds under Online), assert cap-SID DACL
-  enforcement (read of a deny-path returns `Access is denied`).
-  Then strike the "in-development" caveat from this section and
-  recommend `sandbox.enabled = true` as the default.
+  Implemented in this pass (all cross-compile-validated against the
+  `x86_64-pc-windows-gnu` target):
+  - `borg service {install,uninstall} --windows-sandbox` clap
+    subcommand → `borgd_launcher` → `elevated::install` (elevation
+    check, account provisioning, DPAPI-sealed creds, WFP install,
+    atomic `setup.json` write).
+  - `elevated::provision` — `NetUserAdd` / `NetLocalGroupAddMembers` /
+    LSA `SeBatchLogonRight` + deny interactive/network logon, SID
+    resolution, cross-platform strong-password generator.
+  - `elevated::runner_client` / `runner_pipe` — operator-side
+    `CreateProcessWithLogonW` launch of the runner *as the sandbox
+    account* (privilege-correct vs. the original
+    `LogonUserW`+`CreateProcessAsUserW` plan, which needs caller
+    privileges a non-admin operator lacks), SDDL-scoped named pipe,
+    `GetNamedPipeClientProcessId` caller authentication, and the
+    `ipc_runner` framed protocol (`SpawnRequest`/`Output`/`Stdin`/
+    `Resize`/`Exit`/…, base64 binary, 8 MiB cap).
+  - `wfp` — operational `FwpmEngineOpen0` + transactional
+    `FwpmProviderAdd0` / `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2
+    (V4+V6) with an `ALE_USER_ID` security-descriptor condition for
+    the offline SID, `PERSISTENT | BOOTTIME`, and delete-by-key
+    teardown; filter *specs* are cross-platform unit-tested.
+  - `runtime::run_inner` Tier1↔Tier2 routing via `mode::detect()`
+    with fail-safe fallback to the Tier 1 anonymous-pipe self-exec on
+    any Tier 2 error.
+  - ConPTY wired into `process::spawn_with_token` via a `SpawnStdio`
+    enum (`Inherit` / `Handles` / `Pty`): `Pty` adds the
+    `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute and drops
+    `STARTF_USESTDHANDLES`; `conpty::pump_parent_stdio` copies bytes
+    via std threads; `ResizePseudoConsole` exposed. The trampoline
+    uses ConPTY only when stdout is a real console, so non-interactive
+    tool calls keep the proven inherited-handle path.
 - **Docker / SSH sandbox backends.** `[O]` In addition to Seatbelt
   and bwrap, allow agent-issued shell to run inside a Docker container
   or over SSH to a remote VM. Makes Linux desktop installs (where

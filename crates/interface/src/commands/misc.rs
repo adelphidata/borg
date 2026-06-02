@@ -20,9 +20,21 @@ pub(crate) enum ServiceAction {
         /// failing — the agent always boots.
         #[clap(long)]
         secure: bool,
+        /// Windows only: provision the Tier 2 elevated sandbox (dedicated
+        /// `BorgSandboxOnline`/`BorgSandboxOffline` accounts + WFP
+        /// outbound block for the offline account). Must run from an
+        /// elevated (Administrator) terminal. On other platforms this
+        /// flag errors with a clear message.
+        #[clap(long)]
+        windows_sandbox: bool,
     },
     /// Uninstall the daemon service
-    Uninstall,
+    Uninstall {
+        /// Windows only: also remove the Tier 2 elevated sandbox
+        /// (accounts, WFP rules, sealed credentials, setup.json).
+        #[clap(long)]
+        windows_sandbox: bool,
+    },
     /// Show the daemon service status
     Status,
     /// Start the daemon service (via the installed unit, or direct spawn).
@@ -50,8 +62,21 @@ pub(crate) async fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Resul
 /// Dispatch for `borg service ...`.
 pub(crate) async fn dispatch_service(action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Install { secure } => crate::borgd_launcher::install_service(secure),
-        ServiceAction::Uninstall => crate::borgd_launcher::uninstall_service(),
+        ServiceAction::Install {
+            secure,
+            windows_sandbox,
+        } => {
+            if windows_sandbox {
+                crate::borgd_launcher::install_windows_sandbox()?;
+            }
+            crate::borgd_launcher::install_service(secure)
+        }
+        ServiceAction::Uninstall { windows_sandbox } => {
+            if windows_sandbox {
+                crate::borgd_launcher::uninstall_windows_sandbox()?;
+            }
+            crate::borgd_launcher::uninstall_service()
+        }
         ServiceAction::Status => crate::borgd_launcher::service_status().await,
         ServiceAction::Start => crate::borgd_launcher::start_service().await,
         ServiceAction::Stop => crate::borgd_launcher::stop_service().await,

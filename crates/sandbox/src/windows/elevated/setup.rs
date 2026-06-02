@@ -75,6 +75,31 @@ pub fn setup_path() -> Option<PathBuf> {
     )
 }
 
+/// Directory holding Tier 2 state (`setup.json` + sealed credentials).
+pub fn setup_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".borg").join("sandbox-windows"))
+}
+
+/// Resolved path of the DPAPI-sealed password blob for a sandbox
+/// account: `<home>/.borg/sandbox-windows/<account>.cred`.
+///
+/// The installer seals the generated password here; the runner client
+/// unseals it just before `CreateProcessWithLogonW`. The file is
+/// machine-scoped DPAPI ciphertext (see [`super::super::dpapi`]) — never
+/// the plaintext password.
+pub fn cred_path(account: &str) -> Option<PathBuf> {
+    Some(setup_dir()?.join(format!("{account}.cred")))
+}
+
+/// Domain-separation entropy for sealing a sandbox-account password.
+/// Binding the DPAPI blob to the account name means a blob copied to a
+/// different account's file cannot be unsealed in its place.
+pub fn cred_entropy(account: &str) -> Vec<u8> {
+    let mut e = b"borg-sandbox-cred:".to_vec();
+    e.extend_from_slice(account.as_bytes());
+    e
+}
+
 /// Read and validate `setup.json`. Returns `None` if the file is
 /// absent, malformed, version-incompatible, or otherwise unusable —
 /// the caller should fall back to Tier 1 in any of those cases.
