@@ -133,7 +133,6 @@ fn html_to_plain_text(html: &str) -> String {
         })
         .unwrap_or_else(|| document.root_element().text().collect::<Vec<_>>().join(" "));
 
-    // Collapse whitespace
     root.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

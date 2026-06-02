@@ -302,8 +302,6 @@ pub(crate) async fn test(args: IdArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------- helpers ----------
-
 fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 64 {
         bail!("server id must be 1..=64 chars");
@@ -483,8 +481,6 @@ fn truncate(s: &str, n: usize) -> String {
         out
     }
 }
-
-// ---------- presets ----------
 
 /// Catalog of operator-friendly MCP server presets. These are *templates* —
 /// adding one writes a row, it does NOT auto-install anything. The first

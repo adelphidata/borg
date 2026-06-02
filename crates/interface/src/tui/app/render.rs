@@ -630,7 +630,7 @@ impl<'a> App<'a> {
     /// bottom of the terminal and holds chrome (status, composer, queue
     /// preview, footer) plus a bounded streaming-tail preview of in-flight
     /// cells. Capped at the terminal height.
-    #[allow(dead_code)] // wired up in run_event_loop in commit 3
+    #[allow(dead_code)]
     pub fn compute_viewport_height(&self, terminal_size: Size) -> u16 {
         let composer = self.composer.height();
         let status = self.desired_status_height();
@@ -1025,9 +1025,7 @@ mod tests {
         assert!(rendered.iter().all(|l| !l.contains("(stable)")));
     }
 
-    // ========================================================================
     // flush_cell_range_to_scrollback — spacer between non-tool-flow cells.
-    // ========================================================================
 
     #[test]
     fn flush_separates_doctor_warning_from_heartbeat_with_one_blank() {
@@ -1067,12 +1065,10 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // push_borg_card — `/card` bypasses the viewport flush path (the card is
     // taller than the inline viewport and would be clipped). It must mirror
     // the inter-cell spacer policy itself: leading blank when there's a prev
     // cell, no leading blank when it's the first thing in the transcript.
-    // ========================================================================
 
     fn is_brand_line(l: &Line<'_>) -> bool {
         l.spans.iter().any(|s| s.content == "BORG")
@@ -1135,10 +1131,8 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // desired_status_height — governs whether a second row is allocated for
     // the live details snippet; layout depends on this number directly.
-    // ========================================================================
 
     #[test]
     fn desired_status_height_zero_when_idle() {
@@ -1542,9 +1536,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // Queue preview rendering.
-    // ========================================================================
 
     fn line_text(l: &Line<'static>) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()

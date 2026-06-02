@@ -691,7 +691,6 @@ impl Agent {
         &self.session
     }
 
-    /// Get the current conversation history.
     pub fn history(&self) -> &[Message] {
         &self.history
     }

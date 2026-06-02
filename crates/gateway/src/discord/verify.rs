@@ -25,7 +25,6 @@ pub fn verify_discord_signature(
     let verifying_key = VerifyingKey::from_bytes(&key_array)
         .map_err(|e| anyhow::anyhow!("Invalid Discord public key: {e}"))?;
 
-    // Extract headers
     let signature_hex = crate::verify_common::required_header(
         headers,
         hdr::DISCORD_SIGNATURE,

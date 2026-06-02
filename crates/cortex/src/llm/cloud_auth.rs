@@ -13,6 +13,8 @@ const AZURE_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 const AZURE_IMDS_RESOURCE: &str = "https://cognitiveservices.azure.com/";
 const GCP_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_GCP_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+// Expire cached tokens 60s early so an in-flight request can't race the
+// real expiry and hit the provider with a just-dead token.
 const CACHE_SKEW_SECS: u64 = 60;
 
 #[derive(Clone, Debug)]

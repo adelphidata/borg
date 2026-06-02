@@ -101,7 +101,7 @@ impl ManifestItem for ChannelManifest {
     const ITEM_TYPE: &'static str = "channel";
 }
 
-/// Legacy type alias for backward compatibility.
+/// A script-based channel integration discovered from a `channel.toml`.
 pub type RegisteredChannel = RegisteredItem<ChannelManifest>;
 
 /// Registry of script-based channel integrations loaded from `~/.borg/channels/`.

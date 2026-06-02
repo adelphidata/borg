@@ -1087,8 +1087,8 @@ async fn run_session_task(
                     .map(|(text, _raw)| text)
                     .map_err(|e| anyhow!("{e}"));
                 // Best-effort send — caller may have dropped its receiver
-                // (e.g. outer-watchdog fired). Per CLAUDE.md, log on the
-                // drop path so it isn't silent.
+                // (e.g. outer-watchdog fired). Log on the drop path so it
+                // isn't silent.
                 if let Err(_dropped) = reply.send(result) {
                     tracing::warn!(
                         server = %server_name,

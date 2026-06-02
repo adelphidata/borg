@@ -533,15 +533,12 @@ impl<'a> App<'a> {
             return Ok(action);
         }
 
-        // ------------------------------------------------------------
         // Up / Down / Page / Home / End fall through to the composer.
-        // ------------------------------------------------------------
         // Inline-viewport mode delegates transcript scrolling to the
         // terminal (xterm Alternate Scroll Mode). The composer's
         // history navigation handles Up/Down; PageUp/PageDown/Home/End
         // are no-ops at the App level — the terminal owns scrolling.
         // Ctrl+P / Ctrl+N remain the explicit history-recall keys.
-        // ------------------------------------------------------------
 
         if let Some(text) = self.composer.handle_key(key) {
             return self.handle_submit(&text);

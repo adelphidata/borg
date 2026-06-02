@@ -474,7 +474,6 @@ impl Provider {
                     .strip_prefix("http://")
                     .or_else(|| h.strip_prefix("https://"))
                     .unwrap_or(&h);
-                // Remove any path component
                 let host_port = stripped.split('/').next().unwrap_or(stripped);
                 host_port.parse().ok()
             })

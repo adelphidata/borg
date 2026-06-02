@@ -1,10 +1,7 @@
 //! Lowercase hex encode/decode helpers.
 //!
-//! Consolidates implementations previously duplicated across `hmac_chain`,
-//! `evolution::keychain`, `evolution::signature`, `scripts`, `db::web_search_cache`,
-//! and `backup`. All call sites used identical lowercase hex encoding; the only
-//! difference was decoder error type (Result vs Option). The canonical decoder
-//! returns `anyhow::Result`; callers that need an `Option` use `.ok()`.
+//! The canonical decoder returns `anyhow::Result`; callers that need an
+//! `Option` use `.ok()`.
 
 use std::fmt::Write as _;
 

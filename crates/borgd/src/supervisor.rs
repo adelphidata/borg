@@ -40,6 +40,10 @@ use tokio_util::sync::CancellationToken;
 /// so subsystems share access through a plain `Arc`.
 pub type DbHandle = Arc<Database>;
 
+/// Activity-log category for all supervisor-emitted rows; the maintenance
+/// sweep filters on this exact string when surfacing degraded subsystems.
+const ACTIVITY_CATEGORY: &str = "subsystem";
+
 async fn try_log(db: &DbHandle, level: &str, category: &str, message: &str) {
     if let Err(e) = db.log_activity(level, category, message, None).await {
         tracing::debug!("supervisor: activity log write failed: {e}");
@@ -228,7 +232,7 @@ async fn supervised_loop<F, Fut, E>(
                 try_log(
                     &db,
                     "warn",
-                    "subsystem",
+                    ACTIVITY_CATEGORY,
                     &format!("{}: returned Err: {msg}", cfg.name),
                 )
                 .await;
@@ -238,7 +242,7 @@ async fn supervised_loop<F, Fut, E>(
                 try_log(
                     &db,
                     "error",
-                    "subsystem",
+                    ACTIVITY_CATEGORY,
                     &format!("{}: panicked: {msg}", cfg.name),
                 )
                 .await;
@@ -251,7 +255,7 @@ async fn supervised_loop<F, Fut, E>(
                 try_log(
                     &db,
                     "warn",
-                    "subsystem",
+                    ACTIVITY_CATEGORY,
                     &format!(
                         "{}: externally aborted (likely watchdog stall recovery)",
                         cfg.name
@@ -278,7 +282,7 @@ async fn supervised_loop<F, Fut, E>(
             try_log(
                 &db,
                 "error",
-                "subsystem",
+                ACTIVITY_CATEGORY,
                 &format!(
                     "{}: degraded after {} restarts in {:?}; supervisor giving up",
                     cfg.name,
@@ -373,7 +377,7 @@ pub fn spawn_liveness_watchdog(
                     try_log(
                         &db,
                         "warn",
-                        "subsystem",
+                        ACTIVITY_CATEGORY,
                         &format!(
                             "{name}: watchdog detected stall (~{stall_secs}s, counter={now_val}); restart triggered"
                         ),

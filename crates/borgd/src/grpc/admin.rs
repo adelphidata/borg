@@ -913,12 +913,9 @@ impl Admin for AdminSvc {
         }))
     }
 
-    // ── Onboarding ────────────────────────────────────────────────────────
-    //
-    // Single sentinel: settings-table key `onboarded` set to "true". The cli
-    // used to write this directly via `Database::open()`; routing through
-    // the daemon ensures one writer and lets its settings cache stay in sync
-    // after onboarding.
+    // Onboarding sentinel is the settings-table key `onboarded`. Routing the
+    // write through the daemon (rather than direct `Database::open()`) keeps a
+    // single writer so its settings cache stays coherent.
 
     async fn get_onboarding_state(
         &self,

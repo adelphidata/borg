@@ -1174,8 +1174,7 @@ async fn compute_tools_filter(
 }
 
 /// Render the child's initial user-message preamble: identity + role +
-/// delegation policy + workspace + optional context + goal. Replaces the
-/// ad-hoc string concatenation previously embedded in `run_sub_agent`.
+/// delegation policy + workspace + optional context + goal.
 ///
 /// The structured `<context trust="parent">…</context>` and
 /// `<goal>…</goal>` blocks let the child parse intent unambiguously and

@@ -654,8 +654,6 @@ async fn dispatch_voice_channel_via_handle(
     };
     // `<guild>:user:<user_id>` form → resolve current channel via cache.
     let parse_user_target = |s: &str| -> Option<(u64, u64)> {
-        let rest = s.strip_prefix(char::is_alphanumeric).unwrap_or(s);
-        let _ = rest;
         let mut parts = s.split(':');
         let g = parts.next()?.trim().parse::<u64>().ok()?;
         if parts.next()?.trim() != "user" {

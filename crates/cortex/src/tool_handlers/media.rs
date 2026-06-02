@@ -159,8 +159,8 @@ pub async fn handle_browser(
             );
             if let Some(prev) = session.take() {
                 // Close failures are non-fatal (CDP channel may already be
-                // dead) but must be logged per CLAUDE.md's no-silent-swallow
-                // rule — without this, a broken disconnect path is invisible.
+                // dead) but must be logged — without this, a broken
+                // disconnect path is invisible.
                 if let Err(e) = prev.close().await {
                     tracing::warn!(error = %e, "failed to close prior browser session before reattach");
                 }
@@ -257,7 +257,6 @@ pub async fn handle_browser(
             let selector = args.get("selector").and_then(|v| v.as_str());
             match browser.screenshot(selector, timeout).await {
                 Ok((desc, png_bytes)) => {
-                    // Save to disk
                     let saved_path = Config::data_dir().ok().and_then(|data_dir| {
                         let dir = data_dir.join("screenshots");
                         if let Err(e) = std::fs::create_dir_all(&dir) {
