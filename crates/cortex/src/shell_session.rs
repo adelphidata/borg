@@ -331,6 +331,38 @@ mod tests {
         reg.kill(&id).await.expect("kill");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_persists_across_commands_in_a_session() {
+        // A persistent session is one long-lived shell process, so a `cd` in one
+        // command must affect the next — the session must NOT snap back to its
+        // spawn-time cwd. This pins the invariant that makes per-command cwd
+        // re-injection (and the resulting clobber bug) impossible here.
+        let reg = ShellSessionRegistry::new();
+        let child = Command::new("sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir("/") // spawn-time cwd is `/`
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let id = reg.register(child, None);
+
+        // Move somewhere distinct from the spawn-time cwd, then ask where we are
+        // on a *separate* command. A fresh-process-per-command shell would
+        // report `/`; a true persistent session reports `/tmp`.
+        reg.write_stdin(&id, "cd /tmp\n").await.expect("write cd");
+        reg.write_stdin(&id, "pwd\n").await.expect("write pwd");
+        let out = poll_until(&reg, &id, "/tmp").await;
+        assert!(
+            out.contains("/tmp"),
+            "cd must persist to the next command in the same session: {out:?}"
+        );
+
+        reg.kill(&id).await.expect("kill");
+    }
+
     #[tokio::test]
     async fn operations_on_unknown_session_error() {
         let reg = ShellSessionRegistry::new();

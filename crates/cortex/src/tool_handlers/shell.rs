@@ -160,6 +160,14 @@ pub async fn handle_run_shell_with_context(
         }
     }
 
+    // Paired shell-side guard for the file-write control-plane deny: refuse
+    // `run`/`start` commands that write Borg's own control-plane files or flip
+    // a security setting via the CLI. Without this, `echo > ~/.borg/hooks.json`
+    // or `borg settings set …` would bypass the `fs_write` boundary entirely.
+    if crate::tool_handlers::filesystem::shell_command_targets_control_plane(command) {
+        return Ok(deny_control_plane_write(command).await);
+    }
+
     match policy.check(command) {
         crate::policy::PolicyDecision::Deny => {
             // Audit the denial so post-hoc review can spot prompt-injection
@@ -378,6 +386,18 @@ async fn start_session(
 /// normal tool result, not an error) when the session is unknown or no
 /// registry is installed, so the agent loop treats it as recoverable.
 async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result<String> {
+    // `write_stdin` injects fresh commands into a live shell that were never
+    // seen by the start-time policy/control-plane checks, so re-guard the stdin
+    // here — before the registry lookup, so the deny holds regardless of
+    // whether a session registry is installed. Otherwise it becomes the bypass
+    // for the file-write control-plane boundary.
+    if action == "write_stdin" {
+        let stdin = args.get("stdin").and_then(|v| v.as_str()).unwrap_or("");
+        if crate::tool_handlers::filesystem::shell_command_targets_control_plane(stdin) {
+            return Ok(deny_control_plane_write(stdin).await);
+        }
+    }
+
     let Some(sessions) = crate::shell_session::global() else {
         return Ok(no_session_registry_msg());
     };
@@ -572,6 +592,26 @@ async fn run_in_pty(
             ))
         }
     }
+}
+
+/// Audit and produce the user-facing message for a command refused by the
+/// shell-side control-plane guard. Shared by the one-shot `run`/`start` path
+/// and the persistent-session `write_stdin` path so both emit the same audit
+/// event and explanation.
+async fn deny_control_plane_write(command: &str) -> String {
+    crate::db::try_emit_global(
+        crate::db::audit_events::SANDBOX_DENIAL,
+        "system",
+        &serde_json::json!({
+            "tool": "run_shell",
+            "reason": "control_plane_write",
+            "command_redacted": redact_command_for_audit(command),
+        }),
+    )
+    .await;
+    "Shell command denied: writing Borg control-plane files (config DB, secrets, hooks.json) \
+     or changing settings via `borg settings set` is not permitted."
+        .to_string()
 }
 
 /// Bound the size of the command string we put in the audit chain. Keeps the
@@ -891,6 +931,71 @@ mod tests {
                 "expected daemon-required message for {args}, got: {result}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn run_shell_denies_control_plane_write_without_executing() {
+        // A `run` command that redirects into Borg's own hooks config must be
+        // refused by the shell-side control-plane guard — and refused *before*
+        // execution, so there is no "Exit code" in the result (the command
+        // never spawned). hooks.json runs arbitrary shell at every hook point.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "echo pwned > ~/.borg/hooks.json" });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("guarded command returns Ok with a message");
+        assert!(result.contains("denied"), "expected denial, got: {result}");
+        assert!(
+            !result.contains("Exit code"),
+            "guarded command must not execute: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stdin_control_plane_payload_denied_before_registry_check() {
+        // `write_stdin` injects a fresh command into a live shell. The
+        // control-plane guard must fire on the stdin payload *before* the
+        // session-registry lookup — otherwise a live session is a bypass for
+        // the file-write boundary. No registry is installed here, so a guarded
+        // payload must still return the control-plane denial, NOT the
+        // daemon-required message.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({
+            "action": "write_stdin",
+            "session_id": "sh-1",
+            "stdin": "echo pwned > ~/.borg/hooks.json\n",
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("guarded write_stdin returns Ok with a message");
+        assert!(result.contains("denied"), "expected denial, got: {result}");
+        assert!(
+            !result.contains("require the borg daemon"),
+            "control-plane guard must precede the registry check: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_allows_reading_control_plane_file() {
+        // Reads of a control-plane file are not policy mutations and must keep
+        // working — `cat`-ing hooks.json (here a harmless echo of the path) is
+        // not a write, so the guard must not fire.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "echo reading ~/.borg/hooks.json" });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("benign command runs");
+        assert!(
+            result.contains("Exit code: 0"),
+            "benign read-shaped command must execute: {result}"
+        );
+        assert!(!result.contains("denied"), "must not be denied: {result}");
     }
 
     #[tokio::test]

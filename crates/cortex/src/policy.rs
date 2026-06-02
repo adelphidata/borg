@@ -264,7 +264,7 @@ fn strip_path_prefix(token: &str) -> &str {
 /// inspect newline- or semicolon-separated subcommands without rejecting
 /// multiline heredocs outright. We intentionally do not split on `|` because
 /// some hardcoded deny patterns rely on seeing the full pipeline.
-fn command_fragments(command: &str) -> Vec<&str> {
+pub(crate) fn command_fragments(command: &str) -> Vec<&str> {
     command
         .lines()
         .flat_map(|line| line.split(';'))

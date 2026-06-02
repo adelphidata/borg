@@ -12,7 +12,7 @@ mod listing;
 mod patch;
 mod read;
 
-pub use blocked::is_blocked_path;
+pub use blocked::{is_blocked_path, shell_command_targets_control_plane};
 pub use listing::{handle_list_dir, handle_list_dir_with_context};
 pub use patch::{
     handle_apply_patch, handle_apply_patch_unified, handle_apply_patch_unified_with_context,
