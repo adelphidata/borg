@@ -18,6 +18,19 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .map_err(Into::into)
 }
 
+/// Attach the active trace context to an outbound request as a `traceparent`
+/// header so collectors can stitch the HTTP call to the agent span. Inert when
+/// telemetry is disabled or there is no recording span (no header is added).
+fn with_trace_context(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    crate::telemetry::propagation::inject_current_context(&mut headers);
+    if headers.is_empty() {
+        req
+    } else {
+        req.headers(headers)
+    }
+}
+
 /// A single search result from any provider.
 pub struct SearchResult {
     pub title: String,
@@ -81,6 +94,10 @@ pub fn resolve_provider_id(config: &WebConfig) -> &str {
 /// are gated via a `Policy::custom` callback that runs the no-DNS
 /// classifier on each hop; and the final landing URL is re-checked with
 /// the full classifier post-fetch to defend against DNS rebinding.
+#[tracing::instrument(
+    skip_all,
+    fields(http.method = "GET", http.url = %url, http.status_code = tracing::field::Empty)
+)]
 pub async fn web_fetch(
     url: &str,
     max_chars: Option<usize>,
@@ -131,11 +148,11 @@ pub async fn web_fetch(
         .redirect(redirect)
         .build()?;
 
-    let resp = client
-        .get(&effective_url)
+    let resp = with_trace_context(client.get(&effective_url))
         .send()
         .await
         .with_context(|| format!("Failed to fetch {effective_url}"))?;
+    tracing::Span::current().record("http.status_code", resp.status().as_u16());
 
     // Post-fetch: re-validate the final landing URL with full DNS,
     // *unconditionally*, to defend against DNS rebinding. Even a
@@ -212,15 +229,18 @@ pub async fn web_search(query: &str, config: &WebConfig) -> Result<String> {
 // Provider implementations
 
 /// Search via DuckDuckGo HTML endpoint (no API key needed).
+#[tracing::instrument(skip_all, fields(search.provider = "duckduckgo"))]
 async fn duckduckgo_search(query: &str) -> Result<String> {
     let client = build_http_client(15)?;
 
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .form(&[("q", query)])
-        .send()
-        .await
-        .context("Failed to reach DuckDuckGo")?;
+    let resp = with_trace_context(
+        client
+            .post("https://html.duckduckgo.com/html/")
+            .form(&[("q", query)]),
+    )
+    .send()
+    .await
+    .context("Failed to reach DuckDuckGo")?;
 
     let html = resp.text().await?;
     let document = Html::parse_document(&html);
@@ -280,6 +300,7 @@ async fn duckduckgo_search(query: &str) -> Result<String> {
 }
 
 /// Search via Brave Search API (requires API key).
+#[tracing::instrument(skip_all, fields(search.provider = "brave"))]
 async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
     let api_key_env = config
         .search_api_key_env
@@ -290,14 +311,16 @@ async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let client = build_http_client(15)?;
 
-    let resp = client
-        .get("https://api.search.brave.com/res/v1/web/search")
-        .header("X-Subscription-Token", &api_key)
-        .header("Accept", "application/json")
-        .query(&[("q", query), ("count", "8")])
-        .send()
-        .await
-        .context("Failed to reach Brave Search API")?;
+    let resp = with_trace_context(
+        client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .header("X-Subscription-Token", &api_key)
+            .header("Accept", "application/json")
+            .query(&[("q", query), ("count", "8")]),
+    )
+    .send()
+    .await
+    .context("Failed to reach Brave Search API")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -328,6 +351,7 @@ async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
 }
 
 /// Search via Tavily API (AI-optimized search, requires TAVILY_API_KEY).
+#[tracing::instrument(skip_all, fields(search.provider = "tavily"))]
 async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
     let api_key_env = config
         .search_api_key_env
@@ -344,14 +368,16 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
         "include_answer": false,
     });
 
-    let resp = client
-        .post("https://api.tavily.com/search")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("Failed to reach Tavily API")?;
+    let resp = with_trace_context(
+        client
+            .post("https://api.tavily.com/search")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body),
+    )
+    .send()
+    .await
+    .context("Failed to reach Tavily API")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -382,6 +408,7 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
 }
 
 /// Search via Serper API (Google results, requires SERPER_API_KEY).
+#[tracing::instrument(skip_all, fields(search.provider = "serper"))]
 async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
     let api_key_env = config
         .search_api_key_env
@@ -397,14 +424,16 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
         "num": MAX_SEARCH_RESULTS,
     });
 
-    let resp = client
-        .post("https://google.serper.dev/search")
-        .header("X-API-KEY", &api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("Failed to reach Serper API")?;
+    let resp = with_trace_context(
+        client
+            .post("https://google.serper.dev/search")
+            .header("X-API-KEY", &api_key)
+            .header("Content-Type", "application/json")
+            .json(&body),
+    )
+    .send()
+    .await
+    .context("Failed to reach Serper API")?;
 
     if !resp.status().is_success() {
         let status = resp.status();

@@ -1151,8 +1151,24 @@ fn extract_client_ip(
     peer_ip.to_string()
 }
 
-#[instrument(skip_all, fields(channel = %name))]
 async fn webhook_handler(
+    state: State<Arc<AppState>>,
+    addr: ConnectInfo<std::net::SocketAddr>,
+    name: Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> WebhookResponse {
+    use tracing::Instrument;
+    // Chain the inbound webhook to its upstream trace (W3C `traceparent`), so
+    // collectors stitch the gateway span under the caller's distributed trace.
+    let span = tracing::info_span!("webhook.process", channel = %name.0);
+    cortex::telemetry::propagation::set_span_parent_from_headers(&span, &headers);
+    webhook_handler_inner(state, addr, name, headers, body)
+        .instrument(span)
+        .await
+}
+
+async fn webhook_handler_inner(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(name): Path<String>,
@@ -1472,14 +1488,17 @@ mod tests {
         // webhook entry point starts a timer") is not type-expressible, hence
         // the source-grep guard.
         let src = include_str!("server.rs");
+        // `webhook_handler` is a thin tracing wrapper that always delegates to
+        // `webhook_handler_inner`; the inner fn holds every early-return path,
+        // so that is where the timer must sit to time them all.
         let webhook_idx = src
-            .find("async fn webhook_handler")
-            .expect("webhook_handler exists");
+            .find("async fn webhook_handler_inner")
+            .expect("webhook_handler_inner exists");
         let slack_idx = src
             .find("async fn slack_command_handler")
             .expect("slack_command_handler exists");
         for (name, idx) in [
-            ("webhook_handler", webhook_idx),
+            ("webhook_handler_inner", webhook_idx),
             ("slack_command_handler", slack_idx),
         ] {
             // Search the next 400 chars for the timer construction.

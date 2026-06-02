@@ -41,13 +41,33 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    use tracing_subscriber::prelude::*;
 
     let args = Args::parse();
+    let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
+    // Point config/DB resolution at the resolved home so telemetry settings
+    // load from the same database the daemon will use.
+    std::env::set_var("BORG_HOME", &home);
+
+    // Initialize the OpenTelemetry export pipeline before installing the
+    // subscriber. Off by default; `telemetry.{tracing,metrics,logs}_enabled`
+    // opt in. The guard must outlive the daemon so exporters flush on exit.
+    let core_config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
+    let (otel_layers, _telemetry_guard) = cortex::telemetry::init_telemetry(&core_config.telemetry)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: OpenTelemetry init failed: {e}");
+            (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
+        });
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(otel_layers)
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     if args.insecure_tcp {
         tracing::warn!(
             "--insecure-tcp is deprecated: TCP listener now requires mTLS unconditionally"
@@ -61,7 +81,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     tracing::info!(borg_home = %home.display(), "starting borgd");
 
     daemon::run(daemon::Config {

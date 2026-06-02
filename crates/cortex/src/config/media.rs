@@ -1000,6 +1000,8 @@ pub struct TelemetryConfig {
     pub tracing_enabled: bool,
     /// Enable metrics export.
     pub metrics_enabled: bool,
+    /// Enable log export (bridges `tracing` events to OTLP logs).
+    pub logs_enabled: bool,
     /// Enable daemon cost-event streaming.
     pub cost_events: bool,
     /// OTLP collector endpoint URL.
@@ -1015,6 +1017,7 @@ impl Default for TelemetryConfig {
         Self {
             tracing_enabled: false,
             metrics_enabled: false,
+            logs_enabled: false,
             cost_events: false,
             otlp_endpoint: "http://localhost:4317".to_string(),
             service_name: "borg".to_string(),
@@ -1103,5 +1106,66 @@ mod tests {
         let config: SkillEntryConfig = toml::from_str(toml_str).unwrap();
         assert!(config.allowed_env.is_empty());
         assert!(!config.enabled);
+    }
+
+    // ── Telemetry (OpenTelemetry export pipeline) settings ──
+
+    #[test]
+    fn telemetry_defaults_all_off() {
+        // Spec: the export pipeline is off by default.
+        let t = TelemetryConfig::default();
+        assert!(!t.tracing_enabled);
+        assert!(!t.metrics_enabled);
+        assert!(!t.logs_enabled);
+        assert_eq!(t.otlp_endpoint, "http://localhost:4317");
+        assert_eq!(t.sampling_ratio, 1.0);
+    }
+
+    #[test]
+    fn apply_setting_telemetry_knobs_flip_fields() {
+        // Spec: all OTel knobs are runtime-settable and map to the documented
+        // `telemetry.*` fields.
+        let mut cfg = crate::config::Config::default();
+        cfg.apply_setting("telemetry.tracing_enabled", "true")
+            .expect("set tracing");
+        cfg.apply_setting("telemetry.metrics_enabled", "true")
+            .expect("set metrics");
+        cfg.apply_setting("telemetry.logs_enabled", "true")
+            .expect("set logs");
+        cfg.apply_setting("telemetry.otlp_endpoint", "http://collector:4317")
+            .expect("set endpoint");
+        cfg.apply_setting("telemetry.service_name", "borg-prod")
+            .expect("set service name");
+        cfg.apply_setting("telemetry.sampling_ratio", "0.25")
+            .expect("set ratio");
+
+        assert!(cfg.telemetry.tracing_enabled);
+        assert!(cfg.telemetry.metrics_enabled);
+        assert!(cfg.telemetry.logs_enabled);
+        assert_eq!(cfg.telemetry.otlp_endpoint, "http://collector:4317");
+        assert_eq!(cfg.telemetry.service_name, "borg-prod");
+        assert_eq!(cfg.telemetry.sampling_ratio, 0.25);
+    }
+
+    #[test]
+    fn apply_setting_telemetry_sampling_ratio_range_enforced() {
+        // Negative: the range validator rejects ratios outside [0.0, 1.0] and
+        // leaves the field untouched; boundaries are accepted.
+        let mut cfg = crate::config::Config::default();
+        let before = cfg.telemetry.sampling_ratio;
+
+        assert!(cfg
+            .apply_setting("telemetry.sampling_ratio", "1.5")
+            .is_err());
+        assert!(cfg
+            .apply_setting("telemetry.sampling_ratio", "-0.1")
+            .is_err());
+        assert_eq!(
+            cfg.telemetry.sampling_ratio, before,
+            "rejected values must not mutate the field"
+        );
+
+        assert!(cfg.apply_setting("telemetry.sampling_ratio", "0.0").is_ok());
+        assert!(cfg.apply_setting("telemetry.sampling_ratio", "1.0").is_ok());
     }
 }

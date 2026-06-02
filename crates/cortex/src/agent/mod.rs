@@ -1562,6 +1562,10 @@ impl Agent {
             return Ok(());
         }
 
+        // Cheap pruning was insufficient — we are under genuine context-window
+        // pressure and about to run LLM-based compaction.
+        self.metrics.record_memory_pressure("reactive");
+
         let compaction_config = self.config.with_compaction_overrides();
         let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         let protect_first_n = self.config.conversation.protect_first_n;

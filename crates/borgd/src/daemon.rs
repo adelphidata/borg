@@ -39,6 +39,7 @@ struct DaemonSessionFactory {
     cost_event_sink: Arc<dyn CostEventSink>,
     process_registry: cortex::process_registry::ProcessRegistry,
     goal_bus: Option<crate::goal_bus::GoalEventBus>,
+    metrics: BorgMetrics,
 }
 
 impl SessionFactory for DaemonSessionFactory {
@@ -57,7 +58,7 @@ impl SessionFactory for DaemonSessionFactory {
                 .map(|ctx| ctx.with_process_registry(Some(self.process_registry.clone())));
             let backend = AgentBackend::new(
                 config,
-                BorgMetrics::noop(),
+                self.metrics.clone(),
                 resume_id,
                 Some(self.config_rx.clone()),
                 Some(self.cost_event_sink.clone()),
@@ -127,7 +128,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     let initial_core_config = CoreConfig::load_from_db().await.unwrap_or_default();
     let config_watcher =
         ConfigWatcher::start(initial_core_config.clone()).context("start config watcher")?;
-    let metrics = BorgMetrics::noop();
+    // Real instruments when `telemetry.metrics_enabled` (bound to the global
+    // meter provider installed in `main`); a true noop otherwise.
+    let metrics = BorgMetrics::from_config(&initial_core_config);
+    metrics.record_lifecycle_start("borgd");
     let cost_event_bus = CostEventBus::new(&initial_core_config, metrics.clone());
     let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(cost_event_bus.clone());
     {
@@ -170,6 +174,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         cost_event_sink: cost_event_sink.clone(),
         process_registry: process_registry.clone(),
         goal_bus: Some(goal_bus.clone()),
+        metrics: metrics.clone(),
     });
     let capability_router = Arc::new(CapabilityRouter::new());
 
@@ -633,6 +638,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             .context("UDS server")?;
     }
 
+    metrics.record_lifecycle_shutdown("borgd");
     tracing::info!("borgd shutdown complete");
     Ok(())
 }

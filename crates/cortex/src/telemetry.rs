@@ -1,12 +1,16 @@
 use anyhow::Result;
 use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::Registry;
 
 use crate::config::TelemetryConfig;
+
+pub mod propagation;
 
 /// Single source of truth for every `borg.*` metric name. CLAUDE.md, dashboards,
 /// and emission sites all reference these constants — typos fail the build, not
@@ -24,6 +28,13 @@ pub mod names {
     pub const GATEWAY_REQUESTS: &str = "borg.gateway.requests";
     pub const GATEWAY_DURATION: &str = "borg.gateway.duration";
     pub const COST_EVENTS_DROPPED: &str = "borg.telemetry.cost_events_dropped";
+    /// Counter for context-window pressure events that triggered history
+    /// compaction (labelled by `trigger`: proactive | reactive).
+    pub const MEMORY_PRESSURE: &str = "borg.memory.pressure";
+    /// Counter incremented once per harness boot (labelled by `harness`).
+    pub const LIFECYCLE_STARTS: &str = "borg.lifecycle.starts";
+    /// Counter incremented once per graceful harness shutdown (labelled by `harness`).
+    pub const LIFECYCLE_SHUTDOWNS: &str = "borg.lifecycle.shutdowns";
 
     pub const WASM_INSTALLS: &str = "borg.wasm.installs_total";
     pub const WASM_EXECUTES: &str = "borg.wasm.executes_total";
@@ -41,6 +52,7 @@ pub mod names {
 pub struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 impl TelemetryGuard {
@@ -49,6 +61,7 @@ impl TelemetryGuard {
         Self {
             tracer_provider: None,
             meter_provider: None,
+            logger_provider: None,
         }
     }
 }
@@ -65,22 +78,49 @@ impl Drop for TelemetryGuard {
                 tracing::warn!("OpenTelemetry meter shutdown error: {e}");
             }
         }
+        if let Some(lp) = self.logger_provider.take() {
+            if let Err(e) = lp.shutdown() {
+                tracing::warn!("OpenTelemetry logger shutdown error: {e}");
+            }
+        }
     }
 }
 
 /// Type alias for a boxed tracing layer compatible with Registry.
 pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
 
-/// Returns an optional tracing-opentelemetry layer (None if tracing disabled)
-/// and a guard that must be held for the program's lifetime.
-pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, TelemetryGuard)> {
-    if !config.tracing_enabled && !config.metrics_enabled {
-        return Ok((None, TelemetryGuard::noop()));
+/// Initializes the OpenTelemetry export pipeline from `config`.
+///
+/// Returns the `tracing` layers that must be added to the subscriber (a span
+/// export layer when tracing is enabled and a logs-bridge layer when logs are
+/// enabled — the vec is empty when neither is on) plus a guard that flushes and
+/// shuts the providers down on drop, so it must be held for the program's
+/// lifetime.
+///
+/// Also installs the global W3C `TraceContextPropagator` whenever any signal is
+/// enabled, so [`propagation::inject_current_context`] /
+/// [`propagation::extract_parent_context`] carry `traceparent` across the
+/// outbound-HTTP and inbound-webhook boundaries.
+pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Vec<BoxedLayer>, TelemetryGuard)> {
+    if !config.tracing_enabled && !config.metrics_enabled && !config.logs_enabled {
+        return Ok((Vec::new(), TelemetryGuard::noop()));
     }
 
+    // Any enabled signal means cross-process trace correlation is wanted.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let resource = || {
+        opentelemetry_sdk::Resource::builder()
+            .with_service_name(config.service_name.clone())
+            .build()
+    };
+
     let mut tracer_provider = None;
-    let mut otel_layer: Option<BoxedLayer> = None;
     let mut meter_provider = None;
+    let mut logger_provider = None;
+    let mut layers: Vec<BoxedLayer> = Vec::new();
 
     if config.tracing_enabled {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -93,16 +133,12 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, T
         let tp = SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_sampler(sampler)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(config.service_name.clone())
-                    .build(),
-            )
+            .with_resource(resource())
             .build();
 
         let tracer = tp.tracer("borg");
         let layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        otel_layer = Some(Box::new(layer));
+        layers.push(Box::new(layer));
         tracer_provider = Some(tp);
     }
 
@@ -118,22 +154,37 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Option<BoxedLayer>, T
 
         let mp = SdkMeterProvider::builder()
             .with_reader(reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(config.service_name.clone())
-                    .build(),
-            )
+            .with_resource(resource())
             .build();
 
         opentelemetry::global::set_meter_provider(mp.clone());
         meter_provider = Some(mp);
     }
 
+    if config.logs_enabled {
+        let exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(&config.otlp_endpoint)
+            .build()?;
+
+        let lp = SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource())
+            .build();
+
+        // Bridge `tracing` events into OTel logs. Boxed as a Registry layer so
+        // it composes with the span layer + fmt layer at the call site.
+        let bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&lp);
+        layers.push(Box::new(bridge));
+        logger_provider = Some(lp);
+    }
+
     Ok((
-        otel_layer,
+        layers,
         TelemetryGuard {
             tracer_provider,
             meter_provider,
+            logger_provider,
         },
     ))
 }
@@ -166,6 +217,12 @@ pub struct BorgMetrics {
     pub gateway_requests: Counter<u64>,
     pub gateway_duration: Histogram<f64>,
     pub cost_events_dropped: Counter<u64>,
+    /// Context-window pressure events that triggered history compaction.
+    pub memory_pressure: Counter<u64>,
+    /// Harness boots (REPL/TUI/daemon).
+    pub lifecycle_starts: Counter<u64>,
+    /// Graceful harness shutdowns.
+    pub lifecycle_shutdowns: Counter<u64>,
 }
 
 impl Default for BorgMetrics {
@@ -255,7 +312,38 @@ impl BorgMetrics {
                 .u64_counter(names::COST_EVENTS_DROPPED)
                 .with_description("Number of dropped cost events due to lagged consumers")
                 .build(),
+            memory_pressure: meter
+                .u64_counter(names::MEMORY_PRESSURE)
+                .with_description("Context-window pressure events that triggered compaction")
+                .build(),
+            lifecycle_starts: meter
+                .u64_counter(names::LIFECYCLE_STARTS)
+                .with_description("Harness boots")
+                .build(),
+            lifecycle_shutdowns: meter
+                .u64_counter(names::LIFECYCLE_SHUTDOWNS)
+                .with_description("Graceful harness shutdowns")
+                .build(),
         }
+    }
+
+    /// Record a context-window pressure event. `trigger` is `"proactive"`
+    /// (pre-send budget check) or `"reactive"` (mid-stream context overflow).
+    pub fn record_memory_pressure(&self, trigger: &'static str) {
+        self.memory_pressure
+            .add(1, &[KeyValue::new("trigger", trigger)]);
+    }
+
+    /// Record a harness boot. `harness` is e.g. `"borgd"` or `"tui"`.
+    pub fn record_lifecycle_start(&self, harness: &'static str) {
+        self.lifecycle_starts
+            .add(1, &[KeyValue::new("harness", harness)]);
+    }
+
+    /// Record a graceful harness shutdown.
+    pub fn record_lifecycle_shutdown(&self, harness: &'static str) {
+        self.lifecycle_shutdowns
+            .add(1, &[KeyValue::new("harness", harness)]);
     }
 }
 
@@ -590,8 +678,8 @@ mod tests {
         assert!(!config.tracing_enabled);
         assert!(!config.metrics_enabled);
 
-        let (layer, _guard) = init_telemetry(&config).expect("init succeeds when disabled");
-        assert!(layer.is_none(), "no layer when tracing disabled");
+        let (layers, _guard) = init_telemetry(&config).expect("init succeeds when disabled");
+        assert!(layers.is_empty(), "no layers when all signals disabled");
 
         // Sanity: a noop BorgMetrics emits without panicking AND aggregates
         // nowhere observable. We can't easily inspect the private noop
@@ -600,6 +688,73 @@ mod tests {
         let m = BorgMetrics::noop();
         m.agent_turns.add(1, &[]);
         m.gateway_duration.record(0.42, &[]);
+    }
+
+    #[tokio::test]
+    async fn logs_enabled_yields_only_the_bridge_layer() {
+        // Spec: enabling logs (and nothing else) installs exactly one tracing
+        // layer — the OTLP logs bridge — and a guard that owns a logger
+        // provider. Building the exporter must not require a live collector.
+        let config = TelemetryConfig {
+            logs_enabled: true,
+            ..TelemetryConfig::default()
+        };
+        let (layers, guard) = init_telemetry(&config).expect("init with logs succeeds");
+        assert_eq!(
+            layers.len(),
+            1,
+            "logs-only init yields exactly the logs-bridge layer"
+        );
+        assert!(
+            guard.logger_provider.is_some(),
+            "guard must own the logger provider so it is flushed on drop"
+        );
+        assert!(guard.tracer_provider.is_none());
+    }
+
+    #[tokio::test]
+    async fn tracing_plus_logs_yields_two_layers() {
+        // Spec: tracing and logs each contribute a layer; both flags on => 2.
+        let config = TelemetryConfig {
+            tracing_enabled: true,
+            logs_enabled: true,
+            ..TelemetryConfig::default()
+        };
+        let (layers, guard) = init_telemetry(&config).expect("init succeeds");
+        assert_eq!(layers.len(), 2, "span layer + logs-bridge layer");
+        assert!(guard.tracer_provider.is_some());
+        assert!(guard.logger_provider.is_some());
+    }
+
+    #[test]
+    fn lifecycle_and_memory_pressure_emit_under_canonical_names() {
+        // Spec: the harness-lifecycle and memory-pressure signals export under
+        // their `names::*` constants with the expected label keys. A rename
+        // that desyncs const from builder drops the series and fails here.
+        let (provider, meter, exporter) = test_metrics();
+        let m = BorgMetrics::from_meter(&meter);
+
+        m.record_memory_pressure("reactive");
+        m.record_memory_pressure("proactive");
+        m.record_lifecycle_start("borgd");
+        m.record_lifecycle_shutdown("borgd");
+
+        let rms = collect(&provider, &exporter);
+
+        assert_eq!(
+            u64_sum_for(&rms, names::MEMORY_PRESSURE),
+            2,
+            "two pressure events recorded"
+        );
+        assert_eq!(u64_sum_for(&rms, names::LIFECYCLE_STARTS), 1);
+        assert_eq!(u64_sum_for(&rms, names::LIFECYCLE_SHUTDOWNS), 1);
+
+        // The single-datapoint lifecycle counters carry the harness label.
+        let start_attrs = sole_sum_attrs(&rms, names::LIFECYCLE_STARTS);
+        assert_eq!(
+            attr_value(&start_attrs, "harness").as_deref(),
+            Some("borgd")
+        );
     }
 
     #[test]

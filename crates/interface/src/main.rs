@@ -503,10 +503,10 @@ async fn async_main() -> Result<()> {
             }
         }
 
-        let (otel_layer, tg) =
-            cortex::telemetry::init_telemetry(&config.telemetry).unwrap_or_else(|e| {
+        let (otel_layers, tg) = cortex::telemetry::init_telemetry(&config.telemetry)
+            .unwrap_or_else(|e| {
                 eprintln!("Warning: OpenTelemetry init failed: {e}");
-                (None, cortex::telemetry::TelemetryGuard::noop())
+                (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
             });
         _telemetry_guard = tg;
 
@@ -540,7 +540,7 @@ async fn async_main() -> Result<()> {
                 .with_ansi(false)
                 .with_writer(non_blocking);
             tracing_subscriber::registry()
-                .with(otel_layer)
+                .with(otel_layers)
                 .with(env_filter)
                 .with(fmt_layer)
                 .init();
@@ -548,7 +548,7 @@ async fn async_main() -> Result<()> {
             _guard = None;
             let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
             tracing_subscriber::registry()
-                .with(otel_layer)
+                .with(otel_layers)
                 .with(env_filter)
                 .with(fmt_layer)
                 .init();

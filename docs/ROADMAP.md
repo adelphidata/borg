@@ -562,15 +562,6 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   (book a flight, fill a form on a private dashboard) become
   possible.
 
-### Observability
-
-- **OpenTelemetry export pipeline.** `[O][I]` `[telemetry] otel_endpoint`
-  setting; emit traces/metrics/logs for model calls, tool calls, exec,
-  outbound HTTP, webhook processing, context-assembly, memory-pressure,
-  and harness-lifecycle spans/metrics, with W3C traceparent propagation.
-  Off by default. Today borg only exports OTel metrics for WASM plugins
-  — this expands coverage across the agent loop. Targets power users
-  running Borg as a long-lived service.
 ### Scheduling
 
 - **Heartbeat `lightContext` + `isolatedSession` modes.** `[O]`

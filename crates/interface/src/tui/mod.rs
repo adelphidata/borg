@@ -283,6 +283,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     }
 
     let metrics = BorgMetrics::from_config(&config);
+    metrics.record_lifecycle_start("tui");
 
     // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,
     // activity, bond, evolution, budget, script), and config watcher all live

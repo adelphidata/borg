@@ -232,6 +232,12 @@ define_settings! {
 
         // ── Telemetry ──
         "telemetry.cost_events" => telemetry.cost_events, parsed(bool);
+        "telemetry.tracing_enabled" => telemetry.tracing_enabled, parsed(bool);
+        "telemetry.metrics_enabled" => telemetry.metrics_enabled, parsed(bool);
+        "telemetry.logs_enabled" => telemetry.logs_enabled, parsed(bool);
+        "telemetry.otlp_endpoint" => telemetry.otlp_endpoint, string;
+        "telemetry.service_name" => telemetry.service_name, string;
+        "telemetry.sampling_ratio" => telemetry.sampling_ratio, range(f64, 0.0_f64, 1.0);
 
         // ── Audio ──
         "audio.enabled" => audio.enabled, parsed(bool);
@@ -832,6 +838,12 @@ define_settings! {
 
         // — Appearance — TUI theme picker (also reachable as `/theme`)
         "ui.theme" => "Theme", Select, "Appearance";
+
+        // — Telemetry (OpenTelemetry export) — off by default
+        "telemetry.tracing_enabled" => "OTel traces", Bool, "Telemetry";
+        "telemetry.metrics_enabled" => "OTel metrics", Bool, "Telemetry";
+        "telemetry.logs_enabled" => "OTel logs", Bool, "Telemetry";
+        "telemetry.sampling_ratio" => "Trace sampling ratio", Float, "Telemetry";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

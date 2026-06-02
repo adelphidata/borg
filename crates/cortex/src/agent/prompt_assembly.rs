@@ -389,6 +389,7 @@ Rules:
 
         // Only run LLM-based compaction when history still exceeds the token budget
         if history_tokens(&self.history) > max_hist {
+            self.metrics.record_memory_pressure("proactive");
             let pre_compaction_len = self.history.len();
             let before_tokens = history_tokens(&self.history);
 
