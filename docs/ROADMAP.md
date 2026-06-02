@@ -223,14 +223,6 @@ top-down by priority, not by section order.
   rather than API access. Provider-shaped (one credential type each),
   not tools.
 
-    Shipped (no further work):
-    - **xAI (Grok)** — `Provider::XAi` direct integration with the OpenAI-
-      compatible chat-completions surface, Bearer auth via `XAI_API_KEY`,
-      Grok 4 / Grok 4 Fast (reasoning + non-reasoning) in the model
-      picker, aux default `grok-4-fast-non-reasoning`, registry entries
-      and onboarding wiring. Pricing intentionally deferred — see "Cost
-      emission" below.
-
 ### Streaming & channel delivery
 
 - **Block + tool-level streaming with coalescing.** `[O][I]` Stream
