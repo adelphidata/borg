@@ -8,6 +8,27 @@ use crate::constants::{
 use crate::message_processing::chunker;
 use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
+/// Validate a value that will be interpolated into a Google Chat REST URL
+/// path — a space name or an attachment `resourceName`. Both arrive in the
+/// webhook payload and are therefore attacker-influenced, so reject anything
+/// that could break out of the path segment: an empty value (malformed
+/// `//messages` URL), traversal (`..`), a leading slash (absolute-path /
+/// `//host` confusion), or a `?`/`#` that would inject a query string or
+/// fragment ahead of our own `?alt=media` / `?messageReplyOption=...`.
+/// Interior `/` is allowed — both `spaces/<id>` and attachment resource
+/// names legitimately contain it.
+fn validate_url_path_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains("..")
+        || value.starts_with('/')
+        || value.contains('?')
+        || value.contains('#')
+    {
+        bail!("invalid Google Chat {label}: {value:?}");
+    }
+    Ok(())
+}
+
 /// A client for the Google Chat API.
 #[derive(Clone)]
 pub struct GoogleChatClient {
@@ -32,12 +53,7 @@ impl GoogleChatClient {
     /// arrive as `audio/*` attachments that we feed through STT before
     /// the agent runs.
     pub async fn download_attachment(&self, resource_name: &str) -> Result<Vec<u8>> {
-        // Defensive: refuse path traversal. The resource name is
-        // operator-controlled (came from a webhook payload), so it can
-        // contain anything; reject `..` and any leading slash.
-        if resource_name.contains("..") || resource_name.starts_with('/') {
-            bail!("invalid Google Chat attachment resource name: {resource_name}");
-        }
+        validate_url_path_component("attachment resource name", resource_name)?;
         let url = format!("{GOOGLE_CHAT_API_BASE}/media/{resource_name}?alt=media");
         let resp = self
             .client
@@ -82,10 +98,7 @@ impl GoogleChatClient {
         text: &str,
         thread_name: Option<&str>,
     ) -> Result<()> {
-        // Validate space_name to prevent path traversal
-        if space_name.contains("..") || space_name.contains('?') || space_name.contains('#') {
-            bail!("Invalid space name: {space_name}");
-        }
+        validate_url_path_component("space name", space_name)?;
 
         let mut url = format!("{GOOGLE_CHAT_API_BASE}/{space_name}/messages");
 
@@ -172,6 +185,33 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["text"], "hello");
         assert!(json.get("thread").is_none());
+    }
+
+    #[test]
+    fn validate_url_path_component_accepts_real_names() {
+        validate_url_path_component("space name", "spaces/AAAAAAAA").unwrap();
+        validate_url_path_component("attachment resource name", "attachments/AAA/BBB.ext").unwrap();
+    }
+
+    #[test]
+    fn validate_url_path_component_rejects_traversal_and_injection() {
+        // Each value would otherwise break out of the URL path segment:
+        // empty → `//messages`; `..` → traversal; leading `/` → absolute
+        // path; `?`/`#` → query/fragment injection ahead of our own params.
+        let bad = [
+            "",
+            "spaces/../spaces/EVIL",
+            "/spaces/AAA",
+            "spaces/AAA?messageReplyOption=EVIL",
+            "spaces/AAA#frag",
+            "attachments/x?alt=media&foo=bar",
+        ];
+        for value in bad {
+            assert!(
+                validate_url_path_component("x", value).is_err(),
+                "expected rejection for {value:?}"
+            );
+        }
     }
 
     #[test]
