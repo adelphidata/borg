@@ -663,7 +663,7 @@ impl Database {
                         params!(pid as i64, now),
                     ).await?;
                     Ok(true)
-                } else if now - heartbeat_at > 300 {
+                } else if now - heartbeat_at > crate::constants::DAEMON_LOCK_STALE_SECS {
                     // Stale lock fallback (PID recycled to unrelated live
                     // process, or DB shared across hosts) — take over
                     self.conn.execute(
@@ -709,7 +709,7 @@ impl Database {
         match rows.next().await {
             Ok(Some(row)) => row
                 .get::<i64>(0)
-                .map(|heartbeat_at| now - heartbeat_at <= 300)
+                .map(|heartbeat_at| now - heartbeat_at <= crate::constants::DAEMON_LOCK_STALE_SECS)
                 .unwrap_or(false),
             _ => false,
         }
@@ -724,6 +724,58 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    /// Read-only snapshot of the singleton daemon-lock row as `(pid,
+    /// heartbeat_at)`, or `None` when no daemon has ever taken the lock.
+    /// Used by `borg doctor` to detect an orphaned lock without taking it.
+    pub async fn daemon_lock_snapshot(&self) -> Result<Option<(u32, i64)>> {
+        let mut rows = self
+            .conn
+            .query("SELECT pid, heartbeat_at FROM daemon_lock WHERE id = 1", ())
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some((row.get::<i64>(0)? as u32, row.get::<i64>(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Orphan age of the daemon lock: `Some(heartbeat_age_secs)` when the
+    /// lock is held by a PID that is **not alive on this host** AND its
+    /// heartbeat is older than `grace_secs`; `None` when the lock is healthy
+    /// (live PID, fresh heartbeat) or absent. This is the read-only detection
+    /// half of the orphan-lock repair — a running daemon is never reported.
+    pub async fn daemon_lock_orphan_age(&self, now: i64, grace_secs: i64) -> Result<Option<i64>> {
+        let Some((pid, heartbeat_at)) = self.daemon_lock_snapshot().await? else {
+            return Ok(None);
+        };
+        let age = now - heartbeat_at;
+        if pid_alive(pid) || age <= grace_secs {
+            return Ok(None);
+        }
+        Ok(Some(age))
+    }
+
+    /// Clear an orphaned daemon-lock row — but **only** when it is genuinely
+    /// orphaned by the same rule as [`daemon_lock_orphan_age`] (dead PID +
+    /// stale heartbeat). Returns `true` when a row was removed. A live daemon
+    /// (running PID or fresh heartbeat) is never cleared, so this is safe to
+    /// run while a daemon is up. Backs the `locks.clear_orphan` remediation.
+    pub async fn clear_stale_daemon_lock(&self, now: i64, grace_secs: i64) -> Result<bool> {
+        let Some((pid, heartbeat_at)) = self.daemon_lock_snapshot().await? else {
+            return Ok(false);
+        };
+        if pid_alive(pid) || now - heartbeat_at <= grace_secs {
+            return Ok(false);
+        }
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM daemon_lock WHERE id = 1 AND pid = ?1",
+                params!(pid as i64),
+            )
+            .await?;
+        Ok(removed > 0)
     }
 
     /// Delete a task and all its run history. Returns true if found.
@@ -925,5 +977,86 @@ mod tests {
                 .unwrap(),
             "stale heartbeat must permit takeover even when recorded PID is alive",
         );
+    }
+
+    #[tokio::test]
+    async fn orphan_age_and_clear_remove_dead_stale_lock() {
+        // The crash-recovery case `borg doctor --repair` exists for: a daemon
+        // SIGKILLed mid-session leaves a lock row whose PID is dead. Both the
+        // detection (`daemon_lock_orphan_age`) and the repair
+        // (`clear_stale_daemon_lock`) must fire once the heartbeat is stale.
+        let db = test_db().await;
+        let dead_pid = reaped_child_pid();
+        let lock_time = 1_000;
+        assert!(db.acquire_daemon_lock(dead_pid, lock_time).await.unwrap());
+
+        // 400s later: dead PID + heartbeat past the 300s grace → orphaned.
+        let now = lock_time + 400;
+        let grace = 300;
+        assert_eq!(
+            db.daemon_lock_orphan_age(now, grace).await.unwrap(),
+            Some(400),
+            "dead PID past grace must report its idle age",
+        );
+        assert!(
+            db.clear_stale_daemon_lock(now, grace).await.unwrap(),
+            "stale orphan lock must be removed",
+        );
+        assert_eq!(
+            db.daemon_lock_snapshot().await.unwrap(),
+            None,
+            "row must be gone after clear",
+        );
+        assert!(
+            !db.clear_stale_daemon_lock(now, grace).await.unwrap(),
+            "second clear is a no-op (nothing to remove)",
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_age_spares_dead_pid_within_grace() {
+        // A daemon that died seconds ago is still inside the heartbeat grace
+        // window — clearing it would race a restart that's about to take over.
+        // Detection must stay silent and repair must not remove the row.
+        let db = test_db().await;
+        let dead_pid = reaped_child_pid();
+        let lock_time = 1_000;
+        assert!(db.acquire_daemon_lock(dead_pid, lock_time).await.unwrap());
+
+        let now = lock_time + 10; // 10s < 300s grace
+        let grace = 300;
+        assert_eq!(db.daemon_lock_orphan_age(now, grace).await.unwrap(), None);
+        assert!(!db.clear_stale_daemon_lock(now, grace).await.unwrap());
+        assert!(
+            db.daemon_lock_snapshot().await.unwrap().is_some(),
+            "fresh-heartbeat lock must be preserved",
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_age_spares_live_pid_even_when_stale() {
+        // A live daemon whose heartbeat thread merely stalled (e.g. a long GC
+        // pause) must never be treated as orphaned — its PID is alive. PID 1
+        // (launchd/init) is reliably alive on any Unix host.
+        let db = test_db().await;
+        let live_pid = 1u32;
+        let lock_time = 1_000;
+        assert!(db.acquire_daemon_lock(live_pid, lock_time).await.unwrap());
+
+        let now = lock_time + 10_000; // heartbeat very stale
+        let grace = 300;
+        assert_eq!(
+            db.daemon_lock_orphan_age(now, grace).await.unwrap(),
+            None,
+            "live PID must never be reported orphaned regardless of staleness",
+        );
+        assert!(!db.clear_stale_daemon_lock(now, grace).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn orphan_age_none_when_no_lock() {
+        let db = test_db().await;
+        assert_eq!(db.daemon_lock_orphan_age(1_000, 300).await.unwrap(), None);
+        assert!(!db.clear_stale_daemon_lock(1_000, 300).await.unwrap());
     }
 }

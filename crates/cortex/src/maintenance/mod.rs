@@ -32,7 +32,7 @@ pub use fs_setup::{ensure_data_subdirs, ensure_global_index};
 pub use gateway_recovery::recover_gateway_if_abandoned;
 
 use budget::BudgetTracker;
-use embeddings::{repair_embedding_backlog, EmbeddingRepairReport, EMBEDDING_CACHE_TTL_SECS};
+use embeddings::{repair_embedding_backlog, EMBEDDING_CACHE_TTL_SECS};
 use issues::{group_issues_by_remediation, issue_snapshots, RepairExecution};
 use log_prune::{
     prune_log_files, truncate_oversized_logs, CAPPED_LOG_FILES, LOG_FILE_KEEP_BYTES,
@@ -201,6 +201,82 @@ impl MaintenanceReport {
             self.messages_purged,
             self.audit_events_tombstoned,
         )
+    }
+}
+
+/// Result of applying one remediation key via [`apply_remediation_key`].
+/// Keeps the embeddings-internal `EmbeddingRepairReport` out of the public
+/// signature while still surfacing the counts the maintenance sweep needs.
+#[derive(Debug, Default)]
+pub struct RemediationOutcome {
+    /// Whether the action mutated state (so the issue can be marked fixed).
+    pub changed: bool,
+    /// Embedding-repair detail, present only for `embeddings.repair`.
+    pub embeddings: Option<EmbeddingRemediation>,
+}
+
+/// Embedding-repair counts surfaced from `embeddings.repair`.
+#[derive(Debug, Default)]
+pub struct EmbeddingRemediation {
+    /// Whole-file embeddings re-computed.
+    pub repaired_files: usize,
+    /// Chunk indexes rebuilt.
+    pub repaired_chunks: usize,
+    /// True when the repair pass failed partway (provider unavailable, etc.).
+    pub failed: bool,
+    /// Diagnostic issue keys the repair cleared, for issue-state bookkeeping.
+    pub fixed_issue_keys: Vec<String>,
+}
+
+/// Apply the repair action for a single `AutoSafe` remediation `key`.
+///
+/// Single source of truth for *what each remediation key does*, shared by
+/// the nightly maintenance sweep ([`run_daily_maintenance_with_registry`])
+/// and the on-demand `borg doctor --repair` driver
+/// ([`crate::doctor::repair::repair_from_report`]) so both surfaces run
+/// byte-identical repair logic. Unknown keys are a no-op.
+pub async fn apply_remediation_key(
+    db: &Database,
+    config: &Config,
+    key: &str,
+) -> Result<RemediationOutcome> {
+    match key {
+        "data.ensure_subdirs" => Config::data_dir()
+            .and_then(|dir| ensure_data_subdirs(&dir))
+            .map(|_| RemediationOutcome {
+                changed: true,
+                embeddings: None,
+            }),
+        "memory.ensure_global_index" => {
+            ensure_global_index(db)
+                .await
+                .map(|changed| RemediationOutcome {
+                    changed,
+                    embeddings: None,
+                })
+        }
+        "embeddings.repair" => repair_embedding_backlog(db, config).await.map(|r| {
+            let changed = r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed;
+            RemediationOutcome {
+                changed,
+                embeddings: Some(EmbeddingRemediation {
+                    repaired_files: r.repaired_files,
+                    repaired_chunks: r.repaired_chunks,
+                    failed: r.failed,
+                    fixed_issue_keys: r.fixed_issue_keys,
+                }),
+            }
+        }),
+        "locks.clear_orphan" => {
+            let now = chrono::Utc::now().timestamp();
+            db.clear_stale_daemon_lock(now, crate::doctor::DAEMON_LOCK_STALE_SECS)
+                .await
+                .map(|removed| RemediationOutcome {
+                    changed: removed,
+                    embeddings: None,
+                })
+        }
+        _ => Ok(RemediationOutcome::default()),
     }
 }
 
@@ -491,27 +567,16 @@ pub async fn run_daily_maintenance_with_registry(
         group_issues_by_remediation(&initial_issues)
     };
     for (key, issues) in grouped {
-        let result: Result<(bool, Option<EmbeddingRepairReport>)> = match key {
-            "data.ensure_subdirs" => Config::data_dir()
-                .and_then(|dir| ensure_data_subdirs(&dir))
-                .map(|_| (true, None)),
-            "memory.ensure_global_index" => {
-                ensure_global_index(db).await.map(|changed| (changed, None))
-            }
-            "embeddings.repair" => repair_embedding_backlog(db, config).await.map(|r| {
-                report.embeddings_repaired_files += r.repaired_files;
-                report.embeddings_repaired_chunks += r.repaired_chunks;
-                budget.try_spend(r.repaired_files);
-                (
-                    r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed,
-                    Some(r),
-                )
-            }),
-            _ => Ok((false, None)),
-        };
+        let result = apply_remediation_key(db, config, key).await;
         match result {
-            Ok((changed, maybe_embedding_report)) => {
-                if let Some(embedding_report) = maybe_embedding_report {
+            Ok(outcome) => {
+                let changed = outcome.changed;
+                if let Some(r) = outcome.embeddings.as_ref() {
+                    report.embeddings_repaired_files += r.repaired_files;
+                    report.embeddings_repaired_chunks += r.repaired_chunks;
+                    budget.try_spend(r.repaired_files);
+                }
+                if let Some(embedding_report) = outcome.embeddings {
                     for issue in embedding_report.fixed_issue_keys {
                         repair_execution.fixed_issues.insert(issue);
                     }

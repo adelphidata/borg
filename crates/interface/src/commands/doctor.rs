@@ -28,8 +28,13 @@ pub(crate) enum DoctorAction {
     },
 }
 
-pub(crate) async fn dispatch_doctor(action: Option<DoctorAction>) -> Result<()> {
+pub(crate) async fn dispatch_doctor(
+    action: Option<DoctorAction>,
+    repair: bool,
+    force: bool,
+) -> Result<()> {
     match action {
+        None if repair => run_repair(force).await,
         None => super::misc::run_doctor().await,
         Some(DoctorAction::Squelches) => run_list().await,
         Some(DoctorAction::Squelch {
@@ -40,6 +45,43 @@ pub(crate) async fn dispatch_doctor(action: Option<DoctorAction>) -> Result<()> 
         }) => run_squelch(&category, &name, ttl_days, reason.as_deref()).await,
         Some(DoctorAction::Unsquelch { category, name }) => run_unsquelch(&category, &name).await,
     }
+}
+
+/// `borg doctor --repair` / `--fix`: run diagnostics, then apply every
+/// auto-safe remediation it found, taking a full backup first. Runs locally
+/// (the orphan-lock-after-crash case is inherently daemon-down); `/heal`
+/// remains the daemon-side equivalent.
+async fn run_repair(force: bool) -> Result<()> {
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
+    let report = cortex::doctor::run_diagnostics(&config).await;
+    let db = cortex::db::Database::open()
+        .await
+        .context("open database for repair")?;
+
+    let result = cortex::doctor::repair::repair_from_report(&db, &config, &report, force).await?;
+
+    if result.nothing_to_do() {
+        println!("Nothing to repair — all checks are healthy or need manual action.");
+        return Ok(());
+    }
+    if let Some(path) = &result.backup_path {
+        println!("Backup written: {}", path.display());
+    }
+    for key in &result.applied {
+        println!("  ✓ repaired: {key}");
+    }
+    for key in &result.noop {
+        println!("  • already healthy: {key}");
+    }
+    for (key, err) in &result.failed {
+        println!("  ✗ failed: {key} — {err}");
+    }
+    if !result.failed.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn now_unix() -> i64 {

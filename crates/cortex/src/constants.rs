@@ -647,6 +647,22 @@ pub const GATEWAY_RESPAWN_BASE_DELAY: Duration = Duration::from_millis(250);
 /// Consecutive daemon-lock refresh failures before the daemon exits (lock stolen).
 pub const DAEMON_LOCK_MAX_REFRESH_FAILURES: u32 = 3;
 
+/// Seconds without a heartbeat refresh before a daemon lock is considered
+/// stale. Past this — with a dead holder PID — the lock-takeover path reclaims
+/// it and `borg doctor` reports it as orphaned. Single source for the
+/// detection grace and the takeover grace so the two can never drift.
+pub const DAEMON_LOCK_STALE_SECS: i64 = 300;
+
+/// launchd service label (macOS): the daemon's reverse-DNS identifier; the
+/// installed plist is `<label>.plist`. Shared by the service installer
+/// (`borgd_launcher`) and the `borg doctor` service-install check so neither
+/// probes a diverging path.
+pub const LAUNCHD_SERVICE_LABEL: &str = "com.borg.daemon";
+
+/// systemd unit filename (Linux) for the daemon. Same single-source rationale
+/// as [`LAUNCHD_SERVICE_LABEL`].
+pub const SYSTEMD_UNIT_NAME: &str = "borg.service";
+
 // ── Self-healing ──────────────────────────────────────────────────
 
 /// How often the daemon loop scans for scheduled tasks whose `next_run`

@@ -27,7 +27,8 @@ use cortex::util::unix_ext::set_unix_mode;
 
 use crate::daemon_client;
 
-const LAUNCHD_LABEL: &str = "com.borg.daemon";
+// Single-sourced with the `borg doctor` service-install check (cortex).
+const LAUNCHD_LABEL: &str = cortex::constants::LAUNCHD_SERVICE_LABEL;
 #[cfg(test)]
 const BORGD_INSTALL_PATH: &str = "/usr/local/bin/borgd";
 
@@ -863,16 +864,13 @@ impl SystemdScope {
     }
 
     fn unit_path(self) -> Result<PathBuf> {
+        let unit = cortex::constants::SYSTEMD_UNIT_NAME;
         match self {
-            Self::System => Ok(PathBuf::from("/etc/systemd/system/borg.service")),
+            Self::System => Ok(PathBuf::from("/etc/systemd/system").join(unit)),
             Self::User => {
                 let home = dirs::home_dir()
                     .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-                Ok(home
-                    .join(".config")
-                    .join("systemd")
-                    .join("user")
-                    .join("borg.service"))
+                Ok(home.join(".config").join("systemd").join("user").join(unit))
             }
         }
     }

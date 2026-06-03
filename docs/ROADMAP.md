@@ -161,18 +161,6 @@ top-down by priority, not by section order.
 
 ### Resilience & self-healing
 
-- **`borg doctor` — expanded checks + repair modes.** `[O][I]` Today
-  `borg doctor` is mostly read-only and covers a narrow slice. Two
-  axes of growth: (1) broader checks (~16 subsystems — settings
-  validity, LLM credential reachability, DB integrity, embeddings
-  cache, scheduled tasks, gateway bindings, MCP servers, skills load,
-  secrets/keychain, service install state, Docker daemon presence,
-  tunnel binaries); (2) `--repair` / `--fix` / `--force` that actually
-  mutate with backups — legacy config-shape migrations, stale session
-  lock removal (clear orphaned locks when a daemon crashed
-  mid-session), orphan transcript archival, corrupted auth-profile
-  repair. Pairs with the daily self-heal task — doctor is the
-  on-demand surface, self-heal is the cron surface.
 - **Session/transcript JSON repair on load.** `[O]` Detect corrupted
   `messages` rows or orphaned attachment blobs at session-open time
   and repair (truncate to last clean turn, archive bad blobs) instead

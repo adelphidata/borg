@@ -1854,21 +1854,25 @@ async fn run_event_loop(
                     use cortex::doctor::DiagnosticRunner;
                     let mut runner = DiagnosticRunner::new();
                     let mut all_checks: Vec<cortex::doctor::DiagnosticCheck> = Vec::new();
-                    while let Some(label) = runner.peek_label(&config) {
+                    // Drive off `next_step`'s returned label, not `peek_label`:
+                    // `next_step` internally skips `suppress_when_empty` steps
+                    // that produced no rows, so the label it returns always
+                    // matches the checks it returns. Announcing the peeked label
+                    // instead would render a step's checks under the previous
+                    // (suppressed) step's header.
+                    while let Some((label, checks)) = runner.next_step(&config).await {
                         let _ = tx
                             .send(app::DoctorEvent::Analyzing {
                                 label: label.to_string(),
                             })
                             .await;
-                        if let Some((_label, checks)) = runner.next_step(&config).await {
-                            all_checks.extend(checks.clone());
-                            let _ = tx
-                                .send(app::DoctorEvent::Result {
-                                    label: label.to_string(),
-                                    checks,
-                                })
-                                .await;
-                        }
+                        all_checks.extend(checks.clone());
+                        let _ = tx
+                            .send(app::DoctorEvent::Result {
+                                label: label.to_string(),
+                                checks,
+                            })
+                            .await;
                     }
                     let report = cortex::doctor::DiagnosticReport { checks: all_checks };
                     let (pass, warn, fail) = report.counts();

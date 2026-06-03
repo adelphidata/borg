@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use crate::config::security::KekBackend;
+use crate::config::tunnel::TunnelProvider;
 use crate::config::Config;
 use crate::constants::{IDENTITY_FILE, SECS_PER_DAY};
 use crate::db::Database;
@@ -7,6 +9,7 @@ use crate::llm::provider::Provider;
 use crate::process_registry::ProcessRegistry;
 use crate::skills::load_all_skills;
 
+pub mod repair;
 mod types;
 pub use types::{CheckStatus, DiagnosticCheck, DiagnosticReport, RemediationKind};
 
@@ -28,17 +31,26 @@ const EMBEDDING_LAG_WARN_THRESHOLD: usize = 5;
 /// sync. Order is operator-visible in `borg doctor` output.
 const STEPS: &[StepKind] = &[
     StepKind::Provider,
+    StepKind::Credentials,
+    StepKind::Settings,
     StepKind::Secrets,
+    StepKind::Keychain,
     StepKind::Sandbox,
     StepKind::Skills,
     StepKind::Memory,
     StepKind::Embeddings,
     StepKind::Data,
+    StepKind::Locks,
     StepKind::Gateway,
+    StepKind::Tunnel,
     StepKind::Heartbeat,
+    StepKind::ScheduledTasks,
+    StepKind::Service,
     StepKind::Budget,
     StepKind::PromptCache,
     StepKind::Plugins,
+    StepKind::Mcp,
+    StepKind::Docker,
     StepKind::Browser,
     StepKind::Agents,
     StepKind::Security,
@@ -46,20 +58,35 @@ const STEPS: &[StepKind] = &[
     StepKind::HostAudit,
 ];
 
+/// Re-exported for the orphan-lock doctor check and `--repair`. The threshold
+/// and its single definition live with the lock mechanism in
+/// [`crate::constants`]; `acquire_daemon_lock` / `is_daemon_lock_held` use the
+/// same constant, so detection and takeover grace can't drift.
+pub use crate::constants::DAEMON_LOCK_STALE_SECS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepKind {
     Provider,
+    Credentials,
+    Settings,
     Secrets,
+    Keychain,
     Sandbox,
     Skills,
     Memory,
     Embeddings,
     Data,
+    Locks,
     Gateway,
+    Tunnel,
     Heartbeat,
+    ScheduledTasks,
+    Service,
     Budget,
     PromptCache,
     Plugins,
+    Mcp,
+    Docker,
     Browser,
     Agents,
     Security,
@@ -72,17 +99,26 @@ impl StepKind {
     const fn label(self) -> &'static str {
         match self {
             Self::Provider => "Provider",
+            Self::Credentials => "Credentials",
+            Self::Settings => "Settings",
             Self::Secrets => "Secrets",
+            Self::Keychain => "Keychain",
             Self::Sandbox => "Sandbox",
             Self::Skills => "Skills",
             Self::Memory => "Memory",
             Self::Embeddings => "Embeddings",
             Self::Data => "Data",
+            Self::Locks => "Locks",
             Self::Gateway => "Gateway",
+            Self::Tunnel => "Tunnel",
             Self::Heartbeat => "Heartbeat",
+            Self::ScheduledTasks => "Scheduled Tasks",
+            Self::Service => "Service",
             Self::Budget => "Budget",
             Self::PromptCache => "Prompt Cache",
             Self::Plugins => "Plugins",
+            Self::Mcp => "MCP",
+            Self::Docker => "Docker",
             Self::Browser => "Browser",
             Self::Agents => "Agents",
             Self::Security => "Security",
@@ -92,7 +128,7 @@ impl StepKind {
     }
 
     /// Whether this step runs for the given config. Returning `false` skips
-    /// the step entirely — neither `peek_label` nor `next_step` surface it.
+    /// the step entirely — `next_step` never surfaces it.
     fn enabled(self, config: &Config) -> bool {
         match self {
             Self::HostAudit => config.security.host_audit,
@@ -105,23 +141,46 @@ impl StepKind {
     /// because "platform doesn't apply" yields an empty result on macOS
     /// and printing a bare header would mislead operators.
     const fn suppress_when_empty(self) -> bool {
-        matches!(self, Self::HostAudit)
+        // These checks are applicability-gated: when the subsystem isn't
+        // configured/in-use (no MCP servers, no tunnel provider, docker not
+        // enabled, no orphan lock, no key-based provider, service not
+        // installed) the check fn emits zero rows and we drop the header
+        // entirely — never a false "problem" on a vanilla install.
+        matches!(
+            self,
+            Self::HostAudit
+                | Self::Credentials
+                | Self::Locks
+                | Self::Tunnel
+                | Self::Service
+                | Self::Mcp
+                | Self::Docker
+        )
     }
 
     async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         match self {
             Self::Provider => check_provider(config, checks),
+            Self::Credentials => check_llm_credentials(config, checks).await,
+            Self::Settings => check_settings(config, checks),
             Self::Secrets => check_secrets(config, checks),
+            Self::Keychain => check_keychain(config, checks),
             Self::Sandbox => check_sandbox(checks),
             Self::Skills => check_skills(config, checks).await,
             Self::Memory => check_memory(checks).await,
             Self::Embeddings => check_embeddings(config, checks).await,
             Self::Data => check_data_dir(checks).await,
+            Self::Locks => check_daemon_lock(checks).await,
             Self::Gateway => check_gateway(config, checks),
+            Self::Tunnel => check_tunnel(config, checks),
             Self::Heartbeat => check_heartbeat(config, checks).await,
+            Self::ScheduledTasks => check_scheduled_tasks(checks).await,
+            Self::Service => check_service(checks),
             Self::Budget => check_budget(config, checks).await,
             Self::PromptCache => check_prompt_cache(config, checks).await,
             Self::Plugins => check_plugins(checks).await,
+            Self::Mcp => check_mcp(config, checks),
+            Self::Docker => check_docker(config, checks),
             Self::Browser => check_browser(config, checks),
             Self::Agents => check_agents(config, checks).await,
             Self::Security => check_config_security(config, checks),
@@ -135,18 +194,6 @@ impl DiagnosticRunner {
     /// Create a new diagnostic runner starting at step 0.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Returns the label of the next step that would run for `config`,
-    /// skipping any disabled steps. Returns `None` when no more steps will
-    /// run. Note: this can't predict the [`StepKind::suppress_when_empty`]
-    /// case — Host Audit's label is returned even when the actual run will
-    /// drop empty output. Preserves prior behavior.
-    pub fn peek_label(&self, config: &Config) -> Option<&'static str> {
-        STEPS[self.step..]
-            .iter()
-            .find(|kind| kind.enabled(config))
-            .map(|kind| kind.label())
     }
 
     /// Run the next enabled step. Returns `None` when all steps are done.
@@ -1447,6 +1494,404 @@ fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
+// ───────────────────────── Expanded subsystem checks ─────────────────────────
+//
+// Each public-facing check below is applicability-gated: when its subsystem
+// isn't configured/in-use it emits zero rows and `suppress_when_empty` drops
+// the section. The pass/warn/fail decision is factored into a pure `classify_*`
+// helper (or a DB-injectable inner fn) wherever external state is involved, so
+// the thresholds are unit-testable without a network, a live daemon, or the
+// real `~/.borg` on disk.
+
+/// Settings validity: runs the same `Config::validate()` the loader runs so a
+/// fatal misconfiguration (out-of-range temperature, zero token caps) surfaces
+/// as a failing check rather than a silent clamp at boot. Always applicable.
+fn check_settings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    match config.validate() {
+        Ok(()) => checks.push(DiagnosticCheck::pass("Settings", "config values valid")),
+        Err(e) => {
+            let mut c = DiagnosticCheck::fail("Settings", "config values valid", format!("{e}"));
+            c.remediation_kind = RemediationKind::Manual;
+            c.user_hint =
+                Some("fix it via `borg settings set <key> <value>` or `/settings`".to_string());
+            checks.push(c);
+        }
+    }
+}
+
+/// Pure pass/warn/fail decision for credential-pool health. Split out so the
+/// thresholds are testable without constructing a real pool. `has_credentials`
+/// false → Fail (nothing usable); available → Pass; configured-but-all-cooling
+/// → Warn with the earliest recovery estimate.
+fn classify_credential_pool(
+    provider_name: &str,
+    has_credentials: bool,
+    has_available: bool,
+    next_recovery_at_ms: Option<i64>,
+    now_ms: i64,
+) -> DiagnosticCheck {
+    if !has_credentials {
+        return DiagnosticCheck::fail(
+            "Credentials",
+            format!("{provider_name} credentials"),
+            "no usable API credentials resolved for the active provider",
+        );
+    }
+    if has_available {
+        return DiagnosticCheck::pass(
+            "Credentials",
+            format!("{provider_name} credentials available"),
+        );
+    }
+    let detail = match next_recovery_at_ms {
+        Some(reset_ms) if reset_ms > now_ms => {
+            format!(
+                "all keys rate-limited/cooling — earliest recovery in ~{}s",
+                (reset_ms - now_ms) / 1000
+            )
+        }
+        _ => "all keys exhausted with no scheduled recovery".to_string(),
+    };
+    DiagnosticCheck::warn(
+        "Credentials",
+        format!("{provider_name} credentials"),
+        detail,
+    )
+}
+
+/// Whether the credential-pool check applies to `provider`: only providers
+/// that authenticate with a plaintext API key have an inspectable pool. Local
+/// (Ollama), CLI, and AWS-credential-chain providers have no pool and are
+/// covered by the Provider check. Pure, so the applicability gate is testable
+/// alongside the severity mapping in `classify_credential_pool`.
+fn credential_check_applies(provider: Provider) -> bool {
+    provider.requires_api_key() && !provider.uses_aws_credential_chain()
+}
+
+/// LLM credential-pool health (offline). Applicable only to key-authenticated
+/// providers (see [`credential_check_applies`]); other providers are covered by
+/// the Provider check.
+async fn check_llm_credentials(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    let (provider, keys) = match config.resolve_api_keys() {
+        Ok((p, keys)) if credential_check_applies(p) => (p, keys),
+        _ => return,
+    };
+    if keys.iter().all(String::is_empty) {
+        return; // nothing resolvable — the Provider check already reports this
+    }
+    let pool = crate::llm::credential_pool::try_build_from_keys(
+        provider,
+        keys,
+        config.llm.credential_strategy,
+        config.llm.credential_cooldown_secs,
+        config.llm.max_concurrent_per_credential,
+        config.llm.proactive_rate_limit_threshold_pct,
+        config.llm.proactive_rate_limit_min_window_secs,
+    )
+    .await;
+    match pool {
+        Some(pool) => checks.push(classify_credential_pool(
+            provider.as_str(),
+            pool.has_credentials(),
+            pool.has_available(),
+            pool.next_recovery_at_ms(),
+            chrono::Utc::now().timestamp_millis(),
+        )),
+        None => checks.push(DiagnosticCheck::warn(
+            "Credentials",
+            format!("{} credential pool", provider.as_str()),
+            "could not load credential pool (see logs)",
+        )),
+    }
+}
+
+/// Pure decision for the secrets-backend posture check. `kek_file_present` only
+/// matters for the `File` backend, whose encrypted blob must exist.
+fn classify_keychain(backend: KekBackend, kek_file_present: bool) -> DiagnosticCheck {
+    match backend {
+        KekBackend::OsKeychain => DiagnosticCheck::pass("Keychain", "KEK backend: OS keychain"),
+        // `Auto` resolves to a concrete backend on first daemon start and
+        // persists it; seeing it here just means the daemon hasn't booted yet.
+        KekBackend::Auto => {
+            DiagnosticCheck::pass("Keychain", "KEK backend: auto (resolves on daemon start)")
+        }
+        KekBackend::File if kek_file_present => DiagnosticCheck::warn(
+            "Keychain",
+            "KEK backend: encrypted file",
+            "file backend in use — posture is Reduced (×0.85). `borg service install --secure` upgrades to an OS keychain",
+        ),
+        KekBackend::File => DiagnosticCheck::fail(
+            "Keychain",
+            "KEK backend: encrypted file",
+            "file backend selected but ~/.borg/secrets/kek.enc is missing — the daemon cannot unseal its keys",
+        ),
+    }
+}
+
+/// Secrets/keychain posture. Config-based (cortex doesn't link `identity`, so
+/// no live keychain round-trip): reports the resolved KEK backend and, for the
+/// file backend, whether its encrypted blob is present. Always applicable.
+fn check_keychain(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    let kek_present = Config::data_dir()
+        .map(|home| crate::paths::kek_file_path(&home).exists())
+        .unwrap_or(false);
+    checks.push(classify_keychain(config.security.kek_backend, kek_present));
+}
+
+/// Build the orphan-lock finding from its idle age. Pulled out so the message
+/// and remediation wiring are testable without a DB. The detection itself
+/// (dead PID + stale heartbeat) lives in `Database::daemon_lock_orphan_age`.
+fn orphan_lock_check(idle_secs: i64) -> DiagnosticCheck {
+    DiagnosticCheck::warn(
+        "Locks",
+        "orphan daemon lock",
+        format!("daemon lock held by a dead PID, idle {idle_secs}s — a daemon likely crashed mid-session"),
+    )
+    .with_remediation(
+        RemediationKind::AutoSafe,
+        "locks.clear_orphan",
+        "run `borg doctor --repair` (or `/heal`) to clear the stale lock",
+    )
+}
+
+/// Orphan daemon-lock detection. Emits a finding only when the lock is held by
+/// a dead PID past the staleness grace — a running daemon (live PID or fresh
+/// heartbeat) is never flagged. Suppressed when healthy/absent.
+async fn check_daemon_lock(checks: &mut Vec<DiagnosticCheck>) {
+    let Ok(db) = Database::open().await else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(Some(age)) = db.daemon_lock_orphan_age(now, DAEMON_LOCK_STALE_SECS).await {
+        checks.push(orphan_lock_check(age));
+    }
+}
+
+/// Scheduled-task health from a DB handle (injectable for tests). Surfaces a
+/// count summary plus any task whose last run errored — the genuinely
+/// actionable signal. Overdue-but-not-errored tasks are left to the nightly
+/// heal (flagging them here would be noise whenever the daemon is simply off).
+async fn scheduled_task_checks(db: &Database) -> Vec<DiagnosticCheck> {
+    // Single fetch: `list_tasks` already returns every row including
+    // `last_error`, so the count summary and the errored subset come from one
+    // scan rather than a second `tasks_with_last_error` query.
+    let tasks = match db.list_tasks().await {
+        Ok(t) => t,
+        Err(e) => {
+            return vec![DiagnosticCheck::warn(
+                "Scheduled Tasks",
+                "task store",
+                format!("could not list tasks: {e}"),
+            )]
+        }
+    };
+    let mut out = vec![DiagnosticCheck::pass(
+        "Scheduled Tasks",
+        format!("{} scheduled task(s)", tasks.len()),
+    )];
+    let mut errored: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t.last_error.as_deref().is_some_and(|e| !e.is_empty()))
+        .map(|t| t.name.as_str())
+        .collect();
+    errored.sort_unstable(); // stable, name-ordered output
+    if !errored.is_empty() {
+        let sample = errored
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(DiagnosticCheck::warn(
+            "Scheduled Tasks",
+            "tasks with errors",
+            format!(
+                "{} task(s) failed their last run (e.g. {sample}) — inspect via `borg schedule list`",
+                errored.len()
+            ),
+        ));
+    }
+    out
+}
+
+async fn check_scheduled_tasks(checks: &mut Vec<DiagnosticCheck>) {
+    match Database::open().await {
+        Ok(db) => checks.extend(scheduled_task_checks(&db).await),
+        Err(e) => checks.push(DiagnosticCheck::warn(
+            "Scheduled Tasks",
+            "task store",
+            format!("database unavailable: {e}"),
+        )),
+    }
+}
+
+/// Candidate service-unit paths for this platform (launchd plist on macOS,
+/// systemd user/system unit on Linux). Mirrors `borgd_launcher`'s install
+/// paths; kept here so the cortex-side check needs no `interface` dependency.
+fn service_unit_paths() -> Vec<std::path::PathBuf> {
+    use crate::constants::{LAUNCHD_SERVICE_LABEL, SYSTEMD_UNIT_NAME};
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        if cfg!(target_os = "macos") {
+            paths.push(
+                home.join("Library/LaunchAgents")
+                    .join(format!("{LAUNCHD_SERVICE_LABEL}.plist")),
+            );
+        } else if cfg!(target_os = "linux") {
+            paths.push(home.join(".config/systemd/user").join(SYSTEMD_UNIT_NAME));
+        }
+    }
+    if cfg!(target_os = "linux") {
+        paths.push(std::path::PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT_NAME));
+    }
+    paths
+}
+
+/// Pure decision for the service-install check. Detection-only: an installed
+/// unit → informational Pass; not installed → `None` (a foreground setup is a
+/// normal, non-error state, so the section is suppressed).
+fn classify_service(installed_at: Option<&std::path::Path>) -> Option<DiagnosticCheck> {
+    installed_at.map(|p| {
+        DiagnosticCheck::pass(
+            "Service",
+            format!("daemon installed as a service ({})", p.display()),
+        )
+    })
+}
+
+fn check_service(checks: &mut Vec<DiagnosticCheck>) {
+    let found = service_unit_paths().into_iter().find(|p| p.exists());
+    if let Some(check) = classify_service(found.as_deref()) {
+        checks.push(check);
+    }
+}
+
+/// External binary a tunnel provider needs, if any. `None` (no tunnel) and
+/// `Custom` (operator-supplied command) have no fixed binary requirement.
+fn tunnel_binary(provider: TunnelProvider) -> Option<&'static str> {
+    match provider {
+        TunnelProvider::Cloudflare => Some("cloudflared"),
+        TunnelProvider::Ngrok => Some("ngrok"),
+        TunnelProvider::Tailscale => Some("tailscale"),
+        TunnelProvider::None | TunnelProvider::Custom => None,
+    }
+}
+
+/// Pure severity mapping for the tunnel check, given the provider's already-
+/// resolved `bin` (applicability — does the provider need a binary — is gated by
+/// `check_tunnel`). Binary missing from PATH → Fail; present → Pass.
+fn classify_tunnel(provider: TunnelProvider, bin: &str, binary_present: bool) -> DiagnosticCheck {
+    if binary_present {
+        DiagnosticCheck::pass("Tunnel", format!("{provider} binary `{bin}` found"))
+    } else {
+        let mut c = DiagnosticCheck::fail(
+            "Tunnel",
+            format!("{provider} binary"),
+            format!("`{bin}` not found on PATH — `borg tunnel start` will fail"),
+        );
+        c.remediation_kind = RemediationKind::Manual;
+        c.user_hint = Some(format!("install `{bin}` and ensure it is on PATH"));
+        c
+    }
+}
+
+fn check_tunnel(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    let provider = config.tunnel.provider;
+    if let Some(bin) = tunnel_binary(provider) {
+        checks.push(classify_tunnel(provider, bin, which::which(bin).is_ok()));
+    }
+}
+
+/// Build the per-server MCP check from its lifecycle label. Pure so the
+/// state→severity mapping is testable without a live registry — which the CLI
+/// `borg doctor` doesn't have, so every server reads as "not-started" there.
+/// That state must NOT be a failure (configured ≠ broken).
+fn mcp_check_for_label(name: &str, label: &str) -> DiagnosticCheck {
+    match label {
+        "connected" => DiagnosticCheck::pass("MCP", format!("{name}: connected")),
+        "auth-failed" => DiagnosticCheck::fail(
+            "MCP",
+            format!("{name}: auth"),
+            "authentication failed — re-pair the server's credentials",
+        ),
+        "reconnecting" => DiagnosticCheck::warn(
+            "MCP",
+            format!("{name}: reconnecting"),
+            "transport dropped — retrying",
+        ),
+        "degraded" => DiagnosticCheck::warn(
+            "MCP",
+            format!("{name}: degraded"),
+            "server is up but some tools were rejected",
+        ),
+        // "not-started" / "disabled" / "live-disabled": informational only.
+        other => DiagnosticCheck::pass("MCP", format!("{name}: {other}")),
+    }
+}
+
+/// MCP server reachability. Applicable only when servers are configured;
+/// suppressed otherwise. Per server, maps its live lifecycle state to a check.
+fn check_mcp(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    for snap in crate::mcp_clients::server_status_snapshot(config) {
+        checks.push(mcp_check_for_label(&snap.name, snap.state_label()));
+    }
+}
+
+/// Whether docker is actually in use — the docker built-in skill is explicitly
+/// enabled. It ships disabled, so a vanilla install reports docker not-in-use
+/// and the whole check is skipped (honoring "don't flag what isn't applicable").
+fn docker_in_use(config: &Config) -> bool {
+    config
+        .skills
+        .entries
+        .get("docker")
+        .map(|e| e.enabled)
+        .unwrap_or(false)
+}
+
+/// Pure severity mapping for the docker check (applicability — whether docker
+/// is in use — is gated by `check_docker` before this is reached). Missing
+/// binary or a down daemon → Warn (not Fail: a down docker only breaks
+/// docker-backed skills, not borg itself).
+fn classify_docker(binary_present: bool, daemon_up: bool) -> DiagnosticCheck {
+    if !binary_present {
+        DiagnosticCheck::warn(
+            "Docker",
+            "docker CLI",
+            "docker skill is enabled but the `docker` binary is not on PATH",
+        )
+    } else if !daemon_up {
+        DiagnosticCheck::warn(
+            "Docker",
+            "docker daemon",
+            "docker skill is enabled but the daemon is not responding (`docker info` failed)",
+        )
+    } else {
+        DiagnosticCheck::pass("Docker", "docker daemon reachable")
+    }
+}
+
+/// Probe the docker daemon with a short `docker info`. Side-effect free; a
+/// non-zero exit (daemon down / no socket) returns false.
+fn docker_daemon_up() -> bool {
+    std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn check_docker(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    if !docker_in_use(config) {
+        return;
+    }
+    let binary_present = which::which("docker").is_ok();
+    let daemon_up = binary_present && docker_daemon_up();
+    checks.push(classify_docker(binary_present, daemon_up));
+}
+
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;
@@ -1940,5 +2385,211 @@ mod tests {
         } else {
             panic!("expected Warn, got {:?}", check.status);
         }
+    }
+}
+
+#[cfg(test)]
+mod expanded_check_tests {
+    use super::*;
+    use crate::db::NewTask;
+
+    fn fails(c: &DiagnosticCheck) -> bool {
+        matches!(c.status, CheckStatus::Fail(_))
+    }
+    fn warns(c: &DiagnosticCheck) -> bool {
+        matches!(c.status, CheckStatus::Warn(_))
+    }
+    fn passes(c: &DiagnosticCheck) -> bool {
+        matches!(c.status, CheckStatus::Pass)
+    }
+
+    #[test]
+    fn settings_check_passes_default_and_fails_out_of_range() {
+        let mut checks = Vec::new();
+        check_settings(&Config::default(), &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert!(passes(&checks[0]), "valid defaults must pass");
+
+        let mut bad = Config::default();
+        bad.llm.temperature = 5.0; // validate() bails outside 0.0..=2.0
+        let mut checks = Vec::new();
+        check_settings(&bad, &mut checks);
+        assert!(fails(&checks[0]), "out-of-range temperature must fail");
+        assert_eq!(checks[0].remediation_kind, RemediationKind::Manual);
+    }
+
+    #[test]
+    fn credential_pool_classification_covers_all_states() {
+        let no_creds = classify_credential_pool("openrouter", false, false, None, 0);
+        assert!(fails(&no_creds), "no credentials → fail");
+
+        let ok = classify_credential_pool("openrouter", true, true, None, 0);
+        assert!(passes(&ok), "available → pass");
+
+        let cooling = classify_credential_pool("openrouter", true, false, Some(61_000), 1_000);
+        assert!(warns(&cooling), "configured but all cooling → warn");
+        let CheckStatus::Warn(msg) = &cooling.status else {
+            unreachable!()
+        };
+        assert!(msg.contains("60s"), "warn must estimate recovery: {msg}");
+    }
+
+    #[test]
+    fn keychain_classification_reflects_backend_and_file_presence() {
+        assert!(passes(&classify_keychain(KekBackend::OsKeychain, false)));
+        assert!(passes(&classify_keychain(KekBackend::Auto, false)));
+        assert!(
+            warns(&classify_keychain(KekBackend::File, true)),
+            "file backend with blob present → reduced-posture warning",
+        );
+        assert!(
+            fails(&classify_keychain(KekBackend::File, false)),
+            "file backend with missing blob → fail (cannot unseal)",
+        );
+    }
+
+    #[test]
+    fn orphan_lock_check_is_autosafe_with_repair_key() {
+        let c = orphan_lock_check(420);
+        assert!(warns(&c));
+        assert_eq!(c.remediation_kind, RemediationKind::AutoSafe);
+        assert_eq!(c.remediation_key, Some("locks.clear_orphan"));
+        let CheckStatus::Warn(msg) = &c.status else {
+            unreachable!()
+        };
+        assert!(msg.contains("420"), "message names the idle age: {msg}");
+    }
+
+    #[test]
+    fn service_check_reports_only_when_installed() {
+        assert!(
+            classify_service(None).is_none(),
+            "no unit file → no finding (foreground is normal)",
+        );
+        let p = std::path::Path::new("/etc/systemd/system/borg.service");
+        let c = classify_service(Some(p)).expect("installed → some");
+        assert!(
+            passes(&c),
+            "installed service is informational, never a failure"
+        );
+    }
+
+    #[test]
+    fn tunnel_classification_gates_on_provider_and_binary() {
+        // Applicability lives in tunnel_binary: no tunnel / custom command have
+        // no fixed binary, so check_tunnel emits nothing for them.
+        assert!(tunnel_binary(TunnelProvider::None).is_none());
+        assert!(tunnel_binary(TunnelProvider::Custom).is_none());
+        assert_eq!(
+            tunnel_binary(TunnelProvider::Cloudflare),
+            Some("cloudflared")
+        );
+        // Provider binary missing → fail; present → pass.
+        let missing = classify_tunnel(TunnelProvider::Ngrok, "ngrok", false);
+        assert!(fails(&missing));
+        assert_eq!(missing.remediation_kind, RemediationKind::Manual);
+        assert!(passes(&classify_tunnel(
+            TunnelProvider::Ngrok,
+            "ngrok",
+            true
+        )));
+    }
+
+    #[test]
+    fn mcp_label_maps_states_without_false_positives() {
+        assert!(fails(&mcp_check_for_label("srv", "auth-failed")));
+        assert!(warns(&mcp_check_for_label("srv", "reconnecting")));
+        assert!(warns(&mcp_check_for_label("srv", "degraded")));
+        assert!(passes(&mcp_check_for_label("srv", "connected")));
+        // The CLI has no live registry — "not-started" must NOT be a problem.
+        assert!(passes(&mcp_check_for_label("srv", "not-started")));
+    }
+
+    #[test]
+    fn mcp_check_emits_nothing_without_configured_servers() {
+        let mut checks = Vec::new();
+        check_mcp(&Config::default(), &mut checks);
+        assert!(
+            checks.is_empty(),
+            "no configured MCP servers → no rows (suppressed section)",
+        );
+    }
+
+    #[test]
+    fn docker_classification_gates_on_use_and_health() {
+        // Applicability: the docker skill ships disabled, so a vanilla install
+        // is not "in use" and check_docker emits nothing.
+        assert!(
+            !docker_in_use(&Config::default()),
+            "docker skill ships disabled"
+        );
+        // Severity mapping (only reached once in-use):
+        assert!(warns(&classify_docker(false, false)), "no binary → warn");
+        assert!(warns(&classify_docker(true, false)), "daemon down → warn");
+        assert!(passes(&classify_docker(true, true)), "healthy → pass");
+    }
+
+    #[test]
+    fn credential_check_applies_only_to_key_providers() {
+        use crate::llm::provider::Provider;
+        // Key-authenticated cloud provider → applicable.
+        assert!(credential_check_applies(Provider::OpenRouter));
+        // Local provider has no key pool → not applicable.
+        assert!(!credential_check_applies(Provider::Ollama));
+        // AWS-credential-chain provider resolves creds elsewhere → not applicable.
+        assert!(!credential_check_applies(Provider::Bedrock));
+    }
+
+    #[tokio::test]
+    async fn scheduled_tasks_warns_only_on_errored_tasks() {
+        let db = Database::test_db().await;
+
+        // Clean store: summary pass, no warning.
+        let clean = scheduled_task_checks(&db).await;
+        assert!(clean.iter().all(passes), "clean store → all pass");
+        assert!(
+            clean.iter().any(|c| c.name.contains("scheduled task(s)")),
+            "must report a task count summary",
+        );
+
+        // Seed a task whose last run errored.
+        db.create_task(&NewTask {
+            id: "boom",
+            name: "flaky job",
+            prompt: "do stuff",
+            schedule_type: "interval",
+            schedule_expr: "1h",
+            timezone: "local",
+            next_run: Some(100),
+            max_retries: Some(3),
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create task");
+        db.set_task_retry("boom", 1, "connection refused", 0)
+            .await
+            .expect("set last_error");
+
+        let after = scheduled_task_checks(&db).await;
+        let err_warn = after
+            .iter()
+            .find(|c| c.name == "tasks with errors")
+            .expect("errored-task warning present");
+        assert!(warns(err_warn), "a task with last_error must warn");
+        let CheckStatus::Warn(msg) = &err_warn.status else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("flaky job"),
+            "warning names the offending task: {msg}"
+        );
     }
 }

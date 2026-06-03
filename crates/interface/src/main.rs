@@ -109,6 +109,15 @@ enum Commands {
     Doctor {
         #[command(subcommand)]
         action: Option<commands::doctor::DoctorAction>,
+        /// Apply detected auto-safe fixes (recreate runtime dirs, seed the
+        /// memory index, backfill embeddings, clear an orphaned daemon lock).
+        /// Takes a full backup under ~/.borg/backups/ before mutating.
+        #[arg(long, visible_alias = "fix")]
+        repair: bool,
+        /// With --repair: proceed even if the pre-repair backup can't be
+        /// written. Without it, a backup failure aborts before any mutation.
+        #[arg(long)]
+        force: bool,
     },
     /// Manage the daemon as a system service
     Service {
@@ -603,7 +612,11 @@ async fn async_main() -> Result<()> {
         }) => repl::one_shot(&message, json, mode.as_deref()).await?,
         Some(Commands::Status { action }) => commands::status::dispatch_status(action).await?,
         Some(Commands::Bond { action }) => commands::status::dispatch_bond(action).await?,
-        Some(Commands::Doctor { action }) => commands::doctor::dispatch_doctor(action).await?,
+        Some(Commands::Doctor {
+            action,
+            repair,
+            force,
+        }) => commands::doctor::dispatch_doctor(action, repair, force).await?,
         Some(Commands::Skills { action }) => commands::skills::dispatch_skills(action).await?,
         Some(Commands::Memory { action }) => commands::memory::dispatch_memory(action).await?,
         Some(Commands::Heal) => commands::heal::run_heal().await?,
@@ -1583,6 +1596,7 @@ mod tests {
                         ttl_days,
                         reason,
                     }),
+                ..
             }) => {
                 assert_eq!(category, "Host Security");
                 assert_eq!(name, "ALF");
@@ -1600,14 +1614,49 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Doctor {
-                action: Some(commands::doctor::DoctorAction::Unsquelch { .. })
+                action: Some(commands::doctor::DoctorAction::Unsquelch { .. }),
+                ..
             })
         ));
         let cli = Cli::try_parse_from(["borg", "doctor", "squelches"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Commands::Doctor {
-                action: Some(commands::doctor::DoctorAction::Squelches)
+                action: Some(commands::doctor::DoctorAction::Squelches),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_parse_doctor_repair_flags() {
+        // --repair and its --fix alias must both set repair; --force is opt-in.
+        let cli = Cli::try_parse_from(["borg", "doctor", "--repair"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                action: None,
+                repair: true,
+                force: false,
+            })
+        ));
+        let cli = Cli::try_parse_from(["borg", "doctor", "--fix", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                action: None,
+                repair: true,
+                force: true,
+            })
+        ));
+        // Bare `doctor` stays read-only.
+        let cli = Cli::try_parse_from(["borg", "doctor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                action: None,
+                repair: false,
+                force: false,
             })
         ));
     }
