@@ -362,6 +362,32 @@ a single-file impl under `crates/cortex/src/memory/provider/` plus a
   `request_user_input` (free-form). Marginal value; likely covered by
   extending `request_user_input` with an `options` parameter rather than
   adding a new tool.
+- **Post-write lint / diagnostics on write + patch.** `[H] ref`
+  Deferred. After every `fs_write` / patch apply, run a fast
+  language-aware check (syntax/lint for Python, JSON, YAML, TOML, Rust)
+  and fold any failure back into the tool result so the agent
+  self-corrects on the next turn instead of discovering the breakage
+  later. Today writes land unchecked — a malformed JSON config or
+  unparseable edit only surfaces when something downstream reads it.
+- **Stale-file staleness guard on whole-file writes.** `[H] ref`
+  Deferred. Track the on-disk mtime/hash of each file the agent reads
+  and refuse (or warn on) a subsequent blind `fs_write` when the file
+  changed underneath since that read — the classic read-modify-write
+  clobber. Complements the patch DSL, which already fails on drifted
+  context anchors but doesn't protect a full-file overwrite.
+- **Per-turn file-mutation verifier footer.** `[H] ref` Deferred.
+  Append a compact "files created / modified / deleted this turn"
+  summary (computed from the workspace diff) to the agent's turn
+  output. Gives the operator an at-a-glance audit of what changed
+  without diffing, and gives the agent a self-check that its writes
+  matched intent.
+- **`/steer` mid-run nudge + `/queue` prompt queue.** `[H] ref`
+  Deferred. `/steer <text>` injects guidance the running agent picks up
+  after its next tool call without interrupting the loop; `/queue
+  <text>` stacks follow-up prompts to run when the current turn
+  finishes. Borg injects `<proactive_nudges>` internally but exposes no
+  operator-facing steer/queue surface — today the only way to redirect
+  a busy agent is to interrupt it.
 
 ## Cost emission: additional providers
 
@@ -402,6 +428,31 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   including xAI/Grok, OpenAI/Groq Whisper, Mistral, Deepgram, local, and
   command-backed providers. URL/base64 ingestion remains deferred until
   it can share the normal URL policy and media-size gates.
+- **Background-process watch patterns + completion notify.** `[H] ref`
+  Deferred. `run_shell` already has persistent-session `start` / `poll`;
+  add fire-and-forget background execution that pushes a notification on
+  process exit and on lines matching operator-supplied `watch_patterns`
+  (e.g. `ERROR`, `Listening on`) instead of forcing the agent to
+  poll. Turns long builds and dev servers into event-driven waits.
+- **Office-document text extraction.** `[H] ref` Deferred. `fs_read`
+  extracts PDF text via `pdf_extract` today; extend the same path to
+  DOCX / XLSX / PPTX so the agent can read the Office attachments
+  operators routinely drop in. Highest-value file types not yet
+  parseable.
+- **Persistent multi-agent task board with auto-decomposition.**
+  `[H] ref` Deferred. A durable kanban/swarm surface that
+  auto-decomposes one task into a dependency tree of sub-tasks,
+  dispatches them across worker sub-agents, and self-heals
+  (stale-running detection, worker reclaim, respawn-storm guard, cycle
+  detection in the decomposition). Distinct from per-session goals
+  (single Ralph loop) and one-shot `delegate` — this is a long-lived
+  board with parent/child promotion and concurrency caps. Large
+  surface; folds into the existing `spawn_supervised` + `multi_agent`
+  machinery.
+- **`video_generate` tool.** `[H] ref` Deferred. Borg has
+  `video_analyze` (Gemini inline-data) but no generation path; a
+  `video_generate` tool with pluggable provider backends would mirror
+  the deferred image-gen provider routing. Niche; defer until demand.
 
 ### MCP & external integrations
 
@@ -465,6 +516,13 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   model picker → terminal/sandbox backend → channels → tools →
   credentials. Each section idempotent, invokable alone via
   `borg setup <section>`. Today onboarding is one linear flow.
+- **Multi-instance profiles (export / import / clone).** `[H] ref`
+  Deferred. Run several isolated Borg identities from one install —
+  separate data dir, credentials, sessions, and gateway bindings per
+  profile — with `borg profile export/import/clone/rename` for moving
+  or templating an instance. Today one install is one identity
+  (`~/.borg/`); operators wanting a "work" vs "personal" split must
+  juggle data dirs by hand.
 ### Security & sandboxing
 
 - **Windows sandbox — real-host validation pass (code complete).**
@@ -561,6 +619,13 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   logged-in profile" action so multi-step authenticated workflows
   (book a flight, fill a form on a private dashboard) become
   possible.
+- **External secrets-manager backends.** `[H] ref` Deferred.
+  `${SECRET:NAME}` resolves today via credential store → env → OS
+  keychain. Add optional resolvers that read from Bitwarden Secrets
+  Manager, 1Password, or HashiCorp Vault (lazy-install the vendor CLI,
+  cache hits with a TTL) so operators with an existing org secrets
+  store don't have to duplicate credentials into Borg's keychain. Slots
+  in behind the existing `resolve_credential_or_env` seam.
 
 ### Scheduling
 
