@@ -8,13 +8,17 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use super::{honcho::HonchoProvider, mem0::Mem0Provider, openviking::OpenVikingProvider};
+use super::{
+    honcho::HonchoProvider, letta::LettaProvider, mem0::Mem0Provider,
+    openviking::OpenVikingProvider, zep::ZepProvider,
+};
 use super::{MemoryProvider, NativeProvider};
 use crate::config::media::MemoryProviderKind;
 use crate::config::Config;
 
 /// One-shot tracker so a misconfigured external provider doesn't spam
-/// the log every turn. Bits: 1=mem0, 2=honcho, 4=openviking.
+/// the log every turn. Bits: 1=mem0, 2=honcho, 4=openviking, 8=letta,
+/// 16=zep.
 static WARNED_MASK: AtomicU8 = AtomicU8::new(0);
 
 fn warn_once(bit: u8, name: &str, detail: &str) {
@@ -55,6 +59,20 @@ pub fn resolve(config: &Config) -> Arc<dyn MemoryProvider> {
                 }
             }
         }
+        MemoryProviderKind::Letta => match LettaProvider::from_settings(&config.memory.letta) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                warn_once(8, "letta", &e.to_string());
+                Arc::new(NativeProvider::new())
+            }
+        },
+        MemoryProviderKind::Zep => match ZepProvider::from_settings(&config.memory.zep) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                warn_once(16, "zep", &e.to_string());
+                Arc::new(NativeProvider::new())
+            }
+        },
     }
 }
 

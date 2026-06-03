@@ -374,6 +374,18 @@ impl MemoryProvider for Mem0Provider {
         // The service consolidates server-side; nothing to do here.
         Ok(ConsolidationOutcome::Delegated)
     }
+
+    async fn health(&self, _ctx: &MemCtx<'_>) -> Result<(), MemoryError> {
+        // Cheap authenticated GET — a bad key surfaces as a 401 Backend
+        // error rather than a silent fallback at write time.
+        let url = format!(
+            "{}?user_id={}",
+            self.url("/v1/memories/"),
+            urlencode(&self.user_id)
+        );
+        let _: serde_json::Value = self.send_json(self.client.get(url)).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

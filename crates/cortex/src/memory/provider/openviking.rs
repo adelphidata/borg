@@ -342,6 +342,19 @@ impl MemoryProvider for OpenVikingProvider {
     async fn consolidate(&self, _ctx: &MemCtx<'_>) -> Result<ConsolidationOutcome, MemoryError> {
         Ok(ConsolidationOutcome::Delegated)
     }
+
+    async fn health(&self, _ctx: &MemCtx<'_>) -> Result<(), MemoryError> {
+        // List the `global` scope — a cheap authenticated GET that proves
+        // the endpoint is reachable and the api_key is accepted.
+        let _: serde_json::Value = super::send_json(
+            self.client.get(self.list_url("global")),
+            PROVIDER_NAME,
+            &self.auth_header(),
+            &self.api_key,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

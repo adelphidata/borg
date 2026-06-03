@@ -114,26 +114,11 @@ impl HonchoProvider {
 }
 
 /// Stable session id for a given scope. We use a single session per
-/// scope so message lookup by entry-name metadata stays bounded.
-///
-/// The encoding must be injective: `project:abc` and `project-abc` were
-/// previously colliding under a naive `replace(':', "-")` because both
-/// mapped to `borg-project-abc`, which means writes to one scope landed
-/// in the other's session. We escape `_` first (so the escape marker
-/// itself can't be confused with literal input) and then map `:` to
-/// `_c`. Hyphens pass through untouched — they're already legal in
-/// Honcho session ids and the most common scope character.
+/// scope so message lookup by entry-name metadata stays bounded. The
+/// injective encoding lives in [`super::scoped_session_id`] (shared with
+/// the Zep provider); Honcho uses the `borg-` namespace prefix.
 fn session_id(scope: &str) -> String {
-    let mut out = String::with_capacity(scope.len() + 4);
-    out.push_str("borg-");
-    for c in scope.chars() {
-        match c {
-            '_' => out.push_str("__"),
-            ':' => out.push_str("_c"),
-            other => out.push(other),
-        }
-    }
-    out
+    super::scoped_session_id("borg-", scope)
 }
 
 #[derive(Serialize)]
@@ -313,12 +298,7 @@ impl MemoryProvider for HonchoProvider {
                 });
             }
         }
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(query.max_results);
+        super::rank_and_truncate(&mut hits, query.max_results);
         Ok(hits)
     }
 
@@ -378,6 +358,17 @@ impl MemoryProvider for HonchoProvider {
 
     async fn consolidate(&self, _ctx: &MemCtx<'_>) -> Result<ConsolidationOutcome, MemoryError> {
         Ok(ConsolidationOutcome::Delegated)
+    }
+
+    async fn health(&self, _ctx: &MemCtx<'_>) -> Result<(), MemoryError> {
+        // List the peer's sessions — exercises both the api_key and the
+        // configured app_id without writing anything.
+        let url = self.url(&format!(
+            "/v1/apps/{}/users/{}/sessions/",
+            self.app_id, self.peer_id
+        ));
+        let _: serde_json::Value = self.send_json(self.client.get(url)).await?;
+        Ok(())
     }
 }
 

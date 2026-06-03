@@ -434,6 +434,12 @@ pub enum MemoryProviderKind {
     Honcho,
     /// Hierarchical context store with a `viking://` URI scheme.
     Openviking,
+    /// Stateful-agent memory service (MemGPT lineage): hierarchical
+    /// archival + core-memory-block tiers, scoped per Letta agent.
+    Letta,
+    /// Agent-memory service with a temporal knowledge graph and enriched
+    /// session summaries.
+    Zep,
 }
 
 impl FromStr for MemoryProviderKind {
@@ -445,8 +451,11 @@ impl FromStr for MemoryProviderKind {
             "mem0" => Ok(Self::Mem0),
             "honcho" => Ok(Self::Honcho),
             "openviking" | "open_viking" | "open-viking" | "viking" => Ok(Self::Openviking),
+            "letta" | "memgpt" => Ok(Self::Letta),
+            "zep" => Ok(Self::Zep),
             other => anyhow::bail!(
-                "Unknown memory provider '{other}'. Valid: native, mem0, honcho, openviking"
+                "Unknown memory provider '{other}'. \
+                 Valid: native, mem0, honcho, openviking, letta, zep"
             ),
         }
     }
@@ -459,6 +468,8 @@ impl fmt::Display for MemoryProviderKind {
             Self::Mem0 => "mem0",
             Self::Honcho => "honcho",
             Self::Openviking => "openviking",
+            Self::Letta => "letta",
+            Self::Zep => "zep",
         })
     }
 }
@@ -523,6 +534,45 @@ pub struct OpenVikingSettings {
     pub agent: Option<String>,
 }
 
+/// Letta (MemGPT) provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LettaSettings {
+    /// API key (resolved through `${SECRET:NAME}` placeholders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// Letta agent id whose memory tiers Borg reads/writes. Required when
+    /// the provider is selected — memory in Letta is agent-scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Override base URL — defaults to the public Letta Cloud endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Optional Letta Cloud project id (sent as the `X-Project` header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Scope name that maps onto Letta's in-context core-memory blocks
+    /// instead of archival passages. Defaults to `"core"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_scope: Option<String>,
+}
+
+/// Zep provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZepSettings {
+    /// API key (resolved through `${SECRET:NAME}` placeholders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// Override base URL — defaults to the public Zep Cloud endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Zep user id that owns the sessions + knowledge graph. Defaults to
+    /// the OS user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
 /// Configuration for the memory system (loading, embeddings, scoping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -540,6 +590,12 @@ pub struct MemoryConfig {
     /// OpenViking provider settings (only consulted when `provider = openviking`).
     #[serde(default)]
     pub openviking: OpenVikingSettings,
+    /// Letta provider settings (only consulted when `provider = letta`).
+    #[serde(default)]
+    pub letta: LettaSettings,
+    /// Zep provider settings (only consulted when `provider = zep`).
+    #[serde(default)]
+    pub zep: ZepSettings,
     /// Maximum tokens allocated for memory context in the system prompt.
     pub max_context_tokens: usize,
     /// Embedding and semantic search configuration.
@@ -607,6 +663,8 @@ impl Default for MemoryConfig {
             mem0: Mem0Settings::default(),
             honcho: HonchoSettings::default(),
             openviking: OpenVikingSettings::default(),
+            letta: LettaSettings::default(),
+            zep: ZepSettings::default(),
             max_context_tokens: 8000,
             embeddings: EmbeddingsConfig::default(),
             memory_scope: None,

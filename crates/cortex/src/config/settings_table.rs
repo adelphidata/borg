@@ -61,6 +61,12 @@ define_settings! {
         "memory.openviking.account" => memory.openviking.account, opt_string;
         "memory.openviking.user" => memory.openviking.user, opt_string;
         "memory.openviking.agent" => memory.openviking.agent, opt_string;
+        "memory.letta.agent_id" => memory.letta.agent_id, opt_string;
+        "memory.letta.base_url" => memory.letta.base_url, opt_string;
+        "memory.letta.project" => memory.letta.project, opt_string;
+        "memory.letta.core_scope" => memory.letta.core_scope, opt_string;
+        "memory.zep.base_url" => memory.zep.base_url, opt_string;
+        "memory.zep.user_id" => memory.zep.user_id, opt_string;
         "memory.max_context_tokens" => memory.max_context_tokens, nonzero(usize);
         "memory.flush_before_compaction" => memory.flush_before_compaction, parsed(bool);
         "memory.flush_min_messages" => memory.flush_min_messages, parsed(usize);
@@ -464,7 +470,8 @@ define_settings! {
             Ok(format!("{key} = {kind}"))
         };
 
-        // memory.provider: FromStr enum (native | mem0 | honcho | openviking).
+        // memory.provider: FromStr enum
+        // (native | mem0 | honcho | openviking | letta | zep).
         // Default `native`. Selecting an external provider with missing
         // credentials falls back to native at resolve-time with a warn
         // so the agent always boots; here we just persist the chosen
@@ -505,6 +512,28 @@ define_settings! {
                 s.memory.openviking.api_key = None;
             } else {
                 s.memory.openviking.api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "memory.letta.api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.memory.letta.api_key = None;
+            } else {
+                s.memory.letta.api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "memory.zep.api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.memory.zep.api_key = None;
+            } else {
+                s.memory.zep.api_key = Some(
                     serde_json::from_str(value)
                         .with_context(|| format!("Invalid JSON for {key}"))?,
                 );

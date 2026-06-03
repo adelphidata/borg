@@ -5,9 +5,9 @@
 //! the source of truth. Operators who want fact extraction, dialectic
 //! retrieval, or a hierarchical context store can flip `memory.provider`
 //! to one of the bundled external providers ([`mem0`], [`honcho`],
-//! [`openviking`]) — the three model-visible tools (`write_memory`,
-//! `read_memory`, `memory_search`) and the per-turn `<active_memory>`
-//! injection then route through the chosen provider.
+//! [`openviking`], [`letta`], [`zep`]) — the three model-visible tools
+//! (`write_memory`, `read_memory`, `memory_search`) and the per-turn
+//! `<active_memory>` injection then route through the chosen provider.
 //!
 //! Scope caveat: the stable-prefix `<long_term_memory>` block in the
 //! system prompt still loads from the local SQLite store regardless of
@@ -36,10 +36,12 @@ use crate::memory::tokenizer::estimate_tokens;
 use crate::memory::WriteMode;
 
 pub mod honcho;
+pub mod letta;
 pub mod mem0;
 pub mod native;
 pub mod openviking;
 pub mod registry;
+pub mod zep;
 
 #[cfg(test)]
 mod tests;
@@ -202,6 +204,15 @@ pub trait MemoryProvider: Send + Sync {
     async fn consolidate(&self, _ctx: &MemCtx<'_>) -> Result<ConsolidationOutcome, MemoryError> {
         Ok(ConsolidationOutcome::Delegated)
     }
+
+    /// Cheap reachability + credential probe surfaced by `borg doctor`.
+    /// Native is always healthy; external providers override with a
+    /// lightweight authenticated request so a wrong key or unreachable
+    /// endpoint shows up *before* a real `write_memory` silently fails.
+    /// Errors are already secret-redacted by the impl's `send_json`.
+    async fn health(&self, _ctx: &MemCtx<'_>) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 /// Common-path guard wrapper for [`MemoryProvider::write`]. Every backend
@@ -344,6 +355,46 @@ pub(crate) async fn send_json<T: for<'de> Deserialize<'de>>(
     })
 }
 
+/// Like [`send_json`] but discards a successful response body. For
+/// endpoints (DELETE, PATCH, some inserts) that legitimately return an
+/// empty `204`/`200` body, where [`send_json`]'s mandatory JSON decode
+/// would otherwise fail. Error bodies get the same two-pass redaction.
+pub(crate) async fn send_ok(
+    req: reqwest::RequestBuilder,
+    provider: &'static str,
+    auth_header: &str,
+    api_key: &str,
+) -> Result<(), MemoryError> {
+    let resp = req
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| MemoryError::Transport {
+            provider,
+            detail: e.to_string(),
+        })?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
+        provider,
+        detail: e.to_string(),
+    })?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes);
+        let stripped = body.replace(api_key, "<redacted>");
+        let redacted = crate::security::secrets::redact_secrets(&stripped);
+        return Err(MemoryError::Backend {
+            provider,
+            detail: format!(
+                "{}: {}",
+                status.as_u16(),
+                redacted.chars().take(400).collect::<String>()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Percent-encode a URL path segment or query-parameter value. RFC 3986
 /// unreserved set passes through; everything else is `%HH`-encoded.
 /// Shared so each provider's URL builder can defend against `/`, `?`,
@@ -361,8 +412,81 @@ pub(crate) fn urlencode(s: &str) -> String {
     out
 }
 
+/// Sort search hits by descending score (NaN compares equal) and truncate
+/// to `max`. Shared by the session/cloud `search` impls so result ordering
+/// stays byte-identical across providers — the merge order is part of the
+/// model-visible output.
+pub(crate) fn rank_and_truncate(hits: &mut Vec<SearchHit>, max: usize) {
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(max);
+}
+
+/// Build a stable, injective session id for a `scope`, used by the
+/// session-per-scope providers ([`honcho`], [`zep`]). A single session
+/// per scope keeps entry lookup by `borg_name` metadata bounded.
+///
+/// The encoding must be injective: `project:abc` and `project-abc` were
+/// previously colliding under a naive `replace(':', "-")` because both
+/// mapped to the same id, so a write to one scope landed in the other's
+/// session. We escape `_` first (so the escape marker itself can't be
+/// confused with literal input) and then map `:` to `_c`. Hyphens pass
+/// through untouched — they're already legal in session ids and the most
+/// common scope character. `prefix` distinguishes providers/namespaces
+/// (e.g. `"borg-"`).
+pub(crate) fn scoped_session_id(prefix: &str, scope: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + scope.len() + 4);
+    out.push_str(prefix);
+    for c in scope.chars() {
+        match c {
+            '_' => out.push_str("__"),
+            ':' => out.push_str("_c"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Build an `Arc<dyn MemoryProvider>` from config. Wraps [`resolve`] so
 /// callers don't have to import the registry module.
 pub fn from_config(config: &Config) -> Arc<dyn MemoryProvider> {
     resolve(config)
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::scoped_session_id;
+
+    #[test]
+    fn scoped_session_id_is_injective_across_separators() {
+        // Colon-, hyphen-, and underscore-bearing scopes must all map to
+        // distinct ids — a collision routes one scope's writes into
+        // another's session.
+        assert_eq!(scoped_session_id("borg-", "global"), "borg-global");
+        assert_eq!(
+            scoped_session_id("borg-", "project:abc"),
+            "borg-project_cabc"
+        );
+        assert_eq!(
+            scoped_session_id("borg-", "project-abc"),
+            "borg-project-abc"
+        );
+        assert_eq!(scoped_session_id("borg-", "foo_bar"), "borg-foo__bar");
+        assert_ne!(
+            scoped_session_id("borg-", "project:abc"),
+            scoped_session_id("borg-", "project-abc"),
+        );
+        assert_ne!(
+            scoped_session_id("borg-", "foo_cbar"),
+            scoped_session_id("borg-", "foo:bar"),
+        );
+        // Prefix participates in the namespace.
+        assert_ne!(
+            scoped_session_id("borg-", "x"),
+            scoped_session_id("zep-", "x"),
+        );
+    }
 }

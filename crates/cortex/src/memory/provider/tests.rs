@@ -11,7 +11,10 @@
 //!    upstream document.
 
 use super::*;
-use crate::config::media::{HonchoSettings, Mem0Settings, MemoryProviderKind, OpenVikingSettings};
+use crate::config::media::{
+    HonchoSettings, LettaSettings, Mem0Settings, MemoryProviderKind, OpenVikingSettings,
+    ZepSettings,
+};
 use crate::config::Config;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -21,10 +24,21 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[test]
 fn memory_provider_kind_round_trips_through_fromstr() {
     use std::str::FromStr;
-    for name in ["native", "mem0", "honcho", "openviking"] {
+    for name in ["native", "mem0", "honcho", "openviking", "letta", "zep"] {
         let k = MemoryProviderKind::from_str(name).expect(name);
         assert_eq!(k.to_string(), name, "round trip: {name}");
     }
+}
+
+#[test]
+fn memory_provider_kind_memgpt_aliases_to_letta() {
+    use std::str::FromStr;
+    // `memgpt` is the historical name for Letta — operators may reach for
+    // it. It must resolve to the canonical `letta` backend.
+    assert_eq!(
+        MemoryProviderKind::from_str("memgpt").unwrap(),
+        MemoryProviderKind::Letta
+    );
 }
 
 #[test]
@@ -84,6 +98,21 @@ async fn write_guarded_rejects_prompt_injection_for_every_backend() {
     let err = write_guarded(&m0, &ctx, "global", "x", payload, WriteMode::Overwrite)
         .await
         .expect_err("mem0 dispatch must reject injection payload before HTTP");
+    assert!(matches!(err, MemoryError::Invariant(_)));
+
+    // The two newest backends must inherit the same short-circuit — the
+    // guard lives in the shared wrapper, not per-impl, so adding a provider
+    // can't silently opt out.
+    let letta = letta::LettaProvider::for_tests("http://localhost:1");
+    let err = write_guarded(&letta, &ctx, "global", "x", payload, WriteMode::Overwrite)
+        .await
+        .expect_err("letta dispatch must reject injection payload before HTTP");
+    assert!(matches!(err, MemoryError::Invariant(_)));
+
+    let zep = zep::ZepProvider::for_tests("http://localhost:1");
+    let err = write_guarded(&zep, &ctx, "global", "x", payload, WriteMode::Overwrite)
+        .await
+        .expect_err("zep dispatch must reject injection payload before HTTP");
     assert!(matches!(err, MemoryError::Invariant(_)));
 }
 
@@ -602,4 +631,615 @@ fn from_config_unconfigured_external_yields_native() {
             "unconfigured {provider} via from_config must yield native"
         );
     }
+}
+
+#[test]
+fn resolve_falls_back_to_native_when_letta_unconfigured() {
+    registry::reset_warn_once_for_tests();
+    let mut cfg = Config::default();
+    cfg.memory.provider = MemoryProviderKind::Letta;
+    // Neither api_key nor agent_id set → resolve must return Native.
+    cfg.memory.letta = LettaSettings::default();
+    assert_eq!(resolve(&cfg).name(), "native");
+}
+
+#[test]
+fn resolve_falls_back_to_native_when_zep_unconfigured() {
+    registry::reset_warn_once_for_tests();
+    let mut cfg = Config::default();
+    cfg.memory.provider = MemoryProviderKind::Zep;
+    cfg.memory.zep = ZepSettings::default();
+    assert_eq!(resolve(&cfg).name(), "native");
+}
+
+// ── Letta HTTP fixtures ──
+
+#[tokio::test]
+async fn letta_overwrite_deletes_prior_passage_then_inserts_with_marker() {
+    // A keyed write must be idempotent on `(scope, name)`: locate the prior
+    // passage, DELETE it, then insert the new one carrying the key marker.
+    // Without the delete, archival accumulates stale sibling passages and
+    // `read` returns whichever the server ranks first.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "p1", "text": "borg-key: global/note\n\nold"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/agents/agent/archival-memory/p1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .and(header("Authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    prov.write(&ctx, "global", "note", "fresh", WriteMode::Overwrite)
+        .await
+        .expect("overwrite succeeds");
+
+    let received = server.received_requests().await.unwrap();
+    let post = received
+        .iter()
+        .find(|r| r.method.to_string() == "POST")
+        .expect("insert POST must fire");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).expect("json body");
+    let text = body["text"].as_str().expect("text field");
+    assert!(
+        text.starts_with("borg-key: global/note\n\n") && text.contains("fresh"),
+        "inserted passage must carry the key marker + new content; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn letta_core_scope_write_patches_block_not_archival() {
+    // The hierarchical upper tier: a write to the `core` scope must PATCH
+    // the named core-memory block, never touch archival.
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/agents/agent/core-memory/blocks/persona"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    prov.write(&ctx, "core", "persona", "I am Borg", WriteMode::Overwrite)
+        .await
+        .expect("core block write succeeds");
+
+    let received = server.received_requests().await.unwrap();
+    let patch = received
+        .iter()
+        .find(|r| r.method.to_string() == "PATCH")
+        .expect("core block PATCH must fire");
+    let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("json body");
+    assert_eq!(body["value"].as_str(), Some("I am Borg"));
+}
+
+#[tokio::test]
+async fn letta_search_ranks_descending_and_filters_min_score() {
+    // Letta archival search returns rank order without scores; the provider
+    // synthesises a descending score and honors the caller's floor.
+    let server = MockServer::start().await;
+    // Core-block lookup runs first inside search — return none so only the
+    // archival ranking is under test.
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/core-memory/blocks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "p1", "text": "borg-key: global/a\n\nfirst"},
+            {"id": "p2", "text": "borg-key: project:x/b\n\nsecond"},
+        ])))
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let hits = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "q".into(),
+                max_results: 5,
+                min_score: 0.6,
+            },
+        )
+        .await
+        .unwrap();
+    // Two passages → synthesised scores 0.9 and 0.45 (archival band caps
+    // below the core tier); min_score 0.6 keeps only the first.
+    assert_eq!(
+        hits.len(),
+        1,
+        "min_score must drop the lower-ranked passage"
+    );
+    assert_eq!(hits[0].scope, "global");
+    assert_eq!(hits[0].name, "a");
+    assert_eq!(hits[0].snippet, "first");
+}
+
+#[tokio::test]
+async fn letta_search_surfaces_matching_core_block_above_archival() {
+    // The hierarchical tier must win: a matching core block outranks
+    // archival hits so always-in-context facts lead.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/core-memory/blocks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"label": "persona", "value": "loves espresso"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "p1", "text": "borg-key: global/note\n\nespresso machine receipt"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let hits = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "espresso".into(),
+                max_results: 5,
+                min_score: 0.0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2, "core block + archival passage");
+    assert_eq!(hits[0].scope, "core", "core block must rank first");
+    assert_eq!(hits[0].name, "persona");
+}
+
+#[tokio::test]
+async fn letta_read_returns_none_on_miss() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let got = prov.read(&ctx, "global", "missing").await.unwrap();
+    assert!(got.is_none(), "no matching passage must map to None");
+}
+
+#[tokio::test]
+async fn letta_backend_error_redacts_api_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid key: test-key"))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let err = prov
+        .read(&ctx, "global", "x")
+        .await
+        .expect_err("401 must surface");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("test-key"),
+        "api key must be redacted; got: {msg}"
+    );
+    assert!(msg.contains("<redacted>"));
+}
+
+// ── Zep HTTP fixtures ──
+
+#[tokio::test]
+async fn zep_write_creates_session_then_posts_message_with_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/sessions"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .and(header("Authorization", "Api-Key test-key"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    prov.write(&ctx, "global", "note", "hello", WriteMode::Overwrite)
+        .await
+        .expect("write succeeds");
+
+    let received = server.received_requests().await.unwrap();
+    let mem_post = received
+        .iter()
+        .find(|r| r.url.path() == "/api/v2/sessions/borg-global/memory")
+        .expect("memory POST must fire");
+    let body: serde_json::Value = serde_json::from_slice(&mem_post.body).expect("json body");
+    let meta = &body["messages"][0]["metadata"];
+    assert_eq!(meta["borg_name"].as_str(), Some("note"));
+    assert_eq!(meta["borg_scope"].as_str(), Some("global"));
+    assert_eq!(body["messages"][0]["role_type"].as_str(), Some("user"));
+}
+
+#[tokio::test]
+async fn zep_search_maps_graph_facts_and_appends_session_summary() {
+    // Retrieval blends two tiers: knowledge-graph facts (scored) plus the
+    // enriched per-scope session summary. `min_score` filters the weak fact;
+    // the summary survives at its synthesised score.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/graph/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "edges": [
+                {"fact": "user ships rust", "score": 0.8},
+                {"fact": "weak fact", "score": 0.1},
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messages": [],
+            "context": "Over recent sessions the user has been shipping a Rust agent."
+        })))
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let hits = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "rust".into(),
+                max_results: 5,
+                min_score: 0.5,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "strong fact + summary survive; weak fact filtered"
+    );
+    // Highest score first: the graph fact (0.8) leads the summary (0.5).
+    assert_eq!(hits[0].snippet, "user ships rust");
+    assert!(
+        hits.iter()
+            .any(|h| h.name == "zep-summary" && h.snippet.contains("shipping a Rust agent")),
+        "enriched session summary must surface as a hit"
+    );
+    assert!(
+        !hits.iter().any(|h| h.snippet == "weak fact"),
+        "min_score must drop the weak graph fact"
+    );
+}
+
+#[tokio::test]
+async fn zep_search_skips_missing_session_without_error() {
+    // A 404 on the session summary fetch is "nothing stored yet", not a
+    // failure — search must still return the graph results.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/graph/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"edges": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("session not found"))
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let hits = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "anything".into(),
+                max_results: 5,
+                min_score: 0.0,
+            },
+        )
+        .await
+        .expect("404 on summary must not fail the search");
+    assert!(hits.is_empty(), "no edges + missing summary → no hits");
+}
+
+#[tokio::test]
+async fn zep_backend_error_redacts_api_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/graph/search"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("bad key: test-key"))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let err = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "q".into(),
+                max_results: 1,
+                min_score: 0.0,
+            },
+        )
+        .await
+        .expect_err("401 must surface");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("test-key"),
+        "api key must be redacted; got: {msg}"
+    );
+    assert!(msg.contains("<redacted>"));
+}
+
+// ── Letta: additional behavior coverage ──
+
+#[tokio::test]
+async fn letta_read_locates_entry_via_full_scan() {
+    // read() must agree with write/delete by full-scanning + filtering on
+    // the key marker (not relying on a small semantic-search window).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "p1", "text": "borg-key: project:x/other\n\nnope"},
+            {"id": "p2", "text": "borg-key: global/note\n\nthe answer"},
+        ])))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let got = prov.read(&ctx, "global", "note").await.unwrap();
+    assert_eq!(got.expect("entry present").content, "the answer");
+}
+
+#[tokio::test]
+async fn letta_append_concatenates_existing_passage_then_replaces() {
+    // Append must fold the prior passage's content into the new one and
+    // delete the old passage (idempotent on key), not leave a sibling.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "p1", "text": "borg-key: global/note\n\nalpha"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/agents/agent/archival-memory/p1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    prov.write(&ctx, "global", "note", "beta", WriteMode::Append)
+        .await
+        .expect("append succeeds");
+
+    let received = server.received_requests().await.unwrap();
+    let post = received
+        .iter()
+        .find(|r| r.method.to_string() == "POST")
+        .expect("insert POST must fire");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    let text = body["text"].as_str().unwrap();
+    assert!(
+        text.contains("alpha") && text.contains("beta"),
+        "append must concatenate prior + new content; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn letta_core_scope_read_returns_block_value() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/core-memory/blocks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"label": "persona", "value": "I am Borg"}
+        ])))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let got = prov.read(&ctx, "core", "persona").await.unwrap();
+    assert_eq!(got.expect("block present").content, "I am Borg");
+}
+
+#[tokio::test]
+async fn letta_core_scope_delete_clears_block_value() {
+    // Core blocks are structural: delete clears the value (PATCH ""),
+    // returning true only when the labeled block exists.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/core-memory/blocks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"label": "persona", "value": "I am Borg"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/agents/agent/core-memory/blocks/persona"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    let removed = prov.delete(&ctx, "core", "persona").await.unwrap();
+    assert!(removed, "delete must report success for an existing block");
+
+    let received = server.received_requests().await.unwrap();
+    let patch = received
+        .iter()
+        .find(|r| r.method.to_string() == "PATCH")
+        .expect("clear PATCH must fire");
+    let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+    assert_eq!(body["value"].as_str(), Some(""), "delete clears the value");
+}
+
+#[tokio::test]
+async fn letta_health_probes_archival_tier() {
+    // health() must hit the archival tier (the default write target), not
+    // core-memory, so a green doctor reflects the path real writes take.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/agent/archival-memory"))
+        .and(header("Authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = letta::LettaProvider::for_tests(server.uri());
+    prov.health(&ctx)
+        .await
+        .expect("archival probe must succeed");
+}
+
+// ── Zep: additional behavior coverage ──
+
+#[tokio::test]
+async fn zep_read_returns_latest_write_by_timestamp() {
+    // Zep is append-only; read must surface the newest message per key so a
+    // re-write shadows the stale value.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messages": [
+                {"uuid": "m1", "content": "v1", "metadata": {"borg_name": "note"}, "created_at": "2026-01-01T00:00:00Z"},
+                {"uuid": "m2", "content": "v2", "metadata": {"borg_name": "note"}, "created_at": "2026-02-01T00:00:00Z"},
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let got = prov.read(&ctx, "global", "note").await.unwrap();
+    assert_eq!(
+        got.expect("entry present").content,
+        "v2",
+        "newest write wins"
+    );
+}
+
+#[tokio::test]
+async fn zep_delete_removes_newest_matching_message() {
+    // delete must target the live (newest) message's uuid, not a shadowed
+    // older copy — otherwise read still returns the value after delete.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messages": [
+                {"uuid": "old", "content": "v1", "metadata": {"borg_name": "note"}, "created_at": "2026-01-01T00:00:00Z"},
+                {"uuid": "new", "content": "v2", "metadata": {"borg_name": "note"}, "created_at": "2026-02-01T00:00:00Z"},
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v2/sessions/borg-global/messages/new"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let removed = prov.delete(&ctx, "global", "note").await.unwrap();
+    assert!(removed, "delete reports success");
+    // wiremock's expect(1) on /messages/new fails on Drop if the newest
+    // uuid wasn't the one deleted.
+}
+
+#[tokio::test]
+async fn zep_search_tolerates_graph_404_and_still_returns_summary() {
+    // Regression: a 404 from graph/search (graph not built yet) must not
+    // abort the whole search — the enriched session summary still surfaces.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/graph/search"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("graph not found"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sessions/borg-global/memory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "messages": [],
+            "context": "user has been shipping a rust agent"
+        })))
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = zep::ZepProvider::for_tests(server.uri());
+    let hits = prov
+        .search(
+            &ctx,
+            &SearchQuery {
+                query: "rust".into(),
+                max_results: 5,
+                min_score: 0.0,
+            },
+        )
+        .await
+        .expect("graph 404 must not fail the search");
+    assert!(
+        hits.iter().any(|h| h.name == "zep-summary"),
+        "session summary must still surface when the graph is empty/404"
+    );
 }

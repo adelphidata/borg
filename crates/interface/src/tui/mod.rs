@@ -1852,7 +1852,8 @@ async fn run_event_loop(
                 // on a regular tokio task so the async DB calls have a runtime.
                 tokio::spawn(async move {
                     use cortex::doctor::DiagnosticRunner;
-                    let mut runner = DiagnosticRunner::new();
+                    // Interactive doctor: reachability probes (memory provider) are appropriate.
+                    let mut runner = DiagnosticRunner::interactive();
                     let mut all_checks: Vec<cortex::doctor::DiagnosticCheck> = Vec::new();
                     // Drive off `next_step`'s returned label, not `peek_label`:
                     // `next_step` internally skips `suppress_when_empty` steps

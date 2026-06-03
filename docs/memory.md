@@ -186,6 +186,8 @@ Available providers:
 | `mem0`       | Cloud service with server-side fact extraction | You want the model's writes distilled into facts automatically and shared across devices. |
 | `honcho`     | Cloud service with peer/session model + dialectic Q&A | You want a chat-history-aware memory layer that exposes a Q&A endpoint over your past turns. |
 | `openviking` | Self-hosted or cloud hierarchical context store | You want a `viking://account/user/agent/scope/name` URI scheme and operator-controlled deployment. |
+| `letta`      | Stateful-agent service (MemGPT lineage) with hierarchical memory tiers | You want Letta's archival memory plus always-in-context **core-memory blocks**, scoped to a Letta agent. |
+| `zep`        | Temporal knowledge-graph service with enriched session summaries | You want graph-based recall across sessions plus server-built **session summaries** surfaced at retrieval time. |
 
 Switching providers does **not** migrate existing data. The native SQLite
 store remains intact while another provider is active; flipping back via
@@ -211,7 +213,7 @@ so a new provider impl cannot bypass them.
 ### Configuration
 
 ```sh
-# Pick the backend (any of: native, mem0, honcho, openviking)
+# Pick the backend (any of: native, mem0, honcho, openviking, letta, zep)
 borg settings set memory.provider mem0
 
 # Mem0 — set the API key (resolved through the secret-ref shape used
@@ -228,7 +230,42 @@ borg settings set memory.honcho.app_id "borg"
 borg settings set memory.openviking.endpoint "https://openviking.internal"
 borg settings set memory.openviking.api_key '{"env":"OPENVIKING_KEY"}'
 borg settings set memory.openviking.account "acme"
+
+# Letta (MemGPT) — memory is agent-scoped, so agent_id is required
+borg settings set memory.letta.api_key '{"env":"LETTA_API_KEY"}'
+borg settings set memory.letta.agent_id "agent-abc123"
+borg settings set memory.letta.project "default"        # optional, Letta Cloud
+borg settings set memory.letta.core_scope "core"        # optional; scope that maps to core-memory blocks
+
+# Zep
+borg settings set memory.zep.api_key '{"env":"ZEP_API_KEY"}'
+borg settings set memory.zep.user_id "alice"            # optional, falls back to $USER
 ```
+
+The **`letta`** backend maps most scopes onto Letta's embedding-searchable
+**archival memory** (each entry carries a `borg-key: {scope}/{name}` marker
+so reads/deletes stay deterministic). The configured `core_scope` (default
+`core`) routes instead to Letta's always-in-context **core-memory blocks**
+(`label = name`), and `memory_search` ranks matching core blocks above
+archival hits.
+
+The **`zep`** backend writes each entry as a metadata-tagged message into a
+per-scope session (like `honcho`), and `memory_search` blends Zep's
+user-level **knowledge-graph search** with each in-scope session's
+server-built **enriched summary**.
+
+### Provider health check
+
+`borg doctor` reports the configured memory backend under the **Memory**
+category. For external providers the interactive doctor issues a cheap
+authenticated probe: a healthy provider shows `provider '<name>' reachable`,
+a selected-but-unconfigured provider shows a `Warn` pointing at the missing
+`memory.<provider>.api_key`, and an auth/endpoint failure surfaces the
+(secret-redacted) error — so misconfiguration is visible before a write
+silently falls back to native. The unattended nightly maintenance sweep runs
+the same diagnostics but **skips the network probe** (reporting only
+`provider '<name>' configured`), so the self-heal pass never makes outbound
+calls to the memory service.
 
 If the chosen provider's credentials are missing at daemon startup, the
 registry falls back to `native` with a one-shot `tracing::warn!` in
@@ -250,15 +287,13 @@ so operators can confirm the skip is intentional.
 ### Adding more providers
 
 The trait is intentionally small (`write` / `read` / `search` / `list` /
-`delete` / `consolidate`). Adding a new backend means dropping a file
-under `crates/cortex/src/memory/provider/`, wiring a variant into
-`MemoryProviderKind`, and registering credential keys in
-`config/settings_table.rs`. Tests should follow the wiremock fixtures
-in `provider/tests.rs` — pin the request shape your impl sends, not
-canned response data.
-
-Candidates we considered but didn't ship in v1 are tracked in
-`docs/ROADMAP.md` under "Memory providers — additional integrations".
+`delete` / `consolidate`, plus an optional `health` probe). Adding a new
+backend means dropping a file under `crates/cortex/src/memory/provider/`,
+wiring a variant into `MemoryProviderKind`, and registering credential keys
+in `config/settings_table.rs`. Session-per-scope backends can reuse the
+shared `scoped_session_id` encoder. Tests should follow the wiremock
+fixtures in `provider/tests.rs` — pin the request shape your impl sends,
+not canned response data.
 
 ## IDENTITY.md
 

@@ -19,6 +19,12 @@ pub use types::{CheckStatus, DiagnosticCheck, DiagnosticReport, RemediationKind}
 pub struct DiagnosticRunner {
     /// Current cursor into [`STEPS`].
     step: usize,
+    /// Whether checks may issue outbound network probes (e.g. the memory
+    /// provider reachability check). `false` by default so unattended
+    /// callers (the maintenance sweep) never trigger egress; the
+    /// interactive `borg doctor` / TUI paths opt in via
+    /// [`DiagnosticRunner::interactive`].
+    probe_network: bool,
 }
 
 /// Max acceptable gap between memory entries and indexed embeddings before
@@ -158,7 +164,7 @@ impl StepKind {
         )
     }
 
-    async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>, probe_network: bool) {
         match self {
             Self::Provider => check_provider(config, checks),
             Self::Credentials => check_llm_credentials(config, checks).await,
@@ -167,7 +173,7 @@ impl StepKind {
             Self::Keychain => check_keychain(config, checks),
             Self::Sandbox => check_sandbox(checks),
             Self::Skills => check_skills(config, checks).await,
-            Self::Memory => check_memory(checks).await,
+            Self::Memory => check_memory(config, checks, probe_network).await,
             Self::Embeddings => check_embeddings(config, checks).await,
             Self::Data => check_data_dir(checks).await,
             Self::Locks => check_daemon_lock(checks).await,
@@ -191,9 +197,19 @@ impl StepKind {
 }
 
 impl DiagnosticRunner {
-    /// Create a new diagnostic runner starting at step 0.
+    /// Create a new diagnostic runner starting at step 0. Network probes
+    /// are disabled — safe for unattended callers.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a runner for an interactive `borg doctor` / TUI run, where
+    /// outbound reachability probes (memory provider) are appropriate.
+    pub fn interactive() -> Self {
+        Self {
+            step: 0,
+            probe_network: true,
+        }
     }
 
     /// Run the next enabled step. Returns `None` when all steps are done.
@@ -208,7 +224,7 @@ impl DiagnosticRunner {
                 continue;
             }
             let mut checks = Vec::new();
-            kind.run(config, &mut checks).await;
+            kind.run(config, &mut checks, self.probe_network).await;
             if kind.suppress_when_empty() && checks.is_empty() {
                 continue;
             }
@@ -218,22 +234,37 @@ impl DiagnosticRunner {
     }
 }
 
-/// Run all diagnostic checks and return a report. Equivalent to
-/// [`run_diagnostics_with_registry`] with `None` — preserved for call
-/// sites (`borg doctor` CLI, tests) that don't have a process registry
-/// handle.
+/// Run all diagnostic checks and return a report. This is the interactive
+/// `borg doctor` CLI entry point, so it enables outbound reachability
+/// probes (e.g. the memory provider health check).
 pub async fn run_diagnostics(config: &Config) -> DiagnosticReport {
-    run_diagnostics_with_registry(config, None).await
+    run_diagnostics_with_registry_opts(config, None, true).await
 }
 
 /// Run all diagnostic checks plus the `Subprocesses` check when the
-/// caller has a live registry. The daemon's maintenance sweep and
-/// `Admin.Heal` RPC use this variant.
+/// caller has a live registry. Used by the daemon's maintenance sweep and
+/// `Admin.Heal` RPC — these are unattended, so network probes stay
+/// disabled to avoid recurring background egress.
 pub async fn run_diagnostics_with_registry(
     config: &Config,
     registry: Option<&ProcessRegistry>,
 ) -> DiagnosticReport {
-    let mut runner = DiagnosticRunner::new();
+    run_diagnostics_with_registry_opts(config, registry, false).await
+}
+
+/// Shared implementation. `probe_network` gates outbound reachability
+/// probes so the unattended maintenance path never triggers egress while
+/// the interactive CLI does.
+async fn run_diagnostics_with_registry_opts(
+    config: &Config,
+    registry: Option<&ProcessRegistry>,
+    probe_network: bool,
+) -> DiagnosticReport {
+    let mut runner = if probe_network {
+        DiagnosticRunner::interactive()
+    } else {
+        DiagnosticRunner::new()
+    };
     let mut checks = Vec::new();
     while let Some((_label, step_checks)) = runner.next_step(config).await {
         checks.extend(step_checks);
@@ -607,7 +638,78 @@ async fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-async fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
+/// Surface the configured memory backend and, for external providers,
+/// probe reachability + credentials so a misconfiguration is visible here
+/// rather than only as a silent fallback-to-native at write time.
+///
+/// `probe_network` gates the live reachability probe: the interactive
+/// `borg doctor` enables it, the unattended maintenance sweep does not, so
+/// a nightly self-heal pass never makes outbound calls to the memory SaaS.
+/// The config-level checks (selected provider, unconfigured fallback) run
+/// in both modes.
+async fn check_memory_provider(
+    config: &Config,
+    checks: &mut Vec<DiagnosticCheck>,
+    probe_network: bool,
+) {
+    use crate::config::media::MemoryProviderKind;
+
+    let selected = config.memory.provider;
+    if matches!(selected, MemoryProviderKind::Native) {
+        checks.push(DiagnosticCheck::pass("Memory", "provider: native (SQLite)"));
+        return;
+    }
+
+    let prov = crate::memory::provider::from_config(config);
+    // The registry returns native when an external provider is selected
+    // but its credentials are missing/unresolvable.
+    if prov.name() == "native" {
+        checks.push(
+            DiagnosticCheck::warn(
+                "Memory",
+                "provider",
+                format!("memory.provider={selected} is unconfigured — falling back to native"),
+            )
+            .with_remediation(
+                RemediationKind::Manual,
+                "memory.provider_unconfigured",
+                format!("set credentials, e.g. `borg settings set memory.{selected}.api_key`"),
+            ),
+        );
+        return;
+    }
+
+    // Configured external provider. Without a network probe (unattended
+    // path) just confirm it's selected + configured; the interactive path
+    // additionally verifies reachability.
+    if !probe_network {
+        checks.push(DiagnosticCheck::pass(
+            "Memory",
+            format!("provider '{}' configured", prov.name()),
+        ));
+        return;
+    }
+
+    let ctx = crate::memory::provider::MemCtx::from_config(config);
+    match prov.health(&ctx).await {
+        Ok(()) => checks.push(DiagnosticCheck::pass(
+            "Memory",
+            format!("provider '{}' reachable", prov.name()),
+        )),
+        Err(e) => checks.push(
+            DiagnosticCheck::warn("Memory", "provider", format!("{e}")).with_remediation(
+                RemediationKind::Manual,
+                "memory.provider_unreachable",
+                format!(
+                    "verify credentials/endpoint: `borg settings get memory.{selected}.api_key`"
+                ),
+            ),
+        ),
+    }
+}
+
+async fn check_memory(config: &Config, checks: &mut Vec<DiagnosticCheck>, probe_network: bool) {
+    check_memory_provider(config, checks, probe_network).await;
     match Database::open().await {
         Ok(db) => match db.list_memory_entries("global").await {
             Ok(entries) => {
@@ -2590,6 +2692,77 @@ mod expanded_check_tests {
         assert!(
             msg.contains("flaky job"),
             "warning names the offending task: {msg}"
+        );
+    }
+}
+
+/// Ungated tests for the memory-provider health check. The main `tests`
+/// module above is feature-gated off, so these live in their own module
+/// to actually run in `cargo test`. Both cases are config-only — the
+/// registry resolves an unconfigured external provider to native without
+/// any network I/O.
+#[cfg(test)]
+mod memory_provider_check_tests {
+    use super::*;
+    use crate::config::media::MemoryProviderKind;
+
+    #[tokio::test]
+    async fn passes_for_native() {
+        let config = Config::default();
+        let mut checks = Vec::new();
+        check_memory_provider(&config, &mut checks, true).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].status, CheckStatus::Pass));
+        assert!(checks[0].name.contains("native"));
+    }
+
+    #[tokio::test]
+    async fn warns_when_external_unconfigured() {
+        // Selecting Letta without credentials makes the registry fall back
+        // to native; the doctor must surface that as a Warn with a
+        // remediation pointer rather than silently reporting healthy.
+        let mut config = Config::default();
+        config.memory.provider = MemoryProviderKind::Letta;
+        let mut checks = Vec::new();
+        check_memory_provider(&config, &mut checks, true).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].category, "Memory");
+        assert!(matches!(checks[0].status, CheckStatus::Warn(_)));
+        assert_eq!(
+            checks[0].remediation_key,
+            Some("memory.provider_unconfigured")
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_network_probe_when_unattended() {
+        // The maintenance sweep runs with probe_network=false. A *configured*
+        // external provider must NOT trigger an outbound health() call —
+        // base_url points at an unroutable host, so if the probe fired the
+        // check would block/error. Instead we expect a clean "configured"
+        // pass with no network I/O.
+        use crate::security::secrets_resolve::SecretRef;
+        const VAR: &str = "BORG_DOCTOR_TEST_ZEP_KEY";
+        std::env::set_var(VAR, "k");
+        let mut config = Config::default();
+        config.memory.provider = MemoryProviderKind::Zep;
+        config.memory.zep.api_key = Some(SecretRef::Env {
+            var: VAR.to_string(),
+        });
+        config.memory.zep.base_url = Some("http://127.0.0.1:1".to_string());
+        let mut checks = Vec::new();
+        check_memory_provider(&config, &mut checks, false).await;
+        std::env::remove_var(VAR);
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].status, CheckStatus::Pass),
+            "unattended probe-skipped path must pass without network I/O; got {:?}",
+            checks[0].status
+        );
+        assert!(
+            checks[0].name.contains("configured"),
+            "expected 'configured' (not 'reachable'); got {}",
+            checks[0].name
         );
     }
 }

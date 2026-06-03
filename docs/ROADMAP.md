@@ -302,11 +302,6 @@ a single-file impl under `crates/cortex/src/memory/provider/` plus a
   embeddings. Lower-level than the current external providers — those
   are agent-memory services that do their own embedding; this would
   be embeddings-only with Borg's existing chunker + ranker reused.
-- **Letta (MemGPT) / Zep.** Two well-known agent-memory services not
-  surveyed in v1. Mem0 and Honcho cover overlapping ground; revisit if
-  operator demand surfaces specifics neither bundled provider covers
-  (e.g. Letta's hierarchical memory levels, Zep's enriched session
-  summaries).
 
 ### Context & memory
 
