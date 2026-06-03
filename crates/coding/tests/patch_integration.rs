@@ -178,9 +178,18 @@ fn delete_nonexistent_succeeds() {
 *** Delete File: ghost.txt
 *** End Patch";
 
-    // Delete of nonexistent should succeed (idempotent)
-    let result = apply_patch_to_dir(patch, dir);
-    assert!(result.is_ok(), "Delete nonexistent should be idempotent");
+    // Delete of nonexistent should succeed (idempotent) AND still report the
+    // path as deleted so callers get a consistent affected-paths summary.
+    let result = apply_patch_to_dir(patch, dir).expect("delete nonexistent should be idempotent");
+    assert_eq!(
+        result.deleted,
+        vec!["ghost.txt".to_string()],
+        "idempotent delete must still surface the path in the affected set"
+    );
+    assert!(
+        result.added.is_empty() && result.modified.is_empty(),
+        "idempotent delete must not report spurious add/modify"
+    );
 }
 
 // ── Test: affected paths summary ──

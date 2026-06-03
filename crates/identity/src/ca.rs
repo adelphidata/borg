@@ -186,19 +186,35 @@ pub fn issue_client_cert(
 mod tests {
     use super::*;
     use crate::cert::parse_cert_metadata;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    /// Assert `leaf_der` carries a signature that cryptographically verifies
+    /// against `ca_der`'s public key. This is the real CA-binding invariant —
+    /// metadata parsing alone would pass even for a cert signed by an
+    /// attacker's key.
+    fn assert_chains_to(leaf_der: &[u8], ca_der: &[u8]) {
+        let (_, ca) = X509Certificate::from_der(ca_der).expect("parse ca der");
+        let (_, leaf) = X509Certificate::from_der(leaf_der).expect("parse leaf der");
+        leaf.verify_signature(Some(ca.public_key()))
+            .expect("issued cert must verify against the CA public key");
+    }
 
     #[test]
-    fn root_ca_round_trips_through_pem() {
+    fn root_ca_is_self_signed_and_reparses() {
         let ca = generate_root_ca("borg-test-ca").expect("ca");
         assert!(ca.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(ca.key_pkcs8_pem.contains("PRIVATE KEY"));
         let key = KeyPair::from_pem(&ca.key_pkcs8_pem).expect("reparse");
         let params = CertificateParams::from_ca_cert_pem(&ca.cert_pem).expect("ca params");
         let _re = params.self_signed(&key).expect("re-issue");
+        // A root CA must be self-signed: its signature verifies under its own key.
+        assert_chains_to(&ca.cert_der, &ca.cert_der);
+        let meta = parse_cert_metadata(&ca.cert_der).expect("parse");
+        assert_eq!(meta.subject_cn.as_deref(), Some("borg-test-ca"));
     }
 
     #[test]
-    fn server_cert_signed_by_ca_has_correct_validity() {
+    fn server_cert_chains_to_ca_with_correct_validity() {
         let ca = generate_root_ca("borg-test-ca").expect("ca");
         let dns = vec!["localhost".to_string()];
         let p = ServerCertParams {
@@ -212,10 +228,12 @@ mod tests {
         let span_days = (meta.not_after - meta.not_before) / 86_400;
         assert!((89..=91).contains(&span_days), "span_days = {span_days}");
         assert_eq!(meta.subject_cn.as_deref(), Some("borgd"));
+        // The real invariant: the server cert is signed by THIS CA.
+        assert_chains_to(&issued.cert_der, &ca.cert_der);
     }
 
     #[test]
-    fn client_cert_binds_device_id_in_san() {
+    fn client_cert_chains_to_ca_and_binds_device_id() {
         let ca = generate_root_ca("borg-test-ca").expect("ca");
         let client_kp = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("kp");
         let client_pub_pem = client_kp.serialize_pem();
@@ -229,5 +247,33 @@ mod tests {
         let meta = parse_cert_metadata(&issued.cert_der).expect("parse");
         assert_eq!(meta.subject_cn.as_deref(), Some("alice-laptop"));
         assert_eq!(meta.san_uri.as_deref(), Some("borg-device:fp-abc123"));
+        assert_chains_to(&issued.cert_der, &ca.cert_der);
+    }
+
+    #[test]
+    fn cert_from_one_ca_does_not_verify_against_a_foreign_ca() {
+        // Real attack model: a cert signed by CA-A must NOT pass verification
+        // against CA-B's public key. If verify_signature ever ignored the
+        // issuer key, an attacker-minted cert would be accepted by the
+        // mTLS verifier.
+        let ca_a = generate_root_ca("borg-ca-a").expect("ca a");
+        let ca_b = generate_root_ca("borg-ca-b").expect("ca b");
+        let dns = vec!["localhost".to_string()];
+        let p = ServerCertParams {
+            common_name: "borgd",
+            san_dns: &dns,
+            validity_days: 30,
+        };
+        let (issued, _key) =
+            issue_server_cert(&ca_a.cert_pem, &ca_a.key_pkcs8_pem, &p).expect("server cert");
+
+        // Sanity: verifies against the real issuer.
+        assert_chains_to(&issued.cert_der, &ca_a.cert_der);
+
+        // Must FAIL against the foreign CA.
+        let (_, foreign) = X509Certificate::from_der(&ca_b.cert_der).expect("parse ca b");
+        let (_, leaf) = X509Certificate::from_der(&issued.cert_der).expect("parse leaf");
+        leaf.verify_signature(Some(foreign.public_key()))
+            .expect_err("cert must NOT verify against an unrelated CA's key");
     }
 }

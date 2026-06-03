@@ -414,7 +414,9 @@ mod tests {
         let envelope: SlackEnvelope = serde_json::from_str(json).unwrap();
         match envelope {
             SlackEnvelope::EventCallback(cb) => {
-                assert!(cb.event.bot_id.is_some());
+                // bot_id presence is what the bot-loop guard keys on; assert the
+                // exact id mapped and that a bot message carries no human user.
+                assert_eq!(cb.event.bot_id.as_deref(), Some("B123"));
                 assert!(cb.event.user.is_none());
             }
             _ => panic!("expected EventCallback"),
@@ -597,7 +599,13 @@ mod tests {
         assert_eq!(payload.user_name.as_deref(), Some("alice"));
         assert_eq!(payload.channel_name.as_deref(), Some("general"));
         assert_eq!(payload.team_id.as_deref(), Some("T789"));
-        assert!(payload.response_url.is_some());
+        // response_url arrives percent-encoded; assert it round-trips decoded
+        // (it's the callback URL we POST async replies to — a mangled value
+        // would silently drop responses).
+        assert_eq!(
+            payload.response_url.as_deref(),
+            Some("https://hooks.slack.com/commands/xyz")
+        );
         assert_eq!(payload.trigger_id.as_deref(), Some("tr1"));
     }
 
@@ -626,7 +634,10 @@ mod tests {
         assert_eq!(payload.user.id, "U123");
         assert_eq!(payload.user.username.as_deref(), Some("alice"));
         assert_eq!(payload.channel.as_ref().unwrap().id, "C456");
-        assert!(payload.response_url.is_some());
+        assert_eq!(
+            payload.response_url.as_deref(),
+            Some("https://hooks.slack.com/actions/T123/456/abc")
+        );
         let actions = payload.actions.unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_id, "approve_btn");

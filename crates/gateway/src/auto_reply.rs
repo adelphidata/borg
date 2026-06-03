@@ -89,9 +89,16 @@ mod tests {
         assert!(check_auto_reply(&state, &config).await.is_none());
     }
 
-    #[test]
-    fn default_state_is_available() {
-        let state = AutoReplyState::default();
-        assert!(matches!(state, AutoReplyState::Available));
+    #[tokio::test]
+    async fn default_state_does_not_auto_reply_even_when_enabled() {
+        // The default state must behave as "available": with auto-reply
+        // enabled but no explicit Away set, a fresh agent must process
+        // messages normally (None) rather than silently auto-replying.
+        let state: SharedAutoReplyState = Arc::new(RwLock::new(AutoReplyState::default()));
+        let config = AutoReplyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(check_auto_reply(&state, &config).await, None);
     }
 }

@@ -598,11 +598,13 @@ mod tests {
             Ok(_) => panic!("empty batch must not construct an overlay"),
             Err(tx) => tx,
         };
-        // The recovered sender still works — agent can be unblocked.
+        // The recovered sender still works — agent can be unblocked, and the
+        // exact (empty) payload arrives on the original receiver.
         err_tx
             .send(HashMap::new())
             .expect("recovered sender must still send");
-        assert!(rx.try_recv().is_ok());
+        let received = rx.try_recv().expect("payload must arrive on the receiver");
+        assert!(received.is_empty(), "empty-batch reply must carry an empty map");
     }
 
     /// `current_options_len` includes the auto-appended "Other" row. Layout

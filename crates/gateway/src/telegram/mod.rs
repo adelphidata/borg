@@ -208,7 +208,12 @@ mod tests {
         let result = handle_telegram_webhook(&headers, &body, Some("secret123"), &dedup)
             .await
             .unwrap();
-        assert!(result.is_some());
+        // Matching secret must admit the update AND yield the parsed message
+        // (paired with wrong_secret_rejected, this proves the secret gates
+        // the flow without dropping the payload).
+        let msg = result.expect("matching secret must produce a message").inbound;
+        assert_eq!(msg.text, "hi");
+        assert_eq!(msg.sender_id, "42");
     }
 
     #[tokio::test]

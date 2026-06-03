@@ -374,8 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn find_by_id_works() {
-        assert!(find_by_id("messaging/whatsapp").is_some());
+    fn find_by_id_returns_the_matching_entry() {
+        // Real failure mode: a lookup that returned the wrong (or first)
+        // entry would still be `is_some()`. Assert identity round-trips.
+        let found = find_by_id("messaging/whatsapp").expect("whatsapp present");
+        assert_eq!(found.id, "messaging/whatsapp");
+        assert_eq!(found.service_name(), "borg-messaging-whatsapp");
+        assert_eq!(found.category, Category::Channels);
         assert!(find_by_id("nonexistent").is_none());
     }
 
@@ -402,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn find_native_by_id_works() {
+    fn find_native_by_id_returns_native_channel_entries() {
         for id in &[
             "messaging/telegram",
             "messaging/slack",
@@ -410,7 +415,10 @@ mod tests {
             "messaging/teams",
             "messaging/google-chat",
         ] {
-            assert!(find_by_id(id).is_some(), "native plugin {id} not found");
+            let entry = find_by_id(id).unwrap_or_else(|| panic!("native plugin {id} not found"));
+            assert_eq!(&entry.id, id);
+            assert!(entry.is_native, "{id} must be a native integration");
+            assert_eq!(entry.category, Category::Channels);
         }
     }
 

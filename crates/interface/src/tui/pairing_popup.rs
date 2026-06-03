@@ -526,9 +526,20 @@ mod tests {
         popup.handle_key(key(KeyCode::Char('d')));
         // Now cursor is on an approved item, Enter collects revokes
         let result = popup.handle_key(key(KeyCode::Enter));
-        assert!(result.is_some());
-        let actions = result.unwrap();
-        assert_eq!(actions.len(), 2);
+        let actions = result.expect("Enter with pending revokes must emit actions");
+        // Both marked rows must produce Revoke actions for the right
+        // channel/sender pairs — not just "two actions of any kind".
+        let mut revoked: Vec<(&str, &str)> = actions
+            .iter()
+            .map(|a| match a {
+                PairingAction::Revoke { channel, sender_id } => {
+                    (channel.as_str(), sender_id.as_str())
+                }
+                PairingAction::Approve { .. } => panic!("expected Revoke, got Approve"),
+            })
+            .collect();
+        revoked.sort();
+        assert_eq!(revoked, vec![("discord", "456"), ("slack", "789")]);
     }
 
     #[test]

@@ -154,7 +154,7 @@ impl Agent {
         let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
 
-        // Stable prefix: ordered so the largest byte-stable content comes first, enabling
+        // === STABLE PREFIX === ordered so the largest byte-stable content comes first, enabling
         // implicit prefix caching on providers that hash the prompt (OpenAI,
         // Gemini) and maximizing cache hits on providers with explicit markers
         // (Anthropic). Anything that changes turn-to-turn is pushed to the
@@ -251,7 +251,7 @@ impl Agent {
             );
         }
 
-        // Dynamic suffix: per-turn content that invalidates the prefix cache.
+        // === DYNAMIC SUFFIX === per-turn content that invalidates the prefix cache.
 
         // Active memory: per-turn hybrid search of memory + past sessions
         // keyed off the latest user message. Placed at the start of the

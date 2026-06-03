@@ -586,7 +586,9 @@ mod tests {
         let update: Update = serde_json::from_str(json).unwrap();
         let sticker = update.message.unwrap().sticker.unwrap();
         assert_eq!(sticker.width, 512);
-        assert!(sticker.emoji.is_some());
+        assert_eq!(sticker.file_id, "s1");
+        // The \uXXXX-escaped emoji must decode to the actual grapheme.
+        assert_eq!(sticker.emoji.as_deref(), Some("😀"));
     }
 
     #[test]

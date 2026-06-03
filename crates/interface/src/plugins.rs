@@ -457,16 +457,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_known_plugin() {
-        assert!(find_plugin("telegram").is_some());
-        assert!(find_plugin("slack").is_some());
-        assert!(find_plugin("discord").is_some());
-        assert!(find_plugin("signal").is_some());
-        assert!(find_plugin("teams").is_some());
-        assert!(find_plugin("google-chat").is_some());
-        assert!(find_plugin("gmail").is_some());
-        assert!(find_plugin("notion").is_some());
-        assert!(find_plugin("linear").is_some());
+    fn find_known_plugin_returns_matching_def() {
+        // Lookup must return the def whose `name` equals the query — a
+        // bug that returned the wrong (but Some) def would slip past an
+        // `.is_some()` check.
+        for name in [
+            "telegram",
+            "slack",
+            "discord",
+            "signal",
+            "teams",
+            "google-chat",
+            "gmail",
+            "notion",
+            "linear",
+        ] {
+            let def = find_plugin(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(def.name, name, "find_plugin returned the wrong def");
+        }
     }
 
     #[test]

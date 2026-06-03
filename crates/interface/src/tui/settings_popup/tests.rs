@@ -66,7 +66,16 @@ fn bool_toggle() {
     let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
     let result = popup.handle_key(space, &mut cfg).unwrap();
     assert!(!cfg.sandbox.enabled);
-    assert!(result.is_some());
+    // The toggle must emit an UpdateSetting carrying the new value so the
+    // daemon persists "false", not just any action.
+    match result {
+        Some(AppAction::UpdateSetting { key, value }) => {
+            assert_eq!(key, "sandbox.enabled");
+            assert_eq!(value, "false");
+        }
+        Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
+        None => panic!("expected UpdateSetting, got None"),
+    }
 }
 
 #[test]
@@ -99,7 +108,14 @@ fn valid_edit_applies() {
     // Apply
     let result = popup.handle_key(enter, &mut cfg).unwrap();
     assert!((cfg.llm.temperature - 1.5).abs() < f32::EPSILON);
-    assert!(result.is_some());
+    match result {
+        Some(AppAction::UpdateSetting { key, value }) => {
+            assert_eq!(key, "temperature");
+            assert_eq!(value, "1.5");
+        }
+        Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
+        None => panic!("expected UpdateSetting, got None"),
+    }
     assert!(matches!(popup.mode, EditMode::Browsing));
 }
 
@@ -259,7 +275,15 @@ fn provider_cycle_forward() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
     let result = popup.handle_key(right, &mut cfg).unwrap();
-    assert!(result.is_some());
+    // Cycling the provider persists the new provider id.
+    match result {
+        Some(AppAction::UpdateSetting { key, value }) => {
+            assert_eq!(key, "provider");
+            assert_eq!(value, PROVIDERS[(initial_provider_index + 1) % PROVIDERS.len()].0);
+        }
+        Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
+        None => panic!("expected UpdateSetting, got None"),
+    }
     assert_eq!(
         popup.provider_index,
         (initial_provider_index + 1) % PROVIDERS.len()
@@ -317,8 +341,17 @@ fn float_step_right_increases() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
     let result = popup.handle_key(right, &mut cfg).unwrap();
-    assert!(result.is_some());
     assert!((cfg.llm.temperature - (original + 0.1)).abs() < 0.01);
+    // The persisted payload must be the stepped value, not the original.
+    match result {
+        Some(AppAction::UpdateSetting { key, value }) => {
+            assert_eq!(key, "temperature");
+            let parsed: f32 = value.parse().expect("numeric temperature payload");
+            assert!((parsed - (original + 0.1)).abs() < 0.01, "payload was {value}");
+        }
+        Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
+        None => panic!("expected UpdateSetting, got None"),
+    }
 }
 
 #[test]
@@ -520,13 +553,20 @@ fn model_selection_enter_applies() {
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let result = popup.handle_key(enter, &mut cfg).unwrap();
 
-    assert!(result.is_some());
     assert!(matches!(popup.mode, EditMode::Browsing));
     assert_eq!(popup.model_index, 1);
 
     let provider_id = PROVIDERS[popup.provider_index].0;
     let models = models_for_provider(provider_id);
     assert_eq!(cfg.llm.model, models[1].0);
+    match result {
+        Some(AppAction::UpdateSetting { key, value }) => {
+            assert_eq!(key, "model");
+            assert_eq!(value, models[1].0);
+        }
+        Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
+        None => panic!("expected UpdateSetting, got None"),
+    }
 }
 
 #[test]
@@ -568,18 +608,18 @@ fn left_right_noop_on_uint_fields() {
 }
 
 #[test]
-fn bool_display_uses_check_and_cross() {
+fn bool_current_value_reflects_config_state() {
     let popup = SettingsPopup::new();
-    let cfg = Config::default();
+    let mut cfg = Config::default();
 
-    // sandbox.enabled defaults to true
-    let val = popup.current_value(&cfg, "sandbox.enabled");
-    assert_eq!(val, "true");
+    // sandbox.enabled defaults to true and current_value must mirror it.
+    assert!(cfg.sandbox.enabled);
+    assert_eq!(popup.current_value(&cfg, "sandbox.enabled"), "true");
 
-    // The display should use ✓ for true bools — verify via current_value + formatting logic
-    // (render builds the display_value inline; we test the component values here)
-    assert_eq!(theme::CHECK, "✓");
-    assert_eq!(theme::CROSS, "✗");
+    // Flipping the config flips the reported value — guards against a
+    // stale/hardcoded display string.
+    cfg.sandbox.enabled = false;
+    assert_eq!(popup.current_value(&cfg, "sandbox.enabled"), "false");
 }
 
 #[test]
@@ -667,7 +707,7 @@ fn confirm_reset_y_resets_config() {
         "config was not reloaded after reset"
     );
     assert_eq!(popup.mode, EditMode::Browsing);
-    assert!(result.is_some()); // ConfigReloaded action
+    assert!(matches!(result, Some(AppAction::ConfigReloaded)));
     assert!(
         popup
             .status_message

@@ -412,46 +412,81 @@ mod tests {
 
     #[test]
     fn plan_preserves_most_recent_messages() {
+        // Use large messages so the full history overwhelms the threshold even
+        // after the 200-token marker reserve, forcing a real compaction with a
+        // budget that still fits only the most recent pair. (Tiny messages can't
+        // exceed the reserve, which is why the old version's assertion was
+        // wrapped in a never-failing `if let Some`.)
+        let big = "padding ".repeat(60); // ~120 tokens each
         let history = vec![
-            make_user("old message 1"),
-            make_assistant("old response 1"),
-            make_user("old message 2"),
-            make_assistant("old response 2"),
-            make_user("recent question"),
-            make_assistant("recent answer"),
+            make_user(&format!("old message 1 {big}")),
+            make_assistant(&format!("old response 1 {big}")),
+            make_user(&format!("old message 2 {big}")),
+            make_assistant(&format!("old response 2 {big}")),
+            make_user(&format!("recent question {big}")),
+            make_assistant(&format!("recent answer {big}")),
         ];
 
+        // Budget = marker reserve + the last pair (+slack). effective_budget
+        // then fits the last pair; the six big messages overflow the threshold.
         let last_pair_tokens = message_tokens(&history[4]) + message_tokens(&history[5]);
-        // Budget is tight enough that the 6-message history must overflow it,
-        // so compaction MUST fire — assert Some so a regression that returns
-        // None (no compaction) can't pass this test vacuously.
-        let keep_from = plan_compaction(&history, last_pair_tokens + 205)
-            .expect("history must exceed this tight budget and trigger compaction");
-        // The most recent pair (indices 4, 5) must survive in the kept portion.
+        let max_tokens = COMPACTION_MARKER_TOKENS + last_pair_tokens + 10;
         assert!(
-            keep_from <= 4,
-            "keep_from={keep_from} would drop the most recent message pair"
+            history_tokens(&history) as f64
+                > max_tokens as f64 * constants::COMPACTION_SAFETY_MARGIN,
+            "test setup: full history ({}) must exceed threshold ({})",
+            history_tokens(&history),
+            (max_tokens as f64 * constants::COMPACTION_SAFETY_MARGIN) as usize,
+        );
+        let keep_from = plan_compaction(&history, max_tokens)
+            .expect("over-threshold history must trigger compaction");
+        // The most recent pair (indices 4, 5) must survive, and older messages
+        // must actually be dropped.
+        assert!(
+            (1..=4).contains(&keep_from),
+            "keep_from={keep_from} must drop old messages yet preserve the most \
+             recent pair (indices 4, 5)"
         );
     }
 
     #[test]
     fn plan_skips_leading_tool_results() {
+        // The leading user message (idx 0) is huge so it gets dropped. The
+        // tool_result (idx 2) is sized so the budget covers idx 2..=4 but the
+        // tiny tool_call at idx 1 tips it over — so the naive walk-back stops at
+        // keep_from=2 (the tool_result). That is an orphan, because its tool_call
+        // assistant (idx 1) is dropped, so the planner must skip forward to idx 3.
+        let big = "padding ".repeat(200); // huge leading message → dropped
+        let result_big = "out ".repeat(40); // sizeable tool_result body
         let history = vec![
-            make_user("do something"),
+            make_user(&format!("do something {big}")),
             make_tool_call_msg("", "call_1", "run_shell"),
-            make_tool_result("call_1", "command output"),
+            make_tool_result("call_1", &format!("command output {result_big}")),
             make_user("recent question"),
             make_assistant("recent answer"),
         ];
 
-        let last_pair_tokens = message_tokens(&history[3]) + message_tokens(&history[4]);
-        // This history overflows the tight budget, so compaction must fire.
-        // Assert Some so the orphaned-tool-result guard below is actually
-        // exercised rather than skipped when plan_compaction returns None.
-        let keep_from = plan_compaction(&history, last_pair_tokens + 205)
-            .expect("history must exceed this tight budget and trigger compaction");
+        // effective_budget (= max_tokens - marker reserve) is sized to fit
+        // exactly idx 2..=4. Walk-back keeps 4,3,2 then breaks on the tiny idx 1,
+        // leaving keep_from=2 (orphaned tool_result) → skip-forward to idx 3.
+        let fit_2_to_4: usize = history[2..].iter().map(message_tokens).sum();
+        let max_tokens = COMPACTION_MARKER_TOKENS + fit_2_to_4;
+        assert!(
+            history_tokens(&history) as f64
+                > max_tokens as f64 * constants::COMPACTION_SAFETY_MARGIN,
+            "test setup: full history ({}) must exceed threshold ({})",
+            history_tokens(&history),
+            (max_tokens as f64 * constants::COMPACTION_SAFETY_MARGIN) as usize,
+        );
+        let keep_from = plan_compaction(&history, max_tokens)
+            .expect("over-threshold history must trigger compaction");
         // The kept portion must not start with a Tool message, which would be
         // an orphaned tool_result (its assistant tool_call message was dropped).
+        // The skip-forward must have advanced past the tool_result at idx 2.
+        assert!(
+            keep_from >= 3,
+            "planner must skip the orphaned tool_result at idx 2; keep_from={keep_from}"
+        );
         assert_ne!(
             history[keep_from].role,
             Role::Tool,

@@ -759,7 +759,7 @@ fn reply_tags_section_documents_reply_to_current() {
         "reply-tags section must document the [[reply_to_current]] tag: {section}"
     );
     assert!(
-        section.contains("must be the very first token"),
+        section.contains("the very first token"),
         "reply-tags section must state the first-token constraint: {section}"
     );
 }

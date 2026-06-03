@@ -160,13 +160,31 @@ mod tests {
     }
 
     #[test]
-    fn common_langs_are_recognized() {
+    fn common_langs_resolve_to_expected_syntax() {
+        // Each token (name, alias, or extension) must map to the *correct*
+        // syntax, not merely some syntax — a misrouted extension would
+        // highlight Python as JS while still returning Some.
         let ss = syntax_set();
-        assert!(find_syntax(ss, "rust").is_some());
-        assert!(find_syntax(ss, "python").is_some());
-        assert!(find_syntax(ss, "js").is_some());
-        // Extension lookup
-        assert!(find_syntax(ss, "rs").is_some());
-        assert!(find_syntax(ss, "py").is_some());
+        let cases = [
+            ("rust", "Rust"),
+            ("python", "Python"),
+            ("rs", "Rust"), // extension lookup
+            ("py", "Python"),
+        ];
+        for (lang, expected_name) in cases {
+            let syntax = find_syntax(ss, lang).unwrap_or_else(|| panic!("{lang} should resolve"));
+            assert_eq!(
+                syntax.name, expected_name,
+                "{lang} resolved to the wrong syntax"
+            );
+        }
+        // JS may be named "JavaScript" or "JavaScript (Babel)" depending on
+        // the bundled syntax set — assert it at least resolves to a JS family.
+        let js = find_syntax(ss, "js").expect("js should resolve");
+        assert!(
+            js.name.contains("JavaScript"),
+            "js resolved to {:?}",
+            js.name
+        );
     }
 }

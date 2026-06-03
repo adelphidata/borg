@@ -241,18 +241,39 @@ fn channel_toggle_and_credential_flow() {
     assert!(result.is_none());
     assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
 
-    // Type credential and submit
+    // Type credential and submit — the emitted action must be an Install
+    // for telegram carrying the token the user just typed.
     type_text(&mut popup, "test-token");
-    let result = press(&mut popup, KeyCode::Enter);
-    assert!(result.is_some());
+    let result = press(&mut popup, KeyCode::Enter).expect("submit should emit actions");
+    let install = result
+        .iter()
+        .find_map(|a| match a {
+            PluginAction::Install { id, credentials } if id == "messaging/telegram" => {
+                Some(credentials)
+            }
+            _ => None,
+        })
+        .expect("telegram Install action expected");
+    assert!(
+        install.iter().any(|(_, v)| v == "test-token"),
+        "typed credential must be carried in the Install action, got {install:?}"
+    );
 }
 
 #[test]
 fn enter_no_changes_shows_status() {
     let mut popup = make_test_popup();
     let result = press(&mut popup, KeyCode::Enter);
-    assert!(result.is_none());
-    assert!(popup.status_message.is_some());
+    assert!(result.is_none(), "no toggles means no actions emitted");
+    let (msg, ok) = popup
+        .status_message
+        .as_ref()
+        .expect("a status message must explain why nothing happened");
+    assert!(
+        msg.contains("No changes"),
+        "expected a no-changes status, got {msg:?}"
+    );
+    assert!(!ok, "no-changes status is informational, not a success");
 }
 
 #[test]

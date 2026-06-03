@@ -492,8 +492,10 @@ mod tests {
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
-        assert!(route.binding_id.starts_with("bind:"));
-        assert!(route.binding_id.contains("telegram"));
+        // binding_id is the session-isolation key: bind:{channel}:{sender}:{peer_kind}.
+        // A channel-only binding has wildcard sender/peer, so both render as "*".
+        // Two distinct bindings must never collide on this id.
+        assert_eq!(route.binding_id, "bind:telegram:*:*");
     }
 
     #[test]

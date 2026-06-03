@@ -501,9 +501,18 @@ mod tests {
         );
         assert_eq!(req.jsonrpc, "2.0");
         assert_eq!(req.method, "send");
-        assert!(req.id.is_some());
-        let serialized = serde_json::to_string(&req).unwrap();
-        assert!(serialized.contains("\"jsonrpc\":\"2.0\""));
-        assert!(serialized.contains("\"method\":\"send\""));
+        // id must be present so the daemon can correlate the async response.
+        let id = req.id.clone().expect("request must carry a correlation id");
+        // Round-trip through JSON and assert the id + params survive — a
+        // dropped params field would send an empty signal-cli command.
+        let value: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&req).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "send");
+        assert_eq!(value["id"], serde_json::json!(id));
+        assert_eq!(value["params"]["recipient"], "+15551234567");
+        assert_eq!(value["params"]["message"], "hi");
     }
 }

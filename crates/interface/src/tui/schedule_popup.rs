@@ -480,10 +480,19 @@ mod tests {
         assert_eq!(popup.tasks[0].task.status, "paused");
 
         let result = popup.handle_key(enter);
-        assert!(result.is_some());
-        let actions = result.unwrap();
+        let actions = result.expect("toggled task must produce an action on Enter");
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ScheduleAction::ToggleStatus { .. }));
+        // Must target the right task and carry the new "paused" status —
+        // a wrong id or stale status would silently no-op on the daemon.
+        match &actions[0] {
+            ScheduleAction::ToggleStatus { task_id, new_status } => {
+                assert_eq!(task_id, "test-1");
+                assert_eq!(new_status, "paused");
+            }
+            ScheduleAction::UpdateSchedule { .. } | ScheduleAction::DeleteTask { .. } => {
+                panic!("expected ToggleStatus, got a different ScheduleAction")
+            }
+        }
     }
 
     #[test]

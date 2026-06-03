@@ -547,7 +547,10 @@ mod tests {
         open(&mut popup, &cfg);
         popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap();
         assert!(matches!(popup.step, Step::PickModel { cursor: 0 }));
-        assert!(popup.chosen_provider_idx.is_some());
+        // Confirming the provider step must record exactly the highlighted
+        // provider (cursor started at 0) so PickModel lists that provider's
+        // models — a wrong-but-Some index would show the wrong model list.
+        assert_eq!(popup.chosen_provider_idx, Some(0));
     }
 
     #[test]

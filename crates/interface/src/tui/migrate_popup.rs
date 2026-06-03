@@ -685,7 +685,15 @@ mod tests {
         popup.source_data = Some(SourceData::default());
 
         let result = popup.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(result.is_some());
+        // Confirming must emit exactly one Apply action carrying the plan's
+        // source — not just "some action".
+        let actions = result.expect("confirm with a plan must apply");
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            MigrateAction::Apply { plan, .. } => {
+                assert_eq!(plan.source, MigrationSource::Hermes);
+            }
+        }
         assert!(!popup.is_visible()); // dismissed after apply
     }
 

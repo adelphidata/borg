@@ -85,19 +85,34 @@ mod tests {
     use crate::catalog::CATALOG;
 
     #[test]
-    fn verify_uninstalled_fails() {
+    fn verify_template_plugin_fails_on_missing_files_not_some_other_reason() {
+        // whatsapp is a template (non-native) plugin: with no files on disk
+        // verify must fail at the install-files gate. Asserting the exact
+        // reason guards against the test passing for an unrelated failure
+        // (e.g. a missing binary check short-circuiting first).
         let def = CATALOG
             .iter()
             .find(|c| c.id == "messaging/whatsapp")
             .expect("whatsapp in catalog");
+        assert!(
+            !def.is_native,
+            "fixture assumption: whatsapp must be a template plugin"
+        );
         let tmp = std::env::temp_dir().join("borg-verify-test");
         let result = verify(def, &tmp);
         assert!(!result.ok);
+        assert_eq!(result.id, "messaging/whatsapp");
+        assert_eq!(
+            result.message, "Integration files not found",
+            "uninstalled template plugin must fail at the files gate"
+        );
     }
 
     #[test]
-    fn verify_native_without_creds_fails() {
-        // Use discord to avoid env var races with other tests
+    fn verify_native_plugin_fails_naming_the_missing_credential() {
+        // Native plugins skip the files gate, so an absent credential is the
+        // only failure path. Assert the message names the specific missing
+        // credential, not just "something failed". (discord avoids env races.)
         let def = CATALOG
             .iter()
             .find(|c| c.id == "messaging/discord")
@@ -109,25 +124,18 @@ mod tests {
         let tmp = std::env::temp_dir().join("borg-verify-native");
         let result = verify(def, &tmp);
         assert!(!result.ok);
-    }
-
-    #[test]
-    fn verify_native_message_mentions_credentials() {
-        // Use discord to avoid env var races with other tests
-        let def = CATALOG
+        assert_eq!(result.id, "messaging/discord");
+        // The first required, non-optional credential must be named in the
+        // message together with the "not found" cause.
+        let first_required = def
+            .required_credentials
             .iter()
-            .find(|c| c.id == "messaging/discord")
-            .expect("discord in catalog");
-        unsafe {
-            std::env::remove_var("DISCORD_BOT_TOKEN");
-            std::env::remove_var("DISCORD_PUBLIC_KEY");
-        }
-        let tmp = std::env::temp_dir().join("borg-verify-native-msg");
-        let result = verify(def, &tmp);
-        assert!(!result.ok);
+            .find(|c| !c.is_optional)
+            .expect("discord must declare a required credential");
         assert!(
-            result.message.contains("not found"),
-            "message should mention 'not found': {}",
+            result.message.contains(first_required.key)
+                && result.message.contains("not found"),
+            "message must name the missing credential and the cause: {}",
             result.message
         );
     }

@@ -585,8 +585,13 @@ mod tests {
     #[test]
     fn lookup_finds_builtin_and_custom() {
         let popup = CommandPopup::with_custom(vec![custom("/standup", "Daily", "body")]);
-        assert!(popup.lookup("/help").is_some());
+        // Built-in resolves to the matching command (a built-in has no template).
+        let help = popup.lookup("/help").expect("/help is a built-in");
+        assert_eq!(help.name, "/help");
+        assert!(help.template.is_none());
+        // Custom resolves to its own template body.
         let st = popup.lookup("/standup").unwrap();
+        assert_eq!(st.name, "/standup");
         assert_eq!(st.template.as_deref(), Some("body"));
         assert!(popup.lookup("/notathing").is_none());
     }
