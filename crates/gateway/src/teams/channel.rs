@@ -120,6 +120,16 @@ impl NativeChannel for TeamsChannel {
             }
         }
 
+        // A voice-only message whose transcript never materialized (STT
+        // unconfigured, download failed, or transcription errored) would
+        // otherwise emit an empty agent turn. Only the audio path can reach
+        // here with empty text — text/invoke/reaction empties were already
+        // filtered by `parse_activity`.
+        if inbound.text.trim().is_empty() {
+            tracing::info!("teams: dropping voice-only message with no transcript");
+            return Ok(WebhookOutcome::Skip);
+        }
+
         let service_url = activity
             .service_url
             .as_deref()

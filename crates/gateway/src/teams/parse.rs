@@ -43,17 +43,29 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
     } else {
         activity.text.clone()
     };
-    let raw_text = raw_text.as_deref()?;
 
-    // Extract quoted content from HTML blockquotes in reply messages
+    // Voice messages arrive as a `message` activity with an `audio/*`
+    // attachment and (usually) no text. Allow those through with empty text
+    // so channel.rs can transcribe; the transcript becomes the message body.
+    let has_audio_attachment = activity_has_audio(activity);
+    let raw_text = match raw_text.as_deref() {
+        Some(t) => t,
+        None if has_audio_attachment => "",
+        None => return None,
+    };
+
+    // Extract quoted content from HTML blockquotes in reply messages, then
+    // strip the entire blockquote span from the body so the quote appears
+    // ONLY as the `> ...` prefix — not duplicated inline in the reply text.
     let quote_context = activity
         .reply_to_id
         .as_ref()
         .and_then(|_| extract_quote_text(raw_text));
+    let body = strip_blockquotes(raw_text);
 
     // Process mention tags: bot mentions stripped, user mentions preserved as @Name
     let bot_id = activity.recipient.as_ref().map(|r| r.id.as_str());
-    let text = resolve_mention_tags(raw_text, activity.entities.as_deref(), bot_id);
+    let text = resolve_mention_tags(&body, activity.entities.as_deref(), bot_id);
     let text = strip_html_tags(&text);
     let mut text = text.trim().to_string();
 
@@ -62,7 +74,7 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         text = format!("> {quote}\n{text}");
     }
 
-    if text.is_empty() {
+    if text.is_empty() && !has_audio_attachment {
         return None;
     }
 
@@ -208,6 +220,19 @@ fn resolve_mention_tags(
     .to_string()
 }
 
+/// True when the activity carries at least one `audio/*` attachment.
+///
+/// Teams voice messages are `message` activities with an `audio/*` content
+/// type; they often have no text and must still reach the transcription path
+/// in `channel.rs`.
+fn activity_has_audio(activity: &Activity) -> bool {
+    activity
+        .attachments
+        .as_deref()
+        .map(|atts| atts.iter().any(|a| a.content_type.starts_with("audio/")))
+        .unwrap_or(false)
+}
+
 /// Extract quoted text from Teams HTML message content.
 ///
 /// Teams wraps quoted content in `<blockquote>...</blockquote>` tags.
@@ -221,6 +246,21 @@ fn extract_quote_text(text: &str) -> Option<String> {
     re.captures(text)
         .map(|caps| strip_html_tags(&caps[1]).trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Remove `<blockquote>...</blockquote>` spans entirely from Teams content.
+///
+/// Teams reply messages embed the quoted parent as a blockquote followed by
+/// the actual reply text. `extract_quote_text` lifts the quote into a `> ...`
+/// prefix, so the span must be removed from the body to avoid duplicating the
+/// quoted content inline (and mashing it into the reply).
+fn strip_blockquotes(text: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?s)<blockquote[^>]*>.*?</blockquote>").unwrap_or_else(|_| unreachable!())
+    });
+    re.replace_all(text, "").to_string()
 }
 
 /// Minimal HTML tag stripping for extracting plain text from Teams content.
@@ -519,13 +559,27 @@ mod tests {
     }
 
     #[test]
-    fn quote_prepended_to_reply() {
+    fn quote_prepended_to_reply_does_not_duplicate_or_mash() {
         let mut activity = make_activity();
         activity.reply_to_id = Some("parent-1".to_string());
         activity.text = Some("<blockquote>quoted content</blockquote>reply text".to_string());
         let msg = parse_activity(&activity).unwrap();
-        assert!(msg.text.starts_with("> quoted content\n"));
-        assert!(msg.text.contains("reply text"));
+        // Quote surfaces once as a prefix; the reply body is clean.
+        assert_eq!(msg.text, "> quoted content\nreply text");
+        assert_eq!(msg.text.matches("quoted content").count(), 1);
+        // Regression: blockquote content used to leak into the body, mashed
+        // against the reply with no separator.
+        assert!(!msg.text.contains("contentreply"));
+    }
+
+    #[test]
+    fn plain_reply_without_blockquote_is_unchanged() {
+        let mut activity = make_activity();
+        activity.reply_to_id = Some("parent-1".to_string());
+        activity.text = Some("just a normal reply".to_string());
+        let msg = parse_activity(&activity).unwrap();
+        assert_eq!(msg.text, "just a normal reply");
+        assert!(!msg.text.contains('>'));
     }
 
     // ── is_bot_added tests ──
@@ -599,5 +653,43 @@ mod tests {
         activity.text = None;
         activity.value = None;
         assert!(parse_activity(&activity).is_none());
+    }
+
+    // ── Voice attachment routing tests ──
+
+    #[test]
+    fn audio_only_message_parses_so_transcription_is_reachable() {
+        use super::super::types::TeamsInboundAttachment;
+        let mut activity = make_activity();
+        activity.text = None;
+        activity.attachments = Some(vec![TeamsInboundAttachment {
+            content_type: "audio/wav".to_string(),
+            content_url: Some("https://sharepoint.example/voice.wav".to_string()),
+            name: Some("voice.wav".to_string()),
+        }]);
+        let msg = parse_activity(&activity).expect("audio-only message must parse");
+        // Empty text is intentional — channel.rs fills it with the transcript.
+        assert!(msg.text.is_empty());
+        // Identity fields still populated from the shared construction.
+        assert_eq!(msg.sender_id, "user-1");
+        assert_eq!(msg.channel_id.as_deref(), Some("conv-1"));
+        assert_eq!(msg.message_id.as_deref(), Some("act-1"));
+        assert_eq!(msg.peer_kind.as_deref(), Some("group"));
+    }
+
+    #[test]
+    fn non_audio_attachment_with_no_text_returns_none() {
+        use super::super::types::TeamsInboundAttachment;
+        let mut activity = make_activity();
+        activity.text = None;
+        activity.attachments = Some(vec![TeamsInboundAttachment {
+            content_type: "image/png".to_string(),
+            content_url: Some("https://sharepoint.example/pic.png".to_string()),
+            name: Some("pic.png".to_string()),
+        }]);
+        assert!(
+            parse_activity(&activity).is_none(),
+            "non-audio attachment-only message must not emit empty agent turn"
+        );
     }
 }
