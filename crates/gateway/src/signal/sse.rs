@@ -19,6 +19,7 @@ const MAX_BACKOFF: Duration = constants::SIGNAL_SSE_MAX_BACKOFF;
 const BACKOFF_FACTOR: f64 = constants::SIGNAL_SSE_BACKOFF_FACTOR;
 const JITTER_FRACTION: f64 = constants::SIGNAL_SSE_JITTER_FRACTION;
 const STALL_TIMEOUT: Duration = constants::SIGNAL_SSE_STALL_TIMEOUT;
+const MAX_ATTACHMENT_BYTES: u64 = constants::SIGNAL_MAX_ATTACHMENT_BYTES;
 
 /// Maximum SSE buffer size before we drop and reconnect (1 MB).
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
@@ -171,8 +172,13 @@ pub async fn run_sse_loop(
                             // prepend `[Voice transcript]: …` to the message
                             // text — parity with Telegram inbound voice.
                             if !raw_attachments.is_empty() {
-                                enrich_attachments(&mut inbound, &raw_attachments, &client, 10_000)
-                                    .await;
+                                enrich_attachments(
+                                    &mut inbound,
+                                    &raw_attachments,
+                                    &client,
+                                    MAX_ATTACHMENT_BYTES,
+                                )
+                                .await;
                                 if let Some(transcriber) =
                                     cortex::media::understanding::AudioTranscriber::from_config(
                                         &config,

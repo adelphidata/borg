@@ -2,9 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::format::{chunk_with_styles, FormattedText, TextStyle};
+use super::format::{chunk_with_styles, markdown_to_signal};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
-use crate::message_processing::chunker;
 use crate::resilience::circuit_breaker::CircuitBreaker;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -20,6 +19,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(constants::SIGNAL_RPC_TIMEOUT_
 
 /// Monotonically increasing counter for JSON-RPC request IDs.
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Where an outbound message is addressed: a 1:1 recipient or a group.
+enum SendTarget<'a> {
+    Recipient(&'a str),
+    Group(&'a str),
+}
 
 /// A client for the signal-cli JSON-RPC daemon.
 #[derive(Clone)]
@@ -97,119 +102,46 @@ impl SignalClient {
     }
 
     /// Send a text message to a recipient (phone number or UUID).
-    /// Automatically chunks text exceeding the limit.
-    /// When `styles` is provided, includes Signal text style ranges in the RPC call.
-    pub async fn send_message(
-        &self,
-        recipient: &str,
-        text: &str,
-        styles: Option<&[TextStyle]>,
-    ) -> Result<()> {
-        match styles {
-            Some(style_list) if !style_list.is_empty() => {
-                let formatted = FormattedText {
-                    text: text.to_string(),
-                    styles: style_list.to_vec(),
-                };
-                let chunks = chunk_with_styles(&formatted, MESSAGE_CHUNK_SIZE);
-                for chunk in &chunks {
-                    let text_styles: Vec<_> = chunk
-                        .styles
-                        .iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "start": s.start,
-                                "length": s.length,
-                                "style": s.style,
-                            })
-                        })
-                        .collect();
-                    let mut params = serde_json::json!({
-                        "account": self.account,
-                        "recipient": [recipient],
-                        "message": chunk.text,
-                    });
-                    if !text_styles.is_empty() {
-                        params["textStyle"] = serde_json::Value::Array(text_styles);
-                    }
-                    let resp = self.rpc_call("send", params).await?;
-                    if let Some(ref err) = resp.error {
-                        bail!("Signal send failed (code {}): {}", err.code, err.message);
-                    }
-                }
-            }
-            _ => {
-                let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
-                for chunk in &chunks {
-                    let params = serde_json::json!({
-                        "account": self.account,
-                        "recipient": [recipient],
-                        "message": chunk,
-                    });
-                    let resp = self.rpc_call("send", params).await?;
-                    if let Some(ref err) = resp.error {
-                        bail!("Signal send failed (code {}): {}", err.code, err.message);
-                    }
-                }
-            }
-        }
-        Ok(())
+    ///
+    /// `text` is treated as markdown: it is converted to Signal's native text
+    /// style ranges (bold/italic/monospace/strikethrough/spoiler) and chunked
+    /// to fit the per-message size limit. See [`Self::send_to`].
+    pub async fn send_message(&self, recipient: &str, text: &str) -> Result<()> {
+        self.send_to(SendTarget::Recipient(recipient), text).await
     }
 
-    /// Send a text message to a group.
-    /// When `styles` is provided, includes Signal text style ranges in the RPC call.
-    pub async fn send_group_message(
-        &self,
-        group_id: &str,
-        text: &str,
-        styles: Option<&[TextStyle]>,
-    ) -> Result<()> {
-        match styles {
-            Some(style_list) if !style_list.is_empty() => {
-                let formatted = FormattedText {
-                    text: text.to_string(),
-                    styles: style_list.to_vec(),
-                };
-                let chunks = chunk_with_styles(&formatted, MESSAGE_CHUNK_SIZE);
-                for chunk in &chunks {
-                    let text_styles: Vec<_> = chunk
-                        .styles
-                        .iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "start": s.start,
-                                "length": s.length,
-                                "style": s.style,
-                            })
-                        })
-                        .collect();
-                    let mut params = serde_json::json!({
-                        "account": self.account,
-                        "groupId": group_id,
-                        "message": chunk.text,
-                    });
-                    if !text_styles.is_empty() {
-                        params["textStyle"] = serde_json::Value::Array(text_styles);
-                    }
-                    let resp = self.rpc_call("send", params).await?;
-                    if let Some(ref err) = resp.error {
-                        bail!("Signal group send failed: {}", err.message);
-                    }
-                }
+    /// Send a text message to a group. `text` is rendered from markdown like
+    /// [`Self::send_message`].
+    pub async fn send_group_message(&self, group_id: &str, text: &str) -> Result<()> {
+        self.send_to(SendTarget::Group(group_id), text).await
+    }
+
+    /// Render `text` from markdown into Signal style ranges, chunk it, and send
+    /// each chunk to `target`. Empty chunks are skipped so we never POST a blank
+    /// message; the `textStyle` array is included only when a chunk carries styles.
+    async fn send_to(&self, target: SendTarget<'_>, text: &str) -> Result<()> {
+        let formatted = markdown_to_signal(text);
+        let chunks = chunk_with_styles(&formatted, MESSAGE_CHUNK_SIZE);
+        for chunk in &chunks {
+            if chunk.text.is_empty() {
+                continue;
             }
-            _ => {
-                let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
-                for chunk in &chunks {
-                    let params = serde_json::json!({
-                        "account": self.account,
-                        "groupId": group_id,
-                        "message": chunk,
-                    });
-                    let resp = self.rpc_call("send", params).await?;
-                    if let Some(ref err) = resp.error {
-                        bail!("Signal group send failed: {}", err.message);
-                    }
-                }
+            let mut params = serde_json::json!({
+                "account": self.account,
+                "message": chunk.text,
+            });
+            match target {
+                SendTarget::Recipient(r) => params["recipient"] = serde_json::json!([r]),
+                SendTarget::Group(g) => params["groupId"] = serde_json::json!(g),
+            }
+            if !chunk.styles.is_empty() {
+                // TextStyle derives Serialize with the exact wire shape
+                // ({start, length, style: "SCREAMING_SNAKE_CASE"}).
+                params["textStyle"] = serde_json::to_value(&chunk.styles)?;
+            }
+            let resp = self.rpc_call("send", params).await?;
+            if let Some(ref err) = resp.error {
+                bail!("Signal send failed (code {}): {}", err.code, err.message);
             }
         }
         Ok(())
@@ -394,26 +326,139 @@ mod tests {
     }
 
     #[test]
-    fn chunking_short_message() {
-        let chunks = chunker::chunk_text_nonempty("Hello", MESSAGE_CHUNK_SIZE);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "Hello");
-    }
-
-    #[test]
-    fn chunking_long_message() {
-        let long = "a".repeat(MESSAGE_CHUNK_SIZE + 100);
-        let chunks = chunker::chunk_text_nonempty(&long, MESSAGE_CHUNK_SIZE);
-        assert!(chunks.len() >= 2);
-        for chunk in &chunks {
-            assert!(chunk.chars().count() <= MESSAGE_CHUNK_SIZE);
-        }
-    }
-
-    #[test]
     fn request_ids_are_unique() {
         let id1 = next_request_id();
         let id2 = next_request_id();
         assert_ne!(id1, id2);
+    }
+
+    // ── Mock signal-cli daemon over a raw TCP socket ──
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Read a full HTTP/1.1 request (headers + Content-Length body) from `sock`.
+    /// Returns the decoded request body as a string.
+    async fn read_request_body(sock: &mut TcpStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                let content_len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let body_start = pos + 4;
+                while buf.len() - body_start < content_len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                return String::from_utf8_lossy(&buf[body_start..]).to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Send markdown text through a real `send_message` call against a mock
+    /// daemon and assert the daemon receives delimiter-stripped text plus the
+    /// matching Signal `textStyle` ranges. Regression guard: the send path
+    /// previously dropped all styling (callers passed `None`), so `**bold**`
+    /// reached the wire verbatim with no `textStyle`.
+    #[tokio::test]
+    async fn send_message_converts_markdown_to_text_styles_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let body = read_request_body(&mut sock).await;
+            let resp_body = r#"{"jsonrpc":"2.0","result":{},"id":"1"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+            body
+        });
+
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client.send_message("+15551234567", "**bold**").await.unwrap();
+
+        let sent = server.await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(json["method"], "send");
+        let params = &json["params"];
+        assert_eq!(
+            params["message"], "bold",
+            "markdown delimiters must be stripped from the wire text"
+        );
+        assert_eq!(params["recipient"], serde_json::json!(["+15551234567"]));
+        assert_eq!(
+            params["textStyle"],
+            serde_json::json!([{ "start": 0, "length": 4, "style": "BOLD" }]),
+            "bold span must be sent as a Signal textStyle range"
+        );
+    }
+
+    /// `download_attachment` must accept bodies far larger than the old, broken
+    /// 10 KB inline cap (the production cap is `SIGNAL_MAX_ATTACHMENT_BYTES` =
+    /// 10 MB) while still rejecting anything over the caller-supplied limit.
+    #[tokio::test]
+    async fn download_attachment_honors_size_cap_boundary() {
+        // 20 KB body — bigger than the old 10 KB cap that silently broke
+        // every real attachment, small enough to fit a socket buffer.
+        const BODY_LEN: usize = 20 * 1024;
+
+        async fn serve_body(len: usize) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base = format!("http://{addr}");
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut tmp = [0u8; 1024];
+                let _ = sock.read(&mut tmp).await; // drain request headers
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                sock.write_all(header.as_bytes()).await.unwrap();
+                sock.write_all(&vec![b'a'; len]).await.unwrap();
+                sock.shutdown().await.ok();
+            });
+            base
+        }
+
+        // Under the 10 MB production cap: full body returned.
+        let base = serve_body(BODY_LEN).await;
+        let client = SignalClient::new(&base, "+15550000000").unwrap();
+        let bytes = client
+            .download_attachment("att-1", constants::SIGNAL_MAX_ATTACHMENT_BYTES)
+            .await
+            .expect("20 KB attachment must download under the 10 MB cap");
+        assert_eq!(bytes.len(), BODY_LEN);
+
+        // Over an explicit small cap: rejected via the Content-Length pre-check.
+        let base = serve_body(BODY_LEN).await;
+        let client = SignalClient::new(&base, "+15550000000").unwrap();
+        let err = client
+            .download_attachment("att-1", 1_000)
+            .await
+            .expect_err("body exceeding max_bytes must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "error should explain the size rejection, got: {err}"
+        );
     }
 }

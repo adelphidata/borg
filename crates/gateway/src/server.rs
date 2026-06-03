@@ -564,9 +564,9 @@ impl GatewayServer {
                         {
                             Ok((response_text, _)) => {
                                 let send_result = if let Some(ref gid) = group_id {
-                                    client.send_group_message(gid, &response_text, None).await
+                                    client.send_group_message(gid, &response_text).await
                                 } else {
-                                    client.send_message(&recipient, &response_text, None).await
+                                    client.send_message(&recipient, &response_text).await
                                 };
                                 if let Err(e) = send_result {
                                     warn!("Failed to send Signal response: {e}");
@@ -585,9 +585,9 @@ impl GatewayServer {
                                 warn!("Agent error in Signal SSE mode: {e}");
                                 let error_msg = handler::format_gateway_error(&e);
                                 let send_result = if let Some(ref gid) = group_id {
-                                    client.send_group_message(gid, &error_msg, None).await
+                                    client.send_group_message(gid, &error_msg).await
                                 } else {
-                                    client.send_message(&recipient, &error_msg, None).await
+                                    client.send_message(&recipient, &error_msg).await
                                 };
                                 if let Err(send_err) = send_result {
                                     warn!("Failed to send Signal error response: {send_err}");
