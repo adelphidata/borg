@@ -305,9 +305,24 @@ version = "0.5.1"
     #[test]
     fn embedded_advisories_parse_cleanly() {
         // Regression: a malformed `advisories.toml` would silently produce
-        // an empty list and skip every advisory. Assert that whatever ships
-        // in the file parses, even when empty.
-        let _ = embedded_advisories();
+        // an empty list and skip every advisory. `embedded_advisories()`
+        // swallows the parse error (logs + returns empty), so asserting on
+        // its output can never catch a broken file. Parse the embedded
+        // source directly so a malformed toml actually fails this test.
+        let parsed: Result<AdvisoryFile, _> = toml::from_str(EMBEDDED_ADVISORIES);
+        assert!(
+            parsed.is_ok(),
+            "embedded advisories.toml failed to parse: {:?}",
+            parsed.err()
+        );
+        // The accessor must surface exactly what the file declares, not a
+        // silently-empty fallback.
+        let declared = parsed.unwrap().advisories.len();
+        assert_eq!(
+            embedded_advisories().len(),
+            declared,
+            "embedded_advisories() dropped entries — parse fell back to empty"
+        );
     }
 
     #[test]

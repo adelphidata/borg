@@ -774,7 +774,6 @@ impl SettingsPopup {
             let models = models_for_provider(provider_id);
             let content_height = (inner.height as usize).saturating_sub(2); // reserve footer + status
 
-            // Build model list lines
             let mut lines: Vec<Line<'static>> = Vec::new();
             for (i, (_, display)) in models.iter().enumerate() {
                 let is_current = i == self.model_index;
@@ -928,7 +927,6 @@ impl SettingsPopup {
         let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
-        // Status line
         popup_utils::render_status_message(frame, inner, self.status_message.as_ref(), 3);
 
         // CLI hint

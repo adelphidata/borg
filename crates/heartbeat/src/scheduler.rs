@@ -271,6 +271,7 @@ impl HeartbeatScheduler {
     /// Compute the clamped interval from the current config, logging when the
     /// raw value is bumped to the floor.
     fn clamped_interval(&self) -> std::time::Duration {
+        // 1800s = 30min default when `heartbeat.interval` is unparseable.
         let raw =
             parse_interval(&self.config.interval).unwrap_or(std::time::Duration::from_secs(1800));
         let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);

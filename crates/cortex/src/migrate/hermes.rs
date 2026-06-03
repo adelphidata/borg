@@ -439,7 +439,16 @@ UNRELATED_KEY=should-be-ignored
             skills: false,
         };
         let data = parse_from(dir.path(), &categories).unwrap();
-        assert!(data.persona_file.is_some());
+        let persona = data
+            .persona_file
+            .as_ref()
+            .expect("persona category must locate SOUL.md");
+        assert_eq!(
+            persona.file_name().and_then(|f| f.to_str()),
+            Some("SOUL.md"),
+            "persona must point at the source SOUL.md, got {persona:?}"
+        );
+        assert!(persona.exists(), "located persona file must exist on disk");
     }
 
     #[test]

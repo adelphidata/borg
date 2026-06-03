@@ -478,6 +478,8 @@ impl Provider {
                 host_port.parse().ok()
             })
             .unwrap_or(default_addr);
+        // Probe runs on the onboarding/startup hot path; keep it short so an
+        // absent local Ollama doesn't stall boot.
         std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
     }
 }

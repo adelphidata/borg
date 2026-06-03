@@ -427,8 +427,6 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the .tmp path for a given file by appending ".tmp" to the full name.
-/// e.g. "config.toml" → "config.toml.tmp"
 /// Append (or replace) a `KEY=VALUE` line in `<data_dir>/.env`. The temp file
 /// is created with mode 0600 from the start (Unix) so the secret never hits
 /// disk world-readable, even briefly between rename and chmod. Used as the

@@ -31,8 +31,7 @@ use crate::tui::wrapping;
 use super::text_line::TextLine;
 
 /// Vertical spacers reserved between visual sections (question → options →
-/// notes/footer) when there is enough room. Matches the reference TUI
-/// constant; layout.rs is a near-verbatim port and references this value
+/// notes/footer) when there is enough room. `layout.rs` references this value
 /// when collapsing under tight space.
 pub(super) const DESIRED_SPACERS_BETWEEN_SECTIONS: u16 = 2;
 
@@ -163,11 +162,10 @@ impl RequestUserInputOverlay {
 
     // ----- Geometric accessors consumed by layout.rs ---------------------
 
-    /// `true` when there are selectable options to render. borg's
-    /// `parse_questions` enforces ≥ 2 options per question and always
-    /// auto-appends "Other", so this is effectively always `true`, but the
-    /// hook stays in place to mirror the reference layout's contract — a
-    /// future free-form-only question variant would return `false` here.
+    /// `true` when there are selectable options to render. `parse_questions`
+    /// enforces ≥ 2 options per question and always auto-appends "Other", so
+    /// this is effectively always `true`, but the hook stays in place so a
+    /// future free-form-only question variant can return `false` here.
     pub(super) fn has_options(&self) -> bool {
         !self.current().options.is_empty()
     }
@@ -836,9 +834,8 @@ mod tests {
     }
 
     /// Single-select cursor landing on the "Other" row auto-opens the
-    /// notes editor — "Other" without context is useless to the LLM. The
-    /// reference TUI and borg's legacy `AwaitingInput` path both do this;
-    /// regression here breaks the onboarding UX where Other is common.
+    /// notes editor — "Other" without context is useless to the LLM.
+    /// Regression here breaks the onboarding UX where Other is common.
     #[test]
     fn single_select_other_row_auto_opens_notes() {
         let (tx, _rx) = oneshot::channel();

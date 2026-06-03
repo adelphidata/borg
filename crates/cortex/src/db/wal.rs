@@ -203,49 +203,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_vacuum_skips_when_interval_not_elapsed() {
-        // 1 day ago, interval 7d — must skip even with high fragmentation.
-        let now = 7 * 86_400;
-        let last = now - 86_400;
-        assert!(!should_vacuum(now, Some(last), 7, 5_000, 10_000, 4096));
-    }
-
-    #[test]
-    fn should_vacuum_skips_when_fragmentation_low() {
-        // Interval elapsed but only 5% fragmentation and small freelist.
-        let now = 30 * 86_400;
-        let last = 0;
-        assert!(!should_vacuum(now, Some(last), 7, 50, 1_000, 4096));
-    }
-
-    #[test]
-    fn should_vacuum_runs_when_interval_and_ratio_exceeded() {
-        // 8d since last, 20% freelist ratio.
-        let now = 30 * 86_400;
-        let last = now - 8 * 86_400;
-        assert!(should_vacuum(now, Some(last), 7, 200, 1_000, 4096));
-    }
-
-    #[test]
-    fn should_vacuum_runs_when_freelist_exceeds_byte_threshold() {
-        // 8d elapsed, only 1% ratio, but absolute freelist > 64 MB:
-        // 20_000 free pages * 4096 B = ~78 MB.
-        let now = 30 * 86_400;
-        let last = now - 8 * 86_400;
-        assert!(should_vacuum(now, Some(last), 7, 20_000, 2_000_000, 4096));
-    }
-
-    #[test]
-    fn should_vacuum_treats_no_prior_vacuum_as_eligible() {
-        // First-ever sweep with high fragmentation — must run.
-        let now = 30 * 86_400;
-        assert!(should_vacuum(now, None, 7, 200, 1_000, 4096));
-    }
-
-    #[test]
-    fn should_vacuum_respects_interval_with_no_prior_when_not_fragmented() {
-        // No prior, but the DB is clean — interval elapsed but nothing to do.
-        let now = 30 * 86_400;
-        assert!(!should_vacuum(now, None, 7, 0, 1_000, 4096));
+    fn should_vacuum_decision_table() {
+        const D: i64 = 86_400;
+        // (name, now, last_vacuum, interval_days, freelist, page_count,
+        //  page_size, expected)
+        let cases: &[(&str, i64, Option<i64>, u32, i64, i64, i64, bool)] = &[
+            // 1 day since last vacuum, interval 7d — must skip even with high
+            // fragmentation, because the interval gate dominates.
+            (
+                "interval_not_elapsed",
+                7 * D,
+                Some(7 * D - D),
+                7,
+                5_000,
+                10_000,
+                4096,
+                false,
+            ),
+            // Interval elapsed but only 5% fragmentation and small freelist.
+            (
+                "fragmentation_low",
+                30 * D,
+                Some(0),
+                7,
+                50,
+                1_000,
+                4096,
+                false,
+            ),
+            // 8d since last, 20% freelist ratio — runs.
+            (
+                "interval_and_ratio_exceeded",
+                30 * D,
+                Some(30 * D - 8 * D),
+                7,
+                200,
+                1_000,
+                4096,
+                true,
+            ),
+            // 8d elapsed, only 1% ratio, but absolute freelist > 64 MB:
+            // 20_000 free pages * 4096 B = ~78 MB — runs on the byte threshold.
+            (
+                "freelist_exceeds_byte_threshold",
+                30 * D,
+                Some(30 * D - 8 * D),
+                7,
+                20_000,
+                2_000_000,
+                4096,
+                true,
+            ),
+            // First-ever sweep (no prior vacuum) with high fragmentation — runs.
+            (
+                "no_prior_high_fragmentation",
+                30 * D,
+                None,
+                7,
+                200,
+                1_000,
+                4096,
+                true,
+            ),
+            // No prior, but the DB is clean — interval elapsed yet nothing to do.
+            ("no_prior_clean_db", 30 * D, None, 7, 0, 1_000, 4096, false),
+        ];
+        for (name, now, last, interval, freelist, page_count, page_size, expected) in cases {
+            assert_eq!(
+                should_vacuum(*now, *last, *interval, *freelist, *page_count, *page_size),
+                *expected,
+                "should_vacuum mismatch for case {name}"
+            );
+        }
     }
 }

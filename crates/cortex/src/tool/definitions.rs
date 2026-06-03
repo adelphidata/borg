@@ -581,9 +581,18 @@ mod tests {
     fn schedule_tool_schema_includes_pre_run_params() {
         let def = build_schedule_tool_def();
         let props = &def.function.parameters["properties"];
-        assert!(props.get("pre_run_command").is_some());
-        assert!(props.get("pre_run_cwd").is_some());
-        assert!(props.get("pre_run_timeout_ms").is_some());
+        // The LLM relies on these types being correct to emit valid args.
+        assert_eq!(props["pre_run_command"]["type"], "string");
+        assert_eq!(props["pre_run_cwd"]["type"], "string");
+        assert_eq!(props["pre_run_timeout_ms"]["type"], "integer");
+        // pre_run_command's description must signal it's prompt-only (drives routing).
+        assert!(
+            props["pre_run_command"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("type=prompt"),
+            "pre_run_command description should restrict it to prompt tasks"
+        );
     }
 
     #[test]
@@ -709,24 +718,6 @@ mod tests {
                 def.function.name
             );
         }
-    }
-
-    #[test]
-    fn tool_definitions_sorted_deterministically_after_sort() {
-        let mut config = Config::default();
-        config.browser.enabled = true;
-        config.web.enabled = true;
-        config.tts.enabled = true;
-        config.image_gen.enabled = true;
-        let mut defs = core_tool_definitions(&config);
-
-        // Apply the same sort used in Agent::build_tool_definitions
-        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        let mut sorted_names = names.clone();
-        sorted_names.sort();
-        assert_eq!(names, sorted_names, "tools should be in alphabetical order");
     }
 
     #[test]

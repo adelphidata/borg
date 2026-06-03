@@ -346,9 +346,8 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     } = ctx;
 
     let config_clone = config.clone();
-    // Note: previously this ran under tokio::task::spawn_blocking, which is
-    // incompatible with cortex's now-async DB layer. Run the sweep inline on
-    // the async runtime; panic isolation is preserved by AssertUnwindSafe +
+    // Run the sweep inline on the async runtime (cortex's DB layer is async, so
+    // spawn_blocking is out); panic isolation is preserved by AssertUnwindSafe +
     // catch_unwind on the surrounding future.
     let sweep = std::panic::AssertUnwindSafe(async move {
         let db = cortex::db::Database::open().await?;

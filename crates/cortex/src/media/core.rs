@@ -325,7 +325,8 @@ mod tests {
 
     #[test]
     fn validate_base64_valid() {
-        assert!(validate_base64("SGVsbG8=").is_some());
+        // Already-clean valid base64 is returned verbatim (decodes to "Hello").
+        assert_eq!(validate_base64("SGVsbG8=").as_deref(), Some("SGVsbG8="));
     }
 
     #[test]
@@ -347,9 +348,8 @@ mod tests {
         // Smallest valid JPEG: FFD8FFD9 (start + end markers)
         let tiny_jpeg = vec![0xFF, 0xD8, 0xFF, 0xD9];
         let b64 = engine.encode(&tiny_jpeg);
-        let result = compress_image(&b64, "image/jpeg", 6 * 1024 * 1024);
-        assert!(result.is_ok());
-        let (data, mime) = result.unwrap_or_default();
+        let (data, mime) =
+            compress_image(&b64, "image/jpeg", 6 * 1024 * 1024).expect("under-limit image");
         // Small image should pass through unchanged
         assert_eq!(data, b64);
         assert_eq!(mime, "image/jpeg");

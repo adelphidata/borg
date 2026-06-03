@@ -17,9 +17,7 @@ fn cfg_default() -> UrlPolicyConfig {
     UrlPolicyConfig::default()
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Rule matching (table-driven)
-// ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn rules_matches_rule_table() {
@@ -74,9 +72,7 @@ fn rules_normalize_rule_handles_url_shaped_input() {
     assert_eq!(rules::normalize_rule("*.X.COM"), Some("*.x.com".into()));
 }
 
-// ────────────────────────────────────────────────────────────────────
 // SSRF — always-blocked hosts/IPs ignore the toggle
-// ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn ssrf_metadata_hostname_blocked_even_with_toggle() {
@@ -151,9 +147,7 @@ async fn private_ipv4_mapped_ipv6_blocked_by_default() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Private-IP toggle behavior
-// ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn private_ip_blocked_by_default() {
@@ -202,9 +196,7 @@ async fn link_local_blocked_even_with_toggle() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Allowlist / denylist (use literal IPs to avoid DNS in tests)
-// ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn allowlist_admits_matched_host() {
@@ -273,9 +265,7 @@ async fn denylist_substring_does_not_match() {
     assert!(matches!(out, ClassifyOutcome::Allow { .. }));
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Transforms
-// ────────────────────────────────────────────────────────────────────
 
 fn xform_cfg(rules: Vec<TransformRule>) -> UrlPolicyConfig {
     UrlPolicyConfig {
@@ -446,9 +436,7 @@ async fn transform_to_metadata_host_still_blocked_by_ssrf() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Throttle
-// ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn throttle_blocks_second_request_within_window_then_allows_after() {
@@ -556,9 +544,7 @@ async fn throttle_not_applied_when_no_rule_matches() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Scheme gate
-// ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn scheme_gate_offline_blocks_non_http_schemes() {
@@ -580,9 +566,7 @@ fn scheme_gate_offline_blocks_non_http_schemes() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Malformed input
-// ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn malformed_urls_blocked() {
@@ -599,9 +583,7 @@ fn malformed_urls_blocked() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Kill switch (operator escape hatch)
-// ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn kill_switch_disables_all_checks() {
@@ -619,9 +601,7 @@ async fn kill_switch_disables_all_checks() {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Serde round-trip — detect enum-tag drift (#[serde(tag = "kind")])
-// ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn url_policy_config_serde_round_trip() {
@@ -669,9 +649,7 @@ fn url_policy_config_serde_round_trip() {
     assert!(json.contains("\"kind\":\"strip_query_params\""));
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Block-message formatting (used by tool handlers)
-// ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn describe_block_returns_human_string() {

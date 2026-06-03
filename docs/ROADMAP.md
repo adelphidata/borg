@@ -303,11 +303,11 @@ a single-file impl under `crates/cortex/src/memory/provider/` plus a
   three model-visible tools needs an extra metadata field per write.
 - **Holographic / HRR-based stores.** Entity-resolution-first stores
   (holographic reduced representations, fact graphs with trust scoring
-  + temporal decay). Adds an entity-resolution dependency and a more
-  expansive tool surface (`add` / `search` / `probe` / `related` /
-  `reason` / `contradict` / `update` / `remove` / `list`). Worth
-  revisiting if knowledge-graph memory becomes a measured win over the
-  hybrid vector+BM25 native path.
+    - temporal decay). Adds an entity-resolution dependency and a more
+      expansive tool surface (`add` / `search` / `probe` / `related` /
+      `reason` / `contradict` / `update` / `remove` / `list`). Worth
+      revisiting if knowledge-graph memory becomes a measured win over the
+      hybrid vector+BM25 native path.
 - **Self-hosted vector DB adapters.** Direct adapters to Qdrant /
   Weaviate / Pinecone / pgvector would let an operator point Borg at
   an existing org-wide vector store rather than the bundled SQLite
@@ -362,29 +362,29 @@ a single-file impl under `crates/cortex/src/memory/provider/` plus a
   `request_user_input` (free-form). Marginal value; likely covered by
   extending `request_user_input` with an `options` parameter rather than
   adding a new tool.
-- **Post-write lint / diagnostics on write + patch.** `[H] ref`
+- **Post-write lint / diagnostics on write + patch.** `[H]`
   Deferred. After every `fs_write` / patch apply, run a fast
   language-aware check (syntax/lint for Python, JSON, YAML, TOML, Rust)
   and fold any failure back into the tool result so the agent
   self-corrects on the next turn instead of discovering the breakage
   later. Today writes land unchecked — a malformed JSON config or
   unparseable edit only surfaces when something downstream reads it.
-- **Stale-file staleness guard on whole-file writes.** `[H] ref`
+- **Stale-file staleness guard on whole-file writes.** `[H]`
   Deferred. Track the on-disk mtime/hash of each file the agent reads
   and refuse (or warn on) a subsequent blind `fs_write` when the file
   changed underneath since that read — the classic read-modify-write
   clobber. Complements the patch DSL, which already fails on drifted
   context anchors but doesn't protect a full-file overwrite.
-- **Per-turn file-mutation verifier footer.** `[H] ref` Deferred.
+- **Per-turn file-mutation verifier footer.** `[H]` Deferred.
   Append a compact "files created / modified / deleted this turn"
   summary (computed from the workspace diff) to the agent's turn
   output. Gives the operator an at-a-glance audit of what changed
   without diffing, and gives the agent a self-check that its writes
   matched intent.
-- **`/steer` mid-run nudge + `/queue` prompt queue.** `[H] ref`
+- **`/steer` mid-run nudge + `/queue` prompt queue.** `[H]`
   Deferred. `/steer <text>` injects guidance the running agent picks up
   after its next tool call without interrupting the loop; `/queue
-  <text>` stacks follow-up prompts to run when the current turn
+<text>` stacks follow-up prompts to run when the current turn
   finishes. Borg injects `<proactive_nudges>` internally but exposes no
   operator-facing steer/queue surface — today the only way to redirect
   a busy agent is to interrupt it.
@@ -428,19 +428,19 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   including xAI/Grok, OpenAI/Groq Whisper, Mistral, Deepgram, local, and
   command-backed providers. URL/base64 ingestion remains deferred until
   it can share the normal URL policy and media-size gates.
-- **Background-process watch patterns + completion notify.** `[H] ref`
+- **Background-process watch patterns + completion notify.** `[H]`
   Deferred. `run_shell` already has persistent-session `start` / `poll`;
   add fire-and-forget background execution that pushes a notification on
   process exit and on lines matching operator-supplied `watch_patterns`
   (e.g. `ERROR`, `Listening on`) instead of forcing the agent to
   poll. Turns long builds and dev servers into event-driven waits.
-- **Office-document text extraction.** `[H] ref` Deferred. `fs_read`
+- **Office-document text extraction.** `[H]` Deferred. `fs_read`
   extracts PDF text via `pdf_extract` today; extend the same path to
   DOCX / XLSX / PPTX so the agent can read the Office attachments
   operators routinely drop in. Highest-value file types not yet
   parseable.
 - **Persistent multi-agent task board with auto-decomposition.**
-  `[H] ref` Deferred. A durable kanban/swarm surface that
+  `[H]` Deferred. A durable kanban/swarm surface that
   auto-decomposes one task into a dependency tree of sub-tasks,
   dispatches them across worker sub-agents, and self-heals
   (stale-running detection, worker reclaim, respawn-storm guard, cycle
@@ -449,7 +449,7 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   board with parent/child promotion and concurrency caps. Large
   surface; folds into the existing `spawn_supervised` + `multi_agent`
   machinery.
-- **`video_generate` tool.** `[H] ref` Deferred. Borg has
+- **`video_generate` tool.** `[H]` Deferred. Borg has
   `video_analyze` (Gemini inline-data) but no generation path; a
   `video_generate` tool with pluggable provider backends would mirror
   the deferred image-gen provider routing. Niche; defer until demand.
@@ -516,13 +516,14 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   model picker → terminal/sandbox backend → channels → tools →
   credentials. Each section idempotent, invokable alone via
   `borg setup <section>`. Today onboarding is one linear flow.
-- **Multi-instance profiles (export / import / clone).** `[H] ref`
+- **Multi-instance profiles (export / import / clone).** `[H]`
   Deferred. Run several isolated Borg identities from one install —
   separate data dir, credentials, sessions, and gateway bindings per
   profile — with `borg profile export/import/clone/rename` for moving
   or templating an instance. Today one install is one identity
   (`~/.borg/`); operators wanting a "work" vs "personal" split must
   juggle data dirs by hand.
+
 ### Security & sandboxing
 
 - **Windows sandbox — real-host validation pass (code complete).**
@@ -542,58 +543,59 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   pre-provisioned accounts). Until that pass happens, treat the
   sandbox as in-development and recommend operators run with
   `sandbox.enabled = false` if they hit issues. Validation checklist:
-  - Tier 1: `sandbox.enabled = true`, no `setup.json`; `run_shell`
-    reading `~\.ssh\fake_file` returns `Access is denied`, writing to
-    the workspace succeeds; an interactive `run_shell` drives the
-    ConPTY path while a captured (piped) call uses inherited stdio
-    unchanged.
-  - Tier 2: `borg service install --windows-sandbox` (elevated)
-    creates `BorgSandboxOnline`/`BorgSandboxOffline`, seals their
-    DPAPI creds, installs the WFP filters, writes `setup.json`;
-    spawns route through the runner; under Offline `curl example.com`
-    fails (WFP), under Online it succeeds; deny-path read returns
-    `Access is denied`. `borg service uninstall --windows-sandbox`
-    removes accounts, filters, creds, and `setup.json`.
-  - Then strike the "in-development" caveat and recommend
-    `sandbox.enabled = true` as the default.
-  - Follow-up (defense-in-depth, non-blocking): zeroize the
-    sandbox-account password buffers (`provision::generate_account_password`
-    output, the unsealed `String` in `runner_client::load_account_password`,
-    and the wide buffer passed to `CreateProcessWithLogonW`) so the
-    plaintext doesn't linger on the heap after use.
+    - Tier 1: `sandbox.enabled = true`, no `setup.json`; `run_shell`
+      reading `~\.ssh\fake_file` returns `Access is denied`, writing to
+      the workspace succeeds; an interactive `run_shell` drives the
+      ConPTY path while a captured (piped) call uses inherited stdio
+      unchanged.
+    - Tier 2: `borg service install --windows-sandbox` (elevated)
+      creates `BorgSandboxOnline`/`BorgSandboxOffline`, seals their
+      DPAPI creds, installs the WFP filters, writes `setup.json`;
+      spawns route through the runner; under Offline `curl example.com`
+      fails (WFP), under Online it succeeds; deny-path read returns
+      `Access is denied`. `borg service uninstall --windows-sandbox`
+      removes accounts, filters, creds, and `setup.json`.
+    - Then strike the "in-development" caveat and recommend
+      `sandbox.enabled = true` as the default.
+    - Follow-up (defense-in-depth, non-blocking): zeroize the
+      sandbox-account password buffers (`provision::generate_account_password`
+      output, the unsealed `String` in `runner_client::load_account_password`,
+      and the wide buffer passed to `CreateProcessWithLogonW`) so the
+      plaintext doesn't linger on the heap after use.
 
-  Implemented in this pass (all cross-compile-validated against the
-  `x86_64-pc-windows-gnu` target):
-  - `borg service {install,uninstall} --windows-sandbox` clap
-    subcommand → `borgd_launcher` → `elevated::install` (elevation
-    check, account provisioning, DPAPI-sealed creds, WFP install,
-    atomic `setup.json` write).
-  - `elevated::provision` — `NetUserAdd` / `NetLocalGroupAddMembers` /
-    LSA `SeBatchLogonRight` + deny interactive/network logon, SID
-    resolution, cross-platform strong-password generator.
-  - `elevated::runner_client` / `runner_pipe` — operator-side
-    `CreateProcessWithLogonW` launch of the runner *as the sandbox
-    account* (privilege-correct vs. the original
-    `LogonUserW`+`CreateProcessAsUserW` plan, which needs caller
-    privileges a non-admin operator lacks), SDDL-scoped named pipe,
-    `GetNamedPipeClientProcessId` caller authentication, and the
-    `ipc_runner` framed protocol (`SpawnRequest`/`Output`/`Stdin`/
-    `Resize`/`Exit`/…, base64 binary, 8 MiB cap).
-  - `wfp` — operational `FwpmEngineOpen0` + transactional
-    `FwpmProviderAdd0` / `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2
-    (V4+V6) with an `ALE_USER_ID` security-descriptor condition for
-    the offline SID, `PERSISTENT | BOOTTIME`, and delete-by-key
-    teardown; filter *specs* are cross-platform unit-tested.
-  - `runtime::run_inner` Tier1↔Tier2 routing via `mode::detect()`
-    with fail-safe fallback to the Tier 1 anonymous-pipe self-exec on
-    any Tier 2 error.
-  - ConPTY wired into `process::spawn_with_token` via a `SpawnStdio`
-    enum (`Inherit` / `Handles` / `Pty`): `Pty` adds the
-    `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute and drops
-    `STARTF_USESTDHANDLES`; `conpty::pump_parent_stdio` copies bytes
-    via std threads; `ResizePseudoConsole` exposed. The trampoline
-    uses ConPTY only when stdout is a real console, so non-interactive
-    tool calls keep the proven inherited-handle path.
+    Implemented in this pass (all cross-compile-validated against the
+    `x86_64-pc-windows-gnu` target):
+    - `borg service {install,uninstall} --windows-sandbox` clap
+      subcommand → `borgd_launcher` → `elevated::install` (elevation
+      check, account provisioning, DPAPI-sealed creds, WFP install,
+      atomic `setup.json` write).
+    - `elevated::provision` — `NetUserAdd` / `NetLocalGroupAddMembers` /
+      LSA `SeBatchLogonRight` + deny interactive/network logon, SID
+      resolution, cross-platform strong-password generator.
+    - `elevated::runner_client` / `runner_pipe` — operator-side
+      `CreateProcessWithLogonW` launch of the runner _as the sandbox
+      account_ (privilege-correct vs. the original
+      `LogonUserW`+`CreateProcessAsUserW` plan, which needs caller
+      privileges a non-admin operator lacks), SDDL-scoped named pipe,
+      `GetNamedPipeClientProcessId` caller authentication, and the
+      `ipc_runner` framed protocol (`SpawnRequest`/`Output`/`Stdin`/
+      `Resize`/`Exit`/…, base64 binary, 8 MiB cap).
+    - `wfp` — operational `FwpmEngineOpen0` + transactional
+      `FwpmProviderAdd0` / `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2
+      (V4+V6) with an `ALE_USER_ID` security-descriptor condition for
+      the offline SID, `PERSISTENT | BOOTTIME`, and delete-by-key
+      teardown; filter _specs_ are cross-platform unit-tested.
+    - `runtime::run_inner` Tier1↔Tier2 routing via `mode::detect()`
+      with fail-safe fallback to the Tier 1 anonymous-pipe self-exec on
+      any Tier 2 error.
+    - ConPTY wired into `process::spawn_with_token` via a `SpawnStdio`
+      enum (`Inherit` / `Handles` / `Pty`): `Pty` adds the
+      `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute and drops
+      `STARTF_USESTDHANDLES`; `conpty::pump_parent_stdio` copies bytes
+      via std threads; `ResizePseudoConsole` exposed. The trampoline
+      uses ConPTY only when stdout is a real console, so non-interactive
+      tool calls keep the proven inherited-handle path.
+
 - **Docker / SSH sandbox backends.** `[O]` In addition to Seatbelt
   and bwrap, allow agent-issued shell to run inside a Docker container
   or over SSH to a remote VM. Makes Linux desktop installs (where
@@ -619,7 +621,7 @@ at `cost_usd_present = false` until a local-pricing policy exists.
   logged-in profile" action so multi-step authenticated workflows
   (book a flight, fill a form on a private dashboard) become
   possible.
-- **External secrets-manager backends.** `[H] ref` Deferred.
+- **External secrets-manager backends.** `[H]` Deferred.
   `${SECRET:NAME}` resolves today via credential store → env → OS
   keychain. Add optional resolvers that read from Bitwarden Secrets
   Manager, 1Password, or HashiCorp Vault (lazy-install the vendor CLI,

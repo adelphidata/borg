@@ -13,7 +13,3 @@ crate::dedup_wrapper!(
     pub struct InteractionDeduplicator(String, constants::DISCORD_DEDUP_CAPACITY);
     is_duplicate(interaction_id: &str) => interaction_id.to_string();
 );
-
-// First-seen / repeat-seen / LRU eviction is exercised on the underlying
-// `BoundedDedup<K>` in `message_processing::dedup`. The macro substitution
-// here is a straight `&str -> String` passthrough.

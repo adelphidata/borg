@@ -205,8 +205,6 @@ mod tests {
         assert!(args.windows(2).any(|w| w[0] == "--dev" && w[1] == "/dev"));
     }
 
-    // --- Version detection tests ---
-
     #[test]
     fn parse_version_table() {
         // (input, expected) — None means parse must fail.

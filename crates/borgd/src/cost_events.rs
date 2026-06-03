@@ -9,6 +9,8 @@ use cortex::telemetry::BorgMetrics;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, watch};
 
+// Broadcast ring depth: deep enough to absorb a burst of cost events while a
+// slow subscriber catches up before it gets marked `Lagged` and drops events.
 const COST_EVENT_CAPACITY: usize = 1024;
 
 #[derive(Clone)]

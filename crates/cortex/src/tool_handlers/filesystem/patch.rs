@@ -1097,9 +1097,24 @@ mod tests {
     #[test]
     fn apply_patch_unified_default_target_is_cwd() {
         let config = Config::default();
-        let args = json!({"patch": "*** Begin Patch\n*** End Patch"});
-        let result = handle_apply_patch_unified(&args, &config);
-        assert!(result.is_ok());
+        // Omitting `target` must behave exactly like an explicit "cwd" target,
+        // and must NOT be treated as an unknown target.
+        let defaulted =
+            handle_apply_patch_unified(&json!({"patch": "*** Begin Patch\n*** End Patch"}), &config)
+                .unwrap();
+        let explicit_cwd = handle_apply_patch_unified(
+            &json!({"patch": "*** Begin Patch\n*** End Patch", "target": "cwd"}),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted, explicit_cwd,
+            "missing target should default to cwd"
+        );
+        assert!(
+            !defaulted.contains("Unknown target"),
+            "default target must be a known target, got: {defaulted}"
+        );
     }
 
     #[test]

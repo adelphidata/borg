@@ -16,6 +16,12 @@ use super::line_utils::{prefix_lines, LIVE_PREFIX_COLS};
 use super::markdown;
 use super::theme;
 
+/// Footer line shown under a collapsed tool result, nudging toward the
+/// Ctrl+T transcript pager for the hidden `extra` rows.
+fn collapse_footer(extra: usize) -> String {
+    format!("    {} +{extra} lines (ctrl + t to view transcript)", theme::ELLIPSIS)
+}
+
 /// Collapse a finalized assistant cell's rendered lines into
 /// `head + ellipsis + tail` when the body exceeds the threshold. Streaming
 /// cells skip this so the user sees live tokens in full.
@@ -699,13 +705,7 @@ fn render_shell_result(
 
         if collapsed && total_rows > SHELL_PREVIEW_LINES {
             let extra = total_rows.saturating_sub(rows_used);
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "    {} +{extra} lines (ctrl + t to view transcript)",
-                    theme::ELLIPSIS
-                ),
-                dim,
-            )));
+            lines.push(Line::from(Span::styled(collapse_footer(extra), dim)));
         }
     };
 
@@ -1135,13 +1135,8 @@ impl HistoryCell {
 
                 if should_collapse {
                     let extra = total_rows.saturating_sub(rows_used);
-                    // ellipsis line; nudges the user toward Ctrl+T
-                    // (transcript pager) which already exists in Borg.
                     lines.push(Line::from(Span::styled(
-                        format!(
-                            "    {} +{extra} lines (ctrl + t to view transcript)",
-                            theme::ELLIPSIS
-                        ),
+                        collapse_footer(extra),
                         theme::dim(),
                     )));
                 }

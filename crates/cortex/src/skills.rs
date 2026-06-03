@@ -2083,25 +2083,32 @@ Old copy from a previous install.
     }
 
     #[test]
-    fn test_os_gating_empty_means_all() {
-        assert!(check_os_requirements(&[]));
-    }
-
-    #[test]
-    fn test_os_gating_current_os() {
-        let current = std::env::consts::OS.to_string();
-        assert!(check_os_requirements(&[current]));
-    }
-
-    #[test]
-    fn test_os_gating_wrong_os() {
-        assert!(!check_os_requirements(&["totally_fake_os".to_string()]));
-    }
-
-    #[test]
-    fn test_os_gating_darwin_alias() {
-        if std::env::consts::OS == "macos" {
-            assert!(check_os_requirements(&["darwin".to_string()]));
+    fn test_os_gating() {
+        let current = std::env::consts::OS;
+        let on_macos = current == "macos";
+        // (gate list, expected admit). Expectations are derived from the
+        // current OS so the table is correct on every platform CI runs.
+        let cases: &[(Vec<String>, bool)] = &[
+            // Empty gate means "all OSes" — always admits.
+            (vec![], true),
+            // Current OS is explicitly listed — admits.
+            (vec![current.to_string()], true),
+            // No matching OS — denied.
+            (vec!["totally_fake_os".to_string()], false),
+            // "darwin" is an alias for "macos": admits only on macOS.
+            (vec!["darwin".to_string()], on_macos),
+            // A mixed list admits if ANY entry matches the current OS.
+            (
+                vec!["totally_fake_os".to_string(), current.to_string()],
+                true,
+            ),
+        ];
+        for (gate, expected) in cases {
+            assert_eq!(
+                check_os_requirements(gate),
+                *expected,
+                "check_os_requirements({gate:?}) on {current}"
+            );
         }
     }
 

@@ -540,25 +540,6 @@ mod tests {
     }
 
     #[test]
-    fn git_context_default_has_no_repo() {
-        let ctx = GitContext::default();
-        assert!(ctx.repo_root.is_none());
-        assert!(ctx.branch.is_none());
-        assert!(ctx.commit_hash.is_none());
-        assert!(ctx.recent_commits.is_empty());
-        assert!(!ctx.has_uncommitted_changes);
-        assert!(ctx.remote_url.is_none());
-    }
-
-    #[test]
-    fn find_repo_root_in_temp_dir_without_git() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = find_repo_root(tmp.path());
-        // No .git in temp dir, but might find one in parent. Just don't panic.
-        let _ = root;
-    }
-
-    #[test]
     fn find_repo_root_with_fake_git() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
@@ -815,6 +796,54 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "repo-configured hook must not execute during ghost snapshot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ghost_snapshot_and_restore_round_trip_restores_working_tree() {
+        // The core ghost-commit invariant: a snapshot captures the exact
+        // working-tree state, and restore reverts every post-snapshot change
+        // back to that captured state — tracked edits, new untracked files, and
+        // deletions of files present at snapshot time all undone.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir); // commits a.txt = "hello\n"
+
+        // Snapshot the working tree *as it is now*: dirty a tracked file and add
+        // a fresh untracked file so both are captured into the ghost tree.
+        std::fs::write(dir.join("a.txt"), "snapshot-state\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "untracked-but-captured\n").unwrap();
+
+        let ghost = create_ghost_commit(dir).await.expect("snapshot");
+        assert!(
+            ghost.parent_id.is_some(),
+            "snapshot taken on a repo with HEAD must record the parent commit"
+        );
+
+        // Mutate the tree away from the snapshot in three distinct ways.
+        std::fs::write(dir.join("a.txt"), "DRIFTED\n").unwrap(); // edit tracked file
+        std::fs::remove_file(dir.join("b.txt")).unwrap(); // delete a captured file
+        std::fs::write(dir.join("c.txt"), "created-after-snapshot\n").unwrap(); // new file
+
+        restore_ghost_commit(dir, &ghost).await.expect("restore");
+
+        // Tracked edit reverted to the snapshot content.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "snapshot-state\n",
+            "tracked file must be restored to its snapshot content"
+        );
+        // Captured file that was deleted is recreated with snapshot content.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "untracked-but-captured\n",
+            "file present at snapshot time must be restored after deletion"
+        );
+        // File created after the snapshot is removed.
+        assert!(
+            !dir.join("c.txt").exists(),
+            "post-snapshot file must be removed on restore"
         );
     }
 }

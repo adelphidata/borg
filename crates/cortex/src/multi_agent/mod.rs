@@ -1555,7 +1555,6 @@ fn run_sub_agent(
             max_spawn_depth,
         );
 
-        // Update DB status to running
         if let Ok(db) = crate::db::Database::open().await {
             if let Err(e) = db
                 .update_sub_agent_status(&agent_id, &SubAgentStatus::Running)

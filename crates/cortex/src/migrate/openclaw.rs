@@ -625,7 +625,15 @@ mod tests {
             skills: false,
         };
         let data = parse_from(dir.path(), &categories).unwrap();
-        assert!(data.persona_file.is_some());
+        let persona = data
+            .persona_file
+            .as_ref()
+            .expect("persona category must locate workspace/SOUL.md");
+        assert!(
+            persona.ends_with("workspace/SOUL.md"),
+            "persona must resolve to the workspace SOUL.md, got {persona:?}"
+        );
+        assert!(persona.exists(), "located persona file must exist on disk");
     }
 
     #[test]

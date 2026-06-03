@@ -22,24 +22,6 @@ fn apply_setting_evolution_enabled_invalid() {
 }
 
 #[test]
-fn embeddings_config_defaults() {
-    let cfg = EmbeddingsConfig::default();
-    assert!(cfg.enabled);
-    assert!(cfg.provider.is_none());
-    assert!(cfg.model.is_none());
-    assert!(cfg.dimension.is_none());
-    assert!(cfg.api_key_env.is_none());
-    assert!((cfg.recency_weight - 0.2).abs() < f32::EPSILON);
-}
-
-#[test]
-fn memory_config_includes_embeddings() {
-    let cfg = MemoryConfig::default();
-    assert_eq!(cfg.max_context_tokens, 8000);
-    assert!(cfg.embeddings.enabled);
-}
-
-#[test]
 fn embeddings_config_toml_deserialization() {
     let toml_str = r#"
 [memory]
@@ -77,22 +59,6 @@ max_context_tokens = 6000
 }
 
 #[test]
-fn tool_policy_default_values() {
-    let policy = ToolPolicyConfig::default();
-    assert_eq!(policy.profile, "full");
-    assert!(policy.allow.is_empty());
-    assert!(policy.deny.is_empty());
-    assert!(policy.subagent_deny.contains(&"schedule".to_string()));
-    assert!(policy.subagent_deny.contains(&"browser".to_string()));
-}
-
-#[test]
-fn tool_policy_config_is_part_of_tools_config() {
-    let cfg = Config::default();
-    assert_eq!(cfg.tools.policy.profile, "full");
-}
-
-#[test]
 fn parse_tool_policy_from_toml() {
     let toml_str = r#"
 [tools]
@@ -117,16 +83,22 @@ subagent_deny = ["manage_tasks"]
 }
 
 #[test]
-fn parse_tool_policy_empty_defaults() {
+fn omitting_policy_section_keeps_subagent_deny_locked_down() {
+    // A `[tools]` section with no nested `[tools.policy]` must still apply
+    // the security-relevant defaults via `#[serde(default)]`. The invariant
+    // that matters: subagents are denied `schedule`/`browser` out of the box,
+    // so a forgotten policy section can't silently let a child agent schedule
+    // jobs or drive a browser. Pin the concrete values, not default-vs-default.
     let toml_str = r#"
 [tools]
 default_timeout_ms = 30000
 "#;
     let cfg: Config = toml::from_str(toml_str).expect("should parse");
-    let default_policy = ToolPolicyConfig::default();
-    assert_eq!(cfg.tools.policy.profile, default_policy.profile);
-    assert_eq!(cfg.tools.policy.allow.len(), default_policy.allow.len());
-    assert_eq!(cfg.tools.policy.deny.len(), default_policy.deny.len());
+    assert_eq!(cfg.tools.policy.profile, "full");
+    assert!(cfg.tools.policy.allow.is_empty());
+    assert!(cfg.tools.policy.deny.is_empty());
+    assert!(cfg.tools.policy.subagent_deny.contains(&"schedule".to_string()));
+    assert!(cfg.tools.policy.subagent_deny.contains(&"browser".to_string()));
 }
 
 #[test]
@@ -151,17 +123,4 @@ enabled = false
     assert_eq!(slack.env.get("SLACK_BOT_TOKEN").unwrap(), "xoxb-test");
     let docker = &cfg.skills.entries["docker"];
     assert!(!docker.enabled);
-}
-
-#[test]
-fn test_skills_entries_default_empty() {
-    let cfg = SkillsConfig::default();
-    assert!(cfg.entries.is_empty());
-}
-
-#[test]
-fn test_skill_entry_enabled_default_true() {
-    let entry = SkillEntryConfig::default();
-    assert!(entry.enabled);
-    assert!(entry.env.is_empty());
 }

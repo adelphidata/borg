@@ -1,7 +1,7 @@
 //! Server-cert SAN derivation.
 //!
-//! Replaces the historical hard-coded `vec!["localhost".to_string()]` at
-//! daemon startup. The SAN now follows from the actual bind address:
+//! The SAN follows from the actual bind address rather than a fixed
+//! `["localhost"]`, so a remote-bound daemon mints a cert clients can verify:
 //!
 //! - No `--listen`, or loopback (`127.0.0.0/8` / `::1`): `["localhost"]`.
 //! - Non-loopback bind: the operator MUST set `BORG_DAEMON_TLS_SAN` to the

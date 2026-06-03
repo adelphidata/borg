@@ -66,8 +66,6 @@ pub struct Patch {
     pub operations: Vec<PatchOperation>,
 }
 
-// ── Marker constants ──
-
 pub(crate) const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
 pub(crate) const END_PATCH_MARKER: &str = "*** End Patch";
 pub(crate) const ADD_FILE_MARKER: &str = "*** Add File: ";
@@ -543,8 +541,6 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
     Ok(Patch { operations })
 }
 
-// ── Unified-diff input fallback ──
-//
 // Many models (especially non-Anthropic) emit standard `git diff` output
 // instead of the Borg DSL: `--- a/path` / `+++ b/path` / `@@ -L,N +L,N @@`.
 // We detect those inputs and convert them into the same `Patch` AST the DSL

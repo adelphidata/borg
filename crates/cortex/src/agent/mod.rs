@@ -962,6 +962,7 @@ impl Agent {
 
             if cancel.is_cancelled() {
                 self.shutdown_sub_agents();
+                // Best-effort: receiver (UI) may have dropped during cancellation.
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
                 return Ok(());
             }

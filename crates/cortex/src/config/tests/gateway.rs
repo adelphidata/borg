@@ -161,35 +161,9 @@ collaboration_mode = "execute"
 
 // ── ErrorPolicy tests ──
 
-#[test]
-fn error_policy_default_is_once() {
-    assert_eq!(ErrorPolicy::default(), ErrorPolicy::Once);
-}
-
-#[test]
-fn error_policy_from_str() {
-    assert_eq!(
-        "always".parse::<ErrorPolicy>().unwrap(),
-        ErrorPolicy::Always
-    );
-    assert_eq!("once".parse::<ErrorPolicy>().unwrap(), ErrorPolicy::Once);
-    assert_eq!(
-        "silent".parse::<ErrorPolicy>().unwrap(),
-        ErrorPolicy::Silent
-    );
-    assert_eq!(
-        "ALWAYS".parse::<ErrorPolicy>().unwrap(),
-        ErrorPolicy::Always
-    );
-    assert!("invalid".parse::<ErrorPolicy>().is_err());
-}
-
-#[test]
-fn error_policy_display() {
-    assert_eq!(ErrorPolicy::Always.to_string(), "always");
-    assert_eq!(ErrorPolicy::Once.to_string(), "once");
-    assert_eq!(ErrorPolicy::Silent.to_string(), "silent");
-}
+// `ErrorPolicy` FromStr/Display round-trips (incl. case-insensitivity and
+// the unknown-value error) are covered by the unit tests colocated with the
+// type in `config/gateway.rs`; not duplicated here.
 
 #[test]
 fn gateway_config_error_policy_defaults() {

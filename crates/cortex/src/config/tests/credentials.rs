@@ -308,31 +308,27 @@ fn resolve_keychain_fallback_returns_none_for_unknown_key() {
 }
 
 #[test]
-fn resolve_keychain_fallback_maps_known_keys() {
-    // Verify that known credential keys map to the expected keychain service/account
-    // by checking the source code contains the expected mappings
-    let source = include_str!("../mod.rs");
-    assert!(
-        source.contains(r#"("TELEGRAM_BOT_TOKEN", "messaging/telegram")"#),
-        "KEY_PLUGIN_MAP must include TELEGRAM_BOT_TOKEN"
-    );
-    assert!(
-        source.contains(r#"("SLACK_BOT_TOKEN", "messaging/slack")"#),
-        "KEY_PLUGIN_MAP must include SLACK_BOT_TOKEN"
-    );
-    assert!(
-        source.contains(r#"("DISCORD_BOT_TOKEN", "messaging/discord")"#),
-        "KEY_PLUGIN_MAP must include DISCORD_BOT_TOKEN"
-    );
-}
-
-#[test]
-fn resolve_credential_or_env_tries_keychain_fallback() {
-    // Verify the source code calls resolve_keychain_fallback as a final step
-    let source = include_str!("../mod.rs");
-    assert!(
-        source.contains("self.resolve_keychain_fallback(name)"),
-        "resolve_credential_or_env must call resolve_keychain_fallback as final fallback"
+fn keychain_plugin_for_key_maps_known_keys_and_rejects_unknown() {
+    // The keychain fallback derives its service name (`borg-{plugin_id with
+    // / → -}`) from this mapping. A wrong/missing plugin id would route a
+    // channel's keychain lookup to the wrong service and silently fail to
+    // resolve. Assert the live mapping via the public API rather than
+    // grepping source.
+    for (key, plugin_id) in [
+        ("TELEGRAM_BOT_TOKEN", "messaging/telegram"),
+        ("SLACK_BOT_TOKEN", "messaging/slack"),
+        ("DISCORD_BOT_TOKEN", "messaging/discord"),
+    ] {
+        assert_eq!(
+            Config::keychain_plugin_for_key(key),
+            Some(plugin_id),
+            "key {key} must map to {plugin_id}"
+        );
+    }
+    assert_eq!(
+        Config::keychain_plugin_for_key("BORG_TEST_UNMAPPED_KEY"),
+        None,
+        "unmapped keys must not resolve to any plugin"
     );
 }
 
@@ -430,13 +426,17 @@ fn resolve_keychain_fallback_returns_none_when_file_missing_service() {
         r#"{"some-other-service":{"borg-TELEGRAM_BOT_TOKEN":"x"}}"#,
     );
     let config = Config::default();
-    // Known key, but file has no matching service row and keychain (on CI) has
-    // no entry either — expect None.
+    // Known key, but the file only has an *unrelated* service row. The
+    // fallback keys on `borg-messaging-telegram`, so the `"x"` value under
+    // `some-other-service` must never be surfaced — that would be a
+    // cross-service credential leak. (A dev box with a real keychain entry
+    // may return its own Some, which is fine; the leak is what we guard.)
     let resolved = config.resolve_keychain_fallback("TELEGRAM_BOT_TOKEN");
-    // If a developer happens to have a real keychain entry this may be Some;
-    // we only assert the no-panic contract and that the function still returns
-    // a value of the right shape.
-    let _ = resolved;
+    assert_ne!(
+        resolved.as_deref(),
+        Some("x"),
+        "must not surface a credential from a non-matching service row"
+    );
 }
 
 #[test]

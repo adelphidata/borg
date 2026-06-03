@@ -629,10 +629,9 @@ async fn dispatch_voice_channel_via_handle(
     //   `/voice channel <name>` — switch to a different channel.
     //   `/voice leave` — disconnect.
     //
-    // The reference implementation resolves channel names → ids via a guild cache. Borg's
-    // Discord client doesn't currently maintain a guild cache (interactions
-    // come pre-resolved with channel_id). For first cut, accept only the
-    // explicit-id form and direct users at it.
+    // Resolving channel names → ids would need a guild cache, which our
+    // Discord client doesn't maintain (interactions come pre-resolved with
+    // channel_id). Accept only the explicit-id form and direct users at it.
     let parts: Vec<&str> = arg_lower.split_whitespace().collect();
     let action = parts.first().copied().unwrap_or("");
     let arg = parts.get(1).copied().unwrap_or("");
@@ -1332,10 +1331,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_voice_join_returns_stub_status() {
-        // The reference implementation ships `/voice join`, `/voice channel <name>`, `/voice leave`
-        // for Discord bidirectional voice. Borg's slash surface accepts them
-        // and returns a clear "not wired" message — keeps users from
-        // wondering whether they typed the command wrong while the audio
+        // The slash surface accepts `/voice join`, `/voice channel <name>`,
+        // `/voice leave` and returns a clear "not wired" message — keeps users
+        // from wondering whether they typed the command wrong while the audio
         // bridging is genuinely deferred.
         let db = gateway_test_db().await;
         let config = Config::default();

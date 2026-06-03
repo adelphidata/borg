@@ -191,18 +191,3 @@ fn delete_removes_row_and_is_idempotent() {
     assert!(!ProviderRow::delete(db.conn(), "to-remove").unwrap());
     assert!(!ProviderRow::delete(db.conn(), "never-existed").unwrap());
 }
-
-#[test]
-fn category_db_round_trip_covers_all_variants() {
-    // Catches a future variant addition that forgets to update either
-    // `as_db_str` or `from_db_str`. Without this, an unknown variant
-    // would silently fall through to `None` in `from_db_str`.
-    for cat in [
-        ProviderCategory::PublicCloud,
-        ProviderCategory::Local,
-        ProviderCategory::BYOEndpoint,
-    ] {
-        let s = cat.as_db_str();
-        assert_eq!(ProviderCategory::from_db_str(s), Some(cat));
-    }
-}

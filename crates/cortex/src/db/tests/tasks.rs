@@ -28,6 +28,19 @@ fn create_and_list_tasks() {
     // Consolidation, Weekly Maintenance, Daily Self-Healing Maintenance,
     // and the Heartbeat row.
     assert_eq!(tasks.len(), 8);
+
+    // Both user-created tasks must round-trip with their stored fields, not
+    // just bump the count.
+    let t1 = tasks.iter().find(|t| t.id == "t1").expect("t1 listed");
+    assert_eq!(t1.name, "morning summary");
+    assert_eq!(t1.prompt, "summarize");
+    assert_eq!(t1.schedule_type, "cron");
+    assert_eq!(t1.schedule_expr, "0 9 * * *");
+
+    let t2 = tasks.iter().find(|t| t.id == "t2").expect("t2 listed");
+    assert_eq!(t2.name, "stock check");
+    assert_eq!(t2.schedule_type, "interval");
+    assert_eq!(t2.schedule_expr, "1h");
 }
 
 #[test]

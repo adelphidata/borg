@@ -11,6 +11,7 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 const TAILSCALE_INSTALL_URL: &str = "https://tailscale.com/download";
+// Cap the `tailscale status` probe so a hung tailscaled can't stall discovery.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One peer in the local tailnet, as surfaced by `tailscale status --json`.

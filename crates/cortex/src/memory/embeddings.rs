@@ -822,28 +822,66 @@ mod tests {
     }
 
     #[test]
-    fn cached_provider_is_consistent() {
+    fn cache_keys_on_config_fingerprint_not_just_presence() {
+        // A real provider must be cached and a *changed* config must force
+        // re-resolution to a different provider — proving the cache keys on
+        // the config fingerprint, not merely on "is something cached".
+        std::env::set_var("OPENAI_API_KEY", "test-cache-fp");
         invalidate_provider_cache();
-        let config = EmbeddingsConfig {
-            enabled: false,
+        let cfg_small = EmbeddingsConfig {
+            enabled: true,
+            provider: Some("openai".to_string()),
+            model: Some("text-embedding-3-small".to_string()),
             ..Default::default()
         };
-        let a = get_or_init_provider(&config);
-        let b = get_or_init_provider(&config);
-        assert_eq!(a.is_some(), b.is_some());
+        let first = get_or_init_provider(&cfg_small).expect("enabled openai must resolve");
+        assert_eq!(first.model, "text-embedding-3-small");
+        // Same config again hits the cache and yields the identical model.
+        let cached = get_or_init_provider(&cfg_small).expect("cached provider");
+        assert_eq!(cached.model, first.model);
+
+        // A different model is a distinct fingerprint → must re-resolve, not
+        // return the stale small-model provider.
+        let cfg_large = EmbeddingsConfig {
+            model: Some("text-embedding-3-large".to_string()),
+            ..cfg_small.clone()
+        };
+        let re = get_or_init_provider(&cfg_large).expect("re-resolves on fingerprint change");
+        assert_eq!(
+            re.model, "text-embedding-3-large",
+            "fingerprint change must re-resolve, not serve the cached small-model provider"
+        );
+        invalidate_provider_cache();
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]
-    fn invalidate_cache_allows_re_resolution() {
+    fn invalidate_cache_drops_resolved_provider() {
+        // Cache a real provider, then invalidate, then resolve under a config
+        // that yields None — proving invalidation actually cleared the entry
+        // (otherwise the stale Some would be returned for the now-disabled cfg).
+        std::env::set_var("OPENAI_API_KEY", "test-invalidate");
         invalidate_provider_cache();
-        let config = EmbeddingsConfig {
+        let enabled = EmbeddingsConfig {
+            enabled: true,
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            get_or_init_provider(&enabled).is_some(),
+            "enabled openai must cache a provider"
+        );
+        invalidate_provider_cache();
+        let disabled = EmbeddingsConfig {
             enabled: false,
             ..Default::default()
         };
-        assert!(get_or_init_provider(&config).is_none());
+        assert!(
+            get_or_init_provider(&disabled).is_none(),
+            "after invalidation a disabled config must resolve to None, not serve the stale provider"
+        );
         invalidate_provider_cache();
-        // Re-resolves (still None because disabled)
-        assert!(get_or_init_provider(&config).is_none());
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]

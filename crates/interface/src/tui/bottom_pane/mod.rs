@@ -8,9 +8,9 @@
 //! `crates/interface/src/tui/` are not migrated through this host — they keep
 //! their existing surfaces.
 //!
-//! Inspired by the reference TUI's BottomPane, with the View stack flattened
-//! to one slot (borg never stacks request_user_input overlays inside another
-//! View) and key dispatch routed directly from `App::handle_key`.
+//! The View stack is flattened to one slot (borg never stacks
+//! request_user_input overlays inside another View) and key dispatch is
+//! routed directly from `App::handle_key`.
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;

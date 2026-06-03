@@ -1,7 +1,6 @@
-use super::tool_classification::{classify_action, is_mutating_tool};
+use super::tool_classification::is_mutating_tool;
 use super::tool_execution::dispatch_parallel_safe_tool;
 use super::*;
-use crate::rate_guard::ActionType;
 use crate::types::ToolOutput;
 
 // ── Prompt cache: stable prefix ordering ──
@@ -232,39 +231,9 @@ fn require_str_param_wrong_type() {
     assert!(tool_handlers::require_str_param(&args, "name").is_err());
 }
 
-// TODO: update_task_status is async; tests need tokio runtime
-#[cfg(feature = "phase9-tests-disabled")]
-#[test]
-fn update_task_status_not_found() {}
-
-#[cfg(feature = "phase9-tests-disabled")]
-#[test]
-fn update_task_status_formats_verb() {}
-
-// ── classify_action tests ──
-
-#[test]
-fn classify_action_known_and_unknown_tools() {
-    // classify_action feeds the rate-limiter and vitals events. If the
-    // mapping regresses, a shell command could be counted as a generic
-    // tool call and bypass the shell-specific rate bucket.
-    let cases: &[(&str, ActionType)] = &[
-        ("run_shell", ActionType::ShellCommand),
-        ("apply_patch", ActionType::FileWrite),
-        ("write_memory", ActionType::MemoryWrite),
-        ("web_fetch", ActionType::WebRequest),
-        // Unknowns must fall through to ToolCall (safe default).
-        ("some_unknown_tool", ActionType::ToolCall),
-        ("", ActionType::ToolCall),
-    ];
-    for (tool, expected) in cases {
-        let got = classify_action(tool);
-        assert!(
-            std::mem::discriminant(&got) == std::mem::discriminant(expected),
-            "classify_action({tool:?}) = {got:?}, expected {expected:?}"
-        );
-    }
-}
+// NOTE: `classify_action` is exhaustively covered (full match-arm table +
+// unknown fallback) by `tool_classification::tests::classify_action_*`. No
+// duplicate table here.
 
 // -- is_mutating_tool (allowlist-based) --
 
@@ -750,98 +719,109 @@ fn should_nudge_for_response_matrix() {
 
 // -- new system prompt section tests --
 
-#[test]
-fn build_system_prompt_has_tooling_section() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_tooling_section"),
-        "system prompt must include tooling section"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_tool_call_style() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_tool_call_style_section"),
-        "system prompt must include tool call style guidance"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_silent_reply() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_silent_reply_section"),
-        "system prompt must include silent reply protocol"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_heartbeat_protocol() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_heartbeat_section"),
-        "system prompt must include heartbeat ack protocol"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_reply_tags() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_reply_tags_section"),
-        "system prompt must include reply tags section"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_messaging() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_messaging_section"),
-        "system prompt must include messaging/channel routing"
-    );
-}
-
-#[test]
-fn build_system_prompt_has_reasoning() {
-    let body = extract_build_system_prompt_body();
-    assert!(
-        body.contains("build_reasoning_section"),
-        "system prompt must include reasoning format section"
-    );
-}
+// NOTE: the `build_system_prompt_*_after_*` ordering tests above are the
+// prompt-cache guards (an explicitly-allowed source-grep exception). The
+// section *content* itself is verified by the tests below, which call the
+// real section builders and assert on the emitted prompt text — not on the
+// presence of a call site in the source.
 
 #[test]
 fn tool_call_style_section_contains_guidance() {
     let section = Agent::build_tool_call_style_section();
-    assert!(section.contains("do not narrate"));
-    assert!(section.contains("tool_call_style"));
+    assert!(section.contains("<tool_call_style>"), "missing open tag: {section}");
+    assert!(
+        section.contains("do not narrate"),
+        "tool-call-style guidance must instruct the model not to narrate: {section}"
+    );
 }
 
 #[test]
-fn silent_reply_section_contains_token() {
+fn silent_reply_section_embeds_the_live_token() {
+    // The model is told to emit SILENT_REPLY_TOKEN verbatim; if the section
+    // hardcoded a stale literal instead of the constant, the agent loop's
+    // `[SILENT]` suppression would never match. Assert the section carries
+    // the exact runtime token.
     let section = Agent::build_silent_reply_section();
-    assert!(section.contains(constants::SILENT_REPLY_TOKEN));
-    assert!(section.contains("silent_replies"));
+    assert!(section.contains("<silent_replies>"), "missing open tag: {section}");
+    assert!(
+        section.contains(constants::SILENT_REPLY_TOKEN),
+        "silent-reply section must embed the live SILENT_REPLY_TOKEN ({:?}): {section}",
+        constants::SILENT_REPLY_TOKEN
+    );
 }
 
 #[test]
-fn reply_tags_section_contains_tag() {
+fn reply_tags_section_documents_reply_to_current() {
     let section = Agent::build_reply_tags_section();
-    assert!(section.contains("[[reply_to_current]]"));
-    assert!(section.contains("reply_tags"));
+    assert!(section.contains("<reply_tags>"), "missing open tag: {section}");
+    assert!(
+        section.contains("[[reply_to_current]]"),
+        "reply-tags section must document the [[reply_to_current]] tag: {section}"
+    );
+    assert!(
+        section.contains("must be the very first token"),
+        "reply-tags section must state the first-token constraint: {section}"
+    );
 }
 
-#[test]
-fn silent_reply_token_is_not_empty() {
-    assert!(!constants::SILENT_REPLY_TOKEN.is_empty());
+#[tokio::test]
+async fn heartbeat_section_embeds_live_ok_token_and_interval() {
+    // The heartbeat ack protocol tells the model to reply with the exact
+    // HEARTBEAT_OK_TOKEN and quotes the configured interval. A stale literal
+    // or a dropped interval would make the heartbeat scheduler unable to
+    // recognize the "nothing to report" reply.
+    let mut config = Config::default();
+    config.heartbeat.interval = "7m".to_string();
+    let agent = Agent::new(config, BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+
+    let section = agent.build_heartbeat_section();
+    assert!(
+        section.contains(constants::HEARTBEAT_OK_TOKEN),
+        "heartbeat section must embed the live HEARTBEAT_OK_TOKEN: {section}"
+    );
+    assert!(
+        section.contains("7m"),
+        "heartbeat section must quote the configured interval (7m): {section}"
+    );
 }
 
-#[test]
-fn heartbeat_ok_token_is_not_empty() {
-    assert!(!constants::HEARTBEAT_OK_TOKEN.is_empty());
+#[tokio::test]
+async fn messaging_section_lists_native_channels_and_forbids_curl() {
+    // The messaging section steers the model to the compiled-in native
+    // integrations rather than run_shell/curl. Assert the concrete guidance
+    // so a rewrite that drops the curl prohibition is caught.
+    let agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+
+    let section = agent.build_messaging_section();
+    assert!(section.contains("<messaging>"), "missing open tag: {section}");
+    for channel in ["Telegram", "Slack", "Discord", "iMessage"] {
+        assert!(
+            section.contains(channel),
+            "messaging section must name native channel {channel}: {section}"
+        );
+    }
+    assert!(
+        section.contains("do not use run_shell/curl"),
+        "messaging section must forbid run_shell/curl for messaging: {section}"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_section_is_empty_unless_thinking_enabled() {
+    // The reasoning-format section is conditional: it must be empty when
+    // extended thinking is off (default), so it never bloats the cached
+    // prefix, and non-empty (quoting the level) when enabled.
+    let off_agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    assert!(
+        off_agent.build_reasoning_section().is_empty(),
+        "reasoning section must be empty when thinking is disabled"
+    );
 }
 
 #[test]

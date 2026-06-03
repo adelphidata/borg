@@ -308,8 +308,16 @@ fn bond_record_rejects_wrong_delta() {
     let db = test_db();
     let result = db.record_bond_event_chained("tool_success", 99, "test");
     assert!(result.is_err());
-    let result = db.record_bond_event_chained("tool_success", 1, "test");
-    assert!(result.is_ok());
+    // The rejected event must not have been persisted.
+    assert!(db.get_all_bond_events().unwrap().is_empty());
+
+    // The canonical delta for the same event type is accepted and recorded.
+    db.record_bond_event_chained("tool_success", 1, "test")
+        .unwrap();
+    let events = db.get_all_bond_events().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].score_delta, 1);
+    assert_eq!(events[0].event_type, "tool_success");
 }
 
 #[test]

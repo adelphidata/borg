@@ -492,33 +492,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_group_web_tools() {
-        assert_eq!(tool_group("web_fetch"), Some(ToolGroup::Web));
-        assert_eq!(tool_group("web_search"), Some(ToolGroup::Web));
-    }
-
-    #[test]
-    fn tool_group_agent_tools() {
-        assert_eq!(tool_group("spawn_agent"), Some(ToolGroup::Agents));
-        assert_eq!(tool_group("send_to_agent"), Some(ToolGroup::Agents));
-        assert_eq!(tool_group("wait_for_agent"), Some(ToolGroup::Agents));
-        assert_eq!(tool_group("close_agent"), Some(ToolGroup::Agents));
-        assert_eq!(tool_group("manage_roles"), Some(ToolGroup::Agents));
-    }
-
-    #[test]
-    fn tool_group_integration_tools() {
-        assert_eq!(tool_group("gmail"), Some(ToolGroup::Integration));
-        assert_eq!(tool_group("google_calendar"), Some(ToolGroup::Integration));
-        assert_eq!(tool_group("notion"), Some(ToolGroup::Integration));
-        assert_eq!(tool_group("linear"), Some(ToolGroup::Integration));
-    }
-
-    #[test]
-    fn tool_group_singleton_tools() {
-        assert_eq!(tool_group("browser"), Some(ToolGroup::Ui));
-        assert_eq!(tool_group("schedule"), Some(ToolGroup::Scheduling));
-        assert_eq!(tool_group("generate_image"), Some(ToolGroup::Media));
+    fn tool_group_maps_known_tool_names() {
+        let cases = [
+            ("web_fetch", ToolGroup::Web),
+            ("web_search", ToolGroup::Web),
+            ("spawn_agent", ToolGroup::Agents),
+            ("send_to_agent", ToolGroup::Agents),
+            ("wait_for_agent", ToolGroup::Agents),
+            ("close_agent", ToolGroup::Agents),
+            ("manage_roles", ToolGroup::Agents),
+            ("gmail", ToolGroup::Integration),
+            ("google_calendar", ToolGroup::Integration),
+            ("notion", ToolGroup::Integration),
+            ("linear", ToolGroup::Integration),
+            ("browser", ToolGroup::Ui),
+            ("schedule", ToolGroup::Scheduling),
+            ("generate_image", ToolGroup::Media),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(tool_group(name), Some(expected), "wrong group for {name}");
+        }
+        // An unregistered tool name must not be silently bucketed into a group.
+        assert_eq!(tool_group("definitely_not_a_tool"), None);
     }
 
     #[test]

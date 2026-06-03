@@ -112,6 +112,9 @@ impl TypingIndicatorHandle {
 
     /// Signal the background task to stop and wait for it to finish.
     pub async fn stop(&mut self) {
+        // Send errs only if the task already exited (the receiver dropped);
+        // await errs only on a task panic, already surfaced by the loop's
+        // own logging. Either way the indicator is gone, so dropping is safe.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }

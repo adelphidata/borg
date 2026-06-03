@@ -1,9 +1,8 @@
 //! Compact duration formatting for the bottom-right goal indicator.
 //!
 //! Renders an elapsed-seconds count as the largest non-zero unit only —
-//! `"45s"`, `"12m"`, `"3h"`, `"2d"`. Mirrors openclaw's
-//! `formatDurationCompact` shape so the indicator stays narrow enough to
-//! fit even on slim terminals.
+//! `"45s"`, `"12m"`, `"3h"`, `"2d"` — so the indicator stays narrow enough
+//! to fit even on slim terminals.
 
 /// Format `seconds` as a compact duration. Negative inputs and overflowing
 /// systems clamp to `"0s"`.

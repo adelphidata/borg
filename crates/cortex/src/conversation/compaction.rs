@@ -422,12 +422,16 @@ mod tests {
         ];
 
         let last_pair_tokens = message_tokens(&history[4]) + message_tokens(&history[5]);
-        let keep_from = plan_compaction(&history, last_pair_tokens + 205);
-
-        if let Some(kf) = keep_from {
-            // The most recent messages (indices 4, 5) should be in the kept portion
-            assert!(kf <= 4);
-        }
+        // Budget is tight enough that the 6-message history must overflow it,
+        // so compaction MUST fire — assert Some so a regression that returns
+        // None (no compaction) can't pass this test vacuously.
+        let keep_from = plan_compaction(&history, last_pair_tokens + 205)
+            .expect("history must exceed this tight budget and trigger compaction");
+        // The most recent pair (indices 4, 5) must survive in the kept portion.
+        assert!(
+            keep_from <= 4,
+            "keep_from={keep_from} would drop the most recent message pair"
+        );
     }
 
     #[test]
@@ -441,10 +445,18 @@ mod tests {
         ];
 
         let last_pair_tokens = message_tokens(&history[3]) + message_tokens(&history[4]);
-        if let Some(keep_from) = plan_compaction(&history, last_pair_tokens + 205) {
-            // Should not start with a Tool message
-            assert_ne!(history[keep_from].role, Role::Tool);
-        }
+        // This history overflows the tight budget, so compaction must fire.
+        // Assert Some so the orphaned-tool-result guard below is actually
+        // exercised rather than skipped when plan_compaction returns None.
+        let keep_from = plan_compaction(&history, last_pair_tokens + 205)
+            .expect("history must exceed this tight budget and trigger compaction");
+        // The kept portion must not start with a Tool message, which would be
+        // an orphaned tool_result (its assistant tool_call message was dropped).
+        assert_ne!(
+            history[keep_from].role,
+            Role::Tool,
+            "kept window must not start on an orphaned tool_result at index {keep_from}"
+        );
     }
 
     #[test]
@@ -463,9 +475,15 @@ mod tests {
     fn plan_single_message() {
         let history = vec![make_user("only message")];
         let result = plan_compaction(&history, 0);
-        // With only one message, keep_from would be 0, so returns None
-        // (nothing to drop before the last message)
-        assert!(result.is_none() || result == Some(0));
+        // With a single message, the walk-back clamps keep_from to 0, and the
+        // `keep_from == 0` guard returns None — there is nothing to drop before
+        // the last message. Assert the exact documented outcome (None), not the
+        // permissive "None or Some(0)" which would accept a buggy Some(0) that
+        // signals an empty kept window.
+        assert_eq!(
+            result, None,
+            "single-message history has nothing to compact; must return None"
+        );
     }
 
     #[test]

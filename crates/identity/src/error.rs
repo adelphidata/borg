@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Errors emitted by the `borg-pki` crate.
+/// Errors emitted by PKI operations (CA, cert, keychain).
 #[derive(Debug, Error)]
 pub enum PkiError {
     /// Failed to mint or parse a certificate.

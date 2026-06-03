@@ -11,14 +11,9 @@ pub struct VerifyResult {
     pub message: String,
 }
 
-/// Verify that an installed plugin is working.
-///
-/// For now, this checks that:
-/// 1. Required binaries are available
-/// 2. Required credentials are resolvable (env var or keychain)
-///
-/// Full API health checks (e.g., calling Telegram getMe) are done per-integration
-/// when the credentials are available.
+/// Verify an installed plugin: required binaries present and required
+/// credentials resolvable (env var or keychain). Full API health checks
+/// (e.g. Telegram getMe) are done per-integration when credentials exist.
 pub fn verify(def: &PluginDef, data_dir: &std::path::Path) -> VerifyResult {
     let id = def.id.to_string();
 

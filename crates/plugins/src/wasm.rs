@@ -23,6 +23,11 @@ const SCHEMA_VERSION: &str = "borg.plugin.v1";
 const ABI_EXPORT_ALLOC: &str = "alloc";
 const ABI_EXPORT_CALL: &str = "borg_tool_call";
 const ABI_EXPORT_MEMORY: &str = "memory";
+// Sandbox resource caps. `*_DEFAULT` apply when a manifest omits a limit;
+// `*_LIMIT` are the hard ceilings a manifest can request. WASM pages are
+// 64 KiB, so 256 pages = 16 MiB max guest heap. Fuel bounds total executed
+// instructions (DoS guard); the 60s timeout is the wall-clock backstop for
+// fuel-heavy-but-not-fuel-exhausting loops.
 const MAX_OUTPUT_BYTES_DEFAULT: u64 = 64 * 1024;
 const MAX_MEMORY_PAGES_DEFAULT: u64 = 16;
 const FUEL_DEFAULT: u64 = 10_000_000;

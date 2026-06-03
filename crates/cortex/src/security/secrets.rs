@@ -192,6 +192,10 @@ mod tests {
         let input = "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED GitHub Token]"));
+        assert!(
+            !result.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+            "raw token must not survive redaction: {result}"
+        );
     }
 
     #[test]
@@ -199,13 +203,22 @@ mod tests {
         let input = "ANTHROPIC_API_KEY=sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED Anthropic API Key]"));
+        assert!(
+            !result.contains("sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678"),
+            "raw key must not survive redaction: {result}"
+        );
     }
 
     #[test]
     fn redacts_jwt() {
-        let input = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        let result = redact_secrets(input);
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let input = format!("Bearer {jwt}");
+        let result = redact_secrets(&input);
         assert!(result.contains("[REDACTED JWT]"));
+        assert!(
+            !result.contains(jwt),
+            "raw JWT must not survive redaction: {result}"
+        );
     }
 
     #[test]
@@ -233,6 +246,10 @@ mod tests {
         let input = "SLACK_TOKEN=xoxb-1234567890-abcdefghijklmnopqrstuvwx";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED Slack Token]"));
+        assert!(
+            !result.contains("xoxb-1234567890-abcdefghijklmnopqrstuvwx"),
+            "raw Slack token must not survive redaction: {result}"
+        );
     }
 
     #[test]
@@ -248,6 +265,10 @@ mod tests {
         let input = "MONGO=mongodb+srv://admin:secret@cluster0.example.net/db";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED Database Connection String]"));
+        assert!(
+            !result.contains("admin:secret@cluster0.example.net"),
+            "raw connection credentials must not survive redaction: {result}"
+        );
     }
 
     #[test]
@@ -255,6 +276,10 @@ mod tests {
         let input = "key=sk_ant_api03_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED Anthropic API Key]"));
+        assert!(
+            !result.contains("sk_ant_api03_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678"),
+            "raw underscore-variant key must not survive redaction: {result}"
+        );
     }
 
     #[test]
@@ -265,6 +290,16 @@ mod tests {
             result.contains("[REDACTED"),
             "should redact credential assignment, got: {result}"
         );
+        assert!(
+            !result.contains("super-secret-password-123"),
+            "raw credential value must not survive redaction: {result}"
+        );
+        // capture_only must preserve the variable name so the line stays
+        // legible — only the value is scrubbed.
+        assert!(
+            result.contains("PGPASSWORD="),
+            "variable name prefix must be preserved: {result}"
+        );
     }
 
     #[test]
@@ -274,6 +309,10 @@ mod tests {
         assert!(
             result.contains("[REDACTED"),
             "should redact exported credential, got: {result}"
+        );
+        assert!(
+            !result.contains("my_database_secret_key_here"),
+            "raw exported credential value must not survive redaction: {result}"
         );
     }
 }

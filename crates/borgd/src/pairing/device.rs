@@ -37,7 +37,8 @@ use tokio::net::{UnixListener, UnixStream};
 /// Identity strings bound into SPAKE2 — must match between daemon and client.
 const ID_DAEMON: &[u8] = b"borg-pair-daemon";
 const ID_CLIENT: &[u8] = b"borg-pair-client";
-/// Validity for the freshly issued client cert.
+/// Client-cert lifetime; matches the 90-day server/client window the PKI
+/// crate issues so renewal cadence is uniform across both cert kinds.
 const CLIENT_VALIDITY_DAYS: u32 = 90;
 
 #[derive(Debug, Serialize, Deserialize)]

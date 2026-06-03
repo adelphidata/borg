@@ -1202,7 +1202,15 @@ mod tests {
     #[test]
     fn load_extra_paths_respects_budget() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("big.md"), "word ".repeat(5000)).unwrap();
+        // ~5000 words is far over a 100-token budget, so this single file
+        // can never fit and must be skipped entirely — not truncated, not
+        // partially loaded.
+        let big = "word ".repeat(5000);
+        std::fs::write(tmp.path().join("big.md"), &big).unwrap();
+        assert!(
+            estimate_tokens(&big) > 100,
+            "fixture must exceed budget to exercise the skip path"
+        );
         let mut tokens = 0;
         let mut parts = Vec::new();
         load_extra_paths(
@@ -1212,8 +1220,37 @@ mod tests {
             &mut tokens,
             &mut parts,
         );
-        // Either the file fits or it doesn't, but we shouldn't exceed budget
-        assert!(tokens <= 100 || parts.is_empty());
+        assert!(
+            parts.is_empty(),
+            "over-budget file must be skipped, not partially loaded"
+        );
+        assert_eq!(tokens, 0, "skipped file must not consume the budget");
+    }
+
+    #[test]
+    fn load_extra_paths_loads_files_until_budget_exhausted() {
+        // Two small files that each fit, plus one that pushes past budget.
+        // The loader must include the fitting files and stop, never
+        // exceeding the cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let small = "alpha beta gamma"; // small token count
+        std::fs::write(tmp.path().join("a.md"), small).unwrap();
+        let small_tokens = estimate_tokens(small);
+        let mut tokens = 0;
+        let mut parts = Vec::new();
+        load_extra_paths(
+            &[tmp.path().to_string_lossy().to_string()],
+            &[],
+            small_tokens + 1,
+            &mut tokens,
+            &mut parts,
+        );
+        assert_eq!(parts.len(), 1, "the one fitting file must be loaded");
+        assert!(parts[0].contains("alpha beta gamma"));
+        assert!(
+            tokens <= small_tokens + 1 && tokens > 0,
+            "budget must be charged for the loaded file without overrun: {tokens}"
+        );
     }
 
     #[test]

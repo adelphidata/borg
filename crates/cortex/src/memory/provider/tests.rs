@@ -143,22 +143,25 @@ fn format_hits_empty_returns_human_message() {
 // ── Registry fallback ──
 
 #[test]
-fn resolve_falls_back_to_native_when_mem0_unconfigured() {
-    registry::reset_warn_once_for_tests();
-    let mut cfg = Config::default();
-    cfg.memory.provider = MemoryProviderKind::Mem0;
-    // api_key intentionally unset → resolve must return Native.
-    let prov = resolve(&cfg);
-    assert_eq!(prov.name(), "native");
-}
-
-#[test]
-fn resolve_falls_back_to_native_when_openviking_unconfigured() {
-    registry::reset_warn_once_for_tests();
-    let mut cfg = Config::default();
-    cfg.memory.provider = MemoryProviderKind::Openviking;
-    let prov = resolve(&cfg);
-    assert_eq!(prov.name(), "native");
+fn resolve_falls_back_to_native_for_every_unconfigured_external() {
+    // Selecting any external backend without credentials must resolve to
+    // Native — table-driven over every external variant so a new backend
+    // that forgets the fallback is caught here.
+    for provider in [
+        MemoryProviderKind::Mem0,
+        MemoryProviderKind::Honcho,
+        MemoryProviderKind::Openviking,
+    ] {
+        registry::reset_warn_once_for_tests();
+        let mut cfg = Config::default();
+        cfg.memory.provider = provider;
+        // Credentials intentionally unset → resolve must return Native.
+        assert_eq!(
+            resolve(&cfg).name(),
+            "native",
+            "unconfigured {provider} must fall back to native"
+        );
+    }
 }
 
 #[test]
@@ -577,31 +580,26 @@ fn honcho_not_configured_does_not_leak_resolver_detail() {
 // ── Settings round-trip ──
 
 #[test]
-fn from_config_unconfigured_mem0_yields_native() {
-    registry::reset_warn_once_for_tests();
-    let mut cfg = Config::default();
-    cfg.memory.provider = MemoryProviderKind::Mem0;
-    cfg.memory.mem0 = Mem0Settings::default();
-    let prov = from_config(&cfg);
-    assert_eq!(prov.name(), "native");
-}
-
-#[test]
-fn from_config_unconfigured_honcho_yields_native() {
-    registry::reset_warn_once_for_tests();
-    let mut cfg = Config::default();
-    cfg.memory.provider = MemoryProviderKind::Honcho;
-    cfg.memory.honcho = HonchoSettings::default();
-    let prov = from_config(&cfg);
-    assert_eq!(prov.name(), "native");
-}
-
-#[test]
-fn from_config_unconfigured_openviking_yields_native() {
-    registry::reset_warn_once_for_tests();
-    let mut cfg = Config::default();
-    cfg.memory.provider = MemoryProviderKind::Openviking;
-    cfg.memory.openviking = OpenVikingSettings::default();
-    let prov = from_config(&cfg);
-    assert_eq!(prov.name(), "native");
+fn from_config_unconfigured_external_yields_native() {
+    // `from_config` is the settings-round-trip entry point (default
+    // settings structs present but unconfigured). Every external backend
+    // must degrade to Native rather than erroring or selecting a backend
+    // that can't reach its upstream.
+    for provider in [
+        MemoryProviderKind::Mem0,
+        MemoryProviderKind::Honcho,
+        MemoryProviderKind::Openviking,
+    ] {
+        registry::reset_warn_once_for_tests();
+        let mut cfg = Config::default();
+        cfg.memory.provider = provider;
+        cfg.memory.mem0 = Mem0Settings::default();
+        cfg.memory.honcho = HonchoSettings::default();
+        cfg.memory.openviking = OpenVikingSettings::default();
+        assert_eq!(
+            from_config(&cfg).name(),
+            "native",
+            "unconfigured {provider} via from_config must yield native"
+        );
+    }
 }

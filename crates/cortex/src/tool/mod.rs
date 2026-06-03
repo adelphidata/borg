@@ -551,13 +551,13 @@ mod tests {
         for (name, args) in cases {
             let parsed = Tool::parse(name, args.clone())
                 .unwrap_or_else(|e| panic!("parse({name}) failed: {e}"));
-            assert_eq!(parsed.name(), *name);
-            // Classification table coverage — exhaustive matches in the impl
-            // make this trivial to assert by smoke-test, but recording the
-            // values here documents intent.
-            let _ = parsed.parallel_safe();
-            let _ = parsed.allowed_in_plan_mode();
-            let _ = parsed.group();
+            assert_eq!(parsed.name(), *name, "name() must echo the parsed name");
+            // The parsed variant must also map to a non-empty catalog group so a
+            // newly-added variant can't silently fall outside grouping.
+            assert!(
+                !parsed.group().label().is_empty(),
+                "{name} resolved to a group with an empty label"
+            );
         }
     }
 

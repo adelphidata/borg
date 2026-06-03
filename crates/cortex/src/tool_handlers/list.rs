@@ -122,8 +122,17 @@ mod tests {
     fn list_skills_dispatches() {
         let config = Config::default();
         let args = json!({"what": "skills"});
-        let result = handle_list(&args, &config, None);
-        assert!(result.is_ok());
+        // handle_list("skills") must route to handle_list_skills and return its output.
+        let routed = handle_list(&args, &config, None).unwrap();
+        let direct = handle_list_skills(&config).unwrap();
+        assert_eq!(
+            routed, direct,
+            "handle_list(\"skills\") should return the same output as handle_list_skills"
+        );
+        assert!(
+            routed.contains("] slack ("),
+            "routed skills output should list built-in skills, got:\n{routed}"
+        );
     }
 
     #[test]
@@ -146,10 +155,16 @@ mod tests {
 
     #[test]
     fn list_channels_dispatches() {
+        let _lock = CHANNEL_ENV_MUTEX.lock().unwrap();
         let config = Config::default();
         let args = json!({"what": "channels"});
-        let result = handle_list(&args, &config, None);
-        assert!(result.is_ok());
+        // handle_list("channels") must route to handle_list_channels and return its output.
+        let routed = handle_list(&args, &config, None).unwrap();
+        let direct = handle_list_channels(&config).unwrap();
+        assert_eq!(
+            routed, direct,
+            "handle_list(\"channels\") should return the same output as handle_list_channels"
+        );
     }
 
     /// Mutex to prevent env-var–mutating channel tests from racing each other.

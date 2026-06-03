@@ -487,12 +487,10 @@ fn group_activation_defaults_to_mention() {
     assert_eq!(cfg.gateway.group_activation, ActivationMode::Mention);
 }
 
-// ────────────────────────────────────────────────────────────────────────
 // Regression guards for the "onboarded OpenRouter → runtime resolved Ollama"
 // incident. Provider must ALWAYS come from explicit config (onboarding,
 // /settings, /model, or `borg settings set llm.provider <name>`). Never
 // from a TCP probe, an API-key-env-name guess, or any other fuzzy signal.
-// ────────────────────────────────────────────────────────────────────────
 
 /// When no provider is configured, resolve_provider MUST bail with a message
 /// that tells the user how to configure one. It MUST NOT silently pick a

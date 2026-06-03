@@ -2,11 +2,10 @@
 //!
 //! Splits a single host `Rect` into stacked sub-areas (progress row,
 //! question, options list, notes editor) plus a footer-row count, collapsing
-//! gracefully as available height shrinks. Near-verbatim port of the
-//! reference TUI's layout module; the overlay's geometric accessors live in
-//! the sibling `mod.rs`. `render.rs` consumes `LayoutSections`; the state
-//! machine in `mod.rs` decides when the inputs change (notes visibility,
-//! question count).
+//! gracefully as available height shrinks. The overlay's geometric accessors
+//! live in the sibling `mod.rs`. `render.rs` consumes `LayoutSections`; the
+//! state machine in `mod.rs` decides when the inputs change (notes
+//! visibility, question count).
 
 use ratatui::layout::Rect;
 
