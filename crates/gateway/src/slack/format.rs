@@ -1,3 +1,5 @@
+use crate::format_common::strip_header;
+
 /// Convert standard Markdown to Slack mrkdwn format.
 ///
 /// Conversions:
@@ -99,26 +101,6 @@ pub fn markdown_to_mrkdwn(text: &str) -> String {
     }
 
     result
-}
-
-/// Strip markdown header prefix (# through ######) and return the text.
-fn strip_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("###### ") {
-        Some(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("##### ") {
-        Some(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("#### ") {
-        Some(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("### ") {
-        Some(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("## ") {
-        Some(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("# ") {
-        Some(rest)
-    } else {
-        None
-    }
 }
 
 /// Find closing delimiter (two-char sequences like ** or __).

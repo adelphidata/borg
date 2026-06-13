@@ -37,6 +37,7 @@ pub mod discord;
 /// Typed error surface for the crate's public API.
 pub mod error;
 pub mod executor;
+pub mod format_common;
 /// Generic signed-payload webhook surface — `POST /v1/webhook/{name}`
 /// with HMAC-SHA256 verification. Lets users wire arbitrary upstream
 /// JSON events into the agent loop via per-webhook JSON dot-paths.
