@@ -12,7 +12,7 @@
 //! request/response correlation, timeouts, and reconnection.
 
 use crate::errors::Result;
-use crate::manifest::{HttpAuth, ServerManifest, Transport as TransportSpec};
+use crate::manifest::{ServerManifest, Transport as TransportSpec};
 use crate::protocol::Message;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -58,9 +58,7 @@ pub async fn open(
             client_identity,
         } => {
             let mut headers = headers.clone();
-            if let HttpAuth::Bearer { token } = auth {
-                headers.insert("Authorization".into(), format!("Bearer {token}"));
-            }
+            auth.apply_to(&mut headers);
             let cfg = http::HttpConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),
@@ -79,9 +77,7 @@ pub async fn open(
             client_identity,
         } => {
             let mut headers = headers.clone();
-            if let HttpAuth::Bearer { token } = auth {
-                headers.insert("Authorization".into(), format!("Bearer {token}"));
-            }
+            auth.apply_to(&mut headers);
             let cfg = sse::SseConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),

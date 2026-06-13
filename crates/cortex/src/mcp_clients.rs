@@ -959,9 +959,7 @@ async fn open_transport(
             client_identity,
         } => {
             let mut headers = headers.clone();
-            if let mcp::manifest::HttpAuth::Bearer { token } = auth {
-                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
-            }
+            auth.apply_to(&mut headers);
             let cfg = mcp::transport::http::HttpConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),
@@ -980,9 +978,7 @@ async fn open_transport(
             client_identity,
         } => {
             let mut headers = headers.clone();
-            if let mcp::manifest::HttpAuth::Bearer { token } = auth {
-                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
-            }
+            auth.apply_to(&mut headers);
             let cfg = mcp::transport::sse::SseConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),

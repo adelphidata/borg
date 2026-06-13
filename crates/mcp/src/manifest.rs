@@ -103,6 +103,17 @@ pub enum HttpAuth {
     },
 }
 
+impl HttpAuth {
+    /// Apply this auth scheme to an outbound header map, setting
+    /// `Authorization: Bearer <token>` when a bearer token is configured.
+    /// [`HttpAuth::None`] leaves the headers untouched.
+    pub fn apply_to(&self, headers: &mut HashMap<String, String>) {
+        if let HttpAuth::Bearer { token } = self {
+            headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+        }
+    }
+}
+
 /// Per-server tool filter.
 ///
 /// `include` wins over `exclude`. `read_only` flips plan-mode classification —
@@ -249,6 +260,26 @@ mod tests {
         assert!(
             matches!(auth, HttpAuth::None),
             "default HttpAuth must be None, got {auth:?}"
+        );
+    }
+
+    #[test]
+    fn http_auth_apply_to_sets_bearer_only_when_present() {
+        // None must not touch the header map — preserves operator-supplied
+        // headers and never injects an empty Authorization.
+        let mut headers = HashMap::new();
+        HttpAuth::None.apply_to(&mut headers);
+        assert!(headers.is_empty());
+
+        // Bearer injects exactly `Authorization: Bearer <token>`.
+        let mut headers = HashMap::new();
+        HttpAuth::Bearer {
+            token: "sekret".into(),
+        }
+        .apply_to(&mut headers);
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer sekret")
         );
     }
 
