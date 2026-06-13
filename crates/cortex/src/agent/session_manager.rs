@@ -177,7 +177,7 @@ impl Agent {
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.
-    pub(super) async fn persist_message(&mut self, msg: Message) {
+    pub(super) async fn persist_message(&mut self, mut msg: Message) {
         let session_id = self.session.meta.id.clone();
         let role = match msg.role {
             crate::types::Role::System => "system",
@@ -203,7 +203,7 @@ impl Agent {
         {
             let guard = self.db_guard().await;
             if let Some(ref db) = *guard {
-                if let Err(e) = db
+                match db
                     .insert_message(
                         &session_id,
                         role,
@@ -215,7 +215,11 @@ impl Agent {
                     )
                     .await
                 {
-                    warn!("Failed to persist message to SQLite: {e}");
+                    // Stamp the durable log position onto the in-memory copy so
+                    // the working set stays mappable to the log (compaction
+                    // boundaries, fork offsets) without a re-read.
+                    Ok(seq) => msg.seq = Some(seq),
+                    Err(e) => warn!("Failed to persist message to SQLite: {e}"),
                 }
             }
         }

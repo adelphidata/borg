@@ -16,10 +16,12 @@ use tracing::{instrument, warn};
 
 use crate::constants;
 use crate::conversation::{
-    compact_history, compact_tool_results, enforce_tool_result_share_limit, history_tokens,
+    compact_history, compact_history_v2, compact_tool_results, compaction_checkpoint_range,
+    enforce_tool_result_share_limit, extract_last_compaction_summary, history_tokens,
     normalize_history,
 };
 use crate::hooks::{HookAction, HookData, HookPoint};
+use crate::llm::LlmClient;
 use crate::memory::{
     load_knowledge_context, load_memory_context_db_ranked_scoped,
     load_memory_context_db_ranked_scoped_with, load_memory_context_db_scoped,
@@ -390,7 +392,6 @@ Rules:
         // Only run LLM-based compaction when history still exceeds the token budget
         if history_tokens(&self.history) > max_hist {
             self.metrics.record_memory_pressure("proactive");
-            let pre_compaction_len = self.history.len();
             let before_tokens = history_tokens(&self.history);
 
             // Pre-compaction memory flush: save important info before messages are dropped
@@ -418,44 +419,10 @@ Rules:
 
             let compaction_config = self.config.with_compaction_overrides();
             let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
+            // Whether this pass updates a prior summary (UX hint only).
+            let iterative = extract_last_compaction_summary(&self.history).is_some();
 
-            let protect_first_n = self.config.conversation.protect_first_n;
-            // Seed the iterative-summary state from any prior compaction
-            // marker in the loaded history (session-resume case).
-            if self.previous_summary.is_none() {
-                self.previous_summary =
-                    crate::conversation::extract_last_compaction_summary(&self.history);
-            }
-            let iterative = self.previous_summary.is_some();
-
-            let mut dropped_count = if protect_first_n > 0 {
-                crate::conversation::compact_history_v2(
-                    &mut self.history,
-                    max_hist,
-                    protect_first_n,
-                    &mut self.previous_summary,
-                    &compaction_llm,
-                )
-                .await
-            } else {
-                compact_history(&mut self.history, max_hist, &compaction_llm).await;
-                pre_compaction_len.saturating_sub(self.history.len())
-            };
-
-            // Fallback: if v2 couldn't compact (protected head consumed the
-            // budget, or head clamped out the middle) and history is still
-            // over the limit, degrade to non-head-protected compaction so we
-            // don't stall indefinitely at an over-budget history.
-            if dropped_count == 0 && history_tokens(&self.history) > max_hist {
-                let pre_fallback_len = self.history.len();
-                compact_history(&mut self.history, max_hist, &compaction_llm).await;
-                dropped_count = pre_fallback_len.saturating_sub(self.history.len());
-                if dropped_count > 0 {
-                    warn!(
-                        "v2 compaction yielded no progress; fell back to legacy compaction and dropped {dropped_count} messages"
-                    );
-                }
-            }
+            let dropped_count = self.run_llm_compaction(max_hist, &compaction_llm).await;
 
             if dropped_count > 0 {
                 let after_tokens = history_tokens(&self.history);
@@ -483,6 +450,97 @@ Rules:
         }
 
         Ok(())
+    }
+
+    /// Run one LLM-based compaction pass over the working history and record it
+    /// as a durable [`crate::conversation::SessionEventKind::CompactionCheckpoint`].
+    ///
+    /// This is the single place an LLM compaction is realized (the proactive,
+    /// reactive, and manual paths all funnel through here). The working set is
+    /// transformed in place — a head-protected summary of the middle — which
+    /// keeps any unpersisted injected messages intact. When the summarized
+    /// middle is backed by the durable log, a checkpoint is appended over the
+    /// exact `[from_seq, to_seq]` range it covers, so a fresh worker rebuilds
+    /// the identical view from the log via
+    /// [`crate::conversation::project_history`] while the raw rows stay on disk
+    /// (non-destructive).
+    ///
+    /// Returns the number of messages dropped from the working view (0 = no-op).
+    pub(super) async fn run_llm_compaction(&mut self, target: usize, llm: &LlmClient) -> usize {
+        let protect_first_n = self.config.conversation.protect_first_n;
+        // Seed the iterative summary from the marker already in the working set
+        // (itself a projection of the log) — no separate cached field to drift.
+        let mut summary = extract_last_compaction_summary(&self.history);
+        // Capture the durable seq range *before* the fold mutates history.
+        let range = compaction_checkpoint_range(&self.history, target, protect_first_n);
+
+        let head_protected_dropped = if protect_first_n > 0 {
+            compact_history_v2(
+                &mut self.history,
+                target,
+                protect_first_n,
+                &mut summary,
+                llm,
+            )
+            .await
+        } else {
+            let before = self.history.len();
+            compact_history(&mut self.history, target, llm).await;
+            before.saturating_sub(self.history.len())
+        };
+        let mut dropped = head_protected_dropped;
+
+        // Fallback: head-protected compaction made no progress (protected head
+        // alone exceeds budget, or the head clamped out the middle) yet we are
+        // still over budget — degrade to non-head-protected so we don't stall.
+        if dropped == 0 && history_tokens(&self.history) > target {
+            let before = self.history.len();
+            compact_history(&mut self.history, target, llm).await;
+            dropped = before.saturating_sub(self.history.len());
+            if dropped > 0 {
+                warn!(
+                    "v2 compaction yielded no progress; fell back to legacy compaction and dropped {dropped} messages"
+                );
+            }
+        }
+
+        // Record compaction as a durable event. Only the clean head-protected
+        // path maps to a `[from_seq, to_seq]` fold; the non-head-protected
+        // fallback drops the head too, so it skips the checkpoint and simply
+        // re-compacts from the raw rows on the next turn (correct, just not yet
+        // folded on resume).
+        if head_protected_dropped > 0 {
+            if let (Some((from_seq, to_seq)), Some(body)) = (range, summary.as_deref()) {
+                // Sanitize to match the in-band marker the live fold spliced, so
+                // the resumed projection renders a byte-identical summary.
+                let safe = crate::security::sanitize::sanitize_xml_boundaries(body);
+                self.record_compaction_checkpoint(from_seq, to_seq, &safe, llm.model())
+                    .await;
+            }
+        }
+        dropped
+    }
+
+    /// Append a compaction checkpoint to the durable session log. Best-effort:
+    /// a missing DB or write error degrades to an in-memory-only fold, which
+    /// still produces a correct live turn and re-compacts on the next resume.
+    async fn record_compaction_checkpoint(
+        &self,
+        from_seq: i64,
+        to_seq: i64,
+        summary: &str,
+        model: &str,
+    ) {
+        let session_id = self.session.meta.id.clone();
+        let guard = self.db.lock().await;
+        if let Some(ref db) = *guard {
+            if let Err(e) = db
+                .append_compaction_checkpoint(&session_id, from_seq, to_seq, summary, model)
+                .await
+            {
+                warn!("Failed to record compaction checkpoint: {e}");
+            }
+        }
     }
 
     /// Warm the skills context cache on first call (avoids re-parsing every turn).

@@ -109,6 +109,7 @@ fn user_message(text: &str) -> Vec<Message> {
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
+        seq: None,
     }]
 }
 

@@ -86,6 +86,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 
@@ -117,6 +118,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         assert_eq!(message_tokens(&msg), 4); // just overhead
     }
@@ -138,6 +140,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let tokens = message_tokens(&msg);
         // Should include overhead + text tokens + IMAGE_TOKEN_ESTIMATE
@@ -158,6 +161,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let large_audio = Message {
             role: Role::User,
@@ -171,6 +175,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let small_tokens = message_tokens(&small_audio);
         let large_tokens = message_tokens(&large_audio);

@@ -38,6 +38,24 @@ pub struct SessionRow {
     pub forked_from_message_id: Option<i64>,
 }
 
+/// A held per-session lease (worker-pool / fallible executors).
+///
+/// A worker takes this before advancing a session and releases it after; on
+/// crash it simply expires and any worker can reconstruct the session from the
+/// log and continue. `epoch` fences a revived dead worker: a `renew`/`release`
+/// only takes effect while the stored epoch still matches the one granted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLease {
+    /// Session this lease is over.
+    pub session_id: String,
+    /// Worker id that holds the lease.
+    pub owner: String,
+    /// Fencing token — advances on every takeover from a different/expired owner.
+    pub epoch: i64,
+    /// Unix timestamp after which the lease is considered expired.
+    pub expiry: i64,
+}
+
 /// Scheduled task row from SQLite.
 #[derive(Debug, Clone)]
 pub struct ScheduledTaskRow {
@@ -148,7 +166,7 @@ pub struct ClaimedTask {
 }
 
 /// Persisted message row from SQLite.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MessageRow {
     /// Unique row identifier.
     pub id: i64,
@@ -168,6 +186,18 @@ pub struct MessageRow {
     pub timestamp: Option<String>,
     /// Unix timestamp when the message was persisted.
     pub created_at: i64,
+    /// Fine-grained event tag (e.g. `tool_call_started`). `None` for
+    /// conversational message rows, which decode from `role`/`content`.
+    pub event_kind: Option<String>,
+    /// Typed payload for non-message events, serialized as
+    /// [`crate::conversation::SessionEventKind`]. `None` for message rows.
+    pub event_json: Option<String>,
+    /// Per-session HMAC chain link over this event's immutable fields. `None`
+    /// on legacy rows written before the log was chained.
+    pub hmac: Option<String>,
+    /// HMAC of the previous event in this session's chain (`"0"` for the first
+    /// chained event). `None` on legacy rows.
+    pub prev_hmac: Option<String>,
 }
 
 /// Delivery queue row from SQLite.

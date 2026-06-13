@@ -13,8 +13,7 @@ use tracing::{debug, info_span, instrument, warn};
 use crate::config::Config;
 use crate::constants;
 use crate::conversation::{
-    compact_history, compact_tool_results, history_tokens, normalize_history, rewind_to_nth_user,
-    undo_last_turn,
+    compact_tool_results, history_tokens, normalize_history, rewind_to_nth_user, undo_last_turn,
 };
 use crate::db::Database;
 use crate::hooks::{HookData, HookPoint, HookRegistry};
@@ -250,11 +249,6 @@ pub struct Agent {
     pub(super) cost_event_sink: Option<Arc<dyn crate::llm::CostEventSink>>,
     /// Short-term working memory for the current session.
     pub(super) short_term_memory: crate::memory::short_term_memory::ShortTermMemory,
-    /// Most recent compaction summary text (no marker prefix). Used by
-    /// `compact_history_v2` to issue iterative-update prompts rather than
-    /// re-summarizing from scratch. Populated either by the current
-    /// session's compactions or by scanning loaded history on resume.
-    pub(super) previous_summary: Option<String>,
     /// True for exactly one turn: set on the call that first injected
     /// `SETUP.md` and atomically created the `SETUP.md.first_turn_done`
     /// marker. The turn that consumed it must not offer tools to the
@@ -428,7 +422,6 @@ impl Agent {
             short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
                 session_id, 2000,
             ),
-            previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat,
             unknown_tool_tracker,
@@ -720,23 +713,7 @@ impl Agent {
             Err(_) => return (before, before),
         };
         let max_hist = self.config.conversation.max_history_tokens;
-        let protect_first_n = self.config.conversation.protect_first_n;
-        if protect_first_n > 0 {
-            if self.previous_summary.is_none() {
-                self.previous_summary =
-                    crate::conversation::extract_last_compaction_summary(&self.history);
-            }
-            crate::conversation::compact_history_v2(
-                &mut self.history,
-                max_hist,
-                protect_first_n,
-                &mut self.previous_summary,
-                &llm,
-            )
-            .await;
-        } else {
-            compact_history(&mut self.history, max_hist, &llm).await;
-        }
+        self.run_llm_compaction(max_hist, &llm).await;
         let after = history_tokens(&self.history);
         (before, after)
     }
@@ -1569,36 +1546,11 @@ impl Agent {
 
         let compaction_config = self.config.with_compaction_overrides();
         let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
-        let protect_first_n = self.config.conversation.protect_first_n;
+        // Whether this pass updates a prior summary (UX hint only).
+        let iterative =
+            crate::conversation::extract_last_compaction_summary(&self.history).is_some();
 
-        if self.previous_summary.is_none() {
-            self.previous_summary =
-                crate::conversation::extract_last_compaction_summary(&self.history);
-        }
-        let iterative = self.previous_summary.is_some();
-
-        let mut dropped = if protect_first_n > 0 {
-            crate::conversation::compact_history_v2(
-                &mut self.history,
-                target,
-                protect_first_n,
-                &mut self.previous_summary,
-                &compaction_llm,
-            )
-            .await
-        } else {
-            let before_len = self.history.len();
-            compact_history(&mut self.history, target, &compaction_llm).await;
-            before_len.saturating_sub(self.history.len())
-        };
-
-        // If v2 made no progress (protected head alone exceeds target), fall
-        // back to non-head-protected so we don't loop on the same overflow.
-        if dropped == 0 && history_tokens(&self.history) > target {
-            let before_len = self.history.len();
-            compact_history(&mut self.history, target, &compaction_llm).await;
-            dropped = before_len.saturating_sub(self.history.len());
-        }
+        let dropped = self.run_llm_compaction(target, &compaction_llm).await;
 
         if dropped > 0 {
             let _ = event_tx

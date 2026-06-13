@@ -20,7 +20,7 @@ pub async fn index_session(config: &Config, session_id: &str) -> Result<usize> {
         return Ok(0);
     }
 
-    let messages = db.load_session_messages(session_id).await?;
+    let messages = db.load_session_lineage_rows(session_id).await?;
     if messages.is_empty() {
         db.mark_session_indexed(session_id, 0).await?;
         return Ok(0);
@@ -120,6 +120,7 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             created_at: 0,
+            ..Default::default()
         }
     }
 

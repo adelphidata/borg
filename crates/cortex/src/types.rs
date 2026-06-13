@@ -311,6 +311,15 @@ pub struct Message {
     /// RFC 3339 timestamp of when this message was created.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// The durable log seq (`messages.id`) this message occupies, when it came
+    /// from — or has been written to — the session log. `None` for messages not
+    /// yet persisted and for synthetic messages with no log row of their own
+    /// (e.g. a compaction summary marker). Lets the working set map back to the
+    /// log without a side table: it rides along through every history mutator
+    /// (`drain`/`retain`/`append`) for free, since those move whole `Message`s.
+    /// Provider adapters ignore it; it is not part of the model-facing payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
 }
 
 /// An LLM-requested tool invocation.
@@ -379,6 +388,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 
@@ -390,6 +400,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
+            seq: None,
         }
     }
 
@@ -401,6 +412,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
+            seq: None,
         }
     }
 
@@ -412,6 +424,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             timestamp: Some(Self::now_rfc3339()),
+            seq: None,
         }
     }
 
@@ -423,6 +436,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
+            seq: None,
         }
     }
 
@@ -514,6 +528,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             timestamp: Some(Self::now_rfc3339()),
+            seq: None,
         }
     }
 }

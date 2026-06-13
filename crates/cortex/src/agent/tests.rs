@@ -306,7 +306,6 @@ fn skill_tool_write_refreshes_cached_skill_state() {
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
-        previous_summary: None,
         setup_just_consumed: false,
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
@@ -374,7 +373,6 @@ fn reload_config_clears_skills_and_replaces_credentials_preserving_identity() {
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
-        previous_summary: None,
         setup_just_consumed: false,
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
@@ -728,7 +726,10 @@ fn should_nudge_for_response_matrix() {
 #[test]
 fn tool_call_style_section_contains_guidance() {
     let section = Agent::build_tool_call_style_section();
-    assert!(section.contains("<tool_call_style>"), "missing open tag: {section}");
+    assert!(
+        section.contains("<tool_call_style>"),
+        "missing open tag: {section}"
+    );
     assert!(
         section.contains("do not narrate"),
         "tool-call-style guidance must instruct the model not to narrate: {section}"
@@ -742,7 +743,10 @@ fn silent_reply_section_embeds_the_live_token() {
     // `[SILENT]` suppression would never match. Assert the section carries
     // the exact runtime token.
     let section = Agent::build_silent_reply_section();
-    assert!(section.contains("<silent_replies>"), "missing open tag: {section}");
+    assert!(
+        section.contains("<silent_replies>"),
+        "missing open tag: {section}"
+    );
     assert!(
         section.contains(constants::SILENT_REPLY_TOKEN),
         "silent-reply section must embed the live SILENT_REPLY_TOKEN ({:?}): {section}",
@@ -753,7 +757,10 @@ fn silent_reply_section_embeds_the_live_token() {
 #[test]
 fn reply_tags_section_documents_reply_to_current() {
     let section = Agent::build_reply_tags_section();
-    assert!(section.contains("<reply_tags>"), "missing open tag: {section}");
+    assert!(
+        section.contains("<reply_tags>"),
+        "missing open tag: {section}"
+    );
     assert!(
         section.contains("[[reply_to_current]]"),
         "reply-tags section must document the [[reply_to_current]] tag: {section}"
@@ -797,7 +804,10 @@ async fn messaging_section_lists_native_channels_and_forbids_curl() {
         .expect("Agent::new must succeed without credentials");
 
     let section = agent.build_messaging_section();
-    assert!(section.contains("<messaging>"), "missing open tag: {section}");
+    assert!(
+        section.contains("<messaging>"),
+        "missing open tag: {section}"
+    );
     for channel in ["Telegram", "Slack", "Discord", "iMessage"] {
         assert!(
             section.contains(channel),

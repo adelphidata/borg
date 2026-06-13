@@ -835,6 +835,14 @@ impl LlmClient {
         self.cost_event_sink.is_some() && self.cost_event_context.is_some()
     }
 
+    /// The active model id, reflecting any provider/model failover that has
+    /// occurred. Used to stamp the model onto durable records (e.g. a
+    /// compaction checkpoint) so they name the model that actually produced
+    /// the output.
+    pub fn model(&self) -> &str {
+        &self.llm_config.model
+    }
+
     /// Practical context window of the active model in tokens. Resolves through
     /// the model registry; falls back to a conservative default for unknown
     /// models so downstream budget calculations always have a non-zero value.

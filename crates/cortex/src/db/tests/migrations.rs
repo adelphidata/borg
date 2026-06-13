@@ -165,6 +165,30 @@ async fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {
     }
 }
 
+// The sessions table must expose the per-session lease columns (worker-pool /
+// fallible executors). If a future migration recreates the table without them,
+// claim/renew/release/expire all break — guard the column set directly.
+#[tokio::test]
+async fn sessions_has_lease_columns() {
+    let db = test_db().await;
+    let mut stmt = db
+        .conn
+        .prepare("PRAGMA table_info(sessions)")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut cols: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        cols.push(row.get::<String>(1).unwrap());
+    }
+    for required in ["lease_owner", "lease_expiry", "lease_epoch"] {
+        assert!(
+            cols.iter().any(|c| c == required),
+            "sessions must expose {required}; columns: {cols:?}"
+        );
+    }
+}
+
 // Re-running schema_version() when the meta row is corrupted (non-numeric)
 // MUST degrade to 0 rather than panic — otherwise a single bad meta write
 // would brick startup. Documented in db/mod.rs:451-460.

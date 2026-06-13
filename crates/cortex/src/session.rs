@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::db::Database;
 use crate::security::validation::validate_session_id;
-use crate::types::{Message, MessageContent, Role, ToolCall};
+use crate::types::{Message, Role};
 
 /// Lightweight metadata for a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,10 +116,11 @@ impl Session {
 /// Fork an existing session at `anchor_message_id`, creating a new session
 /// whose history is the parent's messages up to and including the anchor.
 ///
-/// The fork is recorded in SQLite (parent lineage on the `sessions` row,
-/// copied `messages` rows), then materialized as a JSON-on-disk session so
-/// it shows up in `/sessions` and `Session::load` works without falling
-/// through to `recover_session_from_db`.
+/// The fork is recorded in SQLite by reference only — parent lineage on the
+/// child `sessions` row, no copied `messages` rows — then materialized as a
+/// JSON-on-disk session (its reconstructed history) so it shows up in
+/// `/sessions` and `Session::load` works without falling through to
+/// `recover_session_from_db`.
 ///
 /// Returns the new `Session`. Caller is responsible for switching the agent
 /// to it (typically via `LoadSession`).
@@ -172,53 +173,40 @@ struct SessionMetaOnly {
     meta: SessionMeta,
 }
 
-/// Attempt to recover a session's messages from SQLite if the JSON file is stale or missing.
+/// Reconstruct a session's working history from the durable event log in
+/// SQLite. The log is the source of truth; this is the canonical
+/// "reconstruct from log" step — decode the persisted rows into
+/// [`crate::conversation::SessionEvent`]s and project them into the
+/// conversation the agent resumes from.
 pub async fn recover_session_from_db(session_id: &str) -> Result<Option<Vec<Message>>> {
     let db = Database::open().await?;
-    let rows = db.load_session_messages(session_id).await?;
+    // Lineage-aware: a forked session inherits its ancestors' history by
+    // reference (no rows are copied at fork time), so reconstruction stitches
+    // the parent prefix in. For a non-forked session this is exactly its own
+    // rows.
+    let rows = db.load_session_lineage_rows(session_id).await?;
     if rows.is_empty() {
         return Ok(None);
     }
-
-    let mut messages = Vec::with_capacity(rows.len());
-    for row in rows {
-        let role = match row.role.as_str() {
-            "system" => Role::System,
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "tool" => Role::Tool,
-            _ => continue,
-        };
-        let tool_calls: Option<Vec<ToolCall>> = row
-            .tool_calls_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok());
-        let content = if let Some(parts_json) = &row.content_parts_json {
-            match serde_json::from_str(parts_json) {
-                Ok(parts) => Some(parts),
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize content_parts_json: {e}");
-                    row.content.map(MessageContent::Text)
-                }
-            }
-        } else {
-            row.content.map(MessageContent::Text)
-        };
-        messages.push(Message {
-            role,
-            content,
-            tool_calls,
-            tool_call_id: row.tool_call_id,
-            timestamp: row.timestamp,
-        });
+    // Surface tampering/corruption of the durable log. Best-effort: a broken
+    // chain still loads (we never strand the user out of their session) — it
+    // just warns, which is what makes the HMAC chain's tamper-evidence live
+    // rather than write-only.
+    let key = db.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN);
+    if !crate::conversation::verify_session_chain(&key, &rows) {
+        tracing::warn!(
+            "session {session_id}: message-log HMAC chain failed verification \
+             (tampering or corruption); loading anyway"
+        );
     }
-
-    Ok(Some(messages))
+    let events = crate::conversation::events_from_rows(rows);
+    Ok(Some(crate::conversation::project_history(&events)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MessageContent;
 
     #[test]
     fn session_new_generates_valid_uuid_and_rfc3339_timestamps() {
@@ -245,6 +233,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.message_count, 1);
@@ -261,6 +250,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert!(session.meta.title.ends_with("..."));
@@ -277,6 +267,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         // Title should not change since it's not "New conversation"
@@ -292,6 +283,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "New conversation");
@@ -316,6 +308,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "*heartbeat tick*");
@@ -332,6 +325,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "Hello world");
@@ -348,6 +342,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "Simple question about code");
@@ -364,6 +359,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }];
         session.update_from_history(&messages);
         assert!(session.meta.title.ends_with("..."));
@@ -388,6 +384,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
+                seq: None,
             }],
         };
         let path = sessions_dir.join(format!("{id}.json"));

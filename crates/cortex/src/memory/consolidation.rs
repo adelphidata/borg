@@ -638,7 +638,7 @@ async fn try_backfill_identity(
     let mut messages_by_session: std::collections::HashMap<String, Vec<crate::db::MessageRow>> =
         std::collections::HashMap::new();
     for session in &sessions {
-        let msgs = db.load_session_messages(&session.id).await?;
+        let msgs = db.load_session_lineage_rows(&session.id).await?;
         messages_by_session.insert(session.id.clone(), msgs);
     }
 
@@ -737,6 +737,7 @@ mod backfill_tests {
             tool_call_id: None,
             timestamp: None,
             created_at: 0,
+            ..Default::default()
         }
     }
 

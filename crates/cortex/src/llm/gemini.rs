@@ -565,6 +565,7 @@ fn parse_gemini_response(
         tool_calls,
         tool_call_id: None,
         timestamp: None,
+        seq: None,
     };
 
     let usage = response.get("usageMetadata").map(|u| {
@@ -864,6 +865,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let tool_result = Message::tool_result("call_abc", "the image shows a cat");
         let msgs = vec![Message::user("look"), assistant_with_call, tool_result];
@@ -901,6 +903,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let tool_result = Message::tool_result_multimodal(
             "call_video",
@@ -995,6 +998,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let cfg = default_cfg();
         let body = build_gemini_request(&make_request(&[assistant], None, &cfg));
@@ -1026,6 +1030,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         };
         let cfg = default_cfg();
         let body = build_gemini_request(&make_request(&[assistant], None, &cfg));

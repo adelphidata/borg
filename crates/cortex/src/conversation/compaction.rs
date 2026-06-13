@@ -26,6 +26,19 @@ pub const COMPACTION_MARKER_CLOSE: &str = "</compaction_summary>";
 pub const COMPACTION_MARKER_HEADING: &str =
     "[Earlier conversation was summarized to fit context limits.]";
 
+/// Render a compaction summary body as the marker message the model reads:
+/// the human-facing heading above the XML-tagged fence that keeps the summary
+/// on the internal trust side. This is the single source of the marker's
+/// shape, shared by the live in-band fold ([`compact_history_v2`]) and the
+/// log-replay projection ([`crate::conversation::project_history`]) so a
+/// resumed session renders a byte-identical summary. The body must already be
+/// sanitized (see [`crate::security::sanitize::sanitize_xml_boundaries`]).
+pub fn render_compaction_marker(body: &str) -> Message {
+    Message::user(format!(
+        "{COMPACTION_MARKER_HEADING}\n\n{COMPACTION_MARKER_OPEN}\n{body}\n{COMPACTION_MARKER_CLOSE}"
+    ))
+}
+
 /// A plan for compacting a message history: which head/tail slices to
 /// preserve and which middle range to summarize.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +142,42 @@ pub fn plan_compaction_v2(
     })
 }
 
+/// Compute the `[from_seq, to_seq]` log range a head-protected compaction will
+/// fold, derived from the working history *before* the compaction mutates it
+/// (the planner is pure). The caller records a
+/// [`crate::conversation::SessionEventKind::CompactionCheckpoint`] over this
+/// range so a fresh worker reconstructs the same compacted view from the log.
+///
+/// `from_seq` is one past the last *persisted* message in the protected head,
+/// so the fold covers the entire middle — including raw rows an earlier
+/// iterative summary already subsumed (their seqs are `>= from_seq`). That is
+/// what lets [`crate::conversation::project_history`] collapse repeated
+/// compactions to a single, current summary. `to_seq` is the last persisted
+/// message in the summarized middle.
+///
+/// Returns `None` when there is nothing to compact, or when the middle holds no
+/// persisted rows (e.g. only unpersisted injected messages) — in which case no
+/// durable checkpoint can be anchored and the in-memory fold stands alone.
+pub fn compaction_checkpoint_range(
+    history: &[Message],
+    max_tokens: usize,
+    protect_first_n: usize,
+) -> Option<(i64, i64)> {
+    let plan = plan_compaction_v2(history, max_tokens, protect_first_n)?;
+    let head_max_seq = history[..plan.head_end].iter().filter_map(|m| m.seq).max();
+    let mut middle_seqs = history[plan.head_end..plan.tail_start]
+        .iter()
+        .filter_map(|m| m.seq);
+    let first_middle = middle_seqs.next()?;
+    // `next_back` walks from the end (the slice iterator is double-ended), so we
+    // get the last persisted middle seq without scanning the whole range.
+    let to_seq = middle_seqs.next_back().unwrap_or(first_middle);
+    // Fold from just past the protected head; with no persisted head, fold from
+    // the first persisted message in the middle.
+    let from_seq = head_max_seq.map_or(first_middle, |h| h + 1);
+    Some((from_seq, to_seq))
+}
+
 /// Compact conversation history using the LLM to summarize dropped messages.
 ///
 /// Strategy:
@@ -204,10 +253,7 @@ pub async fn compact_history_v2(
     // block). Without this, a malicious input could close our tagged fence
     // early and smuggle untrusted content onto the internal side.
     let safe_body = crate::security::sanitize::sanitize_xml_boundaries(&summary_body);
-    let marker_text = format!(
-        "{COMPACTION_MARKER_HEADING}\n\n{COMPACTION_MARKER_OPEN}\n{safe_body}\n{COMPACTION_MARKER_CLOSE}"
-    );
-    let marker = Message::user(marker_text);
+    let marker = render_compaction_marker(&safe_body);
 
     let mut compacted = Vec::with_capacity(plan.head_end + 1 + history.len() - plan.tail_start);
     compacted.extend(history.drain(..plan.head_end));
@@ -281,11 +327,122 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 
     fn make_tool_result(call_id: &str, result: &str) -> Message {
         Message::tool_result(call_id, result)
+    }
+
+    /// A message carrying an explicit durable log seq.
+    fn seq_msg(seq: i64, role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: Some(MessageContent::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+            seq: Some(seq),
+        }
+    }
+
+    // -- compaction_checkpoint_range --
+
+    #[test]
+    fn checkpoint_range_none_when_under_budget() {
+        let history = vec![
+            seq_msg(1, Role::User, "hi"),
+            seq_msg(2, Role::Assistant, "hello"),
+        ];
+        assert!(compaction_checkpoint_range(&history, 100_000, 3).is_none());
+    }
+
+    #[test]
+    fn checkpoint_range_matches_head_protected_plan() {
+        // The durable range must bracket exactly the messages the head-protected
+        // fold summarizes: from one past the last protected-head seq, to the
+        // last middle seq. Ties the range to the planner so it can't drift.
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..30 {
+            history.push(seq_msg(
+                2 * i + 1,
+                Role::User,
+                &format!("message {i} with lots of padding"),
+            ));
+            history.push(seq_msg(
+                2 * i + 2,
+                Role::Assistant,
+                &format!("response {i} with padding"),
+            ));
+        }
+        let plan = plan_compaction_v2(&history, 200, 3).expect("should compact");
+        let (from_seq, to_seq) =
+            compaction_checkpoint_range(&history, 200, 3).expect("should yield a range");
+        assert_eq!(from_seq, history[plan.head_end - 1].seq.unwrap() + 1);
+        assert_eq!(to_seq, history[plan.tail_start - 1].seq.unwrap());
+    }
+
+    #[test]
+    fn checkpoint_range_folds_previously_summarized_rows() {
+        // Iterative case: the working set already carries a summary marker (seq
+        // None) between the protected head and the live tail. The next
+        // checkpoint must start one past the last *real* head message — not the
+        // marker — so the fold re-covers the raw rows the old summary stood in
+        // for (their seqs are >= from_seq). That is what lets project_history
+        // collapse repeated compactions to a single current summary.
+        let mut history = vec![
+            seq_msg(1, Role::User, "original request with padding padding"),
+            seq_msg(2, Role::Assistant, "early framing with padding padding"),
+            // Unpersisted summary marker from an earlier compaction.
+            Message::user("earlier conversation was summarized".to_string()),
+        ];
+        for i in 0..30 {
+            history.push(seq_msg(
+                10 + 2 * i,
+                Role::User,
+                &format!("later message {i} with padding padding"),
+            ));
+            history.push(seq_msg(
+                11 + 2 * i,
+                Role::Assistant,
+                &format!("later response {i} with padding"),
+            ));
+        }
+        let (from_seq, _to_seq) =
+            compaction_checkpoint_range(&history, 200, 3).expect("should yield a range");
+        assert_eq!(
+            from_seq, 3,
+            "fold starts past the last real head message (seq 2), not the seqless marker"
+        );
+    }
+
+    #[test]
+    fn checkpoint_range_none_when_middle_unpersisted() {
+        // If the entire compactible middle is unpersisted (injected) messages,
+        // there is no seq to anchor a durable checkpoint — the in-memory fold
+        // must stand alone.
+        let mut history = vec![
+            seq_msg(1, Role::User, "head a with padding"),
+            seq_msg(2, Role::Assistant, "head b with padding"),
+            seq_msg(3, Role::User, "head c with padding"),
+        ];
+        for i in 0..30 {
+            history.push(Message::user(format!(
+                "injected {i} with padding padding padding"
+            )));
+            history.push(Message::assistant(format!(
+                "injected reply {i} with padding padding"
+            )));
+        }
+        assert!(
+            plan_compaction_v2(&history, 200, 3).is_some(),
+            "test setup: compaction must actually be needed"
+        );
+        assert!(
+            compaction_checkpoint_range(&history, 200, 3).is_none(),
+            "no persisted middle → no durable checkpoint range"
+        );
     }
 
     // -- plan_compaction_v2 + compact_history_v2 --
@@ -338,9 +495,9 @@ mod tests {
     }
 
     fn make_marker_msg(body: &str) -> Message {
-        Message::user(format!(
-            "{COMPACTION_MARKER_HEADING}\n\n{COMPACTION_MARKER_OPEN}\n{body}\n{COMPACTION_MARKER_CLOSE}"
-        ))
+        // Use the production renderer so these round-trip tests stay honest if
+        // the marker framing ever changes.
+        render_compaction_marker(body)
     }
 
     #[test]

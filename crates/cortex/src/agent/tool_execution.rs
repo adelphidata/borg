@@ -70,6 +70,7 @@ impl Agent {
             tool_calls: Some(tc_for_msg),
             tool_call_id: None,
             timestamp: Some(chrono::Local::now().to_rfc3339()),
+            seq: None,
         };
         self.log_and_persist(assistant_msg).await;
 

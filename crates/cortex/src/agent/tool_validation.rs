@@ -424,6 +424,7 @@ mod tests {
             tool_calls: Some(calls),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 

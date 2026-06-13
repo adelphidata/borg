@@ -11,17 +11,25 @@
 //!   weave summarization in with the planner output.
 //! - [`summarize`] — LLM-backed summarization prompts and chunkers.
 //! - [`history`] — `undo_last_turn`, `rewind_to_nth_user`, `normalize_history`.
+//! - [`event`] — the first-class session event log (`SessionEvent`) and the
+//!   projection functions that reconstruct working state from it.
 
 mod compaction;
+mod event;
 mod history;
 mod summarize;
 mod tokens;
 mod truncation;
 
 pub use compaction::{
-    compact_history, compact_history_v2, extract_last_compaction_summary, plan_compaction,
-    plan_compaction_v2, CompactionPlan, COMPACTION_MARKER_CLOSE, COMPACTION_MARKER_HEADING,
-    COMPACTION_MARKER_OPEN,
+    compact_history, compact_history_v2, compaction_checkpoint_range,
+    extract_last_compaction_summary, plan_compaction, plan_compaction_v2, render_compaction_marker,
+    CompactionPlan, COMPACTION_MARKER_CLOSE, COMPACTION_MARKER_HEADING, COMPACTION_MARKER_OPEN,
+};
+pub use event::{
+    compute_session_event_hmac, events_from_rows, project_history, verify_session_chain,
+    SessionEvent, SessionEventHashInput, SessionEventKind, COMPACTION_CHECKPOINT_KIND,
+    SESSION_HMAC_DOMAIN,
 };
 pub use history::{normalize_history, rewind_to_nth_user, undo_last_turn};
 pub use tokens::history_tokens;

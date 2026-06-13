@@ -33,6 +33,10 @@ pub(crate) struct BootRecovery {
     /// Number of due tasks whose `next_run` was auto-advanced because
     /// they were more than [`STALE_TASK_THRESHOLD_SECS`] overdue.
     pub stale_tasks_advanced: usize,
+    /// Number of per-session leases freed because the worker that held them
+    /// died (lease deadline already passed). Lets any worker reclaim the
+    /// session and resume it from the durable log.
+    pub stale_leases_expired: u64,
 }
 
 /// Outcome of one drift-recovery sweep (post-sleep wake-up).
@@ -72,9 +76,29 @@ pub(crate) async fn boot_recovery(db: &Database) -> BootRecovery {
         }
     };
     let stale_tasks_advanced = advance_stale_tasks(db).await;
+    // Cold boot: every on-disk lease belongs to a previous (now-dead) daemon
+    // instance, so reclaim them all — not just the TTL-expired ones — or a
+    // crash-restart within the lease TTL would leave the new process unable to
+    // resume its own sessions.
+    let stale_leases_expired = match db.reclaim_all_session_leases().await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(
+                    count = n,
+                    "freed session leases held by a previous daemon instance"
+                );
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!("reclaim_all_session_leases failed at boot: {e}");
+            0
+        }
+    };
     BootRecovery {
         stale_runs_recovered,
         stale_tasks_advanced,
+        stale_leases_expired,
     }
 }
 

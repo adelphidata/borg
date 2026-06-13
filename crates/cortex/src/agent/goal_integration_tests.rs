@@ -53,7 +53,6 @@ fn agent_with_db(db: Option<Database>) -> Agent {
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
-        previous_summary: None,
         setup_just_consumed: false,
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),

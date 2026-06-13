@@ -339,7 +339,7 @@ impl Admin for AdminSvc {
             let Some(row) = db.session_by_id(&id).await? else {
                 return anyhow::Ok(None);
             };
-            let messages = db.load_session_messages(&row.id).await?;
+            let messages = db.load_session_lineage_rows(&row.id).await?;
             Ok(Some(SessionDetail {
                 id: row.id,
                 title: row.title,

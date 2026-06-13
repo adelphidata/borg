@@ -135,6 +135,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 
@@ -335,6 +336,7 @@ mod tests {
                 ]),
                 tool_call_id: None,
                 timestamp: None,
+                seq: None,
             },
             make_tool_result("c1", "result1"),
             // c2 result is missing

@@ -94,7 +94,7 @@ async fn load_session(db: &Database, session_id: &str) -> Result<Session> {
         .ok_or_else(|| anyhow!("session '{session_id}' not found"))?;
 
     let rows = db
-        .load_session_messages(session_id)
+        .load_session_lineage_rows(session_id)
         .await
         .with_context(|| format!("loading messages for session '{session_id}'"))?;
 
@@ -137,6 +137,7 @@ async fn load_session(db: &Database, session_id: &str) -> Result<Session> {
             tool_calls,
             tool_call_id: mr.tool_call_id,
             timestamp: mr.timestamp,
+            seq: Some(mr.id),
         });
     }
 

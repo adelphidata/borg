@@ -61,7 +61,7 @@ pub async fn gather_daily_context(db: &Database) -> Result<String> {
             .unwrap_or_default();
         out.push_str(&format!("### {title} ({time})\n\n"));
 
-        let messages = match db.load_session_messages(&session.id).await {
+        let messages = match db.load_session_lineage_rows(&session.id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("Failed to load messages for session {}: {e}", session.id);
@@ -213,6 +213,7 @@ mod tests {
                 timestamp: None,
                 created_at: 0,
                 content_parts_json: None,
+                ..Default::default()
             },
             MessageRow {
                 id: 2,
@@ -224,6 +225,7 @@ mod tests {
                 timestamp: None,
                 created_at: 0,
                 content_parts_json: None,
+                ..Default::default()
             },
             MessageRow {
                 id: 3,
@@ -235,6 +237,7 @@ mod tests {
                 timestamp: None,
                 created_at: 0,
                 content_parts_json: None,
+                ..Default::default()
             },
             MessageRow {
                 id: 4,
@@ -246,6 +249,7 @@ mod tests {
                 timestamp: None,
                 created_at: 0,
                 content_parts_json: None,
+                ..Default::default()
             },
         ];
 

@@ -1401,6 +1401,7 @@ fn parse_bedrock_message(message_json: &serde_json::Value) -> Result<Message> {
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         tool_call_id: None,
         timestamp: None,
+        seq: None,
     })
 }
 

@@ -9,10 +9,30 @@ use cortex::agent::{Agent, AgentEvent};
 use cortex::config::Config;
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+
+/// How long a per-session lease stays valid without renewal. Re-claimed at the
+/// start of every turn, so it only matters across a crash: another *live*
+/// worker can take over a dead worker's session this long after its last turn,
+/// and the next daemon boot reclaims every orphaned lease unconditionally
+/// (`reclaim_all_session_leases`). Generous so a long single turn never lets
+/// the lease lapse under a healthy daemon.
+const SESSION_LEASE_TTL_SECS: i64 = 3600;
+
+/// Outcome of taking the per-session lease for a turn.
+enum LeaseStatus {
+    /// This worker owns the session — proceed.
+    Held,
+    /// Another live worker owns the session — refuse the turn.
+    Conflict,
+    /// The lease couldn't be evaluated (DB hiccup). Proceed best-effort so a
+    /// transient error never wedges a healthy single-process daemon.
+    Unavailable,
+}
 
 /// Acquire the agent mutex from a sync trait method that may be invoked
 /// from an async gRPC handler (i.e. from inside the tokio runtime).
@@ -194,6 +214,13 @@ pub struct AgentBackend {
     /// Steer channel sender — held here so `Session.Steer` can push text
     /// into the running turn even though the agent is locked.
     steer_tx: mpsc::UnboundedSender<String>,
+    /// Identifies this daemon instance as the lease holder. Stable for the
+    /// process lifetime, so re-claiming our own session is always re-entrant;
+    /// a restarted daemon has a new id and looks like a (legitimate) takeover.
+    worker_id: String,
+    /// Epoch of the lease this backend currently holds, or `-1` if none. Set on
+    /// every successful claim; used to release precisely on close.
+    lease_epoch: AtomicI64,
 }
 
 impl AgentBackend {
@@ -267,6 +294,8 @@ impl AgentBackend {
         agent.set_steer_channel(steer_rx);
 
         let session_id = agent.session().meta.id.clone();
+        let worker_id = format!("borgd-{}", std::process::id());
+        let mut initial_epoch = -1;
 
         // Materialize the `sessions` row immediately so RPCs that resolve
         // "the latest session" (e.g. Admin.SetGoal with empty session_id)
@@ -285,13 +314,64 @@ impl AgentBackend {
             {
                 tracing::warn!(session_id = %session_id, error = %e, "upsert_session on open failed");
             }
+            // Take ownership of the session up front. A conflict here (another
+            // live worker owns it) is only possible in a multi-worker setup; we
+            // warn but still open locally — the per-turn claim is the real gate.
+            match db
+                .claim_session_lease(&session_id, &worker_id, now, SESSION_LEASE_TTL_SECS)
+                .await
+            {
+                Ok(Some(lease)) => initial_epoch = lease.epoch,
+                Ok(None) => tracing::warn!(
+                    session_id = %session_id,
+                    "session lease held by another worker at open"
+                ),
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, error = %e, "claim_session_lease on open failed")
+                }
+            }
         }
 
         Ok(Arc::new(Self {
             session_id,
             agent: Mutex::new(agent),
             steer_tx,
+            worker_id,
+            lease_epoch: AtomicI64::new(initial_epoch),
         }))
+    }
+
+    /// Take or refresh the per-session lease for the turn about to run. Re-entrant
+    /// for this worker (so a healthy single-process daemon always succeeds);
+    /// only a different live owner yields [`LeaseStatus::Conflict`].
+    async fn acquire_lease(&self) -> LeaseStatus {
+        let db = match cortex::db::Database::open().await {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "lease: db open failed");
+                return LeaseStatus::Unavailable;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        match db
+            .claim_session_lease(
+                &self.session_id,
+                &self.worker_id,
+                now,
+                SESSION_LEASE_TTL_SECS,
+            )
+            .await
+        {
+            Ok(Some(lease)) => {
+                self.lease_epoch.store(lease.epoch, Ordering::Relaxed);
+                LeaseStatus::Held
+            }
+            Ok(None) => LeaseStatus::Conflict,
+            Err(e) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "claim_session_lease failed");
+                LeaseStatus::Unavailable
+            }
+        }
     }
 }
 
@@ -321,6 +401,20 @@ impl SessionBackend for AgentBackend {
                 return;
             }
         };
+
+        // Own the session before advancing it. The log is the source of truth,
+        // so a worker may only act on a session it holds the lease for — if
+        // another live worker owns it, refuse rather than fork the log. A dead
+        // worker's lease expires and any worker can then reconstruct from the
+        // log and continue.
+        if let LeaseStatus::Conflict = self.acquire_lease().await {
+            let msg = "this session is owned by another worker; cannot run the turn here";
+            tracing::warn!(session_id = %self.session_id, "{msg}");
+            if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
+                tracing::warn!(error = %e, "failed to surface session-ownership conflict");
+            }
+            return;
+        }
 
         // Attach the IDE-backed text-file bridge for the duration of the turn
         // and detach unconditionally — including on unwind. The async Mutex
@@ -379,6 +473,21 @@ impl SessionBackend for AgentBackend {
     async fn close_session(&self) -> anyhow::Result<()> {
         let mut agent = self.agent.lock().await;
         agent.end_session().await;
+        drop(agent);
+        // Release our lease so another worker can take the session immediately
+        // (rather than waiting out the TTL). Best-effort: a stale epoch is a
+        // no-op, and on failure the lease simply expires.
+        let epoch = self.lease_epoch.load(Ordering::Relaxed);
+        if epoch >= 0 {
+            if let Ok(db) = cortex::db::Database::open().await {
+                if let Err(e) = db
+                    .release_session_lease(&self.session_id, &self.worker_id, epoch)
+                    .await
+                {
+                    tracing::warn!(session_id = %self.session_id, error = %e, "release_session_lease on close failed");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -452,16 +561,17 @@ impl SessionBackend for AgentBackend {
 
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {
         // Resolve the parent agent session id under the agent lock, then
-        // release it before doing blocking DB work — fork can copy a large
-        // number of message rows and we don't want to block concurrent
-        // reads (e.g. `GetState`) on the agent for the full duration.
+        // release it before doing DB work so concurrent reads (e.g. `GetState`)
+        // aren't blocked on the agent for the duration.
         let parent_id = {
             let agent = self.agent.lock().await;
             agent.session().meta.id.clone()
         };
 
         let db = cortex::db::Database::open().await?;
-        let msgs = db.load_session_messages(&parent_id).await?;
+        // Anchor at the last event in the parent's reconstructable history
+        // (lineage-aware, so forking a fork anchors at the true tip).
+        let msgs = db.load_session_lineage_rows(&parent_id).await?;
         let anchor = msgs
             .last()
             .map(|m| m.id)

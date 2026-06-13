@@ -456,6 +456,7 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
         tool_calls,
         tool_call_id: None,
         timestamp: Some(chrono::Local::now().to_rfc3339()),
+        seq: None,
     })
 }
 
@@ -500,6 +501,7 @@ pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
                 timestamp: msg.timestamp.clone(),
+                seq: msg.seq,
             }
         })
         .collect()

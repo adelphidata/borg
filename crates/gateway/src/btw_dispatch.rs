@@ -93,7 +93,7 @@ pub async fn load_channel_snapshot(channel_name: &str, sender_id: &str) -> Vec<M
         }
     };
 
-    match db.load_session_messages(&session_id).await {
+    match db.load_session_lineage_rows(&session_id).await {
         Ok(rows) => rows.iter().filter_map(message_row_to_message).collect(),
         Err(e) => {
             tracing::warn!("/btw: failed to load session messages: {e:#}");
@@ -119,6 +119,7 @@ fn message_row_to_message(row: &MessageRow) -> Option<Message> {
         tool_calls: None,
         tool_call_id: None,
         timestamp: row.timestamp.clone(),
+        seq: Some(row.id),
     })
 }
 
@@ -401,6 +402,7 @@ mod tests {
             tool_call_id: None,
             timestamp: Some("2026-01-01T00:00:00Z".into()),
             created_at: 0,
+            ..Default::default()
         };
         let m = message_row_to_message(&row).expect("assistant row converts");
         assert!(matches!(m.role, cortex::types::Role::Assistant));
@@ -422,6 +424,7 @@ mod tests {
             tool_call_id: Some("call_1".into()),
             timestamp: None,
             created_at: 0,
+            ..Default::default()
         };
         assert!(message_row_to_message(&row).is_none());
     }
@@ -438,6 +441,7 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             created_at: 0,
+            ..Default::default()
         };
         assert!(message_row_to_message(&row).is_none());
     }

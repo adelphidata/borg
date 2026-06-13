@@ -173,6 +173,7 @@ mod tests {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         }
     }
 

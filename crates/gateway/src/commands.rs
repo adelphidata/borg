@@ -783,7 +783,7 @@ async fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
             _ => return "Usage: /history [count] (1-50, default 10)".to_string(),
         }
     };
-    match db.load_session_messages(session_id).await {
+    match db.load_session_lineage_rows(session_id).await {
         Ok(msgs) if msgs.is_empty() => "No messages in current session.".to_string(),
         Ok(msgs) => {
             let start = msgs.len().saturating_sub(count);

@@ -188,6 +188,70 @@ impl Database {
         Ok(())
     }
 
+    /// Elevate `messages` into the first-class session event log: add the
+    /// `event_kind`/`event_json` payload columns and the `hmac`/`prev_hmac`
+    /// chain columns. Idempotent — fresh installs get the final shape from
+    /// `SCHEMA_SQL` and these ALTERs short-circuit when the column already
+    /// exists. Existing message rows keep working: NULL `event_kind` decodes
+    /// as a conversational message, NULL `hmac` is a legacy-unchained row.
+    /// Add the per-session lease columns (worker-pool / fallible executors).
+    /// Idempotent: guarded by `PRAGMA table_info` so re-running on an
+    /// already-migrated DB is a no-op.
+    pub(super) async fn migrate_v9(&self) -> Result<()> {
+        let mut rows = self.conn.query("PRAGMA table_info(sessions)", ()).await?;
+        let mut existing = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            existing.insert(row.get::<String>(1)?);
+        }
+        for (col, ddl) in [
+            (
+                "lease_owner",
+                "ALTER TABLE sessions ADD COLUMN lease_owner TEXT",
+            ),
+            (
+                "lease_expiry",
+                "ALTER TABLE sessions ADD COLUMN lease_expiry INTEGER",
+            ),
+            (
+                "lease_epoch",
+                "ALTER TABLE sessions ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !existing.contains(col) {
+                self.conn.execute_batch(ddl).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn migrate_v8(&self) -> Result<()> {
+        let mut rows = self.conn.query("PRAGMA table_info(messages)", ()).await?;
+        let mut existing = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            existing.insert(row.get::<String>(1)?);
+        }
+        for (col, ddl) in [
+            (
+                "event_kind",
+                "ALTER TABLE messages ADD COLUMN event_kind TEXT",
+            ),
+            (
+                "event_json",
+                "ALTER TABLE messages ADD COLUMN event_json TEXT",
+            ),
+            ("hmac", "ALTER TABLE messages ADD COLUMN hmac TEXT"),
+            (
+                "prev_hmac",
+                "ALTER TABLE messages ADD COLUMN prev_hmac TEXT",
+            ),
+        ] {
+            if !existing.contains(col) {
+                self.conn.execute_batch(ddl).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn migrate_v4(&self) -> Result<()> {
         // Fresh installs already emit the final shape via `SCHEMA_SQL`
         // (which defines `code_hash`). Only DBs that ran through the v3
@@ -430,7 +494,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_target TEXT,
     handoff_error TEXT,
-    handoff_requested_at INTEGER
+    handoff_requested_at INTEGER,
+    -- Per-session lease (worker-pool / fallible executors). A worker takes the
+    -- lease before advancing a session and releases it after; on crash the
+    -- lease simply expires and any worker can reconstruct from the log and
+    -- continue. `lease_epoch` fences a revived dead worker from writing under a
+    -- lease that has since been reclaimed. NULL owner = free.
+    lease_owner TEXT,
+    lease_expiry INTEGER,
+    lease_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
@@ -444,7 +516,16 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_call_id TEXT,
     timestamp TEXT,
     created_at INTEGER NOT NULL,
-    content_parts_json TEXT
+    content_parts_json TEXT,
+    -- Session event log (the agent IS this log). `event_kind`/`event_json`
+    -- carry fine-grained lifecycle events (tool-call-started, compaction,
+    -- fork markers); conversational rows leave them NULL and decode from
+    -- role/content. `hmac`/`prev_hmac` form a per-session tamper-evident
+    -- chain; NULL on rows written before chaining (legacy-tolerant on replay).
+    event_kind TEXT,
+    event_json TEXT,
+    hmac TEXT,
+    prev_hmac TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
