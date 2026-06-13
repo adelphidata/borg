@@ -122,7 +122,7 @@ use crate::rate_limit::TokenBucket;
 /// reader/writer is unable to safely repair, so we recover the inner guard
 /// rather than propagate the poison and wedge MCP for the process lifetime.
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn buckets() -> &'static Mutex<HashMap<String, TokenBucket>> {
