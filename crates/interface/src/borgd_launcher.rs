@@ -810,14 +810,10 @@ fn uninstall_launchd() -> Result<()> {
     let plist_path = launchd_plist_path()?;
 
     if plist_path.exists() {
-        match std::process::Command::new("launchctl")
+        let status = std::process::Command::new("launchctl")
             .args(["unload", &plist_path.to_string_lossy()])
-            .status()
-        {
-            Ok(s) if !s.success() => tracing::warn!("launchctl unload returned non-zero status"),
-            Err(e) => tracing::warn!("launchctl unload failed: {e}"),
-            _ => {}
-        }
+            .status();
+        warn_on_command_failure(status, "launchctl unload");
         std::fs::remove_file(&plist_path)?;
     } else {
         println!("Borg not installed.");
@@ -961,24 +957,42 @@ fn secrets_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".borg").join("secrets")
 }
 
-/// Provision `~/.borg/secrets/kek.env` with `BORG_KEK_PASSPHRASE=<random>`,
-/// 0600. Idempotent: existing file is left alone so the encrypted blob
-/// keeps decrypting across reinstalls.
-fn provision_kek_env_file(home: &std::path::Path) -> Result<()> {
+/// Log a warning when a best-effort service-control command (launchctl /
+/// systemctl during install/uninstall) exits non-zero or fails to spawn.
+/// `action` labels the command in the message, e.g. "systemctl daemon-reload".
+fn warn_on_command_failure(status: std::io::Result<std::process::ExitStatus>, action: &str) {
+    match status {
+        Ok(s) if !s.success() => tracing::warn!("{action} returned non-zero status"),
+        Err(e) => tracing::warn!("{action} failed: {e}"),
+        _ => {}
+    }
+}
+
+/// Provision `<secrets>/<filename>` with `<env_var>=<random>\n` at 0600,
+/// creating the secrets dir at 0700. Idempotent: an existing file is left
+/// alone so secrets stay stable across reinstalls.
+fn provision_secret_env_file(home: &std::path::Path, filename: &str, env_var: &str) -> Result<()> {
     let secrets = secrets_dir(home);
     std::fs::create_dir_all(&secrets).with_context(|| format!("create {}", secrets.display()))?;
     #[cfg(unix)]
     set_unix_mode(&secrets, 0o700)?;
-    let path = secrets.join("kek.env");
+    let path = secrets.join(filename);
     if path.exists() {
         return Ok(());
     }
     let passphrase = random_passphrase();
-    let body = format!("BORG_KEK_PASSPHRASE={passphrase}\n");
+    let body = format!("{env_var}={passphrase}\n");
     std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     #[cfg(unix)]
     set_unix_mode(&path, 0o600)?;
     Ok(())
+}
+
+/// Provision `~/.borg/secrets/kek.env` with `BORG_KEK_PASSPHRASE=<random>`,
+/// 0600. Idempotent: existing file is left alone so the encrypted blob
+/// keeps decrypting across reinstalls.
+fn provision_kek_env_file(home: &std::path::Path) -> Result<()> {
+    provision_secret_env_file(home, "kek.env", "BORG_KEK_PASSPHRASE")
 }
 
 /// Provision `~/.borg/secrets/keyring.env` with `BORG_KEYRING_PASS=<random>`,
@@ -987,20 +1001,7 @@ fn provision_kek_env_file(home: &std::path::Path) -> Result<()> {
 /// interactive password prompt. Idempotent: regenerating would invalidate
 /// existing keyring contents.
 fn provision_keyring_env_file(home: &std::path::Path) -> Result<()> {
-    let secrets = secrets_dir(home);
-    std::fs::create_dir_all(&secrets).with_context(|| format!("create {}", secrets.display()))?;
-    #[cfg(unix)]
-    set_unix_mode(&secrets, 0o700)?;
-    let path = secrets.join("keyring.env");
-    if path.exists() {
-        return Ok(());
-    }
-    let passphrase = random_passphrase();
-    let body = format!("BORG_KEYRING_PASS={passphrase}\n");
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    set_unix_mode(&path, 0o600)?;
-    Ok(())
+    provision_secret_env_file(home, "keyring.env", "BORG_KEYRING_PASS")
 }
 
 /// True iff this process is running in a headless Linux context where
@@ -1071,23 +1072,11 @@ fn uninstall_systemd() -> Result<()> {
         disable
             .args(scope.ctl_args())
             .args(["disable", "--now", "borg.service"]);
-        match disable.status() {
-            Ok(s) if !s.success() => {
-                tracing::warn!("systemctl disable --now returned non-zero status")
-            }
-            Err(e) => tracing::warn!("systemctl disable --now failed: {e}"),
-            _ => {}
-        }
+        warn_on_command_failure(disable.status(), "systemctl disable --now");
         std::fs::remove_file(&unit_path)?;
         let mut reload = std::process::Command::new("systemctl");
         reload.args(scope.ctl_args()).arg("daemon-reload");
-        match reload.status() {
-            Ok(s) if !s.success() => {
-                tracing::warn!("systemctl daemon-reload returned non-zero status")
-            }
-            Err(e) => tracing::warn!("systemctl daemon-reload failed: {e}"),
-            _ => {}
-        }
+        warn_on_command_failure(reload.status(), "systemctl daemon-reload");
         tore_down_any = true;
     }
     if tore_down_any {
