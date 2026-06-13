@@ -115,15 +115,22 @@ fn builtin_tool_names() -> &'static [&'static str] {
 
 use crate::rate_limit::TokenBucket;
 
+/// Lock a mutex, recovering the guard even if a previous holder panicked.
+///
+/// The MCP global maps (sessions, limits, buckets, disabled set) all tolerate a
+/// poisoned lock: a panic mid-mutation can't leave an invariant a later
+/// reader/writer is unable to safely repair, so we recover the inner guard
+/// rather than propagate the poison and wedge MCP for the process lifetime.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn buckets() -> &'static Mutex<HashMap<String, TokenBucket>> {
     BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn try_consume_rate_token(server: &str, per_minute: u32, burst: u32) -> Option<Duration> {
-    let mut map = match buckets().lock() {
-        Ok(m) => m,
-        Err(p) => p.into_inner(),
-    };
+    let mut map = lock_recover(buckets());
     let bucket = map
         .entry(server.to_string())
         .or_insert_with(|| TokenBucket::new(f64::from(burst)));
@@ -144,10 +151,7 @@ fn record_limits(server: &str, cfg: &McpServerConfig) {
         rate_limit_burst: cfg.rate_limit_burst,
         call_timeout: Duration::from_millis(cfg.call_timeout_ms),
     };
-    let mut map = match limits_map().lock() {
-        Ok(m) => m,
-        Err(p) => p.into_inner(),
-    };
+    let mut map = lock_recover(limits_map());
     map.insert(server.to_string(), limits);
     // Drop any pre-existing bucket so a burst/per-minute change reseeds
     // the bucket on the next call rather than carrying stale capacity.
@@ -169,26 +173,17 @@ fn disabled_set() -> &'static Mutex<Vec<String>> {
 }
 
 fn is_server_disabled(server: &str) -> bool {
-    let guard = match disabled_set().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
+    let guard = lock_recover(disabled_set());
     guard.iter().any(|s| s == server)
 }
 
 fn set_disabled_servers(list: &[String]) {
-    let mut guard = match disabled_set().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
+    let mut guard = lock_recover(disabled_set());
     *guard = list.to_vec();
 }
 
 fn lookup_limits(server: &str) -> Option<ServerLimits> {
-    let map = match limits_map().lock() {
-        Ok(m) => m,
-        Err(p) => p.into_inner(),
-    };
+    let map = lock_recover(limits_map());
     map.get(server).copied()
 }
 
@@ -402,10 +397,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     }
 
     let tx = {
-        let map = match session_map().lock() {
-            Ok(m) => m,
-            Err(p) => p.into_inner(),
-        };
+        let map = lock_recover(session_map());
         match map.get(&tool.server) {
             Some(s) => s.clone(),
             None => {
@@ -717,10 +709,7 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
     };
 
     let current: HashSet<String> = {
-        let map = match session_map().lock() {
-            Ok(m) => m,
-            Err(p) => p.into_inner(),
-        };
+        let map = lock_recover(session_map());
         map.keys().cloned().collect()
     };
 
@@ -904,10 +893,7 @@ async fn start_server(
 
     let (tx, rx) = mpsc::channel::<SessionCmd>(32);
     {
-        let mut map = match session_map().lock() {
-            Ok(m) => m,
-            Err(p) => p.into_inner(),
-        };
+        let mut map = lock_recover(session_map());
         map.insert(server_name.to_string(), tx);
     }
 
@@ -1304,10 +1290,7 @@ pub mod testing {
 
         let (tx, rx) = mpsc::channel::<SessionCmd>(32);
         {
-            let mut map = match session_map().lock() {
-                Ok(m) => m,
-                Err(p) => p.into_inner(),
-            };
+            let mut map = lock_recover(session_map());
             map.insert(server_name.to_string(), tx);
         }
         let registry_clone: McpRegistry = reg.clone();
