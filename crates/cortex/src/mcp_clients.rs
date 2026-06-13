@@ -822,16 +822,11 @@ async fn start_server(
             // class of failure (DNS, TLS, IO, refused). The exact string
             // comes from the underlying McpError Display impl, so the
             // metrics layer can aggregate by the leading word.
-            let transport_label = match &manifest.transport {
-                mcp::manifest::Transport::Stdio { .. } => "stdio",
-                mcp::manifest::Transport::Http { .. } => "streamable-http",
-                mcp::manifest::Transport::Sse { .. } => "sse",
-            };
             tracing::warn!(
                 target: "borg.mcp",
                 event = "transport_error",
                 server = %server_name,
-                transport = transport_label,
+                transport = transport_label(&manifest.transport),
                 kind = "open",
                 error = %e,
                 "mcp transport open failed",
@@ -839,8 +834,32 @@ async fn start_server(
             return Err(e);
         }
     };
-    let mut session = SessionActor::new(&manifest, transport);
+    let session = SessionActor::new(&manifest, transport);
+    handshake_and_register(server_name, server_cfg, &manifest, session, reg, builtin).await
+}
 
+/// Stable metric/audit label for a transport kind.
+fn transport_label(transport: &mcp::manifest::Transport) -> &'static str {
+    match transport {
+        mcp::manifest::Transport::Stdio { .. } => "stdio",
+        mcp::manifest::Transport::Http { .. } => "streamable-http",
+        mcp::manifest::Transport::Sse { .. } => "sse",
+    }
+}
+
+/// Drive a freshly-opened session through handshake → tool discovery →
+/// registration → audit emission, then hand it off to the background session
+/// task. Shared by the production [`start_server`] path and the test-only
+/// `testing::install_session` helper so both exercise identical logic; the only
+/// thing that differs between them is how the transport was obtained.
+async fn handshake_and_register(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    manifest: &ServerManifest,
+    mut session: SessionActor,
+    reg: &McpRegistry,
+    builtin: &[&str],
+) -> Result<()> {
     tokio::time::timeout(manifest.connect_timeout, session.handshake())
         .await
         .map_err(|_| anyhow!("handshake timed out for server '{server_name}'"))?
@@ -867,7 +886,7 @@ async fn start_server(
 
     // Operator-visible "this server is live" signal — paired with
     // `MCP_SERVER_FAILED` for terminal failures and with per-tool
-    // `MCP_TOOL_REGISTERED` rows below in `audit_registrations`.
+    // `MCP_TOOL_REGISTERED` rows above in `audit_registrations`.
     let registered_tools: Vec<&str> = outcomes
         .iter()
         .filter_map(|o| match o {
@@ -880,11 +899,7 @@ async fn start_server(
         server_name,
         &serde_json::json!({
             "server": server_name,
-            "transport": match &manifest.transport {
-                mcp::manifest::Transport::Stdio { .. } => "stdio",
-                mcp::manifest::Transport::Http { .. } => "streamable-http",
-                mcp::manifest::Transport::Sse { .. } => "sse",
-            },
+            "transport": transport_label(&manifest.transport),
             "registered_tools": registered_tools,
             "registered_count": registered_tools.len(),
         }),
@@ -1233,82 +1248,12 @@ pub mod testing {
         );
 
         let manifest = server_cfg.resolve_to_manifest(server_name, cfg)?;
-        let mut session = SessionActor::new(&manifest, transport);
-        tokio::time::timeout(manifest.connect_timeout, session.handshake())
+        let session = SessionActor::new(&manifest, transport);
+        let builtin_refs: Vec<&str> = builtin_tool_names().to_vec();
+        // Same handshake → register → spawn flow as the production
+        // `start_server`; only the transport (caller-supplied here) differs.
+        super::handshake_and_register(server_name, server_cfg, &manifest, session, reg, &builtin_refs)
             .await
-            .map_err(|_| anyhow!("handshake timed out for server '{server_name}'"))?
-            .map_err(|e| anyhow!("handshake failed for server '{server_name}': {e}"))?;
-        let discovered = session
-            .list_tools()
-            .await
-            .map_err(|e| anyhow!("tools/list failed for server '{server_name}': {e}"))?;
-
-        tracing::info!(
-            target: "borg.mcp",
-            event = "tools_listed",
-            server = %server_name,
-            count = discovered.tools.len(),
-            "mcp tools/list completed",
-        );
-
-        let builtin = builtin_tool_names();
-        let builtin_refs: Vec<&str> = builtin.to_vec();
-        let outcomes = reg.replace_server_tools(
-            server_name,
-            &discovered.tools,
-            &manifest.tools,
-            &builtin_refs,
-        );
-        audit_registrations(server_name, &outcomes).await;
-        record_limits(server_name, server_cfg);
-        // Mirror the production `start_server` ordering: registrations →
-        // limits → SERVER_STARTED. Keeping ordering identical means a
-        // future audit emit inside `record_limits` (e.g. limit-snapshot
-        // row) lands in the same position in both code paths.
-        let registered_tools: Vec<&str> = outcomes
-            .iter()
-            .filter_map(|o| match o {
-                ToolRegistrationOutcome::Registered { full_name } => Some(full_name.as_str()),
-                _ => None,
-            })
-            .collect();
-        crate::db::try_emit_global(
-            crate::db::audit_events::MCP_SERVER_STARTED,
-            server_name,
-            &serde_json::json!({
-                "server": server_name,
-                "transport": match &manifest.transport {
-                    mcp::manifest::Transport::Stdio { .. } => "stdio",
-                    mcp::manifest::Transport::Http { .. } => "streamable-http",
-                    mcp::manifest::Transport::Sse { .. } => "sse",
-                },
-                "registered_tools": registered_tools,
-                "registered_count": registered_tools.len(),
-            }),
-        )
-        .await;
-
-        let (tx, rx) = mpsc::channel::<SessionCmd>(32);
-        {
-            let mut map = lock_recover(session_map());
-            map.insert(server_name.to_string(), tx);
-        }
-        let registry_clone: McpRegistry = reg.clone();
-        let filter = manifest.tools.clone();
-        let server_owned = server_name.to_string();
-        let builtin_owned: Vec<String> = builtin.iter().map(ToString::to_string).collect();
-        tokio::spawn(async move {
-            run_session_task(
-                session,
-                server_owned,
-                rx,
-                registry_clone,
-                filter,
-                builtin_owned,
-            )
-            .await;
-        });
-        Ok(())
     }
 
     /// Return the per-server rate-limit and call-timeout currently
