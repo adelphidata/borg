@@ -242,46 +242,60 @@ impl Agent {
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(tool_elapsed, &[]);
 
-            // Sanitize tool name for XML embedding to prevent injection
-            let safe_name = crate::security::sanitize::escape_xml_attr(name);
-
-            let (raw_text, extra_parts) = match tool_output {
-                ToolOutput::Text(t) => (t, None),
-                ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
-            };
-            let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::security::sanitize::sanitize_xml_boundaries(&redacted);
-            let xml = format!(
-                "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
-            );
-            Self::fire_after_tool_hook(
-                &mut self.hook_registry,
-                &self.session.meta.id,
-                self.turn_count,
-                name,
-                &xml,
-            )
-            .await;
-            let _ = event_tx
-                .send(AgentEvent::ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    name: name.clone(),
-                    result: redacted,
-                })
+            self.finalize_tool_output(&tool_call.id, name, tool_output, event_tx)
                 .await;
-            let msg = if let Some(parts) = extra_parts {
-                let mut msg_parts = vec![ContentPart::Text(xml)];
-                msg_parts.extend(
-                    parts
-                        .into_iter()
-                        .filter(|p| !matches!(p, ContentPart::Text(_))),
-                );
-                Message::tool_result_multimodal(&tool_call.id, msg_parts)
-            } else {
-                Message::tool_result(&tool_call.id, &xml)
-            };
-            self.log_and_persist(msg).await;
         }
+    }
+
+    /// Post-process a completed tool call: redact + sanitize the output, wrap
+    /// it in a `<tool_output>` element, fire the after-tool hook, emit the
+    /// `ToolResult` event, and persist the resulting message. Shared verbatim
+    /// by the sequential and parallel execution paths so the two cannot drift.
+    async fn finalize_tool_output(
+        &mut self,
+        tool_call_id: &str,
+        name: &str,
+        tool_output: ToolOutput,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        // Sanitize tool name for XML embedding to prevent injection
+        let safe_name = crate::security::sanitize::escape_xml_attr(name);
+        let (raw_text, extra_parts) = match tool_output {
+            ToolOutput::Text(t) => (t, None),
+            ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
+        };
+        let redacted = self.truncate_and_redact(&raw_text);
+        let sanitized = crate::security::sanitize::sanitize_xml_boundaries(&redacted);
+        let xml = format!(
+            "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
+        );
+        Self::fire_after_tool_hook(
+            &mut self.hook_registry,
+            &self.session.meta.id,
+            self.turn_count,
+            name,
+            &xml,
+        )
+        .await;
+        let _ = event_tx
+            .send(AgentEvent::ToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                name: name.to_string(),
+                result: redacted,
+            })
+            .await;
+        let msg = if let Some(parts) = extra_parts {
+            let mut msg_parts = vec![ContentPart::Text(xml)];
+            msg_parts.extend(
+                parts
+                    .into_iter()
+                    .filter(|p| !matches!(p, ContentPart::Text(_))),
+            );
+            Message::tool_result_multimodal(tool_call_id, msg_parts)
+        } else {
+            Message::tool_result(tool_call_id, &xml)
+        };
+        self.log_and_persist(msg).await;
     }
 
     /// Execute a batch of parallel-safe tool calls concurrently, preserving
@@ -474,43 +488,8 @@ impl Agent {
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(elapsed, &[]);
 
-            let safe_name = crate::security::sanitize::escape_xml_attr(&name);
-            let (raw_text, extra_parts) = match tool_output {
-                ToolOutput::Text(t) => (t, None),
-                ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
-            };
-            let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::security::sanitize::sanitize_xml_boundaries(&redacted);
-            let xml = format!(
-                "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
-            );
-            Self::fire_after_tool_hook(
-                &mut self.hook_registry,
-                &self.session.meta.id,
-                self.turn_count,
-                &name,
-                &xml,
-            )
-            .await;
-            let _ = event_tx
-                .send(AgentEvent::ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    name: name.clone(),
-                    result: redacted,
-                })
+            self.finalize_tool_output(&tool_call.id, &name, tool_output, event_tx)
                 .await;
-            let msg = if let Some(parts) = extra_parts {
-                let mut msg_parts = vec![ContentPart::Text(xml)];
-                msg_parts.extend(
-                    parts
-                        .into_iter()
-                        .filter(|p| !matches!(p, ContentPart::Text(_))),
-                );
-                Message::tool_result_multimodal(&tool_call.id, msg_parts)
-            } else {
-                Message::tool_result(&tool_call.id, &xml)
-            };
-            self.log_and_persist(msg).await;
         }
     }
 
