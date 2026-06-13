@@ -297,16 +297,52 @@ async fn duckduckgo_search(query: &str) -> Result<String> {
     Ok(format_results(query, &results))
 }
 
+/// Resolve a search provider's API key from the configured env var (falling
+/// back to the provider's default). `provider` names the provider in the error.
+fn resolve_search_api_key(config: &WebConfig, default_env: &str, provider: &str) -> Result<String> {
+    let api_key_env = config.search_api_key_env.as_deref().unwrap_or(default_env);
+    std::env::var(api_key_env)
+        .with_context(|| format!("{provider} API key not found. Set {api_key_env}"))
+}
+
+/// Bail with the provider name, status, and response body when a search call
+/// returned a non-success status; otherwise pass the response through.
+async fn ensure_search_ok(resp: reqwest::Response, provider: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_else(|e| {
+        tracing::warn!("Failed to read error response body: {e}");
+        String::new()
+    });
+    anyhow::bail!("{provider} returned HTTP {status}: {body}")
+}
+
+/// Collect up to [`MAX_SEARCH_RESULTS`] results from a provider's JSON result
+/// array, reading title/url/snippet from the provider-specific keys.
+fn collect_search_results(
+    array: Option<&Vec<serde_json::Value>>,
+    title_key: &str,
+    url_key: &str,
+    snippet_key: &str,
+) -> Vec<SearchResult> {
+    array
+        .into_iter()
+        .flatten()
+        .take(MAX_SEARCH_RESULTS)
+        .map(|r| SearchResult {
+            title: r[title_key].as_str().unwrap_or("").to_string(),
+            url: r[url_key].as_str().unwrap_or("").to_string(),
+            snippet: r[snippet_key].as_str().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
 /// Search via Brave Search API (requires API key).
 #[tracing::instrument(skip_all, fields(search.provider = "brave"))]
 async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key_env = config
-        .search_api_key_env
-        .as_deref()
-        .unwrap_or("BRAVE_SEARCH_API_KEY");
-    let api_key = std::env::var(api_key_env)
-        .with_context(|| format!("Brave Search API key not found. Set {api_key_env}"))?;
-
+    let api_key = resolve_search_api_key(config, "BRAVE_SEARCH_API_KEY", "Brave Search")?;
     let client = build_http_client(15)?;
 
     let resp = with_trace_context(
@@ -320,44 +356,16 @@ async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
     .await
     .context("Failed to reach Brave Search API")?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to read error response body: {e}");
-            String::new()
-        });
-        anyhow::bail!("Brave Search returned HTTP {status}: {body}");
-    }
-
+    let resp = ensure_search_ok(resp, "Brave Search").await?;
     let body: serde_json::Value = resp.json().await?;
-    let mut results = Vec::new();
-
-    if let Some(web_results) = body["web"]["results"].as_array() {
-        for (i, r) in web_results.iter().enumerate() {
-            if i >= MAX_SEARCH_RESULTS {
-                break;
-            }
-            results.push(SearchResult {
-                title: r["title"].as_str().unwrap_or("").to_string(),
-                url: r["url"].as_str().unwrap_or("").to_string(),
-                snippet: r["description"].as_str().unwrap_or("").to_string(),
-            });
-        }
-    }
-
+    let results = collect_search_results(body["web"]["results"].as_array(), "title", "url", "description");
     Ok(format_results(query, &results))
 }
 
 /// Search via Tavily API (AI-optimized search, requires TAVILY_API_KEY).
 #[tracing::instrument(skip_all, fields(search.provider = "tavily"))]
 async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key_env = config
-        .search_api_key_env
-        .as_deref()
-        .unwrap_or("TAVILY_API_KEY");
-    let api_key = std::env::var(api_key_env)
-        .with_context(|| format!("Tavily API key not found. Set {api_key_env}"))?;
-
+    let api_key = resolve_search_api_key(config, "TAVILY_API_KEY", "Tavily")?;
     let client = build_http_client(15)?;
 
     let body = serde_json::json!({
@@ -377,44 +385,16 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
     .await
     .context("Failed to reach Tavily API")?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to read error response body: {e}");
-            String::new()
-        });
-        anyhow::bail!("Tavily returned HTTP {status}: {body}");
-    }
-
+    let resp = ensure_search_ok(resp, "Tavily").await?;
     let resp_body: serde_json::Value = resp.json().await?;
-    let mut results = Vec::new();
-
-    if let Some(tavily_results) = resp_body["results"].as_array() {
-        for (i, r) in tavily_results.iter().enumerate() {
-            if i >= MAX_SEARCH_RESULTS {
-                break;
-            }
-            results.push(SearchResult {
-                title: r["title"].as_str().unwrap_or("").to_string(),
-                url: r["url"].as_str().unwrap_or("").to_string(),
-                snippet: r["content"].as_str().unwrap_or("").to_string(),
-            });
-        }
-    }
-
+    let results = collect_search_results(resp_body["results"].as_array(), "title", "url", "content");
     Ok(format_results(query, &results))
 }
 
 /// Search via Serper API (Google results, requires SERPER_API_KEY).
 #[tracing::instrument(skip_all, fields(search.provider = "serper"))]
 async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key_env = config
-        .search_api_key_env
-        .as_deref()
-        .unwrap_or("SERPER_API_KEY");
-    let api_key = std::env::var(api_key_env)
-        .with_context(|| format!("Serper API key not found. Set {api_key_env}"))?;
-
+    let api_key = resolve_search_api_key(config, "SERPER_API_KEY", "Serper")?;
     let client = build_http_client(15)?;
 
     let body = serde_json::json!({
@@ -433,31 +413,9 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
     .await
     .context("Failed to reach Serper API")?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to read error response body: {e}");
-            String::new()
-        });
-        anyhow::bail!("Serper returned HTTP {status}: {body}");
-    }
-
+    let resp = ensure_search_ok(resp, "Serper").await?;
     let resp_body: serde_json::Value = resp.json().await?;
-    let mut results = Vec::new();
-
-    if let Some(organic) = resp_body["organic"].as_array() {
-        for (i, r) in organic.iter().enumerate() {
-            if i >= MAX_SEARCH_RESULTS {
-                break;
-            }
-            results.push(SearchResult {
-                title: r["title"].as_str().unwrap_or("").to_string(),
-                url: r["link"].as_str().unwrap_or("").to_string(),
-                snippet: r["snippet"].as_str().unwrap_or("").to_string(),
-            });
-        }
-    }
-
+    let results = collect_search_results(resp_body["organic"].as_array(), "title", "link", "snippet");
     Ok(format_results(query, &results))
 }
 
@@ -556,6 +514,37 @@ mod tests {
         let results: Vec<SearchResult> = vec![];
         let output = format_results("test", &results);
         assert_eq!(output, "No search results found for: test");
+    }
+
+    #[test]
+    fn collect_search_results_maps_keys_and_caps() {
+        // More items than the cap, with provider-specific key names and one
+        // entry missing the snippet key (should fall back to empty string).
+        let raw = serde_json::Value::Array(
+            (0..MAX_SEARCH_RESULTS + 3)
+                .map(|i| {
+                    let mut obj = serde_json::json!({"t": format!("title{i}"), "u": format!("https://{i}")});
+                    if i != 1 {
+                        obj["s"] = serde_json::json!(format!("snippet{i}"));
+                    }
+                    obj
+                })
+                .collect(),
+        );
+        let results = collect_search_results(raw.as_array(), "t", "u", "s");
+        assert_eq!(results.len(), MAX_SEARCH_RESULTS, "truncated to cap");
+        assert_eq!(results[0].title, "title0");
+        assert_eq!(results[0].url, "https://0");
+        assert_eq!(results[0].snippet, "snippet0");
+        // Missing snippet key resolves to empty, not a panic.
+        assert_eq!(results[1].snippet, "");
+    }
+
+    #[test]
+    fn collect_search_results_none_is_empty() {
+        let absent = serde_json::Value::Null;
+        let results = collect_search_results(absent.as_array(), "title", "url", "snippet");
+        assert!(results.is_empty());
     }
 
     #[test]
