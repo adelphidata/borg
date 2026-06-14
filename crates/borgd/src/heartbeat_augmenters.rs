@@ -65,6 +65,23 @@ use std::pin::Pin;
 /// Boxed future returned by an async augmenter check.
 pub type AugmenterCheckFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
+/// Stamp out the boxing shim the [`Augmenter::check`] field requires.
+///
+/// `check` is a plain `fn` pointer (a `const` array can't hold an `async fn` —
+/// each has a unique anonymous future type), so every augmenter needs a thin
+/// adapter that `Box::pin`s its `async fn` body. This macro generates that
+/// adapter so the same five lines aren't hand-copied per augmenter.
+macro_rules! boxed_check {
+    ($vis:vis $wrapper:ident => $inner:ident) => {
+        $vis fn $wrapper<'a>(
+            config: &'a Config,
+            db: Option<&'a Database>,
+        ) -> AugmenterCheckFuture<'a> {
+            Box::pin($inner(config, db))
+        }
+    };
+}
+
 /// A single proactive nudge check.
 ///
 /// See the module-level docs for how to add one.
@@ -185,9 +202,7 @@ async fn check_no_channels_inner(config: &Config, _db: Option<&Database>) -> Opt
     // native coverage is sufficient — those are the recommended defaults.
     Some(NO_CHANNELS_NUDGE.to_string())
 }
-fn check_no_channels<'a>(config: &'a Config, db: Option<&'a Database>) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_no_channels_inner(config, db))
-}
+boxed_check!(check_no_channels => check_no_channels_inner);
 
 const NO_CHANNELS_NUDGE: &str = "\
 No messaging channels are configured yet, so the user can only reach you \
@@ -228,12 +243,7 @@ async fn check_critical_host_security_inner(
 
     build_security_nudge(&checks)
 }
-fn check_critical_host_security<'a>(
-    config: &'a Config,
-    db: Option<&'a Database>,
-) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_critical_host_security_inner(config, db))
-}
+boxed_check!(check_critical_host_security => check_critical_host_security_inner);
 
 /// Build an LLM directive from diagnostic checks. Returns `None` when
 /// all checks pass. Extracted so it can be tested with synthetic data.
@@ -288,9 +298,7 @@ async fn check_task_health_inner(_config: &Config, db: Option<&Database>) -> Opt
     let db = db?;
     build_task_health_nudge(db, unix_now() as i64).await
 }
-fn check_task_health<'a>(config: &'a Config, db: Option<&'a Database>) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_task_health_inner(config, db))
-}
+boxed_check!(check_task_health => check_task_health_inner);
 
 const TASK_HEALTH_WINDOW_SECS: i64 = 24 * 60 * 60;
 const TASK_HEALTH_MAX_LISTED: usize = 5;
@@ -448,12 +456,7 @@ async fn check_budget_threshold_inner(config: &Config, db: Option<&Database>) ->
     }
     Some(build_budget_nudge(bucket, total, limit))
 }
-fn check_budget_threshold<'a>(
-    config: &'a Config,
-    db: Option<&'a Database>,
-) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_budget_threshold_inner(config, db))
-}
+boxed_check!(check_budget_threshold => check_budget_threshold_inner);
 
 fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
     format!(
@@ -484,12 +487,7 @@ async fn check_identity_unpersonalized_inner(
     }
     Some(IDENTITY_NUDGE.to_string())
 }
-fn check_identity_unpersonalized<'a>(
-    config: &'a Config,
-    db: Option<&'a Database>,
-) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_identity_unpersonalized_inner(config, db))
-}
+boxed_check!(check_identity_unpersonalized => check_identity_unpersonalized_inner);
 
 const IDENTITY_NUDGE: &str = "\
 Your IDENTITY.md is still the unfilled scaffold (~/.borg/IDENTITY.md), \
@@ -545,12 +543,7 @@ pub(crate) async fn check_gateway_unrecoverable_inner(
     }
     Some(GATEWAY_NUDGE.to_string())
 }
-pub(crate) fn check_gateway_unrecoverable<'a>(
-    config: &'a Config,
-    db: Option<&'a Database>,
-) -> AugmenterCheckFuture<'a> {
-    Box::pin(check_gateway_unrecoverable_inner(config, db))
-}
+boxed_check!(pub(crate) check_gateway_unrecoverable => check_gateway_unrecoverable_inner);
 
 pub(crate) const GATEWAY_UNRECOVERABLE_KEY: &str = "gateway_unrecoverable";
 pub(crate) const GATEWAY_UNRECOVERABLE_AT_KEY: &str = "gateway_unrecoverable_at";
