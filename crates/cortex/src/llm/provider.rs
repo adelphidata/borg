@@ -50,81 +50,211 @@ pub enum Provider {
     VertexAi,
 }
 
+/// Static, data-only facts about a provider.
+///
+/// Every provider's pure-data dimensions live in exactly one place: the
+/// `Provider::meta` match. The `auth_kind` / `base_url` / `default_env_var` /
+/// `as_str` / `normalize_model` / `from_str` accessors all read from here, so
+/// adding a provider means filling in one struct literal instead of editing six
+/// parallel match statements (which the compiler can't keep in sync). Genuinely
+/// behavioral methods (`build_headers`, `supports_vision`, …) stay as their own
+/// matches because they encode logic, not data.
+pub(crate) struct ProviderMeta {
+    /// Canonical config string (the `as_str` value).
+    name: &'static str,
+    /// Extra accepted spellings for `from_str`, beyond `name`. All lowercase.
+    aliases: &'static [&'static str],
+    /// Static API base URL, or `""` when composed at request time.
+    base_url: &'static str,
+    /// Default env var seeding this provider's key/host, or `""` when none.
+    env_var: &'static str,
+    /// How requests are authenticated.
+    auth_kind: ProviderAuthKind,
+    /// Vendor prefixes stripped from model ids, tried in order. Empty = passthrough.
+    model_prefixes: &'static [&'static str],
+}
+
 impl Provider {
+    /// Every provider variant, in declaration order. Single source for
+    /// iteration (`from_str`, round-trip tests, onboarding menus).
+    pub const ALL: &'static [Provider] = &[
+        Provider::OpenRouter,
+        Provider::OpenAi,
+        Provider::Anthropic,
+        Provider::Bedrock,
+        Provider::Gemini,
+        Provider::DeepSeek,
+        Provider::Groq,
+        Provider::XAi,
+        Provider::Ollama,
+        Provider::ClaudeCli,
+        Provider::ClaudeCodeOAuth,
+        Provider::CodexOAuth,
+        Provider::CopilotOAuth,
+        Provider::Custom,
+        Provider::AzureOpenAi,
+        Provider::VertexAi,
+    ];
+
+    /// The single data table. One arm per provider; everything data-shaped is here.
+    fn meta(&self) -> &'static ProviderMeta {
+        match self {
+            Provider::OpenRouter => &ProviderMeta {
+                name: "openrouter",
+                aliases: &[],
+                base_url: "https://openrouter.ai/api/v1/chat/completions",
+                env_var: "OPENROUTER_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &[], // keeps the full vendor/model path
+            },
+            Provider::OpenAi => &ProviderMeta {
+                name: "openai",
+                aliases: &[],
+                base_url: "https://api.openai.com/v1/chat/completions",
+                env_var: "OPENAI_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["openai/"],
+            },
+            Provider::Anthropic => &ProviderMeta {
+                name: "anthropic",
+                aliases: &[],
+                base_url: "https://api.anthropic.com/v1/messages",
+                env_var: "ANTHROPIC_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["anthropic/"],
+            },
+            Provider::Bedrock => &ProviderMeta {
+                name: "bedrock",
+                aliases: &[],
+                base_url: "",
+                env_var: "",
+                auth_kind: ProviderAuthKind::AwsCredentialChain,
+                model_prefixes: &[],
+            },
+            Provider::Gemini => &ProviderMeta {
+                name: "gemini",
+                aliases: &[],
+                base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                env_var: "GEMINI_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["google/"],
+            },
+            Provider::DeepSeek => &ProviderMeta {
+                name: "deepseek",
+                aliases: &[],
+                base_url: "https://api.deepseek.com/v1/chat/completions",
+                env_var: "DEEPSEEK_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["deepseek/"],
+            },
+            Provider::Groq => &ProviderMeta {
+                name: "groq",
+                aliases: &[],
+                base_url: "https://api.groq.com/openai/v1/chat/completions",
+                env_var: "GROQ_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["groq/"],
+            },
+            // xAI publishes Grok slugs without a vendor prefix. Tolerate every
+            // common docs spelling so a slug/config copy-pasted from any source
+            // resolves to the same endpoint.
+            Provider::XAi => &ProviderMeta {
+                name: "xai",
+                aliases: &["x-ai", "x_ai", "x.ai", "grok"],
+                base_url: "https://api.x.ai/v1/chat/completions",
+                env_var: "XAI_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["xai/", "x-ai/", "x.ai/", "grok/"],
+            },
+            Provider::Ollama => &ProviderMeta {
+                name: "ollama",
+                aliases: &[],
+                base_url: "http://localhost:11434/v1/chat/completions",
+                env_var: "OLLAMA_HOST",
+                auth_kind: ProviderAuthKind::None,
+                model_prefixes: &[],
+            },
+            Provider::ClaudeCli => &ProviderMeta {
+                name: "claude-cli",
+                aliases: &["claudecli", "claude_cli"],
+                base_url: "", // Not used — communicates via subprocess
+                env_var: "CLAUDE_CLI_PATH", // Optional override for claude binary path
+                auth_kind: ProviderAuthKind::None,
+                model_prefixes: &["claude-cli/"],
+            },
+            // OAuth flavors hit the same wire endpoints as their API-key
+            // counterparts; only the auth header changes. Their credentials seed
+            // via on-disk discoverers, not env vars (empty `env_var`).
+            Provider::ClaudeCodeOAuth => &ProviderMeta {
+                name: "claude-code-oauth",
+                aliases: &["claude_code_oauth", "claudecodeoauth"],
+                base_url: "https://api.anthropic.com/v1/messages",
+                env_var: "",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["anthropic/"],
+            },
+            Provider::CodexOAuth => &ProviderMeta {
+                name: "codex-oauth",
+                aliases: &["codex_oauth", "codexoauth"],
+                base_url: "https://api.openai.com/v1/chat/completions",
+                env_var: "",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["openai/"],
+            },
+            Provider::CopilotOAuth => &ProviderMeta {
+                name: "copilot-oauth",
+                aliases: &["copilot_oauth", "copilotoauth"],
+                base_url: "https://api.githubcopilot.com/chat/completions",
+                env_var: "",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &["copilot/"],
+            },
+            // Custom resolves base_url from the lease at request time.
+            Provider::Custom => &ProviderMeta {
+                name: "custom",
+                aliases: &[],
+                base_url: "",
+                env_var: "",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &[],
+            },
+            // Azure composes its URL from llm.azure_* settings; see
+            // `LlmClient::effective_base_url`. Empty base_url means a caller that
+            // forgets to compose fails loudly on URL parse instead of silently
+            // hitting a wrong host. Deployment names are operator-chosen, so no
+            // prefix is stripped.
+            Provider::AzureOpenAi => &ProviderMeta {
+                name: "azure-openai",
+                aliases: &["azure_openai", "azureopenai"],
+                base_url: "",
+                env_var: "AZURE_OPENAI_API_KEY",
+                auth_kind: ProviderAuthKind::ApiKeyLike,
+                model_prefixes: &[],
+            },
+            Provider::VertexAi => &ProviderMeta {
+                name: "vertex-ai",
+                aliases: &["vertex_ai", "vertexai", "vertex"],
+                base_url: "",
+                env_var: "",
+                auth_kind: ProviderAuthKind::CloudOAuth,
+                model_prefixes: &["google/", "anthropic/"],
+            },
+        }
+    }
+
     /// How this provider obtains request credentials.
     pub fn auth_kind(&self) -> ProviderAuthKind {
-        match self {
-            Provider::Ollama | Provider::ClaudeCli => ProviderAuthKind::None,
-            Provider::Bedrock => ProviderAuthKind::AwsCredentialChain,
-            Provider::VertexAi => ProviderAuthKind::CloudOAuth,
-            Provider::OpenRouter
-            | Provider::OpenAi
-            | Provider::Anthropic
-            | Provider::Gemini
-            | Provider::DeepSeek
-            | Provider::Groq
-            | Provider::XAi
-            | Provider::ClaudeCodeOAuth
-            | Provider::CodexOAuth
-            | Provider::CopilotOAuth
-            | Provider::Custom
-            | Provider::AzureOpenAi => ProviderAuthKind::ApiKeyLike,
-        }
+        self.meta().auth_kind
     }
 
     /// API base URL for this provider.
     pub fn base_url(&self) -> &'static str {
-        match self {
-            Provider::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
-            Provider::OpenAi => "https://api.openai.com/v1/chat/completions",
-            Provider::Anthropic => "https://api.anthropic.com/v1/messages",
-            Provider::Bedrock => "",
-            Provider::Gemini => {
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-            }
-            Provider::DeepSeek => "https://api.deepseek.com/v1/chat/completions",
-            Provider::Groq => "https://api.groq.com/openai/v1/chat/completions",
-            Provider::XAi => "https://api.x.ai/v1/chat/completions",
-            Provider::Ollama => "http://localhost:11434/v1/chat/completions",
-            Provider::ClaudeCli => "", // Not used — communicates via subprocess
-            // OAuth flavors hit the same wire endpoints as their API-key
-            // counterparts; only the auth header changes.
-            Provider::ClaudeCodeOAuth => "https://api.anthropic.com/v1/messages",
-            Provider::CodexOAuth => "https://api.openai.com/v1/chat/completions",
-            Provider::CopilotOAuth => "https://api.githubcopilot.com/chat/completions",
-            // Custom resolves base_url from the lease at request time.
-            Provider::Custom => "",
-            // Azure composes its URL from llm.azure_* settings; see
-            // `LlmClient::effective_base_url`. Empty here means a caller that
-            // forgets to compose will fail loudly on URL parse instead of
-            // silently using a wrong host.
-            Provider::AzureOpenAi => "",
-            Provider::VertexAi => "",
-        }
+        self.meta().base_url
     }
 
     /// Default environment variable name for this provider's API key (or host).
     pub fn default_env_var(&self) -> &'static str {
-        match self {
-            Provider::OpenRouter => "OPENROUTER_API_KEY",
-            Provider::OpenAi => "OPENAI_API_KEY",
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::Bedrock => "",
-            Provider::Gemini => "GEMINI_API_KEY",
-            Provider::DeepSeek => "DEEPSEEK_API_KEY",
-            Provider::Groq => "GROQ_API_KEY",
-            Provider::XAi => "XAI_API_KEY",
-            Provider::Ollama => "OLLAMA_HOST",
-            Provider::ClaudeCli => "CLAUDE_CLI_PATH", // Optional override for claude binary path
-            // OAuth + Custom credentials seed via on-disk discoverers, not
-            // env vars. Empty here disables the env-seed code path.
-            Provider::ClaudeCodeOAuth
-            | Provider::CodexOAuth
-            | Provider::CopilotOAuth
-            | Provider::Custom => "",
-            Provider::AzureOpenAi => "AZURE_OPENAI_API_KEY",
-            Provider::VertexAi => "",
-        }
+        self.meta().env_var
     }
 
     /// Whether this provider requires an API key.
@@ -272,53 +402,16 @@ impl Provider {
     }
 
     /// Strip vendor prefixes for direct providers (e.g., "anthropic/claude-sonnet-4" → "claude-sonnet-4").
+    ///
+    /// Tries each of the provider's `model_prefixes` in order and strips the
+    /// first match; otherwise the model id passes through unchanged.
     pub fn normalize_model(&self, model: &str) -> String {
-        match self {
-            Provider::OpenRouter => model.to_string(),
-            Provider::OpenAi => model.strip_prefix("openai/").unwrap_or(model).to_string(),
-            Provider::Anthropic => model
-                .strip_prefix("anthropic/")
-                .unwrap_or(model)
-                .to_string(),
-            Provider::Bedrock => model.to_string(),
-            Provider::Gemini => model.strip_prefix("google/").unwrap_or(model).to_string(),
-            Provider::DeepSeek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
-            Provider::Groq => model.strip_prefix("groq/").unwrap_or(model).to_string(),
-            // xAI publishes Grok slugs without a vendor prefix. Tolerate every
-            // common docs spelling (`xai/`, `x-ai/` OpenRouter-style, `x.ai/`
-            // the dotted form, and bare `grok/`) so a slug copy-pasted from
-            // any of those sources hits the same endpoint.
-            Provider::XAi => model
-                .strip_prefix("xai/")
-                .or_else(|| model.strip_prefix("x-ai/"))
-                .or_else(|| model.strip_prefix("x.ai/"))
-                .or_else(|| model.strip_prefix("grok/"))
-                .unwrap_or(model)
-                .to_string(),
-            Provider::Ollama => model.to_string(),
-            Provider::ClaudeCli => model
-                .strip_prefix("claude-cli/")
-                .unwrap_or(model)
-                .to_string(),
-            // OAuth flavors normalize like their API-key counterparts.
-            Provider::ClaudeCodeOAuth => model
-                .strip_prefix("anthropic/")
-                .unwrap_or(model)
-                .to_string(),
-            Provider::CodexOAuth => model.strip_prefix("openai/").unwrap_or(model).to_string(),
-            Provider::CopilotOAuth => model.strip_prefix("copilot/").unwrap_or(model).to_string(),
-            Provider::Custom => model.to_string(),
-            // Azure routes by deployment name in the URL, not by model id in
-            // the body — but the body's `model` field is required and should
-            // be passthrough so the operator can put the deployment name (or
-            // a label) there. No vendor prefix to strip.
-            Provider::AzureOpenAi => model.to_string(),
-            Provider::VertexAi => model
-                .strip_prefix("google/")
-                .or_else(|| model.strip_prefix("anthropic/"))
-                .unwrap_or(model)
-                .to_string(),
+        for prefix in self.meta().model_prefixes {
+            if let Some(stripped) = model.strip_prefix(prefix) {
+                return stripped.to_string();
+            }
         }
+        model.to_string()
     }
 
     /// Whether a model supports tool/function calling.
@@ -424,24 +517,7 @@ impl Provider {
 
     /// String identifier for config serialization.
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Provider::OpenRouter => "openrouter",
-            Provider::OpenAi => "openai",
-            Provider::Anthropic => "anthropic",
-            Provider::Bedrock => "bedrock",
-            Provider::Gemini => "gemini",
-            Provider::DeepSeek => "deepseek",
-            Provider::Groq => "groq",
-            Provider::XAi => "xai",
-            Provider::Ollama => "ollama",
-            Provider::ClaudeCli => "claude-cli",
-            Provider::ClaudeCodeOAuth => "claude-code-oauth",
-            Provider::CodexOAuth => "codex-oauth",
-            Provider::CopilotOAuth => "copilot-oauth",
-            Provider::Custom => "custom",
-            Provider::AzureOpenAi => "azure-openai",
-            Provider::VertexAi => "vertex-ai",
-        }
+        self.meta().name
     }
 
     /// Infer the provider from an API key's distinctive prefix.
@@ -494,31 +570,22 @@ impl FromStr for Provider {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "openrouter" => Ok(Provider::OpenRouter),
-            "openai" => Ok(Provider::OpenAi),
-            "anthropic" => Ok(Provider::Anthropic),
-            "bedrock" => Ok(Provider::Bedrock),
-            "gemini" => Ok(Provider::Gemini),
-            "deepseek" => Ok(Provider::DeepSeek),
-            "groq" => Ok(Provider::Groq),
-            // `grok` and `x.ai` are common user-typed spellings — accept them
-            // alongside the canonical `xai` so configs from any docs page parse.
-            "xai" | "x-ai" | "x_ai" | "x.ai" | "grok" => Ok(Provider::XAi),
-            "ollama" => Ok(Provider::Ollama),
-            "claude-cli" | "claudecli" | "claude_cli" => Ok(Provider::ClaudeCli),
-            "claude-code-oauth" | "claude_code_oauth" | "claudecodeoauth" => {
-                Ok(Provider::ClaudeCodeOAuth)
-            }
-            "codex-oauth" | "codex_oauth" | "codexoauth" => Ok(Provider::CodexOAuth),
-            "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
-            "custom" => Ok(Provider::Custom),
-            "azure-openai" | "azure_openai" | "azureopenai" => Ok(Provider::AzureOpenAi),
-            "vertex-ai" | "vertex_ai" | "vertexai" | "vertex" => Ok(Provider::VertexAi),
-            _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom, azure-openai, vertex-ai")
+        let lower = s.to_lowercase();
+        // Canonical name or any documented alias resolves to the provider.
+        // Both live in the `meta()` table, so adding a spelling is a one-line
+        // edit there rather than a new match arm here.
+        for provider in Provider::ALL {
+            let meta = provider.meta();
+            if lower == meta.name || meta.aliases.contains(&lower.as_str()) {
+                return Ok(*provider);
             }
         }
+        let valid = Provider::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("Unknown provider: {s}. Valid options: {valid}")
     }
 }
 
@@ -536,28 +603,45 @@ mod tests {
 
     #[test]
     fn from_str_round_trip() {
-        let all = [
-            Provider::OpenRouter,
-            Provider::OpenAi,
-            Provider::Anthropic,
-            Provider::Bedrock,
-            Provider::Gemini,
-            Provider::DeepSeek,
-            Provider::Groq,
-            Provider::XAi,
-            Provider::Ollama,
-            Provider::ClaudeCli,
-            Provider::ClaudeCodeOAuth,
-            Provider::CodexOAuth,
-            Provider::CopilotOAuth,
-            Provider::Custom,
-            Provider::AzureOpenAi,
-            Provider::VertexAi,
-        ];
-        for provider in &all {
+        for provider in Provider::ALL {
             let s = provider.as_str();
             let parsed = Provider::from_str(s).unwrap();
             assert_eq!(parsed, *provider);
+        }
+    }
+
+    #[test]
+    fn all_table_is_complete_and_unique() {
+        // `ALL` drives `from_str` and every iteration site. A variant added to
+        // the enum + `meta()` but forgotten in `ALL` would be silently
+        // unparseable, so pin the count and the no-duplicate-name invariant.
+        assert_eq!(Provider::ALL.len(), 16);
+        let mut names: Vec<&str> = Provider::ALL.iter().map(|p| p.as_str()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "duplicate provider name in ALL/meta()");
+    }
+
+    #[test]
+    fn aliases_are_lowercase_and_distinct_from_name() {
+        // `from_str` lowercases its input before matching, so an uppercase
+        // alias would be dead. An alias equal to the canonical name is
+        // redundant noise. Guard both so the meta() table stays honest.
+        for provider in Provider::ALL {
+            let meta = provider.meta();
+            for alias in meta.aliases {
+                assert_eq!(
+                    *alias,
+                    alias.to_lowercase(),
+                    "alias {alias:?} for {} must be lowercase",
+                    meta.name
+                );
+                assert_ne!(
+                    *alias, meta.name,
+                    "alias {alias:?} duplicates canonical name"
+                );
+            }
         }
     }
 
