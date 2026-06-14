@@ -1562,6 +1562,19 @@ impl LlmClient {
         }
     }
 
+    /// True when the transport composes the full request URL itself (via
+    /// [`Transport::endpoint`]) rather than using [`Self::effective_base_url`].
+    ///
+    /// These are exactly the SigV4-signed Bedrock path and the Vertex-Anthropic
+    /// publisher path; deriving it from [`Self::wire_path`] keeps the rule in
+    /// lockstep with transport routing.
+    fn transport_composes_url(&self) -> bool {
+        matches!(
+            self.wire_path(),
+            WirePath::Bedrock | WirePath::VertexAnthropic
+        )
+    }
+
     /// Non-streaming call for heartbeat and simple requests
     #[instrument(skip_all, fields(llm.provider = %self.provider, llm.model = %self.llm_config.model))]
     /// Non-streaming chat completion, returning assembled tool calls.
@@ -1782,10 +1795,7 @@ impl LlmClient {
     ) -> std::result::Result<(), LlmError> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
-        let request_url = if self.provider == Provider::Bedrock
-            || (self.provider == Provider::VertexAi
-                && vertex::is_anthropic_model(&self.llm_config.model))
-        {
+        let request_url = if self.transport_composes_url() {
             transport
                 .endpoint(&request, true)
                 .map_err(|e| LlmError::Fatal {
@@ -1940,10 +1950,7 @@ impl LlmClient {
     ) -> Result<Message> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
-        let request_url = if self.provider == Provider::Bedrock
-            || (self.provider == Provider::VertexAi
-                && vertex::is_anthropic_model(&self.llm_config.model))
-        {
+        let request_url = if self.transport_composes_url() {
             transport.endpoint(&request, false)?
         } else {
             self.effective_base_url().into_owned()
