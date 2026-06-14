@@ -97,7 +97,7 @@ impl Provider {
     ];
 
     /// The single data table. One arm per provider; everything data-shaped is here.
-    fn meta(&self) -> &'static ProviderMeta {
+    fn meta(self) -> &'static ProviderMeta {
         match self {
             Provider::OpenRouter => &ProviderMeta {
                 name: "openrouter",
@@ -582,7 +582,7 @@ impl FromStr for Provider {
         }
         let valid = Provider::ALL
             .iter()
-            .map(|p| p.as_str())
+            .map(Provider::as_str)
             .collect::<Vec<_>>()
             .join(", ");
         bail!("Unknown provider: {s}. Valid options: {valid}")
