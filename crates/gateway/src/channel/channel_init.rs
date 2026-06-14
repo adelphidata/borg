@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use cortex::config::Config;
-use cortex::db::Database;
 use tracing::{info, warn};
 
 use crate::discord::api::DiscordClient;
@@ -47,9 +46,7 @@ pub(crate) fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -
 }
 
 async fn log_gateway_activity(message: &str) {
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-        cortex::activity_log::log_activity(&adb, "info", "gateway", message).await;
-    }
+    crate::activity::log_gateway_activity("info", message).await;
 }
 
 /// Initialize Telegram client. Returns (client, bot_username).

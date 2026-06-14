@@ -810,28 +810,20 @@ async fn enforce_access_control(
                 return Ok(Some((String::new(), String::new())));
             }
             info!("Pairing challenge issued for sender '{sender_id}' on channel '{channel_name}'");
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-                cortex::activity_log::log_activity(
-                    &adb,
-                    "info",
-                    "gateway",
-                    &format!("Pairing challenge issued for {sender_id}"),
-                )
-                .await;
-            }
+            crate::activity::log_gateway_activity(
+                "info",
+                &format!("Pairing challenge issued for {sender_id}"),
+            )
+            .await;
             Ok(Some((message, String::new())))
         }
         cortex::pairing::AccessCheckResult::Denied { reason } => {
             info!("Access denied for sender '{sender_id}' on channel '{channel_name}': {reason}");
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-                cortex::activity_log::log_activity(
-                    &adb,
-                    "warn",
-                    "gateway",
-                    &format!("Access denied for {sender_id} on {channel_name}"),
-                )
-                .await;
-            }
+            crate::activity::log_gateway_activity(
+                "warn",
+                &format!("Access denied for {sender_id} on {channel_name}"),
+            )
+            .await;
             Ok(Some((
                 "Access denied. Contact the Borg owner for access.".to_string(),
                 String::new(),
@@ -849,15 +841,11 @@ async fn invoke_agent_inner(
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
     progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-        cortex::activity_log::log_activity(
-            &adb,
-            "info",
-            "gateway",
-            &format!("Webhook from {channel_name}: {}", inbound.sender_id),
-        )
-        .await;
-    }
+    crate::activity::log_gateway_activity(
+        "info",
+        &format!("Webhook from {channel_name}: {}", inbound.sender_id),
+    )
+    .await;
 
     let route = crate::channel::routing::resolve_route(
         config,

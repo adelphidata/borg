@@ -346,15 +346,11 @@ impl GatewayServer {
             }
         })?;
         info!("Gateway listening on {addr} with {channel_count} channel(s)");
-        if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-            cortex::activity_log::log_activity(
-                &adb,
-                "info",
-                "gateway",
-                &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
-            )
-            .await;
-        }
+        crate::activity::log_gateway_activity(
+            "info",
+            &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
+        )
+        .await;
 
         // Crash-recovery: rows left in `sending` from the prior process are
         // demoted to `pending` so the drain loop retries them.
@@ -1006,10 +1002,7 @@ async fn restart_handler(
         );
     }
     info!("Gateway restart requested via /internal/restart");
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-        cortex::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested")
-            .await;
-    }
+    crate::activity::log_gateway_activity("info", "Gateway restart requested").await;
     state.shutdown.cancel();
     (
         StatusCode::OK,

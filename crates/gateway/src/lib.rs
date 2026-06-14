@@ -25,6 +25,8 @@
     )
 )]
 
+/// Fire-and-forget gateway activity logging shared across handler/server/channels.
+pub mod activity;
 pub mod auto_reply;
 /// Ephemeral `/btw` side-question dispatcher shared across native channels.
 pub mod btw_dispatch;
