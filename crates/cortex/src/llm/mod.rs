@@ -129,6 +129,23 @@ pub use crate::llm::llm_error::*;
 
 // ── Data types ──
 
+/// Which wire transport a request is routed to, once provider + model are
+/// known. Produced by [`LlmClient::wire_path`] — the single classifier shared
+/// by the streaming and non-streaming dispatch paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WirePath {
+    /// AWS Bedrock (SigV4-signed, event-stream framing).
+    Bedrock,
+    /// Vertex AI serving an Anthropic (Claude) model — Anthropic wire format.
+    VertexAnthropic,
+    /// Native Gemini `generateContent` transport.
+    Gemini,
+    /// OpenAI-compatible chat-completions transport.
+    OpenAi,
+    /// Anthropic `/v1/messages` transport (also the default fallback).
+    Anthropic,
+}
+
 /// Token usage statistics from an LLM call.
 #[derive(Debug, Clone, Default)]
 pub struct UsageData {
@@ -1354,26 +1371,34 @@ impl LlmClient {
                     None
                 };
 
+                // ClaudeCli is streaming-only, so it's dispatched here before
+                // consulting the shared `wire_path` classifier.
                 let result = if matches!(self.provider, Provider::ClaudeCli) {
                     self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
                         .await
-                } else if matches!(self.provider, Provider::Bedrock) {
-                    self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
-                        .await
-                } else if self.provider == Provider::VertexAi
-                    && vertex::is_anthropic_model(&self.llm_config.model)
-                {
-                    self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
-                        .await
-                } else if matches!(self.provider, Provider::Gemini) {
-                    self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
-                        .await
-                } else if self.provider.is_openai_compatible() {
-                    self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
-                        .await
                 } else {
-                    self.stream_chat_anthropic_inner(messages, tools, &tx, &cancel)
-                        .await
+                    match self.wire_path() {
+                        WirePath::Bedrock => {
+                            self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
+                                .await
+                        }
+                        WirePath::VertexAnthropic => {
+                            self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
+                                .await
+                        }
+                        WirePath::Gemini => {
+                            self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
+                                .await
+                        }
+                        WirePath::OpenAi => {
+                            self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
+                                .await
+                        }
+                        WirePath::Anthropic => {
+                            self.stream_chat_anthropic_inner(messages, tools, &tx, &cancel)
+                                .await
+                        }
+                    }
                 };
 
                 // Lease drop happens here as we re-bind below; report outcome
@@ -1512,6 +1537,31 @@ impl LlmClient {
         bail!("{msg}")
     }
 
+    /// The wire transport a request takes once provider + model are known.
+    ///
+    /// This is the single source of truth for transport routing — both the
+    /// streaming ([`Self::stream_chat_with_cancel`]) and non-streaming
+    /// ([`Self::chat`]) paths consult it, so the provider/model ordering and
+    /// the Vertex-Anthropic split can't drift between them. `ClaudeCli` is not
+    /// represented here: it is streaming-only and handled before this is
+    /// consulted (in non-streaming `chat` it falls through to `Anthropic`,
+    /// matching the historical default).
+    fn wire_path(&self) -> WirePath {
+        if matches!(self.provider, Provider::Bedrock) {
+            WirePath::Bedrock
+        } else if self.provider == Provider::VertexAi
+            && vertex::is_anthropic_model(&self.llm_config.model)
+        {
+            WirePath::VertexAnthropic
+        } else if matches!(self.provider, Provider::Gemini) {
+            WirePath::Gemini
+        } else if self.provider.is_openai_compatible() {
+            WirePath::OpenAi
+        } else {
+            WirePath::Anthropic
+        }
+    }
+
     /// Non-streaming call for heartbeat and simple requests
     #[instrument(skip_all, fields(llm.provider = %self.provider, llm.model = %self.llm_config.model))]
     /// Non-streaming chat completion, returning assembled tool calls.
@@ -1520,18 +1570,12 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        if self.provider == Provider::Bedrock {
-            self.chat_bedrock(messages, tools).await
-        } else if self.provider == Provider::VertexAi
-            && vertex::is_anthropic_model(&self.llm_config.model)
-        {
-            self.chat_vertex_anthropic(messages, tools).await
-        } else if matches!(self.provider, Provider::Gemini) {
-            self.chat_gemini(messages, tools).await
-        } else if self.provider.is_openai_compatible() {
-            self.chat_openai(messages, tools).await
-        } else {
-            self.chat_anthropic(messages, tools).await
+        match self.wire_path() {
+            WirePath::Bedrock => self.chat_bedrock(messages, tools).await,
+            WirePath::VertexAnthropic => self.chat_vertex_anthropic(messages, tools).await,
+            WirePath::Gemini => self.chat_gemini(messages, tools).await,
+            WirePath::OpenAi => self.chat_openai(messages, tools).await,
+            WirePath::Anthropic => self.chat_anthropic(messages, tools).await,
         }
     }
 
