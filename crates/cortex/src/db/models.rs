@@ -38,6 +38,28 @@ pub struct SessionRow {
     pub forked_from_message_id: Option<i64>,
 }
 
+impl SessionRow {
+    /// Column list, in the exact order [`SessionRow::from_row`] reads. Every
+    /// `SELECT ... FROM sessions` that maps into a `SessionRow` interpolates
+    /// this so the column order and the field decoding never drift apart.
+    pub const COLUMNS: &'static str = "id, created_at, updated_at, total_tokens, \
+         model, title, parent_session_id, forked_from_message_id";
+
+    /// Decode a row produced by a `SELECT {COLUMNS} FROM sessions` query.
+    pub fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        Ok(SessionRow {
+            id: row.get::<String>(0)?,
+            created_at: row.get::<i64>(1)?,
+            updated_at: row.get::<i64>(2)?,
+            total_tokens: row.get::<i64>(3)?,
+            model: row.get::<String>(4)?,
+            title: row.get::<String>(5)?,
+            parent_session_id: row.get::<Option<String>>(6)?,
+            forked_from_message_id: row.get::<Option<i64>>(7)?,
+        })
+    }
+}
+
 /// A held per-session lease (worker-pool / fallible executors).
 ///
 /// A worker takes this before advancing a session and releases it after; on

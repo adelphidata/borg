@@ -53,23 +53,12 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, created_at, updated_at, total_tokens, model, title,
-                    parent_session_id, forked_from_message_id
-             FROM sessions WHERE id = ?1",
+                &format!("SELECT {} FROM sessions WHERE id = ?1", SessionRow::COLUMNS),
                 params!(id),
             )
             .await?;
         match rows.next().await? {
-            Some(row) => Ok(Some(SessionRow {
-                id: row.get::<String>(0)?,
-                created_at: row.get::<i64>(1)?,
-                updated_at: row.get::<i64>(2)?,
-                total_tokens: row.get::<i64>(3)?,
-                model: row.get::<String>(4)?,
-                title: row.get::<String>(5)?,
-                parent_session_id: row.get::<Option<String>>(6)?,
-                forked_from_message_id: row.get::<Option<i64>>(7)?,
-            })),
+            Some(row) => Ok(Some(SessionRow::from_row(&row)?)),
             None => Ok(None),
         }
     }
@@ -78,24 +67,16 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, created_at, updated_at, total_tokens, model, title,
-                    parent_session_id, forked_from_message_id
-             FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+                &format!(
+                    "SELECT {} FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+                    SessionRow::COLUMNS
+                ),
                 params!(limit as i64),
             )
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(SessionRow {
-                id: row.get::<String>(0)?,
-                created_at: row.get::<i64>(1)?,
-                updated_at: row.get::<i64>(2)?,
-                total_tokens: row.get::<i64>(3)?,
-                model: row.get::<String>(4)?,
-                title: row.get::<String>(5)?,
-                parent_session_id: row.get::<Option<String>>(6)?,
-                forked_from_message_id: row.get::<Option<i64>>(7)?,
-            });
+            out.push(SessionRow::from_row(&row)?);
         }
         Ok(out)
     }
@@ -109,25 +90,17 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, created_at, updated_at, total_tokens, model, title,
-                    parent_session_id, forked_from_message_id
-             FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
-             LIMIT ?2",
+                &format!(
+                    "SELECT {} FROM sessions WHERE updated_at >= ?1 \
+                     ORDER BY updated_at DESC LIMIT ?2",
+                    SessionRow::COLUMNS
+                ),
                 params!(since, SESSIONS_SINCE_HARD_CAP),
             )
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(SessionRow {
-                id: row.get::<String>(0)?,
-                created_at: row.get::<i64>(1)?,
-                updated_at: row.get::<i64>(2)?,
-                total_tokens: row.get::<i64>(3)?,
-                model: row.get::<String>(4)?,
-                title: row.get::<String>(5)?,
-                parent_session_id: row.get::<Option<String>>(6)?,
-                forked_from_message_id: row.get::<Option<i64>>(7)?,
-            });
+            out.push(SessionRow::from_row(&row)?);
         }
         if out.len() == SESSIONS_SINCE_HARD_CAP as usize {
             // Hitting the cap means a future caller that walks the full set
