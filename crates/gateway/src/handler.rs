@@ -321,6 +321,40 @@ struct SessionResolution {
     command_response: Option<String>,
 }
 
+/// Log a slash-command response as an outbound channel message and package it
+/// into a [`SessionResolution`]. Every command branch in
+/// [`resolve_session_and_commands`] shares this tail: a best-effort outbound log
+/// (DEBUG on failure — the response itself already succeeded) followed by an
+/// early return carrying the response.
+async fn command_resolution(
+    db: Database,
+    channel_name: &str,
+    sender_id: &str,
+    session_id: String,
+    response: String,
+) -> SessionResolution {
+    if let Err(e) = db
+        .log_channel_message(
+            channel_name,
+            sender_id,
+            "outbound",
+            Some(&response),
+            None,
+            Some(&session_id),
+        )
+        .await
+    {
+        // Secondary logging failure (the response itself succeeded).
+        // DEBUG keeps daemon.log clean on flaky DB locks.
+        debug!("Failed to log command response: {e}");
+    }
+    SessionResolution {
+        db,
+        session_id,
+        command_response: Some(response),
+    }
+}
+
 /// Resolve the session and handle slash commands (`/cancel`, `/poke`, other commands).
 async fn resolve_session_and_commands(
     channel_name: &str,
@@ -379,26 +413,9 @@ async fn resolve_session_and_commands(
         } else {
             "Nothing to cancel.".to_string()
         };
-        if let Err(e) = db
-            .log_channel_message(
-                channel_name,
-                &inbound.sender_id,
-                "outbound",
-                Some(&response),
-                None,
-                Some(&session_id),
-            )
-            .await
-        {
-            // Secondary logging failure (the response itself succeeded).
-            // DEBUG keeps daemon.log clean on flaky DB locks.
-            debug!("Failed to log /cancel response: {e}");
-        }
-        return Ok(SessionResolution {
-            db,
-            session_id,
-            command_response: Some(response),
-        });
+        return Ok(
+            command_resolution(db, channel_name, &inbound.sender_id, session_id, response).await,
+        );
     }
 
     // Handle `/poke` before the sync dispatcher (requires async HTTP call).
@@ -417,24 +434,9 @@ async fn resolve_session_and_commands(
             Ok(resp) => format!("Poke failed (HTTP {})", resp.status()),
             Err(e) => format!("Poke failed: {e}"),
         };
-        if let Err(e) = db
-            .log_channel_message(
-                channel_name,
-                &inbound.sender_id,
-                "outbound",
-                Some(&response),
-                None,
-                Some(&session_id),
-            )
-            .await
-        {
-            debug!("Failed to log /poke response: {e}");
-        }
-        return Ok(SessionResolution {
-            db,
-            session_id,
-            command_response: Some(response),
-        });
+        return Ok(
+            command_resolution(db, channel_name, &inbound.sender_id, session_id, response).await,
+        );
     }
 
     if crate::commands::is_dream_command(&inbound.text) {
@@ -449,24 +451,9 @@ async fn resolve_session_and_commands(
                 Ok(Err(e)) => format!("Dream failed: {e}"),
                 Err(e) => format!("Dream failed: {e}"),
             };
-        if let Err(e) = db
-            .log_channel_message(
-                channel_name,
-                &inbound.sender_id,
-                "outbound",
-                Some(&response),
-                None,
-                Some(&session_id),
-            )
-            .await
-        {
-            debug!("Failed to log /dream response: {e}");
-        }
-        return Ok(SessionResolution {
-            db,
-            session_id,
-            command_response: Some(response),
-        });
+        return Ok(
+            command_resolution(db, channel_name, &inbound.sender_id, session_id, response).await,
+        );
     }
 
     // Slash-command dispatch runs against original (un-prepped) text so command
@@ -483,24 +470,9 @@ async fn resolve_session_and_commands(
     )
     .await
     {
-        if let Err(e) = db
-            .log_channel_message(
-                channel_name,
-                &inbound.sender_id,
-                "outbound",
-                Some(&response),
-                None,
-                Some(&session_id),
-            )
-            .await
-        {
-            debug!("Failed to log command response: {e}");
-        }
-        return Ok(SessionResolution {
-            db,
-            session_id,
-            command_response: Some(response),
-        });
+        return Ok(
+            command_resolution(db, channel_name, &inbound.sender_id, session_id, response).await,
+        );
     }
 
     Ok(SessionResolution {
