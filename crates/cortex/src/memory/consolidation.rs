@@ -923,7 +923,7 @@ mod backfill_tests {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1043,77 +1043,77 @@ mod tests {
         assert_eq!(writes, 1);
     }
 
-    #[test]
-    fn flush_writes_to_daily_entry() {
-        let db = crate::db::Database::test_db();
+    #[tokio::test]
+    async fn flush_writes_to_daily_entry() {
+        let db = crate::db::Database::test_db().await;
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let name = format!("daily/{date}");
 
-        db.append_memory_entry("global", &name, "- [Decision] test fact")
+        db.append_memory_entry("global", &name, "- [Decision] test fact").await
             .unwrap();
 
-        let entry = db.get_memory_entry("global", &name).unwrap().unwrap();
+        let entry = db.get_memory_entry("global", &name).await.unwrap().unwrap();
         assert!(entry.content.contains("test fact"));
     }
 
-    #[test]
-    fn flush_with_db_creates_and_appends_daily_entry() {
-        let db = crate::db::Database::test_db();
+    #[tokio::test]
+    async fn flush_with_db_creates_and_appends_daily_entry() {
+        let db = crate::db::Database::test_db().await;
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let name = format!("daily/{date}");
 
-        flush_short_term_to_daily_with_db(&db, "- [Decision] chose rust").unwrap();
-        let first = db.get_memory_entry("global", &name).unwrap().unwrap();
+        flush_short_term_to_daily_with_db(&db, "- [Decision] chose rust").await.unwrap();
+        let first = db.get_memory_entry("global", &name).await.unwrap().unwrap();
         assert!(first.content.contains("chose rust"));
         assert!(first.content.contains("Session flush"));
 
-        flush_short_term_to_daily_with_db(&db, "- [Correction] use snake_case").unwrap();
-        let second = db.get_memory_entry("global", &name).unwrap().unwrap();
+        flush_short_term_to_daily_with_db(&db, "- [Correction] use snake_case").await.unwrap();
+        let second = db.get_memory_entry("global", &name).await.unwrap().unwrap();
         assert!(second.content.contains("chose rust"));
         assert!(second.content.contains("use snake_case"));
         assert!(second.content.len() > first.content.len());
     }
 
-    #[test]
-    fn optional_db_routes_through_provided_handle() {
-        let db = crate::db::Database::test_db();
-        flush_short_term_to_daily_with_optional_db(Some(&db), "- [Decision] use Rust").unwrap();
+    #[tokio::test]
+    async fn optional_db_routes_through_provided_handle() {
+        let db = crate::db::Database::test_db().await;
+        flush_short_term_to_daily_with_optional_db(Some(&db), "- [Decision] use Rust").await.unwrap();
 
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let entry = db
-            .get_memory_entry("global", &format!("daily/{date}"))
+            .get_memory_entry("global", &format!("daily/{date}")).await
             .unwrap()
             .expect("entry must be written through the injected db handle");
         assert!(entry.content.contains("use Rust"));
     }
 
-    #[test]
-    fn optional_db_empty_facts_are_noop_with_or_without_db() {
+    #[tokio::test]
+    async fn optional_db_empty_facts_are_noop_with_or_without_db() {
         // No daily entry should be written for empty or whitespace-only input,
         // regardless of whether a DB handle is provided. Catches a regression
         // where blank-flush would clobber the existing daily/{date} entry with
         // an empty body.
-        let db = crate::db::Database::test_db();
-        flush_short_term_to_daily_with_optional_db(Some(&db), "")
+        let db = crate::db::Database::test_db().await;
+        flush_short_term_to_daily_with_optional_db(Some(&db), "").await
             .expect("empty input must be a no-op, not an error");
-        flush_short_term_to_daily_with_optional_db(Some(&db), "   \n")
+        flush_short_term_to_daily_with_optional_db(Some(&db), "   \n").await
             .expect("whitespace-only input must be a no-op, not an error");
-        flush_short_term_to_daily_with_optional_db(None, "")
+        flush_short_term_to_daily_with_optional_db(None, "").await
             .expect("None db + empty input must be a no-op, not an error");
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
-            db.get_memory_entry("global", &format!("daily/{date}"))
+            db.get_memory_entry("global", &format!("daily/{date}")).await
                 .unwrap()
                 .is_none(),
             "no-op flush must not create a daily entry"
         );
     }
 
-    #[test]
-    fn flush_short_term_memory_integration_with_facts_as_text() {
+    #[tokio::test]
+    async fn flush_short_term_memory_integration_with_facts_as_text() {
         use crate::memory::short_term_memory::{FactCategory, ShortTermMemory};
 
-        let db = crate::db::Database::test_db();
+        let db = crate::db::Database::test_db().await;
         let mut stm = ShortTermMemory::new("sess-test".into(), 2000);
         stm.add_fact(FactCategory::Decision, "agreed on PG over MySQL".into(), 0);
         stm.add_fact(
@@ -1122,11 +1122,11 @@ mod tests {
             1,
         );
 
-        flush_short_term_to_daily_with_db(&db, &stm.facts_as_text()).unwrap();
+        flush_short_term_to_daily_with_db(&db, &stm.facts_as_text()).await.unwrap();
 
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let entry = db
-            .get_memory_entry("global", &format!("daily/{date}"))
+            .get_memory_entry("global", &format!("daily/{date}")).await
             .unwrap()
             .unwrap();
         assert!(entry.content.contains("PG over MySQL"));
