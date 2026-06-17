@@ -320,14 +320,12 @@ pub fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
         .map(|(_, extract)| extract(config))
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
-    fn test_resolver() -> SettingsResolver {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
-        let db = Database::from_connection(conn).expect("db setup");
+    async fn test_resolver() -> SettingsResolver {
+        let db = Database::test_db().await;
         SettingsResolver::new(db)
     }
 
@@ -369,133 +367,133 @@ mod tests {
         assert!(out.len() < long.len());
     }
 
-    #[test]
-    fn defaults_resolve_without_db() {
-        let resolver = test_resolver();
-        let config = resolver.resolve().unwrap();
+    #[tokio::test]
+    async fn defaults_resolve_without_db() {
+        let resolver = test_resolver().await;
+        let config = resolver.resolve().await.unwrap();
         assert!((config.llm.temperature - 0.7).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn db_overrides_default() {
-        let resolver = test_resolver();
-        resolver.set("temperature", "1.2").unwrap();
-        let config = resolver.resolve().unwrap();
+    #[tokio::test]
+    async fn db_overrides_default() {
+        let resolver = test_resolver().await;
+        resolver.set("temperature", "1.2").await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert!((config.llm.temperature - 1.2).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn unset_reverts_to_default() {
-        let resolver = test_resolver();
-        resolver.set("temperature", "1.2").unwrap();
-        resolver.unset("temperature").unwrap();
-        let config = resolver.resolve().unwrap();
+    #[tokio::test]
+    async fn unset_reverts_to_default() {
+        let resolver = test_resolver().await;
+        resolver.set("temperature", "1.2").await.unwrap();
+        resolver.unset("temperature").await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert!((config.llm.temperature - 0.7).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn get_with_source_default() {
-        let resolver = test_resolver();
-        let (val, source) = resolver.get_with_source("temperature").unwrap();
+    #[tokio::test]
+    async fn get_with_source_default() {
+        let resolver = test_resolver().await;
+        let (val, source) = resolver.get_with_source("temperature").await.unwrap();
         assert_eq!(val, "0.7");
         assert_eq!(source, SettingSource::Default);
     }
 
-    #[test]
-    fn get_with_source_db() {
-        let resolver = test_resolver();
-        resolver.set("temperature", "0.9").unwrap();
-        let (val, source) = resolver.get_with_source("temperature").unwrap();
+    #[tokio::test]
+    async fn get_with_source_db() {
+        let resolver = test_resolver().await;
+        resolver.set("temperature", "0.9").await.unwrap();
+        let (val, source) = resolver.get_with_source("temperature").await.unwrap();
         assert_eq!(val, "0.9");
         assert_eq!(source, SettingSource::Database);
     }
 
-    #[test]
-    fn security_verifier_round_trips_through_resolver() {
+    #[tokio::test]
+    async fn security_verifier_round_trips_through_resolver() {
         // Real failure mode: a custom_apply arm that swallows or mistypes the
         // value silently leaves the daemon on TOFU when the user picked
         // tailscale, undermining the security choice. Round-trip both
         // variants and an invalid value through the resolver.
-        let resolver = test_resolver();
+        let resolver = test_resolver().await;
 
         // Default is tofu.
-        let cfg = resolver.resolve().unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert_eq!(cfg.security.verifier, crate::config::VerifierKind::Tofu);
 
-        resolver.set("security.verifier", "tailscale").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        resolver.set("security.verifier", "tailscale").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert_eq!(
             cfg.security.verifier,
             crate::config::VerifierKind::Tailscale
         );
 
-        let (val, source) = resolver.get_with_source("security.verifier").unwrap();
+        let (val, source) = resolver.get_with_source("security.verifier").await.unwrap();
         assert_eq!(val, "tailscale");
         assert_eq!(source, SettingSource::Database);
 
         // Invalid values are rejected — never silently accepted.
-        assert!(resolver.set("security.verifier", "magic").is_err());
+        assert!(resolver.set("security.verifier", "magic").await.is_err());
 
         // Unset restores default.
-        resolver.unset("security.verifier").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        resolver.unset("security.verifier").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert_eq!(cfg.security.verifier, crate::config::VerifierKind::Tofu);
     }
 
-    #[test]
-    fn evolution_enabled_round_trip() {
-        let resolver = test_resolver();
-        let (val, source) = resolver.get_with_source("evolution.enabled").unwrap();
+    #[tokio::test]
+    async fn evolution_enabled_round_trip() {
+        let resolver = test_resolver().await;
+        let (val, source) = resolver.get_with_source("evolution.enabled").await.unwrap();
         assert_eq!(val, "true");
         assert_eq!(source, SettingSource::Default);
 
-        resolver.set("evolution.enabled", "false").unwrap();
-        let (val, source) = resolver.get_with_source("evolution.enabled").unwrap();
+        resolver.set("evolution.enabled", "false").await.unwrap();
+        let (val, source) = resolver.get_with_source("evolution.enabled").await.unwrap();
         assert_eq!(val, "false");
         assert_eq!(source, SettingSource::Database);
     }
 
-    #[test]
-    fn evolution_enabled_in_list_all() {
-        let resolver = test_resolver();
-        let all = resolver.list_all().unwrap();
+    #[tokio::test]
+    async fn evolution_enabled_in_list_all() {
+        let resolver = test_resolver().await;
+        let all = resolver.list_all().await.unwrap();
         assert!(all.iter().any(|s| s.key == "evolution.enabled"));
     }
 
-    #[test]
-    fn invalid_key_errors() {
-        let resolver = test_resolver();
-        assert!(resolver.set("nonexistent", "value").is_err());
+    #[tokio::test]
+    async fn invalid_key_errors() {
+        let resolver = test_resolver().await;
+        assert!(resolver.set("nonexistent", "value").await.is_err());
     }
 
-    #[test]
-    fn invalid_value_errors() {
-        let resolver = test_resolver();
-        assert!(resolver.set("temperature", "5.0").is_err());
+    #[tokio::test]
+    async fn invalid_value_errors() {
+        let resolver = test_resolver().await;
+        assert!(resolver.set("temperature", "5.0").await.is_err());
     }
 
-    #[test]
-    fn llm_aux_round_trips_through_resolver() {
+    #[tokio::test]
+    async fn llm_aux_round_trips_through_resolver() {
         // The aux chain ships behind a JSON setter rather than a single-field
         // path, so a regression in the custom_apply / custom_extract pair is
         // easy to miss. This locks the back-compat invariant (unset = None,
         // primary chain only) AND the set/clear cycle through the same code
         // path the daemon uses on every reload.
-        let resolver = test_resolver();
+        let resolver = test_resolver().await;
 
         // Default: unset → empty extractor output, aux remains None.
-        let cfg = resolver.resolve().unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert!(
             cfg.llm.aux.is_none(),
             "aux must default to None, not auto-populated"
         );
-        let (val, _) = resolver.get_with_source("llm.aux").unwrap();
+        let (val, _) = resolver.get_with_source("llm.aux").await.unwrap();
         assert!(val.is_empty(), "extractor for unset aux must be empty");
 
         // Set whole-blob.
         let blob = r#"{"provider":"anthropic","model":"auto","api_key_env":"ANTHROPIC_API_KEY"}"#;
-        resolver.set("llm.aux", blob).unwrap();
-        let cfg = resolver.resolve().unwrap();
+        resolver.set("llm.aux", blob).await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         let aux = cfg.llm.aux.as_ref().expect("aux must populate after set");
         assert_eq!(aux.provider.as_deref(), Some("anthropic"));
         assert!(aux.model_is_auto());
@@ -504,8 +502,8 @@ mod tests {
         // Override sub-field via dedicated key — must auto-create-if-needed
         // semantics survive the round-trip (already created here, but the
         // setter must NOT clobber unrelated fields).
-        resolver.set("llm.aux.model", "claude-haiku-4-5").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        resolver.set("llm.aux.model", "claude-haiku-4-5").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         let aux = cfg.llm.aux.unwrap();
         assert_eq!(aux.model, "claude-haiku-4-5");
         assert_eq!(
@@ -519,16 +517,16 @@ mod tests {
         // `set` path cascade-clears `llm.aux.model` / `llm.aux.fallback`
         // rows so a leftover sub-key value can't resurrect aux on the
         // next reload — see `cascade_clear_aux_subkeys`.
-        resolver.set("llm.aux", "").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        resolver.set("llm.aux", "").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert!(
             cfg.llm.aux.is_none(),
             "empty value must clear aux back to None (cascade)"
         );
     }
 
-    #[test]
-    fn llm_aux_clear_cascade_prevents_subkey_resurrection() {
+    #[tokio::test]
+    async fn llm_aux_clear_cascade_prevents_subkey_resurrection() {
         // Regression: settings replay iterates rows in DB lex order. If
         // the user sets `llm.aux.model = "claude-haiku-4-5"`, then sets
         // `llm.aux = ""`, a naive implementation would leave the sub-key
@@ -537,61 +535,61 @@ mod tests {
         // creates a half-formed AuxLlmConfig with the leftover model
         // id — silently negating the user's clear. This test locks the
         // cascade-on-clear semantics that prevent that bug.
-        let resolver = test_resolver();
+        let resolver = test_resolver().await;
         let blob = r#"{"provider":"anthropic","model":"auto","api_key_env":"ANTHROPIC_API_KEY"}"#;
-        resolver.set("llm.aux", blob).unwrap();
-        resolver.set("llm.aux.model", "claude-haiku-4-5").unwrap();
+        resolver.set("llm.aux", blob).await.unwrap();
+        resolver.set("llm.aux.model", "claude-haiku-4-5").await.unwrap();
         // Sanity: aux exists with the overridden model.
         assert_eq!(
-            resolver.resolve().unwrap().llm.aux.unwrap().model,
+            resolver.resolve().await.unwrap().llm.aux.unwrap().model,
             "claude-haiku-4-5"
         );
 
         // Clear the parent. The cascade must wipe the sub-key row.
-        resolver.set("llm.aux", "").unwrap();
+        resolver.set("llm.aux", "").await.unwrap();
         assert!(
-            resolver.resolve().unwrap().llm.aux.is_none(),
+            resolver.resolve().await.unwrap().llm.aux.is_none(),
             "cascade-on-clear must prevent zombie sub-key resurrection"
         );
     }
 
-    #[test]
-    fn llm_aux_model_auto_creates_aux_when_unset() {
+    #[tokio::test]
+    async fn llm_aux_model_auto_creates_aux_when_unset() {
         // The TUI Resilience-category quick path: a user opens /settings,
         // edits "Aux model" without ever having seen the JSON blob. Setter
         // must materialize a default AuxLlmConfig so the user's change
         // takes effect — silently failing because aux is None would be a
         // confusing UX dead-end.
-        let resolver = test_resolver();
-        resolver.set("llm.aux.model", "gpt-5-mini").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        let resolver = test_resolver().await;
+        resolver.set("llm.aux.model", "gpt-5-mini").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         let aux = cfg.llm.aux.expect("aux must auto-create on sub-field set");
         assert_eq!(aux.model, "gpt-5-mini");
     }
 
-    #[test]
-    fn llm_aux_model_empty_value_is_noop() {
+    #[tokio::test]
+    async fn llm_aux_model_empty_value_is_noop() {
         // Empty round-trips must NOT spuriously materialize aux on every
         // reload — the extractor returns "" when aux is None, and feeding
         // that back through the setter would auto-create aux ad infinitum.
         // To reset to the resolver default, set the literal "auto"; to
         // clear aux, use the parent `llm.aux` setter with empty value.
-        let resolver = test_resolver();
-        resolver.set("llm.aux.model", "").unwrap();
-        let cfg = resolver.resolve().unwrap();
+        let resolver = test_resolver().await;
+        resolver.set("llm.aux.model", "").await.unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert!(
             cfg.llm.aux.is_none(),
             "empty value must not materialize an aux block"
         );
     }
 
-    #[test]
-    fn llm_aux_invalid_json_is_rejected() {
+    #[tokio::test]
+    async fn llm_aux_invalid_json_is_rejected() {
         // The whole-blob setter must reject malformed JSON loudly — silent
         // acceptance would clobber a working aux config with `None` on the
         // next reload (since deserialize-fallback would yield None).
-        let resolver = test_resolver();
-        let result = resolver.set("llm.aux", "{not valid json");
+        let resolver = test_resolver().await;
+        let result = resolver.set("llm.aux", "{not valid json").await;
         assert!(
             result.is_err(),
             "invalid JSON must error, not silently null aux"
@@ -649,10 +647,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_all_returns_all_keys() {
-        let resolver = test_resolver();
-        let all = resolver.list_all().unwrap();
+    #[tokio::test]
+    async fn list_all_returns_all_keys() {
+        let resolver = test_resolver().await;
+        let all = resolver.list_all().await.unwrap();
         assert!(all.len() >= 14); // at least the original 14 settings
         assert!(all.iter().any(|s| s.key == "temperature"));
         assert!(all
@@ -660,101 +658,101 @@ mod tests {
             .any(|s| s.key == "conversation.tool_output_max_tokens"));
     }
 
-    #[test]
-    fn json_secret_ref_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn json_secret_ref_round_trip() {
+        let resolver = test_resolver().await;
         let json =
             r#"{"source":"exec","command":"security","args":["find-generic-password","-w"]}"#;
-        resolver.set("llm.api_key", json).unwrap();
-        let config = resolver.resolve().unwrap();
+        resolver.set("llm.api_key", json).await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert!(config.llm.api_key.is_some());
-        let (val, source) = resolver.get_with_source("llm.api_key").unwrap();
+        let (val, source) = resolver.get_with_source("llm.api_key").await.unwrap();
         assert_eq!(source, SettingSource::Database);
         assert!(val.contains("exec"));
     }
 
-    #[test]
-    fn json_gateway_bindings_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn json_gateway_bindings_round_trip() {
+        let resolver = test_resolver().await;
         let json = r#"[{"channel":"telegram","provider":"anthropic","model":"claude-sonnet-4"}]"#;
-        resolver.set("gateway.bindings", json).unwrap();
-        let config = resolver.resolve().unwrap();
+        resolver.set("gateway.bindings", json).await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.gateway.bindings.len(), 1);
         assert_eq!(config.gateway.bindings[0].channel, "telegram");
     }
 
-    #[test]
-    fn json_credentials_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn json_credentials_round_trip() {
+        let resolver = test_resolver().await;
         let json = r#"{"SLACK_TOKEN":"SLACK_TOKEN"}"#;
-        resolver.set("credentials", json).unwrap();
-        let config = resolver.resolve().unwrap();
+        resolver.set("credentials", json).await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert!(config.credentials.contains_key("SLACK_TOKEN"));
     }
 
-    #[test]
-    fn user_name_round_trip() {
-        let resolver = test_resolver();
-        resolver.set("user.name", "mike").unwrap();
-        let config = resolver.resolve().unwrap();
+    #[tokio::test]
+    async fn user_name_round_trip() {
+        let resolver = test_resolver().await;
+        resolver.set("user.name", "mike").await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.user.name.as_deref(), Some("mike"));
     }
 
-    #[test]
-    fn llm_thinking_round_trip() {
-        let resolver = test_resolver();
-        resolver.set("llm.thinking", "high").unwrap();
-        let config = resolver.resolve().unwrap();
+    #[tokio::test]
+    async fn llm_thinking_round_trip() {
+        let resolver = test_resolver().await;
+        resolver.set("llm.thinking", "high").await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert!(config.llm.thinking.is_enabled());
     }
 
-    #[test]
-    fn tools_policy_allow_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn tools_policy_allow_round_trip() {
+        let resolver = test_resolver().await;
         let json = r#"["group:git","browser"]"#;
-        resolver.set("tools.policy.allow", json).unwrap();
-        let config = resolver.resolve().unwrap();
+        resolver.set("tools.policy.allow", json).await.unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.tools.policy.allow, vec!["group:git", "browser"]);
     }
 
-    #[test]
-    fn heartbeat_channels_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn heartbeat_channels_round_trip() {
+        let resolver = test_resolver().await;
         resolver
-            .set("heartbeat.channels", r#"["telegram","slack"]"#)
+            .set("heartbeat.channels", r#"["telegram","slack"]"#).await
             .unwrap();
-        let config = resolver.resolve().unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.heartbeat.channels, vec!["telegram", "slack"]);
     }
 
-    #[test]
-    fn security_blocked_paths_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn security_blocked_paths_round_trip() {
+        let resolver = test_resolver().await;
         resolver
-            .set("security.blocked_paths", r#"[".ssh",".env"]"#)
+            .set("security.blocked_paths", r#"[".ssh",".env"]"#).await
             .unwrap();
-        let config = resolver.resolve().unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.security.blocked_paths, vec![".ssh", ".env"]);
     }
 
-    #[test]
-    fn invalid_json_setting_errors() {
-        let resolver = test_resolver();
-        assert!(resolver.set("gateway.bindings", "not json").is_err());
-        assert!(resolver.set("llm.api_key", "{bad}").is_err());
+    #[tokio::test]
+    async fn invalid_json_setting_errors() {
+        let resolver = test_resolver().await;
+        assert!(resolver.set("gateway.bindings", "not json").await.is_err());
+        assert!(resolver.set("llm.api_key", "{bad}").await.is_err());
     }
 
-    #[test]
-    fn new_scalar_settings_round_trip() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn new_scalar_settings_round_trip() {
+        let resolver = test_resolver().await;
 
-        resolver.set("llm.max_retries", "5").unwrap();
-        resolver.set("gateway.port", "8080").unwrap();
-        resolver.set("agents.enabled", "false").unwrap();
-        resolver.set("debug.llm_logging", "true").unwrap();
-        resolver.set("web.enabled", "false").unwrap();
+        resolver.set("llm.max_retries", "5").await.unwrap();
+        resolver.set("gateway.port", "8080").await.unwrap();
+        resolver.set("agents.enabled", "false").await.unwrap();
+        resolver.set("debug.llm_logging", "true").await.unwrap();
+        resolver.set("web.enabled", "false").await.unwrap();
 
-        let config = resolver.resolve().unwrap();
+        let config = resolver.resolve().await.unwrap();
         assert_eq!(config.llm.max_retries, 5);
         assert_eq!(config.gateway.port, 8080);
         assert!(!config.agents.enabled);
@@ -764,10 +762,10 @@ mod tests {
 
     // ── DB-as-source-of-truth tests ──
 
-    #[test]
-    fn ensure_all_settings_seeds_defaults() {
-        let resolver = test_resolver();
-        let settings = resolver.database().list_settings().unwrap();
+    #[tokio::test]
+    async fn ensure_all_settings_seeds_defaults() {
+        let resolver = test_resolver().await;
+        let settings = resolver.database().list_settings().await.unwrap();
         // After from_connection (which calls ensure_all_settings via init_connection),
         // every SETTING_REGISTRY key should have a row.
         assert_eq!(
@@ -783,23 +781,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ensure_all_settings_preserves_overrides() {
-        let resolver = test_resolver();
-        resolver.set("temperature", "1.5").unwrap();
+    #[tokio::test]
+    async fn ensure_all_settings_preserves_overrides() {
+        let resolver = test_resolver().await;
+        resolver.set("temperature", "1.5").await.unwrap();
         // Re-seed — should not clobber the override
-        resolver.database().ensure_all_settings().unwrap();
-        let (val, source) = resolver.get_with_source("temperature").unwrap();
+        resolver.database().ensure_all_settings().await.unwrap();
+        let (val, source) = resolver.get_with_source("temperature").await.unwrap();
         assert_eq!(val, "1.5");
         assert_eq!(source, SettingSource::Database);
     }
 
-    #[test]
-    fn ensure_all_settings_idempotent() {
-        let resolver = test_resolver();
-        let before = resolver.database().list_settings().unwrap();
-        resolver.database().ensure_all_settings().unwrap();
-        let after = resolver.database().list_settings().unwrap();
+    #[tokio::test]
+    async fn ensure_all_settings_idempotent() {
+        let resolver = test_resolver().await;
+        let before = resolver.database().list_settings().await.unwrap();
+        resolver.database().ensure_all_settings().await.unwrap();
+        let after = resolver.database().list_settings().await.unwrap();
         assert_eq!(before.len(), after.len());
         for ((k1, v1, _), (k2, v2, _)) in before.iter().zip(after.iter()) {
             assert_eq!(k1, k2);
@@ -807,41 +805,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unset_writes_default_not_delete() {
-        let resolver = test_resolver();
-        resolver.set("temperature", "1.5").unwrap();
-        resolver.unset("temperature").unwrap();
+    #[tokio::test]
+    async fn unset_writes_default_not_delete() {
+        let resolver = test_resolver().await;
+        resolver.set("temperature", "1.5").await.unwrap();
+        resolver.unset("temperature").await.unwrap();
         // Row should still exist in DB with the default value
-        let db_val = resolver.database().get_setting("temperature").unwrap();
+        let db_val = resolver.database().get_setting("temperature").await.unwrap();
         assert_eq!(db_val, Some("0.7".to_string()));
         // Source should report Default since value matches compiled default
-        let (val, source) = resolver.get_with_source("temperature").unwrap();
+        let (val, source) = resolver.get_with_source("temperature").await.unwrap();
         assert_eq!(val, "0.7");
         assert_eq!(source, SettingSource::Default);
     }
 
-    #[test]
-    fn get_source_default_for_seeded() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn get_source_default_for_seeded() {
+        let resolver = test_resolver().await;
         // All settings are seeded with defaults — should report Default source
-        let (_, source) = resolver.get_with_source("sandbox.enabled").unwrap();
+        let (_, source) = resolver.get_with_source("sandbox.enabled").await.unwrap();
         assert_eq!(source, SettingSource::Default);
     }
 
-    #[test]
-    fn get_source_database_for_modified() {
-        let resolver = test_resolver();
-        resolver.set("sandbox.enabled", "false").unwrap();
-        let (val, source) = resolver.get_with_source("sandbox.enabled").unwrap();
+    #[tokio::test]
+    async fn get_source_database_for_modified() {
+        let resolver = test_resolver().await;
+        resolver.set("sandbox.enabled", "false").await.unwrap();
+        let (val, source) = resolver.get_with_source("sandbox.enabled").await.unwrap();
         assert_eq!(val, "false");
         assert_eq!(source, SettingSource::Database);
     }
 
-    #[test]
-    fn list_all_complete_after_seeding() {
-        let resolver = test_resolver();
-        let all = resolver.list_all().unwrap();
+    #[tokio::test]
+    async fn list_all_complete_after_seeding() {
+        let resolver = test_resolver().await;
+        let all = resolver.list_all().await.unwrap();
         assert_eq!(
             all.len(),
             SETTING_REGISTRY.len(),
@@ -849,10 +847,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn data_version_available() {
-        let resolver = test_resolver();
-        let v1 = resolver.database().data_version().unwrap();
+    #[tokio::test]
+    async fn data_version_available() {
+        let resolver = test_resolver().await;
+        let v1 = resolver.database().data_version().await.unwrap();
         assert!(v1 >= 0, "data_version should be non-negative");
     }
 
@@ -1016,8 +1014,8 @@ mod tests {
     // refactor that drops a variant from the `json_quoted` parser would
     // surface here as a failing arm, not as silent loss of `random`/etc.
 
-    #[test]
-    fn credential_strategy_round_trips_every_variant() {
+    #[tokio::test]
+    async fn credential_strategy_round_trips_every_variant() {
         use crate::llm::credential_pool::CredentialStrategy;
         // `json_quoted` adds the JSON quoting itself, so the operator-supplied
         // value is the raw enum variant string.
@@ -1028,11 +1026,11 @@ mod tests {
             ("random", CredentialStrategy::Random),
         ];
         for (db_value, expected) in cases {
-            let resolver = test_resolver();
+            let resolver = test_resolver().await;
             resolver
-                .set("llm.credential_strategy", db_value)
+                .set("llm.credential_strategy", db_value).await
                 .unwrap_or_else(|e| panic!("set {db_value}: {e}"));
-            let cfg = resolver.resolve().unwrap();
+            let cfg = resolver.resolve().await.unwrap();
             assert_eq!(
                 cfg.llm.credential_strategy, *expected,
                 "{db_value} should resolve to {expected:?}"
@@ -1040,21 +1038,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn credential_strategy_rejects_garbage() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn credential_strategy_rejects_garbage() {
+        let resolver = test_resolver().await;
         assert!(
-            resolver.set("llm.credential_strategy", "sideways").is_err(),
+            resolver.set("llm.credential_strategy", "sideways").await.is_err(),
             "unknown strategy should be rejected at set-time"
         );
     }
 
-    #[test]
-    fn credential_cooldown_secs_round_trips_at_boundaries() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn credential_cooldown_secs_round_trips_at_boundaries() {
+        let resolver = test_resolver().await;
         for raw in &["0", "60", "86400"] {
-            resolver.set("llm.credential_cooldown_secs", raw).unwrap();
-            let cfg = resolver.resolve().unwrap();
+            resolver.set("llm.credential_cooldown_secs", raw).await.unwrap();
+            let cfg = resolver.resolve().await.unwrap();
             assert_eq!(
                 cfg.llm.credential_cooldown_secs,
                 raw.parse::<u64>().unwrap()
@@ -1062,33 +1060,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn credential_cooldown_rejects_negative() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn credential_cooldown_rejects_negative() {
+        let resolver = test_resolver().await;
         assert!(
-            resolver.set("llm.credential_cooldown_secs", "-1").is_err(),
+            resolver.set("llm.credential_cooldown_secs", "-1").await.is_err(),
             "negative cooldown should be rejected"
         );
     }
 
-    #[test]
-    fn max_concurrent_per_credential_rejects_zero() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn max_concurrent_per_credential_rejects_zero() {
+        let resolver = test_resolver().await;
         assert!(
             resolver
-                .set("llm.max_concurrent_per_credential", "0")
+                .set("llm.max_concurrent_per_credential", "0").await
                 .is_err(),
             "max concurrent must be nonzero — zero would dead-end every lease"
         );
     }
 
-    #[test]
-    fn max_concurrent_per_credential_accepts_positive() {
-        let resolver = test_resolver();
+    #[tokio::test]
+    async fn max_concurrent_per_credential_accepts_positive() {
+        let resolver = test_resolver().await;
         resolver
-            .set("llm.max_concurrent_per_credential", "4")
+            .set("llm.max_concurrent_per_credential", "4").await
             .unwrap();
-        let cfg = resolver.resolve().unwrap();
+        let cfg = resolver.resolve().await.unwrap();
         assert_eq!(cfg.llm.max_concurrent_per_credential, 4);
     }
 }

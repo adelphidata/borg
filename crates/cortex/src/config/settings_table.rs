@@ -923,10 +923,18 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
 ];
 
 /// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in
-/// the settings popup. Entries mirror the `range(..)` bounds in the
-/// `registry_and_apply` block above; the extra `step` is TUI-only.
+/// the settings popup. Where a key has a `range(..)` bound in the
+/// `registry_and_apply` block above the entry mirrors it; the rest use sane UI
+/// stepping bounds around the compiled default. The `step` is TUI-only. Every
+/// `Float`-kind `tui_settings` key MUST appear here (guarded by
+/// `every_float_tui_setting_has_range`).
 pub const TUI_FLOAT_RANGES: &[(&str, f64, f64, f64)] = &[
     ("temperature", 0.0, 2.0, 0.1),
     ("budget.warning_threshold", 0.0, 1.0, 0.01),
     ("skills.budget_pct", 0.0, 1.0, 0.01),
+    ("telemetry.sampling_ratio", 0.0, 1.0, 0.05),
+    ("voice.silence_duration_secs", 0.5, 10.0, 0.5),
+    ("voice.min_speech_duration_secs", 0.1, 5.0, 0.1),
+    ("voice.dip_tolerance_secs", 0.1, 5.0, 0.1),
+    ("voice.max_wait_secs", 1.0, 60.0, 1.0),
 ];
