@@ -5,3 +5,4 @@
 //! everything else (classifiers, coverage probes) stays private to its module.
 
 pub(super) mod memory;
+pub(super) mod provider;
