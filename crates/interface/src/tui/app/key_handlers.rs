@@ -22,6 +22,17 @@ use super::{
     QueuedMessage,
 };
 
+/// True for a bare Ctrl+Z (the conventional shell suspend chord). Other
+/// modifier combinations (Ctrl+Shift+Z, Ctrl+Alt+Z) are deliberately excluded
+/// so a future binding can claim them without colliding with suspend.
+pub(crate) fn is_suspend_key(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    key.code == KeyCode::Char('z')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 impl<'a> App<'a> {
     // The terminal owns scrollback in inline-viewport mode (xterm Alternate
     // Scroll Mode + `insert_history_lines`). The app no longer maintains a
@@ -141,6 +152,12 @@ impl<'a> App<'a> {
                 self.resume_streaming();
             }
             return Ok(AppAction::Continue);
+        }
+        // Ctrl+Z suspends to the shell — but only from an inline surface. While
+        // a popup or alt-screen view owns the screen, restore/resume would fight
+        // that surface's own terminal state, so we leave Ctrl+Z to it.
+        if is_suspend_key(&key) && !self.any_popup_visible() && !self.wants_alt_screen() {
+            return Ok(AppAction::Suspend);
         }
         match &self.state {
             AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
@@ -834,5 +851,35 @@ mod voice_key_tests {
     fn empty_spec_does_not_match_anything() {
         let e = ev(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(!matches_voice_record_key(e, ""));
+    }
+
+    #[test]
+    fn bare_ctrl_z_is_a_suspend_chord() {
+        assert!(is_suspend_key(&ev(KeyCode::Char('z'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn plain_z_is_not_suspend() {
+        // Otherwise normal typing of "z" would suspend the app.
+        assert!(!is_suspend_key(&ev(KeyCode::Char('z'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn ctrl_shift_z_and_ctrl_alt_z_are_not_suspend() {
+        // Only the bare chord suspends; decorated variants stay free for
+        // future bindings (e.g. a redo) without colliding with suspend.
+        assert!(!is_suspend_key(&ev(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!is_suspend_key(&ev(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
+    }
+
+    #[test]
+    fn ctrl_other_key_is_not_suspend() {
+        assert!(!is_suspend_key(&ev(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     }
 }

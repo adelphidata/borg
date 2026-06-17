@@ -1041,6 +1041,29 @@ async fn run_event_loop(
                     tracing::warn!(error = %e, "clear terminal scrollback failed");
                 }
             }
+            AppAction::Suspend => {
+                // Ctrl+Z: restore the terminal so the shell sees a clean TTY,
+                // suspend to the shell, then re-arm input modes and repaint
+                // when `fg` resumes us. Mirrors the external-editor bounce
+                // (`restore` → run → `set_modes` → invalidate) — and, like it,
+                // touches no mouse-tracking modes, preserving text selection.
+                //
+                // Unix-only: there is no SIGTSTP elsewhere, so the whole bounce
+                // is gated rather than churning the terminal (restore + re-arm)
+                // for a suspend that can't happen.
+                #[cfg(unix)]
+                {
+                    let _ = tui_lifecycle::restore();
+                    // SAFETY: `raise` is async-signal-safe and we hold no locks
+                    // across it. Execution resumes on the next line once
+                    // SIGCONT (`fg`) is delivered.
+                    unsafe {
+                        libc::raise(libc::SIGTSTP);
+                    }
+                    let _ = tui_lifecycle::set_modes();
+                    tui.terminal.invalidate_viewport();
+                }
+            }
             AppAction::UndoLastTurn => match client.undo(session_id).await {
                 Ok(r) => {
                     let removed = r.removed as usize;

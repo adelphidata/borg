@@ -418,6 +418,10 @@ pub enum AppAction {
     /// Signal that the active alt-screen surface has just dismissed.
     /// Reconciliation in the event loop restores the inline viewport.
     LeaveAltScreen,
+    /// Ctrl+Z: suspend the process to the shell (SIGTSTP) after restoring the
+    /// terminal, then re-arm input modes and repaint when `fg` resumes us.
+    /// Unix-only; a no-op elsewhere.
+    Suspend,
 }
 
 pub struct App<'a> {
