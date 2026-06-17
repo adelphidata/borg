@@ -1505,7 +1505,7 @@ fn check_docker(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     checks.push(classify_docker(binary_present, daemon_up));
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1547,10 +1547,10 @@ mod tests {
         assert_eq!(report.counts(), (0, 0, 0));
     }
 
-    #[test]
-    fn run_diagnostics_produces_checks() {
+    #[tokio::test]
+    async fn run_diagnostics_produces_checks() {
         let config = Config::default();
-        let report = run_diagnostics(&config);
+        let report = run_diagnostics(&config).await;
         // Should always produce at least the provider checks
         assert!(!report.checks.is_empty());
         // Should have at least provider, sandbox, skills, memory, data categories
@@ -1616,10 +1616,10 @@ mod tests {
         assert!(check_c_pos < provider_pos);
     }
 
-    #[test]
-    fn run_diagnostics_includes_browser_category() {
+    #[tokio::test]
+    async fn run_diagnostics_includes_browser_category() {
         let config = Config::default();
-        let report = run_diagnostics(&config);
+        let report = run_diagnostics(&config).await;
         let categories: std::collections::HashSet<&str> =
             report.checks.iter().map(|c| c.category).collect();
         assert!(categories.contains("Browser"));
@@ -1744,10 +1744,10 @@ mod tests {
         assert!(matches!(check.status, CheckStatus::Pass));
     }
 
-    #[test]
-    fn run_diagnostics_includes_security_category() {
+    #[tokio::test]
+    async fn run_diagnostics_includes_security_category() {
         let config = Config::default();
-        let report = run_diagnostics(&config);
+        let report = run_diagnostics(&config).await;
         let categories: std::collections::HashSet<&str> =
             report.checks.iter().map(|c| c.category).collect();
         assert!(categories.contains("Security"));
@@ -1788,20 +1788,20 @@ mod tests {
         assert_eq!(format_relative_time(now + 100), "just now");
     }
 
-    #[test]
-    fn run_diagnostics_includes_heartbeat_category() {
+    #[tokio::test]
+    async fn run_diagnostics_includes_heartbeat_category() {
         let config = Config::default();
-        let report = run_diagnostics(&config);
+        let report = run_diagnostics(&config).await;
         let categories: std::collections::HashSet<&str> =
             report.checks.iter().map(|c| c.category).collect();
         assert!(categories.contains("Heartbeat"));
     }
 
-    #[test]
-    fn heartbeat_check_shows_interval() {
+    #[tokio::test]
+    async fn heartbeat_check_shows_interval() {
         let config = Config::default();
         let mut checks = Vec::new();
-        check_heartbeat(&config, &mut checks);
+        check_heartbeat(&config, &mut checks).await;
         assert!(checks.iter().any(|c| c.name.contains("interval: 60m")));
     }
 
@@ -1814,30 +1814,30 @@ mod tests {
             .find(|c| c.category == "Subprocesses" && c.name == "Long-running children")
     }
 
-    #[test]
-    fn subprocesses_check_absent_without_registry() {
+    #[tokio::test]
+    async fn subprocesses_check_absent_without_registry() {
         // The CLI `borg doctor` path (`run_diagnostics`) has no registry
         // handle and MUST NOT produce a misleading "Pass" for a system
         // it couldn't actually inspect.
         let cfg = Config::default();
-        let report = run_diagnostics(&cfg);
+        let report = run_diagnostics(&cfg).await;
         assert!(
             find_subprocess_check(&report).is_none(),
             "registry-less doctor must omit the Subprocesses check"
         );
     }
 
-    #[test]
-    fn subprocesses_check_passes_when_registry_empty() {
+    #[tokio::test]
+    async fn subprocesses_check_passes_when_registry_empty() {
         let cfg = Config::default();
         let reg = ProcessRegistry::new();
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
-    #[test]
-    fn subprocesses_check_passes_when_all_young() {
+    #[tokio::test]
+    async fn subprocesses_check_passes_when_all_young() {
         let cfg = Config::default();
         let reg = ProcessRegistry::new();
         let _g = reg.register(
@@ -1846,13 +1846,13 @@ mod tests {
             "fresh",
             None,
         );
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
-    #[test]
-    fn subprocesses_check_warns_at_warn_threshold() {
+    #[tokio::test]
+    async fn subprocesses_check_warns_at_warn_threshold() {
         // Threshold = 0s means every running entry is "older than the
         // threshold" — that's the easiest way to drive Warn from a test
         // without a fake clock.
@@ -1866,7 +1866,7 @@ mod tests {
             "long-build",
             None,
         );
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         assert!(
             matches!(check.status, CheckStatus::Warn(_)),
@@ -1877,8 +1877,8 @@ mod tests {
         assert_eq!(check.remediation_key, Some("subprocesses.long_running"));
     }
 
-    #[test]
-    fn subprocesses_check_fails_at_fail_threshold() {
+    #[tokio::test]
+    async fn subprocesses_check_fails_at_fail_threshold() {
         let mut cfg = Config::default();
         cfg.process_registry.orphan_warn_secs = 0;
         cfg.process_registry.orphan_fail_secs = 0;
@@ -1889,7 +1889,7 @@ mod tests {
             "really-old",
             None,
         );
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         assert!(
             matches!(check.status, CheckStatus::Fail(_)),
@@ -1898,8 +1898,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subprocesses_check_omits_pinned_from_warn_count() {
+    #[tokio::test]
+    async fn subprocesses_check_omits_pinned_from_warn_count() {
         // A pinned entry past the warn threshold MUST NOT push the
         // check into Warn — otherwise pinning would be useless.
         let mut cfg = Config::default();
@@ -1913,7 +1913,7 @@ mod tests {
             None,
         );
         reg.pin(g.id()).expect("pin");
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         assert_eq!(
             check.status,
@@ -1922,8 +1922,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subprocesses_check_message_caps_offender_list() {
+    #[tokio::test]
+    async fn subprocesses_check_message_caps_offender_list() {
         // 5 offenders → first 3 named, then "… and 2 more". This keeps
         // the persistent-warning surface scannable.
         let mut cfg = Config::default();
@@ -1939,7 +1939,7 @@ mod tests {
                 None,
             ));
         }
-        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg)).await;
         let check = find_subprocess_check(&report).expect("present");
         if let CheckStatus::Warn(msg) = &check.status {
             assert!(msg.contains("… and 2 more"), "message: {msg}");
