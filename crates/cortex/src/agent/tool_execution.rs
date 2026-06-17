@@ -231,7 +231,7 @@ impl Agent {
 
             let tool_start = Instant::now();
             let tool_output = self
-                .execute_tool(name, args, event_tx, &tool_call.id)
+                .execute_tool(name, args, event_tx, &tool_call.id, cancel)
                 .instrument(info_span!("tool.execute", tool.name = %name))
                 .await
                 .unwrap_or_else(|e| {
@@ -501,6 +501,7 @@ impl Agent {
         args_json: &str,
         event_tx: &mpsc::Sender<AgentEvent>,
         tool_call_id: &str,
+        cancel: &CancellationToken,
     ) -> Result<ToolOutput> {
         let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
             Ok(v) => v,
@@ -595,7 +596,7 @@ impl Agent {
                 return Ok(out);
             }
             crate::tool::Tool::ComputerUse(args) => {
-                let out = crate::tool::computer_use::handle(args, &self.config).await?;
+                let out = crate::tool::computer_use::handle(args, &self.config, cancel).await?;
                 self.maybe_refresh_skills_after_tool(name, &raw_args, "");
                 return Ok(out);
             }

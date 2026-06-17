@@ -34,6 +34,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::types::{ContentPart, MediaData, ToolOutput};
@@ -350,11 +351,27 @@ fn parse_response(line: &str) -> Result<DriverResponse> {
 }
 
 /// Public entry point used by the agent loop's tool dispatcher.
-pub(crate) async fn handle(args: &ComputerUseArgs, config: &Config) -> Result<ToolOutput> {
+///
+/// `cancel` is the turn's interrupt token: when the user interrupts mid-turn,
+/// a blocking `Wait` returns early instead of pinning the worker for up to its
+/// full (capped) duration. Other actions are short driver round-trips and are
+/// left untouched.
+pub(crate) async fn handle(
+    args: &ComputerUseArgs,
+    config: &Config,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput> {
     if !config.computer_use.enabled {
         return Ok(ToolOutput::Text(
             "Error: computer_use is disabled. Enable it via `/settings` (computer_use.enabled = true) — note the driver only ships for macOS today.".into(),
         ));
+    }
+
+    // `Wait` needs no driver and is the only long-blocking action, so handle it
+    // here with interruption wired in rather than spinning up a `cua-driver`
+    // child just to sleep.
+    if matches!(args.action, ComputerUseAction::Wait) {
+        return wait(args, Some(cancel)).await;
     }
 
     let driver = build_driver(config)?;
@@ -384,7 +401,7 @@ pub(crate) async fn handle_with_driver(
     let result = match args.action {
         ComputerUseAction::Capture => return capture(args, driver).await,
         ComputerUseAction::ListApps => return list_apps(driver).await,
-        ComputerUseAction::Wait => return wait(args).await,
+        ComputerUseAction::Wait => return wait(args, None).await,
         ComputerUseAction::Click => click(args, "click", driver).await,
         ComputerUseAction::DoubleClick => click(args, "double_click", driver).await,
         ComputerUseAction::RightClick => click(args, "right_click", driver).await,
@@ -629,16 +646,43 @@ async fn list_apps(driver: &dyn Driver) -> Result<ToolOutput> {
     Ok(ToolOutput::Text(combined))
 }
 
-async fn wait(args: &ComputerUseArgs) -> Result<ToolOutput> {
+/// Cap at 5 minutes so a runaway agent loop can't pin the worker
+/// indefinitely. The driver itself doesn't gate this — we own the budget.
+const MAX_WAIT_MS: u64 = 5 * 60 * 1000;
+
+/// Clamp a requested wait to the worker budget. Pulled out so the cap is
+/// unit-testable without actually sleeping for the duration.
+fn effective_wait_ms(requested: u64) -> u64 {
+    requested.min(MAX_WAIT_MS)
+}
+
+async fn wait(args: &ComputerUseArgs, cancel: Option<&CancellationToken>) -> Result<ToolOutput> {
     let ms = args.duration_ms.ok_or_else(|| {
         anyhow::anyhow!("computer_use.wait requires `duration_ms` (milliseconds to sleep)")
     })?;
-    // Cap at 5 minutes so a runaway agent loop can't pin the worker
-    // indefinitely. The driver itself doesn't gate this — we own the budget.
-    const MAX_WAIT_MS: u64 = 5 * 60 * 1000;
-    let effective = ms.min(MAX_WAIT_MS);
-    tokio::time::sleep(Duration::from_millis(effective)).await;
-    Ok(ToolOutput::Text(format!("waited {effective}ms")))
+    let effective = effective_wait_ms(ms);
+    let sleep = tokio::time::sleep(Duration::from_millis(effective));
+    match cancel {
+        // Interruptible path: a turn interrupt cuts the wait short rather than
+        // blocking the agent for the full (capped) duration. The token may
+        // already be cancelled before we get here (interrupt raced the tool
+        // boundary); `select!` resolves that branch immediately, so the
+        // signal is never lost.
+        Some(token) => {
+            tokio::select! {
+                () = sleep => Ok(ToolOutput::Text(format!("waited {effective}ms"))),
+                () = token.cancelled() => {
+                    Ok(ToolOutput::Text("wait interrupted by new input".to_string()))
+                }
+            }
+        }
+        // No interrupt channel (e.g. the test seam): preserve the original
+        // blocking semantics.
+        None => {
+            sleep.await;
+            Ok(ToolOutput::Text(format!("waited {effective}ms")))
+        }
+    }
 }
 
 /// True iff the given action is allowed when the agent is in Plan mode.
@@ -1218,7 +1262,9 @@ mod tests {
         // loudly — the assertion is that we *never* even try.
         config.computer_use.driver_path = "/definitely/does/not/exist/cua-driver".into();
         let args = args_with_action(ComputerUseAction::Capture);
-        let out = handle(&args, &config).await.unwrap();
+        let out = handle(&args, &config, &CancellationToken::new())
+            .await
+            .unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
             other => panic!("expected text error, got {other:?}"),
@@ -1267,6 +1313,73 @@ mod tests {
     fn ok_response() -> DriverResponse {
         DriverResponse {
             content: vec![DriverContent::Text("ok".into())],
+        }
+    }
+
+    /// Cap guard: a multi-hour request must be clamped to the 5-minute budget;
+    /// a sub-cap request passes through untouched. Pure arithmetic, so no sleep.
+    #[test]
+    fn effective_wait_clamps_runaway_durations_to_the_budget() {
+        assert_eq!(effective_wait_ms(60 * 60 * 1000), 300_000); // 1h → 5min cap
+        assert_eq!(effective_wait_ms(300_000), 300_000); // exactly the cap
+        assert_eq!(effective_wait_ms(5), 5); // sub-cap unchanged
+        assert_eq!(effective_wait_ms(0), 0);
+    }
+
+    /// Sleep branch wins when an interrupt token is present but never fires:
+    /// the wait elapses fully and reports its (clamped) duration.
+    #[tokio::test]
+    async fn wait_completes_normally_with_uncancelled_token() {
+        let mut args = args_with_action(ComputerUseAction::Wait);
+        args.duration_ms = Some(5);
+        let token = CancellationToken::new();
+        let out = wait(&args, Some(&token)).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => assert_eq!(t, "waited 5ms"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Interrupt branch: a long wait must abort promptly once the turn is
+    /// interrupted instead of blocking for the full (capped) duration.
+    #[tokio::test]
+    async fn wait_returns_early_when_token_cancelled_mid_wait() {
+        let mut args = args_with_action(ComputerUseAction::Wait);
+        args.duration_ms = Some(5 * 60 * 1000); // would block ~5 min
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+        let start = std::time::Instant::now();
+        let out = wait(&args, Some(&token)).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "interrupted wait should return promptly, took {:?}",
+            start.elapsed()
+        );
+        match out {
+            ToolOutput::Text(t) => assert_eq!(t, "wait interrupted by new input"),
+            other => panic!("expected interrupt text, got {other:?}"),
+        }
+    }
+
+    /// Race coverage: an interrupt that landed before the tool boundary leaves
+    /// the token already cancelled. The signal must not be lost — the wait
+    /// returns the interrupt result without sleeping.
+    #[tokio::test]
+    async fn wait_with_already_cancelled_token_returns_immediately() {
+        let mut args = args_with_action(ComputerUseAction::Wait);
+        args.duration_ms = Some(5 * 60 * 1000);
+        let token = CancellationToken::new();
+        token.cancel();
+        let start = std::time::Instant::now();
+        let out = wait(&args, Some(&token)).await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        match out {
+            ToolOutput::Text(t) => assert_eq!(t, "wait interrupted by new input"),
+            other => panic!("expected interrupt text, got {other:?}"),
         }
     }
 
