@@ -1628,5 +1628,5 @@ impl Agent {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod goal_integration_tests;
