@@ -391,7 +391,7 @@ fn drain_streams(child: &mut std::process::Child) {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::{HookAction, HookContext, HookData, HookPoint, HookRegistry};
@@ -661,48 +661,48 @@ mod tests {
     mod execute_tests {
         use super::*;
 
-        #[test]
-        fn exit_zero_returns_continue() {
+        #[tokio::test]
+        async fn exit_zero_returns_continue() {
             let hook = make_hook("true", HookPoint::AfterToolCall);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            assert!(matches!(hook.execute(&ctx), HookAction::Continue));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Continue));
         }
 
-        #[test]
-        fn pre_tool_use_nonzero_returns_skip() {
+        #[tokio::test]
+        async fn pre_tool_use_nonzero_returns_skip() {
             let hook = make_hook("false", HookPoint::BeforeToolCall);
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
-            assert!(matches!(hook.execute(&ctx), HookAction::Skip));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip));
         }
 
-        #[test]
-        fn pre_tool_use_zero_returns_continue() {
+        #[tokio::test]
+        async fn pre_tool_use_zero_returns_continue() {
             let hook = make_hook("true", HookPoint::BeforeToolCall);
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
-            assert!(matches!(hook.execute(&ctx), HookAction::Continue));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Continue));
         }
 
-        #[test]
-        fn post_tool_use_nonzero_returns_continue() {
+        #[tokio::test]
+        async fn post_tool_use_nonzero_returns_continue() {
             let hook = make_hook("false", HookPoint::AfterToolCall);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            assert!(matches!(hook.execute(&ctx), HookAction::Continue));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Continue));
         }
 
-        #[test]
-        fn session_start_nonzero_returns_continue() {
+        #[tokio::test]
+        async fn session_start_nonzero_returns_continue() {
             let hook = make_hook("false", HookPoint::SessionStart);
             let ctx = make_simple_ctx(HookPoint::SessionStart);
-            assert!(matches!(hook.execute(&ctx), HookAction::Continue));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Continue));
         }
 
-        #[test]
-        fn timeout_non_pre_tool_returns_continue() {
+        #[tokio::test]
+        async fn timeout_non_pre_tool_returns_continue() {
             let mut hook = make_hook("sleep 10", HookPoint::AfterToolCall);
             hook.timeout = Duration::from_secs(1);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
             let start = Instant::now();
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             assert!(matches!(action, HookAction::Continue));
             assert!(
                 start.elapsed() < Duration::from_secs(4),
@@ -710,19 +710,19 @@ mod tests {
             );
         }
 
-        #[test]
-        fn timeout_pre_tool_returns_skip() {
+        #[tokio::test]
+        async fn timeout_pre_tool_returns_skip() {
             let mut hook = make_hook("sleep 10", HookPoint::BeforeToolCall);
             hook.timeout = Duration::from_secs(1);
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
             let start = Instant::now();
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             assert!(matches!(action, HookAction::Skip));
             assert!(start.elapsed() < Duration::from_secs(4));
         }
 
-        #[test]
-        fn spawn_failure_returns_continue_even_on_pre_tool() {
+        #[tokio::test]
+        async fn spawn_failure_returns_continue_even_on_pre_tool() {
             // Fail-open on spawn for PreToolUse: a typo shouldn't block every tool.
             // We simulate a spawn-ish failure by giving sh a command it runs but fails.
             // Actual spawn failure requires sh itself to be absent, which we can't test
@@ -732,11 +732,11 @@ mod tests {
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
             // 127 from the shell means "command not found" — still a non-zero exit
             // so we map to Skip for PreToolUse. This matches Claude Code semantics.
-            assert!(matches!(hook.execute(&ctx), HookAction::Skip));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip));
         }
 
-        #[test]
-        fn payload_json_reaches_child_as_argv1() {
+        #[tokio::test]
+        async fn payload_json_reaches_child_as_argv1() {
             let dir = tmp();
             let out = dir.path().join("payload.txt");
             // Escape the path for shell inclusion — tempdir paths are well-formed on test hosts.
@@ -746,7 +746,7 @@ mod tests {
             );
             let hook = make_hook(&cmd, HookPoint::AfterToolCall);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             assert!(matches!(action, HookAction::Continue));
             let contents = std::fs::read_to_string(&out).expect("payload file written");
             assert!(
@@ -780,8 +780,8 @@ mod tests {
             }
         }
 
-        #[test]
-        fn matcher_regex_matches_tool_name() {
+        #[tokio::test]
+        async fn matcher_regex_matches_tool_name() {
             let dir = tmp();
             let marker = dir.path().join("fired.txt");
             let cmd = format!("touch '{}'", marker.display());
@@ -789,18 +789,18 @@ mod tests {
 
             // Matches
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            let _ = hook.execute(&ctx);
+            let _ = hook.execute(&ctx).await;
             assert!(marker.exists(), "hook should have fired for run_shell");
 
             // Clear and try non-matching
             std::fs::remove_file(&marker).ok();
             let ctx2 = make_tool_result_ctx(HookPoint::AfterToolCall, "read_file", false);
-            let _ = hook.execute(&ctx2);
+            let _ = hook.execute(&ctx2).await;
             assert!(!marker.exists(), "hook should NOT have fired for read_file");
         }
 
-        #[test]
-        fn matcher_alternation() {
+        #[tokio::test]
+        async fn matcher_alternation() {
             let dir = tmp();
             let marker = dir.path().join("fired.txt");
             let cmd = format!("touch '{}'", marker.display());
@@ -810,29 +810,29 @@ mod tests {
             for tool in ["apply_patch", "write_memory"] {
                 let _ = std::fs::remove_file(&marker);
                 let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, tool, false);
-                let _ = hook.execute(&ctx);
+                let _ = hook.execute(&ctx).await;
                 assert!(marker.exists(), "expected fire for {tool}");
             }
 
             let _ = std::fs::remove_file(&marker);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "read_file", false);
-            let _ = hook.execute(&ctx);
+            let _ = hook.execute(&ctx).await;
             assert!(!marker.exists(), "should not fire for read_file");
         }
 
-        #[test]
-        fn matcher_absent_matches_all() {
+        #[tokio::test]
+        async fn matcher_absent_matches_all() {
             let dir = tmp();
             let marker = dir.path().join("fired.txt");
             let cmd = format!("touch '{}'", marker.display());
             let hook = make_hook(&cmd, HookPoint::AfterToolCall);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "anything", false);
-            let _ = hook.execute(&ctx);
+            let _ = hook.execute(&ctx).await;
             assert!(marker.exists());
         }
 
-        #[test]
-        fn matcher_ignored_on_non_tool_events() {
+        #[tokio::test]
+        async fn matcher_ignored_on_non_tool_events() {
             // Hook has a tool-name matcher, but SessionStart has no tool name.
             // Implementation returns true (ignore matcher) for non-tool events.
             let dir = tmp();
@@ -840,7 +840,7 @@ mod tests {
             let cmd = format!("touch '{}'", marker.display());
             let hook = hook_with_matcher("run_shell", HookPoint::SessionStart, &cmd);
             let ctx = make_simple_ctx(HookPoint::SessionStart);
-            let _ = hook.execute(&ctx);
+            let _ = hook.execute(&ctx).await;
             assert!(
                 marker.exists(),
                 "matcher should be no-op on non-tool events"
@@ -864,8 +864,8 @@ mod tests {
             assert!(hooks[0].matcher.is_some());
         }
 
-        #[test]
-        fn registered_hooks_dispatched_via_registry() {
+        #[tokio::test]
+        async fn registered_hooks_dispatched_via_registry() {
             let dir = tmp();
             let marker_a = dir.path().join("a.txt");
             let marker_b = dir.path().join("b.txt");
@@ -883,14 +883,14 @@ mod tests {
             reg.register(Box::new(hook_b));
 
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            let action = reg.dispatch(&ctx);
+            let action = reg.dispatch(&ctx).await;
             assert!(matches!(action, HookAction::Continue));
             assert!(marker_a.exists());
             assert!(marker_b.exists());
         }
 
-        #[test]
-        fn skip_short_circuits_subsequent_hooks() {
+        #[tokio::test]
+        async fn skip_short_circuits_subsequent_hooks() {
             let dir = tmp();
             let marker = dir.path().join("should_not_exist.txt");
             let skipper = make_hook("false", HookPoint::BeforeToolCall);
@@ -904,7 +904,7 @@ mod tests {
             reg.register(Box::new(toucher));
 
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
-            let action = reg.dispatch(&ctx);
+            let action = reg.dispatch(&ctx).await;
             assert!(matches!(action, HookAction::Skip));
             assert!(!marker.exists(), "second hook must not run after Skip");
         }
@@ -930,8 +930,8 @@ mod tests {
             assert!(hooks.is_empty());
         }
 
-        #[test]
-        fn spawn_failure_does_not_panic() {
+        #[tokio::test]
+        async fn spawn_failure_does_not_panic() {
             // Run `sh -c` with a command that exits nonzero to exercise the non-zero path.
             // Actual sh-missing is not portably testable.
             let hook = make_hook(
@@ -939,7 +939,7 @@ mod tests {
                 HookPoint::AfterToolCall,
             );
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             // sh runs, command-not-found → exit 127. PostToolUse → Continue.
             assert!(matches!(action, HookAction::Continue));
         }
@@ -963,12 +963,12 @@ mod tests {
             assert!(matches!(action, HookAction::InjectContext(_)));
         }
 
-        #[test]
-        fn non_utf8_stdout_does_not_crash() {
+        #[tokio::test]
+        async fn non_utf8_stdout_does_not_crash() {
             // Bash prints raw bytes, hook runner must not panic.
             let hook = make_hook("printf '\\xff\\xfe\\xfd'; exit 0", HookPoint::AfterToolCall);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             assert!(matches!(action, HookAction::Continue));
         }
 
@@ -1001,13 +1001,13 @@ mod tests {
             assert_eq!(hooks[0].command, "y");
         }
 
-        #[test]
-        fn timeout_kills_and_reaps_child() {
+        #[tokio::test]
+        async fn timeout_kills_and_reaps_child() {
             let mut hook = make_hook("sleep 30", HookPoint::AfterToolCall);
             hook.timeout = Duration::from_secs(1);
             let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
             let start = Instant::now();
-            let action = hook.execute(&ctx);
+            let action = hook.execute(&ctx).await;
             let elapsed = start.elapsed();
             assert!(matches!(action, HookAction::Continue));
             assert!(
