@@ -19,12 +19,6 @@
 //!    instructions. The wrapper string is asserted by a source-grep guard
 //!    test below — without it, MCP outputs would silently bypass the
 //!    untrusted-input pipeline.
-//!
-//! ## Lifecycle (Slice 2)
-//!
-//! [`initialize`] opens a per-server [`mcp::session::SessionActor`] on a
-//! plain `tokio::spawn`. Slice 3 will lift this into `borgd`'s
-//! `spawn_supervised` wrapper without changing the cortex-facing API.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -369,6 +363,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     let burst = limits.rate_limit_burst;
     let call_timeout = limits.call_timeout;
     if let Some(retry_after) = try_consume_rate_token(&tool.server, per_minute, burst) {
+        // Floor at 0.1s so a near-zero retry hint never reports "retry in 0s".
         let retry_secs = retry_after.as_secs_f64().max(0.1);
         crate::db::try_emit_global(
             crate::db::audit_events::MCP_RATE_LIMITED,
@@ -1252,8 +1247,15 @@ pub mod testing {
         let builtin_refs: Vec<&str> = builtin_tool_names().to_vec();
         // Same handshake → register → spawn flow as the production
         // `start_server`; only the transport (caller-supplied here) differs.
-        super::handshake_and_register(server_name, server_cfg, &manifest, session, reg, &builtin_refs)
-            .await
+        super::handshake_and_register(
+            server_name,
+            server_cfg,
+            &manifest,
+            session,
+            reg,
+            &builtin_refs,
+        )
+        .await
     }
 
     /// Return the per-server rate-limit and call-timeout currently

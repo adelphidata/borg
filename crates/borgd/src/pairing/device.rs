@@ -309,31 +309,25 @@ pub mod client {
             .await
             .with_context(|| format!("connect bootstrap socket {socket_path:?}"))?;
 
-        // Frame 1: send code.
         write_frame(&mut stream, code.as_bytes()).await?;
 
-        // SPAKE2 — client side.
         let (client_state, client_msg) = Spake2::<Ed25519Group>::start_b(
             &Password::new(code.as_bytes()),
             &SpakeIdentity::new(ID_DAEMON),
             &SpakeIdentity::new(ID_CLIENT),
         );
 
-        // Frame 2: send our SPAKE2 msg.
         write_frame(&mut stream, client_msg.as_slice()).await?;
-        // Frame 3: receive daemon's.
         let daemon_msg = read_frame(&mut stream).await?;
         let shared_key = client_state
             .finish(&daemon_msg)
             .map_err(|e| anyhow!("spake2 finish: {e:?}"))?;
         let aead = derive_aead(&shared_key)?;
 
-        // Generate our client keypair.
         let client_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
             .map_err(|e| anyhow!("client keypair: {e}"))?;
         let client_pem = client_kp.serialize_pem();
 
-        // Frame 4: send client hello.
         let hello = ClientHello {
             client_pub_pem: client_pem.clone(),
             device_label: device_label.to_string(),
@@ -346,7 +340,6 @@ pub mod client {
         write_frame(&mut stream, &nonce).await?;
         write_frame(&mut stream, &ct).await?;
 
-        // Frame 5: receive daemon reply.
         let nonce5 = read_frame(&mut stream).await?;
         let ct5 = read_frame(&mut stream).await?;
         let pt5 = aead

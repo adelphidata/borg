@@ -19,7 +19,10 @@ use super::theme;
 /// Footer line shown under a collapsed tool result, nudging toward the
 /// Ctrl+T transcript pager for the hidden `extra` rows.
 fn collapse_footer(extra: usize) -> String {
-    format!("    {} +{extra} lines (ctrl + t to view transcript)", theme::ELLIPSIS)
+    format!(
+        "    {} +{extra} lines (ctrl + t to view transcript)",
+        theme::ELLIPSIS
+    )
 }
 
 /// Collapse a finalized assistant cell's rendered lines into

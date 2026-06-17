@@ -279,7 +279,10 @@ fn provider_cycle_forward() {
     match result {
         Some(AppAction::UpdateSetting { key, value }) => {
             assert_eq!(key, "provider");
-            assert_eq!(value, PROVIDERS[(initial_provider_index + 1) % PROVIDERS.len()].0);
+            assert_eq!(
+                value,
+                PROVIDERS[(initial_provider_index + 1) % PROVIDERS.len()].0
+            );
         }
         Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
         None => panic!("expected UpdateSetting, got None"),
@@ -347,7 +350,10 @@ fn float_step_right_increases() {
         Some(AppAction::UpdateSetting { key, value }) => {
             assert_eq!(key, "temperature");
             let parsed: f32 = value.parse().expect("numeric temperature payload");
-            assert!((parsed - (original + 0.1)).abs() < 0.01, "payload was {value}");
+            assert!(
+                (parsed - (original + 0.1)).abs() < 0.01,
+                "payload was {value}"
+            );
         }
         Some(_) => panic!("expected UpdateSetting, got a different AppAction variant"),
         None => panic!("expected UpdateSetting, got None"),

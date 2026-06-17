@@ -125,11 +125,14 @@ impl NativeChannel for SlackChannel {
             };
         }
 
-        // Channel history context for @mentions
+        // Only inject channel history for top-level @mentions: a threaded reply
+        // already carries its own conversation context, so re-injecting full
+        // channel history would duplicate it and bloat the prompt.
         if inbound.text.contains("<@") && inbound.thread_ts.is_none() {
             if let Some(ref channel) = inbound.channel_id {
                 match self.client.conversations_history(channel, 10).await {
                     Ok(history) if !history.is_empty() => {
+                        // Cap injected history so it never dominates the agent's token budget.
                         const MAX_CONTEXT_CHARS: usize = 8000;
                         let mut context = String::new();
                         for m in history.iter().rev() {
@@ -229,6 +232,7 @@ impl NativeChannel for SlackChannel {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             let config = crate::typing_keepalive::TypingKeepaliveConfig {
+                // Re-send before Slack's typing indicator decays (~5s) so it stays visible.
                 keepalive_interval: std::time::Duration::from_secs(3),
                 label: "slack",
             };

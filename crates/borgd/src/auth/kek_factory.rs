@@ -43,8 +43,6 @@ const PROBE_VALUE: &[u8] = b"v1";
 /// readable only by root (0600 on the env file).
 pub const PASSPHRASE_ENV: &str = "BORG_KEK_PASSPHRASE";
 
-// Use [`cortex::paths::kek_file_path`] directly; the local helper used to
-// live here but is now centralized so every crate computes the same path.
 pub use cortex::paths::kek_file_path;
 
 /// Build the KEK store for this daemon process. Resolves `Auto` and

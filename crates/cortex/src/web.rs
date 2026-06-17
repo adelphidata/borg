@@ -358,7 +358,12 @@ async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let resp = ensure_search_ok(resp, "Brave Search").await?;
     let body: serde_json::Value = resp.json().await?;
-    let results = collect_search_results(body["web"]["results"].as_array(), "title", "url", "description");
+    let results = collect_search_results(
+        body["web"]["results"].as_array(),
+        "title",
+        "url",
+        "description",
+    );
     Ok(format_results(query, &results))
 }
 
@@ -387,7 +392,8 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let resp = ensure_search_ok(resp, "Tavily").await?;
     let resp_body: serde_json::Value = resp.json().await?;
-    let results = collect_search_results(resp_body["results"].as_array(), "title", "url", "content");
+    let results =
+        collect_search_results(resp_body["results"].as_array(), "title", "url", "content");
     Ok(format_results(query, &results))
 }
 
@@ -415,7 +421,8 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let resp = ensure_search_ok(resp, "Serper").await?;
     let resp_body: serde_json::Value = resp.json().await?;
-    let results = collect_search_results(resp_body["organic"].as_array(), "title", "link", "snippet");
+    let results =
+        collect_search_results(resp_body["organic"].as_array(), "title", "link", "snippet");
     Ok(format_results(query, &results))
 }
 
@@ -523,7 +530,8 @@ mod tests {
         let raw = serde_json::Value::Array(
             (0..MAX_SEARCH_RESULTS + 3)
                 .map(|i| {
-                    let mut obj = serde_json::json!({"t": format!("title{i}"), "u": format!("https://{i}")});
+                    let mut obj =
+                        serde_json::json!({"t": format!("title{i}"), "u": format!("https://{i}")});
                     if i != 1 {
                         obj["s"] = serde_json::json!(format!("snippet{i}"));
                     }

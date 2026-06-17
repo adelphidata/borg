@@ -485,7 +485,10 @@ mod tests {
         // Must target the right task and carry the new "paused" status —
         // a wrong id or stale status would silently no-op on the daemon.
         match &actions[0] {
-            ScheduleAction::ToggleStatus { task_id, new_status } => {
+            ScheduleAction::ToggleStatus {
+                task_id,
+                new_status,
+            } => {
                 assert_eq!(task_id, "test-1");
                 assert_eq!(new_status, "paused");
             }

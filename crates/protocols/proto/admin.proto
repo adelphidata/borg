@@ -174,7 +174,7 @@ service Admin {
   rpc GetAgentSnapshot(AgentSnapshotRefRequest) returns (AgentList);
 }
 
-// -- Sub-agent control messages -------------------------------------------
+// Sub-agent control messages
 
 message AgentRef {
   string agent_id = 1;
@@ -435,7 +435,7 @@ message HealReport {
   uint64 healed_tasks = 4;
   repeated string warnings = 5;
   uint64 log_bytes_truncated = 6;
-  // Field 7 (workflows_pruned) removed when the workflow feature was demolished.
+  // Never reuse field 7 / name: an older wire-format used it for workflows_pruned.
   reserved 7;
   reserved "workflows_pruned";
   uint64 messages_purged = 8;
@@ -886,7 +886,7 @@ message GoalEvent {
   int64 emitted_at_unix = 4;
 }
 
-// /handoff cross-platform session transfer ----------------------------------
+// /handoff cross-platform session transfer
 
 message HandoffRequest {
   // Session being transferred.

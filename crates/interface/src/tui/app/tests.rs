@@ -255,7 +255,7 @@ fn esc_in_pager_dismisses_back_to_idle() {
 }
 
 // ========================================================================
-// Alt-screen wrap (Track D) — emit EnterAltScreen / LeaveAltScreen and
+// Alt-screen wrap — emit EnterAltScreen / LeaveAltScreen and
 // surface the desired alt-screen state to the event loop.
 //
 // Regression guard: if any of these break, large popups will paint into

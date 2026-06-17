@@ -102,7 +102,7 @@ message AcpStartTurn {
 }
 
 // In-stream cancel signal. Borg's own ACP client uses the unary `Cancel` RPC
-// (line 24) instead — it's simpler and idempotent. This variant remains so
+// instead — it's simpler and idempotent. This variant remains so
 // external ACP clients that prefer keeping cancellation on the same bidi
 // stream as the turn can do so; the daemon honors both paths identically.
 message AcpCancel {
@@ -273,8 +273,6 @@ message SystemNotice {
   string category = 1; // e.g. "posture", "budget"
   string text = 2;
 }
-
-// ── Agent-control messages ──────────────────────────────────────────────
 
 message SessionStateRequest { string session_id = 1; }
 message SessionState {

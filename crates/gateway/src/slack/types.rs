@@ -609,8 +609,6 @@ mod tests {
         assert_eq!(payload.trigger_id.as_deref(), Some("tr1"));
     }
 
-    // ── Interactive payload tests ──
-
     #[test]
     fn deserialize_block_actions_payload() {
         let json = r#"{
@@ -697,8 +695,6 @@ mod tests {
         let val = &state.values["block_1"]["input_1"];
         assert_eq!(val.value.as_deref(), Some("Great product!"));
     }
-
-    // ── New feature-parity types ──
 
     #[test]
     fn deserialize_reaction_info() {

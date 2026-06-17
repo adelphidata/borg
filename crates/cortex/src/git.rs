@@ -161,7 +161,9 @@ const IGNORED_DIR_NAMES: &[&str] = &[
     ".nuxt",
 ];
 
-/// Max untracked file size to include in ghost snapshot (10 MiB).
+/// Max untracked file size to include in ghost snapshot (10 MiB). Larger files
+/// are skipped to keep the temp-index snapshot fast and bounded — build
+/// artifacts and media should not bloat undo points.
 const MAX_UNTRACKED_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// A ghost commit that snapshots the entire working tree state.
@@ -631,8 +633,6 @@ mod tests {
             "expected 'run_git' span, got: {recorded:?}"
         );
     }
-
-    // --- Repo-configured code-execution hardening ---------------------------
 
     #[test]
     fn hardened_prelude_disables_fsmonitor_and_hooks() {

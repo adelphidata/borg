@@ -2,9 +2,6 @@
 //! capability flags. Used to drive token-budget decisions (memory, skills,
 //! conversation history) without hardcoding limits that don't fit every model.
 //!
-//! Tracks `context_window` / `max_context_window` per model; compiled in to
-//! match Borg's "all integrations compiled unconditionally" philosophy.
-//!
 //! Lookup uses prefix matching — `claude-sonnet-4-20250514` resolves via the
 //! `claude-sonnet-4` entry. Unknown models fall back to `DEFAULT_CONTEXT_WINDOW`
 //! (a conservative 200K) so the system stays usable for new releases.
@@ -34,7 +31,6 @@ pub struct ModelMetadata {
 /// `claude-haiku-4` before `claude-haiku`). The lookup performs a longest-prefix
 /// scan, so this ordering is for human readability rather than correctness.
 const REGISTRY: &[ModelMetadata] = &[
-    // ── Anthropic Claude family ──
     // Longer/more specific slugs come first so prefix matching resolves them
     // before bare `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`.
     ModelMetadata {
@@ -109,7 +105,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 200_000,
         supports_thinking: false,
     },
-    // ── OpenAI GPT family ──
     // More specific gpt-5-* slugs precede bare `gpt-5` for longest-prefix match.
     ModelMetadata {
         slug: "gpt-5-mini",
@@ -189,7 +184,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 200_000,
         supports_thinking: true,
     },
-    // ── Google Gemini family ──
     // Gemini 3.x — longer slugs first (gemini-3-flash-lite before gemini-3-flash).
     ModelMetadata {
         slug: "gemini-3-flash-lite",
@@ -239,7 +233,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 1_000_000,
         supports_thinking: false,
     },
-    // ── xAI Grok family ──
     // Declared longest-slug-first for human readability; `lookup` does
     // longest-prefix matching independent of declaration order.
     // Context windows mirror xAI's public docs — update when xAI revises them.
@@ -327,7 +320,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 131_072,
         supports_thinking: false,
     },
-    // ── DeepSeek ──
     // `deepseek-chat` is the stable alias — the underlying weights are V3.2 today.
     ModelMetadata {
         slug: "deepseek-reasoner",
@@ -353,7 +345,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 128_000,
         supports_thinking: false,
     },
-    // ── Groq (Llama / Mixtral / OSS weights hosted) ──
     ModelMetadata {
         slug: "gpt-oss-120b",
         context_window: 131_072,
@@ -432,7 +423,6 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 32_768,
         supports_thinking: false,
     },
-    // ── Ollama / smaller local defaults ──
     ModelMetadata {
         slug: "qwen3",
         context_window: 131_072,

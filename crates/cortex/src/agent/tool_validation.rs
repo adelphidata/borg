@@ -78,8 +78,8 @@ impl ToolCallRepeatTracker {
 
     /// Hash `(name, args)`, update streak state, and return the per-call
     /// decision. The signature is stored regardless of the decision so the
-    /// streak keeps growing across already-blocked calls (so test #2 sees
-    /// indices 2,3,4 blocked, not just index 2).
+    /// streak keeps growing across already-blocked calls — every repeated
+    /// call past the cap stays blocked, not just the first one to trip it.
     pub(super) fn observe(&mut self, name: &str, args: &str) -> RepeatDecision {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

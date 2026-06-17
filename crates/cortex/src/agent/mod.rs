@@ -1628,7 +1628,5 @@ impl Agent {
 #[cfg(test)]
 mod tests;
 
-// TODO: port integration tests to async Database fixtures
-// Re-enable once an async test harness lands.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod goal_integration_tests;

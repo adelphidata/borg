@@ -305,9 +305,9 @@ fn run_loops_wrap_each_iteration_in_catch_unwind() {
     );
 }
 
-/// Reload-induced quiet-hours change still goes through after the
-/// hardening refactor — guards against the iteration-extraction
-/// accidentally breaking the apply_config path.
+/// Reload-induced quiet-hours change still applies once the per-iteration
+/// panic isolation wraps the body — guards against that wrapping breaking
+/// the apply_config path.
 #[tokio::test(start_paused = true)]
 async fn config_reload_still_applies_after_hardening() {
     let hb = hb_config("60s");

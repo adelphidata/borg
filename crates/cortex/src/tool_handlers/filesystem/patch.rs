@@ -1099,9 +1099,11 @@ mod tests {
         let config = Config::default();
         // Omitting `target` must behave exactly like an explicit "cwd" target,
         // and must NOT be treated as an unknown target.
-        let defaulted =
-            handle_apply_patch_unified(&json!({"patch": "*** Begin Patch\n*** End Patch"}), &config)
-                .unwrap();
+        let defaulted = handle_apply_patch_unified(
+            &json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            &config,
+        )
+        .unwrap();
         let explicit_cwd = handle_apply_patch_unified(
             &json!({"patch": "*** Begin Patch\n*** End Patch", "target": "cwd"}),
             &config,

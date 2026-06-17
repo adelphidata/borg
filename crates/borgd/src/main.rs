@@ -27,9 +27,8 @@ struct Args {
     #[arg(long, hide = true)]
     insecure_uds: bool,
 
-    /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`). Task
-    /// 02 wires mTLS on this listener; clients must hold a paired-device
-    /// cert.
+    /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`). The
+    /// listener enforces mTLS; clients must hold a paired-device cert.
     #[arg(long)]
     listen: Option<String>,
 

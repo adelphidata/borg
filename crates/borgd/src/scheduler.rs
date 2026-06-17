@@ -289,7 +289,3 @@ pub async fn run(
         // `interval.tick().await`.
     }
 }
-
-// `skip_stale_tasks` and its boundary tests now live in
-// `crate::maintenance::sweep` — the dispatcher loop calls into that
-// module instead of inlining the recovery logic.

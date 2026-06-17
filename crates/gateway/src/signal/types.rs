@@ -505,10 +505,8 @@ mod tests {
         let id = req.id.clone().expect("request must carry a correlation id");
         // Round-trip through JSON and assert the id + params survive — a
         // dropped params field would send an empty signal-cli command.
-        let value: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(&req).unwrap(),
-        )
-        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["method"], "send");
         assert_eq!(value["id"], serde_json::json!(id));

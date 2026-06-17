@@ -211,7 +211,9 @@ mod tests {
         // Matching secret must admit the update AND yield the parsed message
         // (paired with wrong_secret_rejected, this proves the secret gates
         // the flow without dropping the payload).
-        let msg = result.expect("matching secret must produce a message").inbound;
+        let msg = result
+            .expect("matching secret must produce a message")
+            .inbound;
         assert_eq!(msg.text, "hi");
         assert_eq!(msg.sender_id, "42");
     }

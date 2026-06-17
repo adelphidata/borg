@@ -307,8 +307,6 @@ mod tests {
         }
     }
 
-    // ── messageReaction parsing ──
-
     #[test]
     fn message_reaction_added_populates_reaction_field() {
         use super::super::types::MessageReaction;
@@ -467,8 +465,6 @@ mod tests {
         assert!(msg.channel_id.is_none());
     }
 
-    // ── Mention entity tests ──
-
     #[test]
     fn bot_mention_stripped_with_entities() {
         let mut activity = make_activity();
@@ -535,8 +531,6 @@ mod tests {
         assert_eq!(msg.text, "hello");
     }
 
-    // ── Quote extraction tests ──
-
     #[test]
     fn quote_extracted_from_blockquote() {
         assert_eq!(
@@ -582,8 +576,6 @@ mod tests {
         assert!(!msg.text.contains('>'));
     }
 
-    // ── is_bot_added tests ──
-
     #[test]
     fn is_bot_added_true() {
         let mut activity = make_activity();
@@ -624,8 +616,6 @@ mod tests {
         assert!(!is_bot_added(&activity));
     }
 
-    // ── Invoke activity tests ──
-
     #[test]
     fn invoke_activity_parsed() {
         let mut activity = make_activity();
@@ -654,8 +644,6 @@ mod tests {
         activity.value = None;
         assert!(parse_activity(&activity).is_none());
     }
-
-    // ── Voice attachment routing tests ──
 
     #[test]
     fn audio_only_message_parses_so_transcription_is_reachable() {

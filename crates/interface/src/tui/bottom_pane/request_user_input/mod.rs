@@ -604,7 +604,10 @@ mod tests {
             .send(HashMap::new())
             .expect("recovered sender must still send");
         let received = rx.try_recv().expect("payload must arrive on the receiver");
-        assert!(received.is_empty(), "empty-batch reply must carry an empty map");
+        assert!(
+            received.is_empty(),
+            "empty-batch reply must carry an empty map"
+        );
     }
 
     /// `current_options_len` includes the auto-appended "Other" row. Layout

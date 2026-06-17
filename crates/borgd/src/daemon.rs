@@ -478,9 +478,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             Ok(cortex::evolution::security::EmitOutcome::Emitted {
                 state, previous, ..
             }) => {
-                // Transition is logged at INFO inside cortex::evolution::security::emit;
-                // logging it again here used to produce duplicate "posture …" lines
-                // back-to-back in daemon.log. Keep the broadcast; drop the dupe log.
+                // Transition is already logged at INFO inside
+                // cortex::evolution::security::emit — only broadcast here.
                 let text = format_posture_transition(previous, state);
                 registry.broadcast_system_notice("posture", &text);
             }

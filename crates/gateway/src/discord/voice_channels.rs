@@ -195,6 +195,7 @@ static VOICE_MANAGER: std::sync::OnceLock<VoiceManagerHandle> = std::sync::OnceL
 /// forwarded so the inbound event handler can spin up an `AudioTranscriber`
 /// for live STT against decoded speaker PCM.
 pub fn init_voice_manager(bot_token: String, cortex_config: CortexConfig) {
+    // Discard the Err: a second call means the manager is already installed.
     let _ = VOICE_MANAGER.set(spawn_voice_manager(bot_token, cortex_config));
 }
 
@@ -620,8 +621,6 @@ async fn try_complete_join(state: &mut GuildState, guild_id: u64, our_user_id: u
         warn!(guild_id, error = %e, "voice connect failed");
     }
 }
-
-// ─── Inbound voice handler (SSRC → PCM → STT → transcript inbox) ───────────
 
 /// Per-speaker buffer state. Songbird ticks every 20ms with decoded PCM
 /// (or marks the user silent). We accumulate samples until N consecutive

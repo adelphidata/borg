@@ -118,9 +118,8 @@ async fn write_guarded_rejects_prompt_injection_for_every_backend() {
 
 #[tokio::test]
 async fn write_guarded_enforces_token_cap_uniformly() {
-    // 20k-token cap is universal. The payload is ~30k tokens of `"x "`
-    // which is well over the cap — used to be silently dropped by the
-    // prompt-budget loader before this guard moved to the trait wrapper.
+    // 20k-token cap is universal. The payload is ~30k tokens of `"x "`,
+    // well over the cap — the trait wrapper must reject it, not silently drop.
     let big = "x ".repeat(40_000);
     let cfg = Config::default();
     let ctx = MemCtx::from_config(&cfg);

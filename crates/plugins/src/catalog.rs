@@ -46,7 +46,6 @@ impl PluginDef {
     }
 }
 
-// WhatsApp
 const WHATSAPP_CHANNEL_TOML: &str = include_str!("../templates/messaging/whatsapp/channel.toml");
 const WHATSAPP_PARSE_INBOUND: &str =
     include_str!("../templates/messaging/whatsapp/parse_inbound.py");
@@ -54,14 +53,12 @@ const WHATSAPP_SEND_OUTBOUND: &str =
     include_str!("../templates/messaging/whatsapp/send_outbound.py");
 const WHATSAPP_VERIFY: &str = include_str!("../templates/messaging/whatsapp/verify.py");
 
-// iMessage
 const IMESSAGE_CHANNEL_TOML: &str = include_str!("../templates/messaging/imessage/channel.toml");
 const IMESSAGE_POLL: &str = include_str!("../templates/messaging/imessage/poll_messages.py");
 const IMESSAGE_OUTBOUND: &str = include_str!("../templates/messaging/imessage/send_outbound.sh");
 const IMESSAGE_POLICY: &str = include_str!("../templates/messaging/imessage/policy.json");
 const IMESSAGE_STATE: &str = include_str!("../templates/messaging/imessage/state.json");
 
-// SMS
 const SMS_CHANNEL_TOML: &str = include_str!("../templates/messaging/sms/channel.toml");
 const SMS_PARSE_INBOUND: &str = include_str!("../templates/messaging/sms/parse_inbound.py");
 const SMS_SEND_OUTBOUND: &str = include_str!("../templates/messaging/sms/send_outbound.py");

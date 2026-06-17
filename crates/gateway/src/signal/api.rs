@@ -395,7 +395,10 @@ mod tests {
         });
 
         let client = SignalClient::new(&base, "+15559876543").unwrap();
-        client.send_message("+15551234567", "**bold**").await.unwrap();
+        client
+            .send_message("+15551234567", "**bold**")
+            .await
+            .unwrap();
 
         let sent = server.await.unwrap();
         let json: serde_json::Value = serde_json::from_str(&sent).unwrap();

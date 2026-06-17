@@ -163,6 +163,7 @@ impl NativeChannel for TelegramChannel {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             let config = crate::typing_keepalive::TypingKeepaliveConfig {
+                // Telegram's "typing" action lasts ~5s; refresh just under that.
                 keepalive_interval: std::time::Duration::from_secs(4),
                 label: "telegram",
             };

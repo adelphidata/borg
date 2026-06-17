@@ -207,8 +207,3 @@ impl Transport for StdioTransport {
         Ok(())
     }
 }
-
-// Real subprocess round-trip + env-allowlist guard test land in
-// `crates/mcp/tests/stdio_subprocess.rs` (Slice 4) with a dedicated fixture
-// binary. The pure-logic tests for env hygiene live in `super::tests` on
-// `transport/mod.rs`.

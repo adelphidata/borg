@@ -990,8 +990,6 @@ mod tests {
         );
     }
 
-    // ── Error classification tests ──
-
     #[test]
     fn is_fatal_discord_error_classifies_auth() {
         assert!(is_fatal_discord_error(401, None));
@@ -1055,8 +1053,6 @@ mod tests {
         assert_eq!(parsed.code, None);
         assert_eq!(parsed.message.as_deref(), Some("Unknown error"));
     }
-
-    // ── Channel history tests ──
 
     #[test]
     fn channel_messages_url_construction() {
@@ -1134,8 +1130,6 @@ mod tests {
         assert_eq!(msg.author_username, "alice");
         assert_eq!(msg.content, "hello");
     }
-
-    // ── New API method URL construction tests ──
 
     #[test]
     fn edit_message_url_construction() {

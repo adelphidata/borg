@@ -111,8 +111,6 @@ pub struct GatewayServer {
 }
 
 impl GatewayServer {
-    /// Construct the gateway server.
-    ///
     /// When `executor` is `Some`, it is installed as the process-wide handle so
     /// inbound channel messages route through `borgd::session::SessionRegistry`;
     /// when `None`, agent invocations short-circuit with an error.

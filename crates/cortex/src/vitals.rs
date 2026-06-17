@@ -736,12 +736,9 @@ pub fn format_drift_notice(drift: &[DriftFlag]) -> Option<String> {
     Some(format!("Drift: {}", first.description()))
 }
 
-// ── VitalsHook ──
-
 /// Lifecycle hook that passively records vitals events.
 /// Wraps Database in a Mutex because Hook requires Send + Sync
 /// but rusqlite::Connection is !Sync.
-/// Lifecycle hook that records vitals events to SQLite on agent interactions.
 pub struct VitalsHook {
     db: AsyncMutex<Database>,
 }
@@ -819,8 +816,6 @@ impl std::fmt::Debug for VitalsHook {
 mod tests {
     use super::*;
     use chrono::Duration;
-
-    // ── Scoring ──
 
     #[test]
     fn test_baseline_values() {
@@ -951,8 +946,6 @@ mod tests {
         assert_eq!(classify_tool("run_shell", true), EventCategory::Failure);
     }
 
-    // ── Decay ──
-
     #[test]
     fn test_no_decay_within_24h() {
         let mut state = baseline();
@@ -1003,8 +996,6 @@ mod tests {
         assert_eq!(decayed.growth, 40 - 5);
     }
 
-    // ── Drift Detection ──
-
     #[test]
     fn test_drift_inactive() {
         let mut state = baseline();
@@ -1035,8 +1026,6 @@ mod tests {
         assert!(drift.is_empty());
     }
 
-    // ── Recommendations ──
-
     #[test]
     fn test_recommend_low_sync() {
         let mut state = baseline();
@@ -1060,8 +1049,6 @@ mod tests {
         assert!(rec.reason.contains("healthy"));
     }
 
-    // ── Correction Heuristic ──
-
     #[test]
     fn test_correction_positive() {
         assert!(looks_like_correction("that's wrong"));
@@ -1083,8 +1070,6 @@ mod tests {
         assert!(!looks_like_correction("I have no idea"));
         assert!(!looks_like_correction("there is no way to know"));
     }
-
-    // ── Negative Sentiment ──
 
     #[test]
     fn test_negative_sentiment_positive() {
@@ -1130,8 +1115,6 @@ mod tests {
         assert!(looks_like_correction("try again please"));
     }
 
-    // ── Formatting ──
-
     #[test]
     fn test_format_compact() {
         let state = baseline();
@@ -1157,8 +1140,6 @@ mod tests {
         assert!(output.contains("Drift:"));
         assert!(output.contains("Tip:"));
     }
-
-    // ── Failure Drift ──
 
     #[test]
     fn test_detect_failure_drift() {
@@ -1197,8 +1178,6 @@ mod tests {
         }
     }
 
-    // ── Bar Rendering ──
-
     #[test]
     fn test_bar_full() {
         assert_eq!(
@@ -1220,8 +1199,6 @@ mod tests {
         let b = bar(50, 10);
         assert_eq!(b.chars().count(), 10);
     }
-
-    // ── HMAC Chain ──
 
     #[test]
     fn test_hmac_deterministic() {
@@ -1311,8 +1288,6 @@ mod tests {
         assert_eq!(state.stability, 42); // 40 + 2
         assert_eq!(state.growth, 43); // 40 + 3
     }
-
-    // ── Rate Limiting ──
 
     #[test]
     fn test_rate_limiting_caps_events() {
@@ -1563,8 +1538,6 @@ mod tests {
         assert!(!state.chain_valid);
     }
 
-    // ── Baseline Invariants ──
-
     #[test]
     fn test_baseline_all_equal() {
         let state = baseline();
@@ -1646,8 +1619,6 @@ mod tests {
         assert!(!hmac1.is_empty());
     }
 
-    // ── Delta Validation ──
-
     #[test]
     fn validate_deltas_accepts_correct() {
         let categories = [
@@ -1690,7 +1661,6 @@ mod tests {
         );
     }
 
-    // ── Replay Stability (Event Sourcing Invariants) ──
     //
     // These tests pin down properties that make event-sourcing a trustworthy
     // state model: determinism, HMAC tampering detection, rate-limit boundary

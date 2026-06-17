@@ -97,8 +97,16 @@ default_timeout_ms = 30000
     assert_eq!(cfg.tools.policy.profile, "full");
     assert!(cfg.tools.policy.allow.is_empty());
     assert!(cfg.tools.policy.deny.is_empty());
-    assert!(cfg.tools.policy.subagent_deny.contains(&"schedule".to_string()));
-    assert!(cfg.tools.policy.subagent_deny.contains(&"browser".to_string()));
+    assert!(cfg
+        .tools
+        .policy
+        .subagent_deny
+        .contains(&"schedule".to_string()));
+    assert!(cfg
+        .tools
+        .policy
+        .subagent_deny
+        .contains(&"browser".to_string()));
 }
 
 #[test]

@@ -632,7 +632,6 @@ pub async fn update_task_status(task_id: &str, status: &str, verb: &str) -> Resu
     .await
 }
 
-// TODO: port to async test harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

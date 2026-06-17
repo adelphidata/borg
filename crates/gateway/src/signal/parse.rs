@@ -509,8 +509,6 @@ mod tests {
         assert!(parse_envelope(&env, "+15559876543").is_none());
     }
 
-    // ── Mention tests ──
-
     #[test]
     fn mention_replaced_in_text() {
         let env = make_envelope(
@@ -615,8 +613,6 @@ mod tests {
         assert_eq!(msg.text, "plain text");
     }
 
-    // ── Quote tests ──
-
     #[test]
     fn quote_prepended_to_text() {
         let env = make_envelope(
@@ -683,8 +679,6 @@ mod tests {
         assert!(msg.text.starts_with("> someone: quoted text"));
     }
 
-    // ── Edit message tests ──
-
     #[test]
     fn edit_message_parsed() {
         let env = make_envelope(
@@ -747,8 +741,6 @@ mod tests {
         assert!(parse_envelope(&env, "+15559876543").is_none());
     }
 
-    // ── Reaction context tests ──
-
     #[test]
     fn reaction_includes_target_author() {
         let env = make_envelope(
@@ -792,8 +784,6 @@ mod tests {
         let msg = parse_envelope(&env, "+15559876543").unwrap();
         assert!(msg.text.contains("unknown's message"));
     }
-
-    // ── Enrich attachments tests ──
 
     #[test]
     fn enrich_skips_attachment_without_id() {

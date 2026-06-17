@@ -687,8 +687,6 @@ mod tests {
         assert!(json.get("components").is_none());
     }
 
-    // ── New feature-parity types ──
-
     /// `MemberInfo` is a hot path: the agent reads `roles` to gate
     /// permissions and `nick` for display. Verifies all three fields
     /// populate from a real guild-member payload.

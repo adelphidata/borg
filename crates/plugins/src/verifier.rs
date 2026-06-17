@@ -133,8 +133,7 @@ mod tests {
             .find(|c| !c.is_optional)
             .expect("discord must declare a required credential");
         assert!(
-            result.message.contains(first_required.key)
-                && result.message.contains("not found"),
+            result.message.contains(first_required.key) && result.message.contains("not found"),
             "message must name the missing credential and the cause: {}",
             result.message
         );
