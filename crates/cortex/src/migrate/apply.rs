@@ -192,7 +192,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::migrate::{MigrationSource, PlanChange};
@@ -235,8 +235,8 @@ mod tests {
         assert!(active.is_empty());
     }
 
-    #[test]
-    fn test_apply_copies_memory_files() {
+    #[tokio::test]
+    async fn test_apply_copies_memory_files() {
         let borg = make_borg_dir();
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("MEMORY.md"), "# My Memories").unwrap();
@@ -251,15 +251,15 @@ mod tests {
         };
 
         let data = SourceData::default();
-        let result = apply_plan(&plan, &data, borg.path()).unwrap();
+        let result = apply_plan(&plan, &data, borg.path()).await.unwrap();
 
         assert_eq!(result.memory_files_copied, 1);
         let content = std::fs::read_to_string(borg.path().join("memory/hermes-MEMORY.md")).unwrap();
         assert_eq!(content, "# My Memories");
     }
 
-    #[test]
-    fn test_apply_copies_persona() {
+    #[tokio::test]
+    async fn test_apply_copies_persona() {
         let borg = make_borg_dir();
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("SOUL.md"), "# My Persona").unwrap();
@@ -274,15 +274,15 @@ mod tests {
         };
 
         let data = SourceData::default();
-        let result = apply_plan(&plan, &data, borg.path()).unwrap();
+        let result = apply_plan(&plan, &data, borg.path()).await.unwrap();
 
         assert!(result.persona_copied);
         let content = std::fs::read_to_string(borg.path().join("IDENTITY.md")).unwrap();
         assert_eq!(content, "# My Persona");
     }
 
-    #[test]
-    fn test_apply_copies_skills() {
+    #[tokio::test]
+    async fn test_apply_copies_skills() {
         let borg = make_borg_dir();
         let src = TempDir::new().unwrap();
         std::fs::create_dir_all(src.path().join("my-skill")).unwrap();
@@ -302,7 +302,7 @@ mod tests {
         };
 
         let data = SourceData::default();
-        let result = apply_plan(&plan, &data, borg.path()).unwrap();
+        let result = apply_plan(&plan, &data, borg.path()).await.unwrap();
 
         assert_eq!(result.skills_copied, 1);
         assert!(borg.path().join("skills/my-skill/SKILL.md").exists());
