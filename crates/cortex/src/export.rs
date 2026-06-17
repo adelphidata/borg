@@ -301,11 +301,11 @@ fn suggested_filename(meta: &SessionMeta, format: ExportFormat) -> String {
     format!("borg-session-{short}-{stamp}.{}", format.extension())
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn seed_session(db: &Database, id: &str) {
+    async fn seed_session(db: &Database, id: &str) {
         db.upsert_session(
             id,
             1_700_000_000,
@@ -313,7 +313,7 @@ mod tests {
             0,
             "test-model",
             "Demo chat",
-        )
+        ).await
         .unwrap();
         db.insert_message(
             id,
@@ -323,7 +323,7 @@ mod tests {
             None,
             Some("2024-01-01T00:00:00Z"),
             None,
-        )
+        ).await
         .unwrap();
         db.insert_message(
             id,
@@ -333,7 +333,7 @@ mod tests {
             None,
             Some("2024-01-01T00:00:01Z"),
             None,
-        )
+        ).await
         .unwrap();
         db.insert_message(
             id,
@@ -343,7 +343,7 @@ mod tests {
             Some("tc1"),
             Some("2024-01-01T00:00:02Z"),
             None,
-        )
+        ).await
         .unwrap();
     }
 
@@ -363,11 +363,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn export_json_round_trips() {
-        let db = Database::test_db();
-        seed_session(&db, "sess-json");
-        let (out, filename) = export_session(&db, "sess-json", ExportOptions::default()).unwrap();
+    #[tokio::test]
+    async fn export_json_round_trips() {
+        let db = Database::test_db().await;
+        seed_session(&db, "sess-json").await;
+        let (out, filename) = export_session(&db, "sess-json", ExportOptions::default()).await.unwrap();
 
         assert!(filename.starts_with("borg-session-sess-jso-"));
         assert!(filename.ends_with(".json"));
@@ -384,14 +384,14 @@ mod tests {
         assert_eq!(tcs[0].function.name, "run_shell");
     }
 
-    #[test]
-    fn export_csv_has_header_and_rows() {
-        let db = Database::test_db();
-        seed_session(&db, "sess-csv");
+    #[tokio::test]
+    async fn export_csv_has_header_and_rows() {
+        let db = Database::test_db().await;
+        seed_session(&db, "sess-csv").await;
         let opts = ExportOptions {
             format: ExportFormat::Csv,
         };
-        let (out, filename) = export_session(&db, "sess-csv", opts).unwrap();
+        let (out, filename) = export_session(&db, "sess-csv", opts).await.unwrap();
 
         assert!(filename.ends_with(".csv"));
         assert!(out.starts_with("idx,role,timestamp,content,tool_calls_json\n"));
@@ -412,10 +412,10 @@ mod tests {
         assert!(out.contains("\"file1.txt\nfile2.txt\""));
     }
 
-    #[test]
-    fn export_csv_escapes_quotes_and_newlines() {
-        let db = Database::test_db();
-        db.upsert_session("sess-esc", 1, 2, 0, "m", "Escape Test")
+    #[tokio::test]
+    async fn export_csv_escapes_quotes_and_newlines() {
+        let db = Database::test_db().await;
+        db.upsert_session("sess-esc", 1, 2, 0, "m", "Escape Test").await
             .unwrap();
         db.insert_message(
             "sess-esc",
@@ -425,24 +425,24 @@ mod tests {
             None,
             None,
             None,
-        )
+        ).await
         .unwrap();
         let opts = ExportOptions {
             format: ExportFormat::Csv,
         };
-        let (out, _) = export_session(&db, "sess-esc", opts).unwrap();
+        let (out, _) = export_session(&db, "sess-esc", opts).await.unwrap();
         // Doubled quote + wrapped in quotes because of `,` / `"` / `\n`.
         assert!(out.contains("\"she said \"\"hi\"\"\nand left\""));
     }
 
-    #[test]
-    fn export_txt_is_human_readable() {
-        let db = Database::test_db();
-        seed_session(&db, "sess-txt");
+    #[tokio::test]
+    async fn export_txt_is_human_readable() {
+        let db = Database::test_db().await;
+        seed_session(&db, "sess-txt").await;
         let opts = ExportOptions {
             format: ExportFormat::Txt,
         };
-        let (out, filename) = export_session(&db, "sess-txt", opts).unwrap();
+        let (out, filename) = export_session(&db, "sess-txt", opts).await.unwrap();
 
         assert!(filename.ends_with(".txt"));
         assert!(out.contains("# Demo chat"));
@@ -453,10 +453,10 @@ mod tests {
         assert!(out.contains("-> tool_call tc1 run_shell"));
     }
 
-    #[test]
-    fn export_missing_session_errors() {
-        let db = Database::test_db();
-        let err = export_session(&db, "does-not-exist", ExportOptions::default())
+    #[tokio::test]
+    async fn export_missing_session_errors() {
+        let db = Database::test_db().await;
+        let err = export_session(&db, "does-not-exist", ExportOptions::default()).await
             .expect_err("should fail");
         assert!(err.to_string().contains("not found"));
     }
@@ -495,10 +495,10 @@ mod tests {
         assert!(re.is_match(&name), "filename was {name}");
     }
 
-    #[test]
-    fn csv_defuses_formula_prefixes() {
-        let db = Database::test_db();
-        db.upsert_session("sess-inj", 1, 2, 0, "m", "Inj").unwrap();
+    #[tokio::test]
+    async fn csv_defuses_formula_prefixes() {
+        let db = Database::test_db().await;
+        db.upsert_session("sess-inj", 1, 2, 0, "m", "Inj").await.unwrap();
         // Cover all four dangerous prefixes spreadsheets evaluate as formulas.
         for (idx, payload) in ["=SUM(A1)", "+1+1", "-cmd", "@IF(1,1,0)"]
             .iter()
@@ -512,7 +512,7 @@ mod tests {
                 None,
                 Some(&format!("2024-01-01T00:00:{idx:02}Z")),
                 None,
-            )
+            ).await
             .unwrap();
         }
         let (out, _) = export_session(
@@ -521,7 +521,7 @@ mod tests {
             ExportOptions {
                 format: ExportFormat::Csv,
             },
-        )
+        ).await
         .unwrap();
         // Each payload must appear with a literal single-quote prefix so no
         // spreadsheet app evaluates it. A `,` in the raw payload would also
