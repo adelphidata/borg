@@ -854,32 +854,24 @@ mod voice_key_tests {
     }
 
     #[test]
-    fn bare_ctrl_z_is_a_suspend_chord() {
-        assert!(is_suspend_key(&ev(KeyCode::Char('z'), KeyModifiers::CONTROL)));
-    }
-
-    #[test]
-    fn plain_z_is_not_suspend() {
-        // Otherwise normal typing of "z" would suspend the app.
-        assert!(!is_suspend_key(&ev(KeyCode::Char('z'), KeyModifiers::NONE)));
-    }
-
-    #[test]
-    fn ctrl_shift_z_and_ctrl_alt_z_are_not_suspend() {
-        // Only the bare chord suspends; decorated variants stay free for
-        // future bindings (e.g. a redo) without colliding with suspend.
-        assert!(!is_suspend_key(&ev(
-            KeyCode::Char('z'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        )));
-        assert!(!is_suspend_key(&ev(
-            KeyCode::Char('z'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT
-        )));
-    }
-
-    #[test]
-    fn ctrl_other_key_is_not_suspend() {
-        assert!(!is_suspend_key(&ev(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    fn is_suspend_key_matches_only_the_bare_ctrl_z_chord() {
+        let ctrl = KeyModifiers::CONTROL;
+        let cases: &[(&str, KeyCode, KeyModifiers, bool)] = &[
+            ("bare ctrl+z suspends", KeyCode::Char('z'), ctrl, true),
+            // Plain "z" must stay normal typing, not suspend.
+            ("plain z", KeyCode::Char('z'), KeyModifiers::NONE, false),
+            // Decorated variants stay free for future bindings (e.g. redo).
+            ("ctrl+shift+z", KeyCode::Char('z'), ctrl | KeyModifiers::SHIFT, false),
+            ("ctrl+alt+z", KeyCode::Char('z'), ctrl | KeyModifiers::ALT, false),
+            // A different ctrl chord must not be mistaken for suspend.
+            ("ctrl+c", KeyCode::Char('c'), ctrl, false),
+        ];
+        for (label, code, mods, expected) in cases {
+            assert_eq!(
+                is_suspend_key(&ev(*code, *mods)),
+                *expected,
+                "case: {label}"
+            );
+        }
     }
 }
