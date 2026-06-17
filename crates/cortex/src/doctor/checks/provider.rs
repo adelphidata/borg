@@ -193,26 +193,22 @@ mod tests {
     use super::*;
     use crate::doctor::CheckStatus;
 
-    fn passes(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Pass)
-    }
-    fn warns(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Warn(_))
-    }
-    fn fails(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Fail(_))
-    }
-
     #[test]
     fn credential_pool_classification_covers_all_states() {
         let no_creds = classify_credential_pool("openrouter", false, false, None, 0);
-        assert!(fails(&no_creds), "no credentials → fail");
+        assert!(
+            matches!(no_creds.status, CheckStatus::Fail(_)),
+            "no credentials → fail"
+        );
 
         let ok = classify_credential_pool("openrouter", true, true, None, 0);
-        assert!(passes(&ok), "available → pass");
+        assert!(matches!(ok.status, CheckStatus::Pass), "available → pass");
 
         let cooling = classify_credential_pool("openrouter", true, false, Some(61_000), 1_000);
-        assert!(warns(&cooling), "configured but all cooling → warn");
+        assert!(
+            matches!(cooling.status, CheckStatus::Warn(_)),
+            "configured but all cooling → warn"
+        );
         let CheckStatus::Warn(msg) = &cooling.status else {
             unreachable!()
         };
