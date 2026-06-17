@@ -689,7 +689,7 @@ pub fn aggregate_to_file_scores(chunk_scores: &[(String, i64, f32)]) -> Vec<(Str
     result
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1002,12 +1002,12 @@ mod tests {
         assert_eq!(provider_a.cache_model_key(), provider_b.cache_model_key());
     }
 
-    #[test]
-    fn cross_provider_cache_entries_are_isolated_at_db_layer() {
+    #[tokio::test]
+    async fn cross_provider_cache_entries_are_isolated_at_db_layer() {
         // End-to-end check that using the composite cache key writes two
         // distinct rows in the embedding cache when two providers share a
         // model id. Without `provider_tag` these would collide.
-        let db = Database::test_db();
+        let db = Database::test_db().await;
         let shared_model = "text-embedding-3-small";
         let hash = "h1";
 
@@ -1032,7 +1032,7 @@ mod tests {
             hash,
             &[1, 2],
             2,
-        )
+        ).await
         .unwrap();
         db.cache_embedding(
             &openrouter.endpoint,
@@ -1040,15 +1040,15 @@ mod tests {
             hash,
             &[9, 9],
             2,
-        )
+        ).await
         .unwrap();
 
         let (bytes_a, _) = db
-            .get_cached_embedding(&openai.endpoint, &openai.cache_model_key(), hash)
+            .get_cached_embedding(&openai.endpoint, &openai.cache_model_key(), hash).await
             .unwrap()
             .expect("openai entry");
         let (bytes_b, _) = db
-            .get_cached_embedding(&openrouter.endpoint, &openrouter.cache_model_key(), hash)
+            .get_cached_embedding(&openrouter.endpoint, &openrouter.cache_model_key(), hash).await
             .unwrap()
             .expect("openrouter entry");
         assert_eq!(bytes_a, vec![1, 2]);
