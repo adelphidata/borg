@@ -487,14 +487,14 @@ fn strip_enum_parenthetical(desc: &str) -> String {
     trimmed.to_string()
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn core_tools_include_essential_tools() {
+    #[tokio::test]
+    async fn core_tools_include_essential_tools() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
 
         // Essential tools always present
@@ -520,15 +520,16 @@ mod tests {
     ///
     /// `goals.enabled` is off by default — flip every gate to ensure every
     /// optional tool that ships a definition also ships a summary.
-    #[test]
-    fn tool_summaries_cover_all_core_tool_definitions() {
+    #[tokio::test]
+    async fn tool_summaries_cover_all_core_tool_definitions() {
         let mut config = Config::default();
         config.browser.enabled = true;
         config.web.enabled = true;
         config.tts.enabled = true;
+        config.audio.enabled = true;
         config.image_gen.enabled = true;
         config.goals.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
 
         let summary_names: std::collections::HashSet<&str> =
             TOOL_SUMMARIES.iter().map(|(n, _)| *n).collect();
@@ -595,95 +596,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn projects_tool_is_not_registered() {
+    #[tokio::test]
+    async fn projects_tool_is_not_registered() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         assert!(defs.iter().all(|d| d.function.name != "projects"));
     }
 
-    #[test]
-    fn browser_tool_excluded_when_disabled() {
+    #[tokio::test]
+    async fn browser_tool_excluded_when_disabled() {
         let mut config = Config::default();
         config.browser.enabled = false;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(!names.contains(&"browser"));
     }
 
-    #[test]
-    fn browser_tool_included_when_enabled() {
+    #[tokio::test]
+    async fn browser_tool_included_when_enabled() {
         let mut config = Config::default();
         config.browser.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"browser"));
     }
 
-    #[test]
-    fn web_tools_excluded_when_disabled() {
+    #[tokio::test]
+    async fn web_tools_excluded_when_disabled() {
         let mut config = Config::default();
         config.web.enabled = false;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(!names.contains(&"web_fetch"));
         assert!(!names.contains(&"web_search"));
     }
 
-    #[test]
-    fn web_tools_included_when_enabled() {
+    #[tokio::test]
+    async fn web_tools_included_when_enabled() {
         let mut config = Config::default();
         config.web.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"web_search"));
     }
 
-    #[test]
-    fn tts_tool_excluded_when_disabled() {
+    #[tokio::test]
+    async fn tts_tool_excluded_when_disabled() {
         let mut config = Config::default();
         config.tts.enabled = false;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(!names.contains(&"text_to_speech"));
     }
 
-    #[test]
-    fn tts_tool_included_when_enabled() {
+    #[tokio::test]
+    async fn tts_tool_included_when_enabled() {
         let mut config = Config::default();
         config.tts.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"text_to_speech"));
     }
 
-    #[test]
-    fn image_gen_tool_excluded_when_disabled() {
+    #[tokio::test]
+    async fn image_gen_tool_excluded_when_disabled() {
         let mut config = Config::default();
         config.image_gen.enabled = false;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(!names.contains(&"generate_image"));
     }
 
-    #[test]
-    fn image_gen_tool_included_when_enabled() {
+    #[tokio::test]
+    async fn image_gen_tool_included_when_enabled() {
         let mut config = Config::default();
         config.image_gen.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"generate_image"));
     }
 
-    #[test]
-    fn all_tool_definitions_have_valid_schema() {
+    #[tokio::test]
+    async fn all_tool_definitions_have_valid_schema() {
         let mut config = Config::default();
         config.browser.enabled = true;
         config.web.enabled = true;
         config.tts.enabled = true;
         config.image_gen.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
 
         for def in &defs {
             assert!(!def.function.name.is_empty(), "tool name must not be empty");
@@ -702,14 +703,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_duplicate_tool_names() {
+    #[tokio::test]
+    async fn no_duplicate_tool_names() {
         let mut config = Config::default();
         config.browser.enabled = true;
         config.web.enabled = true;
         config.tts.enabled = true;
         config.image_gen.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let mut seen = std::collections::HashSet::new();
         for def in &defs {
             assert!(
@@ -720,19 +721,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_sort_is_stable_across_config_variants() {
+    #[tokio::test]
+    async fn tool_sort_is_stable_across_config_variants() {
         // Tools with all optional features enabled
         let mut config_full = Config::default();
         config_full.browser.enabled = true;
         config_full.web.enabled = true;
         config_full.tts.enabled = true;
         config_full.image_gen.enabled = true;
-        let mut defs_full = core_tool_definitions(&config_full);
+        let mut defs_full = core_tool_definitions(&config_full).await;
         defs_full.sort_by(|a, b| a.function.name.cmp(&b.function.name));
 
         // Same config again — order must be identical
-        let mut defs_full2 = core_tool_definitions(&config_full);
+        let mut defs_full2 = core_tool_definitions(&config_full).await;
         defs_full2.sort_by(|a, b| a.function.name.cmp(&b.function.name));
 
         let names1: Vec<&str> = defs_full.iter().map(|d| d.function.name.as_str()).collect();
@@ -793,12 +794,12 @@ mod tests {
         assert!(schema["required"].is_array());
     }
 
-    #[test]
-    fn compact_schema_round_trip_valid() {
+    #[tokio::test]
+    async fn compact_schema_round_trip_valid() {
         let mut config = Config::default();
         config.browser.enabled = true;
         config.web.enabled = true;
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
 
         for def in &defs {
             let mut schema = def.function.parameters.clone();
@@ -812,10 +813,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compact_schema_reduces_token_count() {
+    #[tokio::test]
+    async fn compact_schema_reduces_token_count() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         // write_memory has "default" keys (append: false, scope: "global")
         let write_mem = defs
             .iter()
