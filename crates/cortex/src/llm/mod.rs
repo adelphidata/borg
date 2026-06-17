@@ -1031,7 +1031,7 @@ impl LlmClient {
         }
     }
 
-    #[cfg(all(test, feature = "phase9-tests-disabled"))]
+    #[cfg(test)]
     /// Resolve provider-reported cost; prefer top-level `cost`/`total_cost`, fall back to `cost_details`.
     fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
         transport::extract_provider_cost_usd(usage)
@@ -2069,7 +2069,7 @@ impl LlmClient {
         .await
     }
 
-    #[cfg(all(test, feature = "phase9-tests-disabled"))]
+    #[cfg(test)]
     /// Parse a single SSE line from an OpenAI-compatible provider.
     fn parse_openai_sse_line(line: &str, provider: &str, model: &str) -> crate::sse::SseAction {
         transport::parse_openai_sse_line(line, provider, model)
@@ -2087,7 +2087,7 @@ impl LlmClient {
 
     // ── Anthropic path ──
 
-    #[cfg(all(test, feature = "phase9-tests-disabled"))]
+    #[cfg(test)]
     fn build_anthropic_request(
         &self,
         messages: &[Message],
@@ -2117,7 +2117,7 @@ impl LlmClient {
         .await
     }
 
-    #[cfg(all(test, feature = "phase9-tests-disabled"))]
+    #[cfg(test)]
     /// Parse a single SSE line from Anthropic's streaming API.
     #[allow(clippy::too_many_arguments)]
     fn parse_anthropic_sse_line(
@@ -2235,7 +2235,7 @@ impl LlmClient {
 
 // ── OpenAI message sanitization ──
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

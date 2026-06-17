@@ -36,27 +36,27 @@ impl CostEventSink for PanicSink {
 
 /// Helper to create an LlmClient with Anthropic provider for testing.
 /// Uses a unique env var to avoid races with parallel tests.
-fn make_test_anthropic_client() -> LlmClient {
+async fn make_test_anthropic_client() -> LlmClient {
     let env_var = "BORG_TEST_ANTHROPIC_LLM";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
     config.llm.provider = Some("anthropic".to_string());
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
-    LlmClient::new(&config).unwrap()
+    LlmClient::new(&config).await.unwrap()
 }
 
-fn make_test_openai_client() -> LlmClient {
+async fn make_test_openai_client() -> LlmClient {
     let env_var = "BORG_TEST_OPENAI_LLM";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
     config.llm.provider = Some("openai".to_string());
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "gpt-4.1".to_string();
-    LlmClient::new(&config).unwrap()
+    LlmClient::new(&config).await.unwrap()
 }
 
-fn make_test_openrouter_client(cost_events: bool) -> LlmClient {
+async fn make_test_openrouter_client(cost_events: bool) -> LlmClient {
     let env_var = "BORG_TEST_OPENROUTER_LLM";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
@@ -64,7 +64,7 @@ fn make_test_openrouter_client(cost_events: bool) -> LlmClient {
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "openai/gpt-4o-mini".to_string();
     config.telemetry.cost_events = cost_events;
-    LlmClient::new(&config).unwrap()
+    LlmClient::new(&config).await.unwrap()
 }
 
 fn cost_context() -> CostEventContext {
@@ -74,8 +74,8 @@ fn cost_context() -> CostEventContext {
     }
 }
 
-#[test]
-fn air_gap_blocks_public_cloud_construction() {
+#[tokio::test]
+async fn air_gap_blocks_public_cloud_construction() {
     // outbound_allowed = false MUST refuse a PublicCloud provider before
     // any HTTP socket is created. Real failure mode: the ProviderRegistry
     // resolver loses its caller, leaving the air-gap setting silently
@@ -88,7 +88,7 @@ fn air_gap_blocks_public_cloud_construction() {
     config.llm.model = "gpt-4o-mini".to_string();
     config.providers.outbound_allowed = false;
 
-    let err = match LlmClient::new(&config) {
+    let err = match LlmClient::new(&config).await {
         Ok(_) => panic!("expected air-gap rejection"),
         Err(e) => e,
     };
@@ -99,19 +99,19 @@ fn air_gap_blocks_public_cloud_construction() {
     );
 }
 
-#[test]
-fn air_gap_allows_local_construction() {
+#[tokio::test]
+async fn air_gap_allows_local_construction() {
     // Ollama is Local — must construct cleanly under air-gap.
     let mut config = Config::default();
     config.llm.provider = Some("ollama".to_string());
     config.llm.model = "llama3".to_string();
     config.providers.outbound_allowed = false;
 
-    LlmClient::new(&config).expect("local provider must be allowed under air-gap");
+    LlmClient::new(&config).await.expect("local provider must be allowed under air-gap");
 }
 
-#[test]
-fn air_gap_skips_public_cloud_fallback_slot() {
+#[tokio::test]
+async fn air_gap_skips_public_cloud_fallback_slot() {
     // A primary Local provider with a PublicCloud fallback under air-gap
     // must construct, but the fallback slot must be dropped — otherwise
     // the failover path would silently make outbound calls.
@@ -132,18 +132,18 @@ fn air_gap_skips_public_cloud_fallback_slot() {
         base_url: None,
     });
 
-    let client = LlmClient::new(&config).expect("primary local must succeed");
+    let client = LlmClient::new(&config).await.expect("primary local must succeed");
     assert!(
         client.provider_slots.is_empty(),
         "PublicCloud fallback must be dropped under air-gap"
     );
 }
 
-#[test]
-fn openrouter_cost_event_uses_usage_cost_verbatim() {
+#[tokio::test]
+async fn openrouter_cost_event_uses_usage_cost_verbatim() {
     let sink = Arc::new(CollectingSink::default());
     let client =
-        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -165,11 +165,11 @@ fn openrouter_cost_event_uses_usage_cost_verbatim() {
     assert_eq!(events[0].cost_source, "openrouter_usage");
 }
 
-#[test]
-fn openrouter_missing_cost_emits_unknown_cost() {
+#[tokio::test]
+async fn openrouter_missing_cost_emits_unknown_cost() {
     let sink = Arc::new(CollectingSink::default());
     let client =
-        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -291,8 +291,8 @@ fn openrouter_sse_usage_cost_as_string_populates_provider_cost_usd() {
     assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000123"));
 }
 
-#[test]
-fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
+#[tokio::test]
+async fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
     // Negative: explicit `cost: null` with no `cost_details` must
     // resolve to `provider_cost_usd = None` AND propagate to
     // `cost_source = "unknown"`. Pins the parser→emitter contract that
@@ -303,7 +303,7 @@ fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
 
     let sink = Arc::new(CollectingSink::default());
     let client =
-        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
     client.emit_cost_event_best_effort("req-null", Some(&usage), "openai/gpt-4o-mini");
     let events = sink.take();
     assert_eq!(events.len(), 1);
@@ -311,8 +311,8 @@ fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
     assert!(!events[0].cost_usd_present);
 }
 
-#[test]
-fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
+#[tokio::test]
+async fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
     // Regression guard: a reported cost of exactly 0 (e.g. free-tier
     // model) is still authoritative provider attribution. Must NOT
     // collapse to `cost_source = "unknown"`.
@@ -322,7 +322,7 @@ fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
 
     let sink = Arc::new(CollectingSink::default());
     let client =
-        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
     client.emit_cost_event_best_effort("req-zero", Some(&usage), "openai/gpt-4o-mini");
     let events = sink.take();
     assert_eq!(events.len(), 1);
@@ -383,10 +383,10 @@ fn openrouter_non_streaming_usage_cost_resolves_via_extractor() {
     assert_eq!(resolved.as_deref(), Some("0.000123"));
 }
 
-#[test]
-fn openai_cost_event_uses_static_price_table() {
+#[tokio::test]
+async fn openai_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openai_client().with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openai_client().await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -407,10 +407,10 @@ fn openai_cost_event_uses_static_price_table() {
     assert_eq!(events[0].cost_source, "table_openai");
 }
 
-#[test]
-fn anthropic_cost_event_uses_static_price_table() {
+#[tokio::test]
+async fn anthropic_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_anthropic_client().with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_anthropic_client().await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -431,10 +431,10 @@ fn anthropic_cost_event_uses_static_price_table() {
     assert_eq!(events[0].cost_source, "table_anthropic");
 }
 
-#[test]
-fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
+#[tokio::test]
+async fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_anthropic_client().with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_anthropic_client().await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -455,10 +455,10 @@ fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
     assert_eq!(events[0].cost_source, "table_anthropic");
 }
 
-#[test]
-fn unknown_openai_model_emits_unknown_cost() {
+#[tokio::test]
+async fn unknown_openai_model_emits_unknown_cost() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openai_client().with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openai_client().await.with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -479,9 +479,9 @@ fn unknown_openai_model_emits_unknown_cost() {
     assert_eq!(events[0].cost_source, "unknown");
 }
 
-#[test]
-fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
-    let client = make_test_openrouter_client(false);
+#[tokio::test]
+async fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
+    let client = make_test_openrouter_client(false).await;
     let request = ChatRequest {
         model: client.provider.normalize_model(&client.llm_config.model),
         messages: vec![Message::user("hi")],
@@ -502,10 +502,10 @@ fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
     assert!(json.get("usage").is_none());
 }
 
-#[test]
-fn sink_panic_is_caught_and_does_not_propagate() {
+#[tokio::test]
+async fn sink_panic_is_caught_and_does_not_propagate() {
     let client =
-        make_test_openai_client().with_cost_event_sink(Arc::new(PanicSink), cost_context());
+        make_test_openai_client().await.with_cost_event_sink(Arc::new(PanicSink), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -524,11 +524,11 @@ fn sink_panic_is_caught_and_does_not_propagate() {
     assert!(result.is_ok(), "sink panic must not escape the LLM path");
 }
 
-#[test]
-fn anthropic_system_extraction() {
+#[tokio::test]
+async fn anthropic_system_extraction() {
     let messages = vec![Message::system("You are helpful."), Message::user("Hello")];
 
-    let client = make_test_anthropic_client();
+    let client = make_test_anthropic_client().await;
     let body = client.build_anthropic_request(&messages, None, false);
 
     // With prompt caching enabled by default, system is emitted as a content-block array.
@@ -559,6 +559,7 @@ fn anthropic_tool_result_conversion() {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::tool_result("call_1", "file contents here"),
     ];
@@ -614,6 +615,7 @@ fn anthropic_tool_result_carries_multimodal_image_blocks() {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::tool_result_multimodal("call_cap", parts),
     ];
@@ -636,15 +638,15 @@ fn anthropic_tool_result_carries_multimodal_image_blocks() {
     assert_eq!(inner[1]["source"]["data"], "iVBORw0KGgo=");
 }
 
-#[test]
-fn anthropic_tool_definition_conversion() {
+#[tokio::test]
+async fn anthropic_tool_definition_conversion() {
     let tools = vec![ToolDefinition::new(
         "test_tool",
         "A test tool",
         serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
     )];
 
-    let client = make_test_anthropic_client();
+    let client = make_test_anthropic_client().await;
 
     let body = client.build_anthropic_request(&[Message::user("hi")], Some(&tools), false);
 
@@ -684,6 +686,7 @@ fn anthropic_adjacent_tool_results_merge() {
             ]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::tool_result("call_1", "result a"),
         Message::tool_result("call_2", "result b"),
@@ -809,25 +812,25 @@ fn cooldown_auth_has_longer_base() {
     assert!(auth_until > rl_until);
 }
 
-#[test]
-fn effective_base_url_uses_config_override() {
+#[tokio::test]
+async fn effective_base_url_uses_config_override() {
     let mut config = Config::default();
     config.llm.provider = Some("ollama".to_string());
     config.llm.model = "llama3.3".to_string();
     config.llm.base_url = Some("http://custom:8080/v1/chat/completions".to_string());
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
     assert_eq!(
         client.effective_base_url().as_ref(),
         "http://custom:8080/v1/chat/completions"
     );
 }
 
-#[test]
-fn effective_base_url_falls_back_to_provider_default() {
+#[tokio::test]
+async fn effective_base_url_falls_back_to_provider_default() {
     let mut config = Config::default();
     config.llm.provider = Some("ollama".to_string());
     config.llm.model = "llama3.3".to_string();
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
     assert_eq!(
         client.effective_base_url().as_ref(),
         "http://localhost:11434/v1/chat/completions"
@@ -905,8 +908,8 @@ fn normalize_gemini_base_table() {
     }
 }
 
-#[test]
-fn effective_base_url_normalizes_gemini_override() {
+#[tokio::test]
+async fn effective_base_url_normalizes_gemini_override() {
     let mut config = Config::default();
     config.llm.provider = Some("gemini".to_string());
     config.llm.api_key_env = "GEMINI_API_KEY".to_string();
@@ -914,7 +917,7 @@ fn effective_base_url_normalizes_gemini_override() {
     config.llm.base_url =
         Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
     std::env::set_var("GEMINI_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
     assert_eq!(
         client.effective_base_url().as_ref(),
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -922,15 +925,15 @@ fn effective_base_url_normalizes_gemini_override() {
     std::env::remove_var("GEMINI_API_KEY");
 }
 
-#[test]
-fn anthropic_request_thinking_off_includes_temperature() {
+#[tokio::test]
+async fn anthropic_request_thinking_off_includes_temperature() {
     let mut config = Config::default();
     config.llm.provider = Some("anthropic".to_string());
     config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
     config.llm.model = "claude-sonnet-4-20250514".to_string();
     config.llm.thinking = crate::config::ThinkingLevel::Off;
     std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
 
     let messages = vec![Message::user("hi")];
     let body = client.build_anthropic_request(&messages, None, false);
@@ -946,15 +949,15 @@ fn anthropic_request_thinking_off_includes_temperature() {
     std::env::remove_var("ANTHROPIC_API_KEY");
 }
 
-#[test]
-fn anthropic_request_thinking_enabled_omits_temperature() {
+#[tokio::test]
+async fn anthropic_request_thinking_enabled_omits_temperature() {
     let mut config = Config::default();
     config.llm.provider = Some("anthropic".to_string());
     config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
     config.llm.model = "claude-sonnet-4-20250514".to_string();
     config.llm.thinking = crate::config::ThinkingLevel::High;
     std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
 
     let messages = vec![Message::user("hi")];
     let body = client.build_anthropic_request(&messages, None, false);
@@ -975,8 +978,8 @@ fn anthropic_request_thinking_enabled_omits_temperature() {
     std::env::remove_var("ANTHROPIC_API_KEY");
 }
 
-#[test]
-fn anthropic_request_adaptive_emits_8192_budget() {
+#[tokio::test]
+async fn anthropic_request_adaptive_emits_8192_budget() {
     // Adaptive on Anthropic is the moderate provider-best default. If anyone
     // bumps it to a different number, an operator running `/think adaptive`
     // suddenly pays a different bill — fail loudly instead.
@@ -986,7 +989,7 @@ fn anthropic_request_adaptive_emits_8192_budget() {
     config.llm.model = "claude-sonnet-4-20250514".to_string();
     config.llm.thinking = crate::config::ThinkingLevel::Adaptive;
     std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
 
     let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
 
@@ -1002,8 +1005,8 @@ fn anthropic_request_adaptive_emits_8192_budget() {
     std::env::remove_var("ANTHROPIC_API_KEY");
 }
 
-#[test]
-fn anthropic_request_max_emits_64000_budget() {
+#[tokio::test]
+async fn anthropic_request_max_emits_64000_budget() {
     // Max ceiling is load-bearing: it's what users get when they type
     // `/think max`. Drifting this number silently changes the cost of the
     // documented "go all-in" mode.
@@ -1013,7 +1016,7 @@ fn anthropic_request_max_emits_64000_budget() {
     config.llm.model = "claude-sonnet-4-20250514".to_string();
     config.llm.thinking = crate::config::ThinkingLevel::Max;
     std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
 
     let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
 
@@ -1021,8 +1024,8 @@ fn anthropic_request_max_emits_64000_budget() {
     std::env::remove_var("ANTHROPIC_API_KEY");
 }
 
-#[test]
-fn anthropic_request_per_model_override_disables_thinking() {
+#[tokio::test]
+async fn anthropic_request_per_model_override_disables_thinking() {
     // Operator pattern: global thinking = High, but an override pins one
     // model to Off (e.g. for a fast lane). The override MUST win, otherwise
     // per-model defaults are decorative.
@@ -1036,7 +1039,7 @@ fn anthropic_request_per_model_override_disables_thinking() {
         .thinking_overrides
         .insert("haiku".to_string(), crate::config::ThinkingLevel::Off);
     std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let client = LlmClient::new(&config).expect("should create client");
+    let client = LlmClient::new(&config).await.expect("should create client");
 
     let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
 
@@ -1360,6 +1363,7 @@ fn openai_sanitizes_null_content_on_tool_call_messages() {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::tool_result("call_1", "result"),
     ];
@@ -1401,6 +1405,7 @@ fn openai_drops_empty_user_message_for_gemini_compat() {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
     ];
 
@@ -1429,6 +1434,7 @@ fn openai_drops_empty_assistant_message_without_tool_calls() {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::user("actual question"),
     ];
@@ -1457,6 +1463,7 @@ fn openai_drops_none_content_assistant_without_tool_calls() {
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message::user("follow up"),
     ];
@@ -1484,6 +1491,7 @@ fn openai_preserves_tool_result_messages() {
             }]),
             tool_call_id: None,
             timestamp: None,
+            seq: None,
         },
         Message {
             role: Role::Tool,
@@ -1491,6 +1499,7 @@ fn openai_preserves_tool_result_messages() {
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
             timestamp: None,
+            seq: None,
         },
     ];
 
@@ -1502,9 +1511,9 @@ fn openai_preserves_tool_result_messages() {
 // ── Prompt caching (Anthropic) ──
 
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-#[test]
-fn anthropic_request_includes_cache_control_on_system() {
-    let client = make_test_anthropic_client();
+#[tokio::test]
+async fn anthropic_request_includes_cache_control_on_system() {
+    let client = make_test_anthropic_client().await;
     let messages = vec![Message::system("stable system prompt"), Message::user("hi")];
     let body = client.build_anthropic_request(&messages, None, false);
 
@@ -1518,9 +1527,9 @@ fn anthropic_request_includes_cache_control_on_system() {
 }
 
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-#[test]
-fn anthropic_request_caches_last_two_messages() {
-    let client = make_test_anthropic_client();
+#[tokio::test]
+async fn anthropic_request_caches_last_two_messages() {
+    let client = make_test_anthropic_client().await;
     // 5 user/assistant messages so we can verify ONLY the last two carry markers.
     let messages = vec![
         Message::system("sys"),
@@ -1565,8 +1574,8 @@ fn anthropic_request_caches_last_two_messages() {
 }
 
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-#[test]
-fn anthropic_request_cache_disabled_emits_no_markers() {
+#[tokio::test]
+async fn anthropic_request_cache_disabled_emits_no_markers() {
     let env_var = "BORG_TEST_ANTHROPIC_CACHE_OFF";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
@@ -1574,7 +1583,7 @@ fn anthropic_request_cache_disabled_emits_no_markers() {
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
     config.llm.cache.enabled = false;
-    let client = LlmClient::new(&config).unwrap();
+    let client = LlmClient::new(&config).await.unwrap();
 
     let messages = vec![
         Message::system("sys"),
@@ -1636,9 +1645,9 @@ fn apply_message_cache_control_upgrades_string_content() {
 // ── New prompt caching tests ──
 
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-#[test]
-fn anthropic_request_marks_last_tool_with_cache_control() {
-    let client = make_test_anthropic_client();
+#[tokio::test]
+async fn anthropic_request_marks_last_tool_with_cache_control() {
+    let client = make_test_anthropic_client().await;
     let messages = vec![Message::system("sys"), Message::user("hi")];
     let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
     let body = client.build_anthropic_request(&messages, Some(&tools), false);
@@ -1659,8 +1668,8 @@ fn anthropic_request_marks_last_tool_with_cache_control() {
 }
 
 #[allow(clippy::unwrap_used)]
-#[test]
-fn anthropic_request_cache_disabled_leaves_tools_unmarked() {
+#[tokio::test]
+async fn anthropic_request_cache_disabled_leaves_tools_unmarked() {
     let env_var = "BORG_TEST_ANTHROPIC_TOOLS_NOCACHE";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
@@ -1668,7 +1677,7 @@ fn anthropic_request_cache_disabled_leaves_tools_unmarked() {
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
     config.llm.cache.enabled = false;
-    let client = LlmClient::new(&config).unwrap();
+    let client = LlmClient::new(&config).await.unwrap();
 
     let tools = vec![make_tool("a"), make_tool("b")];
     let messages = vec![Message::system("sys"), Message::user("hi")];
@@ -1753,8 +1762,8 @@ fn build_cache_control_marker_one_hour() {
 }
 
 #[allow(clippy::unwrap_used)]
-#[test]
-fn anthropic_request_honors_one_hour_ttl() {
+#[tokio::test]
+async fn anthropic_request_honors_one_hour_ttl() {
     let env_var = "BORG_TEST_ANTHROPIC_TTL_1H";
     std::env::set_var(env_var, "sk-test");
     let mut config = Config::default();
@@ -1762,7 +1771,7 @@ fn anthropic_request_honors_one_hour_ttl() {
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
     config.llm.cache.ttl = crate::config::CacheTtl::OneHour;
-    let client = LlmClient::new(&config).unwrap();
+    let client = LlmClient::new(&config).await.unwrap();
 
     let tools = vec![make_tool("a")];
     let messages = vec![Message::system("sys"), Message::user("hi")];
@@ -1775,7 +1784,7 @@ fn anthropic_request_honors_one_hour_ttl() {
 // ── Cache strategy: system_and_3 ──
 
 #[allow(clippy::unwrap_used)]
-fn make_system_and_3_client(env_var: &'static str) -> (LlmClient, &'static str) {
+async fn make_system_and_3_client(env_var: &'static str) -> (LlmClient, &'static str) {
     // Each caller passes a unique env var name so parallel tests don't race
     // on set_var / remove_var of a shared key (was causing flaky failures
     // where one test removed the var while another was still reading it).
@@ -1785,13 +1794,13 @@ fn make_system_and_3_client(env_var: &'static str) -> (LlmClient, &'static str) 
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
     config.llm.cache.strategy = crate::config::CacheStrategy::SystemAnd3;
-    (LlmClient::new(&config).unwrap(), env_var)
+    (LlmClient::new(&config).await.unwrap(), env_var)
 }
 
 #[allow(clippy::unwrap_used)]
-#[test]
-fn anthropic_request_system_and_3_no_tools_marker() {
-    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_A");
+#[tokio::test]
+async fn anthropic_request_system_and_3_no_tools_marker() {
+    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_A").await;
     let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
     let messages = vec![Message::system("sys"), Message::user("hi")];
     let body = client.build_anthropic_request(&messages, Some(&tools), false);
@@ -1812,9 +1821,9 @@ fn anthropic_request_system_and_3_no_tools_marker() {
 }
 
 #[allow(clippy::unwrap_used)]
-#[test]
-fn anthropic_request_system_and_3_marks_last_three_messages() {
-    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_B");
+#[tokio::test]
+async fn anthropic_request_system_and_3_marks_last_three_messages() {
+    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_B").await;
     let messages = vec![
         Message::system("sys"),
         Message::user("turn 1"),
@@ -1853,10 +1862,10 @@ fn anthropic_request_system_and_3_marks_last_three_messages() {
 }
 
 #[allow(clippy::unwrap_used)]
-#[test]
-fn anthropic_request_system_and_3_fewer_than_three_messages() {
+#[tokio::test]
+async fn anthropic_request_system_and_3_fewer_than_three_messages() {
     // With only 1 user message the helper must not crash; fewer breakpoints is fine.
-    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_C");
+    let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_C").await;
     let messages = vec![Message::system("sys"), Message::user("only one")];
     let body = client.build_anthropic_request(&messages, None, false);
     let msgs = body["messages"].as_array().unwrap();
@@ -1993,9 +2002,9 @@ fn prompt_cache_config_rolling_messages_clamped() {
     assert_eq!(cfg.rolling_messages_clamped(), 1);
 }
 
-#[test]
-fn with_prompt_cache_key_sets_field() {
-    let client = make_test_anthropic_client().with_prompt_cache_key("sess-xyz");
+#[tokio::test]
+async fn with_prompt_cache_key_sets_field() {
+    let client = make_test_anthropic_client().await.with_prompt_cache_key("sess-xyz");
     assert_eq!(client.prompt_cache_key.as_deref(), Some("sess-xyz"));
 }
 
@@ -2222,8 +2231,8 @@ fn openrouter_sse_without_cache_creation_field_reports_zero() {
     assert_eq!(usage.cached_input_tokens, 0);
 }
 
-#[test]
-fn for_auxiliary_falls_through_to_primary_when_aux_unset() {
+#[tokio::test]
+async fn for_auxiliary_falls_through_to_primary_when_aux_unset() {
     // Back-compat invariant: pre-aux-feature configs (`llm.aux = None`)
     // must produce a working client identical to `LlmClient::new`. A
     // regression here breaks every existing deployment on first reload.
@@ -2235,13 +2244,13 @@ fn for_auxiliary_falls_through_to_primary_when_aux_unset() {
     config.llm.model = "claude-sonnet-4".to_string();
     assert!(config.llm.aux.is_none(), "aux defaults to None");
 
-    let client = LlmClient::for_auxiliary(&config).expect("aux-unset must fall through to primary");
+    let client = LlmClient::for_auxiliary(&config).await.expect("aux-unset must fall through to primary");
     assert_eq!(client.provider, Provider::Anthropic);
     assert_eq!(client.llm_config.model, "claude-sonnet-4");
 }
 
-#[test]
-fn for_auxiliary_resolves_auto_sentinel_via_picker() {
+#[tokio::test]
+async fn for_auxiliary_resolves_auto_sentinel_via_picker() {
     // The onboarding-emitted `[llm.aux] model = "auto"` row gets
     // materialized into a concrete model id at client-construction time.
     // If the resolver dead-ends silently, every aux call would request a
@@ -2260,7 +2269,7 @@ fn for_auxiliary_resolves_auto_sentinel_via_picker() {
         ..Default::default()
     });
 
-    let client = LlmClient::for_auxiliary(&config).expect("auto sentinel must resolve");
+    let client = LlmClient::for_auxiliary(&config).await.expect("auto sentinel must resolve");
     assert_eq!(client.provider, Provider::Anthropic);
     assert_eq!(
         client.llm_config.model,
@@ -2269,8 +2278,8 @@ fn for_auxiliary_resolves_auto_sentinel_via_picker() {
     );
 }
 
-#[test]
-fn for_auxiliary_passes_concrete_model_through() {
+#[tokio::test]
+async fn for_auxiliary_passes_concrete_model_through() {
     // Power-user override: setting `llm.aux.model` to a real model id
     // bypasses the resolver entirely. Locks the override invariant — if
     // we later add a "normalize aux model" pass, it must not stomp the
@@ -2288,12 +2297,12 @@ fn for_auxiliary_passes_concrete_model_through() {
         ..Default::default()
     });
 
-    let client = LlmClient::for_auxiliary(&config).expect("concrete model must pass through");
+    let client = LlmClient::for_auxiliary(&config).await.expect("concrete model must pass through");
     assert_eq!(client.llm_config.model, "claude-haiku-4-5");
 }
 
-#[test]
-fn for_auxiliary_falls_through_for_local_provider() {
+#[tokio::test]
+async fn for_auxiliary_falls_through_for_local_provider() {
     // Local providers (Ollama, Claude CLI) have no aux-default entry in
     // the picker. A naive `unwrap_or("")` would route every aux call to
     // the empty model id and 400 immediately — instead, we silently fall
@@ -2308,14 +2317,14 @@ fn for_auxiliary_falls_through_for_local_provider() {
     });
 
     let client =
-        LlmClient::for_auxiliary(&config).expect("local-provider aux must fall through, not error");
+        LlmClient::for_auxiliary(&config).await.expect("local-provider aux must fall through, not error");
     // Falls through to primary, which is also ollama.
     assert_eq!(client.provider, Provider::Ollama);
     assert_eq!(client.llm_config.model, "llama3");
 }
 
-#[test]
-fn for_auxiliary_synthesizes_separate_fallback_chain() {
+#[tokio::test]
+async fn for_auxiliary_synthesizes_separate_fallback_chain() {
     // Isolation invariant: the aux client's `provider_slots` must be a
     // distinct allocation that mirrors `aux.fallback`, NOT shared with
     // (or derived from) the primary's `llm.fallback`. Shared cooldown
@@ -2375,8 +2384,8 @@ fn for_auxiliary_synthesizes_separate_fallback_chain() {
         ..Default::default()
     });
 
-    let primary = LlmClient::new(&config).expect("primary must build");
-    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+    let primary = LlmClient::new(&config).await.expect("primary must build");
+    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
 
     assert_eq!(primary.provider_slots.len(), 1);
     assert_eq!(aux.provider_slots.len(), 2);
@@ -2390,8 +2399,8 @@ fn for_auxiliary_synthesizes_separate_fallback_chain() {
     assert!(aux.llm_config.aux.is_none(), "aux must not nest aux");
 }
 
-#[test]
-fn for_auxiliary_forces_thinking_off() {
+#[tokio::test]
+async fn for_auxiliary_forces_thinking_off() {
     // Aux work doesn't benefit from extended reasoning, and the cheap
     // sibling models in `aux_model_picker` either don't support it or
     // pay latency for nothing. Primary's `thinking="high"` must NOT
@@ -2410,7 +2419,7 @@ fn for_auxiliary_forces_thinking_off() {
         ..Default::default()
     });
 
-    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
     assert_eq!(
         aux.llm_config.thinking,
         crate::config::llm::ThinkingLevel::Off,
@@ -2418,8 +2427,8 @@ fn for_auxiliary_forces_thinking_off() {
     );
 }
 
-#[test]
-fn for_auxiliary_clears_thinking_overrides_so_picker_choice_stays_off() {
+#[tokio::test]
+async fn for_auxiliary_clears_thinking_overrides_so_picker_choice_stays_off() {
     // Regression for the failure mode the for_auxiliary doc-comment
     // describes: an operator pins `"claude"` → High on primary, the aux
     // picker then chooses `claude-haiku-4-5`, and the substring override
@@ -2444,7 +2453,7 @@ fn for_auxiliary_clears_thinking_overrides_so_picker_choice_stays_off() {
         ..Default::default()
     });
 
-    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
     assert!(
         aux.llm_config.thinking_overrides.is_empty(),
         "primary overrides must be wiped from aux"
@@ -2684,13 +2693,13 @@ fn azure_test_config(env_var: &str) -> Config {
     cfg
 }
 
-#[test]
-fn azure_openai_construction_fails_without_settings() {
+#[tokio::test]
+async fn azure_openai_construction_fails_without_settings() {
     // LlmClient::new must reject an Azure config that's missing the
     // required Azure settings — fail-fast at start rather than 400 on
     // first prompt. This pins the construction-time guard.
     let cfg = azure_test_config("BORG_TEST_AZURE_MISSING");
-    let err = match LlmClient::new(&cfg) {
+    let err = match LlmClient::new(&cfg).await {
         Ok(_) => panic!("expected Azure config-missing error"),
         Err(e) => e.to_string(),
     };
@@ -2700,8 +2709,8 @@ fn azure_openai_construction_fails_without_settings() {
     );
 }
 
-#[test]
-fn azure_openai_construction_succeeds_with_settings() {
+#[tokio::test]
+async fn azure_openai_construction_succeeds_with_settings() {
     // Mirror of the failure case: with all three fields set, construction
     // succeeds and the composed URL is stored as the effective base URL.
     let mut cfg = azure_test_config("BORG_TEST_AZURE_OK");
@@ -2709,7 +2718,7 @@ fn azure_openai_construction_succeeds_with_settings() {
     cfg.llm.azure_deployment = Some("gpt-4o-prod".to_string());
     cfg.llm.azure_api_version = Some("2024-10-21".to_string());
 
-    let client = LlmClient::new(&cfg).expect("Azure client should construct");
+    let client = LlmClient::new(&cfg).await.expect("Azure client should construct");
     let url = client.effective_base_url().to_string();
     assert_eq!(
         url,
@@ -2717,8 +2726,8 @@ fn azure_openai_construction_succeeds_with_settings() {
     );
 }
 
-#[test]
-fn azure_openai_construction_respects_base_url_override() {
+#[tokio::test]
+async fn azure_openai_construction_respects_base_url_override() {
     // Operators sometimes proxy Azure through a private gateway. When
     // `llm.base_url` is set, the Azure URL composer must defer to it.
     let mut cfg = azure_test_config("BORG_TEST_AZURE_PROXY");
@@ -2726,7 +2735,7 @@ fn azure_openai_construction_respects_base_url_override() {
         "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21".to_string(),
     );
 
-    let client = LlmClient::new(&cfg).expect("base_url override should bypass composer");
+    let client = LlmClient::new(&cfg).await.expect("base_url override should bypass composer");
     let url = client.effective_base_url().to_string();
     assert_eq!(
         url,
