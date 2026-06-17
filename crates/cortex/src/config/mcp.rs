@@ -86,7 +86,7 @@ pub struct McpServerConfig {
     /// Initial handshake timeout. Default: 60_000 ms.
     #[serde(default = "default_connect_ms")]
     pub connect_timeout_ms: u64,
-    /// Per-call timeout for `tools/call`. Default: 120_000 ms.
+    /// Per-call timeout for `tools/call`. Default: 300_000 ms.
     #[serde(default = "default_call_ms")]
     pub call_timeout_ms: u64,
     /// Steady-state per-minute call rate. Default: 60.
@@ -107,7 +107,7 @@ fn default_connect_ms() -> u64 {
     60_000
 }
 fn default_call_ms() -> u64 {
-    120_000
+    300_000
 }
 fn default_rate_per_minute() -> u32 {
     60
@@ -385,6 +385,22 @@ mod tests {
         c.credentials
             .insert(name.to_string(), CredentialValue::EnvVar(name.to_string()));
         c
+    }
+
+    #[test]
+    fn call_timeout_ms_defaults_to_300s_when_omitted() {
+        // Spec: a server config that omits `call_timeout_ms` inherits the
+        // 300_000 ms default. Long-running MCP tools should not hit a
+        // 2-minute ceiling unless an operator opts into a shorter one. This
+        // pins the serde default so a regression in `default_call_ms` fails.
+        let json = serde_json::json!({
+            "transport": { "type": "stdio", "command": "true" }
+        });
+        let server: McpServerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(server.call_timeout_ms, 300_000);
+        // And the resolved wire manifest carries that same wall-clock bound.
+        let manifest = server.resolve_to_manifest("t", &Config::default()).unwrap();
+        assert_eq!(manifest.call_timeout, Duration::from_millis(300_000));
     }
 
     #[test]
