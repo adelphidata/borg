@@ -294,7 +294,7 @@ fn higher_threat(a: ThreatLevel, b: ThreatLevel) -> ThreatLevel {
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::skills::SkillRequires;
@@ -576,31 +576,31 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), body).unwrap();
     }
 
-    #[test]
-    fn audit_missing_dir_is_empty_not_error() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn audit_missing_dir_is_empty_not_error() {
+        let db = Database::test_db().await;
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        let findings = audit_user_skills(&db, &missing);
+        let findings = audit_user_skills(&db, &missing).await;
         assert!(findings.is_empty());
     }
 
-    #[test]
-    fn audit_empty_dir_is_empty() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn audit_empty_dir_is_empty() {
+        let db = Database::test_db().await;
         let dir = tempfile::tempdir().unwrap();
-        let findings = audit_user_skills(&db, dir.path());
+        let findings = audit_user_skills(&db, dir.path()).await;
         assert!(findings.is_empty());
     }
 
-    #[test]
-    fn audit_first_pass_records_all_as_first_seen() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn audit_first_pass_records_all_as_first_seen() {
+        let db = Database::test_db().await;
         let dir = tempfile::tempdir().unwrap();
         write_skill(dir.path(), "alpha", "alpha body");
         write_skill(dir.path(), "beta", "beta body");
 
-        let findings = audit_user_skills(&db, dir.path());
+        let findings = audit_user_skills(&db, dir.path()).await;
         assert_eq!(findings.len(), 2);
         assert!(findings
             .iter()
@@ -608,19 +608,19 @@ mod tests {
         assert!(findings.iter().all(|f| !f.is_modified()));
     }
 
-    #[test]
-    fn audit_flags_modified_skill_on_second_pass() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn audit_flags_modified_skill_on_second_pass() {
+        let db = Database::test_db().await;
         let dir = tempfile::tempdir().unwrap();
         write_skill(dir.path(), "alpha", "alpha body");
         write_skill(dir.path(), "beta", "beta body");
-        let first = audit_user_skills(&db, dir.path());
+        let first = audit_user_skills(&db, dir.path()).await;
         assert_eq!(first.len(), 2);
 
         // Tamper with alpha; leave beta alone.
         write_skill(dir.path(), "alpha", "ALPHA MODIFIED");
 
-        let second = audit_user_skills(&db, dir.path());
+        let second = audit_user_skills(&db, dir.path()).await;
         let alpha = second.iter().find(|f| f.name == "alpha").unwrap();
         let beta = second.iter().find(|f| f.name == "beta").unwrap();
         assert!(alpha.is_modified(), "alpha should be flagged as modified");
@@ -628,15 +628,15 @@ mod tests {
         assert_eq!(beta.outcome, SkillAuditOutcome::Unchanged);
     }
 
-    #[test]
-    fn audit_skips_directory_without_skill_md() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn audit_skips_directory_without_skill_md() {
+        let db = Database::test_db().await;
         let dir = tempfile::tempdir().unwrap();
         // Directory with no SKILL.md — e.g. leftover references/ or .git
         std::fs::create_dir_all(dir.path().join("not-a-skill")).unwrap();
         write_skill(dir.path(), "real-skill", "body");
 
-        let findings = audit_user_skills(&db, dir.path());
+        let findings = audit_user_skills(&db, dir.path()).await;
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].name, "real-skill");
     }
