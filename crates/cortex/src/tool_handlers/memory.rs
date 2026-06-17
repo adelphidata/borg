@@ -460,7 +460,7 @@ pub fn format_search_results(results: &[embeddings::SearchResult]) -> String {
     output.trim_end().to_string()
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -580,34 +580,34 @@ mod tests {
         assert!(out.ends_with('…'));
     }
 
-    #[test]
-    fn handle_write_memory_missing_filename_errors() {
+    #[tokio::test]
+    async fn handle_write_memory_missing_filename_errors() {
         let cfg = Config::default();
         let args = serde_json::json!({"content": "hi"});
-        let err = handle_write_memory(&args, &cfg).unwrap_err().to_string();
+        let err = handle_write_memory(&args, &cfg).await.unwrap_err().to_string();
         assert!(err.contains("filename"), "got: {err}");
     }
 
-    #[test]
-    fn handle_write_memory_missing_content_errors() {
+    #[tokio::test]
+    async fn handle_write_memory_missing_content_errors() {
         let cfg = Config::default();
         let args = serde_json::json!({"filename": "x.md"});
-        let err = handle_write_memory(&args, &cfg).unwrap_err().to_string();
+        let err = handle_write_memory(&args, &cfg).await.unwrap_err().to_string();
         assert!(err.contains("content"), "got: {err}");
     }
 
-    #[test]
-    fn handle_read_memory_missing_filename_errors() {
+    #[tokio::test]
+    async fn handle_read_memory_missing_filename_errors() {
         let cfg = Config::default();
         let args = serde_json::json!({});
-        let err = handle_read_memory(&args, &cfg).unwrap_err().to_string();
+        let err = handle_read_memory(&args, &cfg).await.unwrap_err().to_string();
         assert!(err.contains("filename"), "got: {err}");
     }
 
     /// Combined lifecycle test: uses BORG_DATA_DIR, so kept as a single test to
     /// avoid env-var races with other tests in this crate.
-    #[test]
-    fn handle_write_and_read_roundtrip_global() {
+    #[tokio::test]
+    async fn handle_write_and_read_roundtrip_global() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BORG_DATA_DIR", tmp.path());
         let cfg = Config::default();
@@ -616,10 +616,10 @@ mod tests {
             "filename": "note.md",
             "content": "alpha",
         });
-        let msg = handle_write_memory(&args, &cfg).expect("write global");
+        let msg = handle_write_memory(&args, &cfg).await.expect("write global");
         assert!(msg.contains("note"), "got: {msg}");
 
-        let read = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg)
+        let read = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg).await
             .expect("read global");
         assert_eq!(read.trim(), "alpha");
 
@@ -631,14 +631,14 @@ mod tests {
                 "append": true,
             }),
             &cfg,
-        )
+        ).await
         .expect("append global");
-        let read2 = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg)
+        let read2 = handle_read_memory(&serde_json::json!({"filename": "note.md"}), &cfg).await
             .expect("read after append");
         assert!(read2.contains("alpha"));
         assert!(read2.contains("beta"));
 
-        let missing = handle_read_memory(&serde_json::json!({"filename": "missing.md"}), &cfg)
+        let missing = handle_read_memory(&serde_json::json!({"filename": "missing.md"}), &cfg).await
             .expect("read missing");
         assert!(missing.contains("not found"), "got: {missing}");
 
