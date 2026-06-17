@@ -510,6 +510,18 @@ async fn async_main() -> Result<()> {
             }
         }
 
+        // If the database was unreadable on open, recovery preserved it aside
+        // and rebuilt an empty one so the agent could still boot. Tell the user
+        // once, here, where the original went.
+        if let Some(notice) = cortex::db::Database::take_recovery_notice() {
+            eprintln!(
+                "Notice: your database was unreadable and has been rebuilt empty. \
+                 The original was preserved at {} — remove it once you've confirmed \
+                 you don't need it.",
+                notice.backup_path.display()
+            );
+        }
+
         let (otel_layers, tg) = cortex::telemetry::init_telemetry(&config.telemetry)
             .unwrap_or_else(|e| {
                 eprintln!("Warning: OpenTelemetry init failed: {e}");

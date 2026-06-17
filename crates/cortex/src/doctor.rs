@@ -267,7 +267,32 @@ async fn run_diagnostics_with_registry_opts(
     if let Some(reg) = registry {
         check_subprocesses(config, reg, &mut checks);
     }
+    check_db_recovery(&mut checks);
     DiagnosticReport { checks }
+}
+
+/// Surface an automatic database recovery that happened earlier in this
+/// process: the live DB was unreadable on open, so it was preserved aside and
+/// rebuilt empty. Non-draining (`peek`) so the boot path's user-facing notice
+/// still fires. Passes silently when no recovery occurred.
+fn check_db_recovery(checks: &mut Vec<DiagnosticCheck>) {
+    checks.push(db_recovery_check(crate::db::Database::peek_recovery_notice()));
+}
+
+/// Pure mapping from a recovery notice to a diagnostic check, split out so the
+/// warn/pass rendering is testable without poking the process-global.
+fn db_recovery_check(notice: Option<crate::db::RecoveryNotice>) -> DiagnosticCheck {
+    match notice {
+        Some(notice) => DiagnosticCheck::warn(
+            "Database",
+            "Auto-recovered",
+            format!(
+                "database was unreadable and rebuilt empty; the original is preserved at {}",
+                notice.backup_path.display()
+            ),
+        ),
+        None => DiagnosticCheck::pass("Database", "Integrity"),
+    }
 }
 
 /// Subprocess registry health: surfaces `Warn`/`Fail` when one or more

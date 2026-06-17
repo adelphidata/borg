@@ -91,7 +91,55 @@ pub struct Database {
     read_only: bool,
 }
 
+/// Records that the primary database was unreadable on open and had to be
+/// preserved aside and recreated. Borg keeps no on-disk rollouts to rebuild
+/// structured state from, so recovery is preserve-and-restart, not
+/// reconstruct: the bad file is moved to `borg.db.corrupt-<unix_ts>` and a
+/// fresh, migrated database takes its place. This upholds the "agent always
+/// boots" invariant — a corrupt DB degrades to a clean slate, never a dead
+/// process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryNotice {
+    /// Where the unreadable original was preserved.
+    pub backup_path: PathBuf,
+    /// The freshly-created database now in use (the original path).
+    pub new_path: PathBuf,
+}
+
+/// Process-global record of the most recent automatic DB recovery. Lets the
+/// boot path and `doctor` surface the event to the user without threading a
+/// return value through the ~40 `Database::open()` call sites. One-shot:
+/// [`Database::take_recovery_notice`] drains it.
+static LAST_RECOVERY: Mutex<Option<RecoveryNotice>> = Mutex::new(None);
+
+fn record_recovery(notice: &RecoveryNotice) {
+    *LAST_RECOVERY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notice.clone());
+}
+
 impl Database {
+    /// Drain the most recent automatic-recovery notice, if any. Called once by
+    /// the boot path / `doctor` to tell the user their database was rebuilt and
+    /// where the corrupt original was preserved. Returns `None` when no
+    /// recovery occurred (the common case).
+    pub fn take_recovery_notice() -> Option<RecoveryNotice> {
+        LAST_RECOVERY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Inspect the most recent automatic-recovery notice without draining it.
+    /// `doctor` uses this so it can report a recovery that happened earlier in
+    /// the same process without consuming the one-shot the boot path drains.
+    pub fn peek_recovery_notice() -> Option<RecoveryNotice> {
+        LAST_RECOVERY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Get a reference to the underlying connection. Cheap to clone if the
     /// caller needs an owned handle for an async task — libsql's `Connection`
     /// is internally `Arc`'d.
@@ -122,10 +170,19 @@ impl Database {
     }
 
     /// Open (or create) the database with a custom busy timeout (in milliseconds).
+    ///
+    /// Auto-recovers from an unreadable (corrupt) database or a path that is
+    /// unexpectedly not a regular file: the bad file is preserved and a fresh
+    /// one created so the agent always boots. See [`RecoveryNotice`].
     #[instrument(skip_all)]
     pub async fn open_with_timeout(busy_timeout_ms: u64) -> Result<Self> {
         let path = Self::db_path()?;
-        Self::open_at_inner(&path, busy_timeout_ms, None, false).await
+        let now = crate::util::time::now_unix().max(0) as u64;
+        let (db, notice) = Self::open_at_recovering(&path, busy_timeout_ms, None, now).await?;
+        if let Some(n) = notice {
+            record_recovery(&n);
+        }
+        Ok(db)
     }
 
     /// Open (or create) the database with a KEK-derived AES-256 key.
@@ -135,7 +192,13 @@ impl Database {
     #[instrument(skip_all)]
     pub async fn open_encrypted(key: &[u8]) -> Result<Self> {
         let path = Self::db_path()?;
-        Self::open_at_inner(&path, Self::DEFAULT_BUSY_TIMEOUT_MS, Some(key), false).await
+        let now = crate::util::time::now_unix().max(0) as u64;
+        let (db, notice) =
+            Self::open_at_recovering(&path, Self::DEFAULT_BUSY_TIMEOUT_MS, Some(key), now).await?;
+        if let Some(n) = notice {
+            record_recovery(&n);
+        }
+        Ok(db)
     }
 
     /// Create a Database from an existing libsql connection. Runs migrations.
@@ -229,6 +292,122 @@ impl Database {
     ) -> Result<Self> {
         let conn = Self::build_connection(path, key).await?;
         Self::init_connection_inner(conn, busy_timeout_ms, read_only).await
+    }
+
+    /// Open the primary database, recovering from an unreadable file or a
+    /// non-regular path. A clean open (including first-boot, where the file
+    /// doesn't exist yet) returns `(db, None)`. When the existing file can't be
+    /// opened — corrupt image, or the SQLCipher key no longer matches — or the
+    /// path is a directory, the original is **preserved** (never deleted) under
+    /// `borg.db.corrupt-<now_unix>` and a fresh migrated DB is created in its
+    /// place, returning the [`RecoveryNotice`].
+    ///
+    /// `now_unix` is injected so the backup name is deterministic under test.
+    async fn open_at_recovering(
+        path: &Path,
+        busy_timeout_ms: u64,
+        key: Option<&[u8]>,
+        now_unix: u64,
+    ) -> Result<(Self, Option<RecoveryNotice>)> {
+        // Serialize recovery so concurrent boot-time openers (daemon, budget
+        // tick, config watcher, PKI bootstrap all open their own handle) don't
+        // each race to quarantine the same corrupt file. The happy path never
+        // touches this lock.
+        static RECOVERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        // A regular file (or an absent path, which `open_at_inner` creates
+        // fresh) is the overwhelmingly common case — try it directly first.
+        if !path.exists() || path.is_file() {
+            match Self::open_at_inner(path, busy_timeout_ms, key, false).await {
+                Ok(db) => return Ok((db, None)),
+                Err(first_err) => {
+                    let _guard = RECOVERY_LOCK.lock().await;
+                    // Another task may have recovered the file while we waited
+                    // on the lock; re-try before quarantining anything.
+                    if path.is_file() {
+                        if let Ok(db) = Self::open_at_inner(path, busy_timeout_ms, key, false).await
+                        {
+                            return Ok((db, None));
+                        }
+                    } else if !path.exists() {
+                        // A concurrent recoverer already moved the bad file
+                        // aside (and may have failed to recreate it). Nothing
+                        // left to quarantine — just create a fresh DB. The
+                        // other task owns the recovery notice.
+                        let db = Self::open_at_inner(path, busy_timeout_ms, key, false)
+                            .await
+                            .context("re-create database after concurrent quarantine")?;
+                        return Ok((db, None));
+                    }
+                    tracing::warn!(
+                        "database at {} is unreadable ({first_err:#}); preserving it and starting fresh",
+                        path.display()
+                    );
+                    let notice = Self::quarantine_corrupt_db(path, now_unix)?;
+                    let db = Self::open_at_inner(path, busy_timeout_ms, key, false)
+                        .await
+                        .context("re-create database after preserving unreadable file")?;
+                    return Ok((db, Some(notice)));
+                }
+            }
+        }
+
+        // Path exists but is not a regular file (e.g. a directory): it can
+        // never be opened as a SQLite database.
+        let _guard = RECOVERY_LOCK.lock().await;
+        if path.is_file() || !path.exists() {
+            // A concurrent opener already replaced it with a real file, or
+            // moved the non-file aside — either way there is nothing to
+            // quarantine here, so just open/create at the path.
+            return Ok((
+                Self::open_at_inner(path, busy_timeout_ms, key, false).await?,
+                None,
+            ));
+        }
+        tracing::warn!(
+            "database path {} is not a regular file; preserving it and starting fresh",
+            path.display()
+        );
+        let notice = Self::quarantine_corrupt_db(path, now_unix)?;
+        let db = Self::open_at_inner(path, busy_timeout_ms, key, false)
+            .await
+            .context("re-create database after moving aside non-file path")?;
+        Ok((db, Some(notice)))
+    }
+
+    /// Move an unreadable database (and any stale WAL/SHM siblings) aside to
+    /// `borg.db.corrupt-<now_unix>` so a fresh DB can be created at `path`.
+    /// Renames rather than deletes — the operator can salvage the original.
+    fn quarantine_corrupt_db(path: &Path, now_unix: u64) -> Result<RecoveryNotice> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("borg.db");
+        let backup = path.with_file_name(format!("{file_name}.corrupt-{now_unix}"));
+        std::fs::rename(path, &backup).with_context(|| {
+            format!(
+                "preserve unreadable db {} -> {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        // Move WAL/SHM siblings too: a leftover `-wal` adjacent to the new file
+        // would be adopted on first open and corrupt the fresh database. Their
+        // absence is normal (no recent writes), so a missing sibling is fine,
+        // but a failed move is logged rather than swallowed.
+        for ext in ["-wal", "-shm"] {
+            let sibling = path.with_file_name(format!("{file_name}{ext}"));
+            if sibling.exists() {
+                let moved = path.with_file_name(format!("{file_name}.corrupt-{now_unix}{ext}"));
+                if let Err(e) = std::fs::rename(&sibling, &moved) {
+                    tracing::warn!("failed to move stale {} aside: {e}", sibling.display());
+                }
+            }
+        }
+        Ok(RecoveryNotice {
+            backup_path: backup,
+            new_path: path.to_path_buf(),
+        })
     }
 
     /// Restrict DB file to owner-only access on Unix.
@@ -683,5 +862,141 @@ impl Database {
             .expect("init test db");
         db.set_evolution_keystore(Box::new(crate::evolution::keychain::InMemoryKeyStore::new()));
         db
+    }
+}
+
+/// Auto-recovery tests. Ungated (unlike the phase9 `tests` module) because
+/// they exercise the libsql-shaped open path directly. Each drives
+/// [`Database::open_at_recovering`] against a real temp file so the assertions
+/// are on actual on-disk state, not canned returns.
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// A table exists iff migrations ran — our proxy for "this is a fresh,
+    /// usable database".
+    async fn settings_table_present(db: &Database) -> bool {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='settings'",
+                libsql::params![],
+            )
+            .await
+            .expect("query sqlite_master");
+        rows.next().await.expect("row").is_some()
+    }
+
+    #[tokio::test]
+    async fn corrupt_file_is_preserved_and_database_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        let garbage = b"this is definitely not a valid sqlite database header".repeat(4);
+        std::fs::write(&path, &garbage).unwrap();
+
+        let (db, notice) = Database::open_at_recovering(&path, 5000, None, 12345)
+            .await
+            .expect("recovering open should succeed on a corrupt file");
+
+        // Recovery was reported, with deterministic paths.
+        let notice = notice.expect("a corrupt file must yield a recovery notice");
+        let expected_backup = dir.path().join("borg.db.corrupt-12345");
+        assert_eq!(notice.backup_path, expected_backup);
+        assert_eq!(notice.new_path, path);
+
+        // The original bytes were preserved, not destroyed.
+        assert!(expected_backup.exists(), "corrupt original must be kept");
+        assert_eq!(std::fs::read(&expected_backup).unwrap(), garbage);
+
+        // The replacement is a real, migrated database.
+        assert!(path.is_file());
+        assert!(settings_table_present(&db).await);
+    }
+
+    #[tokio::test]
+    async fn directory_at_db_path_is_moved_aside_and_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        std::fs::create_dir(&path).unwrap();
+        // Put a marker inside so we can prove the directory was preserved.
+        std::fs::write(path.join("marker"), b"x").unwrap();
+
+        let (db, notice) = Database::open_at_recovering(&path, 5000, None, 999)
+            .await
+            .expect("recovering open should succeed when the path is a directory");
+
+        let notice = notice.expect("a non-file path must yield a recovery notice");
+        let backup = dir.path().join("borg.db.corrupt-999");
+        assert_eq!(notice.backup_path, backup);
+        assert!(backup.join("marker").exists(), "directory must be preserved");
+        assert!(path.is_file(), "a fresh db file now sits at the path");
+        assert!(settings_table_present(&db).await);
+    }
+
+    #[tokio::test]
+    async fn healthy_database_opens_without_recovery_or_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+
+        // First boot: file does not exist yet → created fresh, no recovery.
+        let (_db, first) = Database::open_at_recovering(&path, 5000, None, 1)
+            .await
+            .unwrap();
+        assert!(first.is_none(), "first-boot create must not report recovery");
+
+        // Second boot against the now-healthy file → still no recovery, and no
+        // stray `.corrupt-*` backup was produced.
+        let (db, second) = Database::open_at_recovering(&path, 5000, None, 2)
+            .await
+            .unwrap();
+        assert!(second.is_none(), "healthy reopen must not report recovery");
+        assert!(settings_table_present(&db).await);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert!(backups.is_empty(), "no backup file should exist: {backups:?}");
+    }
+
+    /// Quarantine moves the main file and any WAL/SHM siblings aside together,
+    /// so the fresh database can't adopt a stale write-ahead log. Tested as the
+    /// pure filesystem operation it is — driving it through a real libsql open
+    /// is unreliable because SQLite may consume the `-wal` during its own
+    /// failed-open recovery before quarantine runs.
+    #[test]
+    fn quarantine_moves_main_and_wal_shm_siblings_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        std::fs::write(&path, b"corrupt-main").unwrap();
+        std::fs::write(dir.path().join("borg.db-wal"), b"stale-wal").unwrap();
+        std::fs::write(dir.path().join("borg.db-shm"), b"stale-shm").unwrap();
+
+        let notice = Database::quarantine_corrupt_db(&path, 7).unwrap();
+
+        assert_eq!(notice.backup_path, dir.path().join("borg.db.corrupt-7"));
+        assert_eq!(
+            std::fs::read(&notice.backup_path).unwrap(),
+            b"corrupt-main"
+        );
+        // Siblings followed the main file under the timestamped backup name.
+        assert!(dir.path().join("borg.db.corrupt-7-wal").exists());
+        assert!(dir.path().join("borg.db.corrupt-7-shm").exists());
+        // Nothing stale remains at the live paths.
+        assert!(!path.exists());
+        assert!(!dir.path().join("borg.db-wal").exists());
+        assert!(!dir.path().join("borg.db-shm").exists());
+    }
+
+    #[test]
+    fn take_recovery_notice_drains_exactly_once() {
+        let notice = RecoveryNotice {
+            backup_path: PathBuf::from("/tmp/borg.db.corrupt-1"),
+            new_path: PathBuf::from("/tmp/borg.db"),
+        };
+        record_recovery(&notice);
+        assert_eq!(Database::take_recovery_notice(), Some(notice));
+        // One-shot: a second drain sees nothing.
+        assert_eq!(Database::take_recovery_notice(), None);
     }
 }

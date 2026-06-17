@@ -23,6 +23,26 @@
     }
 
     #[test]
+    fn db_recovery_check_warns_with_backup_path_and_passes_otherwise() {
+        // A recorded recovery surfaces as a Warn naming the preserved backup,
+        // so the operator knows their DB was rebuilt and where the original is.
+        let notice = crate::db::RecoveryNotice {
+            backup_path: std::path::PathBuf::from("/home/u/.borg/borg.db.corrupt-42"),
+            new_path: std::path::PathBuf::from("/home/u/.borg/borg.db"),
+        };
+        let warn = db_recovery_check(Some(notice));
+        assert_eq!(warn.category, "Database");
+        assert!(matches!(warn.status, CheckStatus::Warn(_)));
+        match &warn.status {
+            CheckStatus::Warn(msg) => assert!(msg.contains("borg.db.corrupt-42"), "got: {msg}"),
+            other => panic!("expected warn, got {other:?}"),
+        }
+        // No recovery → a quiet pass, no spurious warning.
+        let ok = db_recovery_check(None);
+        assert!(matches!(ok.status, CheckStatus::Pass));
+    }
+
+    #[test]
     fn report_counts() {
         let report = DiagnosticReport {
             checks: vec![
