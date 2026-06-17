@@ -360,9 +360,13 @@ sampling_ratio = 0.5
 }
 
 #[test]
-fn apply_setting_telemetry_hidden_from_user() {
+fn apply_setting_telemetry_tracing_is_user_settable() {
+    // Telemetry became user-configurable when the OpenTelemetry pipeline
+    // shipped (registered in the settings table + /settings popup), so
+    // apply_setting must accept the key and actually mutate the field.
     let mut cfg = Config::default();
-    assert!(cfg
-        .apply_setting("telemetry.tracing_enabled", "true")
-        .is_err());
+    cfg.telemetry.tracing_enabled = false;
+    cfg.apply_setting("telemetry.tracing_enabled", "true")
+        .expect("telemetry.tracing_enabled is a registered bool setting");
+    assert!(cfg.telemetry.tracing_enabled);
 }

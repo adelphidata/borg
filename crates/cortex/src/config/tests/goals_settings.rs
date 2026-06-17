@@ -63,19 +63,19 @@ fn malformed_goals_bool_errors_via_registered_path() {
 /// schema sent to the LLM (Tool Conservation invariant — every schema is
 /// ~5KB / turn). Catching a regression here is the whole point of the
 /// gate; the dispatcher-level guard is defense in depth only.
-#[test]
-fn disabling_goals_drops_tool_schemas() {
+#[tokio::test]
+async fn disabling_goals_drops_tool_schemas() {
     use crate::tool::definitions::core_tool_definitions;
 
     let mut cfg = Config::default();
-    let defs_on = core_tool_definitions(&cfg);
+    let defs_on = core_tool_definitions(&cfg).await;
     let names_on: Vec<&str> = defs_on.iter().map(|t| t.function.name.as_str()).collect();
     assert!(names_on.contains(&"create_goal"));
     assert!(names_on.contains(&"update_goal"));
     assert!(names_on.contains(&"get_goal"));
 
     cfg.goals.enabled = false;
-    let defs_off = core_tool_definitions(&cfg);
+    let defs_off = core_tool_definitions(&cfg).await;
     let names_off: Vec<&str> = defs_off.iter().map(|t| t.function.name.as_str()).collect();
     assert!(!names_off.contains(&"create_goal"));
     assert!(!names_off.contains(&"update_goal"));

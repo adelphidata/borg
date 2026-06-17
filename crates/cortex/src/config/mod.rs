@@ -20,7 +20,7 @@ pub mod ui;
 pub mod update;
 pub mod voice;
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests;
 
 pub use apns::ApnsConfig;
