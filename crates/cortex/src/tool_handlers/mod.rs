@@ -107,7 +107,7 @@ pub use scripts::{handle_manage_scripts, handle_run_script, handle_security_audi
 // User input
 pub use user_input::{handle_request_user_input, handle_update_plan};
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -152,10 +152,10 @@ mod tests {
 
     // -- core_tool_definitions --
 
-    #[test]
-    fn core_tool_definitions_includes_base_tools() {
+    #[tokio::test]
+    async fn core_tool_definitions_includes_base_tools() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"write_memory"));
         assert!(names.contains(&"read_memory"));
@@ -169,10 +169,10 @@ mod tests {
         assert!(!names.contains(&"apply_skill_patch"));
     }
 
-    fn assert_tool_gated(enabled: bool, set_enabled: fn(&mut Config, bool), tool_names: &[&str]) {
+    async fn assert_tool_gated(enabled: bool, set_enabled: fn(&mut Config, bool), tool_names: &[&str]) {
         let mut config = Config::default();
         set_enabled(&mut config, enabled);
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         for tool in tool_names {
             assert_eq!(
@@ -183,31 +183,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn core_tool_definitions_gates_browser_on_config() {
+    #[tokio::test]
+    async fn core_tool_definitions_gates_browser_on_config() {
         let setter: fn(&mut Config, bool) = |c, v| c.browser.enabled = v;
-        assert_tool_gated(false, setter, &["browser"]);
-        assert_tool_gated(true, setter, &["browser"]);
+        assert_tool_gated(false, setter, &["browser"]).await;
+        assert_tool_gated(true, setter, &["browser"]).await;
     }
 
-    #[test]
-    fn core_tool_definitions_gates_tts_on_config() {
+    #[tokio::test]
+    async fn core_tool_definitions_gates_tts_on_config() {
         let setter: fn(&mut Config, bool) = |c, v| c.tts.enabled = v;
-        assert_tool_gated(false, setter, &["text_to_speech"]);
-        assert_tool_gated(true, setter, &["text_to_speech"]);
+        assert_tool_gated(false, setter, &["text_to_speech"]).await;
+        assert_tool_gated(true, setter, &["text_to_speech"]).await;
     }
 
-    #[test]
-    fn core_tool_definitions_gates_web_on_config() {
+    #[tokio::test]
+    async fn core_tool_definitions_gates_web_on_config() {
         let setter: fn(&mut Config, bool) = |c, v| c.web.enabled = v;
-        assert_tool_gated(false, setter, &["web_fetch", "web_search"]);
-        assert_tool_gated(true, setter, &["web_fetch", "web_search"]);
+        assert_tool_gated(false, setter, &["web_fetch", "web_search"]).await;
+        assert_tool_gated(true, setter, &["web_fetch", "web_search"]).await;
     }
 
-    #[test]
-    fn core_tool_definitions_all_have_parameters() {
+    #[tokio::test]
+    async fn core_tool_definitions_all_have_parameters() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         for def in &defs {
             assert!(
                 def.function.parameters.is_object(),
@@ -217,10 +217,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn core_tool_definitions_all_have_descriptions() {
+    #[tokio::test]
+    async fn core_tool_definitions_all_have_descriptions() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         for def in &defs {
             assert!(
                 !def.function.description.is_empty(),
@@ -230,10 +230,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn core_tool_definitions_has_apply_patch_with_target() {
+    #[tokio::test]
+    async fn core_tool_definitions_has_apply_patch_with_target() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let ap = defs
             .iter()
             .find(|d| d.function.name == "apply_patch")
@@ -245,10 +245,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn core_tool_definitions_has_list_with_what() {
+    #[tokio::test]
+    async fn core_tool_definitions_has_list_with_what() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let list = defs
             .iter()
             .find(|d| d.function.name == "list")
@@ -260,33 +260,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn core_tool_definitions_count_reduced() {
+    #[tokio::test]
+    async fn core_tool_definitions_count_reduced() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            17,
-            "expected 17 core tools (all enabled, incl. 3 goal tools + vision_analyze), got: {names:?}"
+            19,
+            "expected 19 core tools (all enabled: 3 goal tools, vision_analyze, \
+             video_analyze, computer_use), got: {names:?}"
         );
 
         let mut minimal_config = Config::default();
         minimal_config.web.enabled = false;
         minimal_config.browser.enabled = false;
-        let defs = core_tool_definitions(&minimal_config);
+        let defs = core_tool_definitions(&minimal_config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            13,
-            "expected 13 base tools (incl. goals), got: {names:?}"
+            14,
+            "expected 14 base tools: full minus web_fetch/web_search/vision_analyze/\
+             video_analyze (web-gated) and browser, got: {names:?}"
         );
     }
 
-    #[test]
-    fn core_tool_definitions_includes_request_user_input() {
+    #[tokio::test]
+    async fn core_tool_definitions_includes_request_user_input() {
         let config = Config::default();
-        let defs = core_tool_definitions(&config);
+        let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"request_user_input"));
     }
