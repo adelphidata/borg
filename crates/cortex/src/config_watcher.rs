@@ -154,7 +154,7 @@ async fn poll_loop(
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -258,31 +258,25 @@ mod tests {
         watcher.stop();
     }
 
-    #[test]
-    fn load_config_from_db() {
-        use rusqlite::Connection;
+    #[tokio::test]
+    async fn load_config_from_db() {
+        let db = Database::test_db().await;
+        db.set_setting("temperature", "1.2").await.unwrap();
+        db.set_setting("sandbox.enabled", "false").await.unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
-        let db = Database::init_connection(conn, 5000).unwrap();
-        db.set_setting("temperature", "1.2").unwrap();
-        db.set_setting("sandbox.enabled", "false").unwrap();
-
-        let config = load_config_from(&db).unwrap();
+        let config = load_config_from(&db).await.unwrap();
         assert!((config.llm.temperature - 1.2).abs() < f32::EPSILON);
         assert!(!config.sandbox.enabled);
     }
 
-    #[test]
-    fn load_config_from_db_ignores_invalid_settings() {
-        use rusqlite::Connection;
-
-        let conn = Connection::open_in_memory().unwrap();
-        let db = Database::init_connection(conn, 5000).unwrap();
-        db.set_setting("temperature", "not_a_number").unwrap();
-        db.set_setting("sandbox.enabled", "true").unwrap();
+    #[tokio::test]
+    async fn load_config_from_db_ignores_invalid_settings() {
+        let db = Database::test_db().await;
+        db.set_setting("temperature", "not_a_number").await.unwrap();
+        db.set_setting("sandbox.enabled", "true").await.unwrap();
 
         // Should succeed, ignoring the bad temperature
-        let config = load_config_from(&db).unwrap();
+        let config = load_config_from(&db).await.unwrap();
         // Temperature falls back to default since "not_a_number" was ignored
         assert!((config.llm.temperature - 0.7).abs() < f32::EPSILON);
         assert!(config.sandbox.enabled);
