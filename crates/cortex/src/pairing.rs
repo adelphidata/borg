@@ -358,7 +358,7 @@ async fn send_approval_notification_inner(
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -474,31 +474,31 @@ mod tests {
         config
     }
 
-    fn test_db() -> Database {
-        Database::test_db()
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn test_check_sender_access_open_policy() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_open_policy() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Open);
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
     }
 
-    #[test]
-    fn test_check_sender_access_disabled_policy() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_disabled_policy() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Disabled);
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
         assert!(matches!(result, AccessCheckResult::Denied { .. }));
     }
 
-    #[test]
-    fn test_check_sender_access_pairing_issues_challenge() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_pairing_issues_challenge() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let result = check_sender_access(&db, &config, "telegram", "new_user", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "new_user", None).await.unwrap();
         match result {
             AccessCheckResult::Challenge { code, message } => {
                 assert!(code.starts_with("tg/"), "expected tg/ prefix, got: {code}");
@@ -518,12 +518,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_check_sender_access_pairing_custom_agent_name() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_pairing_custom_agent_name() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
         let result =
-            check_sender_access(&db, &config, "telegram", "named_user", Some("Nova")).unwrap();
+            check_sender_access(&db, &config, "telegram", "named_user", Some("Nova")).await.unwrap();
         match result {
             AccessCheckResult::Challenge { code, message } => {
                 assert!(message.contains("Nova: access not configured"));
@@ -544,46 +544,49 @@ mod tests {
         assert_eq!(format_ttl(3600 * 48), "2 days");
     }
 
-    #[test]
-    fn test_check_sender_access_approved_sender_allowed() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_approved_sender_allowed() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
 
         // First call creates a challenge
-        let result = check_sender_access(&db, &config, "telegram", "user1", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "user1", None).await.unwrap();
         let code = match result {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
         // Approve the code
-        db.approve_pairing("telegram", &code).unwrap();
+        db.approve_pairing("telegram", &code).await.unwrap();
 
         // Second call should be allowed
-        let result = check_sender_access(&db, &config, "telegram", "user1", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "user1", None).await.unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
     }
 
-    #[test]
-    fn test_check_sender_access_reuses_existing_code() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_check_sender_access_mints_fresh_code_each_call() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
 
-        // Two calls for the same sender should return the same code
-        let code1 = match check_sender_access(&db, &config, "telegram", "user2", None).unwrap() {
+        // Pairing codes are SHA-256 hashed at rest, so the plaintext of an
+        // existing pending request can't be recovered to re-display. Each
+        // challenge therefore expires the old request and mints a fresh code
+        // (see `check_pairing`); the rate limit bounds the churn.
+        let code1 = match check_sender_access(&db, &config, "telegram", "user2", None).await.unwrap() {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
-        let code2 = match check_sender_access(&db, &config, "telegram", "user2", None).unwrap() {
+        let code2 = match check_sender_access(&db, &config, "telegram", "user2", None).await.unwrap() {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
-        assert_eq!(code1, code2);
+        assert_ne!(code1, code2, "each challenge must mint a fresh code");
     }
 
-    #[test]
-    fn test_channel_policy_override() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_channel_policy_override() {
+        let db = test_db().await;
         let mut config = Config::default();
         config.gateway.dm_policy = DmPolicy::Pairing;
         config
@@ -592,66 +595,71 @@ mod tests {
             .insert("slack".into(), DmPolicy::Open);
 
         // Slack should be open despite default being pairing
-        let result = check_sender_access(&db, &config, "slack", "anyone", None).unwrap();
+        let result = check_sender_access(&db, &config, "slack", "anyone", None).await.unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
 
         // Telegram still uses default pairing
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
         assert!(matches!(result, AccessCheckResult::Challenge { .. }));
     }
 
-    #[test]
-    fn test_find_pending_by_code_returns_match() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_find_pending_by_code_returns_match() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_code", None).unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_code", None).await.unwrap() {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let found = db.find_pending_by_code(&code).unwrap();
+        let found = db.find_pending_by_code(&code).await.unwrap();
         assert!(found.is_some());
         let row = found.unwrap();
-        assert_eq!(row.code, code);
+        // Codes are hashed at rest, so the stored row holds the hash of the
+        // plaintext code we searched with — not the plaintext itself.
+        assert_eq!(
+            row.code,
+            crate::db::device_pairing::hash_pairing_code(&code.to_lowercase())
+        );
         assert_eq!(row.channel_name, "telegram");
         assert_eq!(row.sender_id, "user_code");
     }
 
-    #[test]
-    fn test_find_pending_by_code_unknown_returns_none() {
-        let db = test_db();
-        let found = db.find_pending_by_code("ZZZZZZZZ").unwrap();
+    #[tokio::test]
+    async fn test_find_pending_by_code_unknown_returns_none() {
+        let db = test_db().await;
+        let found = db.find_pending_by_code("ZZZZZZZZ").await.unwrap();
         assert!(found.is_none());
     }
 
-    #[test]
-    fn test_find_pending_by_code_case_insensitive() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_find_pending_by_code_case_insensitive() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_ci", None).unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_ci", None).await.unwrap() {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
         // Lookup with lowercase should still find it
-        let found = db.find_pending_by_code(&code.to_lowercase()).unwrap();
+        let found = db.find_pending_by_code(&code.to_lowercase()).await.unwrap();
         assert!(found.is_some());
     }
 
-    #[test]
-    fn test_find_pending_by_code_approved_returns_none() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_find_pending_by_code_approved_returns_none() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_appr", None).unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_appr", None).await.unwrap() {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
         // Approve the code
-        db.approve_pairing("telegram", &code).unwrap();
+        db.approve_pairing("telegram", &code).await.unwrap();
 
         // Should no longer be found as pending
-        let found = db.find_pending_by_code(&code).unwrap();
+        let found = db.find_pending_by_code(&code).await.unwrap();
         assert!(found.is_none());
     }
 
@@ -730,78 +738,78 @@ mod tests {
         assert_eq!(channel_display_name("custom"), "custom");
     }
 
-    #[test]
-    fn test_pairing_rate_limit_exceeded() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_pairing_rate_limit_exceeded() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
 
         // Create max attempts directly in the DB for the same sender
         for _ in 0..constants::PAIRING_MAX_ATTEMPTS_PER_HOUR {
             let code = generate_code("telegram");
-            db.create_pairing_request("telegram", "rate_limit_user", &code, None, 3600)
+            db.create_pairing_request("telegram", "rate_limit_user", &code, None, 3600).await
                 .unwrap();
         }
 
         // The next attempt should be denied
         let result =
-            check_sender_access(&db, &config, "telegram", "rate_limit_user", None).unwrap();
+            check_sender_access(&db, &config, "telegram", "rate_limit_user", None).await.unwrap();
         assert!(
             matches!(result, AccessCheckResult::Denied { .. }),
             "expected Denied after exceeding rate limit, got {result:?}"
         );
     }
 
-    #[test]
-    fn test_pairing_rate_limit_reuse_doesnt_count() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_pairing_rate_limit_counts_every_attempt() {
+        let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
 
-        // First call creates a code
-        let result = check_sender_access(&db, &config, "telegram", "reuse_user", None).unwrap();
-        assert!(matches!(result, AccessCheckResult::Challenge { .. }));
+        // Each challenge mints a fresh request (no plaintext-reuse path that
+        // could skip the counter), so every call is recorded against the
+        // per-sender hourly rate limit.
+        for _ in 0..2 {
+            let result =
+                check_sender_access(&db, &config, "telegram", "reuse_user", None).await.unwrap();
+            assert!(matches!(result, AccessCheckResult::Challenge { .. }));
+        }
 
-        // Repeated calls reuse the same code (don't create new ones)
-        let result = check_sender_access(&db, &config, "telegram", "reuse_user", None).unwrap();
-        assert!(matches!(result, AccessCheckResult::Challenge { .. }));
-
-        // Count should be 1, not 2
         let count = db
-            .count_pairing_attempts("telegram", "reuse_user", 3600)
+            .count_pairing_attempts("telegram", "reuse_user", 3600).await
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2, "every challenge counts toward the rate limit");
     }
 
-    #[test]
-    fn test_count_pairing_attempts_db_method() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_count_pairing_attempts_db_method() {
+        let db = test_db().await;
 
         // No attempts yet
         let count = db
-            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .count_pairing_attempts("telegram", "counter_user", 3600).await
             .unwrap();
         assert_eq!(count, 0);
 
         // Create some requests
         for _ in 0..5 {
             let code = generate_code("telegram");
-            db.create_pairing_request("telegram", "counter_user", &code, None, 3600)
+            db.create_pairing_request("telegram", "counter_user", &code, None, 3600).await
                 .unwrap();
         }
 
         let count = db
-            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .count_pairing_attempts("telegram", "counter_user", 3600).await
             .unwrap();
         assert_eq!(count, 5);
 
         // Different sender should have 0
         let count = db
-            .count_pairing_attempts("telegram", "other_user", 3600)
+            .count_pairing_attempts("telegram", "other_user", 3600).await
             .unwrap();
         assert_eq!(count, 0);
 
         // Different channel should have 0
         let count = db
-            .count_pairing_attempts("slack", "counter_user", 3600)
+            .count_pairing_attempts("slack", "counter_user", 3600).await
             .unwrap();
         assert_eq!(count, 0);
     }
