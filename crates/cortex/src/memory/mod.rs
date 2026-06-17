@@ -1126,7 +1126,7 @@ pub fn load_extra_paths(
     }
 }
 
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1417,17 +1417,17 @@ mod tests {
     // data shouldn't be in the test path and because a corrupted prod DB
     // would silently mask real test failures.
 
-    #[test]
-    fn load_memory_context_db_index_loaded_first() {
-        let db = crate::db::Database::test_db();
-        db.upsert_memory_entry("global", "_t_aaa_", "aaa-content marker_aaa")
+    #[tokio::test]
+    async fn load_memory_context_db_index_loaded_first() {
+        let db = crate::db::Database::test_db().await;
+        db.upsert_memory_entry("global", "_t_aaa_", "aaa-content marker_aaa").await
             .unwrap();
-        db.upsert_memory_entry("global", "_t_bbb_", "bbb-content marker_bbb")
+        db.upsert_memory_entry("global", "_t_bbb_", "bbb-content marker_bbb").await
             .unwrap();
-        db.upsert_memory_entry("global", "INDEX", "- index-marker-xyz\n")
+        db.upsert_memory_entry("global", "INDEX", "- index-marker-xyz\n").await
             .unwrap();
 
-        let out = load_memory_context_db_with(&db, 100_000).unwrap();
+        let out = load_memory_context_db_with(&db, 100_000).await.unwrap();
         let pos_index = out.find("index-marker-xyz").expect("INDEX not loaded");
         let pos_aaa = out.find("marker_aaa");
         let pos_bbb = out.find("marker_bbb");
@@ -1437,21 +1437,21 @@ mod tests {
         assert!(pos_index < pos_bbb.unwrap(), "INDEX must load before bbb");
     }
 
-    #[test]
-    fn load_memory_context_db_scoped_includes_global_and_active_scope() {
-        let db = crate::db::Database::test_db();
-        db.upsert_memory_entry("global", "shared", "global marker")
+    #[tokio::test]
+    async fn load_memory_context_db_scoped_includes_global_and_active_scope() {
+        let db = crate::db::Database::test_db().await;
+        db.upsert_memory_entry("global", "shared", "global marker").await
             .unwrap();
-        db.upsert_memory_entry("project:abc", "scoped", "project marker")
+        db.upsert_memory_entry("project:abc", "scoped", "project marker").await
             .unwrap();
-        db.upsert_memory_entry("project:other", "other", "other marker")
+        db.upsert_memory_entry("project:other", "other", "other marker").await
             .unwrap();
 
         let out = load_memory_context_db_scoped_with(
             &db,
             &["global".to_string(), "project:abc".to_string()],
             100_000,
-        )
+        ).await
         .unwrap();
 
         assert!(out.contains("global marker"));
@@ -1461,21 +1461,21 @@ mod tests {
         assert!(out.contains("scope=\"project:abc\""));
     }
 
-    #[test]
-    fn load_memory_context_db_ranked_order() {
-        let db = crate::db::Database::test_db();
-        db.upsert_memory_entry("global", "_r_first_", "content for first ENT_FIRST")
+    #[tokio::test]
+    async fn load_memory_context_db_ranked_order() {
+        let db = crate::db::Database::test_db().await;
+        db.upsert_memory_entry("global", "_r_first_", "content for first ENT_FIRST").await
             .unwrap();
-        db.upsert_memory_entry("global", "_r_second_", "content for second ENT_SECOND")
+        db.upsert_memory_entry("global", "_r_second_", "content for second ENT_SECOND").await
             .unwrap();
-        db.upsert_memory_entry("global", "_r_third_", "content for third ENT_THIRD")
+        db.upsert_memory_entry("global", "_r_third_", "content for third ENT_THIRD").await
             .unwrap();
 
         let ranked = vec![
             ("_r_third_".to_string(), 0.9),
             ("_r_first_".to_string(), 0.5),
         ];
-        let out = load_memory_context_db_ranked_with(&db, 100_000, &ranked).unwrap();
+        let out = load_memory_context_db_ranked_with(&db, 100_000, &ranked).await.unwrap();
         let pos_third = out.find("ENT_THIRD").unwrap();
         let pos_first = out.find("ENT_FIRST").unwrap();
         assert!(
@@ -1486,14 +1486,14 @@ mod tests {
         assert!(out.contains("ENT_SECOND"));
     }
 
-    #[test]
-    fn load_memory_context_db_ranked_scoped_prioritizes_scoped_hits() {
-        let db = crate::db::Database::test_db();
-        db.upsert_memory_entry("global", "g1", "global one")
+    #[tokio::test]
+    async fn load_memory_context_db_ranked_scoped_prioritizes_scoped_hits() {
+        let db = crate::db::Database::test_db().await;
+        db.upsert_memory_entry("global", "g1", "global one").await
             .unwrap();
-        db.upsert_memory_entry("project:abc", "p1", "project one")
+        db.upsert_memory_entry("project:abc", "p1", "project one").await
             .unwrap();
-        db.upsert_memory_entry("project:abc", "p2", "project two")
+        db.upsert_memory_entry("project:abc", "p2", "project two").await
             .unwrap();
 
         let ranked = vec![
@@ -1505,7 +1505,7 @@ mod tests {
             &["global".to_string(), "project:abc".to_string()],
             100_000,
             &ranked,
-        )
+        ).await
         .unwrap();
 
         let pos_p2 = out.find("project two").unwrap();
@@ -1514,15 +1514,15 @@ mod tests {
         assert!(out.contains("project one"));
     }
 
-    #[test]
-    fn load_memory_context_db_respects_budget() {
-        let db = crate::db::Database::test_db();
+    #[tokio::test]
+    async fn load_memory_context_db_respects_budget() {
+        let db = crate::db::Database::test_db().await;
         let big = "budgetword ".repeat(5000);
-        db.upsert_memory_entry("global", "_b_big_", &big).unwrap();
-        db.upsert_memory_entry("global", "_b_small_", "tinymarker")
+        db.upsert_memory_entry("global", "_b_big_", &big).await.unwrap();
+        db.upsert_memory_entry("global", "_b_small_", "tinymarker").await
             .unwrap();
 
-        let out = load_memory_context_db_with(&db, 50).unwrap();
+        let out = load_memory_context_db_with(&db, 50).await.unwrap();
         assert!(
             !out.contains("budgetword"),
             "oversized entry must be skipped under small budget"
@@ -1531,11 +1531,11 @@ mod tests {
         assert!(out.contains("tinymarker"));
     }
 
-    #[test]
-    fn load_memory_context_db_zero_budget_empty() {
-        let out = load_memory_context_db(0).unwrap();
+    #[tokio::test]
+    async fn load_memory_context_db_zero_budget_empty() {
+        let out = load_memory_context_db(0).await.unwrap();
         assert!(out.is_empty());
-        let out = load_memory_context_db_ranked(0, &[]).unwrap();
+        let out = load_memory_context_db_ranked(0, &[]).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -1625,21 +1625,21 @@ mod tests {
         assert!(out.contains("<knowledge_file path=\"global/MEMORY.md\">"));
     }
 
-    #[test]
-    fn read_memory_db_missing_returns_none() {
+    #[tokio::test]
+    async fn read_memory_db_missing_returns_none() {
         // Use the `_with` form against an isolated test DB — the public
         // `read_memory_db` opens `~/.borg/borg.db`, which would couple the
         // test to the user's actual DB state.
-        let db = crate::db::Database::test_db();
-        let out = read_memory_db_with(&db, "_nope_xyz_nonexistent_", "global").unwrap();
+        let db = crate::db::Database::test_db().await;
+        let out = read_memory_db_with(&db, "_nope_xyz_nonexistent_", "global").await.unwrap();
         assert!(out.is_none());
     }
 
-    #[test]
-    fn read_memory_db_or_not_found_falls_back() {
-        let db = crate::db::Database::test_db();
+    #[tokio::test]
+    async fn read_memory_db_or_not_found_falls_back() {
+        let db = crate::db::Database::test_db().await;
         let out =
-            read_memory_db_or_not_found_with(&db, "_nope_xyz_nonexistent_", "global").unwrap();
+            read_memory_db_or_not_found_with(&db, "_nope_xyz_nonexistent_", "global").await.unwrap();
         assert!(out.contains("not found"));
     }
 
