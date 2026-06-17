@@ -861,8 +861,18 @@ mod voice_key_tests {
             // Plain "z" must stay normal typing, not suspend.
             ("plain z", KeyCode::Char('z'), KeyModifiers::NONE, false),
             // Decorated variants stay free for future bindings (e.g. redo).
-            ("ctrl+shift+z", KeyCode::Char('z'), ctrl | KeyModifiers::SHIFT, false),
-            ("ctrl+alt+z", KeyCode::Char('z'), ctrl | KeyModifiers::ALT, false),
+            (
+                "ctrl+shift+z",
+                KeyCode::Char('z'),
+                ctrl | KeyModifiers::SHIFT,
+                false,
+            ),
+            (
+                "ctrl+alt+z",
+                KeyCode::Char('z'),
+                ctrl | KeyModifiers::ALT,
+                false,
+            ),
             // A different ctrl chord must not be mistaken for suspend.
             ("ctrl+c", KeyCode::Char('c'), ctrl, false),
         ];

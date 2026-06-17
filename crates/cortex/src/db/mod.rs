@@ -935,7 +935,10 @@ mod recovery_tests {
         let notice = notice.expect("a non-file path must yield a recovery notice");
         let backup = dir.path().join("borg.db.corrupt-999");
         assert_eq!(notice.backup_path, backup);
-        assert!(backup.join("marker").exists(), "directory must be preserved");
+        assert!(
+            backup.join("marker").exists(),
+            "directory must be preserved"
+        );
         assert!(path.is_file(), "a fresh db file now sits at the path");
         assert!(settings_table_present(&db).await);
     }
@@ -949,7 +952,10 @@ mod recovery_tests {
         let (_db, first) = Database::open_at_recovering(&path, 5000, None, 1)
             .await
             .unwrap();
-        assert!(first.is_none(), "first-boot create must not report recovery");
+        assert!(
+            first.is_none(),
+            "first-boot create must not report recovery"
+        );
 
         // Second boot against the now-healthy file → still no recovery, and no
         // stray `.corrupt-*` backup was produced.
@@ -963,7 +969,10 @@ mod recovery_tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
             .collect();
-        assert!(backups.is_empty(), "no backup file should exist: {backups:?}");
+        assert!(
+            backups.is_empty(),
+            "no backup file should exist: {backups:?}"
+        );
     }
 
     /// Quarantine moves the main file and any WAL/SHM siblings aside together,
@@ -982,10 +991,7 @@ mod recovery_tests {
         let notice = Database::quarantine_corrupt_db(&path, 7).unwrap();
 
         assert_eq!(notice.backup_path, dir.path().join("borg.db.corrupt-7"));
-        assert_eq!(
-            std::fs::read(&notice.backup_path).unwrap(),
-            b"corrupt-main"
-        );
+        assert_eq!(std::fs::read(&notice.backup_path).unwrap(), b"corrupt-main");
         // Siblings followed the main file under the timestamped backup name.
         assert!(dir.path().join("borg.db.corrupt-7-wal").exists());
         assert!(dir.path().join("borg.db.corrupt-7-shm").exists());
