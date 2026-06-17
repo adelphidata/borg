@@ -662,27 +662,28 @@ async fn wait(args: &ComputerUseArgs, cancel: Option<&CancellationToken>) -> Res
     })?;
     let effective = effective_wait_ms(ms);
     let sleep = tokio::time::sleep(Duration::from_millis(effective));
-    match cancel {
+    let interrupted = match cancel {
         // Interruptible path: a turn interrupt cuts the wait short rather than
         // blocking the agent for the full (capped) duration. The token may
         // already be cancelled before we get here (interrupt raced the tool
         // boundary); `select!` resolves that branch immediately, so the
         // signal is never lost.
-        Some(token) => {
-            tokio::select! {
-                () = sleep => Ok(ToolOutput::Text(format!("waited {effective}ms"))),
-                () = token.cancelled() => {
-                    Ok(ToolOutput::Text("wait interrupted by new input".to_string()))
-                }
-            }
-        }
+        Some(token) => tokio::select! {
+            () = sleep => false,
+            () = token.cancelled() => true,
+        },
         // No interrupt channel (e.g. the test seam): preserve the original
         // blocking semantics.
         None => {
             sleep.await;
-            Ok(ToolOutput::Text(format!("waited {effective}ms")))
+            false
         }
-    }
+    };
+    Ok(ToolOutput::Text(if interrupted {
+        "wait interrupted by new input".to_string()
+    } else {
+        format!("waited {effective}ms")
+    }))
 }
 
 /// True iff the given action is allowed when the agent is in Plan mode.

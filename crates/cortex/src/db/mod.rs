@@ -317,7 +317,14 @@ impl Database {
 
         // A regular file (or an absent path, which `open_at_inner` creates
         // fresh) is the overwhelmingly common case — try it directly first.
-        if !path.exists() || path.is_file() {
+        // One `metadata` stat answers both questions on the happy path:
+        // `Ok(regular file)` or any error (absent / unstattable) takes the fast
+        // path; only an existing non-file (e.g. a directory) falls through.
+        let regular_or_absent = match std::fs::metadata(path) {
+            Ok(meta) => meta.is_file(),
+            Err(_) => true,
+        };
+        if regular_or_absent {
             match Self::open_at_inner(path, busy_timeout_ms, key, false).await {
                 Ok(db) => return Ok((db, None)),
                 Err(first_err) => {
