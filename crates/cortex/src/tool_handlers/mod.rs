@@ -169,7 +169,11 @@ mod tests {
         assert!(!names.contains(&"apply_skill_patch"));
     }
 
-    async fn assert_tool_gated(enabled: bool, set_enabled: fn(&mut Config, bool), tool_names: &[&str]) {
+    async fn assert_tool_gated(
+        enabled: bool,
+        set_enabled: fn(&mut Config, bool),
+        tool_names: &[&str],
+    ) {
         let mut config = Config::default();
         set_enabled(&mut config, enabled);
         let defs = core_tool_definitions(&config).await;

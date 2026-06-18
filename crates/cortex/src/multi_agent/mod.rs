@@ -4,10 +4,10 @@ pub mod event_bus;
 pub mod names;
 /// Predefined role definitions for sub-agents.
 pub mod roles;
-/// Tool definitions for multi-agent orchestration.
-pub mod tools;
 /// Sub-agent spawn + execution machinery (driven by `AgentControl::spawn_agent`).
 mod spawn;
+/// Tool definitions for multi-agent orchestration.
+pub mod tools;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,9 +22,9 @@ pub use event_bus::{AgentTreeBus, AgentTreeEvent, AgentTreeEventKind};
 
 use crate::config::Config;
 
-use spawn::{run_sub_agent_task, SubAgentSpawn};
 #[cfg(test)]
 use spawn::{build_subagent_preamble, extract_apply_patch_paths, is_apply_patch_success};
+use spawn::{run_sub_agent_task, SubAgentSpawn};
 
 /// Delegation kind for a sub-agent. `Leaf` (default) cannot re-delegate
 /// — the multi-agent tool surface is stripped from its tool definitions.
@@ -1178,7 +1178,6 @@ async fn compute_tools_filter(
 
     Some(allowed)
 }
-
 
 /// Tests for `/agents`-feature runtime additions: Paused status, pause gate,
 /// shutdown_subtree, aggregate_subtree, AgentTreeBus integration, and the

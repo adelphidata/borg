@@ -313,7 +313,8 @@ mod tests {
             0,
             "test-model",
             "Demo chat",
-        ).await
+        )
+        .await
         .unwrap();
         db.insert_message(
             id,
@@ -323,7 +324,8 @@ mod tests {
             None,
             Some("2024-01-01T00:00:00Z"),
             None,
-        ).await
+        )
+        .await
         .unwrap();
         db.insert_message(
             id,
@@ -343,7 +345,8 @@ mod tests {
             Some("tc1"),
             Some("2024-01-01T00:00:02Z"),
             None,
-        ).await
+        )
+        .await
         .unwrap();
     }
 
@@ -367,7 +370,9 @@ mod tests {
     async fn export_json_round_trips() {
         let db = Database::test_db().await;
         seed_session(&db, "sess-json").await;
-        let (out, filename) = export_session(&db, "sess-json", ExportOptions::default()).await.unwrap();
+        let (out, filename) = export_session(&db, "sess-json", ExportOptions::default())
+            .await
+            .unwrap();
 
         assert!(filename.starts_with("borg-session-sess-jso-"));
         assert!(filename.ends_with(".json"));
@@ -415,7 +420,8 @@ mod tests {
     #[tokio::test]
     async fn export_csv_escapes_quotes_and_newlines() {
         let db = Database::test_db().await;
-        db.upsert_session("sess-esc", 1, 2, 0, "m", "Escape Test").await
+        db.upsert_session("sess-esc", 1, 2, 0, "m", "Escape Test")
+            .await
             .unwrap();
         db.insert_message(
             "sess-esc",
@@ -425,7 +431,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap();
         let opts = ExportOptions {
             format: ExportFormat::Csv,
@@ -456,7 +463,8 @@ mod tests {
     #[tokio::test]
     async fn export_missing_session_errors() {
         let db = Database::test_db().await;
-        let err = export_session(&db, "does-not-exist", ExportOptions::default()).await
+        let err = export_session(&db, "does-not-exist", ExportOptions::default())
+            .await
             .expect_err("should fail");
         assert!(err.to_string().contains("not found"));
     }
@@ -498,7 +506,9 @@ mod tests {
     #[tokio::test]
     async fn csv_defuses_formula_prefixes() {
         let db = Database::test_db().await;
-        db.upsert_session("sess-inj", 1, 2, 0, "m", "Inj").await.unwrap();
+        db.upsert_session("sess-inj", 1, 2, 0, "m", "Inj")
+            .await
+            .unwrap();
         // Cover all four dangerous prefixes spreadsheets evaluate as formulas.
         for (idx, payload) in ["=SUM(A1)", "+1+1", "-cmd", "@IF(1,1,0)"]
             .iter()
@@ -512,7 +522,8 @@ mod tests {
                 None,
                 Some(&format!("2024-01-01T00:00:{idx:02}Z")),
                 None,
-            ).await
+            )
+            .await
             .unwrap();
         }
         let (out, _) = export_session(
@@ -521,7 +532,8 @@ mod tests {
             ExportOptions {
                 format: ExportFormat::Csv,
             },
-        ).await
+        )
+        .await
         .unwrap();
         // Each payload must appear with a literal single-quote prefix so no
         // spreadsheet app evaluates it. A `,` in the raw payload would also

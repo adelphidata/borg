@@ -4,12 +4,12 @@ use environment::format_skill_info;
 pub use environment::{collect_required_env_vars, collect_skill_env, install_skill_deps};
 
 mod types;
+#[cfg(test)]
+use types::{check_os_requirements, check_requirements};
 pub use types::{
     parse_skill_md, InstallSpec, PrerequisitesLegacy, Skill, SkillLoadLevel, SkillManifest,
     SkillRequires, SkillSource,
 };
-#[cfg(test)]
-use types::{check_os_requirements, check_requirements};
 
 mod loader;
 pub use loader::{
@@ -19,9 +19,9 @@ pub use loader::{
 use loader::{is_skill_disabled, load_builtin_skill};
 
 mod context;
-pub use context::{effective_skill_budget, load_skills_context, SkillBudgetReport};
 #[cfg(test)]
 use context::skill_relevance_score;
+pub use context::{effective_skill_budget, load_skills_context, SkillBudgetReport};
 
 // Test-only imports — the registry below needs none of these, but the colocated
 // test module exercises functions across every skills submodule.

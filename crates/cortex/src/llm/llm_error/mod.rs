@@ -14,8 +14,8 @@ use classify::{
 
 pub use classify::{classify_402, classify_error_text};
 pub(crate) use classify::{classify_anthropic_stream_error, classify_network_error};
-pub use retry::{parse_retry_after, parse_retry_after_header, parse_retry_hint_from_body};
 pub(crate) use retry::override_retry_after;
+pub use retry::{parse_retry_after, parse_retry_after_header, parse_retry_hint_from_body};
 
 /// Maximum bytes of provider response body retained in error messages.
 /// Bodies are redacted first, then truncated — keeps logs bounded and avoids

@@ -312,8 +312,12 @@ mod tests {
     async fn cache_store_then_lookup_serves_back_in_auto() {
         let db = Database::test_db().await;
         let hash = crate::db::web_search_cache::hash_query("q");
-        cache_store(&db, "tavily", &hash, "q", "BODY", 1000).await.unwrap();
-        let decision = cache_lookup(&db, "tavily", &hash, SearchMode::Auto, "q", 60, 1010).await.unwrap();
+        cache_store(&db, "tavily", &hash, "q", "BODY", 1000)
+            .await
+            .unwrap();
+        let decision = cache_lookup(&db, "tavily", &hash, SearchMode::Auto, "q", 60, 1010)
+            .await
+            .unwrap();
         match decision {
             CacheDecision::Serve(b) => assert_eq!(b, "BODY"),
             CacheDecision::CallLive => panic!("expected fresh hit"),
@@ -324,8 +328,12 @@ mod tests {
     async fn cache_lookup_returns_calllive_after_ttl_expiry() {
         let db = Database::test_db().await;
         let hash = crate::db::web_search_cache::hash_query("q");
-        cache_store(&db, "tavily", &hash, "q", "BODY", 1000).await.unwrap();
-        let decision = cache_lookup(&db, "tavily", &hash, SearchMode::Auto, "q", 60, 1100).await.unwrap();
+        cache_store(&db, "tavily", &hash, "q", "BODY", 1000)
+            .await
+            .unwrap();
+        let decision = cache_lookup(&db, "tavily", &hash, SearchMode::Auto, "q", 60, 1100)
+            .await
+            .unwrap();
         assert!(matches!(decision, CacheDecision::CallLive));
     }
 
@@ -333,9 +341,17 @@ mod tests {
     async fn cache_store_overwrites_existing_row_on_refresh() {
         let db = Database::test_db().await;
         let hash = crate::db::web_search_cache::hash_query("q");
-        cache_store(&db, "tavily", &hash, "q", "v1", 1000).await.unwrap();
-        cache_store(&db, "tavily", &hash, "q", "v2", 2000).await.unwrap();
-        let row = db.web_search_cache_get("tavily", &hash).await.unwrap().unwrap();
+        cache_store(&db, "tavily", &hash, "q", "v1", 1000)
+            .await
+            .unwrap();
+        cache_store(&db, "tavily", &hash, "q", "v2", 2000)
+            .await
+            .unwrap();
+        let row = db
+            .web_search_cache_get("tavily", &hash)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.body, "v2");
         assert_eq!(row.fetched_at, 2000);
         assert_eq!(db.web_search_cache_count().await.unwrap(), 1);

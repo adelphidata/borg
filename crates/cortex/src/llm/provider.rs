@@ -134,7 +134,8 @@ impl Provider {
             Provider::Gemini => &ProviderMeta {
                 name: "gemini",
                 aliases: &[],
-                base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                base_url:
+                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                 env_var: "GEMINI_API_KEY",
                 auth_kind: ProviderAuthKind::ApiKeyLike,
                 model_prefixes: &["google/"],
@@ -177,7 +178,7 @@ impl Provider {
             Provider::ClaudeCli => &ProviderMeta {
                 name: "claude-cli",
                 aliases: &["claudecli", "claude_cli"],
-                base_url: "", // Not used — communicates via subprocess
+                base_url: "",               // Not used — communicates via subprocess
                 env_var: "CLAUDE_CLI_PATH", // Optional override for claude binary path
                 auth_kind: ProviderAuthKind::None,
                 model_prefixes: &["claude-cli/"],

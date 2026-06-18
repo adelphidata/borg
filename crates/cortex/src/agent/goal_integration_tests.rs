@@ -81,7 +81,8 @@ async fn goal_context_objective_cannot_break_out_of_xml() {
     {
         let guard = agent.db_guard().await;
         let db = guard.as_ref().expect("db");
-        db.insert_goal(&session_id, injection, GoalStatus::Active, Some(5000)).await
+        db.insert_goal(&session_id, injection, GoalStatus::Active, Some(5000))
+            .await
             .expect("insert goal");
     }
 
@@ -115,7 +116,8 @@ async fn goal_context_empty_for_complete_goal() {
     {
         let guard = agent.db_guard().await;
         let db = guard.as_ref().expect("db");
-        db.insert_goal(&session_id, "done", GoalStatus::Active, None).await
+        db.insert_goal(&session_id, "done", GoalStatus::Active, None)
+            .await
             .expect("insert")
             .expect("returned");
         db.update_goal(
@@ -124,7 +126,8 @@ async fn goal_context_empty_for_complete_goal() {
                 status: Some(GoalStatus::Complete),
                 ..Default::default()
             },
-        ).await
+        )
+        .await
         .expect("complete");
     }
     let section = agent.build_goal_context_section().await;
@@ -153,7 +156,8 @@ async fn on_goal_created_via_tool_adopts_when_ok() {
         let guard = agent.db_guard().await;
         let db = guard.as_ref().expect("db");
         let goal = db
-            .insert_goal(&session_id, "ship it", GoalStatus::Active, Some(1000)).await
+            .insert_goal(&session_id, "ship it", GoalStatus::Active, Some(1000))
+            .await
             .expect("insert")
             .expect("row");
         goal.goal_id
@@ -163,7 +167,9 @@ async fn on_goal_created_via_tool_adopts_when_ok() {
         agent.goal_runtime.current_goal_id().is_none(),
         "runtime should start with no adopted goal"
     );
-    agent.on_goal_created_via_tool(r#"{"ok": true, "goal_id": "ignored"}"#).await;
+    agent
+        .on_goal_created_via_tool(r#"{"ok": true, "goal_id": "ignored"}"#)
+        .await;
     assert_eq!(
         agent.goal_runtime.current_goal_id().as_deref(),
         Some(inserted_id.as_str()),
@@ -192,7 +198,8 @@ async fn on_goal_created_via_tool_noop_on_failure_shapes() {
             let g = agent.db_guard().await;
             g.as_ref()
                 .unwrap()
-                .insert_goal(&sid, "x", GoalStatus::Active, None).await
+                .insert_goal(&sid, "x", GoalStatus::Active, None)
+                .await
                 .unwrap();
         }
         agent.on_goal_created_via_tool(body).await;
@@ -215,7 +222,8 @@ async fn on_goal_updated_via_tool_forgets_on_complete() {
         let guard = agent.db_guard().await;
         let db = guard.as_ref().expect("db");
         let goal = db
-            .insert_goal(&session_id, "ship it", GoalStatus::Active, None).await
+            .insert_goal(&session_id, "ship it", GoalStatus::Active, None)
+            .await
             .expect("insert")
             .expect("row");
         goal.goal_id
@@ -250,7 +258,8 @@ async fn on_goal_updated_via_tool_forgets_on_complete() {
                     expected_goal_id: Some(goal_id.clone()),
                     ..Default::default()
                 },
-            ).await
+            )
+            .await
             .unwrap();
     }
     agent.on_goal_updated_via_tool(r#"{"ok": true}"#).await;
@@ -272,7 +281,8 @@ async fn on_goal_updated_via_tool_noop_on_already_complete() {
         let guard = agent.db_guard().await;
         let db = guard.as_ref().expect("db");
         let goal = db
-            .insert_goal(&session_id, "x", GoalStatus::Active, None).await
+            .insert_goal(&session_id, "x", GoalStatus::Active, None)
+            .await
             .expect("insert")
             .expect("row");
         goal.goal_id
@@ -288,7 +298,9 @@ async fn on_goal_updated_via_tool_noop_on_already_complete() {
         created_at: 0,
         updated_at: 0,
     });
-    agent.on_goal_updated_via_tool(r#"{"ok": true, "already_complete": true}"#).await;
+    agent
+        .on_goal_updated_via_tool(r#"{"ok": true, "already_complete": true}"#)
+        .await;
     assert_eq!(
         agent.goal_runtime.current_goal_id().as_deref(),
         Some(goal_id.as_str()),
@@ -310,7 +322,8 @@ async fn on_goal_updated_via_tool_noop_when_status_still_active() {
         let g = guard
             .as_ref()
             .unwrap()
-            .insert_goal(&session_id, "x", GoalStatus::Active, None).await
+            .insert_goal(&session_id, "x", GoalStatus::Active, None)
+            .await
             .unwrap()
             .unwrap();
         g.goal_id

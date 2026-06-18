@@ -107,7 +107,9 @@ async fn air_gap_allows_local_construction() {
     config.llm.model = "llama3".to_string();
     config.providers.outbound_allowed = false;
 
-    LlmClient::new(&config).await.expect("local provider must be allowed under air-gap");
+    LlmClient::new(&config)
+        .await
+        .expect("local provider must be allowed under air-gap");
 }
 
 #[tokio::test]
@@ -132,7 +134,9 @@ async fn air_gap_skips_public_cloud_fallback_slot() {
         base_url: None,
     });
 
-    let client = LlmClient::new(&config).await.expect("primary local must succeed");
+    let client = LlmClient::new(&config)
+        .await
+        .expect("primary local must succeed");
     assert!(
         client.provider_slots.is_empty(),
         "PublicCloud fallback must be dropped under air-gap"
@@ -142,8 +146,9 @@ async fn air_gap_skips_public_cloud_fallback_slot() {
 #[tokio::test]
 async fn openrouter_cost_event_uses_usage_cost_verbatim() {
     let sink = Arc::new(CollectingSink::default());
-    let client =
-        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openrouter_client(true)
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -168,8 +173,9 @@ async fn openrouter_cost_event_uses_usage_cost_verbatim() {
 #[tokio::test]
 async fn openrouter_missing_cost_emits_unknown_cost() {
     let sink = Arc::new(CollectingSink::default());
-    let client =
-        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openrouter_client(true)
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -302,8 +308,9 @@ async fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
     assert_eq!(usage.provider_cost_usd, None);
 
     let sink = Arc::new(CollectingSink::default());
-    let client =
-        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openrouter_client(true)
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     client.emit_cost_event_best_effort("req-null", Some(&usage), "openai/gpt-4o-mini");
     let events = sink.take();
     assert_eq!(events.len(), 1);
@@ -321,8 +328,9 @@ async fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
     assert_eq!(usage.provider_cost_usd.as_deref(), Some("0"));
 
     let sink = Arc::new(CollectingSink::default());
-    let client =
-        make_test_openrouter_client(true).await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openrouter_client(true)
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     client.emit_cost_event_best_effort("req-zero", Some(&usage), "openai/gpt-4o-mini");
     let events = sink.take();
     assert_eq!(events.len(), 1);
@@ -386,7 +394,9 @@ fn openrouter_non_streaming_usage_cost_resolves_via_extractor() {
 #[tokio::test]
 async fn openai_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openai_client().await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openai_client()
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -410,7 +420,9 @@ async fn openai_cost_event_uses_static_price_table() {
 #[tokio::test]
 async fn anthropic_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_anthropic_client().await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_anthropic_client()
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -434,7 +446,9 @@ async fn anthropic_cost_event_uses_static_price_table() {
 #[tokio::test]
 async fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_anthropic_client().await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_anthropic_client()
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -458,7 +472,9 @@ async fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
 #[tokio::test]
 async fn unknown_openai_model_emits_unknown_cost() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openai_client().await.with_cost_event_sink(sink.clone(), cost_context());
+    let client = make_test_openai_client()
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -504,8 +520,9 @@ async fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
 
 #[tokio::test]
 async fn sink_panic_is_caught_and_does_not_propagate() {
-    let client =
-        make_test_openai_client().await.with_cost_event_sink(Arc::new(PanicSink), cost_context());
+    let client = make_test_openai_client()
+        .await
+        .with_cost_event_sink(Arc::new(PanicSink), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,
@@ -2004,7 +2021,9 @@ fn prompt_cache_config_rolling_messages_clamped() {
 
 #[tokio::test]
 async fn with_prompt_cache_key_sets_field() {
-    let client = make_test_anthropic_client().await.with_prompt_cache_key("sess-xyz");
+    let client = make_test_anthropic_client()
+        .await
+        .with_prompt_cache_key("sess-xyz");
     assert_eq!(client.prompt_cache_key.as_deref(), Some("sess-xyz"));
 }
 
@@ -2244,7 +2263,9 @@ async fn for_auxiliary_falls_through_to_primary_when_aux_unset() {
     config.llm.model = "claude-sonnet-4".to_string();
     assert!(config.llm.aux.is_none(), "aux defaults to None");
 
-    let client = LlmClient::for_auxiliary(&config).await.expect("aux-unset must fall through to primary");
+    let client = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("aux-unset must fall through to primary");
     assert_eq!(client.provider, Provider::Anthropic);
     assert_eq!(client.llm_config.model, "claude-sonnet-4");
 }
@@ -2269,7 +2290,9 @@ async fn for_auxiliary_resolves_auto_sentinel_via_picker() {
         ..Default::default()
     });
 
-    let client = LlmClient::for_auxiliary(&config).await.expect("auto sentinel must resolve");
+    let client = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("auto sentinel must resolve");
     assert_eq!(client.provider, Provider::Anthropic);
     assert_eq!(
         client.llm_config.model,
@@ -2297,7 +2320,9 @@ async fn for_auxiliary_passes_concrete_model_through() {
         ..Default::default()
     });
 
-    let client = LlmClient::for_auxiliary(&config).await.expect("concrete model must pass through");
+    let client = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("concrete model must pass through");
     assert_eq!(client.llm_config.model, "claude-haiku-4-5");
 }
 
@@ -2316,8 +2341,9 @@ async fn for_auxiliary_falls_through_for_local_provider() {
         ..Default::default()
     });
 
-    let client =
-        LlmClient::for_auxiliary(&config).await.expect("local-provider aux must fall through, not error");
+    let client = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("local-provider aux must fall through, not error");
     // Falls through to primary, which is also ollama.
     assert_eq!(client.provider, Provider::Ollama);
     assert_eq!(client.llm_config.model, "llama3");
@@ -2385,7 +2411,9 @@ async fn for_auxiliary_synthesizes_separate_fallback_chain() {
     });
 
     let primary = LlmClient::new(&config).await.expect("primary must build");
-    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
+    let aux = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("aux must build");
 
     assert_eq!(primary.provider_slots.len(), 1);
     assert_eq!(aux.provider_slots.len(), 2);
@@ -2419,7 +2447,9 @@ async fn for_auxiliary_forces_thinking_off() {
         ..Default::default()
     });
 
-    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
+    let aux = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("aux must build");
     assert_eq!(
         aux.llm_config.thinking,
         crate::config::llm::ThinkingLevel::Off,
@@ -2453,7 +2483,9 @@ async fn for_auxiliary_clears_thinking_overrides_so_picker_choice_stays_off() {
         ..Default::default()
     });
 
-    let aux = LlmClient::for_auxiliary(&config).await.expect("aux must build");
+    let aux = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("aux must build");
     assert!(
         aux.llm_config.thinking_overrides.is_empty(),
         "primary overrides must be wiped from aux"
@@ -2718,7 +2750,9 @@ async fn azure_openai_construction_succeeds_with_settings() {
     cfg.llm.azure_deployment = Some("gpt-4o-prod".to_string());
     cfg.llm.azure_api_version = Some("2024-10-21".to_string());
 
-    let client = LlmClient::new(&cfg).await.expect("Azure client should construct");
+    let client = LlmClient::new(&cfg)
+        .await
+        .expect("Azure client should construct");
     let url = client.effective_base_url().to_string();
     assert_eq!(
         url,
@@ -2735,7 +2769,9 @@ async fn azure_openai_construction_respects_base_url_override() {
         "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21".to_string(),
     );
 
-    let client = LlmClient::new(&cfg).await.expect("base_url override should bypass composer");
+    let client = LlmClient::new(&cfg)
+        .await
+        .expect("base_url override should bypass composer");
     let url = client.effective_base_url().to_string();
     assert_eq!(
         url,

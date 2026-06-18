@@ -482,7 +482,9 @@ mod tests {
     async fn test_check_sender_access_open_policy() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Open);
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None)
+            .await
+            .unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
     }
 
@@ -490,7 +492,9 @@ mod tests {
     async fn test_check_sender_access_disabled_policy() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Disabled);
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None)
+            .await
+            .unwrap();
         assert!(matches!(result, AccessCheckResult::Denied { .. }));
     }
 
@@ -498,7 +502,9 @@ mod tests {
     async fn test_check_sender_access_pairing_issues_challenge() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let result = check_sender_access(&db, &config, "telegram", "new_user", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "new_user", None)
+            .await
+            .unwrap();
         match result {
             AccessCheckResult::Challenge { code, message } => {
                 assert!(code.starts_with("tg/"), "expected tg/ prefix, got: {code}");
@@ -522,8 +528,9 @@ mod tests {
     async fn test_check_sender_access_pairing_custom_agent_name() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let result =
-            check_sender_access(&db, &config, "telegram", "named_user", Some("Nova")).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "named_user", Some("Nova"))
+            .await
+            .unwrap();
         match result {
             AccessCheckResult::Challenge { code, message } => {
                 assert!(message.contains("Nova: access not configured"));
@@ -550,7 +557,9 @@ mod tests {
         let config = test_config_with_policy(DmPolicy::Pairing);
 
         // First call creates a challenge
-        let result = check_sender_access(&db, &config, "telegram", "user1", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "user1", None)
+            .await
+            .unwrap();
         let code = match result {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
@@ -560,7 +569,9 @@ mod tests {
         db.approve_pairing("telegram", &code).await.unwrap();
 
         // Second call should be allowed
-        let result = check_sender_access(&db, &config, "telegram", "user1", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "user1", None)
+            .await
+            .unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
     }
 
@@ -573,11 +584,17 @@ mod tests {
         // existing pending request can't be recovered to re-display. Each
         // challenge therefore expires the old request and mints a fresh code
         // (see `check_pairing`); the rate limit bounds the churn.
-        let code1 = match check_sender_access(&db, &config, "telegram", "user2", None).await.unwrap() {
+        let code1 = match check_sender_access(&db, &config, "telegram", "user2", None)
+            .await
+            .unwrap()
+        {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
-        let code2 = match check_sender_access(&db, &config, "telegram", "user2", None).await.unwrap() {
+        let code2 = match check_sender_access(&db, &config, "telegram", "user2", None)
+            .await
+            .unwrap()
+        {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
@@ -595,11 +612,15 @@ mod tests {
             .insert("slack".into(), DmPolicy::Open);
 
         // Slack should be open despite default being pairing
-        let result = check_sender_access(&db, &config, "slack", "anyone", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "slack", "anyone", None)
+            .await
+            .unwrap();
         assert!(matches!(result, AccessCheckResult::Allowed));
 
         // Telegram still uses default pairing
-        let result = check_sender_access(&db, &config, "telegram", "anyone", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "anyone", None)
+            .await
+            .unwrap();
         assert!(matches!(result, AccessCheckResult::Challenge { .. }));
     }
 
@@ -607,7 +628,10 @@ mod tests {
     async fn test_find_pending_by_code_returns_match() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_code", None).await.unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_code", None)
+            .await
+            .unwrap()
+        {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
@@ -636,7 +660,10 @@ mod tests {
     async fn test_find_pending_by_code_case_insensitive() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_ci", None).await.unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_ci", None)
+            .await
+            .unwrap()
+        {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
@@ -650,7 +677,10 @@ mod tests {
     async fn test_find_pending_by_code_approved_returns_none() {
         let db = test_db().await;
         let config = test_config_with_policy(DmPolicy::Pairing);
-        let code = match check_sender_access(&db, &config, "telegram", "user_appr", None).await.unwrap() {
+        let code = match check_sender_access(&db, &config, "telegram", "user_appr", None)
+            .await
+            .unwrap()
+        {
             AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
@@ -746,13 +776,15 @@ mod tests {
         // Create max attempts directly in the DB for the same sender
         for _ in 0..constants::PAIRING_MAX_ATTEMPTS_PER_HOUR {
             let code = generate_code("telegram");
-            db.create_pairing_request("telegram", "rate_limit_user", &code, None, 3600).await
+            db.create_pairing_request("telegram", "rate_limit_user", &code, None, 3600)
+                .await
                 .unwrap();
         }
 
         // The next attempt should be denied
-        let result =
-            check_sender_access(&db, &config, "telegram", "rate_limit_user", None).await.unwrap();
+        let result = check_sender_access(&db, &config, "telegram", "rate_limit_user", None)
+            .await
+            .unwrap();
         assert!(
             matches!(result, AccessCheckResult::Denied { .. }),
             "expected Denied after exceeding rate limit, got {result:?}"
@@ -768,13 +800,15 @@ mod tests {
         // could skip the counter), so every call is recorded against the
         // per-sender hourly rate limit.
         for _ in 0..2 {
-            let result =
-                check_sender_access(&db, &config, "telegram", "reuse_user", None).await.unwrap();
+            let result = check_sender_access(&db, &config, "telegram", "reuse_user", None)
+                .await
+                .unwrap();
             assert!(matches!(result, AccessCheckResult::Challenge { .. }));
         }
 
         let count = db
-            .count_pairing_attempts("telegram", "reuse_user", 3600).await
+            .count_pairing_attempts("telegram", "reuse_user", 3600)
+            .await
             .unwrap();
         assert_eq!(count, 2, "every challenge counts toward the rate limit");
     }
@@ -785,31 +819,36 @@ mod tests {
 
         // No attempts yet
         let count = db
-            .count_pairing_attempts("telegram", "counter_user", 3600).await
+            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .await
             .unwrap();
         assert_eq!(count, 0);
 
         // Create some requests
         for _ in 0..5 {
             let code = generate_code("telegram");
-            db.create_pairing_request("telegram", "counter_user", &code, None, 3600).await
+            db.create_pairing_request("telegram", "counter_user", &code, None, 3600)
+                .await
                 .unwrap();
         }
 
         let count = db
-            .count_pairing_attempts("telegram", "counter_user", 3600).await
+            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .await
             .unwrap();
         assert_eq!(count, 5);
 
         // Different sender should have 0
         let count = db
-            .count_pairing_attempts("telegram", "other_user", 3600).await
+            .count_pairing_attempts("telegram", "other_user", 3600)
+            .await
             .unwrap();
         assert_eq!(count, 0);
 
         // Different channel should have 0
         let count = db
-            .count_pairing_attempts("slack", "counter_user", 3600).await
+            .count_pairing_attempts("slack", "counter_user", 3600)
+            .await
             .unwrap();
         assert_eq!(count, 0);
     }

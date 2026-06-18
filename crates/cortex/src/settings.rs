@@ -420,7 +420,10 @@ mod tests {
         let cfg = resolver.resolve().await.unwrap();
         assert_eq!(cfg.security.verifier, crate::config::VerifierKind::Tofu);
 
-        resolver.set("security.verifier", "tailscale").await.unwrap();
+        resolver
+            .set("security.verifier", "tailscale")
+            .await
+            .unwrap();
         let cfg = resolver.resolve().await.unwrap();
         assert_eq!(
             cfg.security.verifier,
@@ -502,7 +505,10 @@ mod tests {
         // Override sub-field via dedicated key — must auto-create-if-needed
         // semantics survive the round-trip (already created here, but the
         // setter must NOT clobber unrelated fields).
-        resolver.set("llm.aux.model", "claude-haiku-4-5").await.unwrap();
+        resolver
+            .set("llm.aux.model", "claude-haiku-4-5")
+            .await
+            .unwrap();
         let cfg = resolver.resolve().await.unwrap();
         let aux = cfg.llm.aux.unwrap();
         assert_eq!(aux.model, "claude-haiku-4-5");
@@ -538,7 +544,10 @@ mod tests {
         let resolver = test_resolver().await;
         let blob = r#"{"provider":"anthropic","model":"auto","api_key_env":"ANTHROPIC_API_KEY"}"#;
         resolver.set("llm.aux", blob).await.unwrap();
-        resolver.set("llm.aux.model", "claude-haiku-4-5").await.unwrap();
+        resolver
+            .set("llm.aux.model", "claude-haiku-4-5")
+            .await
+            .unwrap();
         // Sanity: aux exists with the overridden model.
         assert_eq!(
             resolver.resolve().await.unwrap().llm.aux.unwrap().model,
@@ -719,7 +728,8 @@ mod tests {
     async fn heartbeat_channels_round_trip() {
         let resolver = test_resolver().await;
         resolver
-            .set("heartbeat.channels", r#"["telegram","slack"]"#).await
+            .set("heartbeat.channels", r#"["telegram","slack"]"#)
+            .await
             .unwrap();
         let config = resolver.resolve().await.unwrap();
         assert_eq!(config.heartbeat.channels, vec!["telegram", "slack"]);
@@ -729,7 +739,8 @@ mod tests {
     async fn security_blocked_paths_round_trip() {
         let resolver = test_resolver().await;
         resolver
-            .set("security.blocked_paths", r#"[".ssh",".env"]"#).await
+            .set("security.blocked_paths", r#"[".ssh",".env"]"#)
+            .await
             .unwrap();
         let config = resolver.resolve().await.unwrap();
         assert_eq!(config.security.blocked_paths, vec![".ssh", ".env"]);
@@ -811,7 +822,11 @@ mod tests {
         resolver.set("temperature", "1.5").await.unwrap();
         resolver.unset("temperature").await.unwrap();
         // Row should still exist in DB with the default value
-        let db_val = resolver.database().get_setting("temperature").await.unwrap();
+        let db_val = resolver
+            .database()
+            .get_setting("temperature")
+            .await
+            .unwrap();
         assert_eq!(db_val, Some("0.7".to_string()));
         // Source should report Default since value matches compiled default
         let (val, source) = resolver.get_with_source("temperature").await.unwrap();
@@ -1028,7 +1043,8 @@ mod tests {
         for (db_value, expected) in cases {
             let resolver = test_resolver().await;
             resolver
-                .set("llm.credential_strategy", db_value).await
+                .set("llm.credential_strategy", db_value)
+                .await
                 .unwrap_or_else(|e| panic!("set {db_value}: {e}"));
             let cfg = resolver.resolve().await.unwrap();
             assert_eq!(
@@ -1042,7 +1058,10 @@ mod tests {
     async fn credential_strategy_rejects_garbage() {
         let resolver = test_resolver().await;
         assert!(
-            resolver.set("llm.credential_strategy", "sideways").await.is_err(),
+            resolver
+                .set("llm.credential_strategy", "sideways")
+                .await
+                .is_err(),
             "unknown strategy should be rejected at set-time"
         );
     }
@@ -1051,7 +1070,10 @@ mod tests {
     async fn credential_cooldown_secs_round_trips_at_boundaries() {
         let resolver = test_resolver().await;
         for raw in &["0", "60", "86400"] {
-            resolver.set("llm.credential_cooldown_secs", raw).await.unwrap();
+            resolver
+                .set("llm.credential_cooldown_secs", raw)
+                .await
+                .unwrap();
             let cfg = resolver.resolve().await.unwrap();
             assert_eq!(
                 cfg.llm.credential_cooldown_secs,
@@ -1064,7 +1086,10 @@ mod tests {
     async fn credential_cooldown_rejects_negative() {
         let resolver = test_resolver().await;
         assert!(
-            resolver.set("llm.credential_cooldown_secs", "-1").await.is_err(),
+            resolver
+                .set("llm.credential_cooldown_secs", "-1")
+                .await
+                .is_err(),
             "negative cooldown should be rejected"
         );
     }
@@ -1074,7 +1099,8 @@ mod tests {
         let resolver = test_resolver().await;
         assert!(
             resolver
-                .set("llm.max_concurrent_per_credential", "0").await
+                .set("llm.max_concurrent_per_credential", "0")
+                .await
                 .is_err(),
             "max concurrent must be nonzero — zero would dead-end every lease"
         );
@@ -1084,7 +1110,8 @@ mod tests {
     async fn max_concurrent_per_credential_accepts_positive() {
         let resolver = test_resolver().await;
         resolver
-            .set("llm.max_concurrent_per_credential", "4").await
+            .set("llm.max_concurrent_per_credential", "4")
+            .await
             .unwrap();
         let cfg = resolver.resolve().await.unwrap();
         assert_eq!(cfg.llm.max_concurrent_per_credential, 4);

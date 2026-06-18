@@ -1032,7 +1032,8 @@ mod tests {
             hash,
             &[1, 2],
             2,
-        ).await
+        )
+        .await
         .unwrap();
         db.cache_embedding(
             &openrouter.endpoint,
@@ -1040,15 +1041,18 @@ mod tests {
             hash,
             &[9, 9],
             2,
-        ).await
+        )
+        .await
         .unwrap();
 
         let (bytes_a, _) = db
-            .get_cached_embedding(&openai.endpoint, &openai.cache_model_key(), hash).await
+            .get_cached_embedding(&openai.endpoint, &openai.cache_model_key(), hash)
+            .await
             .unwrap()
             .expect("openai entry");
         let (bytes_b, _) = db
-            .get_cached_embedding(&openrouter.endpoint, &openrouter.cache_model_key(), hash).await
+            .get_cached_embedding(&openrouter.endpoint, &openrouter.cache_model_key(), hash)
+            .await
             .unwrap()
             .expect("openrouter entry");
         assert_eq!(bytes_a, vec![1, 2]);

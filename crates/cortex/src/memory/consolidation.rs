@@ -1049,7 +1049,8 @@ mod tests {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let name = format!("daily/{date}");
 
-        db.append_memory_entry("global", &name, "- [Decision] test fact").await
+        db.append_memory_entry("global", &name, "- [Decision] test fact")
+            .await
             .unwrap();
 
         let entry = db.get_memory_entry("global", &name).await.unwrap().unwrap();
@@ -1062,12 +1063,16 @@ mod tests {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let name = format!("daily/{date}");
 
-        flush_short_term_to_daily_with_db(&db, "- [Decision] chose rust").await.unwrap();
+        flush_short_term_to_daily_with_db(&db, "- [Decision] chose rust")
+            .await
+            .unwrap();
         let first = db.get_memory_entry("global", &name).await.unwrap().unwrap();
         assert!(first.content.contains("chose rust"));
         assert!(first.content.contains("Session flush"));
 
-        flush_short_term_to_daily_with_db(&db, "- [Correction] use snake_case").await.unwrap();
+        flush_short_term_to_daily_with_db(&db, "- [Correction] use snake_case")
+            .await
+            .unwrap();
         let second = db.get_memory_entry("global", &name).await.unwrap().unwrap();
         assert!(second.content.contains("chose rust"));
         assert!(second.content.contains("use snake_case"));
@@ -1077,11 +1082,14 @@ mod tests {
     #[tokio::test]
     async fn optional_db_routes_through_provided_handle() {
         let db = crate::db::Database::test_db().await;
-        flush_short_term_to_daily_with_optional_db(Some(&db), "- [Decision] use Rust").await.unwrap();
+        flush_short_term_to_daily_with_optional_db(Some(&db), "- [Decision] use Rust")
+            .await
+            .unwrap();
 
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let entry = db
-            .get_memory_entry("global", &format!("daily/{date}")).await
+            .get_memory_entry("global", &format!("daily/{date}"))
+            .await
             .unwrap()
             .expect("entry must be written through the injected db handle");
         assert!(entry.content.contains("use Rust"));
@@ -1094,15 +1102,19 @@ mod tests {
         // where blank-flush would clobber the existing daily/{date} entry with
         // an empty body.
         let db = crate::db::Database::test_db().await;
-        flush_short_term_to_daily_with_optional_db(Some(&db), "").await
+        flush_short_term_to_daily_with_optional_db(Some(&db), "")
+            .await
             .expect("empty input must be a no-op, not an error");
-        flush_short_term_to_daily_with_optional_db(Some(&db), "   \n").await
+        flush_short_term_to_daily_with_optional_db(Some(&db), "   \n")
+            .await
             .expect("whitespace-only input must be a no-op, not an error");
-        flush_short_term_to_daily_with_optional_db(None, "").await
+        flush_short_term_to_daily_with_optional_db(None, "")
+            .await
             .expect("None db + empty input must be a no-op, not an error");
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
-            db.get_memory_entry("global", &format!("daily/{date}")).await
+            db.get_memory_entry("global", &format!("daily/{date}"))
+                .await
                 .unwrap()
                 .is_none(),
             "no-op flush must not create a daily entry"
@@ -1122,11 +1134,14 @@ mod tests {
             1,
         );
 
-        flush_short_term_to_daily_with_db(&db, &stm.facts_as_text()).await.unwrap();
+        flush_short_term_to_daily_with_db(&db, &stm.facts_as_text())
+            .await
+            .unwrap();
 
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let entry = db
-            .get_memory_entry("global", &format!("daily/{date}")).await
+            .get_memory_entry("global", &format!("daily/{date}"))
+            .await
             .unwrap()
             .unwrap();
         assert!(entry.content.contains("PG over MySQL"));

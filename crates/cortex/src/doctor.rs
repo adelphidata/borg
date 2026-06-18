@@ -276,7 +276,9 @@ async fn run_diagnostics_with_registry_opts(
 /// rebuilt empty. Non-draining (`peek`) so the boot path's user-facing notice
 /// still fires. Passes silently when no recovery occurred.
 fn check_db_recovery(checks: &mut Vec<DiagnosticCheck>) {
-    checks.push(db_recovery_check(crate::db::Database::peek_recovery_notice()));
+    checks.push(db_recovery_check(
+        crate::db::Database::peek_recovery_notice(),
+    ));
 }
 
 /// Pure mapping from a recovery notice to a diagnostic check, split out so the
