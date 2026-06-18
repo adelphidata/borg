@@ -11,6 +11,10 @@
 //!   the LLM — that would be a credential-exfiltration vector.
 //! - **No shell.** The command and args are passed directly to `Command`;
 //!   no `sh -c` interpolation.
+//! - **Exfil-shape refusal.** Every spawn funnels through here, so this is the
+//!   universal enforcement point for [`crate::security::validate_stdio_command`]:
+//!   a shell interpreter wrapping network egress is refused before exec,
+//!   covering the daemon and operator tooling (`borg mcp …`) alike.
 
 use super::{is_env_allowed, Transport};
 use crate::errors::{McpError, Result};
@@ -46,6 +50,18 @@ pub type StderrSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Spawn the child and return a connected transport.
 pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTransport> {
+    // Universal exfil-shape backstop: refuse a shell interpreter wrapping
+    // network egress before exec. cortex's start_server emits the specific
+    // audit row and returns earlier on the daemon path; this catch covers any
+    // caller (operator `borg mcp …` tooling spawns straight through here),
+    // so no path can bypass the gate.
+    if let Some(reason) = crate::security::validate_stdio_command(&config.command, &config.args) {
+        return Err(McpError::Connect(format!(
+            "refused exfiltration-shaped stdio command '{}': {reason}",
+            config.command
+        )));
+    }
+
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .stdin(Stdio::piped())

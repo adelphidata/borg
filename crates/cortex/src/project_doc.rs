@@ -46,7 +46,15 @@ pub fn discover_project_docs(cwd: &Path) -> Result<Option<String>> {
                     if !combined.is_empty() {
                         combined.push_str("\n\n---\n\n");
                     }
-                    combined.push_str(&format!("<!-- {} -->\n{}", path.display(), truncated));
+                    // Name the file and tell the agent it can read the rest, so a
+                    // partial doc isn't mistaken for the whole file. The marker is
+                    // an HTML comment so it stays inert in the rendered prompt.
+                    combined.push_str(&format!(
+                        "<!-- {path} (TRUNCATED: exceeded the project-doc budget; \
+                         read the full file with read_file(\"{path}\") if you need \
+                         the omitted content) -->\n{truncated}",
+                        path = path.display(),
+                    ));
                     break;
                 }
                 if !combined.is_empty() {
@@ -239,7 +247,14 @@ mod tests {
 
         let result = discover_project_docs(tmp.path()).unwrap();
         let content = result.unwrap();
-        assert!(content.len() <= MAX_PROJECT_DOC_BYTES + 200); // some overhead for path comment
+        // Budget plus the truncation marker (which names the path twice and the
+        // read_file hint). Generous headroom keeps this from being brittle.
+        assert!(content.len() <= MAX_PROJECT_DOC_BYTES + 512);
+        // Truncation must be announced with an actionable read_file hint so the
+        // agent doesn't treat the partial doc as the whole file.
+        assert!(content.contains("TRUNCATED"));
+        assert!(content.contains("read_file"));
+        assert!(content.contains("AGENTS.md"));
     }
 
     #[test]
@@ -432,6 +447,9 @@ mod tests {
         let b_count = result.matches('b').count();
         assert!(b_count > 0, "second file should be partially included");
         assert!(b_count < 2000, "second file should be truncated");
+        // The truncated (second) doc carries the actionable marker.
+        assert!(result.contains("TRUNCATED"));
+        assert!(result.contains("read_file"));
     }
 
     #[test]

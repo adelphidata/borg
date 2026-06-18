@@ -45,6 +45,7 @@ pub mod errors;
 pub mod manifest;
 pub mod protocol;
 pub mod registry;
+pub mod security;
 pub mod session;
 pub mod transport;
 
@@ -52,3 +53,4 @@ pub use errors::McpError;
 pub use manifest::{HttpAuth, ServerManifest, ToolFilter, Transport};
 pub use protocol::{McpToolSchema, ToolCallResult};
 pub use registry::{McpRegistry, RegisteredTool, RegistryStatus};
+pub use security::{is_stdio_command_suspicious, validate_stdio_command};
