@@ -122,7 +122,12 @@ pub async fn run_btw(
                 stream_error = Some(msg);
             }
             StreamEvent::Done => break,
-            StreamEvent::ThinkingDelta(_) | StreamEvent::Usage(_) | StreamEvent::Truncated => {}
+            // Failover identity only matters for the conversational
+            // <environment> section; this one-shot helper has none to sync.
+            StreamEvent::ThinkingDelta(_)
+            | StreamEvent::Usage(_)
+            | StreamEvent::Truncated
+            | StreamEvent::Failover { .. } => {}
         }
     }
 

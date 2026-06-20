@@ -291,6 +291,13 @@ pub struct Agent {
     /// for this session so a multi-iteration first turn (tool calls,
     /// continuations) doesn't spawn it repeatedly. Reset by `new_session`.
     pub(super) auto_title_spawned: bool,
+    /// Provider/model that actually served the most recent response when a
+    /// failover occurred, as `(provider, model)`. Reset to `None` at the start
+    /// of each iteration's stream and re-set by a [`crate::llm::StreamEvent::Failover`];
+    /// read by `build_environment_section` so the model reports the model that
+    /// served it rather than the configured primary during an outage.
+    /// In-memory only — never persisted.
+    pub(super) active_failover_identity: Option<(String, String)>,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -429,6 +436,7 @@ impl Agent {
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
             auto_title_spawned: false,
+            active_failover_identity: None,
         }
     }
 
@@ -1000,6 +1008,12 @@ impl Agent {
             };
 
             // --- Stream LLM response ---
+            // Reset the failover identity for this stream: the prompt for this
+            // iteration was already built (line above) from the prior value, so
+            // clearing now means a clean primary serve leaves it `None` and the
+            // next iteration reports the configured primary again. A failover
+            // during this stream re-sets it via `StreamEvent::Failover`.
+            self.active_failover_identity = None;
             let llm_start = Instant::now();
             self.metrics.llm_requests.add(1, &[]);
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);

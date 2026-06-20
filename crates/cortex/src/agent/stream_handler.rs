@@ -96,6 +96,14 @@ impl Agent {
                 // unclosed by the cut-off.
                 *truncated_due_to_length = true;
             }
+            StreamEvent::Failover { provider, model } => {
+                // The client switched to a fallback slot mid-request. Record it
+                // so the next iteration's <environment> section reports the
+                // model that actually served the response, keeping the model's
+                // self-identification truthful during a primary outage.
+                tracing::info!(provider = %provider, model = %model, "LLM failover; syncing prompt model identity");
+                self.active_failover_identity = Some((provider, model));
+            }
             StreamEvent::Done => return StreamEventOutcome::Terminal,
             StreamEvent::Error(e) => {
                 warn!("LLM stream emitted error mid-response: {e}");

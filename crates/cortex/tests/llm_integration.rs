@@ -114,6 +114,9 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
                 events.push("truncated".into());
                 break;
             }
+            StreamEvent::Failover { provider, model } => {
+                events.push(format!("failover:{provider}:{model}"));
+            }
         }
     }
     events

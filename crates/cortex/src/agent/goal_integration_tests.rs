@@ -61,6 +61,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,
         auto_title_spawned: false,
+        active_failover_identity: None,
     }
 }
 

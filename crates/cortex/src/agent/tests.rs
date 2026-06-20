@@ -267,12 +267,13 @@ fn non_mutating_tools_allowed_in_plan_mode() {
     assert!(!is_mutating_tool("request_user_input"));
 }
 
-#[test]
-fn skill_tool_write_refreshes_cached_skill_state() {
-    let config = Config::default();
+/// Build a minimal in-memory `Agent` for unit tests that exercise prompt /
+/// section assembly. No DB, network, or sub-agent control — just enough state
+/// for the section builders to run.
+fn minimal_test_agent(config: Config) -> Agent {
     let session = Session::new();
     let session_id = session.meta.id.clone();
-    let mut agent = Agent {
+    Agent {
         config: config.clone(),
         history: Vec::new(),
         session,
@@ -289,13 +290,7 @@ fn skill_tool_write_refreshes_cached_skill_state() {
         tts_synthesizer: None,
         config_rx: None,
         db: Mutex::new(None),
-        caches: SystemPromptCache::with_test_state(
-            None,
-            Some(HashMap::new()),
-            Some("cached".to_string()),
-            Some("old request".to_string()),
-            Some(vec!["pdf".to_string()]),
-        ),
+        caches: SystemPromptCache::with_test_state(None, Some(HashMap::new()), None, None, None),
         ghost_commit: None,
         execution_context: crate::execution_context::ExecutionContext::unrestricted(
             std::path::PathBuf::from("."),
@@ -313,7 +308,54 @@ fn skill_tool_write_refreshes_cached_skill_state() {
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,
         auto_title_spawned: false,
-    };
+        active_failover_identity: None,
+    }
+}
+
+/// After a provider failover, the `<environment>` runtime line must report the
+/// model that actually served the response — not the configured primary — so
+/// the model identifies itself truthfully during an outage. Guards the
+/// `active_failover_identity` → environment-section wiring.
+#[tokio::test]
+async fn environment_section_reports_failover_model_identity() {
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.model = "claude-primary".to_string();
+    let mut agent = minimal_test_agent(config);
+
+    // No failover this turn: report the configured primary, no marker.
+    let env = agent.build_environment_section().await;
+    assert!(env.contains("provider=anthropic"), "got: {env}");
+    assert!(env.contains("model=claude-primary"), "got: {env}");
+    assert!(
+        !env.contains("failover active"),
+        "no failover marker when the primary serves: {env}"
+    );
+
+    // A failover occurred: report the slot that actually served the response.
+    agent.active_failover_identity = Some(("openai".to_string(), "gpt-fallback".to_string()));
+    let env = agent.build_environment_section().await;
+    assert!(
+        env.contains("provider=openai (failover active)"),
+        "got: {env}"
+    );
+    assert!(env.contains("model=gpt-fallback"), "got: {env}");
+    assert!(
+        !env.contains("model=claude-primary"),
+        "must not still report the primary model after failover: {env}"
+    );
+}
+
+#[test]
+fn skill_tool_write_refreshes_cached_skill_state() {
+    let mut agent = minimal_test_agent(Config::default());
+    agent.caches = SystemPromptCache::with_test_state(
+        None,
+        Some(HashMap::new()),
+        Some("cached".to_string()),
+        Some("old request".to_string()),
+        Some(vec!["pdf".to_string()]),
+    );
 
     agent.maybe_refresh_skills_after_tool(
         tn::APPLY_PATCH,
@@ -336,51 +378,14 @@ fn skill_tool_write_refreshes_cached_skill_state() {
 /// is the Agent-side end-to-end of `SystemPromptCache::on_config_reloaded`.
 #[test]
 fn reload_config_clears_skills_and_replaces_credentials_preserving_identity() {
-    let config = Config::default();
-    let session = Session::new();
-    let session_id = session.meta.id.clone();
-    let mut agent = Agent {
-        config: config.clone(),
-        history: Vec::new(),
-        session,
-        policy: config.policy.clone(),
-        hook_registry: HookRegistry::new(),
-        turn_count: 0,
-        rate_guard: SessionRateGuard::new(config.security.action_limits.clone()),
-        agent_control: None,
-        spawn_depth: 0,
-        tools_filter: None,
-        skill_env_allowlist: std::collections::HashSet::new(),
-        metrics: BorgMetrics::default(),
-        browser_session: None,
-        tts_synthesizer: None,
-        config_rx: None,
-        db: Mutex::new(None),
-        caches: SystemPromptCache::with_test_state(
-            Some("identity-snapshot".into()),
-            Some(HashMap::from([("OLD_TOKEN".into(), "v".into())])),
-            Some("rendered-skills".into()),
-            Some("user-request".into()),
-            Some(vec!["pdf".into()]),
-        ),
-        ghost_commit: None,
-        execution_context: crate::execution_context::ExecutionContext::unrestricted(
-            std::path::PathBuf::from("."),
-        ),
-        git_repo_root: None,
-        config_arc: Arc::new(config.clone()),
-        steer_rx: None,
-        recent_tool_names: std::collections::HashSet::new(),
-        cost_event_sink: None,
-        short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
-        setup_just_consumed: false,
-        tool_call_repeat: ToolCallRepeatTracker::default(),
-        unknown_tool_tracker: UnknownToolTracker::default(),
-        llm_role: LlmRole::Primary,
-        goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
-        goal_event_sink: None,
-        auto_title_spawned: false,
-    };
+    let mut agent = minimal_test_agent(Config::default());
+    agent.caches = SystemPromptCache::with_test_state(
+        Some("identity-snapshot".into()),
+        Some(HashMap::from([("OLD_TOKEN".into(), "v".into())])),
+        Some("rendered-skills".into()),
+        Some("user-request".into()),
+        Some(vec!["pdf".into()]),
+    );
 
     agent.reload_config(Config::default());
 

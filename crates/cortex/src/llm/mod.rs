@@ -190,6 +190,13 @@ pub enum StreamEvent {
     /// `delta.stop_reason == "max_tokens"`. Non-terminal — the SSE driver
     /// still relies on `[DONE]` / `message_stop` to end the stream.
     Truncated,
+    /// The client failed over to a fallback provider/model mid-request. Emitted
+    /// at the switch, before the (re)attempt that produces the response, so it
+    /// arrives ahead of `Done`. The agent records `(provider, model)` and the
+    /// next iteration's `<environment>` section reports the model that actually
+    /// served the response instead of the configured primary — otherwise the
+    /// model misidentifies itself during a primary outage. Non-terminal.
+    Failover { provider: String, model: String },
     /// Stream completed.
     Done,
     /// Stream error.
@@ -1011,6 +1018,39 @@ impl LlmClient {
         }
     }
 
+    /// Switch to the next usable provider slot AND announce the switch on the
+    /// stream, returning whether a failover occurred. Couples the slot switch to
+    /// the [`StreamEvent::Failover`] notification structurally so a new failover
+    /// call site cannot switch slots without keeping the agent's reported model
+    /// identity in sync — every failover path must go through here, not bare
+    /// [`Self::try_failover_provider`].
+    async fn failover_and_notify(&mut self, tx: &mpsc::Sender<StreamEvent>) -> bool {
+        if self.try_failover_provider() {
+            self.notify_failover(tx).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Announce the now-active slot after a failover so the agent can keep the
+    /// model's self-reported identity in sync. Called right after
+    /// [`Self::try_failover_provider`] switches slots — `self.provider` and
+    /// `self.llm_config.model` already reflect the new slot. Best-effort: a
+    /// closed receiver only means the turn is being torn down.
+    async fn notify_failover(&self, tx: &mpsc::Sender<StreamEvent>) {
+        if tx
+            .send(StreamEvent::Failover {
+                provider: self.provider.to_string(),
+                model: self.llm_config.model.clone(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::trace!("llm: stream receiver closed before failover notice");
+        }
+    }
+
     fn debug_log(&self, label: &str, content: &str) {
         if !self.debug_logging {
             return;
@@ -1358,7 +1398,7 @@ impl LlmClient {
                             FailoverReason::AuthPermanent
                         };
                         self.record_provider_failure(reason);
-                        if self.try_failover_provider() {
+                        if self.failover_and_notify(&tx).await {
                             should_failover = true;
                             break;
                         }
@@ -1473,7 +1513,7 @@ impl LlmClient {
                                 .unwrap_or(false);
                             if !defer_fallback
                                 && e.should_fallback()
-                                && self.try_failover_provider()
+                                && self.failover_and_notify(&tx).await
                             {
                                 should_failover = true;
                                 break;

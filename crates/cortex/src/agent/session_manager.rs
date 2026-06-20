@@ -55,6 +55,9 @@ impl Agent {
         );
         // A fresh session gets its own one-shot auto-title pass.
         self.auto_title_spawned = false;
+        // Don't carry a prior session's failover identity into a new session —
+        // its first turn runs on the configured primary until proven otherwise.
+        self.active_failover_identity = None;
 
         // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(

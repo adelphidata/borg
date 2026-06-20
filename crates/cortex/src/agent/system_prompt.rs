@@ -337,11 +337,21 @@ impl Agent {
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
-        if let Some(ref provider) = self.config.llm.provider {
-            runtime_parts.push(format!("provider={provider}"));
-        }
-        if !self.config.llm.model.is_empty() {
-            runtime_parts.push(format!("model={}", self.config.llm.model));
+        // After a failover, report the provider/model that actually served the
+        // last response so the model identifies itself truthfully; otherwise
+        // report the configured primary.
+        if let Some((provider, model)) = self.active_failover_identity.as_ref() {
+            runtime_parts.push(format!("provider={provider} (failover active)"));
+            if !model.is_empty() {
+                runtime_parts.push(format!("model={model}"));
+            }
+        } else {
+            if let Some(ref provider) = self.config.llm.provider {
+                runtime_parts.push(format!("provider={provider}"));
+            }
+            if !self.config.llm.model.is_empty() {
+                runtime_parts.push(format!("model={}", self.config.llm.model));
+            }
         }
         // Render the level via serde so new variants (minimal, adaptive, max)
         // pick up automatically. `serde_json::to_value` always succeeds for
