@@ -207,6 +207,7 @@ mod tests {
         const D: i64 = 86_400;
         // (name, now, last_vacuum, interval_days, freelist, page_count,
         //  page_size, expected)
+        #[allow(clippy::type_complexity)]
         let cases: &[(&str, i64, Option<i64>, u32, i64, i64, i64, bool)] = &[
             // 1 day since last vacuum, interval 7d — must skip even with high
             // fragmentation, because the interval gate dominates.

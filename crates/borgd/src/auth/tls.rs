@@ -116,7 +116,7 @@ mod tests {
                 "server_key_pem",
                 ServerCertMaterial {
                     server_key_pem: String::new(),
-                    ..base.clone()
+                    ..base
                 },
             ),
         ];

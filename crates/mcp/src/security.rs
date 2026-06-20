@@ -136,7 +136,7 @@ mod tests {
     use super::*;
 
     fn args(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+        parts.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
