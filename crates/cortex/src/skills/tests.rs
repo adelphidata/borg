@@ -330,6 +330,46 @@ fn borg_cli_skill_is_registered_default_enabled_and_documents_self_config() {
 }
 
 #[test]
+fn code_simplify_skill_is_registered_optin_and_documents_silent_failure_detection() {
+    // This skill's reason for existing is enforcing the project's
+    // "no silent error swallowing" invariant against arbitrary code. If
+    // the body ever loses the swallowed-error patterns or the risk-tier
+    // guidance, it stops doing the one thing it was added to do.
+    assert!(is_builtin_skill_name("code-simplify"));
+    // Opt-in: a specialized refactoring workflow, not needed every session.
+    assert!(
+        !DEFAULT_ENABLED_SKILLS.contains(&"code-simplify"),
+        "code-simplify is opt-in; default-enabling it spends prompt budget every session"
+    );
+
+    let content = bundled_skill_content("code-simplify").expect("code-simplify content embedded");
+    let (manifest, body) = parse_skill_md(content).expect("code-simplify SKILL.md parses");
+    assert_eq!(manifest.name, "code-simplify");
+    assert!(
+        !manifest.description.is_empty(),
+        "code-simplify must have a description so the loader can advertise it"
+    );
+
+    for required in [
+        // The swallowed-error detector — the core value, must enumerate the
+        // exact antipatterns the project invariant forbids.
+        "let _ =",
+        ".ok()",
+        // Chesterton's Fence — never delete on a hunch.
+        "git blame",
+        // Risk tiers gate application; a swallowed-error fix is never SAFE.
+        "SAFE",
+        "CAREFUL",
+        "RISKY",
+    ] {
+        assert!(
+            body.contains(required),
+            "code-simplify skill missing required guidance: {required}"
+        );
+    }
+}
+
+#[test]
 fn install_default_skills_no_overwrite() {
     let tmp = tempfile::TempDir::new().unwrap();
     let skill_dir = tmp.path().join("skills/slack");

@@ -86,6 +86,7 @@ bundled_skills! {
     "git"            => "git"            { category: "developer", default_enabled: true,  hidden: false },
     "search"         => "search"         { category: "core",      default_enabled: true,  hidden: false },
     "docker"         => "docker"         { category: "developer", default_enabled: false, hidden: false },
+    "code-simplify"  => "code-simplify"  { category: "developer", default_enabled: false, hidden: false },
     "database"       => "database"       { category: "developer", default_enabled: false, hidden: false },
     "notes"          => "notes"          { category: "utilities", default_enabled: false, hidden: false },
     "obsidian"       => "obsidian"       { category: "utilities", default_enabled: false, hidden: false },
