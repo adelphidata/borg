@@ -838,31 +838,120 @@ async fn start_server(
         }
     }
 
-    let policy = mcp::transport::http::HttpPolicy {
-        allow_plaintext_http: config.mcp.allow_plaintext_http,
-        allow_local_network: config.mcp.allow_local_network,
+    // Streamable-HTTP startup (`initialize` + read-only `tools/list`) can hit a
+    // transient `5xx`/`429` or a connection blip. Retry those by recreating the
+    // transport, bounded by `mcp.startup_max_retries`. Other transports and
+    // non-transient failures keep the original single-attempt behavior; a
+    // mutating `tools/call` is never on this path, so nothing side-effecting is
+    // ever replayed.
+    let is_http = matches!(manifest.transport, mcp::manifest::Transport::Http { .. });
+    let max_attempts = if is_http {
+        config.mcp.startup_max_retries.saturating_add(1).max(1)
+    } else {
+        1
     };
-    let transport = match open_transport(&manifest, policy).await {
-        Ok(t) => t,
-        Err(e) => {
-            // OTEL-style transport_errors_total breakdown: kind labels the
-            // class of failure (DNS, TLS, IO, refused). The exact string
-            // comes from the underlying McpError Display impl, so the
-            // metrics layer can aggregate by the leading word.
-            tracing::warn!(
-                target: "borg.mcp",
-                event = "transport_error",
-                server = %server_name,
-                transport = transport_label(&manifest.transport),
-                kind = "open",
-                error = %e,
-                "mcp transport open failed",
-            );
-            return Err(e);
+
+    let mut attempt: u32 = 0;
+    let (session, discovered) = loop {
+        attempt += 1;
+        let policy = mcp::transport::http::HttpPolicy {
+            allow_plaintext_http: config.mcp.allow_plaintext_http,
+            allow_local_network: config.mcp.allow_local_network,
+        };
+        let transport = match open_transport(&manifest, policy).await {
+            Ok(t) => t,
+            Err(e) => {
+                let retryable = is_http
+                    && attempt < max_attempts
+                    && e.downcast_ref::<mcp::errors::McpError>()
+                        .is_some_and(mcp::errors::McpError::is_retryable_startup);
+                if retryable {
+                    log_startup_retry(server_name, &manifest, attempt, "open", &e.to_string());
+                    sleep_startup_backoff(config.mcp.startup_retry_base_ms, attempt).await;
+                    continue;
+                }
+                // OTEL-style transport_errors_total breakdown: kind labels the
+                // class of failure (DNS, TLS, IO, refused). The exact string
+                // comes from the underlying McpError Display impl, so the
+                // metrics layer can aggregate by the leading word.
+                tracing::warn!(
+                    target: "borg.mcp",
+                    event = "transport_error",
+                    server = %server_name,
+                    transport = transport_label(&manifest.transport),
+                    kind = "open",
+                    error = %e,
+                    "mcp transport open failed",
+                );
+                return Err(e);
+            }
+        };
+        let session = SessionActor::new(&manifest, transport);
+        match discover_session(&manifest, session).await {
+            Ok(pair) => break pair,
+            Err(e) => {
+                if is_http && attempt < max_attempts && e.is_retryable_startup() {
+                    log_startup_retry(server_name, &manifest, attempt, "handshake", &e.to_string());
+                    sleep_startup_backoff(config.mcp.startup_retry_base_ms, attempt).await;
+                    continue;
+                }
+                tracing::warn!(
+                    target: "borg.mcp",
+                    event = "transport_error",
+                    server = %server_name,
+                    transport = transport_label(&manifest.transport),
+                    kind = "handshake",
+                    error = %e,
+                    "mcp handshake/discovery failed",
+                );
+                return Err(anyhow!(
+                    "handshake/discovery failed for server '{server_name}': {e}"
+                ));
+            }
         }
     };
-    let session = SessionActor::new(&manifest, transport);
-    handshake_and_register(server_name, server_cfg, &manifest, session, reg, builtin).await
+    register_discovered(
+        server_name,
+        server_cfg,
+        &manifest,
+        session,
+        discovered,
+        reg,
+        builtin,
+    )
+    .await
+}
+
+/// Exponential backoff sleep between streamable-HTTP startup attempts.
+/// `attempt` is 1-based; the per-attempt delay is `base_ms * 2^(attempt-1)`,
+/// with the shift capped so it cannot overflow.
+async fn sleep_startup_backoff(base_ms: u64, attempt: u32) {
+    if base_ms == 0 {
+        return;
+    }
+    let shift = attempt.saturating_sub(1).min(6);
+    let delay = base_ms.saturating_mul(1u64 << shift);
+    tokio::time::sleep(Duration::from_millis(delay)).await;
+}
+
+/// Operator-visible signal that a transient MCP startup failure is being retried.
+fn log_startup_retry(
+    server_name: &str,
+    manifest: &ServerManifest,
+    attempt: u32,
+    stage: &str,
+    error: &str,
+) {
+    tracing::warn!(
+        target: "borg.mcp",
+        event = "startup_retry",
+        server = %server_name,
+        transport = transport_label(&manifest.transport),
+        stage,
+        attempt,
+        error,
+        "retrying transient mcp startup failure",
+    );
 }
 
 /// Stable metric/audit label for a transport kind.
@@ -874,29 +963,70 @@ fn transport_label(transport: &mcp::manifest::Transport) -> &'static str {
     }
 }
 
+/// Run the idempotent startup exchange — `initialize` (bounded by
+/// `connect_timeout`) then read-only `tools/list` — returning the live session
+/// and discovered tools, or a typed [`mcp::errors::McpError`] the caller can
+/// classify for retry. No registration or other side effects happen here, so the
+/// caller may recreate the transport and call this again safely.
+async fn discover_session(
+    manifest: &ServerManifest,
+    mut session: SessionActor,
+) -> std::result::Result<(SessionActor, mcp::session::DiscoveredTools), mcp::errors::McpError> {
+    match tokio::time::timeout(manifest.connect_timeout, session.handshake()).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(mcp::errors::McpError::Timeout {
+                ms: manifest.connect_timeout.as_millis() as u64,
+            });
+        }
+    }
+    let discovered = session.list_tools().await?;
+    Ok((session, discovered))
+}
+
 /// Drive a freshly-opened session through handshake → tool discovery →
 /// registration → audit emission, then hand it off to the background session
-/// task. Shared by the production [`start_server`] path and the test-only
-/// `testing::install_session` helper so both exercise identical logic; the only
-/// thing that differs between them is how the transport was obtained.
+/// task. Used by the test-only `testing::install_session` helper; the production
+/// [`start_server`] path drives [`discover_session`] (with retry) and
+/// [`register_discovered`] directly so it can recreate the transport on a
+/// transient failure.
 async fn handshake_and_register(
     server_name: &str,
     server_cfg: &McpServerConfig,
     manifest: &ServerManifest,
-    mut session: SessionActor,
+    session: SessionActor,
     reg: &McpRegistry,
     builtin: &[&str],
 ) -> Result<()> {
-    tokio::time::timeout(manifest.connect_timeout, session.handshake())
+    let (session, discovered) = discover_session(manifest, session)
         .await
-        .map_err(|_| anyhow!("handshake timed out for server '{server_name}'"))?
-        .map_err(|e| anyhow!("handshake failed for server '{server_name}': {e}"))?;
+        .map_err(|e| anyhow!("handshake/discovery failed for server '{server_name}': {e}"))?;
+    register_discovered(
+        server_name,
+        server_cfg,
+        manifest,
+        session,
+        discovered,
+        reg,
+        builtin,
+    )
+    .await
+}
 
-    let discovered = session
-        .list_tools()
-        .await
-        .map_err(|e| anyhow!("tools/list failed for server '{server_name}': {e}"))?;
-
+/// Register discovered tools, emit audit rows, and hand the live session to the
+/// background session task. Runs once per server after a successful
+/// [`discover_session`] — never on a retried or failed attempt.
+async fn register_discovered(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    manifest: &ServerManifest,
+    session: SessionActor,
+    discovered: mcp::session::DiscoveredTools,
+    reg: &McpRegistry,
+    builtin: &[&str],
+) -> Result<()> {
     tracing::info!(
         target: "borg.mcp",
         event = "tools_listed",

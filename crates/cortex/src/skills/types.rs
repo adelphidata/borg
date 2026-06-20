@@ -312,8 +312,25 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String)> {
     let yaml_str = &after_first[..end];
     let body = after_first[end + 4..].trim().to_string();
 
-    let mut manifest: SkillManifest =
-        serde_yaml::from_str(yaml_str).context("Failed to parse SKILL.md YAML frontmatter")?;
+    let mut manifest: SkillManifest = match serde_yaml::from_str(yaml_str) {
+        Ok(manifest) => manifest,
+        Err(original_err) => {
+            // Some third-party SKILL.md files write frontmatter values as prose
+            // that is not valid YAML — e.g. `description: Build for AWS: ECS`
+            // (the second `: ` reads as nested structure) or `tags: [a,@b]`.
+            // Try a line-oriented repair that quotes the offending scalar, then
+            // retry. If the repaired text still fails, surface the ORIGINAL error
+            // so genuinely-broken frontmatter is not masked.
+            match repair_frontmatter_scalar_fields(yaml_str)
+                .and_then(|repaired| serde_yaml::from_str(&repaired).ok())
+            {
+                Some(manifest) => manifest,
+                None => {
+                    return Err(original_err).context("Failed to parse SKILL.md YAML frontmatter");
+                }
+            }
+        }
+    };
 
     // Fold legacy `prerequisites` (agentskills.io frontmatter) into `requires`
     // when no explicit `requires` was provided. Explicit requires always wins:
@@ -330,6 +347,106 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String)> {
     }
 
     Ok((manifest, body))
+}
+
+/// Repair common non-YAML prose in SKILL.md frontmatter scalar values so the
+/// manifest still loads. `serde_yaml` rejects values like
+/// `description: Build for AWS: ECS` or `tags: [a,@b]` before it can ignore
+/// unknown fields, so the repair happens before a retry. This is a line-oriented
+/// pass that single-quotes offending scalar values while leaving `|`/`>` block
+/// scalars and already-quoted values untouched. Returns `Some` only when at
+/// least one line changed (an unchanged result means the failure was unrelated).
+fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
+    let mut changed = false;
+    // When `Some`, we're inside a `|`/`>` block scalar body opened at this indent.
+    let mut block_scalar_indent: Option<usize> = None;
+    let mut out: Vec<String> = Vec::new();
+
+    for line in frontmatter.lines() {
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+
+        // Copy block-scalar body lines (indented deeper, or blank) verbatim.
+        if let Some(block_indent) = block_scalar_indent {
+            if line.trim().is_empty() || indent > block_indent {
+                out.push(line.to_string());
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            out.push(line.to_string());
+            continue;
+        };
+        // Require the `key: value` shape (a space after the colon). A colon with
+        // no following whitespace belongs to a URL or flow construct we leave be.
+        if key.trim().is_empty() || value.chars().next().is_some_and(|c| !c.is_whitespace()) {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let trimmed = value.trim_start();
+        let leading_ws = &value[..value.len() - trimmed.len()];
+        let (scalar, comment) = split_trailing_comment(trimmed);
+        let scalar = scalar.trim_end();
+
+        let Some(first) = scalar.chars().next() else {
+            out.push(line.to_string());
+            continue;
+        };
+        // A `|`/`>` block scalar: leave the header and its body alone.
+        if matches!(first, '|' | '>') {
+            block_scalar_indent = Some(indent);
+            out.push(line.to_string());
+            continue;
+        }
+        // Already quoted — valid YAML, nothing to repair.
+        if matches!(first, '\'' | '"') {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let has_colon_separator = scalar_has_colon_separator(scalar);
+        let invalid_flow_like = matches!(first, '[' | '{' | '@' | '`')
+            && serde_yaml::from_str::<serde_yaml::Value>(scalar).is_err();
+        if !has_colon_separator && !invalid_flow_like {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let quoted = format!("'{}'", scalar.replace('\'', "''"));
+        out.push(format!("{key}:{leading_ws}{quoted}{comment}"));
+        changed = true;
+    }
+
+    changed.then(|| out.join("\n"))
+}
+
+/// Split an unquoted ` # comment` suffix off a frontmatter value, returning
+/// `(scalar, comment_with_leading_whitespace)`. A `#` only starts a comment when
+/// it is at the start or preceded by whitespace (so `C#` is left intact).
+fn split_trailing_comment(value: &str) -> (&str, &str) {
+    let mut prev_is_ws = true;
+    for (i, c) in value.char_indices() {
+        if c == '#' && prev_is_ws {
+            let scalar_end = value[..i].trim_end().len();
+            return (&value[..scalar_end], &value[scalar_end..]);
+        }
+        prev_is_ws = c.is_whitespace();
+    }
+    (value, "")
+}
+
+/// True when a scalar contains a YAML `key: value` separator (a `:` followed by
+/// whitespace), which `serde_yaml` would otherwise read as nested structure.
+fn scalar_has_colon_separator(scalar: &str) -> bool {
+    let mut chars = scalar.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek().is_some_and(|n| n.is_whitespace()) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn check_os_requirements(os: &[String]) -> bool {

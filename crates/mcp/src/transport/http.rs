@@ -371,7 +371,15 @@ impl Transport for HttpTransport {
             req = req.header(MCP_SESSION_ID_HEADER, sid);
         }
         let resp = req.json(&msg).send().await.map_err(|e| {
-            McpError::TransportClosed(format!("{}: http send failed: {e}", self.server_name))
+            // A connect/timeout failure (server not yet listening, momentary
+            // network blip) is transient and retryable on the idempotent startup
+            // path; any other send failure tears the transport down.
+            let detail = format!("{}: http send failed: {e}", self.server_name);
+            if e.is_connect() || e.is_timeout() {
+                McpError::Connect(detail)
+            } else {
+                McpError::TransportClosed(detail)
+            }
         })?;
 
         let status = resp.status();
@@ -402,13 +410,25 @@ impl Transport for HttpTransport {
             )));
         }
         if !status.is_success() {
+            let code = status.as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(McpError::TransportClosed(format!(
+            let detail = format!(
                 "{}: HTTP {}: {}",
                 self.server_name,
-                status.as_u16(),
+                code,
                 truncate(&body, 200)
-            )));
+            );
+            // Transient statuses (timeouts, too-early, rate-limit, 5xx) are safe
+            // to retry by recreating the transport — but only on the idempotent
+            // startup path (`initialize` / read-only `tools/list`). Everything
+            // else tears the transport down via `TransportClosed`.
+            if matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504) {
+                return Err(McpError::TransientHttp {
+                    status: code,
+                    msg: detail,
+                });
+            }
+            return Err(McpError::TransportClosed(detail));
         }
 
         // Capture / refresh the session id from the response headers. The

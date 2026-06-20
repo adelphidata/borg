@@ -36,6 +36,7 @@ use serde::Deserialize;
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HooksFile {
     #[serde(default)]
     hooks: HashMap<String, Vec<MatcherGroup>>,
@@ -530,6 +531,53 @@ mod tests {
             let dir = tmp();
             let path = write_hooks_file(dir.path(), "not json at all {{{ ");
             assert!(ScriptHook::load_from_file(&path).is_empty());
+        }
+
+        #[test]
+        fn root_level_event_is_rejected_not_silently_ignored() {
+            // A common mistake: hook events at the top level instead of nested
+            // under "hooks". Without deny_unknown_fields this parses to zero
+            // hooks with no signal. We require an explicit parse error so the
+            // load path can warn the user.
+            let err = serde_json::from_str::<HooksFile>(
+                r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
+            )
+            .expect_err("root-level hook events must be rejected");
+            assert!(
+                err.to_string().contains("unknown field `SessionStart`"),
+                "unexpected parse error: {err}"
+            );
+        }
+
+        #[test]
+        fn root_level_event_file_warns_and_loads_no_hooks() {
+            // A misplaced event key at the root degrades to zero hooks (logged
+            // via warn), never an Err or panic — hooks can never break the agent.
+            // The differential against the correctly-nested form proves the
+            // emptiness is the *misplacement* (which deny_unknown_fields now
+            // rejects), not a generally-broken loader: the byte-identical hook
+            // loads fine once nested under "hooks".
+            let hook = r#"[{"hooks":[{"type":"command","command":"echo hi"}]}]"#;
+
+            let bad_dir = tmp();
+            let bad = write_hooks_file(bad_dir.path(), &format!(r#"{{"PostToolUse":{hook}}}"#));
+            assert!(
+                ScriptHook::load_from_file(&bad).is_empty(),
+                "a root-level event key must degrade to zero hooks, not load or panic"
+            );
+
+            let good_dir = tmp();
+            let good = write_hooks_file(
+                good_dir.path(),
+                &format!(r#"{{"hooks":{{"PostToolUse":{hook}}}}}"#),
+            );
+            let loaded = ScriptHook::load_from_file(&good);
+            assert_eq!(
+                loaded.len(),
+                1,
+                "the same hook must load when correctly nested"
+            );
+            assert_eq!(loaded[0].points, vec![HookPoint::AfterToolCall]);
         }
 
         #[test]

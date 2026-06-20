@@ -50,6 +50,17 @@ pub struct McpConfig {
     /// ceiling so the two untrusted-code paths share one budget.
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
+    /// Max retries for a *transient* streamable-HTTP startup failure (a `5xx`/
+    /// `429` during `initialize`, or the first read-only `tools/list`). Each
+    /// retry recreates the transport. `0` disables startup retry. Only the
+    /// idempotent startup path is retried — a mutating `tools/call` is never
+    /// auto-replayed. Default: 2.
+    #[serde(default = "default_startup_max_retries")]
+    pub startup_max_retries: u32,
+    /// Base backoff in milliseconds between streamable-HTTP startup retries;
+    /// doubles each attempt. Default: 250.
+    #[serde(default = "default_startup_retry_base_ms")]
+    pub startup_retry_base_ms: u64,
 }
 
 impl Default for McpConfig {
@@ -62,6 +73,8 @@ impl Default for McpConfig {
             disabled_servers: Vec::new(),
             servers: HashMap::new(),
             max_response_bytes: default_max_response_bytes(),
+            startup_max_retries: default_startup_max_retries(),
+            startup_retry_base_ms: default_startup_retry_base_ms(),
         }
     }
 }
@@ -72,6 +85,14 @@ fn default_max_tools_total() -> usize {
 
 fn default_max_response_bytes() -> usize {
     1024 * 1024
+}
+
+fn default_startup_max_retries() -> u32 {
+    2
+}
+
+fn default_startup_retry_base_ms() -> u64 {
+    250
 }
 
 /// Per-server config.

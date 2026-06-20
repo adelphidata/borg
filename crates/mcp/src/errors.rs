@@ -29,6 +29,18 @@ pub enum McpError {
     #[error("transport closed: {0}")]
     TransportClosed(String),
 
+    /// A transient HTTP status (`408`, `425`, `429`, `5xx`) seen during the
+    /// streamable-HTTP handshake or a read-only `tools/list`. Safe to retry by
+    /// recreating the transport — unlike `TransportClosed`, which tears the
+    /// session down. Never produced for mutating `tools/call` requests.
+    #[error("transient http status {status}: {msg}")]
+    TransientHttp {
+        /// The HTTP status code observed.
+        status: u16,
+        /// Server name + truncated body, for logs.
+        msg: String,
+    },
+
     /// Tool call exceeded its per-call timeout.
     #[error("timeout after {ms}ms")]
     Timeout {
@@ -92,6 +104,28 @@ pub enum McpError {
     /// JSON (de)serialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl McpError {
+    /// Whether this error is worth retrying during a *server startup* sequence
+    /// (the idempotent `initialize` followed by a read-only `tools/list`).
+    /// Transient transport/HTTP failures are retryable by recreating the
+    /// transport; deterministic policy / auth / schema failures are not. Only
+    /// ever consulted for the startup path — a mutating `tools/call` is never
+    /// auto-retried, so this must not be used to gate replay of tool calls.
+    pub fn is_retryable_startup(&self) -> bool {
+        // Note: a generic `TransportClosed` is deliberately NOT retryable — it
+        // also covers deterministic non-success statuses (e.g. `400`) and the
+        // `404` session-teardown, which must fail fast. Genuinely-transient
+        // connect/timeout send failures are classified as `Connect`/`Timeout`.
+        matches!(
+            self,
+            McpError::TransientHttp { .. }
+                | McpError::Connect(_)
+                | McpError::Timeout { .. }
+                | McpError::Io(_)
+        )
+    }
 }
 
 /// Why a tool's schema was rejected at registration time.
@@ -166,6 +200,44 @@ pub type Result<T, E = McpError> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_retryable_startup_classifies_transient_vs_terminal() {
+        // Transient transport/HTTP failures are safe to retry on the idempotent
+        // startup path (recreate the transport and re-`initialize`).
+        assert!(McpError::TransientHttp {
+            status: 503,
+            msg: "x".into()
+        }
+        .is_retryable_startup());
+        assert!(McpError::Connect("dns".into()).is_retryable_startup());
+        assert!(McpError::Timeout { ms: 1000 }.is_retryable_startup());
+
+        // A generic `TransportClosed` is terminal: it also encodes deterministic
+        // non-success statuses (e.g. `400`) and the `404` session teardown, so it
+        // must fail fast rather than spin a doomed retry loop.
+        assert!(!McpError::TransportClosed("HTTP 400".into()).is_retryable_startup());
+
+        // Deterministic policy / auth / schema failures must NOT spin a retry
+        // loop — retrying can burn an auth-lockout budget or never converge.
+        assert!(!McpError::Auth("401".into()).is_retryable_startup());
+        assert!(!McpError::Protocol("bad json-rpc".into()).is_retryable_startup());
+        assert!(!McpError::UrlRefused {
+            url: "http://x".into(),
+            reason: UrlRefusalReason::NotHttps,
+        }
+        .is_retryable_startup());
+        assert!(!McpError::RateLimited {
+            server: "s".into(),
+            retry_after_ms: 1000,
+        }
+        .is_retryable_startup());
+        assert!(!McpError::NameCollision {
+            server: "s".into(),
+            full_name: "mcp_s_t".into(),
+        }
+        .is_retryable_startup());
+    }
 
     #[test]
     fn schema_rejection_display_includes_diagnostic_payload() {

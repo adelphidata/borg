@@ -71,6 +71,7 @@ define_settings! {
         "memory.flush_before_compaction" => memory.flush_before_compaction, parsed(bool);
         "memory.flush_min_messages" => memory.flush_min_messages, parsed(usize);
         "memory.flush_soft_threshold_tokens" => memory.flush_soft_threshold_tokens, parsed(usize);
+        "memory.exclude_external_tool_output" => memory.exclude_external_tool_output, parsed(bool);
         "memory.chunk_level_selection" => memory.chunk_level_selection, parsed(bool);
         "memory.active_injection.enabled" => memory.active_injection.enabled, parsed(bool);
         "memory.active_injection.top_k" => memory.active_injection.top_k, parsed(usize);
@@ -291,6 +292,8 @@ define_settings! {
         "mcp.disabled_servers" => mcp.disabled_servers, json;
         "mcp.servers" => mcp.servers, json;
         "mcp.max_response_bytes" => mcp.max_response_bytes, parsed(usize);
+        "mcp.startup_max_retries" => mcp.startup_max_retries, parsed(u32);
+        "mcp.startup_retry_base_ms" => mcp.startup_retry_base_ms, parsed(u64);
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
@@ -768,6 +771,7 @@ define_settings! {
         // — Memory & Skills —
         "skills.enabled" => "Allow skills", Bool, "Memory & Skills";
         "memory.active_injection.enabled" => "Active memory inject", Bool, "Memory & Skills";
+        "memory.exclude_external_tool_output" => "Exclude untrusted from memory", Bool, "Memory & Skills";
         "memory.active_injection.top_k" => "Active memory top-k", Uint, "Memory & Skills";
 
         // — Personality —

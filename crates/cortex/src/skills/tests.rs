@@ -216,6 +216,53 @@ fn parse_missing_closing_delimiter() {
 }
 
 #[test]
+fn repairs_unquoted_prose_colon_in_description() {
+    // A second `: ` would otherwise read as YAML nesting and fail the parse.
+    let src = "---\nname: deploy-aws\ndescription: Build for AWS: ECS Fargate, Lambda, and S3\n---\n\n# body\n";
+    let (manifest, _body) = parse_skill_md(src).expect("prose colon should be repaired");
+    assert_eq!(manifest.name, "deploy-aws");
+    assert_eq!(
+        manifest.description,
+        "Build for AWS: ECS Fargate, Lambda, and S3"
+    );
+}
+
+#[test]
+fn repairs_invalid_flow_like_scalar_in_ignored_field() {
+    // `tags` is not a manifest field, but invalid flow syntax (`@`) fails the
+    // whole document parse before serde can ignore it. After repair it parses as
+    // a quoted string and the unknown field is dropped.
+    let src =
+        "---\nname: ssr\ndescription: SSR helper\ntags: [next,@supabase/ssr]\n---\n\n# body\n";
+    let (manifest, _body) = parse_skill_md(src).expect("invalid flow scalar should be repaired");
+    assert_eq!(manifest.name, "ssr");
+    assert_eq!(manifest.description, "SSR helper");
+}
+
+#[test]
+fn repair_preserves_block_scalar_body_while_fixing_sibling() {
+    // The `description` block scalar (which legitimately contains `: `) must be
+    // copied verbatim, while the sibling `author` prose-colon line is repaired.
+    let src = "---\nname: deploy\ndescription: |-\n  Build for AWS: ECS\n  and Lambda\nauthor: ada: lovelace\n---\n\n# body\n";
+    let (manifest, _body) = parse_skill_md(src).expect("block scalar preserved, sibling repaired");
+    assert_eq!(manifest.description, "Build for AWS: ECS\nand Lambda");
+    assert_eq!(manifest.author.as_deref(), Some("ada: lovelace"));
+}
+
+#[test]
+fn repair_leaves_genuinely_broken_yaml_as_original_error() {
+    // An empty-key line is not a repairable scalar; the original parse error must
+    // surface (with the frontmatter context) rather than being masked.
+    let src = "---\nname: broken\ndescription: ok\n: orphan-value\n---\n\n# body\n";
+    let err = parse_skill_md(src).expect_err("unrepairable frontmatter must still error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("frontmatter"),
+        "error should carry the frontmatter context, got: {msg}"
+    );
+}
+
+#[test]
 fn builtins_parse_correctly() {
     for &(name, content) in BUNDLED_SKILLS {
         let (manifest, body) = parse_skill_md(content)

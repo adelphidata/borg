@@ -630,6 +630,11 @@ pub struct MemoryConfig {
     /// in the system prompt as `<active_memory trust="retrieved">`.
     #[serde(default)]
     pub active_injection: ActiveInjectionConfig,
+    /// When true (default), tool output carrying an untrusted trust boundary
+    /// (MCP results, fetched web content) is excluded from the pre-compaction
+    /// memory flush, so a poisoned external result cannot plant a durable
+    /// memory. Disable only if you trust every connected source.
+    pub exclude_external_tool_output: bool,
 }
 
 /// Settings for proactive memory injection (top-k hybrid search per turn).
@@ -676,6 +681,7 @@ impl Default for MemoryConfig {
             cache_ttl_days: 30,
             cache_max_entries: 10_000,
             active_injection: ActiveInjectionConfig::default(),
+            exclude_external_tool_output: true,
         }
     }
 }

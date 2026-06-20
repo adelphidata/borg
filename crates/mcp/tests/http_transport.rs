@@ -24,6 +24,7 @@ use axum::{
     routing::post,
     Router,
 };
+use mcp::errors::McpError;
 use mcp::transport::http::{open, HttpConfig, HttpPolicy, MCP_SESSION_ID_HEADER};
 use mcp::transport::Transport;
 use serde_json::{json, Value};
@@ -238,12 +239,12 @@ async fn session_id_is_dropped_on_404_so_caller_can_reinitialize() {
 }
 
 #[tokio::test]
-async fn server_5xx_is_classified_as_transport_closed_not_silent() {
-    // Spec: 5xx from the server must surface as `TransportClosed` so the
-    // supervisor classifies the session as broken and the LLM-visible
-    // tool call returns a clear error. Silently retrying or returning
-    // `Ok(None)` would leave the caller waiting on a response that never
-    // arrives.
+async fn server_5xx_is_classified_as_retryable_transient() {
+    // Spec: a 5xx during the streamable-HTTP handshake / read-only `tools/list`
+    // is transient — it must surface as a `TransientHttp` error the startup path
+    // can retry (by recreating the transport), not as a terminal `TransportClosed`
+    // that permanently fails the server until a daemon restart. The status must
+    // still be carried for logs.
     let (url, server, _shutdown) = spawn_fixture().await;
     let mut transport = open(config(url)).await.expect("open");
 
@@ -254,10 +255,55 @@ async fn server_5xx_is_classified_as_transport_closed_not_silent() {
         .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
         .await
         .expect_err("send must fail on 5xx");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("503"),
-        "error must surface the HTTP status; got: {msg}",
+        matches!(&err, McpError::TransientHttp { status: 503, .. }),
+        "5xx must classify as TransientHttp; got: {err:?}",
+    );
+    assert!(
+        err.is_retryable_startup(),
+        "5xx during startup must be retryable",
+    );
+    assert!(format!("{err}").contains("503"), "status must reach logs");
+}
+
+#[tokio::test]
+async fn rate_limit_429_is_classified_as_retryable_transient() {
+    // Spec: a 429 during startup is transient (server warming up / momentary
+    // throttle) and retryable, same as 5xx.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
+    server
+        .next_status
+        .store(429, std::sync::atomic::Ordering::SeqCst);
+    let err = transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect_err("send must fail on 429");
+    assert!(
+        matches!(&err, McpError::TransientHttp { status: 429, .. }) && err.is_retryable_startup(),
+        "429 must classify as retryable TransientHttp; got: {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn client_4xx_is_not_retryable() {
+    // Spec: a deterministic 4xx (other than auth/404-session) is the server's
+    // last word — it must stay a terminal `TransportClosed` so the startup path
+    // fails fast instead of spinning a doomed retry loop.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
+    server
+        .next_status
+        .store(400, std::sync::atomic::Ordering::SeqCst);
+    let err = transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect_err("send must fail on 400");
+    assert!(
+        matches!(&err, McpError::TransportClosed(_)) && !err.is_retryable_startup(),
+        "400 must be terminal (TransportClosed, not retryable); got: {err:?}",
     );
 }
 
