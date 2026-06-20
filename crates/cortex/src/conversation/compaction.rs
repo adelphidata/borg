@@ -195,8 +195,15 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
     let dropped = keep_from;
     debug!("Dropping {dropped} old messages from conversation history");
 
-    // Use LLM to summarize the dropped messages
-    let summary = summarize_with_llm(&history[..dropped], llm).await;
+    // Use LLM to summarize the dropped messages. Abort without mutating history
+    // when the summarizer gave us nothing usable (e.g. a provider auth outage):
+    // dropping the range for a degraded placeholder would irrecoverably lose
+    // context, whereas leaving history intact lets the next turn retry once the
+    // provider recovers. Mirrors the v2 path's empty-summary bail-out.
+    let Some(summary) = summarize_with_llm(&history[..dropped], llm).await else {
+        warn!("compaction summary unavailable, leaving history untouched");
+        return;
+    };
 
     let marker = Message::user(summary);
 
@@ -238,15 +245,15 @@ pub async fn compact_history_v2(
     );
 
     let middle = &history[plan.head_end..plan.tail_start];
-    let summary_body = summarize_with_llm_v2(middle, previous_summary.as_deref(), llm).await;
 
     // Bail out without mutating history if the summarizer gave us nothing
     // usable — better to let the next turn try again than to drop the
-    // middle with no context at all.
-    if summary_body.trim().is_empty() {
-        warn!("compact_history_v2: empty summary, leaving history untouched");
+    // middle with no context at all. Shares the v1 path's let-else abort.
+    let Some(summary_body) = summarize_with_llm_v2(middle, previous_summary.as_deref(), llm).await
+    else {
+        warn!("compact_history_v2: no usable summary, leaving history untouched");
         return 0;
-    }
+    };
 
     // Sanitize the summary body to strip any XML tag boundaries the LLM may
     // have injected (e.g. a stray `</compaction_summary>` inside a code
@@ -715,6 +722,66 @@ mod tests {
         assert!(
             plan_compaction(&history, tight_budget).is_some(),
             "should compact at ~90% usage (above 85% margin)"
+        );
+    }
+
+    /// A summarizer that fails — here a provider whose endpoint refuses the
+    /// connection, standing in for a persistent auth outage — must NOT drop the
+    /// summarized range for a degraded placeholder. `compact_history` leaves the
+    /// working history byte-for-byte intact so the next turn can retry once the
+    /// provider recovers. Regression guard for the v1 compaction abort path
+    /// (the v2 path already bails on an empty summary).
+    #[tokio::test]
+    async fn compact_history_aborts_instead_of_degrading_when_summarizer_fails() {
+        // Over-budget history so `plan_compaction` fires and summarization is
+        // actually attempted (otherwise the test would pass vacuously).
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..8 {
+            history.push(make_user(&format!(
+                "Message {i}: the quick brown fox jumps over the lazy dog, repeated enough to cost tokens."
+            )));
+            history.push(make_assistant(&format!(
+                "Response {i}: a sufficiently long reply with plenty of text to accumulate token budget."
+            )));
+        }
+        let before: Vec<Option<String>> = history
+            .iter()
+            .map(|m| m.text_content().map(str::to_string))
+            .collect();
+        let total = history_tokens(&history);
+        let tight_budget = (total as f64 / 0.90) as usize;
+        assert!(
+            plan_compaction(&history, tight_budget).is_some(),
+            "precondition: history must be over budget so summarization is attempted"
+        );
+
+        // Ollama client pointed at a closed loopback port: `chat()` fails fast
+        // (connection refused, no retries) → the summarizer returns `None`.
+        let mut config = crate::config::Config::default();
+        config.llm.provider = Some("ollama".to_string());
+        config.llm.model = "llama3.3".to_string();
+        config.llm.base_url = Some("http://127.0.0.1:1/v1/chat/completions".to_string());
+        config.llm.max_retries = 0;
+        config.llm.initial_retry_delay_ms = 0;
+        let llm = LlmClient::new(&config)
+            .await
+            .expect("offline ollama client builds");
+
+        compact_history(&mut history, tight_budget, &llm).await;
+
+        let after: Vec<Option<String>> = history
+            .iter()
+            .map(|m| m.text_content().map(str::to_string))
+            .collect();
+        assert_eq!(
+            after, before,
+            "aborted compaction must leave history untouched (no drop, no placeholder)"
+        );
+        assert!(
+            !history.iter().any(|m| m
+                .text_content()
+                .is_some_and(|t| t.contains(COMPACTION_MARKER_HEADING))),
+            "no degraded summary placeholder may be inserted on summarizer failure"
         );
     }
 }

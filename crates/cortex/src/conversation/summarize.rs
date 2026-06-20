@@ -100,7 +100,10 @@ pub(super) fn is_trivial_tool_result(msg: &Message) -> bool {
 }
 
 /// Use the LLM to generate a concise summary of dropped conversation messages.
-pub(super) async fn summarize_with_llm(messages: &[Message], llm: &LlmClient) -> String {
+/// Returns `None` when the summarizer produced nothing usable (e.g. a provider
+/// auth outage). The caller aborts compaction in that case rather than dropping
+/// the summarized range for a degraded placeholder.
+pub(super) async fn summarize_with_llm(messages: &[Message], llm: &LlmClient) -> Option<String> {
     // Build a transcript of dropped messages for the LLM to summarize
     let mut transcript = String::new();
     for msg in messages {
@@ -152,18 +155,23 @@ pub(super) async fn summarize_with_llm(messages: &[Message], llm: &LlmClient) ->
         summarize_chunked(&transcript, llm).await
     } else {
         summarize_single_chunk(&transcript, llm).await
-    };
+    }?;
 
-    format!("[Earlier conversation was summarized to fit context limits.]\n\n{summary_text}")
+    Some(format!(
+        "[Earlier conversation was summarized to fit context limits.]\n\n{summary_text}"
+    ))
 }
 
 /// Summarize the middle region of a conversation, optionally iterating on a
-/// prior summary. Returns the summary body (no marker prefix).
+/// prior summary. Returns the summary body (no marker prefix), or `None` when
+/// the summarizer produced nothing usable — the caller aborts compaction in
+/// that case, sharing the v1 path's abort idiom rather than carrying an
+/// empty-string sentinel.
 pub(super) async fn summarize_with_llm_v2(
     messages: &[Message],
     previous_summary: Option<&str>,
     llm: &LlmClient,
-) -> String {
+) -> Option<String> {
     // Build a transcript of the middle region. Reuses the same trivial-result
     // skipping and truncation as the legacy summarizer.
     let mut transcript = String::new();
@@ -226,16 +234,21 @@ pub(super) async fn summarize_with_llm_v2(
     let request = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
     match llm.chat(&request, None).await {
-        Ok(response) => response.text_content().unwrap_or("").to_string(),
+        Ok(response) => {
+            let text = response.text_content().unwrap_or("").trim().to_string();
+            (!text.is_empty()).then_some(text)
+        }
         Err(e) => {
             warn!("LLM summarization (v2) failed: {e}");
-            String::new()
+            None
         }
     }
 }
 
-/// Summarize a single chunk of transcript.
-async fn summarize_single_chunk(transcript: &str, llm: &LlmClient) -> String {
+/// Summarize a single chunk of transcript. Returns `None` when the LLM call
+/// failed or produced nothing usable — the caller aborts compaction rather
+/// than dropping the middle for a degraded placeholder.
+async fn summarize_single_chunk(transcript: &str, llm: &LlmClient) -> Option<String> {
     let capped: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
 
     let messages = vec![
@@ -244,16 +257,21 @@ async fn summarize_single_chunk(transcript: &str, llm: &LlmClient) -> String {
     ];
 
     match llm.chat(&messages, None).await {
-        Ok(response) => response.text_content().unwrap_or("").to_string(),
+        Ok(response) => {
+            let text = response.text_content().unwrap_or("").trim().to_string();
+            (!text.is_empty()).then_some(text)
+        }
         Err(e) => {
             warn!("LLM summarization failed: {e}");
-            "[Summary unavailable — earlier conversation was truncated.]".to_string()
+            None
         }
     }
 }
 
-/// Split a long transcript into chunks, summarize each, then merge.
-async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> String {
+/// Split a long transcript into chunks, summarize each, then merge. Returns
+/// `None` when every chunk failed — the caller aborts compaction rather than
+/// substituting a degraded placeholder.
+async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> {
     // Cap at 5 chunks to avoid runaway LLM calls on very long conversations
     const MAX_SUMMARY_CHUNKS: usize = 5;
     let chars: Vec<char> = transcript
@@ -284,7 +302,10 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> String {
 
         match llm.chat(&messages, None).await {
             Ok(response) => {
-                let text = response.text_content().unwrap_or("").to_string();
+                // Trim before the emptiness gate so a whitespace-only chunk
+                // response is dropped, matching summarize_single_chunk — a blank
+                // chunk must not slip through as a "successful" summary.
+                let text = response.text_content().unwrap_or("").trim().to_string();
                 if !text.is_empty() {
                     chunk_summaries.push(text);
                 }
@@ -296,12 +317,13 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> String {
     }
 
     if chunk_summaries.is_empty() {
-        return "[Summary unavailable — earlier conversation was truncated.]".to_string();
+        warn!("Chunked summarization: every chunk failed, aborting compaction");
+        return None;
     }
 
     // If only one chunk succeeded, use it directly
     if chunk_summaries.len() == 1 {
-        return chunk_summaries.into_iter().next().unwrap_or_default();
+        return chunk_summaries.into_iter().next();
     }
 
     // Merge chunk summaries
@@ -321,11 +343,20 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> String {
     ];
 
     match llm.chat(&merge_messages, None).await {
-        Ok(response) => response.text_content().unwrap_or("").to_string(),
+        Ok(response) => {
+            let text = response.text_content().unwrap_or("").trim().to_string();
+            // A successful merge that came back empty still has the per-chunk
+            // summaries to fall back on — only a hard failure aborts.
+            Some(if text.is_empty() {
+                chunk_summaries.join("\n\n")
+            } else {
+                text
+            })
+        }
         Err(e) => {
             warn!("Merge summarization failed, using concatenated chunks: {e}");
             // Fallback: just concatenate the chunk summaries
-            chunk_summaries.join("\n\n")
+            Some(chunk_summaries.join("\n\n"))
         }
     }
 }
