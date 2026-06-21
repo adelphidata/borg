@@ -797,16 +797,26 @@ impl<'a> App<'a> {
 
     /// Whether the TUI currently wants an alt-screen surface.
     ///
-    /// True when any of the large popups in the spec's "alt-screen wrap audit"
-    /// is visible, or while the full-screen transcript pager is open. The
-    /// event loop reconciles this against [`super::tui_lifecycle::Tui::is_alt_screen_active`]
-    /// after every iteration; smaller popups (`command_popup`, `model_popup`,
-    /// `file_popup`, plan overlay, file search) stay inline.
+    /// True when any centered-overlay popup is visible, or while the
+    /// full-screen transcript pager is open. The event loop reconciles this
+    /// against [`super::tui_lifecycle::Tui::is_alt_screen_active`] after every
+    /// iteration.
+    ///
+    /// Invariant: every popup that renders through
+    /// [`super::popup_utils::popup_area`] (the centered 60%×80% modal) MUST be
+    /// listed here. That helper centers within the frame buffer, and in
+    /// inline-viewport mode the buffer is the short, bottom-anchored strip — a
+    /// centered modal computed against it lands above the buffer and panics
+    /// ratatui. The alt-screen surface spans the full terminal (`area.y == 0`),
+    /// so the modal fits. Anchored popups (`command_popup`, `file_popup`, plan
+    /// overlay, file search) use `popup_rect_above` instead and stay inline.
     pub fn wants_alt_screen(&self) -> bool {
         if matches!(self.state, AppState::TranscriptPager) {
             return true;
         }
         self.settings_popup.is_visible()
+            || self.model_popup.is_visible()
+            || self.theme_popup.is_visible()
             || self.pairing_popup.is_visible()
             || self.sessions_popup.is_visible()
             || self.schedule_popup.is_visible()

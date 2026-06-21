@@ -21,6 +21,14 @@ const POPUP_V_MARGIN: u16 = 2;
 const POPUP_RENDER_MIN_INNER_WIDTH: u16 = 12;
 
 /// Compute centered popup geometry (60% width, 80% height, clamped).
+///
+/// The result is always fully contained within `area` — including its
+/// `x`/`y` origin. In inline-viewport mode the frame buffer's `area.y` is the
+/// terminal-bottom offset (e.g. `{x:0, y:7, ...}`), so a centered popup MUST be
+/// anchored relative to that origin, not `(0, 0)`. Omitting the offset writes
+/// above the buffer and panics ratatui (`index outside of buffer`). Centered
+/// overlays therefore render on the full-screen alt surface (`area.y == 0`),
+/// but honoring the offset here keeps `popup_area` correct on any surface.
 pub fn popup_area(area: Rect) -> Rect {
     let popup_width = (area.width * POPUP_WIDTH_PCT / 100)
         .max(POPUP_MIN_WIDTH)
@@ -28,8 +36,8 @@ pub fn popup_area(area: Rect) -> Rect {
     let popup_height = (area.height * POPUP_HEIGHT_PCT / 100)
         .max(POPUP_MIN_HEIGHT)
         .min(area.height.saturating_sub(POPUP_V_MARGIN));
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     Rect::new(x, y, popup_width, popup_height)
 }
 
@@ -212,6 +220,68 @@ mod tests {
         let popup = popup_rect_above(viewport, composer, 6, 3, 50).unwrap();
         assert_eq!(popup.y, 29);
         assert_eq!(popup.height, 6);
+    }
+
+    /// Regression: `/model` panicked ratatui with
+    /// `index outside of buffer: the area is Rect { x: 0, y: 7, width: 112,
+    /// height: 7 } but index is (22, 1)`. In inline-viewport mode the frame
+    /// buffer is offset to the terminal bottom (`y == 7` here), but `popup_area`
+    /// centered against `(0, 0)` and produced `y == 1` — above the buffer. The
+    /// returned rect MUST be fully contained within the input area's bounds,
+    /// origin included, on any surface.
+    #[test]
+    fn popup_area_contained_within_offset_inline_viewport() {
+        // Exact geometry from the panic: a short viewport anchored at y=7.
+        let area = Rect::new(0, 7, 112, 7);
+        let popup = popup_area(area);
+        assert!(
+            popup.x >= area.x,
+            "popup.x {} escaped left of area.x {}",
+            popup.x,
+            area.x
+        );
+        assert!(
+            popup.y >= area.y,
+            "popup.y {} escaped above area.y {} (the original panic)",
+            popup.y,
+            area.y
+        );
+        assert!(
+            popup.right() <= area.right(),
+            "popup.right {} escaped area.right {}",
+            popup.right(),
+            area.right()
+        );
+        assert!(
+            popup.bottom() <= area.bottom(),
+            "popup.bottom {} escaped area.bottom {}",
+            popup.bottom(),
+            area.bottom()
+        );
+    }
+
+    /// Generalizes the containment invariant across a range of offset areas so a
+    /// future tweak to the centering math can't reintroduce an out-of-buffer
+    /// write on any surface origin.
+    #[test]
+    fn popup_area_always_contained_for_varied_offsets() {
+        for &(x, y, w, h) in &[
+            (0u16, 0u16, 200u16, 50u16),
+            (0, 7, 112, 7),
+            (0, 20, 80, 12),
+            (5, 3, 100, 40),
+            (0, 38, 120, 2),
+        ] {
+            let area = Rect::new(x, y, w, h);
+            let popup = popup_area(area);
+            assert!(
+                popup.x >= area.x
+                    && popup.y >= area.y
+                    && popup.right() <= area.right()
+                    && popup.bottom() <= area.bottom(),
+                "popup {popup:?} escaped area {area:?}"
+            );
+        }
     }
 
     #[test]

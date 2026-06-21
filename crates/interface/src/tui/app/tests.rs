@@ -303,16 +303,45 @@ fn settings_popup_show_drives_wants_alt_screen() {
 }
 
 #[test]
-fn small_popups_do_not_request_alt_screen() {
-    // command_popup / model_popup / file_popup / plan_overlay / file_search
-    // stay inline. Opening the model popup must not flip wants_alt_screen.
+fn anchored_popups_do_not_request_alt_screen() {
+    // Genuinely inline popups — command_popup / file_popup / plan_overlay —
+    // render via `popup_rect_above` (anchored above the composer, clamped to
+    // the viewport), so they must NOT flip wants_alt_screen.
+    let mut app = make_app();
+    app.command_popup.update_filter("/");
+    assert!(app.command_popup.is_visible());
+    assert!(
+        !app.wants_alt_screen(),
+        "command_popup is anchored/inline; alt-screen must not be requested"
+    );
+}
+
+/// Regression: `/model` panicked ratatui ("index outside of buffer") because
+/// `model_popup` renders through the centered `popup_area` overlay — exactly
+/// like `settings_popup` — yet was missing from `wants_alt_screen`. Without the
+/// alt-screen surface it rendered into the short, bottom-anchored inline
+/// viewport, and the centered modal landed above the buffer. Any popup using
+/// `popup_area` (the centered 60%×80% modal) MUST request the alt-screen
+/// surface so the modal has a full-terminal buffer to center within.
+#[test]
+fn centered_overlay_popups_request_alt_screen() {
     let mut app = make_app();
     let client = app.client.clone();
+
     app.model_popup.show(&app.config, &client);
     assert!(app.model_popup.is_visible());
     assert!(
-        !app.wants_alt_screen(),
-        "model_popup is inline; alt-screen must not be requested"
+        app.wants_alt_screen(),
+        "model_popup renders the centered popup_area modal; it must request alt-screen"
+    );
+    app.model_popup.dismiss();
+    assert!(!app.wants_alt_screen());
+
+    app.theme_popup.show(&app.config);
+    assert!(app.theme_popup.is_visible());
+    assert!(
+        app.wants_alt_screen(),
+        "theme_popup renders the centered popup_area modal; it must request alt-screen"
     );
 }
 
