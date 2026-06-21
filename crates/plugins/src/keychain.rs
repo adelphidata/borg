@@ -1,5 +1,44 @@
 use anyhow::Result;
+use std::ffi::OsStr;
 use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+/// Run a keychain helper subprocess (`security` / `secret-tool` / `cmdkey`)
+/// with all three standard streams captured, never inherited.
+///
+/// The TUI client owns the terminal (alt-screen / inline viewport), and these
+/// helpers are invoked from that same process. `security delete-generic-password`
+/// prints `password has been deleted.` plus a keychain attribute dump to stdout,
+/// and `add-generic-password` can print too. Inheriting stdio (via plain
+/// `.status()`/`.spawn()`) paints that output over the TUI and corrupts the
+/// screen. Capturing it here is the single chokepoint that keeps keychain writes
+/// invisible. `stdin` bytes are piped in when present (Linux `secret-tool`).
+fn run_captured<I, S>(program: &str, args: I, stdin: Option<&[u8]>) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    match stdin {
+        None => {
+            // `Command::output` captures stdout+stderr and closes stdin.
+            cmd.output()
+        }
+        Some(data) => {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn()?;
+            if let Some(mut si) = child.stdin.take() {
+                use std::io::Write;
+                si.write_all(data)?;
+                drop(si); // close stdin so the child sees EOF
+            }
+            child.wait_with_output()
+        }
+    }
+}
 
 /// Check if the OS keychain is available.
 pub fn available() -> bool {
@@ -62,44 +101,34 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
             }
         };
         let args = build_macos_store_args(service, account, value, exe.as_deref());
-        let status = std::process::Command::new("security")
-            .args(&args)
-            .status()?;
-        if !status.success() {
+        let output = run_captured("security", &args, None)?;
+        if !output.status.success() {
             anyhow::bail!(
                 "Failed to store in macOS Keychain (service={service}, account={account})"
             );
         }
     } else if cfg!(target_os = "linux") {
-        let mut child = std::process::Command::new("secret-tool")
-            .args([
-                "store",
-                "--label",
-                &format!("Borg {account}"),
-                "service",
-                service,
-                "account",
-                account,
-            ])
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(value.as_bytes())?;
-            drop(stdin); // close stdin so secret-tool sees EOF
-        }
-        let status = child.wait()?;
-        if !status.success() {
+        let label = format!("Borg {account}");
+        let output = run_captured(
+            "secret-tool",
+            ["store", "--label", &label, "service", service, "account", account],
+            Some(value.as_bytes()),
+        )?;
+        if !output.status.success() {
             anyhow::bail!("Failed to store via secret-tool (service={service}, account={account})");
         }
     } else if cfg!(target_os = "windows") {
         let target = format!("{service}/{account}");
-        let status = std::process::Command::new("cmdkey")
-            .arg(format!("/generic:{target}"))
-            .arg(format!("/user:{account}"))
-            .arg(format!("/pass:{value}"))
-            .status()?;
-        if !status.success() {
+        let output = run_captured(
+            "cmdkey",
+            [
+                format!("/generic:{target}"),
+                format!("/user:{account}"),
+                format!("/pass:{value}"),
+            ],
+            None,
+        )?;
+        if !output.status.success() {
             anyhow::bail!("Failed to store in Windows Credential Manager (target={target})");
         }
     } else {
@@ -109,20 +138,26 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
 }
 
 /// Remove a credential from the OS keychain. Errors are silently ignored.
+///
+/// Output is captured (not inherited) — `security delete-generic-password`
+/// prints `password has been deleted.` and an attribute dump to stdout, which
+/// would otherwise corrupt the TUI's alt-screen. See [`run_captured`].
 pub fn remove(service: &str, account: &str) {
     if cfg!(target_os = "macos") {
-        let _ = std::process::Command::new("security")
-            .args(["delete-generic-password", "-s", service, "-a", account])
-            .status();
+        let _ = run_captured(
+            "security",
+            ["delete-generic-password", "-s", service, "-a", account],
+            None,
+        );
     } else if cfg!(target_os = "linux") {
-        let _ = std::process::Command::new("secret-tool")
-            .args(["clear", "service", service, "account", account])
-            .status();
+        let _ = run_captured(
+            "secret-tool",
+            ["clear", "service", service, "account", account],
+            None,
+        );
     } else if cfg!(target_os = "windows") {
         let target = format!("{service}/{account}");
-        let _ = std::process::Command::new("cmdkey")
-            .arg(format!("/delete:{target}"))
-            .status();
+        let _ = run_captured("cmdkey", [format!("/delete:{target}")], None);
     }
 }
 
@@ -160,6 +195,43 @@ mod tests {
     fn available_true_on_macos() {
         // macOS always has the `security` binary
         assert!(available());
+    }
+
+    /// Regression: saving an API key in `/settings` corrupted the TUI because
+    /// `store`/`remove` ran the `security` helper with inherited stdio, so its
+    /// output (`password has been deleted.` + a keychain attribute dump) painted
+    /// over the alt-screen. `run_captured` MUST capture stdout instead of letting
+    /// it reach the terminal. We run a command that prints a sentinel: if the
+    /// helper captures (correct), the sentinel lands in `output.stdout`; if a
+    /// future edit reverts to inherited stdio, captured stdout is empty and this
+    /// fails — the same condition that produced the on-screen corruption.
+    #[test]
+    fn run_captured_captures_stdout_instead_of_inheriting() {
+        const SENTINEL: &str = "BORG_KEYCHAIN_STDOUT_SENTINEL";
+        #[cfg(not(target_os = "windows"))]
+        let output = run_captured("sh", ["-c", &format!("echo {SENTINEL}")], None)
+            .expect("sh subprocess should spawn");
+        #[cfg(target_os = "windows")]
+        let output = run_captured("cmd", ["/C", &format!("echo {SENTINEL}")], None)
+            .expect("cmd subprocess should spawn");
+
+        assert!(output.status.success(), "sentinel command should succeed");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(SENTINEL),
+            "stdout must be captured into Output (not inherited to the terminal)"
+        );
+    }
+
+    /// `run_captured` pipes `stdin` to the child and still captures its streams.
+    /// This is the Linux `secret-tool` path; verify the bytes reach the child by
+    /// echoing them back through `cat`.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn run_captured_pipes_stdin_to_child() {
+        let output = run_captured("cat", std::iter::empty::<&str>(), Some(b"piped-secret"))
+            .expect("cat subprocess should spawn");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "piped-secret");
     }
 
     #[test]
