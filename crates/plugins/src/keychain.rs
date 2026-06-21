@@ -111,7 +111,9 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
         let label = format!("Borg {account}");
         let output = run_captured(
             "secret-tool",
-            ["store", "--label", &label, "service", service, "account", account],
+            [
+                "store", "--label", &label, "service", service, "account", account,
+            ],
             Some(value.as_bytes()),
         )?;
         if !output.status.success() {

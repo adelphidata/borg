@@ -11,8 +11,9 @@ use crate::parser::{Hunk, Patch, PatchOperation};
 use crate::seek_sequence::{find_nearest_context, seek_sequence, MatchOutcome};
 
 /// Maximum size (in bytes) for any single file created or modified by a patch.
-/// Prevents disk exhaustion from LLM-generated oversized patches.
-const MAX_PATCH_FILE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+/// 10 MB caps disk exhaustion from runaway LLM patches while staying well above
+/// any legitimate source file.
+const MAX_PATCH_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Categorized list of files affected by a patch application.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -193,8 +194,6 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                         actions.push(CommitAction::Write {
                             path: path.clone(),
                             content: content.clone(),
-                            // New-file content is written verbatim; any BOM the
-                            // patch itself carries is already in `content`.
                             had_bom: false,
                         });
                         affected.added.push(path.clone());
@@ -722,6 +721,7 @@ fn render_unified_diff(
 ) -> String {
     let old_text = old.unwrap_or("");
     let new_text = new.unwrap_or("");
+    // No change ⇒ empty diff so callers don't emit a no-op hunk.
     if old_text == new_text {
         return String::new();
     }

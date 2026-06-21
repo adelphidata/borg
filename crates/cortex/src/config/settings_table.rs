@@ -183,6 +183,10 @@ define_settings! {
         "heartbeat.pre_run_cwd" => heartbeat.pre_run_cwd, string;
         "heartbeat.pre_run_timeout_ms" => heartbeat.pre_run_timeout_ms, parsed(u64);
         "heartbeat.turn_timeout_secs" => heartbeat.turn_timeout_secs, parsed(u64);
+        "heartbeat.remediation_enabled" => heartbeat.remediation_enabled, parsed(bool);
+        "heartbeat.remediation_timeout_secs" => heartbeat.remediation_timeout_secs, parsed(u64);
+        "heartbeat.remediation_token_budget" => heartbeat.remediation_token_budget, parsed(u64);
+        "heartbeat.remediation_max_ticks" => heartbeat.remediation_max_ticks, parsed(u32);
 
         // ── User ──
         "user.name" => user.name, opt_string;

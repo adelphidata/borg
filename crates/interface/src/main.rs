@@ -535,6 +535,7 @@ async fn async_main() -> Result<()> {
         if tui_mode {
             let (non_blocking, guard) = match cortex::config::Config::logs_dir() {
                 Ok(log_dir) => {
+                    // The OpenOptions::open below surfaces any real dir-creation failure.
                     let _ = std::fs::create_dir_all(&log_dir);
                     let mut opts = std::fs::OpenOptions::new();
                     opts.create(true).append(true);

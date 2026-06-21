@@ -630,6 +630,32 @@ pub struct HeartbeatConfig {
     /// Default 75 keeps a 15s margin under the smorgasborg eval's 90s
     /// `collect_samples` timeout.
     pub turn_timeout_secs: u64,
+    /// Master switch for agentic heartbeat remediation. When true, a
+    /// scheduled tick that detects something actionable (a proactive nudge
+    /// fired, or a remediation goal is already in flight) runs the full
+    /// agent loop — tools + the per-session goal/Ralph loop — instead of the
+    /// cheap tool-less check-in, so the agent can investigate and fix rather
+    /// than merely report. Quiet ticks (nothing detected) stay on the cheap
+    /// path, so steady-state cost is unchanged. When false, every tick uses
+    /// the cheap tool-less path (legacy behavior).
+    pub remediation_enabled: bool,
+    /// Wall-clock cap, in seconds, on an agentic remediation turn. Far larger
+    /// than `turn_timeout_secs` (which governs the lightweight check-in)
+    /// because fixing a real problem may need many tool round-trips. The
+    /// remediation goal persists across ticks, so a turn cut off here resumes
+    /// on the next tick rather than losing progress. Default 600.
+    pub remediation_timeout_secs: u64,
+    /// Token budget applied to an agent-created remediation goal when the
+    /// agent did not set one itself. Caps how much a single remediation can
+    /// spend before the goal flips to `BudgetLimited` and stops auto-
+    /// continuing. `0` means unbounded (no cap is imposed). Default 50_000.
+    pub remediation_token_budget: u64,
+    /// Backstop on how many scheduled ticks a single remediation goal may
+    /// stay `Active` without reaching a terminal state. Once exceeded the
+    /// dispatcher force-marks the goal `Blocked` and escalates to the owner,
+    /// so a goal the agent keeps believing it can finish (or one stalled on an
+    /// un-fixable provider error) cannot churn forever. Default 12.
+    pub remediation_max_ticks: u32,
 }
 
 impl Default for HeartbeatConfig {
@@ -649,6 +675,10 @@ impl Default for HeartbeatConfig {
             pre_run_cwd: String::new(),
             pre_run_timeout_ms: crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS,
             turn_timeout_secs: 75,
+            remediation_enabled: true,
+            remediation_timeout_secs: 600,
+            remediation_token_budget: 50_000,
+            remediation_max_ticks: 12,
         }
     }
 }
@@ -656,9 +686,6 @@ impl Default for HeartbeatConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── ThinkingLevel ──
-
     #[test]
     fn thinking_level_default_is_off() {
         assert_eq!(ThinkingLevel::default(), ThinkingLevel::Off);
@@ -793,9 +820,6 @@ mod tests {
             assert!(lvl.is_enabled(), "{lvl:?} must report enabled");
         }
     }
-
-    // ── effective_thinking ──
-
     #[test]
     fn effective_thinking_per_model_override_wins() {
         // Per-model substring match beats the global default — the core
@@ -881,9 +905,6 @@ mod tests {
             ThinkingLevel::Off
         );
     }
-
-    // ── thinking_overrides via apply_setting round-trip ──
-
     /// Apply a well-formed `llm.thinking_overrides` JSON blob and round-trip
     /// it into `effective_thinking`. Locks the `json_count` setter wiring +
     /// the override-resolution end-to-end.
@@ -920,9 +941,6 @@ mod tests {
             "failed apply MUST NOT mutate config"
         );
     }
-
-    // ── LlmConfig defaults ──
-
     #[test]
     fn llm_config_defaults() {
         let cfg = LlmConfig::default();
@@ -943,9 +961,6 @@ mod tests {
         );
         assert_eq!(cfg.thinking, ThinkingLevel::Off);
     }
-
-    // ── AuxLlmConfig ──
-
     #[test]
     fn aux_default_model_is_auto_sentinel() {
         // The default-constructed aux config has an empty model string, which
@@ -1030,9 +1045,6 @@ mod tests {
         let cfg: LlmConfig = toml::from_str(toml_str).expect("parse");
         assert!(cfg.aux.is_none());
     }
-
-    // ── LlmConfig deserialization ──
-
     #[test]
     fn llm_config_from_toml_minimal() {
         let toml_str = r#"
@@ -1056,9 +1068,6 @@ mod tests {
         let cfg: LlmConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.thinking, ThinkingLevel::High);
     }
-
-    // ── CompactionConfig ──
-
     #[test]
     fn compaction_config_no_overrides_by_default() {
         let cfg = CompactionConfig::default();
@@ -1071,9 +1080,6 @@ mod tests {
         cfg.model = Some("anthropic/claude-haiku-4-5".into());
         assert!(cfg.has_overrides());
     }
-
-    // ── HeartbeatConfig defaults ──
-
     #[test]
     fn heartbeat_config_defaults() {
         let cfg = HeartbeatConfig::default();
@@ -1120,9 +1126,6 @@ mod tests {
         );
         assert_eq!(cfg.recipients.get("discord").unwrap(), &vec!["*"]);
     }
-
-    // ── CacheTtl ──
-
     #[test]
     fn cache_ttl_default_is_auto() {
         assert_eq!(CacheTtl::default(), CacheTtl::Auto);

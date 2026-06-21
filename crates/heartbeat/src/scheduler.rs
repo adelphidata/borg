@@ -532,6 +532,9 @@ impl HeartbeatScheduler {
         // sees a fresh liveness timestamp at least once per minute even
         // when the next fire is hours away. When the cap clips the wait,
         // we'll come back through the loop, log nothing, and reschedule.
+        // `to_std()` only fails if `next` is already in the past (negative
+        // span); fall back to one liveness tick so we loop promptly and
+        // recompute rather than busy-spinning on a zero wait.
         let raw_wait = (next - now)
             .to_std()
             .unwrap_or(std::time::Duration::from_secs(60));

@@ -1,16 +1,5 @@
 //! Native Gemini AI Studio adapter (generateContent / streamGenerateContent).
 //!
-//! This file lands in three milestones:
-//!
-//! - **M2 (this commit)** — request builder, non-streaming response parser,
-//!   error mapping, schema sanitisation, role/part conversion. The streaming
-//!   methods are placeholders that fail loudly with `LlmError::Fatal` so a
-//!   premature dispatch is obvious in logs.
-//! - **M3** — fills `parse_stream_line` and `new_stream_state` for SSE,
-//!   driven by `GeminiStreamState`.
-//! - **M4** — flips `Provider::Gemini.is_openai_compatible()` to `false` and
-//!   wires `transport.endpoint()` into the dispatcher for Gemini.
-//!
 //! Vertex AI's Gemini variant is intentionally *not* served by this adapter
 //! — Vertex auth (service-account OAuth, regionalised endpoints) lives in
 //! `crate::llm::vertex`. This file is for the AI Studio API-key endpoint at
@@ -165,8 +154,6 @@ impl Transport for GeminiTransport {
         parse_gemini_response(response, provider, model)
     }
 }
-
-// ── Request building ─────────────────────────────────────────────────────
 
 /// Build the full Gemini `generateContent` request body from a Borg
 /// `TransportRequest`. Pure function — every shape decision is in one place
@@ -486,8 +473,6 @@ fn safety_settings_block() -> Value {
     ])
 }
 
-// ── Response parsing ─────────────────────────────────────────────────────
-
 fn parse_gemini_response(
     response: Value,
     provider: &str,
@@ -591,8 +576,6 @@ fn parse_gemini_response(
 fn synth_call_id(name: &str, idx: usize) -> String {
     format!("gem_call_{name}_{idx}")
 }
-
-// ── SSE streaming parser ─────────────────────────────────────────────────
 
 /// Parse one SSE line from `streamGenerateContent?alt=sse`. The driver in
 /// `crate::sse` strips empty lines and `:`-prefixed comments before
@@ -1363,8 +1346,6 @@ mod tests {
         );
     }
 
-    // ── M3 SSE streaming tests ───────────────────────────────────────────
-
     /// Feed an SSE byte sequence one line at a time and collect every event
     /// emitted along the way. Mirrors how `crate::sse` drives the parser.
     fn feed(events: &[&str]) -> (GeminiStreamState, Vec<StreamEvent>, bool) {
@@ -1643,11 +1624,9 @@ mod tests {
         );
     }
 
-    // ── M4 dispatch wiring regression guards ─────────────────────────────
-
     #[test]
     fn gemini_provider_is_not_openai_compatible_after_m4_flip() {
-        // The whole point of M4: Gemini stops sharing the OpenAI dispatch
+        // Gemini must stop sharing the OpenAI dispatch
         // path so the native transport (and inline_data video parts) reach
         // the model. If someone reverts `is_openai_compatible()` to true,
         // Gemini silently goes back through the lossy façade.

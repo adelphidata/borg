@@ -262,6 +262,9 @@ pub async fn start(
     let scheduler_semaphore = semaphore;
     let task_cost_event_sink = cost_event_sink;
     let scheduler_db = supervisor_db;
+    // The executor lets heartbeat ticks run the full agent loop (tools + the
+    // goal/Ralph loop) for remediation; all other scheduled tasks ignore it.
+    let scheduler_executor = executor.clone();
     spawn_supervised(
         SupervisorConfig::new("scheduler-dispatch"),
         scheduler_shutdown.clone(),
@@ -271,11 +274,14 @@ pub async fn start(
             let scheduler_semaphore = scheduler_semaphore.clone();
             let scheduler_shutdown = scheduler_shutdown.clone();
             let task_cost_event_sink = task_cost_event_sink.clone();
+            let scheduler_executor = scheduler_executor.clone();
             async move {
                 let cost_for_hook = task_cost_event_sink.clone();
+                let exec_for_hook = scheduler_executor.clone();
                 let hooks = scheduler::DispatcherHooks {
                     spawn_task: Arc::new(move |task, run_id, retry, sem, cfg| {
                         let cost_event_sink = cost_for_hook.clone();
+                        let executor = exec_for_hook.clone();
                         Box::pin(async move {
                             task_runner::spawn_task_execution(
                                 task,
@@ -284,6 +290,7 @@ pub async fn start(
                                 sem,
                                 cfg,
                                 Some(cost_event_sink),
+                                Some(executor),
                             )
                             .await
                         })

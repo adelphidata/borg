@@ -235,8 +235,6 @@ fn require_str_param_wrong_type() {
 // unknown fallback) by `tool_classification::tests::classify_action_*`. No
 // duplicate table here.
 
-// -- is_mutating_tool (allowlist-based) --
-
 #[test]
 fn mutating_tools_are_blocked_in_plan_mode() {
     // Plan mode security boundary: these tools must be blocked. If a new
@@ -441,8 +439,6 @@ async fn spawn_logged_handles_panic() {
     // If we get here, the panic was handled (not propagated)
 }
 
-// -- dispatch_parallel_safe_tool --
-
 #[tokio::test]
 async fn dispatch_parallel_safe_tool_read_file_returns_content() {
     use std::io::Write;
@@ -496,8 +492,6 @@ async fn dispatch_parallel_safe_tool_invalid_json_returns_text() {
     };
     assert!(text.contains("Invalid JSON"), "got: {text}");
 }
-
-// -- SETUP template tests --
 //
 // The two `setup_template_*` template-rendering tests live alongside
 // `SETUP_TEMPLATE` in `agent::system_prompt`. The lifecycle tests below
@@ -697,8 +691,6 @@ async fn identity_in_long_term_memory_with_db_distinguishes_states() {
     );
 }
 
-// -- should_nudge_for_response --
-
 #[test]
 fn should_nudge_for_response_matrix() {
     // (text, tools_executed, already_retried, expected_nudge)
@@ -717,10 +709,6 @@ fn should_nudge_for_response_matrix() {
         );
     }
 }
-
-// -- collaboration mode template tests --
-
-// -- new system prompt section tests --
 
 // NOTE: the `build_system_prompt_*_after_*` ordering tests above are the
 // prompt-cache guards (an explicitly-allowed source-grep exception). The

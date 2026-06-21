@@ -71,6 +71,7 @@ fn name(cn: &str) -> DistinguishedName {
 pub fn generate_root_ca(common_name: &str) -> Result<RootCa, PkiError> {
     let mut params = CertificateParams::default();
     params.distinguished_name = name(common_name);
+    // pathlen=0: the root signs leaf certs directly, never intermediate CAs.
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,

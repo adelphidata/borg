@@ -1007,7 +1007,6 @@ impl Agent {
                 Some(tool_defs.as_slice())
             };
 
-            // --- Stream LLM response ---
             // Reset the failover identity for this stream: the prompt for this
             // iteration was already built (line above) from the prior value, so
             // clearing now means a clean primary serve leaves it `None` and the

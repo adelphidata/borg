@@ -13,6 +13,7 @@ use crate::session::DaemonSessionExecutor;
 use anyhow::Result;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
+use cortex::goals::{Goal, GoalStatus};
 use gateway::{InboundTurn, SessionExecutor};
 use heartbeat::scheduler::{HeartbeatResult, SkipReason};
 use std::collections::hash_map::DefaultHasher;
@@ -462,7 +463,10 @@ pub async fn execute_heartbeat_turn(
     config.llm.cache.ttl = config.llm.cache.ttl.resolve(true);
 
     let user_msg = match source {
-        HeartbeatSource::Scheduled => build_scheduled_heartbeat_prompt(&config).await,
+        HeartbeatSource::Scheduled => {
+            let nudges = collect_scheduled_nudges(&config).await;
+            build_scheduled_heartbeat_prompt(nudges)
+        }
         HeartbeatSource::SessionStart => build_session_start_prompt(&config).await,
     };
 
@@ -596,18 +600,261 @@ fn skip_reason_wire(reason: &SkipReason) -> &'static str {
     }
 }
 
-pub(crate) async fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
+/// Collect this tick's proactive nudges. Each augmenter is rate-limited via
+/// the `meta` table, so `collect` mutates cooldown state and MUST be called
+/// exactly once per tick — the caller decides the agentic-vs-cheap path from
+/// whether the result is empty, then threads the same `Vec` into
+/// [`build_scheduled_heartbeat_prompt`].
+pub(crate) async fn collect_scheduled_nudges(config: &Config) -> Vec<String> {
+    let nudge_db = open_heartbeat_db_for_nudges().await;
+    crate::heartbeat_augmenters::collect(config, nudge_db.as_ref()).await
+}
+
+pub(crate) fn build_scheduled_heartbeat_prompt(nudges: Vec<String>) -> String {
     let mut user_msg = "*heartbeat tick*".to_string();
     if let Some(cl) = cortex::memory::load_heartbeat_checklist() {
         user_msg.push_str("\n\n# Heartbeat Checklist\n");
         user_msg.push_str(&cl);
     }
-    let nudge_db = open_heartbeat_db_for_nudges().await;
-    append_proactive_nudges(
-        &mut user_msg,
-        crate::heartbeat_augmenters::collect(config, nudge_db.as_ref()).await,
-    );
+    append_proactive_nudges(&mut user_msg, nudges);
     user_msg
+}
+
+/// Session key for the scheduled-heartbeat conversation. Remediation goals
+/// live here so they persist across ticks and resume automatically — the
+/// owner never chats in this session, so any goal present is a remediation
+/// goal the heartbeat itself created.
+pub(crate) fn scheduled_session_key() -> String {
+    format!("heartbeat:{}", HeartbeatSource::Scheduled.as_wire())
+}
+
+/// Meta-table keys backing the max-ticks backstop. `TICKS` counts how many
+/// scheduled ticks the current goal has stayed `Active`; `GOAL_ID` records
+/// which goal the count belongs to so a fresh goal restarts the counter.
+const REMEDIATION_TICKS_KEY: &str = "heartbeat_remediation_ticks";
+const REMEDIATION_GOAL_KEY: &str = "heartbeat_remediation_goal_id";
+
+/// Run an agentic remediation turn through the executor — the full agent loop
+/// (tools + the per-session goal/Ralph loop), unlike the cheap tool-less
+/// check-in. Returns the collected response text. The turn runs in the
+/// scheduled-heartbeat session so an agent-created goal persists across ticks.
+pub(crate) async fn run_scheduled_remediation_turn(
+    executor: &dyn SessionExecutor,
+    user_msg: String,
+    timeout_secs: u64,
+) -> CollectOutcome {
+    let turn = InboundTurn {
+        session_key: scheduled_session_key(),
+        text: user_msg,
+        images: Vec::new(),
+    };
+    match executor.start_turn(turn).await {
+        Ok((event_rx, cancel)) => {
+            collect_heartbeat_response(event_rx, cancel, Duration::from_secs(timeout_secs.max(1)))
+                .await
+        }
+        Err(e) => {
+            tracing::warn!("Heartbeat remediation: start_turn failed: {e}");
+            CollectOutcome::Completed(String::new())
+        }
+    }
+}
+
+/// What to do with the heartbeat message after an agentic remediation turn.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemediationFollowup {
+    /// Deliver this message regardless of the agent's own (possibly silent)
+    /// output — a terminal or escalation announcement the owner must see.
+    Announce(String),
+    /// No override; run the agent's own response text through the normal
+    /// silent / zero-info / dedup gates.
+    Passthrough,
+}
+
+/// Inspect the remediation goal after an agentic turn and decide follow-up:
+/// enforce the per-goal token budget, advance the max-ticks backstop, and
+/// turn terminal goal states into owner-facing announcements.
+pub(crate) async fn handle_remediation_goal(config: &Config) -> RemediationFollowup {
+    let db = match cortex::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("Heartbeat remediation: DB open for goal follow-up failed: {e}");
+            return RemediationFollowup::Passthrough;
+        }
+    };
+    let session_key = scheduled_session_key();
+    let goal = match db.get_goal(&session_key).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            // No goal: the agent fixed it inline this turn or judged none was
+            // warranted. Drop any stale counter and pass through.
+            clear_remediation_ticks(&db).await;
+            return RemediationFollowup::Passthrough;
+        }
+        Err(e) => {
+            tracing::warn!("Heartbeat remediation: get_goal failed: {e}");
+            return RemediationFollowup::Passthrough;
+        }
+    };
+
+    let max = config.heartbeat.remediation_max_ticks;
+    match goal.status {
+        GoalStatus::Complete => {
+            if let Err(e) = db.delete_goal(&session_key).await {
+                tracing::warn!("Heartbeat remediation: delete completed goal failed: {e}");
+            }
+            clear_remediation_ticks(&db).await;
+            remediation_followup_for(GoalStatus::Complete, &goal.objective, 0, max)
+        }
+        GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::BudgetLimited => {
+            clear_remediation_ticks(&db).await;
+            remediation_followup_for(goal.status, &goal.objective, 0, max)
+        }
+        GoalStatus::Paused => RemediationFollowup::Passthrough,
+        GoalStatus::Active => {
+            ensure_remediation_budget(&db, config, &goal).await;
+            let ticks = bump_remediation_ticks(&db, &goal.goal_id).await;
+            let followup =
+                remediation_followup_for(GoalStatus::Active, &goal.objective, ticks, max);
+            // An Announce on an Active goal means the max-ticks backstop tripped
+            // — the goal keeps believing it can finish (or is stalled on an
+            // un-fixable error). Force it terminal so it can't churn forever.
+            if matches!(followup, RemediationFollowup::Announce(_)) {
+                if let Err(e) = db
+                    .update_goal(
+                        &session_key,
+                        cortex::db::GoalUpdate {
+                            status: Some(GoalStatus::Blocked),
+                            expected_goal_id: Some(goal.goal_id.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!("Heartbeat remediation: force-block failed: {e}");
+                }
+                clear_remediation_ticks(&db).await;
+            }
+            followup
+        }
+    }
+}
+
+/// Pure message-selection for a remediation follow-up: maps a goal's status
+/// (and, for an `Active` goal, the running tick count vs the backstop) to
+/// either an owner-facing announcement or a passthrough. Kept side-effect-free
+/// so the escalation matrix — including the max-ticks backstop — is unit
+/// testable without a DB.
+pub(crate) fn remediation_followup_for(
+    status: GoalStatus,
+    objective: &str,
+    ticks: u32,
+    max_ticks: u32,
+) -> RemediationFollowup {
+    match status {
+        GoalStatus::Complete => RemediationFollowup::Announce(format!("✓ Resolved: {objective}")),
+        GoalStatus::Blocked => RemediationFollowup::Announce(format!(
+            "⚠ I hit a wall working on: {objective} — I need your help to go further."
+        )),
+        GoalStatus::UsageLimited => RemediationFollowup::Announce(format!(
+            "⚠ Can't continue remediation of: {objective} — the LLM provider cut us off \
+             (usage limit or invalid credentials). This needs your attention."
+        )),
+        GoalStatus::BudgetLimited => RemediationFollowup::Announce(format!(
+            "⚠ Spent the remediation token budget on: {objective} without finishing. \
+             Use /goal to resume if you want me to keep going."
+        )),
+        GoalStatus::Paused => RemediationFollowup::Passthrough,
+        GoalStatus::Active => {
+            if max_ticks > 0 && ticks > max_ticks {
+                RemediationFollowup::Announce(format!(
+                    "⚠ Couldn't resolve: {objective} after {ticks} attempts — pausing it. \
+                     This likely needs your help."
+                ))
+            } else {
+                // In-progress: let the agent's own (usually silent) output run
+                // through the normal gates so the owner isn't pinged each tick.
+                RemediationFollowup::Passthrough
+            }
+        }
+    }
+}
+
+/// Whether a scheduled tick should run the agentic remediation path instead of
+/// the cheap tool-less check-in. Pure so the gate is table-testable: go agentic
+/// only when remediation is enabled, an executor is available, and there is
+/// something to act on (a nudge fired this tick, or a remediation goal is
+/// already in flight).
+pub(crate) fn remediation_gate_open(
+    enabled: bool,
+    has_executor: bool,
+    has_nudges: bool,
+    active_goal: bool,
+) -> bool {
+    enabled && has_executor && (has_nudges || active_goal)
+}
+
+/// Apply the configured remediation token budget to a goal the agent created
+/// without one, so a single remediation can't spend unbounded tokens. No-op
+/// when the goal already has a budget or the cap is disabled (`0`).
+async fn ensure_remediation_budget(db: &cortex::db::Database, config: &Config, goal: &Goal) {
+    if goal.token_budget.is_some() {
+        return;
+    }
+    let budget = config.heartbeat.remediation_token_budget;
+    if budget == 0 {
+        return;
+    }
+    if let Err(e) = db
+        .update_goal(
+            &goal.session_id,
+            cortex::db::GoalUpdate {
+                token_budget: Some(Some(budget as i64)),
+                expected_goal_id: Some(goal.goal_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        tracing::warn!("Heartbeat remediation: set goal budget failed: {e}");
+    }
+}
+
+/// Increment the max-ticks counter, resetting it when the active goal changed.
+/// Returns the post-increment count (1 on the first tick of a goal).
+async fn bump_remediation_ticks(db: &cortex::db::Database, goal_id: &str) -> u32 {
+    let same_goal = matches!(
+        db.get_meta(REMEDIATION_GOAL_KEY).await,
+        Ok(Some(ref prev)) if prev == goal_id
+    );
+    let prev = if same_goal {
+        db.get_meta(REMEDIATION_TICKS_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let count = prev.saturating_add(1);
+    if let Err(e) = db.set_meta(REMEDIATION_GOAL_KEY, goal_id).await {
+        tracing::warn!("Heartbeat remediation: persist goal-id meta failed: {e}");
+    }
+    if let Err(e) = db.set_meta(REMEDIATION_TICKS_KEY, &count.to_string()).await {
+        tracing::warn!("Heartbeat remediation: persist ticks meta failed: {e}");
+    }
+    count
+}
+
+/// Reset the max-ticks backstop once a remediation reaches a terminal state.
+async fn clear_remediation_ticks(db: &cortex::db::Database) {
+    if let Err(e) = db.set_meta(REMEDIATION_TICKS_KEY, "0").await {
+        tracing::warn!("Heartbeat remediation: clear ticks meta failed: {e}");
+    }
+    if let Err(e) = db.set_meta(REMEDIATION_GOAL_KEY, "").await {
+        tracing::warn!("Heartbeat remediation: clear goal-id meta failed: {e}");
+    }
 }
 
 async fn build_session_start_prompt(config: &Config) -> String {
@@ -781,6 +1028,78 @@ fn resolve_recipients_for_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agentic-vs-cheap gate: go agentic only when remediation is enabled,
+    /// an executor exists, and there is something to act on (a nudge fired or a
+    /// remediation goal is already running). Every other combination must stay
+    /// on the cheap tool-less path so quiet ticks don't pay for the agent loop.
+    #[test]
+    fn remediation_gate_requires_enabled_executor_and_a_trigger() {
+        // (enabled, has_executor, has_nudges, active_goal) -> open?
+        let cases = [
+            ((true, true, true, false), true),   // nudge fired
+            ((true, true, false, true), true),   // goal in flight
+            ((true, true, true, true), true),    // both
+            ((true, true, false, false), false), // quiet tick → cheap path
+            ((false, true, true, true), false),  // master switch off
+            ((true, false, true, true), false),  // no executor (e.g. tests)
+        ];
+        for ((enabled, exec, nudges, goal), expected) in cases {
+            assert_eq!(
+                remediation_gate_open(enabled, exec, nudges, goal),
+                expected,
+                "gate({enabled},{exec},{nudges},{goal})"
+            );
+        }
+    }
+
+    /// Terminal goal states must escalate to the owner; an in-progress goal
+    /// stays silent until the max-ticks backstop trips, at which point it
+    /// escalates rather than churning forever.
+    #[test]
+    fn remediation_followup_escalates_terminal_states_and_backstop() {
+        use GoalStatus::*;
+        let obj = "fix the stale cache";
+        let max = 12;
+
+        for status in [Complete, Blocked, UsageLimited, BudgetLimited] {
+            assert!(
+                matches!(
+                    remediation_followup_for(status, obj, 0, max),
+                    RemediationFollowup::Announce(ref m) if m.contains(obj)
+                ),
+                "{status:?} should announce and name the objective"
+            );
+        }
+
+        // Paused is owner-driven; nothing to say.
+        assert_eq!(
+            remediation_followup_for(Paused, obj, 0, max),
+            RemediationFollowup::Passthrough
+        );
+
+        // Active under the cap stays quiet (agent's own output passes through).
+        assert_eq!(
+            remediation_followup_for(Active, obj, max, max),
+            RemediationFollowup::Passthrough
+        );
+
+        // Active past the cap escalates and reports the attempt count.
+        match remediation_followup_for(Active, obj, max + 1, max) {
+            RemediationFollowup::Announce(m) => {
+                assert!(m.contains(obj));
+                assert!(m.contains(&(max + 1).to_string()), "names attempt count");
+            }
+            RemediationFollowup::Passthrough => panic!("backstop must escalate past max_ticks"),
+        }
+
+        // max_ticks == 0 disables the backstop — an Active goal never escalates
+        // on count alone, no matter how high.
+        assert_eq!(
+            remediation_followup_for(Active, obj, 9999, 0),
+            RemediationFollowup::Passthrough
+        );
+    }
 
     /// `heartbeat::spawn` MUST NOT spawn an in-process
     /// `HeartbeatScheduler::run` timer. Scheduled heartbeat firings flow

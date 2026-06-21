@@ -81,7 +81,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
     let hooks = scheduler::DispatcherHooks {
         spawn_task: Arc::new(|task, run_id, retry, sem, cfg| {
             Box::pin(async move {
-                task_runner::spawn_task_execution(task, run_id, retry, sem, cfg, None).await
+                task_runner::spawn_task_execution(task, run_id, retry, sem, cfg, None, None).await
             })
         }),
         deliver_celebration: Arc::new(|cfg, c| {

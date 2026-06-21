@@ -302,6 +302,7 @@ impl KekStore for FileKekStore {
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), passphrase);
     let mut okm = [0u8; 32];
+    // Domain-separation info string; changing it makes existing kek.enc files undecryptable.
     hk.expand(b"borg-kek-v1", &mut okm)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: hkdf: {e}")))?;
     Ok(*Key::from_slice(&okm))

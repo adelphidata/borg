@@ -340,8 +340,6 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000_000;
 
-    // ── OpenAI-style positive ────────────────────────────────────────────
-
     #[test]
     fn openai_both_buckets_parsed() {
         let h = hm(&[
@@ -411,8 +409,6 @@ mod tests {
         assert_eq!(snap.tokens.unwrap().reset_at_ms, reset_s * 1000);
     }
 
-    // ── Anthropic-style positive ─────────────────────────────────────────
-
     #[test]
     fn anthropic_rfc3339_reset() {
         let h = hm(&[
@@ -464,8 +460,6 @@ mod tests {
         let snap = parse_rate_limit_headers(Provider::ClaudeCodeOAuth, &h, NOW).expect("snapshot");
         assert_eq!(snap.requests.unwrap().remaining, 2);
     }
-
-    // ── Negative ─────────────────────────────────────────────────────────
 
     #[test]
     fn no_headers_returns_none() {
@@ -528,8 +522,6 @@ mod tests {
         ]);
         assert!(parse_rate_limit_headers(Provider::OpenAi, &h, NOW).is_none());
     }
-
-    // ── Bucket helpers ───────────────────────────────────────────────────
 
     #[test]
     fn remaining_pct_zero_limit_is_full() {

@@ -164,8 +164,6 @@ pub fn is_installed(def: &PluginDef, _data_dir: &std::path::Path) -> bool {
     manifest.exists()
 }
 
-// ── Internal helpers ──
-
 /// Compute SHA-256 hashes of all template files after installation.
 /// Returns `(relative_path, hex_hash)` pairs.
 pub fn compute_file_hashes(def: &PluginDef, data_dir: &std::path::Path) -> Vec<(String, String)> {
@@ -242,7 +240,7 @@ fn make_scripts_executable(def: &PluginDef, data_dir: &std::path::Path) -> Resul
     Ok(())
 }
 
-fn credential_account(key: &str) -> String {
+pub(crate) fn credential_account(key: &str) -> String {
     format!("borg-{key}")
 }
 

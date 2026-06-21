@@ -12,8 +12,6 @@ use anyhow::Result;
 
 use crate::db::Database;
 
-// ── Shared helpers ──
-
 /// Return an early-exit string if the feature is disabled.
 pub(crate) fn check_enabled(enabled: bool, feature: &str) -> Option<String> {
     if enabled {
@@ -71,8 +69,6 @@ pub fn optional_i64_param(args: &serde_json::Value, name: &str) -> Option<i64> {
 pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) -> f64 {
     args[name].as_f64().unwrap_or(default)
 }
-
-// ── Re-exports ──
 
 // Memory
 pub(crate) use memory::native_memory_search;

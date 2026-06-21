@@ -448,16 +448,7 @@ impl Agent {
 
     /// Build the heartbeat ack protocol section.
     pub(super) fn build_heartbeat_section(&self) -> String {
-        let ok_token = constants::HEARTBEAT_OK_TOKEN;
-        let interval = &self.config.heartbeat.interval;
-        format!(
-            "\n<heartbeat_protocol>\n\
-            Heartbeat interval: {interval}. \
-            If you receive a heartbeat poll (*heartbeat tick*) and there is nothing that needs attention, reply exactly:\n\
-            {ok_token}\n\
-            If something needs attention, do NOT include \"{ok_token}\"; reply with the alert text instead.\n\
-            </heartbeat_protocol>\n"
-        )
+        build_heartbeat_protocol(&self.config)
     }
 
     /// Build the reply tags section for message threading.
@@ -583,6 +574,82 @@ pub(super) async fn render_scheduled_tasks_snapshot(db: &crate::db::Database, no
     );
     s.push_str("</scheduled_tasks>\n");
     s
+}
+
+/// Render the `<heartbeat_protocol>` section. Free function (not a method) so
+/// the remediation-guidance gating is unit-testable from a bare `Config`.
+///
+/// The remediation guidance is only emitted when the agent can actually open a
+/// goal to carry multi-tick work (`goals.enabled`) AND remediation is on
+/// (`heartbeat.remediation_enabled`). Without the goal/Ralph loop a heartbeat
+/// turn is one-shot, so telling the agent to "fix it across ticks" would be a
+/// lie — it would promise follow-up the runtime can't deliver.
+pub(super) fn build_heartbeat_protocol(config: &crate::config::Config) -> String {
+    let ok_token = constants::HEARTBEAT_OK_TOKEN;
+    let interval = &config.heartbeat.interval;
+    let remediation = if config.goals.enabled && config.heartbeat.remediation_enabled {
+        "When something needs attention and you can act on it with your tools, DO the work now \
+         — investigate and fix it; do not merely report it or say you will look into it later, \
+         because there is no later turn unless a goal exists. \
+         If the fix needs more than this one turn, call create_goal with a concrete objective; \
+         the goal persists and you automatically resume it on later heartbeat ticks until it is \
+         done. When you have verified the problem is resolved, call update_goal with \
+         status=\"complete\". If you hit a wall that genuinely needs the owner (a missing \
+         credential or API key, a permission denial, an external outage) after a few attempts, \
+         call update_goal with status=\"blocked\" and explain what you need — do not keep \
+         retrying something only the owner can fix.\n"
+    } else {
+        ""
+    };
+    format!(
+        "\n<heartbeat_protocol>\n\
+        Heartbeat interval: {interval}. \
+        If you receive a heartbeat poll (*heartbeat tick*) and there is nothing that needs attention, reply exactly:\n\
+        {ok_token}\n\
+        If something needs attention, do NOT include \"{ok_token}\"; reply with the alert text instead.\n\
+        {remediation}\
+        </heartbeat_protocol>\n"
+    )
+}
+
+#[cfg(test)]
+mod heartbeat_protocol_tests {
+    use super::build_heartbeat_protocol;
+    use crate::config::Config;
+
+    #[test]
+    fn remediation_guidance_present_only_when_goals_and_remediation_enabled() {
+        let mut cfg = Config::default();
+        cfg.goals.enabled = true;
+        cfg.heartbeat.remediation_enabled = true;
+        let on = build_heartbeat_protocol(&cfg);
+        // The whole point of the feature: tell the agent to act + open a goal.
+        assert!(
+            on.contains("create_goal"),
+            "should steer toward create_goal"
+        );
+        assert!(
+            on.contains("update_goal"),
+            "should steer toward terminal marks"
+        );
+        assert!(on.contains("DO the work now"));
+
+        // Disabling remediation drops the guidance even with goals on, so the
+        // cheap one-shot heartbeat doesn't promise follow-up it can't deliver.
+        cfg.heartbeat.remediation_enabled = false;
+        let off = build_heartbeat_protocol(&cfg);
+        assert!(!off.contains("create_goal"));
+
+        // Goals off (no Ralph loop) also drops it, regardless of the switch.
+        cfg.goals.enabled = false;
+        cfg.heartbeat.remediation_enabled = true;
+        assert!(!build_heartbeat_protocol(&cfg).contains("create_goal"));
+
+        // The base ack protocol is always present in every variant.
+        for variant in [&on, &off] {
+            assert!(variant.contains("<heartbeat_protocol>"));
+        }
+    }
 }
 
 impl Agent {

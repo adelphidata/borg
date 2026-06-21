@@ -1,6 +1,7 @@
 //! Scheduled-task execution. Runs in the daemon binary so jobs don't have to
 //! shell out to the cli's in-process helpers.
 
+use crate::session::DaemonSessionExecutor;
 use cortex::config::Config;
 use cortex::llm::{CostEventContext, CostEventSink, LlmClient};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub async fn spawn_task_execution(
     semaphore: Arc<Semaphore>,
     config: Config,
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    executor: Option<Arc<DaemonSessionExecutor>>,
 ) {
     // Acquire the permit *inside* the spawned task, not on the caller's
     // dispatcher loop. If we awaited here while all permits were claimed, the
@@ -118,6 +120,7 @@ pub async fn spawn_task_execution(
             pre_run_command,
             pre_run_cwd,
             pre_run_timeout_ms,
+            executor,
         };
 
         let result = std::panic::AssertUnwindSafe(async {
@@ -311,6 +314,9 @@ struct TaskExecContext {
     pre_run_command: Option<String>,
     pre_run_cwd: Option<String>,
     pre_run_timeout_ms: i64,
+    /// Session executor for agentic turns (heartbeat remediation). `None` on
+    /// paths that only run cheap tool-less tasks (tests, manual triggers).
+    executor: Option<Arc<DaemonSessionExecutor>>,
 }
 
 fn maybe_attach_cost_event_sink(
@@ -423,6 +429,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         pre_run_command: _,
         pre_run_cwd: _,
         pre_run_timeout_ms: _,
+        executor: _,
     } = ctx;
     let mut cmd = build_filtered_sh_command(command.as_str());
     let result = tokio::time::timeout(*timeout, cmd.output()).await;
@@ -636,6 +643,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         pre_run_command,
         pre_run_cwd,
         pre_run_timeout_ms,
+        executor: _,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
     let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
@@ -841,66 +849,137 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         }
     }
 
-    let identity = cortex::identity::load_identity().unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
-        .await
-        .unwrap_or_default();
-    let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let system = format!(
-        "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
-         # Heartbeat\nYou are running a proactive heartbeat check-in. \
-         If nothing actionable changed, respond with exactly `{SILENT_SENTINEL}` \
-         on its own line to suppress delivery."
+    // Collect this tick's proactive nudges exactly once — augmenter cooldowns
+    // are stateful, so a second `collect` would double-consume them. Then
+    // decide cheap-vs-agentic: go agentic only when there's something to act
+    // on (a nudge fired, or a remediation goal is already in flight). Quiet
+    // ticks stay on the cheap tool-less path, so steady-state cost is
+    // unchanged.
+    let nudges = crate::heartbeat::collect_scheduled_nudges(config).await;
+    let active_goal = match cortex::db::Database::open().await {
+        Ok(db) => matches!(
+            db.get_goal(&crate::heartbeat::scheduled_session_key()).await,
+            Ok(Some(g)) if g.status == cortex::goals::GoalStatus::Active
+        ),
+        Err(e) => {
+            tracing::warn!("Heartbeat: DB open for remediation gate failed: {e}");
+            false
+        }
+    };
+    let go_agentic = crate::heartbeat::remediation_gate_open(
+        config.heartbeat.remediation_enabled,
+        ctx.executor.is_some(),
+        !nudges.is_empty(),
+        active_goal,
     );
 
-    let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(config).await;
+    let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(nudges);
     if let Some(cmd) = pre_run_command.as_deref() {
         let outcome = run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms).await;
         user_msg = format!("{}{user_msg}", render_pre_run_block(&outcome));
     }
 
-    let messages = vec![
-        cortex::types::Message::system(system),
-        cortex::types::Message::user(&user_msg),
-    ];
-    let llm = match LlmClient::for_auxiliary(config).await {
-        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
-        Err(e) => {
-            let err_str = format!("{e}");
-            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
-            publish_failed_event(started_unix, &err_str);
-            return;
+    let (result_text, followup) = match (go_agentic, ctx.executor.as_ref()) {
+        (true, Some(executor)) => {
+            // Agentic remediation: full agent loop (tools + the per-session
+            // goal/Ralph loop). An agent-created goal persists in the
+            // scheduled-heartbeat session and resumes on later ticks.
+            let outcome = crate::heartbeat::run_scheduled_remediation_turn(
+                executor.as_ref(),
+                user_msg,
+                config.heartbeat.remediation_timeout_secs,
+            )
+            .await;
+            let text = match outcome {
+                crate::heartbeat::CollectOutcome::Completed(t) => t.trim().to_string(),
+                crate::heartbeat::CollectOutcome::Timeout => String::new(),
+                crate::heartbeat::CollectOutcome::InteractivePromptRequested(detail) => {
+                    tracing::warn!(
+                        "Heartbeat remediation: agent requested interactive input ({detail})"
+                    );
+                    String::new()
+                }
+            };
+            let followup = crate::heartbeat::handle_remediation_goal(config).await;
+            (text, followup)
         }
-    };
-    let result = tokio::time::timeout(*timeout, llm.chat(&messages, None)).await;
-    let response = match result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            let err_str = format!("{e}");
-            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
-            publish_failed_event(started_unix, &err_str);
-            return;
-        }
-        Err(_) => {
-            record_heartbeat_failure(*run_id, *started_at_ms, "Heartbeat timed out", task_name)
-                .await;
-            publish_failed_event(started_unix, "Heartbeat timed out");
-            return;
+        _ => {
+            // Cheap tool-less check-in (legacy path).
+            let identity = cortex::identity::load_identity().unwrap_or_default();
+            let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
+                .await
+                .unwrap_or_default();
+            let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let system = format!(
+                "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
+                 # Heartbeat\nYou are running a proactive heartbeat check-in. \
+                 If nothing actionable changed, respond with exactly `{SILENT_SENTINEL}` \
+                 on its own line to suppress delivery."
+            );
+            let messages = vec![
+                cortex::types::Message::system(system),
+                cortex::types::Message::user(&user_msg),
+            ];
+            let llm = match LlmClient::for_auxiliary(config).await {
+                Ok(l) => {
+                    maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary")
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
+                    publish_failed_event(started_unix, &err_str);
+                    return;
+                }
+            };
+            let result = tokio::time::timeout(*timeout, llm.chat(&messages, None)).await;
+            let response = match result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let err_str = format!("{e}");
+                    record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
+                    publish_failed_event(started_unix, &err_str);
+                    return;
+                }
+                Err(_) => {
+                    record_heartbeat_failure(
+                        *run_id,
+                        *started_at_ms,
+                        "Heartbeat timed out",
+                        task_name,
+                    )
+                    .await;
+                    publish_failed_event(started_unix, "Heartbeat timed out");
+                    return;
+                }
+            };
+            (
+                response.text_content().unwrap_or("").trim().to_string(),
+                crate::heartbeat::RemediationFollowup::Passthrough,
+            )
         }
     };
 
     let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
-    let result_text = response.text_content().unwrap_or("").trim().to_string();
 
-    if is_silent_response(&result_text) {
-        record_heartbeat_silent(*run_id, duration_ms, "silent", task_name).await;
-        publish_skip_event(started_unix, "silent");
-        return;
-    }
-    if result_text.is_empty() || crate::heartbeat::is_zero_info_heartbeat(&result_text) {
-        record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name).await;
-        publish_skip_event(started_unix, "zero_info");
-        return;
+    // A terminal/escalation announcement must reach the owner even if the
+    // agent's own turn output was silent or trivial; Passthrough runs the text
+    // through the normal suppression gates.
+    let (result_text, force_deliver) = match followup {
+        crate::heartbeat::RemediationFollowup::Announce(msg) => (msg, true),
+        crate::heartbeat::RemediationFollowup::Passthrough => (result_text, false),
+    };
+
+    if !force_deliver {
+        if is_silent_response(&result_text) {
+            record_heartbeat_silent(*run_id, duration_ms, "silent", task_name).await;
+            publish_skip_event(started_unix, "silent");
+            return;
+        }
+        if result_text.is_empty() || crate::heartbeat::is_zero_info_heartbeat(&result_text) {
+            record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name).await;
+            publish_skip_event(started_unix, "zero_info");
+            return;
+        }
     }
     let new_hash = response_hash(&result_text);
     if task.last_response_hash.as_deref() == Some(new_hash.as_str()) {

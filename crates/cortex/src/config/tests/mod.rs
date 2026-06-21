@@ -13,6 +13,7 @@ mod credentials;
 mod gateway;
 mod goals_settings;
 mod guards;
+mod heartbeat_remediation_settings;
 mod media;
 mod memory_skills;
 mod save_roundtrip;

@@ -137,8 +137,11 @@ impl<'a> ScriptRunner<'a> {
         let mut callback_bytes: usize = 0;
         let mut stdout_truncated = false;
         let mut stderr_truncated = false;
+        // Stop streaming live output to the callback past this point to bound UI/log volume;
+        // the full stream is still captured up to MAX_OUTPUT_BYTES.
         const STREAM_CALLBACK_LIMIT: usize = 120 * 1024;
-        const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MB cap per stream
+        // 10 MB cap per stream guards against a runaway child exhausting memory.
+        const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
         let streaming_future = async {
             let mut stdout_lines = stdout_pipe.map(|p| BufReader::new(p).lines());

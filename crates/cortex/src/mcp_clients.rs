@@ -61,7 +61,7 @@ static SERVER_LIMITS: OnceLock<Mutex<HashMap<String, ServerLimits>>> = OnceLock:
 /// [`initialize`] / [`reload_from_config`]. Atomic because dispatch is on
 /// the hot path and contending on a Mutex for a single `usize` would hurt.
 static MAX_RESPONSE_BYTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1024 * 1024);
+    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_RESPONSE_BYTES);
 
 /// Floor on `mcp.max_response_bytes`. A value of 0 in config is treated as
 /// "use the default" rather than "no cap" — the latter would defeat the

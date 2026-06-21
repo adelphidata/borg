@@ -73,6 +73,7 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })();
 
     if let Err(e) = write_result {
+        // Best-effort cleanup of the partial temp file; the write error is what matters.
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }

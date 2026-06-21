@@ -16,6 +16,7 @@ pub fn fingerprint_sha256(cert_der: &[u8]) -> String {
     let digest = hasher.finalize();
     digest.iter().fold(String::with_capacity(64), |mut acc, b| {
         use std::fmt::Write;
+        // Writing to a String is infallible.
         let _ = write!(&mut acc, "{b:02x}");
         acc
     })

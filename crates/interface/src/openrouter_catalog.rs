@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::onboarding::OPENROUTER_MODELS;
 
 const CATALOG_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/models";
+// Short cap so a slow catalog fetch can't stall onboarding; falls back to the baked-in list.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// `(model_id, display_label)` pairs — matches the hardcoded shape in

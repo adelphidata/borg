@@ -199,8 +199,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build a config with compaction overrides applied to the LLM section.
-    /// If no compaction overrides are set, returns a clone of self.
+    /// Applies compaction overrides to the LLM section; if none are set,
+    /// returns a clone of self unchanged.
     pub fn with_compaction_overrides(&self) -> Config {
         if !self.compaction.has_overrides() {
             return self.clone();
