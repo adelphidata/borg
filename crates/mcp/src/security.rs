@@ -97,6 +97,16 @@ const PERSISTENCE_IF_WRITTEN: &[&str] = &[
 
 /// Write / copy verbs that turn a persistence path into an *implant* rather than
 /// a read. Substring checks against the lowercased script.
+///
+/// `>` is matched broadly and on purpose: distinguishing a redirect (`echo x >
+/// ~/.bashrc`, with or without spaces) from a `[ a > b ]` test comparison needs a
+/// real shell tokenizer, and POSIX `sh` treats `>` inside `[ ]` as a redirect
+/// anyway. Matching it as a plain substring can *over*-flag a script that only
+/// references a [`PERSISTENCE_IF_WRITTEN`] path while using `>` elsewhere — but
+/// over-blocking a suspicious shell-wrapped MCP is the fail-safe direction. Do
+/// NOT narrow this to only spaced/append forms: that would let `echo x>~/.bashrc`
+/// through. This list only gates the softer `IF_WRITTEN` set; `PERSISTENCE_ALWAYS`
+/// fires regardless.
 const WRITE_INDICATORS: &[&str] = &[">", "tee ", "cp ", "mv ", "install ", "dd "];
 
 /// Does the (already-lowercased) inline script write to an OS persistence
