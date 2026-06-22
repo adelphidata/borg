@@ -15,7 +15,7 @@ use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
-use gateway::{InboundTurn, SessionExecutor};
+use gateway::{InboundTurn, SessionExecutor, TurnKind};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::{broadcast, mpsc};
@@ -106,12 +106,34 @@ impl SessionExecutor for DaemonSessionExecutor {
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
         let host = self.ensure_host(&turn.session_key).await?;
 
-        // Cancel any in-flight turn on this session before starting a new one.
-        // Matches today's gateway semantics: a new inbound replaces a stalled
-        // reply (the underlying `AgentBackend::run_turn` `try_lock` rejects
-        // genuinely-overlapping turns, but cancellation here lets the prior
-        // backend turn unblock its mutex before our new turn tries to grab it).
-        host.cancel_turn().await;
+        match turn.kind {
+            TurnKind::User => {
+                // A new user message replaces a stalled in-flight reply.
+                // Matches today's gateway semantics: the underlying
+                // `AgentBackend::run_turn` `try_lock` rejects genuinely-
+                // overlapping turns, but cancellation here lets the prior
+                // backend turn unblock its mutex before our new turn grabs it.
+                host.cancel_turn().await;
+            }
+            TurnKind::Internal => {
+                // Internal/system turns (heartbeat, greeting, proactive
+                // delivery, async sub-agent completion) must NEVER abort a live
+                // turn. If the session is busy, defer: hand back an
+                // immediately-closed stream so the caller winds down cleanly
+                // without interrupting. The internal source re-fires on its own
+                // cadence (heartbeats tick again; greet sessions are never busy).
+                if host.is_busy() {
+                    tracing::debug!(
+                        session_key = %turn.session_key,
+                        "internal turn deferred: session busy — not interrupting in-flight turn"
+                    );
+                    let (tx, rx) = mpsc::channel::<AgentEvent>(1);
+                    drop(tx);
+                    return Ok((rx, CancellationToken::new()));
+                }
+                // Idle: no cancel needed; fall through and run normally.
+            }
+        }
 
         // Subscribe BEFORE start_turn so we can't miss the first event.
         let mut sub = host.subscribe();

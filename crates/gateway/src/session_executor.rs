@@ -9,12 +9,30 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Who initiated a turn — governs the interrupt policy in
+/// [`SessionExecutor::start_turn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnKind {
+    /// A real user message. A new one replaces (cancels) a stalled in-flight
+    /// reply on the same session — preserves today's "latest message wins"
+    /// behavior.
+    #[default]
+    User,
+    /// A system/background-initiated turn (heartbeat, approval greeting,
+    /// proactive delivery, async sub-agent completion). Must NEVER abort an
+    /// in-flight turn: if the target session is busy it is deferred rather
+    /// than interrupting the live turn.
+    Internal,
+}
+
 /// One inbound message → one turn.
 #[derive(Debug, Clone)]
 pub struct InboundTurn {
     pub session_key: String,
     pub text: String,
     pub images: Vec<InlineImage>,
+    /// Initiator class; defaults to [`TurnKind::User`].
+    pub kind: TurnKind,
 }
 
 pub use cortex::session_types::InlineImage;

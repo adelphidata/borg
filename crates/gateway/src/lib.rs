@@ -83,7 +83,9 @@ pub mod voice;
 pub use channel::registry::ChannelRegistry;
 pub use error::{Error, Result};
 pub use server::GatewayServer;
-pub use session_executor::{InboundTurn, InlineImage, SessionExecutor, SessionExecutorHandle};
+pub use session_executor::{
+    InboundTurn, InlineImage, SessionExecutor, SessionExecutorHandle, TurnKind,
+};
 
 /// Future returned by [`DbOpener`]: an async DB open that yields a `Database`.
 /// Boxed so each HTTP-surface state struct can carry a uniform factory type.

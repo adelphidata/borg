@@ -63,6 +63,7 @@ impl AdmitSink for AgentSink {
             session_key: admitted.session_key.clone(),
             text: admitted.dispatch_text.clone(),
             images: vec![],
+            kind: session_executor::TurnKind::User,
         };
         let session_key = admitted.session_key.clone();
         let source = admitted.message.source.audit_label();

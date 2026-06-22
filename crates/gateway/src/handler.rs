@@ -944,6 +944,7 @@ async fn invoke_agent_inner(
             session_key: session_id.clone(),
             text: message_text,
             images,
+            kind: crate::session_executor::TurnKind::User,
         })
         .await
     {

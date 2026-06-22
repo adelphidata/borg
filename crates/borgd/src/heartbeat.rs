@@ -14,7 +14,7 @@ use anyhow::Result;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::goals::{Goal, GoalStatus};
-use gateway::{InboundTurn, SessionExecutor};
+use gateway::{InboundTurn, SessionExecutor, TurnKind};
 use heartbeat::scheduler::{HeartbeatResult, SkipReason};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -475,6 +475,7 @@ pub async fn execute_heartbeat_turn(
         session_key,
         text: user_msg,
         images: Vec::new(),
+        kind: TurnKind::Internal,
     };
     let (event_rx, cancel) = match executor.start_turn(turn).await {
         Ok(pair) => pair,
@@ -659,6 +660,7 @@ pub(crate) async fn run_scheduled_remediation_turn(
         session_key,
         text: user_msg,
         images: Vec::new(),
+        kind: TurnKind::Internal,
     };
     match executor.start_turn(turn).await {
         Ok((event_rx, cancel)) => {

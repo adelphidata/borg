@@ -15,15 +15,50 @@ use crate::agent::system_prompt_cache::SystemPromptCache;
 use crate::config::Config;
 use crate::tool_handlers;
 
-/// Typed arguments for `write_memory`.
+/// Action for a batch [`MemoryOp`]. `add` and `replace` both upsert the entry
+/// (append-aware); the two verbs exist so the model can signal intent — Borg
+/// upserts either way. `remove` deletes the entry (and its embeddings/chunks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MemoryOpAction {
+    Add,
+    Replace,
+    Remove,
+}
+
+/// One operation in a batch `write_memory` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WriteMemoryArgs {
+pub(crate) struct MemoryOp {
+    pub action: MemoryOpAction,
     pub filename: String,
-    pub content: String,
+    /// Required for `add`/`replace`; ignored for `remove`.
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub append: bool,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+/// Typed arguments for `write_memory`.
+///
+/// Two mutually exclusive shapes:
+/// - **single op**: `filename` + `content` (+ optional `append`/`scope`);
+/// - **batch**: `operations` — a list of add/replace/remove ops applied
+///   atomically against the final per-entry token budget. When `operations`
+///   is present, the top-level single-op fields are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WriteMemoryArgs {
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub operations: Option<Vec<MemoryOp>>,
 }
 
 impl WriteMemoryArgs {
@@ -52,19 +87,66 @@ pub(crate) async fn handle(
     config_arc: &Arc<Config>,
     caches: &mut SystemPromptCache,
 ) -> Result<String> {
+    // Batch mode: when `operations` is present and non-empty it takes
+    // precedence and the single-op fields are ignored.
+    if let Some(ops) = args.operations.as_deref() {
+        if !ops.is_empty() {
+            return handle_batch(ops, config, config_arc, caches).await;
+        }
+    }
+
+    let filename = match args.filename.as_deref() {
+        Some(f) if !f.is_empty() => f,
+        _ => anyhow::bail!(
+            "write_memory requires either 'filename'+'content' or a non-empty 'operations' array"
+        ),
+    };
     let value = args.to_value();
     let result = tool_handlers::handle_write_memory(&value, config).await;
 
     if result.is_ok() {
         let scope = args.scope.as_deref().unwrap_or("global");
-        caches.on_memory_written(scope, &args.filename);
+        caches.on_memory_written(scope, filename);
         if config.memory.embeddings.enabled {
-            spawn_embedding_task(args, config_arc);
+            spawn_embedding_task(filename, args.scope.as_deref(), config_arc);
         }
-        maybe_slide_quiet_hours_tz(&args.content);
+        maybe_slide_quiet_hours_tz(args.content.as_deref().unwrap_or(""));
     }
 
     result
+}
+
+/// Apply a batch of memory operations atomically. The validate-then-apply
+/// happens in [`tool_handlers::handle_write_memory_batch`]; here we fire the
+/// per-op side effects (IDENTITY-cache invalidation, embedding, tz-slide) on
+/// success, mirroring the single-op path.
+async fn handle_batch(
+    ops: &[MemoryOp],
+    config: &Config,
+    config_arc: &Arc<Config>,
+    caches: &mut SystemPromptCache,
+) -> Result<String> {
+    let summary = tool_handlers::handle_write_memory_batch(ops, config).await?;
+
+    for op in ops {
+        let scope = op.scope.as_deref().unwrap_or("global");
+        // Invalidate the IDENTITY cache for any touched entry (incl. removals).
+        caches.on_memory_written(scope, &op.filename);
+        match op.action {
+            MemoryOpAction::Add | MemoryOpAction::Replace => {
+                let entry_name = op.filename.strip_suffix(".md").unwrap_or(&op.filename);
+                if config.memory.embeddings.enabled {
+                    spawn_embedding_task(entry_name, op.scope.as_deref(), config_arc);
+                }
+                if let Some(c) = op.content.as_deref() {
+                    maybe_slide_quiet_hours_tz(c);
+                }
+            }
+            MemoryOpAction::Remove => {}
+        }
+    }
+
+    Ok(summary)
 }
 
 /// Spawn a background task to generate embeddings for the just-written entry.
@@ -73,10 +155,10 @@ pub(crate) async fn handle(
 /// content matches what `memory_search` will find. Missing rows are skipped
 /// rather than embedding placeholders. All failures log + continue — the
 /// primary write has already succeeded.
-fn spawn_embedding_task(args: &WriteMemoryArgs, config_arc: &Arc<Config>) {
+fn spawn_embedding_task(raw_filename: &str, scope: Option<&str>, config_arc: &Arc<Config>) {
     let config = Arc::clone(config_arc);
-    let raw_filename = args.filename.clone();
-    let scope = args.scope.clone().unwrap_or_else(|| "global".to_string());
+    let raw_filename = raw_filename.to_string();
+    let scope = scope.unwrap_or("global").to_string();
     // Match the storage key used by handle_write_memory (strips .md suffix).
     let entry_name = raw_filename
         .strip_suffix(".md")
@@ -266,10 +348,11 @@ mod tests {
         let args: WriteMemoryArgs =
             serde_json::from_value(serde_json::json!({"filename":"x","content":"y"}))
                 .expect("minimal args");
-        assert_eq!(args.filename, "x");
-        assert_eq!(args.content, "y");
+        assert_eq!(args.filename.as_deref(), Some("x"));
+        assert_eq!(args.content.as_deref(), Some("y"));
         assert!(!args.append);
         assert!(args.scope.is_none());
+        assert!(args.operations.is_none());
     }
 
     #[test]
@@ -305,10 +388,11 @@ mod tests {
             None,
         );
         let args = WriteMemoryArgs {
-            filename: "non_identity.md".into(),
-            content: "x".into(),
+            filename: Some("non_identity.md".into()),
+            content: Some("x".into()),
             append: false,
             scope: Some("nonexistent_scope_just_for_test".into()),
+            operations: None,
         };
         let _ = handle(&args, &config, &config_arc, &mut caches).await;
         assert_eq!(
@@ -316,6 +400,27 @@ mod tests {
             Some("stale-identity"),
             "non-IDENTITY writes must not clear the identity cache"
         );
+    }
+
+    #[test]
+    fn deserialize_batch_operations() {
+        let args: WriteMemoryArgs = serde_json::from_value(serde_json::json!({
+            "operations": [
+                {"action": "remove", "filename": "stale.md"},
+                {"action": "add", "filename": "new.md", "content": "hi"},
+                {"action": "replace", "filename": "log.md", "content": "more", "append": true, "scope": "project:x"},
+            ]
+        }))
+        .expect("batch args");
+        assert!(args.filename.is_none());
+        let ops = args.operations.expect("operations present");
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].action, MemoryOpAction::Remove);
+        assert!(ops[0].content.is_none());
+        assert_eq!(ops[1].action, MemoryOpAction::Add);
+        assert_eq!(ops[1].content.as_deref(), Some("hi"));
+        assert!(ops[2].append);
+        assert_eq!(ops[2].scope.as_deref(), Some("project:x"));
     }
 
     #[test]

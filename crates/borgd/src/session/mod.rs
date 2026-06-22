@@ -28,6 +28,7 @@ use buffer::SequencedBuffer;
 use cortex::agent::AgentEvent;
 use prompts::PromptRegistry;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -49,6 +50,11 @@ struct HostInner {
     /// forwarder. Held under one mutex so `start_turn` can serialize a new
     /// turn against the prior one's drain (no event-leak between turns).
     turn_state: AsyncMutex<TurnState>,
+    /// `true` while a turn's events are streaming. Set when a turn installs
+    /// its state in [`SessionHost::start_turn`]; cleared when that turn's
+    /// forwarder drains. Read by [`SessionHost::is_busy`] so an internal/
+    /// system turn can decline to interrupt a live turn.
+    busy: AtomicBool,
 }
 
 struct TurnState {
@@ -75,8 +81,16 @@ impl SessionHost {
                     cancel: CancellationToken::new(),
                     forwarder: None,
                 }),
+                busy: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// True while a turn is in flight (its events are still streaming). Used by
+    /// the executor to decide whether an internal/system turn may run now or
+    /// must be deferred to avoid aborting a live turn.
+    pub fn is_busy(&self) -> bool {
+        self.inner.busy.load(Ordering::SeqCst)
     }
 
     /// Stable session id — used by the registry and as an event-stream key.
@@ -242,6 +256,8 @@ impl SessionHost {
                 let proto = convert::to_proto(evt, &inner_fwd.prompts);
                 inner_fwd.buffer.push(proto);
             }
+            // Turn fully streamed → session is idle again.
+            inner_fwd.busy.store(false, Ordering::SeqCst);
         });
 
         // Critical section: await prior forwarder's drain, install our turn
@@ -259,6 +275,9 @@ impl SessionHost {
             }
             state.cancel = cancel.clone();
             state.forwarder = Some(forwarder);
+            // Mark busy under the same lock that installs the turn, so a
+            // concurrent `is_busy()` can't observe a half-installed state.
+            inner.busy.store(true, Ordering::SeqCst);
             inner.buffer.last_seq()
         };
 
@@ -604,6 +623,30 @@ mod tests {
             "expected terminal Error('cancelled'), got {:?}",
             last.kind
         );
+    }
+
+    #[tokio::test]
+    async fn is_busy_tracks_turn_lifecycle() {
+        // Real failure mode: if `busy` is never set (or cleared too early), the
+        // executor's internal-turn deferral can't tell a live turn from an idle
+        // session — and would either always interrupt or never defer.
+        let host = SessionHost::new(stub("s-busy", &["a", "b"], 50));
+        assert!(!host.is_busy(), "must be idle before any turn");
+
+        let mut rx = host.subscribe();
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(host.is_busy(), "must be busy while a turn is in flight");
+
+        drain_until_terminal(&mut rx).await;
+        // The forwarder clears `busy` after the terminal event drains — allow a
+        // few ticks for that task to run.
+        for _ in 0..100 {
+            if !host.is_busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!host.is_busy(), "must be idle again after the turn completes");
     }
 
     #[tokio::test]

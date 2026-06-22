@@ -66,6 +66,7 @@ impl ChatDispatcher for AgentDispatcher {
             session_key: admitted.session_key.clone(),
             text: admitted.dispatch_text.clone(),
             images: vec![],
+            kind: session_executor::TurnKind::User,
         };
 
         let receiver = match executor.start_turn(turn).await {

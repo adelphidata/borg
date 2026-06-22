@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use borgd::session::backend::{InlineImage, SessionBackend};
 use borgd::session::{SessionHost, SessionRegistry};
 use cortex::agent::AgentEvent;
-use gateway::session_executor::{InboundTurn, SessionExecutor};
+use gateway::session_executor::{InboundTurn, SessionExecutor, TurnKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -100,6 +100,7 @@ async fn start_turn_streams_deltas_then_turn_complete() {
             session_key: "alice:t1".into(),
             text: "ping".into(),
             images: vec![],
+            kind: TurnKind::User,
         })
         .await
         .expect("start_turn");
@@ -144,6 +145,7 @@ async fn cancel_aborts_in_flight_turn_promptly() {
             session_key: "bob:t1".into(),
             text: "go".into(),
             images: vec![],
+            kind: TurnKind::User,
         })
         .await
         .expect("start_turn");
@@ -194,6 +196,7 @@ async fn second_start_turn_reuses_existing_host() {
             session_key: "carol:t1".into(),
             text: "first".into(),
             images: vec![],
+            kind: TurnKind::User,
         })
         .await
         .expect("start_turn 1");
@@ -211,6 +214,7 @@ async fn second_start_turn_reuses_existing_host() {
             session_key: "carol:t1".into(),
             text: "second".into(),
             images: vec![],
+            kind: TurnKind::User,
         })
         .await
         .expect("start_turn 2");
@@ -219,6 +223,113 @@ async fn second_start_turn_reuses_existing_host() {
         registry.live_ids().len(),
         1,
         "registry must hold exactly one host for the session_key"
+    );
+}
+
+#[tokio::test]
+async fn internal_turn_does_not_interrupt_busy_user_turn() {
+    // Core invariant: an internal/system turn must NEVER abort a user's
+    // in-flight turn. Regression guard for the unconditional `cancel_turn()`
+    // that used to run for every inbound in DaemonSessionExecutor::start_turn.
+    let registry = registry_with_stub("dave:t1", vec!["a", "b", "c", "d"], 50);
+    let exec = executor(registry.clone());
+
+    let (mut user_rx, _c) = exec
+        .start_turn(InboundTurn {
+            session_key: "dave:t1".into(),
+            text: "work".into(),
+            images: vec![],
+            kind: TurnKind::User,
+        })
+        .await
+        .expect("user start_turn");
+
+    // Wait for the first delta so the turn is genuinely in flight (busy).
+    let first = tokio::time::timeout(Duration::from_secs(1), user_rx.recv())
+        .await
+        .expect("first delta in time")
+        .expect("a delta");
+    assert!(matches!(first, AgentEvent::TextDelta(_)));
+
+    // Fire an INTERNAL turn at the same session while it's busy.
+    let (mut internal_rx, _ic) = exec
+        .start_turn(InboundTurn {
+            session_key: "dave:t1".into(),
+            text: "heartbeat".into(),
+            images: vec![],
+            kind: TurnKind::Internal,
+        })
+        .await
+        .expect("internal start_turn");
+
+    // Deferred: the internal stream closes immediately with no events.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), internal_rx.recv())
+            .await
+            .expect("internal stream resolves promptly")
+            .is_none(),
+        "deferred internal turn must yield an empty, closed stream"
+    );
+
+    // The user turn must run to completion uninterrupted — no 'cancelled'.
+    let mut got_complete = false;
+    let mut cancelled = false;
+    while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(2), user_rx.recv()).await {
+        match evt {
+            AgentEvent::TurnComplete => {
+                got_complete = true;
+                break;
+            }
+            AgentEvent::Error(e) if e == "cancelled" => {
+                cancelled = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(!cancelled, "internal turn must not cancel the user turn");
+    assert!(got_complete, "user turn must complete normally");
+    assert_eq!(registry.live_ids().len(), 1, "no extra host created");
+}
+
+#[tokio::test]
+async fn user_turn_still_replaces_busy_user_turn() {
+    // Contrast to the internal case: a new USER message preserves today's
+    // "latest message wins" semantics and cancels the prior in-flight turn.
+    let registry = registry_with_stub("erin:t1", vec!["a", "b", "c", "d"], 50);
+    let exec = executor(registry);
+
+    let (mut rx1, _c) = exec
+        .start_turn(InboundTurn {
+            session_key: "erin:t1".into(),
+            text: "first".into(),
+            images: vec![],
+            kind: TurnKind::User,
+        })
+        .await
+        .expect("first start_turn");
+    let _ = tokio::time::timeout(Duration::from_secs(1), rx1.recv()).await;
+
+    let (_rx2, _c2) = exec
+        .start_turn(InboundTurn {
+            session_key: "erin:t1".into(),
+            text: "second".into(),
+            images: vec![],
+            kind: TurnKind::User,
+        })
+        .await
+        .expect("second start_turn");
+
+    let mut saw_cancel = false;
+    while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(2), rx1.recv()).await {
+        if matches!(&evt, AgentEvent::Error(e) if e == "cancelled") {
+            saw_cancel = true;
+            break;
+        }
+    }
+    assert!(
+        saw_cancel,
+        "a new user turn must cancel the prior in-flight turn"
     );
 }
 

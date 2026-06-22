@@ -7,7 +7,7 @@
 use crate::session::DaemonSessionExecutor;
 use cortex::agent::AgentEvent;
 use cortex::config::{CollaborationMode, Config};
-use gateway::{InboundTurn, SessionExecutor};
+use gateway::{InboundTurn, SessionExecutor, TurnKind};
 
 /// Run a quick agent turn to draft a greeting and deliver it. Fire-and-forget;
 /// errors are logged + the static fallback is sent.
@@ -84,6 +84,8 @@ async fn generate_and_deliver(
         session_key: session_key.clone(),
         text: prompt,
         images: Vec::new(),
+        // A greeting must never abort whatever the user is mid-conversation on.
+        kind: TurnKind::Internal,
     };
 
     let (mut rx, _cancel) = executor.start_turn(turn).await?;
