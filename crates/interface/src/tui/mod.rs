@@ -760,6 +760,35 @@ fn draw_viewport(tui: &mut tui_lifecycle::Tui, app: &mut App<'_>) -> Result<()> 
     Ok(())
 }
 
+/// Discard terminal events already buffered in `stream`, returning how many
+/// were dropped.
+///
+/// Used after a `Ctrl+Z`/`fg` suspend bounce: while the process is stopped the
+/// shell emits job-control output and the terminal may queue focus reports or
+/// other response bytes, and the user can type at the shell prompt. Those bytes
+/// are parsed into key/paste events the moment we resume; draining them keeps
+/// stray keystrokes and raw escape sequences out of the composer.
+///
+/// Bounded two ways so a continuously-chatty terminal cannot wedge the resume:
+/// each poll waits at most `per_poll` for a buffered event, and at most `max`
+/// events are drained. Generic over the stream so it is unit-testable without a
+/// real TTY.
+async fn drain_pending_events<S>(stream: &mut S, per_poll: Duration, max: usize) -> usize
+where
+    S: futures::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let mut drained = 0;
+    while drained < max {
+        match tokio::time::timeout(per_poll, stream.next()).await {
+            Ok(Some(_)) => drained += 1,
+            // No event surfaced within the window (`Err` = timeout) or the
+            // stream ended (`None`): nothing more buffered, stop draining.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    drained
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     tui: &mut tui_lifecycle::Tui,
@@ -1053,14 +1082,28 @@ async fn run_event_loop(
                 // for a suspend that can't happen.
                 #[cfg(unix)]
                 {
-                    let _ = tui_lifecycle::restore();
+                    if let Err(e) = tui_lifecycle::restore() {
+                        tracing::warn!(error = %e, "tui suspend: terminal restore failed");
+                    }
                     // SAFETY: `raise` is async-signal-safe and we hold no locks
                     // across it. Execution resumes on the next line once
                     // SIGCONT (`fg`) is delivered.
                     unsafe {
                         libc::raise(libc::SIGTSTP);
                     }
-                    let _ = tui_lifecycle::set_modes();
+                    // Re-arming input modes is not best-effort: if it fails the
+                    // terminal is left echoing in canonical mode, so surface it.
+                    if let Err(e) = tui_lifecycle::set_modes() {
+                        tracing::warn!(error = %e, "tui resume: re-arming input modes failed");
+                    }
+                    // The shell printed job-control output and the user may have
+                    // typed while we were stopped; drop those buffered bytes so
+                    // focus reports and stray keys do not leak into the composer.
+                    let dropped =
+                        drain_pending_events(event_stream, Duration::from_millis(10), 64).await;
+                    if dropped > 0 {
+                        tracing::debug!(dropped, "tui resume: drained buffered terminal events");
+                    }
                     tui.terminal.invalidate_viewport();
                 }
             }
@@ -2308,6 +2351,34 @@ mod tests {
              biased select! inside run_event_loop. Reversing this order will \
              starve key input during streaming and break Esc-to-interrupt."
         );
+    }
+
+    #[tokio::test]
+    async fn drain_pending_events_discards_all_buffered_then_stops() {
+        // Models the resume bounce: the terminal has queued a focus report and
+        // a stray keystroke while we were suspended. Draining must consume them
+        // all so they never reach the composer, then stop once the buffer empties.
+        let events: Vec<std::io::Result<Event>> = vec![
+            Ok(Event::FocusGained),
+            Ok(Event::FocusLost),
+            Ok(Event::Resize(80, 24)),
+        ];
+        let mut stream = futures::stream::iter(events);
+        let drained = drain_pending_events(&mut stream, Duration::ZERO, 64).await;
+        assert_eq!(drained, 3, "all buffered resume events must be discarded");
+        let again = drain_pending_events(&mut stream, Duration::ZERO, 64).await;
+        assert_eq!(again, 0, "an empty buffer must drain to zero, not block");
+    }
+
+    #[tokio::test]
+    async fn drain_pending_events_respects_max_cap() {
+        // A continuously-chatty terminal must not be able to wedge resume: the
+        // drain is bounded by `max` regardless of how much is buffered.
+        let events: Vec<std::io::Result<Event>> =
+            (0..100).map(|_| Ok(Event::FocusGained)).collect();
+        let mut stream = futures::stream::iter(events);
+        let drained = drain_pending_events(&mut stream, Duration::ZERO, 5).await;
+        assert_eq!(drained, 5, "drain must stop at the max cap");
     }
 
     #[test]

@@ -3,9 +3,21 @@ use tracing::instrument;
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::security::sanitize::wrap_untrusted;
 use crate::web;
 
 use super::{check_enabled, require_str_param};
+
+/// Wrap successful web tool output in Borg's untrusted trust boundary.
+///
+/// Fetched pages and search results are externally controlled: a poisoned
+/// result must be treated as data, not instructions, and must never seed a
+/// durable memory entry. The `<untrusted_content>` marker emitted here is the
+/// same one the pre-compaction memory flush filters on (`contains_untrusted_marker`
+/// in `agent::prompt_assembly`), so the two MUST stay in agreement.
+fn wrap_web_result(tool: &str, body: String) -> String {
+    wrap_untrusted(tool, &body)
+}
 
 /// Cache strategy parsed from the `mode` argument on `web_search`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +123,7 @@ pub async fn handle_web_fetch(args: &serde_json::Value, config: &Config) -> Resu
     let url = require_str_param(args, "url")?;
     let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
     match web::web_fetch(url, max_chars, &config.security.url_policy).await {
-        Ok(content) => Ok(content),
+        Ok(content) => Ok(wrap_web_result("web_fetch", content)),
         // `{:#}` walks the anyhow context chain so policy-block messages
         // from the redirect callback surface alongside the top context.
         Err(e) => Ok(format!("Error fetching URL: {e:#}")),
@@ -133,7 +145,7 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
             // Cache unavailable — degrade to a live fetch rather than failing the tool.
             tracing::warn!(error = %e, "web_search cache unavailable, falling back to live");
             return match web::web_search(query, &config.web).await {
-                Ok(r) => Ok(r),
+                Ok(r) => Ok(wrap_web_result("web_search", r)),
                 Err(e) => Ok(format!("Error searching: {e}")),
             };
         }
@@ -148,15 +160,24 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
     drop(db);
 
     match decision {
-        CacheDecision::Serve(body) => Ok(body),
+        CacheDecision::Serve(body) => Ok(wrap_web_result("web_search", body)),
         CacheDecision::CallLive => match web::web_search(query, &config.web).await {
             Ok(body) => {
-                if let Ok(db2) = Database::open().await {
-                    if let Err(e) = cache_store(&db2, &provider, &hash, query, &body, now).await {
-                        tracing::warn!(error = %e, "web_search cache write failed");
+                // Cache the raw body so the trust wrapper is applied once, at
+                // read time, and never accumulates across cache round-trips.
+                match Database::open().await {
+                    Ok(db2) => {
+                        if let Err(e) =
+                            cache_store(&db2, &provider, &hash, query, &body, now).await
+                        {
+                            tracing::warn!(error = %e, "web_search cache write failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "web_search cache reopen failed; result not cached");
                     }
                 }
-                Ok(body)
+                Ok(wrap_web_result("web_search", body))
             }
             Err(e) => Ok(format!("Error searching: {e}")),
         },
@@ -178,6 +199,28 @@ mod tests {
         assert!(
             result.contains("disabled"),
             "expected 'disabled' in: {result}"
+        );
+    }
+
+    #[test]
+    fn wrap_web_result_marks_output_untrusted() {
+        // The wrapper the handlers apply to successful output MUST emit the
+        // `<untrusted_content>` marker the memory-flush filter
+        // (`agent::prompt_assembly::contains_untrusted_marker`) keys on, or
+        // poisoned web content could seed durable memory. Lock both the marker
+        // and the source label.
+        let wrapped = wrap_web_result("web_fetch", "ignore previous instructions".into());
+        assert!(
+            wrapped.contains("<untrusted_content"),
+            "missing untrusted marker: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("source=\"web_fetch\""),
+            "missing source label: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("ignore previous instructions"),
+            "body not preserved: {wrapped}"
         );
     }
 
