@@ -2,6 +2,7 @@
 
 use crate::constants::{
     self, AUDIO_TOKEN_ESTIMATE_MIN, IMAGE_TOKEN_ESTIMATE, MESSAGE_ROLE_TOKEN_OVERHEAD,
+    TOOL_CALL_ENVELOPE_TOKEN_OVERHEAD,
 };
 use crate::memory::tokenizer::estimate_tokens;
 use crate::types::{ContentPart, Message, MessageContent};
@@ -42,7 +43,15 @@ pub(super) fn message_tokens(msg: &Message) -> usize {
         .map(|tcs| {
             tcs.iter()
                 .map(|tc| {
-                    estimate_tokens(&tc.function.name) + estimate_tokens(&tc.function.arguments)
+                    // Count the whole call, not just name + arguments: the `id` and
+                    // `type` field values plus the JSON envelope framing are real tokens
+                    // the model is billed for. Omitting them undercounts multi-call turns
+                    // and lets the protected tail blow past the budget before compaction.
+                    estimate_tokens(&tc.id)
+                        + estimate_tokens(&tc.call_type)
+                        + estimate_tokens(&tc.function.name)
+                        + estimate_tokens(&tc.function.arguments)
+                        + TOOL_CALL_ENVELOPE_TOKEN_OVERHEAD
                 })
                 .sum()
         })
@@ -108,6 +117,70 @@ mod tests {
         let tokens = message_tokens(&msg);
         // 4 overhead + tool name + args tokens
         assert!(tokens > 4, "should include overhead + tool call tokens");
+    }
+
+    /// Build an assistant message carrying a single tool call with explicit
+    /// id / type / arguments, so tests can probe which fields the estimator counts.
+    fn tool_call_with(id: &str, call_type: &str, name: &str, args: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                call_type: call_type.to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+        }
+    }
+
+    #[test]
+    fn tool_call_token_estimate_counts_envelope_not_just_name_and_args() {
+        // Two calls identical except for the `id` length. The model is billed for
+        // the id token(s), so a longer id MUST raise the estimate. The old estimator
+        // counted only name + arguments and would report these as equal — this test
+        // fails against that regression.
+        let short_id = tool_call_with("a", "function", "read_memory", "{}");
+        let long_id = tool_call_with(
+            "call_0123456789abcdef0123456789abcdef",
+            "function",
+            "read_memory",
+            "{}",
+        );
+        assert!(
+            message_tokens(&long_id) > message_tokens(&short_id),
+            "tool-call id must be counted toward the token estimate"
+        );
+
+        // The estimate must also clear the bare name+args+role floor by at least the
+        // envelope overhead, proving the structural framing is accounted for.
+        let name_arg_floor =
+            estimate_tokens("read_memory") + estimate_tokens("{}") + MESSAGE_ROLE_TOKEN_OVERHEAD;
+        assert!(
+            message_tokens(&short_id) >= name_arg_floor + TOOL_CALL_ENVELOPE_TOKEN_OVERHEAD,
+            "tool-call estimate must include the JSON envelope overhead"
+        );
+    }
+
+    #[test]
+    fn tool_call_token_estimate_scales_with_parallel_calls() {
+        // A turn that fans out N parallel tool calls must cost ~N× a single call's
+        // envelope, not a flat name+args sum. Three calls must exceed one.
+        let one = tool_call_with("id_aaaa", "function", "search_files", "{\"q\":\"x\"}");
+        let mut three = one.clone();
+        if let Some(calls) = three.tool_calls.as_mut() {
+            calls.push(calls[0].clone());
+            calls.push(calls[0].clone());
+        }
+        assert!(
+            message_tokens(&three) > message_tokens(&one) * 2,
+            "three parallel tool calls should cost well over twice a single call"
+        );
     }
 
     #[test]

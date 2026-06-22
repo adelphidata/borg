@@ -206,6 +206,12 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
     pub host_audit: bool,
+    /// Emit advisory `tracing::warn!` posture findings once at daemon startup
+    /// (running as root, weak SSH config, world-writable data dir). Warn-only —
+    /// never blocks boot. Default on (security-first); the heavier `borg doctor`
+    /// host audit remains the on-demand deep check.
+    #[serde(default = "default_startup_audit")]
+    pub startup_audit: bool,
     /// Strip detected secrets from agent-generated output before it reaches
     /// channels, the TUI transcript, or logs. Pairs with input-side detection
     /// (`secret_detection`); this is the output-side counterpart. Default true
@@ -264,6 +270,10 @@ fn default_output_redaction() -> bool {
     true
 }
 
+fn default_startup_audit() -> bool {
+    true
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +289,7 @@ impl Default for SecurityConfig {
             ],
             allowed_paths: Vec::new(),
             host_audit: true,
+            startup_audit: true,
             output_redaction: true,
             action_limits: crate::rate_guard::ActionLimits::default(),
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),

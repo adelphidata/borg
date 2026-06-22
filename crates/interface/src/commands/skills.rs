@@ -20,6 +20,12 @@ pub(crate) enum SkillsAction {
         /// Skill name
         name: String,
     },
+    /// Show which bundled skills you've modified on disk (no name), or diff one
+    /// bundled skill against your `~/.borg/skills/<name>/SKILL.md` copy.
+    Diff {
+        /// Skill name to diff; omit to list all modified bundled skills.
+        name: Option<String>,
+    },
 }
 
 pub(crate) async fn dispatch_skills(action: Option<SkillsAction>) -> Result<()> {
@@ -28,6 +34,63 @@ pub(crate) async fn dispatch_skills(action: Option<SkillsAction>) -> Result<()> 
         Some(SkillsAction::Show { name }) => run_show(&name).await,
         Some(SkillsAction::Enable { name }) => run_set_enabled(&name, true).await,
         Some(SkillsAction::Disable { name }) => run_set_enabled(&name, false).await,
+        Some(SkillsAction::Diff { name }) => run_diff(name.as_deref()).await,
+    }
+}
+
+/// `skills diff` — surface user modifications to bundled skills. With no name,
+/// lists every bundled skill the user has a local copy of and whether it
+/// diverges from the shipped baseline; with a name, prints a line-level diff.
+async fn run_diff(name: Option<&str>) -> Result<()> {
+    let dir = cortex::skills::skills_dir()?;
+    match name {
+        None => {
+            let overrides = cortex::skills::modified_bundled_skills(&dir);
+            if overrides.is_empty() {
+                println!(
+                    "No local copies of bundled skills found under {}.",
+                    dir.display()
+                );
+                return Ok(());
+            }
+            println!("{:24} STATUS", "NAME");
+            for o in &overrides {
+                let status = if o.modified { "modified" } else { "unchanged" };
+                println!("{:24} {status}", o.name);
+            }
+        }
+        Some(name) => {
+            let (bundled, user) =
+                cortex::skills::bundled_vs_user_skill(name, &dir).ok_or_else(|| {
+                    anyhow!(
+                        "no bundled skill '{name}' with a local copy at {}/{name}/SKILL.md",
+                        dir.display()
+                    )
+                })?;
+            if bundled.trim() == user.trim() {
+                println!("'{name}' matches the bundled version (no changes).");
+                return Ok(());
+            }
+            print_line_diff(bundled, &user);
+        }
+    }
+    Ok(())
+}
+
+/// Minimal, dependency-free line diff: `-` bundled-only, `+` user-only, ` ` common.
+fn print_line_diff(bundled: &str, user: &str) {
+    let user_lines: std::collections::HashSet<&str> = user.lines().collect();
+    let bundled_lines: std::collections::HashSet<&str> = bundled.lines().collect();
+    println!("--- bundled\n+++ user (~/.borg/skills)");
+    for line in bundled.lines() {
+        if !user_lines.contains(line) {
+            println!("-{line}");
+        }
+    }
+    for line in user.lines() {
+        if !bundled_lines.contains(line) {
+            println!("+{line}");
+        }
     }
 }
 

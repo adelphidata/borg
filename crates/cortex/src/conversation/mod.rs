@@ -22,9 +22,10 @@ mod tokens;
 mod truncation;
 
 pub use compaction::{
-    compact_history, compact_history_v2, compaction_checkpoint_range,
+    compact_history, compact_history_v2, compaction_checkpoint_range, effective_head_protection,
     extract_last_compaction_summary, plan_compaction, plan_compaction_v2, render_compaction_marker,
-    CompactionPlan, COMPACTION_MARKER_CLOSE, COMPACTION_MARKER_HEADING, COMPACTION_MARKER_OPEN,
+    reserve_output_budget, CompactionPlan, COMPACTION_MARKER_CLOSE, COMPACTION_MARKER_HEADING,
+    COMPACTION_MARKER_OPEN,
 };
 pub use event::{
     compute_session_event_hmac, events_from_rows, project_history, verify_session_chain,

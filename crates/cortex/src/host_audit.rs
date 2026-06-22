@@ -26,13 +26,13 @@ pub fn run_host_security_checks(checks: &mut Vec<DiagnosticCheck>) {
 /// requires root — running it as a normal user always fails and produces
 /// a permanent unactionable warning, so we skip it entirely off-root.
 #[cfg(unix)]
-fn is_effective_root() -> bool {
+pub(crate) fn is_effective_root() -> bool {
     // SAFETY: `geteuid` is async-signal-safe and has no preconditions.
     unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(not(unix))]
-fn is_effective_root() -> bool {
+pub(crate) fn is_effective_root() -> bool {
     false
 }
 
@@ -601,7 +601,7 @@ fn parse_listening_ports(output: &str) -> Vec<String> {
 /// Secure PermitRootLogin values that disable password-based root access.
 const SECURE_ROOT_LOGIN_VALUES: &[&str] = &["no", "without-password", "prohibit-password"];
 
-fn parse_ssh_config(content: &str) -> Vec<String> {
+pub(crate) fn parse_ssh_config(content: &str) -> Vec<String> {
     let mut issues = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();

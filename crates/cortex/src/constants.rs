@@ -512,6 +512,14 @@ pub const AUDIO_TOKEN_ESTIMATE_MIN: usize = 200;
 /// Bytes per token for audio content estimation.
 pub const AUDIO_BYTES_PER_TOKEN: usize = 16;
 
+/// Approximate token overhead per tool call for the JSON envelope that wraps
+/// each call (id, `"type":"function"`, and the surrounding `{}`/`":"` framing).
+/// The model pays for these structural tokens too, so a per-call estimate that
+/// counts only the function name and arguments undercounts multi-call turns and
+/// mis-times compaction. The `id`/`type` field *values* are counted separately
+/// against their actual contents; this constant covers only the framing.
+pub const TOOL_CALL_ENVELOPE_TOKEN_OVERHEAD: usize = 8;
+
 /// Token threshold below which tool results are not compacted.
 pub const TOOL_RESULT_COMPACT_THRESHOLD: usize = 20;
 

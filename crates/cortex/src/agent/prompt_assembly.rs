@@ -363,7 +363,9 @@ Rules:
     ) -> Result<()> {
         normalize_history(&mut self.history);
 
-        let max_hist = self.config.conversation.max_history_tokens;
+        // Reserve the model's output budget out of the context window so history
+        // can't grow until the provider has no room left to answer.
+        let max_hist = self.effective_history_budget();
 
         // Age-based degradation: progressively reduce old tool results
         if self.config.conversation.age_based_degradation {
@@ -453,18 +455,33 @@ Rules:
     ///
     /// Returns the number of messages dropped from the working view (0 = no-op).
     pub(super) async fn run_llm_compaction(&mut self, target: usize, llm: &LlmClient) -> usize {
-        let protect_first_n = self.config.conversation.protect_first_n;
         // Seed the iterative summary from the marker already in the working set
         // (itself a projection of the log) — no separate cached field to drift.
         let mut summary = extract_last_compaction_summary(&self.history);
-        // Capture the durable seq range *before* the fold mutates history.
-        let range = compaction_checkpoint_range(&self.history, target, protect_first_n);
+        // Decay head protection once a prior compaction summary exists. The first
+        // `protect_first_n` messages are protected only to keep the original user
+        // request and early framing intact through the *first* compaction; that
+        // content is then captured in the summary marker itself. Re-pinning those
+        // raw turns verbatim on every subsequent pass fossilizes them into every
+        // future window and starves the tail of budget, so once a summary exists
+        // the effective head protection drops to zero.
+        let effective_protect_first_n = crate::conversation::effective_head_protection(
+            self.config.conversation.protect_first_n,
+            summary.is_some(),
+        );
+        // Capture the durable seq range *before* the fold mutates history. Uses the
+        // decayed head so the recorded checkpoint range matches what the fold did.
+        let range = compaction_checkpoint_range(&self.history, target, effective_protect_first_n);
 
-        let head_protected_dropped = if protect_first_n > 0 {
+        // Stay on the head-protected v2 path whenever the feature is configured —
+        // even when protection has *decayed* to 0 — so the iterative summary fold
+        // and durable checkpoint keep chaining. Only a user who disabled head
+        // protection entirely (configured 0) takes the legacy path.
+        let head_protected_dropped = if self.config.conversation.protect_first_n > 0 {
             compact_history_v2(
                 &mut self.history,
                 target,
-                protect_first_n,
+                effective_protect_first_n,
                 &mut summary,
                 llm,
             )
@@ -559,6 +576,19 @@ Rules:
     /// model registry; falls back to `DEFAULT_CONTEXT_WINDOW` for unknown models.
     pub(super) fn active_context_window(&self) -> u32 {
         crate::llm::model_registry::context_window_for(&self.config.llm.model)
+    }
+
+    /// Working-history token budget with the model's output reservation carved
+    /// out of the context window. Clamps the configured `max_history_tokens` so a
+    /// large `llm.max_tokens` (output cap) can't let history grow until the
+    /// provider rejects the request for lack of response room. See
+    /// [`crate::conversation::reserve_output_budget`].
+    pub(super) fn effective_history_budget(&self) -> usize {
+        crate::conversation::reserve_output_budget(
+            self.config.conversation.max_history_tokens,
+            self.active_context_window() as usize,
+            self.config.llm.max_tokens as usize,
+        )
     }
 
     /// Emit a per-session toast/log warning when the skill budget had to drop

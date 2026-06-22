@@ -147,6 +147,12 @@ pub struct ProcessEntry {
     pub session_id: Option<String>,
     /// Unix seconds at register time.
     pub started_at: i64,
+    /// Kernel process start-time fingerprint captured at register time, used to
+    /// detect PID reuse before we signal. `None` when the platform can't
+    /// provide it (the kill path then falls back to liveness-only behavior).
+    /// `#[serde(default)]` so snapshots from older daemons still deserialize.
+    #[serde(default)]
+    pub start_fingerprint: Option<u64>,
     /// Unix seconds when the entry transitioned out of `Running`.
     pub finished_at: Option<i64>,
     /// Exit code captured on `complete()`; `None` for non-`Exited`
@@ -195,6 +201,9 @@ pub struct AutoReapReport {
     pub exempted_by_kind: usize,
     pub exempted_by_pattern: usize,
     pub exempted_by_pin: usize,
+    /// Entries whose PID was recycled to a different process before the sweep
+    /// could signal it — skipped to avoid killing an unrelated bystander.
+    pub recycled_skipped: usize,
 }
 
 impl AutoReapReport {
@@ -314,6 +323,7 @@ impl ProcessRegistry {
             command: cmd_trunc,
             session_id,
             started_at: now,
+            start_fingerprint: pid_start_fingerprint(pid),
             finished_at: None,
             exit_code: None,
             status: ProcessStatus::Running,
@@ -435,7 +445,11 @@ impl ProcessRegistry {
         let mut reaped_norm: Vec<String> = Vec::with_capacity(to_kill.len());
         for entry in to_kill {
             reaped_norm.push(normalize_command(&entry.command));
-            let outcome = send_term_then_kill(entry.pid, policy.sigterm_grace_secs);
+            let outcome = send_term_then_kill(
+                entry.pid,
+                policy.sigterm_grace_secs,
+                entry.start_fingerprint,
+            );
             let finished = finalize_killed(self, entry.id, now);
             if let Some(mut f) = finished {
                 match outcome {
@@ -452,6 +466,18 @@ impl ProcessRegistry {
                         // PID); mark Dead so the sweep still cleans it up.
                         f.status = ProcessStatus::Dead;
                         report.killed.push(f);
+                    }
+                    KillOutcome::Recycled => {
+                        // PID belonged to a different process — we signaled
+                        // nothing. Drop our stale entry as Dead and count it so
+                        // the sweep is honest about what it did (and didn't) do.
+                        tracing::warn!(
+                            pid = entry.pid,
+                            id = entry.id,
+                            "process_registry: PID recycled before reap; skipped kill"
+                        );
+                        f.status = ProcessStatus::Dead;
+                        report.recycled_skipped += 1;
                     }
                 }
             }
@@ -649,6 +675,71 @@ enum KillOutcome {
     TermSufficed,
     NeededKill,
     SignalFailed,
+    /// The PID was recycled to a different process before we signaled — we
+    /// refused to signal it. Our registered process is gone.
+    Recycled,
+}
+
+/// A kernel-provided process start-time fingerprint used to detect PID reuse:
+/// if the same PID later reports a different start time, it is a *different*
+/// process that happens to have inherited the number, and must not be signaled.
+///
+/// Returns `None` when the platform/kernel can't supply it; callers treat
+/// `None` as "can't prove reuse" and fall back to liveness-only behavior rather
+/// than skipping a real kill.
+#[cfg(target_os = "linux")]
+fn pid_start_fingerprint(pid: u32) -> Option<u64> {
+    // `/proc/<pid>/stat` field 22 (`starttime`) is the process start time in
+    // clock ticks since boot — stable for the life of the process, and fresh on
+    // reuse. The `comm` field (2nd) can contain spaces and parentheses, so split
+    // after the final ')': what remains starts at field 3 (state), making
+    // `starttime` the 20th whitespace token (index 19).
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn pid_start_fingerprint(pid: u32) -> Option<u64> {
+    use std::mem::{size_of, MaybeUninit};
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: pure FFI. `info` is a correctly-sized, zeroed `proc_bsdinfo`
+    // buffer; `proc_pidinfo` writes at most `size` bytes into it and returns the
+    // number of bytes written (== size on success, 0/-1 on failure).
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled the whole struct (checked above).
+    let info = unsafe { info.assume_init() };
+    // The start time (seconds + microseconds) uniquely fingerprints this PID
+    // instance; combine both components so two processes started in the same
+    // second still differ.
+    Some((info.pbi_start_tvsec << 20) ^ info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pid_start_fingerprint(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// True if `pid` still refers to the same process instance we registered.
+/// Conservative: when either fingerprint is unavailable we return `true` —
+/// inability to prove reuse must not cause us to skip a legitimate kill.
+fn pid_identity_matches(pid: u32, registered: Option<u64>) -> bool {
+    match (registered, pid_start_fingerprint(pid)) {
+        (Some(reg), Some(current)) => reg == current,
+        _ => true,
+    }
 }
 
 #[cfg(unix)]
@@ -674,9 +765,15 @@ fn pid_alive(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
+fn send_term_then_kill(pid: u32, grace_secs: u64, fingerprint: Option<u64>) -> KillOutcome {
     if pid == 0 {
         return KillOutcome::SignalFailed;
+    }
+    // Re-validate identity immediately before SIGTERM: between registration and
+    // this sweep the process may have exited and its PID been recycled to an
+    // unrelated process. Signaling that would be killing a bystander.
+    if !pid_identity_matches(pid, fingerprint) {
+        return KillOutcome::Recycled;
     }
     // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
     let term = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
@@ -695,6 +792,12 @@ fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
     if !pid_alive(pid) {
         return KillOutcome::TermSufficed;
     }
+    // Re-validate once more before the hard SIGKILL. The grace window is exactly
+    // when our process could have exited and the PID been reused, so escalating
+    // to an unconditional SIGKILL here is the highest-risk recycle moment.
+    if !pid_identity_matches(pid, fingerprint) {
+        return KillOutcome::Recycled;
+    }
     // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
     let kill = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     if kill != 0 && pid_alive(pid) {
@@ -704,7 +807,7 @@ fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
 }
 
 #[cfg(not(unix))]
-fn send_term_then_kill(_pid: u32, _grace_secs: u64) -> KillOutcome {
+fn send_term_then_kill(_pid: u32, _grace_secs: u64, _fingerprint: Option<u64>) -> KillOutcome {
     KillOutcome::SignalFailed
 }
 
@@ -737,6 +840,15 @@ mod tests {
         let mut inner = reg.lock();
         if let Some(e) = inner.running.get_mut(&id) {
             e.started_at = when;
+        }
+    }
+
+    /// Backdoor to simulate PID recycling: overwrite the registered start-time
+    /// fingerprint so it no longer matches the live process at that PID.
+    fn force_fingerprint(reg: &ProcessRegistry, id: u64, fp: Option<u64>) {
+        let mut inner = reg.lock();
+        if let Some(e) = inner.running.get_mut(&id) {
+            e.start_fingerprint = fp;
         }
     }
 
@@ -1024,6 +1136,71 @@ mod tests {
             // is a no-op.
             drop(g);
         }
+    }
+
+    #[test]
+    fn auto_reap_skips_recycled_pid_and_spares_the_bystander() {
+        // A registered process whose PID has been recycled to a *different*
+        // process must NOT be signaled. We simulate the recycle by corrupting
+        // the stored start-time fingerprint so it can't match the live process,
+        // then assert the real process survives the sweep.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::process::{Command, Stdio};
+            let reg = ProcessRegistry::new();
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 99")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn sh");
+            let pid = child.id();
+            // Sanity: the platform must actually produce a fingerprint, else the
+            // guard can't engage and the test would be vacuous.
+            assert!(
+                pid_start_fingerprint(pid).is_some(),
+                "platform must supply a start-time fingerprint for this test to be meaningful"
+            );
+            let g = reg.register(pid, ProcessKind::RunShell, "sleep 99", None);
+            force_started_at(&reg, g.id(), unix_now() - 999_999);
+            // Stamp a fingerprint that cannot match the live process → "recycled".
+            force_fingerprint(&reg, g.id(), Some(0xDEAD_BEEF_DEAD_BEEF));
+
+            let policy = AutoReapPolicy {
+                max_age_secs: 60,
+                never_kill_patterns: vec![],
+                sigterm_grace_secs: 2,
+            };
+            let rep = reg.auto_reap(unix_now(), &policy);
+
+            assert_eq!(
+                rep.recycled_skipped, 1,
+                "recycle must be detected and counted"
+            );
+            assert_eq!(
+                rep.killed_count(),
+                0,
+                "no process may be killed on a recycle"
+            );
+            assert!(
+                pid_alive(pid),
+                "the bystander process must survive a recycled-PID sweep"
+            );
+
+            // Clean up the real child ourselves.
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(g);
+        }
+    }
+
+    #[test]
+    fn pid_identity_matches_falls_back_to_true_without_fingerprints() {
+        // When the registered fingerprint is unknown we cannot prove reuse, so
+        // we must NOT skip a legitimate kill — identity check returns true.
+        assert!(pid_identity_matches(99999, None));
     }
 
     #[test]

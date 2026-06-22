@@ -130,6 +130,14 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Loaded once in `main` and threaded through `cfg` — no second DB decrypt.
     let initial_core_config = cfg.core_config.clone();
+
+    // Startup security posture audit — advisory warn-on-load (running as root,
+    // weak SSH config, world-writable data dir). Never blocks boot; gated by
+    // `security.startup_audit`. The on-demand `borg doctor` host audit remains
+    // the deep check.
+    if initial_core_config.security.startup_audit {
+        cortex::security::startup_audit::log_startup_posture(&cfg.borg_home);
+    }
     let config_watcher =
         ConfigWatcher::start(initial_core_config.clone()).context("start config watcher")?;
     // Real instruments when `telemetry.metrics_enabled` (bound to the global

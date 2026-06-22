@@ -8,4 +8,5 @@ pub mod sanitize;
 pub mod secrets;
 pub mod secrets_resolve;
 pub mod skill;
+pub mod startup_audit;
 pub mod validation;

@@ -158,6 +158,55 @@ fn bundled_skill_content(name: &str) -> Option<&'static str> {
         .find_map(|(skill_name, content)| (*skill_name == name).then_some(*content))
 }
 
+/// A bundled skill the user has shadowed with an on-disk copy under
+/// `~/.borg/skills/<name>/SKILL.md`, and whether that copy diverges from the
+/// compiled-in baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundledSkillOverride {
+    /// Skill name (matches a `BUNDLED_SKILLS` entry).
+    pub name: String,
+    /// True when the user's `SKILL.md` differs from the bundled version.
+    pub modified: bool,
+}
+
+/// Compare two `SKILL.md` bodies ignoring leading/trailing whitespace so a
+/// stray trailing newline from an editor doesn't read as a modification.
+fn skill_bodies_differ(a: &str, b: &str) -> bool {
+    a.trim() != b.trim()
+}
+
+/// Return the bundled and user-on-disk copies of a bundled skill, if the user
+/// has a copy at `skills_dir/<name>/SKILL.md`. `None` when `name` is not a
+/// bundled skill or the user has no copy. Used by `borg skills diff <name>`.
+pub fn bundled_vs_user_skill(
+    name: &str,
+    skills_dir: &std::path::Path,
+) -> Option<(&'static str, String)> {
+    let bundled = bundled_skill_content(name)?;
+    let user = std::fs::read_to_string(skills_dir.join(name).join("SKILL.md")).ok()?;
+    Some((bundled, user))
+}
+
+/// Scan `skills_dir` for user copies of bundled skills and report which diverge
+/// from the compiled-in baseline. Only names present in `BUNDLED_SKILLS` are
+/// considered — a purely custom user skill has no baseline to diff against and
+/// is skipped. A missing/unreadable skills dir yields an empty list, not an
+/// error, so fresh installs don't error out.
+pub fn modified_bundled_skills(skills_dir: &std::path::Path) -> Vec<BundledSkillOverride> {
+    let mut out = Vec::new();
+    for (name, bundled) in BUNDLED_SKILLS {
+        let path = skills_dir.join(name).join("SKILL.md");
+        let Ok(user_content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.push(BundledSkillOverride {
+            name: (*name).to_string(),
+            modified: skill_bodies_differ(&user_content, bundled),
+        });
+    }
+    out
+}
+
 /// Skills that cannot be disabled — always loaded regardless of user config.
 /// Use sparingly: only for skills that teach core agent capabilities whose
 /// tools are always present (e.g. `scheduler` teaches the always-available

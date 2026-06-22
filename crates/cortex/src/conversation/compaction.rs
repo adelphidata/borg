@@ -51,6 +51,51 @@ pub struct CompactionPlan {
     pub tail_start: usize,
 }
 
+/// Reserve the model's output-token budget out of the context window when
+/// sizing the working history.
+///
+/// The prompt (system + tools + history) and the generated response share one
+/// context window, so the usable *input* budget is
+/// `context_window - output_reservation`. A history budget configured larger than
+/// that lets the conversation grow until the provider rejects the request for
+/// lack of room to answer — compaction never fires because the threshold was
+/// computed against the full window. This clamps the configured history budget to
+/// the usable input budget so compaction triggers early enough to leave the
+/// reserved output space.
+///
+/// Floored at a quarter of the window so a pathological config
+/// (`output_reservation >= context_window`) still leaves room to make progress
+/// rather than collapsing the budget to zero.
+pub fn reserve_output_budget(
+    configured_history_budget: usize,
+    context_window: usize,
+    output_reservation: usize,
+) -> usize {
+    let usable = context_window
+        .saturating_sub(output_reservation)
+        .max(context_window / 4);
+    configured_history_budget.min(usable)
+}
+
+/// Decay head protection across repeated compactions.
+///
+/// `protect_first_n` keeps the original user request and early framing verbatim
+/// through the *first* compaction; that content is then captured in the
+/// compaction summary marker. Re-pinning those raw turns on every later pass
+/// fossilizes them into every future window and starves the tail of budget, so
+/// once a prior summary exists the effective head protection decays to zero.
+///
+/// `has_prior_summary` is the durable signal a compaction already ran (the
+/// summary marker is itself a projection of the session log, so there is no
+/// separate counter to drift).
+pub fn effective_head_protection(protect_first_n: usize, has_prior_summary: bool) -> usize {
+    if has_prior_summary {
+        0
+    } else {
+        protect_first_n
+    }
+}
+
 /// Determine which messages need to be dropped for compaction.
 /// Returns `Some(keep_from_index)` if compaction is needed, `None` otherwise.
 pub fn plan_compaction(history: &[Message], max_tokens: usize) -> Option<usize> {
@@ -544,6 +589,76 @@ mod tests {
             "{COMPACTION_MARKER_HEADING}\n\nsome text that looks like a summary but has no fence"
         ))];
         assert!(extract_last_compaction_summary(&history).is_none());
+    }
+
+    // -- reserve_output_budget --
+
+    #[test]
+    fn reserve_output_budget_clamps_when_output_eats_the_window() {
+        // 200k window, 64k reserved for output → usable input is 136k. A history
+        // budget configured above that must clamp down so compaction fires before
+        // the provider runs out of response room.
+        assert_eq!(reserve_output_budget(180_000, 200_000, 64_000), 136_000);
+    }
+
+    #[test]
+    fn reserve_output_budget_leaves_small_budgets_untouched() {
+        // A history budget that already fits under the usable window is returned
+        // unchanged — no behavior change in the common case.
+        assert_eq!(reserve_output_budget(100_000, 200_000, 16_000), 100_000);
+    }
+
+    #[test]
+    fn reserve_output_budget_floors_at_quarter_window_on_pathological_config() {
+        // Output reservation >= window would collapse usable input to zero; the
+        // floor keeps a quarter-window so compaction can still make progress.
+        assert_eq!(reserve_output_budget(180_000, 200_000, 250_000), 50_000);
+    }
+
+    // -- effective_head_protection (decay) --
+
+    #[test]
+    fn head_protection_decays_after_first_compaction() {
+        // First compaction (no prior summary) honors the configured protection;
+        // every subsequent one (summary exists) decays it to zero so the early
+        // turns stop being re-pinned verbatim.
+        assert_eq!(effective_head_protection(4, false), 4);
+        assert_eq!(effective_head_protection(4, true), 0);
+    }
+
+    #[test]
+    fn head_protection_decay_unpins_early_turns_on_second_pass() {
+        // Behavioral: an over-budget history is planned twice. On the first pass
+        // the head [0..protect) is kept verbatim; on a later pass (summary
+        // present) head protection decays, so the early turns become eligible for
+        // summarization instead of fossilizing into every future window.
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..40 {
+            history.push(make_user(&format!(
+                "user turn number {i} with some filler text"
+            )));
+            history.push(make_assistant(&"assistant reply ".repeat(8)));
+        }
+        let protect = 4;
+        let budget = 400;
+
+        let first = effective_head_protection(protect, false);
+        let plan_first = plan_compaction_v2(&history, budget, first).expect("first compaction");
+        assert_eq!(
+            plan_first.head_end, protect,
+            "first pass pins the early turns"
+        );
+
+        let later = effective_head_protection(protect, true);
+        let plan_later = plan_compaction_v2(&history, budget, later).expect("later compaction");
+        assert_eq!(
+            plan_later.head_end, 0,
+            "later pass no longer pins early turns"
+        );
+        assert!(
+            plan_later.head_end < plan_first.head_end,
+            "head protection must decay so early turns stop fossilizing"
+        );
     }
 
     // -- plan_compaction --

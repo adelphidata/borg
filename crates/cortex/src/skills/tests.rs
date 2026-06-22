@@ -1928,3 +1928,58 @@ fn user_skill_flagged_injection_wrapped() {
         crate::security::sanitize::ThreatLevel::Flagged { .. }
     ));
 }
+
+#[test]
+fn modified_bundled_skills_flags_only_divergent_user_copies() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path();
+    // A real bundled skill and its compiled-in baseline.
+    let (name, bundled) = BUNDLED_SKILLS[0];
+
+    // No user copies under the dir → nothing to report.
+    assert!(modified_bundled_skills(dir).is_empty());
+
+    // An identical user copy is detected as an override but NOT modified.
+    let skill_dir = dir.join(name);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), bundled).unwrap();
+    let found = modified_bundled_skills(dir);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].name, name);
+    assert!(
+        !found[0].modified,
+        "an identical copy must not be flagged as modified"
+    );
+
+    // Diverging the on-disk copy flips the flag.
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("{bundled}\n\nan operator-added line"),
+    )
+    .unwrap();
+    assert!(
+        modified_bundled_skills(dir)[0].modified,
+        "a divergent copy must be flagged as modified"
+    );
+
+    // A purely custom skill (no bundled baseline) is skipped entirely.
+    let custom = dir.join("totally-custom-skill-xyz");
+    std::fs::create_dir_all(&custom).unwrap();
+    std::fs::write(custom.join("SKILL.md"), "custom body").unwrap();
+    assert!(
+        !modified_bundled_skills(dir)
+            .iter()
+            .any(|o| o.name == "totally-custom-skill-xyz"),
+        "custom skills have no bundled baseline and must not appear"
+    );
+}
+
+#[test]
+fn bundled_vs_user_skill_returns_none_without_local_copy() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (name, _) = BUNDLED_SKILLS[0];
+    // No local copy → None even though the name is a real bundled skill.
+    assert!(bundled_vs_user_skill(name, tmp.path()).is_none());
+    // A non-bundled name → None regardless of disk state.
+    assert!(bundled_vs_user_skill("no-such-bundled-skill", tmp.path()).is_none());
+}

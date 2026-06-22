@@ -108,6 +108,7 @@ define_settings! {
         // ── Security ──
         "security.secret_detection" => security.secret_detection, parsed(bool);
         "security.host_audit" => security.host_audit, parsed(bool);
+        "security.startup_audit" => security.startup_audit, parsed(bool);
         "security.output_redaction" => security.output_redaction, parsed(bool);
         "security.blocked_paths" => security.blocked_paths, json;
         "security.allowed_paths" => security.allowed_paths, json;
@@ -829,6 +830,7 @@ define_settings! {
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
         "security.secret_detection" => "Secret detection", Bool, "Security";
+        "security.startup_audit" => "Startup posture audit", Bool, "Security";
         "security.output_redaction" => "Output redaction", Bool, "Security";
         "security.verifier" => "mTLS verifier", Select, "Security";
 

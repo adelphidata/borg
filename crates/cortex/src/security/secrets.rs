@@ -53,6 +53,23 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             "Database Connection String",
             false,
         ),
+        // HTTP auth headers. capture_only=true masks only the credential value and
+        // keeps the header name + scheme word visible for debuggability, e.g.
+        // `Authorization: Bearer [REDACTED Authorization Header]`. Covers the common
+        // schemes (Bearer/Basic/Digest/token); opaque no-scheme values are left alone
+        // to avoid clobbering the scheme word on a second pass.
+        (
+            r"(?i)authorization\s*:\s*(?:bearer|basic|digest|token)\s+(\S{4,})",
+            "Authorization Header",
+            true,
+        ),
+        // Opaque API-key headers (`x-api-key:`, `api-key:`, `apikey:`) carry the secret
+        // directly after the colon.
+        (
+            r"(?i)(?:x-api-key|api[-_]?key)\s*:\s*(\S{4,})",
+            "API Key Header",
+            true,
+        ),
         // Generic assignment patterns — run last so specific patterns above take priority.
         // capture_only=true: only the captured value (group 1) is replaced, preserving the
         // variable name prefix so the surrounding text remains readable.
@@ -172,6 +189,8 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     r#"password="super-secret-shh""#,
     "password=hunter2trustno1",
     "postgresql://user:hunter2pw@localhost:5432/mydb",
+    "Authorization: Bearer abcDEF123456ghiJKL789",
+    "x-api-key: AbCdEf0123456789TokenValue",
     "API_KEY=AbCdEf0123456789TokenValue",
 ];
 
@@ -196,6 +215,63 @@ mod tests {
             !result.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
             "raw token must not survive redaction: {result}"
         );
+    }
+
+    #[test]
+    fn redacts_authorization_bearer_keeps_scheme() {
+        let input = "Authorization: Bearer abcDEF123456ghiJKL789";
+        let result = redact_secrets(input);
+        assert!(
+            result.contains("[REDACTED Authorization Header]"),
+            "token must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("abcDEF123456ghiJKL789"),
+            "raw bearer token must not survive: {result}"
+        );
+        assert!(
+            result.contains("Authorization: Bearer "),
+            "scheme word must stay visible for debuggability: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_authorization_basic_and_token_schemes() {
+        for scheme in ["Basic", "Digest", "token"] {
+            let input = format!("authorization: {scheme} c3VwZXJzZWNyZXR2YWx1ZQ==");
+            let result = redact_secrets(&input);
+            assert!(
+                result.contains("[REDACTED Authorization Header]"),
+                "{scheme} credential must be redacted: {result}"
+            );
+            assert!(
+                !result.contains("c3VwZXJzZWNyZXR2YWx1ZQ=="),
+                "{scheme} credential must not survive: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_x_api_key_header() {
+        for header in ["x-api-key", "X-Api-Key", "api-key", "apikey"] {
+            let input = format!("{header}: AbCdEf0123456789TokenValue");
+            let result = redact_secrets(&input);
+            assert!(
+                result.contains("[REDACTED API Key Header]"),
+                "{header} value must be redacted: {result}"
+            );
+            assert!(
+                !result.contains("AbCdEf0123456789TokenValue"),
+                "{header} value must not survive: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_redaction_does_not_touch_unrelated_text() {
+        // No over-blocking: a sentence merely mentioning authorization stays intact.
+        let input = "The user needs authorization to proceed with the request.";
+        assert_eq!(redact_secrets(input), input);
     }
 
     #[test]

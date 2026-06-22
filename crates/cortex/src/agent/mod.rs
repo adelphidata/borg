@@ -720,7 +720,7 @@ impl Agent {
             Ok(l) => l,
             Err(_) => return (before, before),
         };
-        let max_hist = self.config.conversation.max_history_tokens;
+        let max_hist = self.effective_history_budget();
         self.run_llm_compaction(max_hist, &llm).await;
         let after = history_tokens(&self.history);
         (before, after)
@@ -1530,7 +1530,7 @@ impl Agent {
     ) -> Result<()> {
         normalize_history(&mut self.history);
 
-        let max_hist = self.config.conversation.max_history_tokens;
+        let max_hist = self.effective_history_budget();
         let target = (max_hist as f64 * 0.6) as usize;
         let before_tokens = history_tokens(&self.history);
         let pre_len = self.history.len();
