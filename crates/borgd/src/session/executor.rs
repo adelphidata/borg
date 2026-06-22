@@ -122,14 +122,28 @@ impl SessionExecutor for DaemonSessionExecutor {
                 // immediately-closed stream so the caller winds down cleanly
                 // without interrupting. The internal source re-fires on its own
                 // cadence (heartbeats tick again; greet sessions are never busy).
+                //
+                // The `is_busy()` gate is best-effort: it's a read outside the
+                // turn-state lock and the user's primary turns enter via gRPC
+                // `Send` (host.start_turn) directly, not through this executor.
+                // That's sufficient today because every internal turn runs on an
+                // isolated session key (`heartbeat:*`, `greet:*`) that no user
+                // turn shares. Race-free deferral on a *shared* session — and an
+                // explicit "deferred" outcome the caller can distinguish from
+                // "ran, produced nothing" — lands with async sub-agent re-entry.
                 if host.is_busy() {
                     tracing::debug!(
                         session_key = %turn.session_key,
                         "internal turn deferred: session busy — not interrupting in-flight turn"
                     );
+                    // Pre-cancelled token: there is no live turn behind it, so a
+                    // caller that calls `.cancel()`/`.cancelled()` sees an
+                    // already-finished turn rather than a token wired to nothing.
+                    let cancelled = CancellationToken::new();
+                    cancelled.cancel();
                     let (tx, rx) = mpsc::channel::<AgentEvent>(1);
                     drop(tx);
-                    return Ok((rx, CancellationToken::new()));
+                    return Ok((rx, cancelled));
                 }
                 // Idle: no cancel needed; fall through and run normally.
             }

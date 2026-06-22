@@ -256,7 +256,12 @@ impl SessionHost {
                 let proto = convert::to_proto(evt, &inner_fwd.prompts);
                 inner_fwd.buffer.push(proto);
             }
-            // Turn fully streamed → session is idle again.
+            // Turn fully streamed → session is idle again. This MUST remain the
+            // FINAL statement of the forwarder: the next turn's `start_turn`
+            // awaits this task (`prior.await`) before it sets `busy = true`, so
+            // anything appended after this store would let `prior.await` resolve
+            // while `busy` is momentarily stale — reopening a window where
+            // `is_busy()` wrongly reports idle during a live turn.
             inner_fwd.busy.store(false, Ordering::SeqCst);
         });
 

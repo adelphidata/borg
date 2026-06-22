@@ -103,7 +103,7 @@ pub fn resolved_memory_scopes(config: &Config) -> Vec<String> {
 /// Enforce the memory-entry size cap. Bails with a human-readable error
 /// if `projected_tokens` exceeds the reject threshold, logs a warning if
 /// it's between warn and reject, and otherwise is a no-op.
-fn enforce_memory_size(name: &str, scope: &str, projected_tokens: usize) -> Result<()> {
+pub(crate) fn enforce_memory_size(name: &str, scope: &str, projected_tokens: usize) -> Result<()> {
     if projected_tokens >= MEMORY_ENTRY_REJECT_TOKENS {
         anyhow::bail!(
             "memory entry '{name}' (scope {scope}) would be ~{projected_tokens} tokens, \

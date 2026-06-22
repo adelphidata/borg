@@ -6,13 +6,12 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::memory::embeddings;
 use crate::memory::mmr;
-use crate::constants::{MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
 use crate::memory::injection::scan_for_injection;
-use crate::memory::provider::{self, format_hits, write_guarded, MemCtx, SearchQuery};
+use crate::memory::provider::{self, format_hits, write_guarded, MemCtx, MemoryProvider, SearchQuery};
 use crate::memory::tokenizer::estimate_tokens;
 use crate::memory::{
-    delete_memory_db, read_memory_db, read_memory_db_or_not_found, resolved_memory_scopes,
-    search_knowledge_files, write_memory_db, WriteMode,
+    delete_memory_db, enforce_memory_size, read_memory_db, read_memory_db_or_not_found,
+    resolved_memory_scopes, search_knowledge_files, write_memory_db, WriteMode,
 };
 use crate::tool::write_memory::{MemoryOp, MemoryOpAction};
 
@@ -50,21 +49,27 @@ pub async fn handle_write_memory(args: &serde_json::Value, config: &Config) -> R
 }
 
 /// Apply a batch of memory operations in ONE call, atomically against the
-/// final per-entry token budget.
+/// per-entry token budget.
 ///
 /// Two phases, so a bad op leaves nothing written:
-/// 1. **Validate** — fold the ops per `(scope, entry)` into a final projected
-///    token count (seeded from the currently-stored size), run the injection
-///    scan on every add/replace payload, and reject the WHOLE batch if any
-///    resulting entry would exceed [`MEMORY_ENTRY_REJECT_TOKENS`].
+/// 1. **Validate** — *simulate* the exact apply sequence per `(scope, entry)`,
+///    in order: fold each op into the entry's projected final content (`None` =
+///    removed/absent), run the injection scan on every add/replace payload, and
+///    enforce the per-entry cap **after each op** via [`enforce_memory_size`].
+///    Because phase 2 applies ops one at a time and `write_memory_db` enforces
+///    the cap per op, checking only the *final* folded state would let an
+///    oversized *intermediate* op (e.g. a huge overwrite later shrunk by
+///    another op) slip through validation and then hard-bail mid-batch. The
+///    simulation predicts phase 2 exactly for the native store (the daemon is
+///    the single writer, so nothing interleaves between the phases).
 /// 2. **Apply** — replay the ops in order via the same primitives the single-op
 ///    path uses (`write_memory_db`/`delete_memory_db` native, or the provider
-///    trait for external stores).
+///    trait for external stores). Their per-op re-checks are a redundant
+///    backstop that, thanks to the simulation, won't diverge from phase 1.
 ///
-/// Phase 2 re-validates per op as a backstop; a transient store error there is
-/// surfaced (never silently swallowed), accepting that a mid-batch failure can
-/// leave earlier ops applied — the common rejections (cap, injection) are all
-/// caught in phase 1 before any write.
+/// External providers do their own append concatenation, so the projection is
+/// best-effort there (matching `write_guarded`'s own best-effort append cap);
+/// it is exact for the native store, the default.
 pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config) -> Result<String> {
     if ops.is_empty() {
         anyhow::bail!("write_memory: 'operations' array is empty");
@@ -74,12 +79,12 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
     let native = prov.name() == "native";
     let ctx = MemCtx::from_config(config);
 
-    // Projected post-batch token count per (scope, entry). `None` = the entry
-    // ends the batch removed/absent.
-    let mut projected: std::collections::HashMap<(String, String), Option<usize>> =
+    // Projected final content per (scope, entry). `None` = the entry ends the
+    // batch removed/absent.
+    let mut state: std::collections::HashMap<(String, String), Option<String>> =
         std::collections::HashMap::new();
 
-    // ── Phase 1: validate (no writes) ──
+    // ── Phase 1: validate by simulating the exact apply sequence (no writes) ──
     for (i, op) in ops.iter().enumerate() {
         let name = op.filename.strip_suffix(".md").unwrap_or(&op.filename);
         if name.is_empty() {
@@ -88,14 +93,9 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
         let scope = op.scope.as_deref().unwrap_or("global").to_string();
         let key = (scope, name.to_string());
 
-        if !projected.contains_key(&key) {
-            let current = current_entry_tokens(native, prov.as_ref(), &ctx, &key.0, name).await?;
-            projected.insert(key.clone(), current);
-        }
-
         match op.action {
             MemoryOpAction::Remove => {
-                projected.insert(key, None);
+                state.insert(key, None);
             }
             MemoryOpAction::Add | MemoryOpAction::Replace => {
                 let content = op.content.as_deref().ok_or_else(|| {
@@ -105,31 +105,23 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
                     )
                 })?;
                 scan_for_injection(content).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let existing = projected.get(&key).copied().flatten().unwrap_or(0);
-                let new_tokens = if op.append {
-                    existing + estimate_tokens(content)
+                let next = if op.append {
+                    // Seed the append base from the simulated state, or read the
+                    // store once for the entry's first touch (overwrite/remove
+                    // ops never read — they don't need the prior content).
+                    let base = match state.get(&key) {
+                        Some(simulated) => simulated.clone(),
+                        None => {
+                            current_entry_content(native, prov.as_ref(), &ctx, &key.0, name).await?
+                        }
+                    };
+                    append_join(base.as_deref(), content)
                 } else {
-                    estimate_tokens(content)
+                    content.to_string()
                 };
-                projected.insert(key, Some(new_tokens));
-            }
-        }
-    }
-
-    for ((scope, name), toks) in &projected {
-        if let Some(t) = toks {
-            if *t >= MEMORY_ENTRY_REJECT_TOKENS {
-                anyhow::bail!(
-                    "memory entry '{name}' (scope {scope}) would be ~{t} tokens, over the \
-                     {MEMORY_ENTRY_REJECT_TOKENS}-token cap. The batch was REJECTED — nothing was \
-                     written. Split into multiple topic entries."
-                );
-            }
-            if *t >= MEMORY_ENTRY_WARN_TOKENS {
-                tracing::warn!(
-                    "memory entry {scope}/{name} is ~{t} tokens — approaching \
-                     the {MEMORY_ENTRY_REJECT_TOKENS}-token cap; consider splitting"
-                );
+                enforce_memory_size(name, &key.0, estimate_tokens(&next))
+                    .map_err(|e| anyhow::anyhow!("{e} (batch rejected — nothing written)"))?;
+                state.insert(key, Some(next));
             }
         }
     }
@@ -172,7 +164,7 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
         }
     }
 
-    let entries = projected.len();
+    let entries = state.len();
     let body = format!(
         "Batch applied: {writes} write(s), {removals} removal(s) across {entries} \
          entr{}. Done — do not repeat this batch.",
@@ -181,23 +173,36 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
     Ok(prepend_fallback_notice(config, prov.name(), body))
 }
 
-/// Current stored token count for an entry, or `None` if it doesn't exist.
-async fn current_entry_tokens(
+/// Current stored content for an entry, or `None` if it doesn't exist.
+async fn current_entry_content(
     native: bool,
-    prov: &dyn provider::MemoryProvider,
+    prov: &dyn MemoryProvider,
     ctx: &MemCtx<'_>,
     scope: &str,
     name: &str,
-) -> Result<Option<usize>> {
-    let content = if native {
-        read_memory_db(name, scope).await?
+) -> Result<Option<String>> {
+    if native {
+        read_memory_db(name, scope).await
     } else {
-        prov.read(ctx, scope, name)
+        Ok(prov
+            .read(ctx, scope, name)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .map(|entry| entry.content)
-    };
-    Ok(content.as_deref().map(estimate_tokens))
+            .map(|entry| entry.content))
+    }
+}
+
+/// Replicate `Database::append_memory_entry`'s concatenation so phase-1
+/// projection tokenizes exactly what the native append will store: a `\n`
+/// separator unless the prior content already ends in a newline.
+fn append_join(prev: Option<&str>, content: &str) -> String {
+    match prev {
+        Some(prev) => {
+            let sep = if prev.ends_with('\n') { "" } else { "\n" };
+            format!("{prev}{sep}{content}")
+        }
+        None => content.to_string(),
+    }
 }
 
 pub async fn handle_read_memory(args: &serde_json::Value, config: &Config) -> Result<String> {
@@ -870,7 +875,11 @@ mod tests {
         )
         .await
         .expect_err("oversized batch must be rejected");
-        assert!(err.to_string().contains("REJECTED"), "got: {err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("cap") && err.to_lowercase().contains("rejected"),
+            "got: {err}"
+        );
         assert!(
             not_found(&cfg, "ok.md").await,
             "valid op must not be written when the batch is rejected"
@@ -897,6 +906,48 @@ mod tests {
         );
         assert!(not_found(&cfg, "clean.md").await);
         assert!(not_found(&cfg, "evil.md").await);
+
+        // Atomicity: an oversized INTERMEDIATE op (later shrunk by another op on
+        // the same entry) must still reject the whole batch. Checking only the
+        // final folded state would miss it and then hard-bail mid-apply.
+        let err = handle_write_memory_batch(
+            &[
+                op(MemoryOpAction::Replace, "mid.md", Some(&huge)),
+                op(MemoryOpAction::Replace, "mid.md", Some("small")),
+            ],
+            &cfg,
+        )
+        .await
+        .expect_err("oversized intermediate op must reject the batch");
+        assert!(err.to_string().contains("cap"), "got: {err}");
+        assert!(
+            not_found(&cfg, "mid.md").await,
+            "nothing may be written when an intermediate op is rejected"
+        );
+
+        // Append chaining within a single batch composes onto a fresh entry.
+        handle_write_memory_batch(
+            &[
+                op(MemoryOpAction::Add, "chain.md", Some("a")),
+                MemoryOp {
+                    action: MemoryOpAction::Add,
+                    filename: "chain.md".into(),
+                    content: Some("b".into()),
+                    append: true,
+                    scope: None,
+                },
+            ],
+            &cfg,
+        )
+        .await
+        .expect("append chain batch");
+        let chain = handle_read_memory(&serde_json::json!({"filename": "chain.md"}), &cfg)
+            .await
+            .unwrap();
+        assert!(
+            chain.contains('a') && chain.contains('b'),
+            "append chain must compose both pieces, got: {chain}"
+        );
 
         std::env::remove_var("BORG_DATA_DIR");
     }
