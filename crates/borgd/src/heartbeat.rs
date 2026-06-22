@@ -643,8 +643,20 @@ pub(crate) async fn run_scheduled_remediation_turn(
     user_msg: String,
     timeout_secs: u64,
 ) -> CollectOutcome {
+    let session_key = scheduled_session_key();
+    // Materialize the session under this exact id BEFORE the turn so
+    // `AgentBackend::new`'s `load_session(session_key)` succeeds and the
+    // agent's `meta.id` becomes `session_key` rather than a fresh random
+    // UUID. Without this the agent-created goal is stored under a random id
+    // and the budget / max-ticks / escalation queries below — which key on
+    // `session_key` — would never find it.
+    if let Err(e) = cortex::session::ensure_session_on_disk(&session_key) {
+        tracing::warn!(
+            "Heartbeat remediation: could not materialize session '{session_key}': {e}"
+        );
+    }
     let turn = InboundTurn {
-        session_key: scheduled_session_key(),
+        session_key,
         text: user_msg,
         images: Vec::new(),
     };
@@ -699,16 +711,22 @@ pub(crate) async fn handle_remediation_goal(config: &Config) -> RemediationFollo
 
     let max = config.heartbeat.remediation_max_ticks;
     match goal.status {
-        GoalStatus::Complete => {
+        // All terminal states: announce once, then delete the goal. Deleting
+        // (rather than leaving it Blocked) means the escalation can't re-fire
+        // every subsequent tick and the session frees up for an unrelated
+        // future remediation. Heartbeat goals are autonomous — the owner
+        // doesn't resume them via `/goal`; if the problem persists a later
+        // nudge re-attempts with a fresh goal.
+        GoalStatus::Complete
+        | GoalStatus::Blocked
+        | GoalStatus::UsageLimited
+        | GoalStatus::BudgetLimited => {
+            let followup = remediation_followup_for(goal.status, &goal.objective, 0, max);
             if let Err(e) = db.delete_goal(&session_key).await {
-                tracing::warn!("Heartbeat remediation: delete completed goal failed: {e}");
+                tracing::warn!("Heartbeat remediation: delete terminal goal failed: {e}");
             }
             clear_remediation_ticks(&db).await;
-            remediation_followup_for(GoalStatus::Complete, &goal.objective, 0, max)
-        }
-        GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::BudgetLimited => {
-            clear_remediation_ticks(&db).await;
-            remediation_followup_for(goal.status, &goal.objective, 0, max)
+            followup
         }
         GoalStatus::Paused => RemediationFollowup::Passthrough,
         GoalStatus::Active => {
@@ -718,20 +736,11 @@ pub(crate) async fn handle_remediation_goal(config: &Config) -> RemediationFollo
                 remediation_followup_for(GoalStatus::Active, &goal.objective, ticks, max);
             // An Announce on an Active goal means the max-ticks backstop tripped
             // — the goal keeps believing it can finish (or is stalled on an
-            // un-fixable error). Force it terminal so it can't churn forever.
+            // un-fixable error like a provider 401). Delete it so it can't churn
+            // forever; a future nudge can re-attempt fresh.
             if matches!(followup, RemediationFollowup::Announce(_)) {
-                if let Err(e) = db
-                    .update_goal(
-                        &session_key,
-                        cortex::db::GoalUpdate {
-                            status: Some(GoalStatus::Blocked),
-                            expected_goal_id: Some(goal.goal_id.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    tracing::warn!("Heartbeat remediation: force-block failed: {e}");
+                if let Err(e) = db.delete_goal(&session_key).await {
+                    tracing::warn!("Heartbeat remediation: delete stalled goal failed: {e}");
                 }
                 clear_remediation_ticks(&db).await;
             }

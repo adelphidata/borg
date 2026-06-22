@@ -67,6 +67,19 @@ impl Session {
         }
     }
 
+    /// Like [`Session::new`] but with a caller-chosen id instead of a random
+    /// UUID. For daemon subsystems that need a *deterministic, resumable*
+    /// session id (e.g. heartbeat remediation): state keyed on that id — the
+    /// per-session goal — is only findable if the agent's `meta.id` actually
+    /// equals the id, which requires `load_session(id)` to succeed, which
+    /// requires the on-disk session to carry this id. The id must pass
+    /// [`crate::security::validation::validate_session_id`] for `save` to work.
+    pub fn new_with_id(id: String) -> Self {
+        let mut session = Session::new();
+        session.meta.id = id;
+        session
+    }
+
     /// Persist this session to disk as JSON (atomic write via temp file).
     pub fn save(&self) -> Result<()> {
         let path = session_path(&self.meta.id)?;
@@ -111,6 +124,19 @@ impl Session {
             }
         }
     }
+}
+
+/// Ensure a session with id `id` exists on disk, creating an empty one if it
+/// doesn't. Idempotent: an existing session is left untouched (history
+/// preserved). Used by subsystems that need a stable, pre-known session id so
+/// `load_session(id)` succeeds on the first turn — without this,
+/// `AgentBackend::new` mints a random id and any state keyed on `id` (e.g. a
+/// goal) is never found again.
+pub fn ensure_session_on_disk(id: &str) -> Result<()> {
+    if Session::load(id).is_ok() {
+        return Ok(());
+    }
+    Session::new_with_id(id.to_string()).save()
 }
 
 /// Fork an existing session at `anchor_message_id`, creating a new session
@@ -238,6 +264,65 @@ mod tests {
         session.update_from_history(&messages);
         assert_eq!(session.meta.message_count, 1);
         assert_eq!(session.meta.title, "Hello, world!");
+    }
+
+    /// Regression guard for the heartbeat-remediation session↔goal binding:
+    /// `ensure_session_on_disk(id)` must persist a session whose `meta.id`
+    /// equals `id` (so `AgentBackend`'s `load_session(id)` adopts that id
+    /// instead of minting a random UUID — the bug that made goals keyed on
+    /// `id` unfindable), and must be idempotent (never clobber existing
+    /// history). Exercises a colon-bearing slug exactly like the real
+    /// `heartbeat:scheduled` key.
+    #[test]
+    fn ensure_session_on_disk_materializes_resumable_deterministic_id() {
+        use std::sync::{Mutex, OnceLock};
+        // Serialize within-module mutation of the process-global BORG_HOME.
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _serial = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os(crate::paths::BORG_HOME_ENV);
+        // SAFETY: env mutation is serialized by LOCK and restored below.
+        unsafe { std::env::set_var(crate::paths::BORG_HOME_ENV, tmp.path()) };
+
+        let id = "heartbeat:scheduled";
+        assert!(Session::load(id).is_err(), "precondition: no session yet");
+
+        ensure_session_on_disk(id).expect("ensure must create the session");
+        let loaded = Session::load(id).expect("session must exist after ensure");
+        assert_eq!(
+            loaded.meta.id, id,
+            "persisted meta.id must equal the requested id, or load_session would mint a random one"
+        );
+
+        // Idempotent: a second ensure must preserve existing history.
+        let mut populated = loaded;
+        populated.messages.push(Message {
+            role: Role::User,
+            content: Some(MessageContent::Text("remember me".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+        });
+        populated.save().expect("save populated session");
+        ensure_session_on_disk(id).expect("second ensure is a no-op");
+        assert_eq!(
+            Session::load(id).expect("still exists").messages.len(),
+            1,
+            "existing history must be preserved across a redundant ensure"
+        );
+
+        // SAFETY: restore prior env under the same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(crate::paths::BORG_HOME_ENV, v),
+                None => std::env::remove_var(crate::paths::BORG_HOME_ENV),
+            }
+        }
     }
 
     #[test]

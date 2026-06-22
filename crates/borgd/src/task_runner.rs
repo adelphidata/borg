@@ -981,8 +981,13 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             return;
         }
     }
+    // Dedup suppresses an identical repeat of the *previous* message — but an
+    // escalation/terminal announcement is an owner-must-see event, so
+    // force_deliver bypasses it. (Terminal goals are deleted after announcing,
+    // so a given escalation can't repeat tick-over-tick anyway.) The new hash
+    // is still persisted below so a later cheap check-in dedups against it.
     let new_hash = response_hash(&result_text);
-    if task.last_response_hash.as_deref() == Some(new_hash.as_str()) {
+    if !force_deliver && task.last_response_hash.as_deref() == Some(new_hash.as_str()) {
         record_heartbeat_silent(*run_id, duration_ms, "dedup_suppressed", task_name).await;
         publish_skip_event(started_unix, "dedup_suppressed");
         return;
