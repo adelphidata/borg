@@ -755,9 +755,9 @@ mod tests {
 
     #[test]
     fn flush_transcript_excludes_wrapped_web_tool_output() {
-        // Web tool output is wrapped by `tool_handlers::web::wrap_web_result`,
-        // which delegates to `security::sanitize::wrap_untrusted`. Build the
-        // exact wrapper that path emits and assert the flush filter drops it —
+        // Web tool output is wrapped by `tool_handlers::web` via
+        // `security::sanitize::wrap_untrusted`. Build the exact wrapper that
+        // path emits and assert the flush filter drops it —
         // this locks the cross-module contract so a relabel on either side
         // (web handler ↔ marker list) can't silently let fetched pages seed
         // durable memory.
