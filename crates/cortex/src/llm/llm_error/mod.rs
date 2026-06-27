@@ -9,7 +9,7 @@ mod retry;
 
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
-    body_indicates_context_overflow, body_indicates_expired_signature,
+    body_indicates_context_overflow, body_indicates_expired_credential,
     body_indicates_no_allowed_providers, body_mentions_model,
 };
 
@@ -226,19 +226,22 @@ pub(crate) fn classify_status(
             reason: FailoverReason::Overloaded,
         },
         401 if matches!(provider, Provider::Bedrock)
-            && body_indicates_expired_signature(body) =>
+            && body_indicates_expired_credential(body) =>
         {
-            // Amazon Bedrock answers 401 with "Signature expired" when AWS
-            // SigV4 credentials or a short-lived AWS_BEARER_TOKEN_BEDROCK have
-            // aged out. Borg cannot refresh an env-provided token in-process, so
-            // rotation won't recover — surface an actionable message and treat
-            // it as permanent so the pool retires the credential rather than
-            // spinning a doomed cooldown-and-retry loop.
+            // Amazon Bedrock answers 401 with "Signature expired" (or an
+            // expired STS token) when AWS credentials / a short-lived
+            // AWS_BEARER_TOKEN_BEDROCK have aged out. Borg cannot refresh an
+            // env-provided token in-process, so surface an actionable
+            // refresh-your-credentials message. Classify as `Auth` (not
+            // `AuthPermanent`): on 401 the pool retires the dead credential, so
+            // this still rotates to another AWS profile and, failing that, the
+            // `llm.fallback` chain — only surfacing this message once every
+            // option is exhausted. `AuthPermanent` would forfeit that failover.
             LlmError::Fatal {
                 source: anyhow::anyhow!(
                     "{provider} returned 401 (AWS credentials expired — refresh your AWS credentials, or replace/remove AWS_BEARER_TOKEN_BEDROCK, then restart borg): {safe}"
                 ),
-                reason: FailoverReason::AuthPermanent,
+                reason: FailoverReason::Auth,
             }
         }
         401 => {
@@ -443,20 +446,45 @@ mod tests {
     }
 
     #[test]
-    fn classify_401_bedrock_expired_signature_is_actionable_and_permanent() {
+    fn classify_401_bedrock_expired_signature_is_actionable_but_keeps_failover() {
         // Bedrock's "Signature expired" 401 means the AWS credential aged out.
-        // It must be permanent (no rotation spin) and carry a refresh-your-creds
-        // hint rather than the generic "auth error" message.
+        // It carries a refresh-your-creds hint, but stays `Auth` (not
+        // `AuthPermanent`) so the pool can retire the dead key and still rotate
+        // to another credential / the llm.fallback chain before giving up.
         let err = classify_status(
             reqwest::StatusCode::UNAUTHORIZED,
             "Signature expired: 20260625T000000Z is now earlier than ...",
             Provider::Bedrock,
         );
         assert!(!err.is_retryable());
-        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert!(
+            err.should_rotate_credential(),
+            "expired credential must still rotate to another key"
+        );
+        assert!(
+            err.should_fallback(),
+            "expired credential must not forfeit the llm.fallback chain"
+        );
         assert!(
             err.to_string().contains("refresh your AWS credentials"),
             "expired-signature 401 must surface a recovery hint; got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_401_bedrock_expired_sts_token_is_actionable() {
+        // STS session credentials report expiry with different wording than
+        // SigV4; it must still hit the actionable refresh-your-creds path.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "The security token included in the request is expired",
+            Provider::Bedrock,
+        );
+        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert!(
+            err.to_string().contains("refresh your AWS credentials"),
+            "expired STS token 401 must surface a recovery hint; got: {err}"
         );
     }
 

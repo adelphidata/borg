@@ -1,7 +1,7 @@
 use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::custom_commands::CustomCommand;
 use super::popup_utils;
@@ -318,10 +318,9 @@ impl CommandPopup {
         ) else {
             return;
         };
-        let popup_height = popup_area.height;
-        let max_visible = (popup_height - 2) as usize; // items that fit inside borders
-
-        frame.render_widget(Clear, popup_area);
+        // Codex-style borderless menu surface (tinted bg, inset padding).
+        let inner = popup_utils::render_menu_surface(frame, popup_area);
+        let max_visible = inner.height as usize; // items that fit inside the surface
 
         // Scroll the visible window to keep the selected item in view
         let scroll_offset = if self.selected >= max_visible {
@@ -370,13 +369,7 @@ impl CommandPopup {
             })
             .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::dim())
-            .title(" Commands ");
-
-        let paragraph = Paragraph::new(lines).block(block);
-        frame.render_widget(paragraph, popup_area);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 

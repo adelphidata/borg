@@ -878,16 +878,21 @@ async fn start_server(
                     sleep_startup_backoff(config.mcp.startup_retry_base_ms, attempt).await;
                     continue;
                 }
-                // OTEL-style transport_errors_total breakdown: kind labels the
-                // class of failure (DNS, TLS, IO, refused). The exact string
-                // comes from the underlying McpError Display impl, so the
-                // metrics layer can aggregate by the leading word.
+                // OTEL-style transport_errors_total breakdown: `kind` is the
+                // phase (open vs handshake) and `error_kind` is the structured
+                // McpError class (connect/auth/transport_closed/…), so the
+                // metrics layer can aggregate failures without grepping the
+                // free-text Display string. Mirrors the tool-exec audit row.
+                let error_kind = e
+                    .downcast_ref::<mcp::errors::McpError>()
+                    .map_or("unknown", mcp::errors::McpError::kind);
                 tracing::warn!(
                     target: "borg.mcp",
                     event = "transport_error",
                     server = %server_name,
                     transport = transport_label(&manifest.transport),
                     kind = "open",
+                    error_kind,
                     error = %e,
                     "mcp transport open failed",
                 );
@@ -909,6 +914,7 @@ async fn start_server(
                     server = %server_name,
                     transport = transport_label(&manifest.transport),
                     kind = "handshake",
+                    error_kind = e.kind(),
                     error = %e,
                     "mcp handshake/discovery failed",
                 );

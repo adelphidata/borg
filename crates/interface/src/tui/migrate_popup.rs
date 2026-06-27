@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use cortex::config::Config;
 use cortex::migrate::{self, MigrationCategories, MigrationPlan, MigrationSource, SourceData};
@@ -273,8 +273,6 @@ impl MigratePopup {
         let y = (area.height.saturating_sub(popup_height)) / 2;
         let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-        frame.render_widget(Clear, popup_area);
-
         let phase_label = match self.phase {
             MigratePhase::SourceSelection => "Source",
             MigratePhase::Categories => "Categories",
@@ -282,12 +280,11 @@ impl MigratePopup {
             MigratePhase::Confirm => "Confirm",
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::dim())
-            .title(format!(" Migrate > {phase_label} "));
-        let inner = block.inner(popup_area);
-        frame.render_widget(block, popup_area);
+        let inner = super::popup_utils::render_popup_frame(
+            frame,
+            popup_area,
+            &format!("Migrate › {phase_label}"),
+        );
 
         let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 

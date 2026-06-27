@@ -2390,7 +2390,7 @@ mod tests {
                 args_json: None,
                 collapsed: false,
             },
-            HistoryCell::Separator,
+            HistoryCell::Separator { label: None },
             HistoryCell::User {
                 text: "".to_string(), // empty — should be skipped
             },

@@ -393,8 +393,13 @@ pub enum HistoryCell {
     MentionCard {
         label: String,
     },
-    #[allow(dead_code)]
-    Separator,
+    /// Turn divider rendered as a full-width dim rule. When `label` is set it
+    /// renders Codex-style as `─ {label} ─` padded to the viewport width;
+    /// otherwise a plain full-width rule. Emitted after turns that did concrete
+    /// work (tool calls / edits).
+    Separator {
+        label: Option<String>,
+    },
 }
 
 /// Split a mention card label like `Read CLAUDE.md (275 lines)` into a
@@ -1255,26 +1260,38 @@ impl HistoryCell {
                 rendered
             }
             HistoryCell::Plan { steps } => {
-                let mut lines = vec![Line::from(Span::styled(
-                    "Plan:".to_string(),
-                    theme::dim().add_modifier(ratatui::style::Modifier::BOLD),
-                ))];
+                use ratatui::style::Modifier;
+                // Header: `• Updated Plan` (dim bullet + bold title).
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(format!("{} ", theme::BULLET), theme::dim()),
+                    Span::styled("Updated Plan", theme::bold()),
+                ])];
+                // Step markers mirror Codex: `✔ ` crossed-out+dim (done),
+                // `□ ` teal+bold (in-progress), `□ ` dim (pending).
+                let mut step_lines: Vec<Line<'static>> = Vec::new();
                 for step in steps {
-                    let (icon, style) = match step.status {
+                    let (marker, style) = match step.status {
                         PlanStepStatus::Completed => {
-                            (theme::CHECK.to_string(), theme::check_style())
+                            ("✔ ", theme::dim().add_modifier(Modifier::CROSSED_OUT))
                         }
                         PlanStepStatus::InProgress => (
-                            "~".to_string(),
-                            ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                            "□ ",
+                            ratatui::style::Style::default()
+                                .fg(theme::cyan())
+                                .add_modifier(Modifier::BOLD),
                         ),
-                        PlanStepStatus::Pending => (" ".to_string(), theme::dim()),
+                        PlanStepStatus::Pending => ("□ ", theme::dim()),
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  [{icon}] "), style),
+                    step_lines.push(Line::from(vec![
+                        Span::styled(marker, style),
                         Span::styled(step.title.clone(), style),
                     ]));
                 }
+                lines.extend(prefix_lines(
+                    step_lines,
+                    Span::styled("  └ ", theme::dim()),
+                    Span::raw("    "),
+                ));
                 lines
             }
             HistoryCell::MentionCard { label } => {
@@ -1295,12 +1312,19 @@ impl HistoryCell {
                 }
                 vec![Line::from(spans)]
             }
-            HistoryCell::Separator => {
-                let rule_width = ((width as usize) * 2 / 3).min(80);
-                vec![Line::from(Span::styled(
-                    theme::SEPARATOR.repeat(rule_width),
-                    theme::dim(),
-                ))]
+            HistoryCell::Separator { label } => {
+                let w = width as usize;
+                let line = match label {
+                    Some(l) if !l.is_empty() => {
+                        // Codex format: `─ {label} ─` then fill the remainder.
+                        let labeled = format!("{0} {l} {0}", theme::SEPARATOR);
+                        let used = unicode_width::UnicodeWidthStr::width(labeled.as_str());
+                        let fill = w.saturating_sub(used);
+                        format!("{labeled}{}", theme::SEPARATOR.repeat(fill))
+                    }
+                    _ => theme::SEPARATOR.repeat(w),
+                };
+                vec![Line::from(Span::styled(line, theme::dim()))]
             }
         }
     }

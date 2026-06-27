@@ -431,7 +431,7 @@ fn toggle_collapsed_flips_state() {
 
 #[test]
 fn toggle_collapsed_noop_on_non_result() {
-    let mut cell = HistoryCell::Separator;
+    let mut cell = HistoryCell::Separator { label: None };
     assert!(!cell.toggle_collapsed());
 }
 
@@ -539,10 +539,41 @@ fn render_tool_result_uses_display_label() {
 
 #[test]
 fn render_separator() {
-    let cell = HistoryCell::Separator;
+    let cell = HistoryCell::Separator { label: None };
     let lines = cell.render(60, None);
     // Only the rule line; surrounding spacing is handled by the render loop.
     assert_eq!(lines.len(), 1);
+    // Codex parity: the unlabeled rule fills the full viewport width.
+    let rule_w: usize = lines[0]
+        .spans
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    assert_eq!(rule_w, 60, "unlabeled separator must span the full width");
+}
+
+#[test]
+fn render_labeled_separator_codex_format() {
+    let cell = HistoryCell::Separator {
+        label: Some("Worked for 2m • Local tools: 3 calls".to_string()),
+    };
+    let lines = cell.render(60, None);
+    assert_eq!(lines.len(), 1);
+    let text: String = lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    // Codex format: `─ {label} ─` then fill to the full width.
+    assert!(
+        text.starts_with("─ Worked for 2m • Local tools: 3 calls ─"),
+        "labeled separator must use the `─ label ─` form: {text}"
+    );
+    assert_eq!(
+        unicode_width::UnicodeWidthStr::width(text.as_str()),
+        60,
+        "labeled separator must still fill the full width"
+    );
 }
 
 #[test]
@@ -652,17 +683,25 @@ fn render_plan_cell_with_steps() {
         .flat_map(|l| l.spans.iter())
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(all_text.contains("Plan:"));
+    assert!(all_text.contains("Updated Plan"));
     assert!(all_text.contains("Read files"));
     assert!(all_text.contains("Write code"));
     assert!(all_text.contains("Run tests"));
+    // Codex-style step markers: ✔ for completed, □ for in-progress/pending,
+    // with the block carrying the `└` tree prefix on its first row.
+    assert!(all_text.contains('✔'), "completed step uses ✔: {all_text}");
+    assert!(
+        all_text.contains('□'),
+        "in-progress/pending steps use □: {all_text}"
+    );
+    assert!(all_text.contains('└'), "plan steps carry the └ prefix: {all_text}");
 }
 
 #[test]
 fn render_plan_cell_empty() {
     let cell = HistoryCell::Plan { steps: vec![] };
     let lines = cell.render(80, None);
-    // Should have at least the "Plan:" header
+    // Should have at least the "Updated Plan" header
     assert!(!lines.is_empty());
 }
 

@@ -16,7 +16,7 @@ struct FooterHint {
     priority: u8,
 }
 
-const HINT_SEP: &str = "  •  ";
+const HINT_SEP: &str = " · ";
 
 /// Greedy width-aware fit: keep dropping the lowest-priority hint until
 /// the rendered string (including ` • ` separators) fits in `available`.
@@ -41,6 +41,19 @@ fn fit_footer_hints(mut hints: Vec<FooterHint>, available: usize) -> String {
             }
         }
         hints.remove(victim);
+    }
+}
+
+/// Split one footer hint into styled spans: the leading key token renders in
+/// the default foreground (emphasized), the trailing label dim — matching
+/// Codex's footer convention where the key is brighter than its description.
+fn footer_hint_spans(hint: &str) -> Vec<Span<'static>> {
+    match hint.split_once(' ') {
+        Some((key, rest)) => vec![
+            Span::raw(key.to_string()),
+            Span::styled(format!(" {rest}"), theme::dim()),
+        ],
+        None => vec![Span::raw(hint.to_string())],
     }
 }
 
@@ -247,7 +260,7 @@ impl<'a> App<'a> {
             self.stream_status.header
         )));
         header_spans.push(Span::styled(format!(" ({elapsed}"), theme::tool_style()));
-        header_spans.push(Span::styled(" • esc to interrupt)", theme::dim()));
+        header_spans.push(Span::styled(" · esc to interrupt)", theme::dim()));
 
         let mut lines = vec![Line::from(header_spans)];
         if area.height >= 2 {
@@ -320,7 +333,7 @@ impl<'a> App<'a> {
                 Span::styled(label, style),
                 Span::styled(format!("`{query}`"), theme::dim()),
                 Span::styled(
-                    "  •  Ctrl+R back  •  Ctrl+S forward  •  Enter accept  •  Esc cancel",
+                    " · Ctrl+R back · Ctrl+S forward · Enter accept · Esc cancel",
                     theme::dim(),
                 ),
             ]);
@@ -560,11 +573,17 @@ impl<'a> App<'a> {
             .saturating_sub(prefix_w)
             .saturating_sub(goal_reserve);
         let left = fit_footer_hints(hints, available);
-        let line = Line::from(vec![
-            Span::styled(prefix, pct_style),
-            Span::styled(format!("{HINT_SEP}{left}"), theme::dim()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        let mut spans = vec![Span::styled(prefix, pct_style)];
+        if !left.is_empty() {
+            spans.push(Span::styled(HINT_SEP, theme::dim()));
+            for (i, hint) in left.split(HINT_SEP).enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(HINT_SEP, theme::dim()));
+                }
+                spans.extend(footer_hint_spans(hint));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
         // Right-aligned goal indicator. Hidden when the terminal is too
         // narrow to fit it after the prefix + at least one separator.
@@ -1258,7 +1277,7 @@ mod tests {
             },
         ];
         let out = fit_footer_hints(hints, 80);
-        assert_eq!(out, "alpha  •  beta");
+        assert_eq!(out, "alpha · beta");
     }
 
     #[test]
@@ -1277,7 +1296,7 @@ mod tests {
                 priority: 50,
             },
         ];
-        // Total joined = "low  •  high  •  mid" = 20 cols. Cap at 14 forces
+        // Total joined = "low · high · mid" = 16 cols. Cap at 14 forces
         // a drop; the lowest-priority "low" must be the first to go.
         let out = fit_footer_hints(hints, 14);
         assert!(!out.contains("low"), "low should be dropped, got: {out}");
@@ -1306,7 +1325,7 @@ mod tests {
                 },
             ]
         };
-        assert_eq!(fit_footer_hints(mk(), 15), "first  •  third");
+        assert_eq!(fit_footer_hints(mk(), 15), "first · third");
         assert_eq!(fit_footer_hints(mk(), 5), "first");
     }
 

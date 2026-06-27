@@ -367,6 +367,33 @@ impl<'a> App<'a> {
                 break;
             }
         }
+        // Codex-style turn divider: emitted only after turns that did concrete
+        // work (tool calls / edits), labeled with elapsed time (when notable)
+        // and the local tool-call count. A working turn always has a tool
+        // count, so the label is non-empty.
+        if self.cells[split..].iter().any(HistoryCell::is_tool_flow) {
+            let tool_calls = self.cells[split..]
+                .iter()
+                .filter(|c| matches!(c, HistoryCell::ToolResult { .. }))
+                .count();
+            let elapsed_secs = match &self.state {
+                AppState::Streaming { start } => Some(start.elapsed().as_secs()),
+                _ => None,
+            };
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(secs) = elapsed_secs.filter(|s| *s > 60) {
+                parts.push(format!(
+                    "Worked for {}",
+                    super::super::theme::format_elapsed(secs)
+                ));
+            }
+            if tool_calls > 0 {
+                let noun = if tool_calls == 1 { "call" } else { "calls" };
+                parts.push(format!("Local tools: {tool_calls} {noun}"));
+            }
+            let label = (!parts.is_empty()).then(|| parts.join(" • "));
+            self.cells.push(HistoryCell::Separator { label });
+        }
         // Force the entire finalized tail into scrollback now so it cannot
         // disappear from the live viewport before native scrollback owns it.
         self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);

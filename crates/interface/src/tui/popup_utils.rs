@@ -1,9 +1,16 @@
 use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use super::theme;
+
+/// Vertical padding (rows) inside the menu surface, matching Codex's
+/// `MENU_SURFACE_INSET_V`.
+const MENU_SURFACE_INSET_V: u16 = 1;
+/// Horizontal padding (cols) inside the menu surface, matching Codex's
+/// `MENU_SURFACE_INSET_H`.
+const MENU_SURFACE_INSET_H: u16 = 2;
 
 /// Popup width as a percentage of the host terminal width.
 pub const POPUP_WIDTH_PCT: u16 = 60;
@@ -41,18 +48,54 @@ pub fn popup_area(area: Rect) -> Rect {
     Rect::new(x, y, popup_width, popup_height)
 }
 
-/// Render a popup frame with a bordered block and title. Returns the inner area.
+/// Paint a Codex-style "menu surface": clear the area, fill it with a subtle
+/// `user_message_style()` background tint (no border), and return the content
+/// area inset by the shared menu padding (V=1, H=2). Callers render all inner
+/// content in the returned rect. Mirrors Codex's `render_menu_surface`.
+pub fn render_menu_surface(frame: &mut Frame, area: Rect) -> Rect {
+    // Wipe whatever was behind the surface, then paint the tint. The tint alone
+    // only restyles cells, so the `Clear` is what removes glyphs.
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme::user_message_style()), area);
+    Rect {
+        x: area.x.saturating_add(MENU_SURFACE_INSET_H),
+        y: area.y.saturating_add(MENU_SURFACE_INSET_V),
+        width: area
+            .width
+            .saturating_sub(MENU_SURFACE_INSET_H.saturating_mul(2)),
+        height: area
+            .height
+            .saturating_sub(MENU_SURFACE_INSET_V.saturating_mul(2)),
+    }
+}
+
+/// Render a popup as a Codex-style menu surface with the title shown as a bold
+/// header on the first inner row. Returns the content area below the title.
 pub fn render_popup_frame(frame: &mut Frame, popup_area: Rect, title: &str) -> Rect {
-    frame.render_widget(Clear, popup_area);
+    let inset = render_menu_surface(frame, popup_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::dim())
-        .title(format!(" {title} "));
+    if inset.width == 0 || inset.height == 0 {
+        return inset;
+    }
 
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-    inner
+    // Title as a bold header on the first inner row, content below it.
+    if !title.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                title.to_string(),
+                theme::header_style(),
+            ))),
+            Rect::new(inset.x, inset.y, inset.width, 1),
+        );
+        Rect {
+            x: inset.x,
+            y: inset.y.saturating_add(1),
+            width: inset.width,
+            height: inset.height.saturating_sub(1),
+        }
+    } else {
+        inset
+    }
 }
 
 /// Compute a popup rectangle anchored above the composer, clamped to fit

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::popup_utils;
 use super::theme;
@@ -143,10 +143,9 @@ impl FileSearchPopup {
         ) else {
             return;
         };
-        let popup_height = popup_area.height;
-        let max_visible = (popup_height - 2) as usize;
-
-        frame.render_widget(Clear, popup_area);
+        // Codex-style borderless menu surface (tinted bg, inset padding).
+        let inner = popup_utils::render_menu_surface(frame, popup_area);
+        let max_visible = inner.height as usize;
 
         let lines: Vec<Line<'_>> = if show_searching_only {
             vec![Line::from(Span::styled(" Searching…", theme::dim()))]
@@ -173,13 +172,7 @@ impl FileSearchPopup {
                 .collect()
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::dim())
-            .title(" Files ");
-
-        let paragraph = Paragraph::new(lines).block(block);
-        frame.render_widget(paragraph, popup_area);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 

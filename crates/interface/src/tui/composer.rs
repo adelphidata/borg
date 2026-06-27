@@ -277,17 +277,9 @@ impl<'a> Composer<'a> {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
-        // chevron `›` rendered as a cyan+bold title span,
-        // distinct from the dim teal block border. Keeps the focal point on
-        // the prompt indicator rather than the border chrome.
-        textarea.set_block(
-            Block::bordered()
-                .title(ratatui::text::Line::from(vec![
-                    Span::styled(theme::CHEVRON, theme::composer_cursor_style(true)),
-                    Span::raw(" "),
-                ]))
-                .border_style(Style::default().fg(theme::border_color())),
-        );
+        // Borderless: the composer is a subtly-tinted block with a `›` prompt
+        // in the left gutter (drawn in `render`), not a bordered box. The
+        // textarea itself carries no chrome.
         Self {
             textarea,
             // Tests call `Composer::new()` directly and expect an empty
@@ -675,7 +667,7 @@ impl<'a> Composer<'a> {
 
     pub fn height(&self) -> u16 {
         let content_lines = self.textarea.lines().len() as u16;
-        // 2 for border, min 1 content line
+        // +2 for the 1-row top/bottom padding around the text, min 1 content line.
         (content_lines.max(1) + 2).min(10)
     }
 
@@ -712,7 +704,48 @@ impl<'a> Composer<'a> {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(&self.textarea, area);
+        use ratatui::widgets::Paragraph;
+
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // Left gutter width reserved for the `›` prompt (Codex LIVE_PREFIX_COLS).
+        let gutter = (super::line_utils::LIVE_PREFIX_COLS as u16).min(area.width);
+
+        // Subtle user-message background tint across the whole composer block.
+        frame.render_widget(Block::default().style(theme::user_message_style()), area);
+
+        // 1-row top/bottom padding, 2-col left gutter, 1-col right margin — the
+        // textarea floats inside a tinted card rather than a bordered box.
+        let top = u16::from(area.height > 2);
+        let textarea_rect = Rect {
+            x: area.x.saturating_add(gutter),
+            y: area.y.saturating_add(top),
+            width: area.width.saturating_sub(gutter.saturating_add(1)),
+            height: area.height.saturating_sub(top.saturating_mul(2)),
+        };
+
+        // Prompt chevron in the left gutter, aligned to the first text row.
+        if gutter > 0 {
+            let prompt = ratatui::text::Line::from(Span::styled(
+                theme::CHEVRON,
+                theme::composer_cursor_style(true),
+            ));
+            frame.render_widget(
+                Paragraph::new(prompt),
+                Rect {
+                    x: area.x,
+                    y: textarea_rect.y,
+                    width: gutter,
+                    height: 1,
+                },
+            );
+        }
+
+        if textarea_rect.width > 0 && textarea_rect.height > 0 {
+            frame.render_widget(&self.textarea, textarea_rect);
+        }
     }
 }
 

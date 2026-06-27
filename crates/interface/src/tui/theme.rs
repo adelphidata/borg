@@ -32,11 +32,6 @@ pub fn amber() -> Color {
 }
 
 #[inline]
-pub fn border_color() -> Color {
-    themes::active().palette.border
-}
-
-#[inline]
 pub fn dim_color() -> Color {
     themes::active().palette.dim
 }

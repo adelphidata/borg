@@ -259,13 +259,12 @@ where
     /// Updates the Terminal so that internal buffers match the requested area.
     pub fn resize(&mut self, screen_size: Size) -> io::Result<()> {
         self.last_known_screen_size = screen_size;
-        let mut area = self.viewport_area;
         let new_width = screen_size.width;
-        let new_height = area.height.min(screen_size.height);
-        let max_y = screen_size.height.saturating_sub(new_height);
+        // Clamp height/top against the new screen via the shared helper (same
+        // math used to realign after a Ctrl+Z resume), then widen to the screen.
+        let mut area =
+            viewport_realigned_to_row(self.viewport_area, self.viewport_area.y, screen_size.height);
         area.width = new_width;
-        area.height = new_height;
-        area.y = area.y.min(max_y);
         self.set_viewport_area(area);
         self.last_known_cursor_pos.x = self
             .last_known_cursor_pos

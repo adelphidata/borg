@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use cortex::config::Config;
 
@@ -82,17 +82,7 @@ impl BtwPopup {
         let y = full.y + (full.height.saturating_sub(h)) / 2;
         let area = Rect::new(x, y, w, h);
 
-        frame.render_widget(Clear, area);
-
-        let title_style = Style::default()
-            .fg(theme::cyan())
-            .add_modifier(Modifier::BOLD);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::dim())
-            .title(Span::styled(" /btw ", title_style));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = super::popup_utils::render_popup_frame(frame, area, "/btw");
 
         if inner.height < 3 || inner.width < 10 {
             return;

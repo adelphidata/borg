@@ -10,7 +10,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use tokio::sync::Mutex;
 
 use cortex::config::Config;
@@ -145,19 +145,12 @@ impl UsagePopup {
         }
 
         let popup_area = frame.area();
-        frame.render_widget(Clear, popup_area);
 
         let title = match self.days {
-            Some(0) | None => " Usage ".to_string(),
-            Some(d) => format!(" Usage · {d}d "),
+            Some(0) | None => "Usage".to_string(),
+            Some(d) => format!("Usage · {d}d"),
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::dim())
-            .title(title);
-
-        let inner = block.inner(popup_area);
-        frame.render_widget(block, popup_area);
+        let inner = super::popup_utils::render_popup_frame(frame, popup_area, &title);
 
         if inner.height < 2 || inner.width < 10 {
             return;
