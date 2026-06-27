@@ -394,7 +394,7 @@ pub enum HistoryCell {
         label: String,
     },
     /// Turn divider rendered as a full-width dim rule. When `label` is set it
-    /// renders Codex-style as `─ {label} ─` padded to the viewport width;
+    /// renders as `─ {label} ─` padded to the viewport width;
     /// otherwise a plain full-width rule. Emitted after turns that did concrete
     /// work (tool calls / edits).
     Separator {
@@ -745,6 +745,26 @@ impl HistoryCell {
             text,
             streaming,
             cache: RefCell::new(AssistantRenderCache::default()),
+        }
+    }
+
+    /// Build the turn divider for a completed working turn. The
+    /// label aggregates elapsed time (only when notable, i.e. over a minute)
+    /// and the local tool-call count; when neither applies the divider renders
+    /// as a plain full-width rule. `tool_calls` is the number of `ToolResult`
+    /// cells in the turn; `elapsed_secs` is the turn's wall-clock duration when
+    /// known.
+    pub fn turn_separator(tool_calls: usize, elapsed_secs: Option<u64>) -> Self {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(secs) = elapsed_secs.filter(|s| *s > 60) {
+            parts.push(format!("Worked for {}", theme::format_elapsed(secs)));
+        }
+        if tool_calls > 0 {
+            let noun = if tool_calls == 1 { "call" } else { "calls" };
+            parts.push(format!("Local tools: {tool_calls} {noun}"));
+        }
+        HistoryCell::Separator {
+            label: (!parts.is_empty()).then(|| parts.join(" • ")),
         }
     }
 
@@ -1266,7 +1286,7 @@ impl HistoryCell {
                     Span::styled(format!("{} ", theme::BULLET), theme::dim()),
                     Span::styled("Updated Plan", theme::bold()),
                 ])];
-                // Step markers mirror Codex: `✔ ` crossed-out+dim (done),
+                // Step markers: `✔ ` crossed-out+dim (done),
                 // `□ ` teal+bold (in-progress), `□ ` dim (pending).
                 let mut step_lines: Vec<Line<'static>> = Vec::new();
                 for step in steps {
@@ -1316,11 +1336,16 @@ impl HistoryCell {
                 let w = width as usize;
                 let line = match label {
                     Some(l) if !l.is_empty() => {
-                        // Codex format: `─ {label} ─` then fill the remainder.
+                        // Labeled format: `─ {label} ─` then fill the remainder.
+                        // If the label can't fit the viewport, fall back to a
+                        // plain full-width rule rather than overflow/truncate it.
                         let labeled = format!("{0} {l} {0}", theme::SEPARATOR);
                         let used = unicode_width::UnicodeWidthStr::width(labeled.as_str());
-                        let fill = w.saturating_sub(used);
-                        format!("{labeled}{}", theme::SEPARATOR.repeat(fill))
+                        if used > w {
+                            theme::SEPARATOR.repeat(w)
+                        } else {
+                            format!("{labeled}{}", theme::SEPARATOR.repeat(w - used))
+                        }
                     }
                     _ => theme::SEPARATOR.repeat(w),
                 };

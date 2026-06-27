@@ -543,7 +543,7 @@ fn render_separator() {
     let lines = cell.render(60, None);
     // Only the rule line; surrounding spacing is handled by the render loop.
     assert_eq!(lines.len(), 1);
-    // Codex parity: the unlabeled rule fills the full viewport width.
+    // The unlabeled rule fills the full viewport width.
     let rule_w: usize = lines[0]
         .spans
         .iter()
@@ -553,18 +553,14 @@ fn render_separator() {
 }
 
 #[test]
-fn render_labeled_separator_codex_format() {
+fn render_labeled_separator_rule_format() {
     let cell = HistoryCell::Separator {
         label: Some("Worked for 2m • Local tools: 3 calls".to_string()),
     };
     let lines = cell.render(60, None);
     assert_eq!(lines.len(), 1);
-    let text: String = lines[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-    // Codex format: `─ {label} ─` then fill to the full width.
+    let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    // Labeled format: `─ {label} ─` then fill to the full width.
     assert!(
         text.starts_with("─ Worked for 2m • Local tools: 3 calls ─"),
         "labeled separator must use the `─ label ─` form: {text}"
@@ -573,6 +569,52 @@ fn render_labeled_separator_codex_format() {
         unicode_width::UnicodeWidthStr::width(text.as_str()),
         60,
         "labeled separator must still fill the full width"
+    );
+}
+
+#[test]
+fn labeled_separator_falls_back_to_plain_rule_when_too_narrow() {
+    // A label wider than the viewport must not overflow/truncate — the divider
+    // degrades to a plain full-width rule instead.
+    let cell = HistoryCell::Separator {
+        label: Some("Worked for 2m 3s • Local tools: 12 calls".to_string()),
+    };
+    let lines = cell.render(20, None);
+    assert_eq!(lines.len(), 1);
+    let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        !text.contains("Worked for"),
+        "narrow divider must drop the label, got: {text}"
+    );
+    assert_eq!(
+        unicode_width::UnicodeWidthStr::width(text.as_str()),
+        20,
+        "fallback rule still spans the full width"
+    );
+    assert!(
+        text.chars().all(|c| c.to_string() == theme::SEPARATOR),
+        "fallback must be a pure rule of separator glyphs"
+    );
+}
+
+#[test]
+fn turn_separator_label_policy() {
+    let label = |c, s| match HistoryCell::turn_separator(c, s) {
+        HistoryCell::Separator { label } => label,
+        _ => panic!("turn_separator must produce a Separator cell"),
+    };
+    // Elapsed only counts when over a minute; under the threshold it is dropped.
+    assert_eq!(
+        label(0, Some(45)),
+        None,
+        "no work + short turn → plain rule"
+    );
+    assert_eq!(label(0, Some(90)), Some("Worked for 1m 30s".to_string()));
+    // Tool count uses singular/plural and combines with notable elapsed.
+    assert_eq!(label(1, Some(10)), Some("Local tools: 1 call".to_string()));
+    assert_eq!(
+        label(3, Some(125)),
+        Some("Worked for 2m 5s • Local tools: 3 calls".to_string())
     );
 }
 
@@ -687,14 +729,17 @@ fn render_plan_cell_with_steps() {
     assert!(all_text.contains("Read files"));
     assert!(all_text.contains("Write code"));
     assert!(all_text.contains("Run tests"));
-    // Codex-style step markers: ✔ for completed, □ for in-progress/pending,
+    // Step markers: ✔ for completed, □ for in-progress/pending,
     // with the block carrying the `└` tree prefix on its first row.
     assert!(all_text.contains('✔'), "completed step uses ✔: {all_text}");
     assert!(
         all_text.contains('□'),
         "in-progress/pending steps use □: {all_text}"
     );
-    assert!(all_text.contains('└'), "plan steps carry the └ prefix: {all_text}");
+    assert!(
+        all_text.contains('└'),
+        "plan steps carry the └ prefix: {all_text}"
+    );
 }
 
 #[test]

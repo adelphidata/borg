@@ -318,7 +318,7 @@ impl CommandPopup {
         ) else {
             return;
         };
-        // Codex-style borderless menu surface (tinted bg, inset padding).
+        // Borderless menu surface (tinted bg, inset padding).
         let inner = popup_utils::render_menu_surface(frame, popup_area);
         let max_visible = inner.height as usize; // items that fit inside the surface
 

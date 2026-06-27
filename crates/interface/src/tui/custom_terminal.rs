@@ -412,7 +412,9 @@ where
                 self.last_known_cursor_pos = Position { x: 0, y: area.y };
             }
             Err(err) => {
-                tracing::warn!("failed to re-read cursor after resume; keeping viewport row: {err}");
+                tracing::warn!(
+                    "failed to re-read cursor after resume; keeping viewport row: {err}"
+                );
             }
         }
         self.invalidate_viewport();
@@ -750,7 +752,8 @@ mod tests {
         // composer (height 3) must move to that row, keeping its width/height,
         // so it redraws below the shell output instead of at the stale top.
         let area = Rect::new(0, 2, 80, 3);
-        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 11, /*screen_height*/ 40);
+        let realigned =
+            viewport_realigned_to_row(area, /*cursor_row*/ 11, /*screen_height*/ 40);
         assert_eq!(realigned, Rect::new(0, 11, 80, 3));
     }
 
@@ -760,7 +763,8 @@ mod tests {
         // 40-row terminal must clamp the top up so the whole viewport stays
         // on-screen (top = 40 - 3), never clipping the composer.
         let area = Rect::new(0, 2, 80, 3);
-        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 39, /*screen_height*/ 40);
+        let realigned =
+            viewport_realigned_to_row(area, /*cursor_row*/ 39, /*screen_height*/ 40);
         assert_eq!(realigned, Rect::new(0, 37, 80, 3));
     }
 
@@ -769,7 +773,8 @@ mod tests {
         // A viewport taller than the terminal is clamped to the screen height
         // and pinned to the top — there is nowhere else for it to go.
         let area = Rect::new(0, 5, 80, 10);
-        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 7, /*screen_height*/ 4);
+        let realigned =
+            viewport_realigned_to_row(area, /*cursor_row*/ 7, /*screen_height*/ 4);
         assert_eq!(realigned, Rect::new(0, 0, 80, 4));
     }
 

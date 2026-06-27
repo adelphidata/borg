@@ -710,23 +710,31 @@ impl<'a> Composer<'a> {
             return;
         }
 
-        // Left gutter width reserved for the `›` prompt (Codex LIVE_PREFIX_COLS).
-        let gutter = (super::line_utils::LIVE_PREFIX_COLS as u16).min(area.width);
-
         // Subtle user-message background tint across the whole composer block.
         frame.render_widget(Block::default().style(theme::user_message_style()), area);
 
-        // 1-row top/bottom padding, 2-col left gutter, 1-col right margin — the
-        // textarea floats inside a tinted card rather than a bordered box.
+        // `›` prompt gutter (LIVE_PREFIX_COLS) plus a 1-col right margin — but
+        // only when the viewport is wide enough that the textarea still keeps at
+        // least one column. On an ultra-narrow viewport, drop the chrome so the
+        // input never disappears.
+        let chrome = super::line_utils::LIVE_PREFIX_COLS as u16 + 1;
+        let (gutter, right_margin) = if area.width > chrome {
+            (super::line_utils::LIVE_PREFIX_COLS as u16, 1)
+        } else {
+            (0, 0)
+        };
+
+        // 1-row top/bottom padding floats the textarea inside the tinted card.
         let top = u16::from(area.height > 2);
         let textarea_rect = Rect {
             x: area.x.saturating_add(gutter),
             y: area.y.saturating_add(top),
-            width: area.width.saturating_sub(gutter.saturating_add(1)),
+            width: area.width.saturating_sub(gutter + right_margin),
             height: area.height.saturating_sub(top.saturating_mul(2)),
         };
 
         // Prompt chevron in the left gutter, aligned to the first text row.
+        // Skipped when the viewport is too narrow to carry a gutter.
         if gutter > 0 {
             let prompt = ratatui::text::Line::from(Span::styled(
                 theme::CHEVRON,
@@ -880,6 +888,39 @@ mod tests {
         let mut c = Composer::new();
         c.handle_paste("hello world");
         assert_eq!(c.text(), "hello world");
+    }
+
+    /// On an ultra-narrow viewport (≤ gutter+1 cols) the `›` gutter must be
+    /// dropped so the textarea still gets every column — otherwise typed input
+    /// would render nowhere and the composer would look dead. Once the viewport
+    /// is wide enough, the chevron returns.
+    #[test]
+    fn render_drops_chevron_gutter_on_ultra_narrow_viewport() {
+        use ratatui::buffer::Buffer;
+        let render_row = |w: u16| {
+            let c = Composer::new();
+            let area = Rect::new(0, 0, w, 1);
+            let mut buffer = Buffer::empty(area);
+            {
+                let mut frame = super::super::custom_terminal::Frame::__test_new(&mut buffer);
+                c.render(&mut frame, area);
+            }
+            (0..w)
+                .map(|x| buffer.cell((x, 0)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+        // width == gutter+1 (3) and below: no room for chrome, chevron dropped.
+        for w in [1u16, 2, 3] {
+            assert!(
+                !render_row(w).contains(theme::CHEVRON),
+                "chevron gutter must be dropped at width {w}"
+            );
+        }
+        // Wider: the chevron reappears (guards against always-dropping chrome).
+        assert!(
+            render_row(20).contains(theme::CHEVRON),
+            "chevron must render once the viewport has room"
+        );
     }
 
     #[test]

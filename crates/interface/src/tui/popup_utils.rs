@@ -5,11 +5,9 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use super::theme;
 
-/// Vertical padding (rows) inside the menu surface, matching Codex's
-/// `MENU_SURFACE_INSET_V`.
+/// Vertical padding (rows) inside the menu surface.
 const MENU_SURFACE_INSET_V: u16 = 1;
-/// Horizontal padding (cols) inside the menu surface, matching Codex's
-/// `MENU_SURFACE_INSET_H`.
+/// Horizontal padding (cols) inside the menu surface.
 const MENU_SURFACE_INSET_H: u16 = 2;
 
 /// Popup width as a percentage of the host terminal width.
@@ -48,10 +46,10 @@ pub fn popup_area(area: Rect) -> Rect {
     Rect::new(x, y, popup_width, popup_height)
 }
 
-/// Paint a Codex-style "menu surface": clear the area, fill it with a subtle
+/// Paint a borderless "menu surface": clear the area, fill it with a subtle
 /// `user_message_style()` background tint (no border), and return the content
 /// area inset by the shared menu padding (V=1, H=2). Callers render all inner
-/// content in the returned rect. Mirrors Codex's `render_menu_surface`.
+/// content in the returned rect.
 pub fn render_menu_surface(frame: &mut Frame, area: Rect) -> Rect {
     // Wipe whatever was behind the surface, then paint the tint. The tint alone
     // only restyles cells, so the `Clear` is what removes glyphs.
@@ -69,7 +67,7 @@ pub fn render_menu_surface(frame: &mut Frame, area: Rect) -> Rect {
     }
 }
 
-/// Render a popup as a Codex-style menu surface with the title shown as a bold
+/// Render a popup as a borderless menu surface with the title shown as a bold
 /// header on the first inner row. Returns the content area below the title.
 pub fn render_popup_frame(frame: &mut Frame, popup_area: Rect, title: &str) -> Rect {
     let inset = render_menu_surface(frame, popup_area);

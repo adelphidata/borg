@@ -18,18 +18,21 @@ struct FooterHint {
 
 const HINT_SEP: &str = " · ";
 
-/// Greedy width-aware fit: keep dropping the lowest-priority hint until
-/// the rendered string (including ` • ` separators) fits in `available`.
-/// Hints render in their original order.
-fn fit_footer_hints(mut hints: Vec<FooterHint>, available: usize) -> String {
+/// Greedy width-aware fit: keep dropping the lowest-priority hint until the
+/// surviving hints (joined by ` · ` separators) fit in `available`, then return
+/// them in their original order. Width is summed from the hint widths rather
+/// than materializing the joined string, and the caller builds spans straight
+/// from the returned hints.
+fn fit_footer_hints(mut hints: Vec<FooterHint>, available: usize) -> Vec<FooterHint> {
+    let sep_w = UnicodeWidthStr::width(HINT_SEP);
     loop {
-        let rendered = hints
+        let text_w: usize = hints
             .iter()
-            .map(|h| h.text.as_str())
-            .collect::<Vec<_>>()
-            .join(HINT_SEP);
-        if hints.is_empty() || UnicodeWidthStr::width(rendered.as_str()) <= available {
-            return rendered;
+            .map(|h| UnicodeWidthStr::width(h.text.as_str()))
+            .sum();
+        let rendered_w = text_w + sep_w * hints.len().saturating_sub(1);
+        if hints.is_empty() || rendered_w <= available {
+            return hints;
         }
         // Drop the lowest-priority hint (ties: drop the rightmost).
         let mut victim = 0usize;
@@ -45,8 +48,8 @@ fn fit_footer_hints(mut hints: Vec<FooterHint>, available: usize) -> String {
 }
 
 /// Split one footer hint into styled spans: the leading key token renders in
-/// the default foreground (emphasized), the trailing label dim — matching
-/// Codex's footer convention where the key is brighter than its description.
+/// the default foreground (emphasized), the trailing label dim — following the
+/// footer convention where the key is brighter than its description.
 fn footer_hint_spans(hint: &str) -> Vec<Span<'static>> {
     match hint.split_once(' ') {
         Some((key, rest)) => vec![
@@ -576,11 +579,11 @@ impl<'a> App<'a> {
         let mut spans = vec![Span::styled(prefix, pct_style)];
         if !left.is_empty() {
             spans.push(Span::styled(HINT_SEP, theme::dim()));
-            for (i, hint) in left.split(HINT_SEP).enumerate() {
+            for (i, hint) in left.iter().enumerate() {
                 if i > 0 {
                     spans.push(Span::styled(HINT_SEP, theme::dim()));
                 }
-                spans.extend(footer_hint_spans(hint));
+                spans.extend(footer_hint_spans(&hint.text));
             }
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -969,6 +972,11 @@ mod tests {
     use cortex::config::Config;
     use std::time::Instant;
 
+    /// Surviving hint texts, in render order — what the footer actually draws.
+    fn footer_texts(hints: &[FooterHint]) -> Vec<&str> {
+        hints.iter().map(|h| h.text.as_str()).collect()
+    }
+
     fn make_app() -> App<'static> {
         use crate::daemon_client::DaemonClient;
         use std::sync::Arc;
@@ -1277,7 +1285,7 @@ mod tests {
             },
         ];
         let out = fit_footer_hints(hints, 80);
-        assert_eq!(out, "alpha · beta");
+        assert_eq!(footer_texts(&out), ["alpha", "beta"]);
     }
 
     #[test]
@@ -1299,8 +1307,12 @@ mod tests {
         // Total joined = "low · high · mid" = 16 cols. Cap at 14 forces
         // a drop; the lowest-priority "low" must be the first to go.
         let out = fit_footer_hints(hints, 14);
-        assert!(!out.contains("low"), "low should be dropped, got: {out}");
-        assert!(out.contains("high"));
+        let texts = footer_texts(&out);
+        assert!(
+            !texts.contains(&"low"),
+            "low should be dropped, got: {texts:?}"
+        );
+        assert!(texts.contains(&"high"));
     }
 
     #[test]
@@ -1325,8 +1337,11 @@ mod tests {
                 },
             ]
         };
-        assert_eq!(fit_footer_hints(mk(), 15), "first · third");
-        assert_eq!(fit_footer_hints(mk(), 5), "first");
+        assert_eq!(
+            footer_texts(&fit_footer_hints(mk(), 15)),
+            ["first", "third"]
+        );
+        assert_eq!(footer_texts(&fit_footer_hints(mk(), 5)), ["first"]);
     }
 
     #[test]
@@ -1336,7 +1351,7 @@ mod tests {
             priority: 100,
         }];
         let out = fit_footer_hints(hints, 0);
-        assert_eq!(out, "");
+        assert!(out.is_empty());
     }
 
     #[test]
