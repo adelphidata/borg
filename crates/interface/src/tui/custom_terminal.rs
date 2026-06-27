@@ -391,6 +391,34 @@ where
         self.previous_buffer_mut().reset();
     }
 
+    /// Re-probe the terminal's cursor position (CPR) and move the inline
+    /// viewport so its top sits at that row, then force a full repaint.
+    ///
+    /// Used after a Ctrl+Z / `fg` bounce: while the process is stopped the
+    /// shell prints job-control output and a fresh prompt, moving the terminal
+    /// cursor, so the saved `viewport_area.y` is stale. Realigning to the live
+    /// cursor row makes the composer redraw *below* the shell output instead of
+    /// overlapping it. A PTY that does not answer CPR keeps the previous row
+    /// (best effort) but still invalidates so the repaint happens — matching the
+    /// tolerant fallback in [`Self::with_options`].
+    pub fn reposition_viewport_to_cursor(&mut self) {
+        match self.backend.get_cursor_position() {
+            Ok(pos) => {
+                let area = viewport_realigned_to_row(
+                    self.viewport_area,
+                    pos.y,
+                    self.last_known_screen_size.height,
+                );
+                self.set_viewport_area(area);
+                self.last_known_cursor_pos = Position { x: 0, y: area.y };
+            }
+            Err(err) => {
+                tracing::warn!("failed to re-read cursor after resume; keeping viewport row: {err}");
+            }
+        }
+        self.invalidate_viewport();
+    }
+
     /// Clear terminal scrollback (if supported) and force a full redraw.
     pub fn clear_scrollback(&mut self) -> io::Result<()> {
         if self.viewport_area.is_empty() {
@@ -462,6 +490,19 @@ where
     pub fn size(&self) -> io::Result<Size> {
         self.backend.size()
     }
+}
+
+/// Realign an inline viewport so its top sits at `cursor_row`, preserving width
+/// and height but never letting the viewport run past the bottom of a
+/// `screen_height`-row terminal (the top is clamped up if it would). The pure
+/// half of [`Terminal::reposition_viewport_to_cursor`], extracted so the
+/// realign math is unit-testable without a live terminal. Mirrors the clamping
+/// in [`Terminal::resize`].
+fn viewport_realigned_to_row(area: Rect, cursor_row: u16, screen_height: u16) -> Rect {
+    let height = area.height.min(screen_height);
+    let max_top = screen_height.saturating_sub(height);
+    let top = cursor_row.min(max_top);
+    Rect::new(area.x, top, area.width, height)
 }
 
 use ratatui::buffer::Cell;
@@ -702,6 +743,35 @@ mod tests {
                 .any(|command| matches!(command, DrawCommand::Put { x: 2, y: 0, .. })),
             "expected diff_buffers to update the final cell; commands: {commands:?}",
         );
+    }
+
+    #[test]
+    fn resume_realign_moves_viewport_top_to_cursor_row() {
+        // After `fg`, the shell left the cursor partway down the screen. The
+        // composer (height 3) must move to that row, keeping its width/height,
+        // so it redraws below the shell output instead of at the stale top.
+        let area = Rect::new(0, 2, 80, 3);
+        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 11, /*screen_height*/ 40);
+        assert_eq!(realigned, Rect::new(0, 11, 80, 3));
+    }
+
+    #[test]
+    fn resume_realign_clamps_viewport_within_screen_bottom() {
+        // A cursor row that would push the 3-row composer past the bottom of a
+        // 40-row terminal must clamp the top up so the whole viewport stays
+        // on-screen (top = 40 - 3), never clipping the composer.
+        let area = Rect::new(0, 2, 80, 3);
+        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 39, /*screen_height*/ 40);
+        assert_eq!(realigned, Rect::new(0, 37, 80, 3));
+    }
+
+    #[test]
+    fn resume_realign_clamps_height_to_a_short_screen() {
+        // A viewport taller than the terminal is clamped to the screen height
+        // and pinned to the top — there is nowhere else for it to go.
+        let area = Rect::new(0, 5, 80, 10);
+        let realigned = viewport_realigned_to_row(area, /*cursor_row*/ 7, /*screen_height*/ 4);
+        assert_eq!(realigned, Rect::new(0, 0, 80, 4));
     }
 
     #[test]

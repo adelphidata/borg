@@ -1104,7 +1104,12 @@ async fn run_event_loop(
                     if dropped > 0 {
                         tracing::debug!(dropped, "tui resume: drained buffered terminal events");
                     }
-                    tui.terminal.invalidate_viewport();
+                    // The shell moved the cursor (job-control output + a fresh
+                    // prompt) while we were stopped, so the saved viewport row is
+                    // stale. Re-probe the cursor and realign the inline viewport
+                    // before repainting so the composer lands below the shell
+                    // output rather than overlapping it.
+                    tui.terminal.reposition_viewport_to_cursor();
                 }
             }
             AppAction::UndoLastTurn => match client.undo(session_id).await {
