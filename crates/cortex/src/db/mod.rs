@@ -315,6 +315,33 @@ impl Database {
         // touches this lock.
         static RECOVERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+        // The data dir itself can be a regular file in a corrupted layout (e.g.
+        // `~/.borg` is a file, not a directory). No database can ever be created
+        // under it — `create_dir_all` in `build_connection` would fail — so the
+        // db path neither exists nor can be stat'd, and the checks below would
+        // loop on an un-creatable path. Move the blocking parent aside first.
+        if Self::sqlite_home_is_blocking_file(path) {
+            let _guard = RECOVERY_LOCK.lock().await;
+            // Re-check under the lock; a concurrent opener may have fixed it.
+            if Self::sqlite_home_is_blocking_file(path) {
+                let parent = path
+                    .parent()
+                    .expect("a blocking parent file implies the path has a parent");
+                tracing::warn!(
+                    "database parent {} is a regular file; preserving it and starting fresh",
+                    parent.display()
+                );
+                let mut notice = Self::quarantine_corrupt_db(parent, now_unix)?;
+                // The backup points at the moved-aside parent file, but the
+                // freshly-created database lives at the original db path.
+                notice.new_path = path.to_path_buf();
+                let db = Self::open_at_inner(path, busy_timeout_ms, key, false)
+                    .await
+                    .context("re-create database after moving aside blocking parent dir")?;
+                return Ok((db, Some(notice)));
+            }
+        }
+
         // A regular file (or an absent path, which `open_at_inner` creates
         // fresh) is the overwhelmingly common case — try it directly first.
         // One `metadata` stat answers both questions on the happy path:
@@ -380,6 +407,17 @@ impl Database {
             .await
             .context("re-create database after moving aside non-file path")?;
         Ok((db, Some(notice)))
+    }
+
+    /// True when the database's parent path exists but is a regular file
+    /// rather than a directory. In that layout `create_dir_all` can never
+    /// succeed and the database can never be created, so the blocking file has
+    /// to be moved aside before opening.
+    fn sqlite_home_is_blocking_file(path: &Path) -> bool {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .and_then(|p| std::fs::metadata(p).ok())
+            .is_some_and(|meta| meta.is_file())
     }
 
     /// Move an unreadable database (and any stale WAL/SHM siblings) aside to
@@ -939,6 +977,34 @@ mod recovery_tests {
             backup.join("marker").exists(),
             "directory must be preserved"
         );
+        assert!(path.is_file(), "a fresh db file now sits at the path");
+        assert!(settings_table_present(&db).await);
+    }
+
+    #[tokio::test]
+    async fn blocking_parent_file_is_moved_aside_and_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        // The data dir itself is a regular file, not a directory.
+        let home = dir.path().join("dot-borg");
+        std::fs::write(&home, b"this is a file where a directory should be").unwrap();
+        let path = home.join("borg.db");
+
+        let (db, notice) = Database::open_at_recovering(&path, 5000, None, 777)
+            .await
+            .expect("recovering open should succeed when the parent is a file");
+
+        let notice = notice.expect("a blocking parent file must yield a recovery notice");
+        let backup = dir.path().join("dot-borg.corrupt-777");
+        assert_eq!(notice.backup_path, backup, "parent file is preserved");
+        assert_eq!(notice.new_path, path, "fresh db lives at the original path");
+        assert!(backup.is_file(), "original parent file must be kept");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"this is a file where a directory should be"
+        );
+
+        // The parent is now a directory holding a real, migrated database.
+        assert!(home.is_dir(), "a fresh data dir now sits where the file was");
         assert!(path.is_file(), "a fresh db file now sits at the path");
         assert!(settings_table_present(&db).await);
     }
