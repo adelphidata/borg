@@ -140,6 +140,16 @@ pub(super) fn body_mentions_model(body: &str) -> bool {
     lower.contains("model")
 }
 
+/// True when a 401 body signals an *expired* credential rather than a wrong
+/// one. Amazon Bedrock returns `Signature expired: ...` when AWS SigV4 creds or
+/// a short-lived `AWS_BEARER_TOKEN_BEDROCK` have aged out. Borg cannot refresh
+/// an env-provided token in-process, so this routes to a "refresh your
+/// credentials" message rather than a generic auth error.
+pub(super) fn body_indicates_expired_signature(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("signature expired") || lower.contains("expired token")
+}
+
 /// True when an OpenRouter 404 body indicates the account's provider filters
 /// blocked every upstream that serves the model — distinct from "model not
 /// found" even though both return 404. Example body:

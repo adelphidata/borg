@@ -9,7 +9,8 @@ mod retry;
 
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
-    body_indicates_context_overflow, body_indicates_no_allowed_providers, body_mentions_model,
+    body_indicates_context_overflow, body_indicates_expired_signature,
+    body_indicates_no_allowed_providers, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
@@ -224,6 +225,22 @@ pub(crate) fn classify_status(
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
+        401 if matches!(provider, Provider::Bedrock)
+            && body_indicates_expired_signature(body) =>
+        {
+            // Amazon Bedrock answers 401 with "Signature expired" when AWS
+            // SigV4 credentials or a short-lived AWS_BEARER_TOKEN_BEDROCK have
+            // aged out. Borg cannot refresh an env-provided token in-process, so
+            // rotation won't recover — surface an actionable message and treat
+            // it as permanent so the pool retires the credential rather than
+            // spinning a doomed cooldown-and-retry loop.
+            LlmError::Fatal {
+                source: anyhow::anyhow!(
+                    "{provider} returned 401 (AWS credentials expired — refresh your AWS credentials, or replace/remove AWS_BEARER_TOKEN_BEDROCK, then restart borg): {safe}"
+                ),
+                reason: FailoverReason::AuthPermanent,
+            }
+        }
         401 => {
             // Gemini AI Studio uses static API keys (no token-refresh dance)
             // — a 401 means the key is wrong/revoked and rotation alone won't
@@ -423,6 +440,50 @@ mod tests {
         );
         assert!(!err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::Auth);
+    }
+
+    #[test]
+    fn classify_401_bedrock_expired_signature_is_actionable_and_permanent() {
+        // Bedrock's "Signature expired" 401 means the AWS credential aged out.
+        // It must be permanent (no rotation spin) and carry a refresh-your-creds
+        // hint rather than the generic "auth error" message.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Signature expired: 20260625T000000Z is now earlier than ...",
+            Provider::Bedrock,
+        );
+        assert!(!err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        assert!(
+            err.to_string().contains("refresh your AWS credentials"),
+            "expired-signature 401 must surface a recovery hint; got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_401_bedrock_wrong_key_stays_generic_auth() {
+        // A non-expiry 401 from Bedrock (e.g. a malformed key) is NOT the expiry
+        // case: it stays a generic, rotatable auth error.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "The security token included in the request is invalid",
+            Provider::Bedrock,
+        );
+        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert!(!err.to_string().contains("refresh your AWS credentials"));
+    }
+
+    #[test]
+    fn classify_401_non_bedrock_expiry_text_stays_generic_auth() {
+        // The expiry branch is provider-scoped: the same body from another
+        // provider must not be rewritten into the Bedrock-specific message.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Signature expired",
+            Provider::OpenAi,
+        );
+        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert!(!err.to_string().contains("refresh your AWS credentials"));
     }
 
     #[test]
