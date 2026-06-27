@@ -426,6 +426,12 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         Ok(Ok(Ok(text))) => text,
         Ok(Ok(Err(e))) => {
             let duration_ms = start.elapsed().as_millis() as u64;
+            // Structured error kind from the typed `McpError` (preserved as the
+            // anyhow root by the session actor). Defaults to "unknown" for
+            // errors raised outside the MCP crate.
+            let error_kind = e
+                .downcast_ref::<mcp::errors::McpError>()
+                .map_or("unknown", mcp::errors::McpError::kind);
             crate::db::try_emit_global(
                 crate::db::audit_events::MCP_TOOL_EXECUTED,
                 &tool.server,
@@ -434,12 +440,13 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                     "tool": &tool.full_name,
                     "success": false,
                     "duration_ms": duration_ms,
+                    "error_kind": error_kind,
                     "error": e.to_string(),
                 }),
             )
             .await;
             // OTEL-style structured event — `borg.mcp.executes_total{outcome="error"}`
-            // plus the error message for correlation with logs.
+            // plus the error kind and message for correlation with logs.
             tracing::info!(
                 target: "borg.mcp",
                 event = "execute",
@@ -447,6 +454,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                 tool = %tool.full_name,
                 outcome = "error",
                 duration_ms,
+                error_kind,
                 error = %e,
                 "mcp tool execution failed",
             );
@@ -1237,9 +1245,14 @@ async fn run_session_task(
                 // operator sees one clear error per call.
                 let transport_dead =
                     matches!(&raw_result, Err(mcp::errors::McpError::TransportClosed(_)));
+                // Preserve the typed `McpError` as the anyhow root (rather than
+                // flattening to a string) so the dispatch site can downcast it
+                // for a structured `error_kind` in the audit row. The Display
+                // output — and therefore the message surfaced to the LLM — is
+                // unchanged.
                 let result = raw_result
                     .map(|(text, _raw)| text)
-                    .map_err(|e| anyhow!("{e}"));
+                    .map_err(anyhow::Error::new);
                 // Best-effort send — caller may have dropped its receiver
                 // (e.g. outer-watchdog fired). Log on the drop path so it
                 // isn't silent.

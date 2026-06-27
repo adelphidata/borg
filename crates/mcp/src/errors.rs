@@ -107,6 +107,28 @@ pub enum McpError {
 }
 
 impl McpError {
+    /// Stable, machine-readable variant kind (snake_case) for telemetry and
+    /// audit attribution. Lets failure rows carry a structured error code
+    /// alongside the free-text message, so operators can aggregate failures by
+    /// kind rather than grepping strings. Values are part of the audit
+    /// contract — extend, don't rename.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            McpError::Connect(_) => "connect",
+            McpError::Auth(_) => "auth",
+            McpError::TransportClosed(_) => "transport_closed",
+            McpError::TransientHttp { .. } => "transient_http",
+            McpError::Timeout { .. } => "timeout",
+            McpError::RateLimited { .. } => "rate_limited",
+            McpError::SchemaRejected { .. } => "schema_rejected",
+            McpError::NameCollision { .. } => "name_collision",
+            McpError::UrlRefused { .. } => "url_refused",
+            McpError::Protocol(_) => "protocol",
+            McpError::Io(_) => "io",
+            McpError::Json(_) => "json",
+        }
+    }
+
     /// Whether this error is worth retrying during a *server startup* sequence
     /// (the idempotent `initialize` followed by a read-only `tools/list`).
     /// Transient transport/HTTP failures are retryable by recreating the
@@ -237,6 +259,79 @@ mod tests {
             full_name: "mcp_s_t".into(),
         }
         .is_retryable_startup());
+    }
+
+    #[test]
+    fn kind_maps_every_variant_to_a_stable_audit_code() {
+        // These strings are the audit contract: failure rows aggregate by them,
+        // so a rename or mis-mapping is a breaking change. Cover every variant.
+        let cases: &[(McpError, &str)] = &[
+            (McpError::Connect("x".into()), "connect"),
+            (McpError::Auth("401".into()), "auth"),
+            (McpError::TransportClosed("eof".into()), "transport_closed"),
+            (
+                McpError::TransientHttp {
+                    status: 503,
+                    msg: "x".into(),
+                },
+                "transient_http",
+            ),
+            (McpError::Timeout { ms: 10 }, "timeout"),
+            (
+                McpError::RateLimited {
+                    server: "s".into(),
+                    retry_after_ms: 1,
+                },
+                "rate_limited",
+            ),
+            (
+                McpError::SchemaRejected {
+                    server: "s".into(),
+                    tool: "t".into(),
+                    reason: SchemaRejectionReason::NotObjectRoot,
+                },
+                "schema_rejected",
+            ),
+            (
+                McpError::NameCollision {
+                    server: "s".into(),
+                    full_name: "mcp_s_t".into(),
+                },
+                "name_collision",
+            ),
+            (
+                McpError::UrlRefused {
+                    url: "http://x".into(),
+                    reason: UrlRefusalReason::NotHttps,
+                },
+                "url_refused",
+            ),
+            (McpError::Protocol("bad".into()), "protocol"),
+            (McpError::Io(std::io::Error::other("boom")), "io"),
+            (
+                McpError::Json(serde_json::from_str::<i32>("nope").unwrap_err()),
+                "json",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.kind(), *expected, "kind for {err:?}");
+        }
+    }
+
+    #[test]
+    fn kind_survives_round_trip_through_anyhow_error() {
+        // The dispatch site recovers the kind by downcasting the anyhow root the
+        // session actor wraps the typed error in. If that wrapping ever flattens
+        // the error to a string again, this downcast fails and the audit row
+        // loses its structured `error_kind`.
+        let err = anyhow::Error::new(McpError::Protocol("bad json-rpc".into()));
+        let recovered = err
+            .downcast_ref::<McpError>()
+            .map(McpError::kind)
+            .expect("typed McpError must survive as the anyhow root");
+        assert_eq!(recovered, "protocol");
+        // Display is preserved for the message surfaced to the LLM.
+        assert_eq!(err.to_string(), "protocol error: bad json-rpc");
     }
 
     #[test]
