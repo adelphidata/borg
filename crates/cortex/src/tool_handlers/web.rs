@@ -162,8 +162,7 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
                 // read time, and never accumulates across cache round-trips.
                 match Database::open().await {
                     Ok(db2) => {
-                        if let Err(e) =
-                            cache_store(&db2, &provider, &hash, query, &body, now).await
+                        if let Err(e) = cache_store(&db2, &provider, &hash, query, &body, now).await
                         {
                             tracing::warn!(error = %e, "web_search cache write failed");
                         }

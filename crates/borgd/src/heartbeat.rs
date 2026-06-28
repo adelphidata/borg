@@ -652,9 +652,7 @@ pub(crate) async fn run_scheduled_remediation_turn(
     // and the budget / max-ticks / escalation queries below — which key on
     // `session_key` — would never find it.
     if let Err(e) = cortex::session::ensure_session_on_disk(&session_key) {
-        tracing::warn!(
-            "Heartbeat remediation: could not materialize session '{session_key}': {e}"
-        );
+        tracing::warn!("Heartbeat remediation: could not materialize session '{session_key}': {e}");
     }
     let turn = InboundTurn {
         session_key,

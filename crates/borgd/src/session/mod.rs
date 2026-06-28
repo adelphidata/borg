@@ -651,7 +651,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!host.is_busy(), "must be idle again after the turn completes");
+        assert!(
+            !host.is_busy(),
+            "must be idle again after the turn completes"
+        );
     }
 
     #[tokio::test]

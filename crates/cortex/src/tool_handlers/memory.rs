@@ -5,9 +5,11 @@ use crate::config::media::MemoryProviderKind;
 use crate::config::Config;
 use crate::db::Database;
 use crate::memory::embeddings;
-use crate::memory::mmr;
 use crate::memory::injection::scan_for_injection;
-use crate::memory::provider::{self, format_hits, write_guarded, MemCtx, MemoryProvider, SearchQuery};
+use crate::memory::mmr;
+use crate::memory::provider::{
+    self, format_hits, write_guarded, MemCtx, MemoryProvider, SearchQuery,
+};
 use crate::memory::tokenizer::estimate_tokens;
 use crate::memory::{
     delete_memory_db, enforce_memory_size, read_memory_db, read_memory_db_or_not_found,
