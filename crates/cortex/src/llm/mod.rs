@@ -110,6 +110,7 @@ pub mod oauth_refresh;
 mod pricing;
 pub mod provider;
 pub mod rate_limit_headers;
+pub mod reasoning_timeouts;
 mod transport;
 pub(crate) mod vertex;
 
@@ -1900,6 +1901,18 @@ impl LlmClient {
         let stream = response.bytes_stream();
         let provider_str = self.provider.as_str().to_string();
         let model_str = self.llm_config.model.clone();
+        // Reasoning models can think for minutes before the first token; lift the
+        // per-chunk stall timeout to the model's floor so we don't idle-kill the
+        // socket mid-think and fire a spurious fallback. Never lowers a higher
+        // user config; a configured 0 (no timeout) is left as 0.
+        let chunk_timeout_secs = {
+            let configured = self.llm_config.stream_chunk_timeout_secs;
+            if configured == 0 {
+                0
+            } else {
+                configured.max(reasoning_timeouts::stale_timeout_floor_secs(&model_str))
+            }
+        };
         let mut state = transport.new_stream_state();
         let mut first_byte_ms: Option<u64> = None;
         let mut line_count: u64 = 0;
@@ -1911,7 +1924,7 @@ impl LlmClient {
                     stream,
                     tx,
                     cancel,
-                    self.llm_config.stream_chunk_timeout_secs,
+                    chunk_timeout_secs,
                     MAX_SSE_BUFFER,
                     |line| {
                         if first_byte_ms.is_none() {
@@ -1935,7 +1948,7 @@ impl LlmClient {
                     stream,
                     tx,
                     cancel,
-                    self.llm_config.stream_chunk_timeout_secs,
+                    chunk_timeout_secs,
                     MAX_SSE_BUFFER,
                     |payload| {
                         if first_byte_ms.is_none() {

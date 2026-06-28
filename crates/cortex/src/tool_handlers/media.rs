@@ -311,10 +311,11 @@ pub async fn handle_browser(
         }
         "evaluate_js" => {
             let expression = require_str_param(args, "expression")?;
+            let policy = &config.security.url_policy;
             browser_action_with_recovery!(
                 browser,
                 "evaluate_js",
-                browser.evaluate_js(expression, timeout).await
+                browser.evaluate_js(expression, timeout, policy).await
             )
         }
         "hover" => {

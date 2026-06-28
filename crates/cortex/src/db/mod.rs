@@ -324,9 +324,12 @@ impl Database {
             let _guard = RECOVERY_LOCK.lock().await;
             // Re-check under the lock; a concurrent opener may have fixed it.
             if Self::sqlite_home_is_blocking_file(path) {
-                let parent = path
-                    .parent()
-                    .expect("a blocking parent file implies the path has a parent");
+                let parent = path.parent().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "database path {} has no parent directory to recover",
+                        path.display()
+                    )
+                })?;
                 tracing::warn!(
                     "database parent {} is a regular file; preserving it and starting fresh",
                     parent.display()
@@ -513,6 +516,22 @@ impl Database {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .await
             .context("set synchronous=NORMAL")?;
+        // Durability barrier at WAL checkpoints on macOS. A plain `fsync()`
+        // there does NOT guarantee writes reach stable storage or stay
+        // ordered — Apple documents `F_FULLFSYNC` as the only call that does.
+        // SQLite's WAL crash-safety assumes the OS honors the fsync barrier;
+        // macOS doesn't unless the app asks for `F_FULLFSYNC`. During a system
+        // shutdown the page cache is dropped (effectively power-loss for
+        // in-flight pages), so a checkpoint whose fsync "reported" durable may
+        // never hit the platter — corrupting `borg.db`. `checkpoint_fullfsync`
+        // forces the barrier only at checkpoint boundaries (where WAL frames
+        // land in the main DB), amortizing to ~+0.1ms/commit vs the ~+4ms of a
+        // blanket `fullfsync`. `F_FULLFSYNC` is macOS-only, so we set it only
+        // there.
+        #[cfg(target_os = "macos")]
+        conn.execute_batch("PRAGMA checkpoint_fullfsync=ON;")
+            .await
+            .context("set checkpoint_fullfsync=ON")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .await
             .context("set foreign_keys=ON")?;
@@ -910,6 +929,31 @@ impl Database {
     }
 }
 
+/// macOS-only: every connection must enable `checkpoint_fullfsync` so WAL
+/// checkpoints issue the `F_FULLFSYNC` durability barrier. Asserts the live
+/// pragma value rather than grepping source, so it fails if the pragma is
+/// dropped, mistyped, or reordered before the connection is handed out.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_durability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_fullfsync_is_enabled() {
+        let db = Database::test_db().await;
+        let mut rows = db
+            .conn()
+            .query("PRAGMA checkpoint_fullfsync", ())
+            .await
+            .expect("query checkpoint_fullfsync");
+        let row = rows.next().await.expect("row").expect("one row");
+        assert_eq!(
+            row.get::<i64>(0).expect("int"),
+            1,
+            "checkpoint_fullfsync must be ON for the F_FULLFSYNC barrier"
+        );
+    }
+}
+
 /// Auto-recovery tests. Ungated (unlike the phase9 `tests` module) because
 /// they exercise the libsql-shaped open path directly. Each drives
 /// [`Database::open_at_recovering`] against a real temp file so the assertions
@@ -1004,7 +1048,10 @@ mod recovery_tests {
         );
 
         // The parent is now a directory holding a real, migrated database.
-        assert!(home.is_dir(), "a fresh data dir now sits where the file was");
+        assert!(
+            home.is_dir(),
+            "a fresh data dir now sits where the file was"
+        );
         assert!(path.is_file(), "a fresh db file now sits at the path");
         assert!(settings_table_present(&db).await);
     }

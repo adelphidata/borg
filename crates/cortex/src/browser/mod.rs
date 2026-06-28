@@ -436,23 +436,82 @@ impl BrowserSession {
 
     /// Evaluate a JavaScript expression with an inner Promise.race timeout
     /// to prevent CDP serialization deadlock from stuck JS.
+    ///
+    /// `navigate` runs every URL through the policy classifier, but a JS
+    /// expression can reach a private / cloud-metadata origin two ways that
+    /// bypass that path: an inline `fetch('http://169.254.169.254/...')` —
+    /// where the page URL stays public, so a post-eval recheck alone never
+    /// sees it — or `location.href='http://127.0.0.1/'` followed by reading
+    /// the document. We pre-scan the expression for blocked URL literals and
+    /// re-check the page's origin after the eval. Both use the no-DNS
+    /// classifier, so a string that merely *names* a non-resolving host can't
+    /// cause a false refusal; the real vectors (IP literals and metadata
+    /// hostnames) are caught without a network round-trip. The policy kill
+    /// switch and `allow_private_urls` are honoured exactly as for `navigate`.
+    ///
+    /// This is best-effort defense-in-depth, not a complete sandbox: a
+    /// `fetch` whose URL is obfuscated (string concat, char codes,
+    /// protocol-relative `//host/`) is not extractable and is out of scope —
+    /// the origin recheck only catches `location.href`-style navigation.
     #[instrument(skip_all, fields(browser.action = "evaluate_js"))]
-    pub async fn evaluate_js(&self, expression: &str, timeout: Duration) -> Result<String> {
+    pub async fn evaluate_js(
+        &self,
+        expression: &str,
+        timeout: Duration,
+        policy: &UrlPolicyConfig,
+    ) -> Result<String> {
+        if let Some(reason) = first_blocked_url_literal(expression, policy) {
+            anyhow::bail!("URL policy blocked JS expression: {reason}");
+        }
+
         let page = self.tab_manager.active_page();
         let inner_timeout_ms = self.config.js_eval_timeout_ms;
         let wrapped = wrap_js_with_timeout(expression, inner_timeout_ms);
 
-        tokio::time::timeout(timeout, async {
+        let result_str = tokio::time::timeout(timeout, async {
             let result: serde_json::Value = page
                 .evaluate(wrapped.as_str())
                 .await
                 .context("JS evaluation failed")?
                 .into_value()
                 .context("Failed to deserialize JS result")?;
-            Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
+            Ok::<_, anyhow::Error>(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
+            )
         })
         .await
-        .context("Evaluate JS timed out")?
+        .context("Evaluate JS timed out")??;
+
+        // The expression may have navigated the page to a disallowed origin
+        // (e.g. `location.href='http://127.0.0.1/'`). Refuse to return the
+        // result if so. Fail open if the current URL can't be read — matches
+        // navigate's best-effort posture — but warn so an operator can see the
+        // guard was skipped (per the no-silent-swallowing convention).
+        if policy.enabled {
+            match page.url().await {
+                Ok(Some(current_url)) => {
+                    if let ClassifyOutcome::Block { reason, rule } =
+                        url_policy::classify_offline(&current_url, policy)
+                    {
+                        anyhow::bail!(
+                            "evaluate_js blocked: page navigated to a disallowed origin during eval: {reason} (rule: {rule})"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "evaluate_js: page reported no URL; post-eval SSRF recheck skipped (failing open)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "evaluate_js: post-eval SSRF recheck skipped, page URL unreadable: {e} (failing open)"
+                    );
+                }
+            }
+        }
+
+        Ok(result_str)
     }
 
     // -- New Actions --
@@ -794,6 +853,66 @@ pub fn validate_url_scheme(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Scan a JS expression for `http`/`https` URL literals and return a
+/// human-readable reason for the first one the policy would block, if any.
+/// Uses the no-DNS classifier so a literal that merely names a non-resolving
+/// host can't trigger a false refusal; the SSRF vectors that matter — IP
+/// literals like `127.0.0.1` / `169.254.169.254` and cloud-metadata hostnames
+/// — are caught without a network round-trip. Returns `None` when the policy
+/// kill switch is off (parity with `navigate`, which is bypassed too).
+fn first_blocked_url_literal(expression: &str, policy: &UrlPolicyConfig) -> Option<String> {
+    if !policy.enabled {
+        return None;
+    }
+    for url in extract_url_literals(expression) {
+        if let ClassifyOutcome::Block { reason, rule } = url_policy::classify_offline(&url, policy)
+        {
+            return Some(format!("{url} — {reason} (rule: {rule})"));
+        }
+    }
+    None
+}
+
+/// Extract `http://` / `https://` URL-like substrings from arbitrary source
+/// text. A literal runs from the scheme up to the first character that can't
+/// appear unescaped in a URL embedded in code (quotes, whitespace, brackets,
+/// etc.). Over-extraction is harmless: each candidate is independently
+/// classified, and a non-URL substring simply won't match a block rule.
+///
+/// URL schemes are case-insensitive (`HTTP://1.2.3.4/` is a valid in-page
+/// request and the browser lowercases the scheme), so we scan a lowercased
+/// copy — otherwise an `HTTP://`/`Http://` literal would slip past the guard.
+/// The result feeds SSRF classification only, which normalizes scheme + host
+/// anyway, so emitting the lowercased form loses nothing.
+pub(crate) fn extract_url_literals(text: &str) -> Vec<String> {
+    const TERMINATORS: &[char] = &[
+        '\'', '"', '`', ' ', '\t', '\n', '\r', '<', '>', '(', ')', '[', ']', '{', '}', ',', ';',
+        '\\',
+    ];
+    let text = text.to_ascii_lowercase();
+    let text = text.as_str();
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("http") {
+        let start = search_from + rel;
+        let rest = &text[start..];
+        let scheme_len = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            // "http" not followed by a scheme separator — skip past it.
+            search_from = start + 4;
+            continue;
+        };
+        let after = &rest[scheme_len..];
+        let end = after.find(TERMINATORS).unwrap_or(after.len());
+        out.push(rest[..scheme_len + end].to_string());
+        search_from = start + scheme_len + end;
+    }
+    out
+}
+
 /// Wrap a JS expression with Promise.race for bounded evaluation.
 /// The inner timeout prevents CDP serialization deadlock from stuck JS.
 pub fn wrap_js_with_timeout(expression: &str, timeout_ms: u64) -> String {
@@ -813,6 +932,79 @@ pub fn wrap_js_with_timeout(expression: &str, timeout_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_url_literals_pulls_quoted_and_bare_urls() {
+        let expr = "fetch('http://127.0.0.1/secret').then(r=>r.text()); \
+                    const u=\"https://example.com/a?b=1\"; nope://x; http://no-scheme";
+        let urls = extract_url_literals(expr);
+        assert!(urls.contains(&"http://127.0.0.1/secret".to_string()));
+        assert!(urls.contains(&"https://example.com/a?b=1".to_string()));
+        // `nope://x` is not http(s); `http://no-scheme` is captured (bare, to EOL).
+        assert!(urls
+            .iter()
+            .all(|u| u.starts_with("http://") || u.starts_with("https://")));
+        assert!(!urls.iter().any(|u| u.starts_with("nope")));
+    }
+
+    #[test]
+    fn extract_url_literals_is_scheme_case_insensitive() {
+        // Schemes are case-insensitive in the browser; `HTTP://`/`Http://`
+        // must not slip past the extractor (regression: lowercase-only scan).
+        let urls =
+            extract_url_literals("fetch('HTTP://169.254.169.254/'); g('Https://EXAMPLE.com')");
+        assert!(urls.contains(&"http://169.254.169.254/".to_string()));
+        assert!(urls.contains(&"https://example.com".to_string()));
+    }
+
+    #[test]
+    fn eval_guard_blocks_loopback_and_metadata_literals() {
+        let policy = UrlPolicyConfig::default(); // enabled, allow_private_urls=false
+                                                 // Loopback fetch — the classic eval SSRF bypass.
+        assert!(first_blocked_url_literal(
+            "fetch('http://127.0.0.1/secret').then(r=>r.text())",
+            &policy
+        )
+        .is_some());
+        // Cloud-metadata endpoint stays blocked even by host name.
+        assert!(first_blocked_url_literal(
+            "fetch('http://169.254.169.254/latest/meta-data/')",
+            &policy
+        )
+        .is_some());
+        // …and the same with an uppercase scheme (case-insensitive bypass).
+        assert!(first_blocked_url_literal("fetch('HTTP://127.0.0.1/secret')", &policy).is_some());
+    }
+
+    #[test]
+    fn eval_guard_allows_public_urls_and_non_url_exprs() {
+        let policy = UrlPolicyConfig::default();
+        assert!(first_blocked_url_literal("document.body.innerText", &policy).is_none());
+        assert!(
+            first_blocked_url_literal("fetch('https://api.github.com/zen')", &policy).is_none()
+        );
+    }
+
+    #[test]
+    fn eval_guard_respects_kill_switch_and_allow_private() {
+        // Kill switch off → no guard (parity with navigate bypass).
+        let disabled = UrlPolicyConfig {
+            enabled: false,
+            ..UrlPolicyConfig::default()
+        };
+        assert!(first_blocked_url_literal("fetch('http://127.0.0.1/')", &disabled).is_none());
+
+        // Operator opted into private URLs → loopback is permitted, but
+        // cloud-metadata stays blocked (never a legitimate target).
+        let allow_private = UrlPolicyConfig {
+            allow_private_urls: true,
+            ..UrlPolicyConfig::default()
+        };
+        assert!(first_blocked_url_literal("fetch('http://127.0.0.1/')", &allow_private).is_none());
+        assert!(
+            first_blocked_url_literal("fetch('http://169.254.169.254/')", &allow_private).is_some()
+        );
+    }
 
     /// Schema-drift guard: every browser action surfaced in the tool
     /// JSON schema must be honoured by `validate_browser_args`. The schema

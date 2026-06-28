@@ -1507,8 +1507,16 @@ mod sub_agent_surface_tests {
             3,
         );
         assert!(
-            preamble.contains("<context trust=\"parent\">\nthe user prefers tabs\n</context>"),
-            "preamble must wrap context in trust-tagged block, got:\n{preamble}"
+            preamble.contains("<context trust=\"parent\">\n"),
+            "preamble must open a trust-tagged context block, got:\n{preamble}"
+        );
+        assert!(
+            preamble.contains("the user prefers tabs\n</context>"),
+            "preamble must carry the parent context verbatim, got:\n{preamble}"
+        );
+        assert!(
+            preamble.contains("Point-in-time snapshot from when you were spawned"),
+            "context block must carry the freshness frame so the child re-verifies stale handoffs, got:\n{preamble}"
         );
         assert!(
             preamble.contains("<goal>\ndo the thing\n</goal>"),

@@ -19,12 +19,22 @@ use super::{
     SubAgentStatus,
 };
 
+/// Prefixed to every parent-supplied `<context>` block so the child reads the
+/// handoff as a snapshot taken when it was spawned, not guaranteed-current
+/// truth. The parent's view can drift while the child runs (files change, tasks
+/// complete), and an LLM otherwise treats handed-down context as live fact
+/// regardless of age — so it's told to re-verify anything time-sensitive.
+const SUBAGENT_CONTEXT_FRESHNESS_NOTE: &str =
+    "[Point-in-time snapshot from when you were spawned — re-verify anything \
+     time-sensitive against the live source before acting on it.]";
+
 /// Render the child's initial user-message preamble: identity + role +
 /// delegation policy + workspace + optional context + goal.
 ///
 /// The structured `<context trust="parent">…</context>` and
 /// `<goal>…</goal>` blocks let the child parse intent unambiguously and
-/// give callers (and downstream tests) stable anchors to grep against.
+/// give callers (and downstream tests) stable anchors to grep against. The
+/// context block opens with [`SUBAGENT_CONTEXT_FRESHNESS_NOTE`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_subagent_preamble(
     nickname: &str,
@@ -86,6 +96,11 @@ pub fn build_subagent_preamble(
 
     if let Some(ctx) = context {
         if !ctx.is_empty() {
+            // Frame sits OUTSIDE the trust boundary: it's our own trusted
+            // directive, so keep it clear of the lower-trust parent content
+            // (which could carry an injection payload).
+            out.push_str(SUBAGENT_CONTEXT_FRESHNESS_NOTE);
+            out.push('\n');
             out.push_str("<context trust=\"parent\">\n");
             out.push_str(ctx);
             if !ctx.ends_with('\n') {
