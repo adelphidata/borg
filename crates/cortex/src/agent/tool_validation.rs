@@ -231,10 +231,25 @@ pub(super) fn partition_tool_calls(
             continue;
         }
         if ptc.name.is_empty() {
+            // A tool call with an id but no name is a "phantom" the model can
+            // loop on. Unlike a missing id, this one is addressable, so we feed
+            // back a terse error instead of silently dropping it — silence
+            // gives the model no signal and it re-emits the same empty call.
+            // We can't echo an empty function name to the provider (Anthropic /
+            // OpenAI reject a nameless tool_use block), so the synthetic call
+            // carries a placeholder name; the reason stays terse so we don't
+            // prime further bad calls with a tool-catalog dump.
             warn!(
-                "Dropping unaddressable tool call (id={}, missing name)",
+                "Surfacing terse error for unnamed tool call (id={})",
                 ptc.id
             );
+            invalid.push(InvalidToolCall {
+                id: ptc.id.clone(),
+                name: "(missing name)".to_string(),
+                reason: "tool call had no tool name — re-issue the call with a valid tool name"
+                    .to_string(),
+                raw_arguments: ptc.arguments.clone(),
+            });
             continue;
         }
         if ptc.name.len() > constants::MAX_TOOL_NAME_LEN {
@@ -598,14 +613,40 @@ mod tests {
     }
 
     #[test]
-    fn partition_tool_calls_drops_unaddressable_calls() {
-        let calls = vec![ptc("", "apply_patch", "{}"), ptc("call_1", "", "{}")];
+    fn partition_tool_calls_drops_calls_with_no_id() {
+        // No id → no way to address a synthetic tool_result, so it stays dropped.
+        let calls = vec![ptc("", "apply_patch", "{}")];
         let (valid, invalid) = partition_tool_calls(&calls, false);
         assert!(valid.is_empty());
         assert!(
             invalid.is_empty(),
-            "unaddressable calls must not be promoted to invalid bucket — \
-             we have no id to address a synthetic tool_result to",
+            "a call with no id must not be promoted to invalid — nothing to address",
+        );
+    }
+
+    #[test]
+    fn partition_tool_calls_surfaces_terse_error_for_unnamed_call() {
+        // id present but no name: addressable phantom. It must produce a terse
+        // invalid result (so the model gets feedback and stops looping) rather
+        // than being silently dropped, and must carry a non-empty placeholder
+        // name so the echoed tool_call doesn't violate the provider contract.
+        let calls = vec![ptc("call_1", "", "{}")];
+        let (valid, invalid) = partition_tool_calls(&calls, false);
+        assert!(valid.is_empty());
+        assert_eq!(
+            invalid.len(),
+            1,
+            "unnamed-but-addressable call must be surfaced"
+        );
+        assert_eq!(invalid[0].id, "call_1");
+        assert!(
+            !invalid[0].name.is_empty(),
+            "echoed tool_call must not have an empty name (provider rejects it)",
+        );
+        assert!(
+            invalid[0].reason.contains("no tool name"),
+            "reason must tell the model the name was missing, got: {}",
+            invalid[0].reason,
         );
     }
 

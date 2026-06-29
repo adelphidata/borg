@@ -102,8 +102,13 @@ pub fn build_subagent_preamble(
             out.push_str(SUBAGENT_CONTEXT_FRESHNESS_NOTE);
             out.push('\n');
             out.push_str("<context trust=\"parent\">\n");
-            out.push_str(ctx);
-            if !ctx.ends_with('\n') {
+            // Neutralize any embedded `</context>` (or other boundary close
+            // tag) so parent-supplied content can't break out of the trust
+            // frame and smuggle text in adjacent to the goal as if it were our
+            // own directive.
+            let safe_ctx = crate::security::sanitize::sanitize_xml_boundaries(ctx);
+            out.push_str(&safe_ctx);
+            if !safe_ctx.ends_with('\n') {
                 out.push('\n');
             }
             out.push_str("</context>\n\n");
@@ -111,8 +116,11 @@ pub fn build_subagent_preamble(
     }
 
     out.push_str("<goal>\n");
-    out.push_str(goal);
-    if !goal.ends_with('\n') {
+    // Same breakout guard for the goal block — a smuggled `</goal>` would let
+    // following text escape the framing.
+    let safe_goal = crate::security::sanitize::sanitize_xml_boundaries(goal);
+    out.push_str(&safe_goal);
+    if !safe_goal.ends_with('\n') {
         out.push('\n');
     }
     out.push_str("</goal>\n");

@@ -410,6 +410,38 @@ fn reload_config_clears_skills_and_replaces_credentials_preserving_identity() {
     );
 }
 
+/// Starting a new session must drop the system-prompt input caches, or a
+/// long-lived `Agent` reused across the reset would render the next session's
+/// prompt from the prior session's cached IDENTITY.md / credential values —
+/// a stale-context leak across the session boundary.
+#[tokio::test]
+async fn new_session_clears_system_prompt_caches() {
+    let mut agent = minimal_test_agent(Config::default());
+    agent.caches = SystemPromptCache::with_test_state(
+        Some("prior-identity".into()),
+        Some(HashMap::from([("PRIOR_TOKEN".into(), "v".into())])),
+        Some("prior-skills".into()),
+        Some("prior-request".into()),
+        Some(vec!["pdf".into()]),
+    );
+
+    agent.new_session().await;
+
+    assert_eq!(
+        agent.caches.identity_for_test(),
+        None,
+        "prior-session identity must not survive a new session"
+    );
+    assert!(
+        !agent.credentials_cached().contains_key("PRIOR_TOKEN"),
+        "prior-session credentials must not survive a new session"
+    );
+    assert!(
+        agent.caches.skills_context_for_test().is_none(),
+        "prior-session skills context must not survive a new session"
+    );
+}
+
 #[test]
 fn unknown_tools_default_to_mutating() {
     // New/unknown tools should be blocked by default (safety)
@@ -1232,5 +1264,44 @@ async fn tool_output_truncation_honors_configured_cap() {
     assert!(
         out.contains("omitted"),
         "truncated output must carry the disclosure marker: {out}"
+    );
+}
+
+#[tokio::test]
+async fn tool_output_truncation_clamps_to_model_context_window() {
+    // A fixed per-result cap ignores the model: a generous configured ceiling
+    // would let one tool result exceed a small-context model's whole window.
+    // The cap must additionally clamp to a quarter of the active window.
+    let raw = "abcd ".repeat(3000); // ~3.7k tokens — above gpt-4's 8192/4 = 2048 cap
+
+    // Small-context model (gpt-4 = 8192) with an effectively unbounded
+    // configured cap → the window clamp must still truncate.
+    let mut small = Config::default();
+    small.conversation.tool_output_max_tokens = 1_000_000;
+    small.llm.model = "gpt-4".to_string();
+    let small_agent = Agent::new(small, BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    let small_out = small_agent.truncate_and_redact(&raw);
+    assert!(
+        small_out.len() < raw.len() && small_out.contains("omitted"),
+        "small-context model must clamp tool output to ~window/4 despite a huge \
+         configured cap, got len {} of {}",
+        small_out.len(),
+        raw.len(),
+    );
+
+    // Control: a large-context model (default 200k window) with the same huge
+    // configured cap must NOT truncate the same input — proving the clamp, not
+    // the configured cap, did the work above.
+    let mut large = Config::default();
+    large.conversation.tool_output_max_tokens = 1_000_000;
+    let large_agent = Agent::new(large, BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    let large_out = large_agent.truncate_and_redact(&raw);
+    assert!(
+        !large_out.contains("omitted"),
+        "large-context model must not truncate a ~3.7k-token output under a huge cap"
     );
 }

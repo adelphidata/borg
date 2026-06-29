@@ -255,7 +255,10 @@ pub async fn handle_browser(
         }
         "screenshot" => {
             let selector = args.get("selector").and_then(|v| v.as_str());
-            match browser.screenshot(selector, timeout).await {
+            match browser
+                .screenshot(selector, timeout, &config.security.url_policy)
+                .await
+            {
                 Ok((desc, png_bytes)) => {
                     let saved_path = Config::data_dir().ok().and_then(|data_dir| {
                         let dir = data_dir.join("screenshots");
@@ -306,7 +309,9 @@ pub async fn handle_browser(
             browser_action_with_recovery!(
                 browser,
                 "get_text",
-                browser.get_text(selector, timeout).await
+                browser
+                    .get_text(selector, timeout, &config.security.url_policy)
+                    .await
             )
         }
         "evaluate_js" => {
@@ -413,10 +418,20 @@ pub async fn handle_browser(
                 .get("max_elements")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize);
-            browser_result(browser.snapshot(cap, timeout).await)
+            browser_result(
+                browser
+                    .snapshot(cap, timeout, &config.security.url_policy)
+                    .await,
+            )
         }
         "get_images" => {
-            browser_action_with_recovery!(browser, "get_images", browser.get_images(timeout).await)
+            browser_action_with_recovery!(
+                browser,
+                "get_images",
+                browser
+                    .get_images(timeout, &config.security.url_policy)
+                    .await
+            )
         }
         "upload" => {
             let selector = require_str_param(args, "selector")?;

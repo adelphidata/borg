@@ -373,7 +373,10 @@ impl BrowserSession {
         &self,
         selector: Option<&str>,
         timeout: Duration,
+        policy: &UrlPolicyConfig,
     ) -> Result<(String, Vec<u8>)> {
+        self.ensure_active_origin_allowed("screenshot", policy)
+            .await?;
         let page = self.tab_manager.active_page();
         tokio::time::timeout(timeout, async {
             if let Some(sel) = selector {
@@ -404,7 +407,14 @@ impl BrowserSession {
 
     /// Get text content from the page or a specific element.
     #[instrument(skip_all, fields(browser.action = "get_text"))]
-    pub async fn get_text(&self, selector: Option<&str>, timeout: Duration) -> Result<String> {
+    pub async fn get_text(
+        &self,
+        selector: Option<&str>,
+        timeout: Duration,
+        policy: &UrlPolicyConfig,
+    ) -> Result<String> {
+        self.ensure_active_origin_allowed("get_text", policy)
+            .await?;
         let page = self.tab_manager.active_page();
         tokio::time::timeout(timeout, async {
             if let Some(sel) = selector {
@@ -484,34 +494,64 @@ impl BrowserSession {
 
         // The expression may have navigated the page to a disallowed origin
         // (e.g. `location.href='http://127.0.0.1/'`). Refuse to return the
-        // result if so. Fail open if the current URL can't be read — matches
-        // navigate's best-effort posture — but warn so an operator can see the
-        // guard was skipped (per the no-silent-swallowing convention).
-        if policy.enabled {
-            match page.url().await {
-                Ok(Some(current_url)) => {
-                    if let ClassifyOutcome::Block { reason, rule } =
-                        url_policy::classify_offline(&current_url, policy)
-                    {
+        // result if so.
+        self.ensure_active_origin_allowed("evaluate_js", policy)
+            .await?;
+
+        Ok(result_str)
+    }
+
+    /// Refuse to act on the active page when its origin is blocked by the URL
+    /// policy as a *network* destination — a private IP or cloud-metadata host.
+    ///
+    /// A prior `evaluate_js` can drive the page to such an origin via
+    /// `location.href`; that call's own recheck only fires during the eval, so
+    /// a later `screenshot` / `snapshot` / `get_images` / `get_text` would
+    /// otherwise read and return the private page's content. This shared guard
+    /// closes that window for every page-data reader.
+    ///
+    /// Non-http(s) schemes (`about:blank`, `data:`, `blob:`, …) are *not*
+    /// violations: they aren't network exfiltration, and a freshly opened tab
+    /// legitimately sits on `about:blank`. We therefore ignore the
+    /// `scheme_blocked` rule and act only on the SSRF rules (`private_ip`,
+    /// `cloud_metadata`, host blocklist).
+    ///
+    /// Best-effort, fail-open: when the page URL can't be read we warn and
+    /// allow, matching `navigate`'s posture and the no-silent-swallowing
+    /// convention (the alternative — failing closed on a transient CDP read
+    /// error — would spuriously refuse legitimate reads).
+    async fn ensure_active_origin_allowed(
+        &self,
+        action: &str,
+        policy: &UrlPolicyConfig,
+    ) -> Result<()> {
+        if !policy.enabled {
+            return Ok(());
+        }
+        match self.tab_manager.active_page().url().await {
+            Ok(Some(current_url)) => {
+                if let ClassifyOutcome::Block { reason, rule } =
+                    url_policy::classify_offline(&current_url, policy)
+                {
+                    if rule != "scheme_blocked" {
                         anyhow::bail!(
-                            "evaluate_js blocked: page navigated to a disallowed origin during eval: {reason} (rule: {rule})"
+                            "{action} blocked: active page is on a disallowed origin: {reason} (rule: {rule})"
                         );
                     }
                 }
-                Ok(None) => {
-                    tracing::warn!(
-                        "evaluate_js: page reported no URL; post-eval SSRF recheck skipped (failing open)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "evaluate_js: post-eval SSRF recheck skipped, page URL unreadable: {e} (failing open)"
-                    );
-                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "{action}: page reported no URL; SSRF origin recheck skipped (failing open)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{action}: SSRF origin recheck skipped, page URL unreadable: {e} (failing open)"
+                );
             }
         }
-
-        Ok(result_str)
+        Ok(())
     }
 
     // -- New Actions --
@@ -608,7 +648,10 @@ impl BrowserSession {
         &mut self,
         max_elements: Option<usize>,
         timeout: Duration,
+        policy: &UrlPolicyConfig,
     ) -> Result<String> {
+        self.ensure_active_origin_allowed("snapshot", policy)
+            .await?;
         let cap = max_elements.unwrap_or(self.config.snapshot_max_elements);
         let page = self.tab_manager.active_page();
         let result = snapshot::snapshot(page, cap, timeout).await?;
@@ -618,7 +661,9 @@ impl BrowserSession {
 
     /// Enumerate `<img>` elements on the page.
     #[instrument(skip_all, fields(browser.action = "get_images"))]
-    pub async fn get_images(&self, timeout: Duration) -> Result<String> {
+    pub async fn get_images(&self, timeout: Duration, policy: &UrlPolicyConfig) -> Result<String> {
+        self.ensure_active_origin_allowed("get_images", policy)
+            .await?;
         let js = r#"(() => {
             const imgs = Array.from(document.querySelectorAll('img'));
             return imgs.map(i => ({
@@ -884,13 +929,17 @@ fn first_blocked_url_literal(expression: &str, policy: &UrlPolicyConfig) -> Opti
 /// copy — otherwise an `HTTP://`/`Http://` literal would slip past the guard.
 /// The result feeds SSRF classification only, which normalizes scheme + host
 /// anyway, so emitting the lowercased form loses nothing.
+///
+/// We also collapse the one-character escape `\/` → `/` first, so the common
+/// JS/JSON form `fetch("http:\/\/169.254.169.254/")` is recognised as a URL
+/// literal rather than slipping past the scan. Heavier obfuscation (char
+/// codes, `/`, string concat) remains out of scope — see `evaluate_js`.
 pub(crate) fn extract_url_literals(text: &str) -> Vec<String> {
     const TERMINATORS: &[char] = &[
         '\'', '"', '`', ' ', '\t', '\n', '\r', '<', '>', '(', ')', '[', ']', '{', '}', ',', ';',
         '\\',
     ];
-    let text = text.to_ascii_lowercase();
-    let text = text.as_str();
+    let text = text.to_ascii_lowercase().replace("\\/", "/");
     let mut out = Vec::new();
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find("http") {
@@ -955,6 +1004,29 @@ mod tests {
             extract_url_literals("fetch('HTTP://169.254.169.254/'); g('Https://EXAMPLE.com')");
         assert!(urls.contains(&"http://169.254.169.254/".to_string()));
         assert!(urls.contains(&"https://example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_url_literals_normalizes_escaped_slashes() {
+        // The common JS/JSON escape form `http:\/\/host` must be recognised —
+        // a one-character obfuscation that otherwise slips past the scan and
+        // reaches the cloud-metadata endpoint (SSRF bypass).
+        let urls = extract_url_literals(r#"fetch("http:\/\/169.254.169.254\/latest")"#);
+        assert!(
+            urls.contains(&"http://169.254.169.254/latest".to_string()),
+            "escaped-slash URL not extracted: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn eval_guard_blocks_escaped_slash_metadata_literal() {
+        // Regression: `fetch("http:\/\/169.254.169.254/")` previously bypassed
+        // the pre-scan because the bytes were `http:\/`, not `http://`.
+        let policy = UrlPolicyConfig::default();
+        assert!(
+            first_blocked_url_literal(r#"fetch("http:\/\/169.254.169.254\/meta")"#, &policy)
+                .is_some()
+        );
     }
 
     #[test]

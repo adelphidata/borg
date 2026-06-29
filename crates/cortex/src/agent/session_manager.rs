@@ -58,6 +58,12 @@ impl Agent {
         // Don't carry a prior session's failover identity into a new session —
         // its first turn runs on the configured primary until proven otherwise.
         self.active_failover_identity = None;
+        // Drop the system-prompt input caches (identity, resolved credentials,
+        // project docs, skills). Otherwise a long-lived `Agent` reused across a
+        // reset would assemble the new session's prompt from the prior session's
+        // cached IDENTITY.md / .env values — a stale-context leak. They lazily
+        // reload on the next turn.
+        self.caches = super::system_prompt_cache::SystemPromptCache::default();
 
         // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(
@@ -172,11 +178,18 @@ impl Agent {
     }
 
     /// Truncate and optionally redact secrets from raw tool output.
+    ///
+    /// The configured `tool_output_max_tokens` (default 10k) is a fixed ceiling
+    /// that ignores the model — on a small-context model a single 10k-token
+    /// tool result is larger than the entire window and crowds out history. We
+    /// clamp the per-result cap to a quarter of the active context window so
+    /// one result can never dominate, while large-context models keep the
+    /// configured ceiling unchanged.
     pub(super) fn truncate_and_redact(&self, raw: &str) -> String {
-        self.maybe_redact(truncate_output(
-            raw,
-            self.config.conversation.tool_output_max_tokens,
-        ))
+        let configured = self.config.conversation.tool_output_max_tokens;
+        let window_cap = (self.active_context_window() as usize / 4).max(256);
+        let effective = configured.min(window_cap);
+        self.maybe_redact(truncate_output(raw, effective))
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.

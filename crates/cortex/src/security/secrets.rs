@@ -53,6 +53,19 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             "Database Connection String",
             false,
         ),
+        // Bare-token credential in a URL's userinfo, e.g.
+        // `git remote set-url origin https://ghp_xxx@github.com/org/repo`. The
+        // `user:pass@` form (with a colon) is left to the connection-string /
+        // generic patterns; this targets the single-token form a colon-based
+        // pattern misses. Requiring 20+ userinfo chars avoids redacting an
+        // ordinary `https://user@host` username. The whole URL is masked
+        // (not just the token) because the secret sits mid-match — preserving
+        // the host would require a lookahead the regex crate lacks.
+        (
+            r"(?:https?|ssh|git\+https?)://[A-Za-z0-9._~%+-]{20,}@\S+",
+            "URL Credential",
+            false,
+        ),
         // HTTP auth headers. capture_only=true masks only the credential value and
         // keeps the header name + scheme word visible for debuggability, e.g.
         // `Authorization: Bearer [REDACTED Authorization Header]`. Covers the common
@@ -76,8 +89,13 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // The replace closure skips values already starting with "[REDACTED" to avoid
         // double-redacting values already handled by an earlier specific pattern
         // (Rust's regex crate does not support lookahead assertions).
+        //
+        // The key prefix is `[\w.]*` (not `\w*`) so dotted/namespaced config keys
+        // — `spring.datasource.password=…`, `app.config.api_key=…`, Java
+        // `.properties` files — are covered, not just bare `API_KEY=…`. Dots are
+        // a superset of the prior word-char prefix, so no existing match is lost.
         (
-            r"(?i)(?:^|[\s;])(?:export\s+)?(?:\w*(?:PASSWORD|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
+            r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
             "Credential Assignment",
             true,
         ),
@@ -189,6 +207,7 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     r#"password="super-secret-shh""#,
     "password=hunter2trustno1",
     "postgresql://user:hunter2pw@localhost:5432/mydb",
+    "https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk@github.com/org/repo",
     "Authorization: Bearer abcDEF123456ghiJKL789",
     "x-api-key: AbCdEf0123456789TokenValue",
     "API_KEY=AbCdEf0123456789TokenValue",
@@ -215,6 +234,39 @@ mod tests {
             !result.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
             "raw token must not survive redaction: {result}"
         );
+    }
+
+    #[test]
+    fn redacts_bare_token_url_credential() {
+        // A PAT in URL userinfo (e.g. from `git remote set-url`) must not leak.
+        let input = "remote: https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk@github.com/org/repo";
+        let result = redact_secrets(input);
+        assert!(
+            !result.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+            "bare URL token must not survive redaction: {result}"
+        );
+        assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn redacts_dotted_config_key_credential() {
+        // Namespaced/dotted keys ending in a credential word were missed by the
+        // word-char-only prefix; they must now be masked.
+        for input in [
+            "spring.datasource.password=hunter2trustno1",
+            "app.config.api_key=AbCdEf0123456789TokenValue",
+        ] {
+            let result = redact_secrets(input);
+            assert!(
+                result.contains("[REDACTED"),
+                "dotted config key not redacted: {input} -> {result}"
+            );
+            assert!(
+                !result.contains("hunter2trustno1")
+                    && !result.contains("AbCdEf0123456789TokenValue"),
+                "dotted config value leaked: {result}"
+            );
+        }
     }
 
     #[test]
