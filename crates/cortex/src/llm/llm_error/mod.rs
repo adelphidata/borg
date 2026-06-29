@@ -9,8 +9,8 @@ mod retry;
 
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
-    body_indicates_context_overflow, body_indicates_expired_credential,
-    body_indicates_no_allowed_providers, body_mentions_model,
+    body_indicates_cloudflare_block, body_indicates_context_overflow,
+    body_indicates_expired_credential, body_indicates_no_allowed_providers, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
@@ -257,6 +257,20 @@ pub(crate) fn classify_status(
             LlmError::Fatal {
                 source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
                 reason,
+            }
+        }
+        403 if body_indicates_cloudflare_block(body) => {
+            // A Cloudflare edge block (restricted region, flagged VPN/proxy, or
+            // a WAF rule) is not a credential problem — rotating keys or trying
+            // the next provider over the same blocked egress won't recover it.
+            // Surface an actionable network/region hint and keep the existing
+            // 403 handling (`AuthPermanent`: no rotate, no fallback, fast-fail)
+            // so the user acts on the real cause instead of burning retries.
+            LlmError::Fatal {
+                source: anyhow::anyhow!(
+                    "{provider} returned 403 (request blocked by Cloudflare — usually a restricted region or a flagged VPN/proxy; try a different network or region): {safe}"
+                ),
+                reason: FailoverReason::AuthPermanent,
             }
         }
         403 => LlmError::Fatal {
@@ -523,6 +537,45 @@ mod tests {
         );
         assert!(!err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+    }
+
+    #[test]
+    fn classify_403_cloudflare_block_is_actionable_region_hint() {
+        // Cloudflare interstitial HTML returned with a 403 when the egress IP is
+        // blocked. Must surface a network/region hint rather than the opaque
+        // "auth permanent" message, while keeping AuthPermanent semantics so the
+        // agent fast-fails instead of rotating keys over the same blocked egress.
+        let body =
+            "<html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked<br>Cloudflare Ray ID: 8a1b2c3d</body></html>";
+        let err = classify_status(reqwest::StatusCode::FORBIDDEN, body, Provider::OpenRouter);
+        assert!(!err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        assert!(
+            !err.should_rotate_credential(),
+            "a Cloudflare block must not rotate credentials"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Cloudflare"),
+            "expected Cloudflare attribution, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("restricted region") || rendered.contains("VPN/proxy"),
+            "expected actionable region/network hint, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn classify_403_generic_forbidden_stays_plain_auth_permanent() {
+        // A non-Cloudflare 403 (genuine account/permission denial) must NOT be
+        // rewritten into the Cloudflare-specific message.
+        let err = classify_status(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"You do not have access to this model"}}"#,
+            Provider::Anthropic,
+        );
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        assert!(!err.to_string().contains("Cloudflare"));
     }
 
     #[test]

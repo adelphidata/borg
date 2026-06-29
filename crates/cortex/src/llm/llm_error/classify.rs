@@ -156,6 +156,26 @@ pub(super) fn body_indicates_expired_credential(body: &str) -> bool {
         || (lower.contains("security token") && lower.contains("expired"))
 }
 
+/// True when a 403 body is a Cloudflare edge block rather than a provider
+/// auth/permission denial. Cloudflare fronts several LLM providers; when an
+/// egress IP is blocked (commonly a restricted region, a flagged VPN/proxy, or
+/// a WAF rule) it answers with a 403 HTML interstitial naming Cloudflare and a
+/// "blocked"/"Sorry, you have been blocked" phrase. Rotating API keys cannot
+/// fix this, so it routes to a "this looks like a network/region block" message
+/// instead of the generic permission-denied error.
+pub(super) fn body_indicates_cloudflare_block(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Require both the Cloudflare attribution AND a *block-interstitial* phrase
+    // specific to the edge-block page ("Attention Required! | Cloudflare",
+    // "Sorry, you have been blocked"). Deliberately NOT a bare "blocked": a real
+    // account/permission 403 proxied through Cloudflare can say "your account has
+    // been blocked", and a bare Ray ID rides on every Cloudflare-proxied response
+    // — keying on either would mislabel a genuine credential/permission denial as
+    // a network/region block and send the user chasing their VPN instead.
+    lower.contains("cloudflare")
+        && (lower.contains("you have been blocked") || lower.contains("attention required"))
+}
+
 /// True when an OpenRouter 404 body indicates the account's provider filters
 /// blocked every upstream that serves the model — distinct from "model not
 /// found" even though both return 404. Example body:
