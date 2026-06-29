@@ -809,8 +809,6 @@ mod tests {
         assert!(filtered.iter().all(|r| r.2 >= 0.2));
     }
 
-    // -- provider cache --
-
     #[test]
     fn get_or_init_provider_returns_none_when_disabled() {
         invalidate_provider_cache();
@@ -901,8 +899,6 @@ mod tests {
         assert!((a_score - 0.9).abs() < 1e-6);
     }
 
-    // -- EmbeddingProvider::from_config --
-
     #[test]
     fn from_config_disabled_returns_none() {
         let config = EmbeddingsConfig {
@@ -935,8 +931,6 @@ mod tests {
         };
         assert!(EmbeddingProvider::from_config(&config).is_none());
     }
-
-    // -- provider_tag / cache_model_key --
 
     #[test]
     fn from_config_populates_provider_tag() {
@@ -1059,8 +1053,6 @@ mod tests {
         assert_eq!(bytes_b, vec![9, 9]);
     }
 
-    // -- find_provider_meta --
-
     #[test]
     fn find_provider_meta_known_providers() {
         assert_eq!(
@@ -1081,8 +1073,6 @@ mod tests {
     fn find_provider_meta_unknown_returns_none() {
         assert!(find_provider_meta("somethingelse").is_none());
     }
-
-    // -- config_fingerprint --
 
     #[test]
     fn config_fingerprint_deterministic() {
@@ -1109,8 +1099,6 @@ mod tests {
         assert_ne!(config_fingerprint(&c1), config_fingerprint(&c2));
     }
 
-    // -- bytes_to_embedding edge case --
-
     #[test]
     fn bytes_to_embedding_unaligned_returns_empty() {
         let result = bytes_to_embedding(&[1, 2, 3]); // 3 bytes, not aligned to 4
@@ -1123,16 +1111,12 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // -- cosine_similarity edge case --
-
     #[test]
     fn cosine_similarity_zero_vector() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
     }
-
-    // -- adaptive hybrid merge --
 
     #[test]
     fn merge_empty_vector_uses_fts_only() {

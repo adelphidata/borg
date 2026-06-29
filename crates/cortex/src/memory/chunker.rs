@@ -346,8 +346,6 @@ mod tests {
         assert!(chunks.len() >= 2);
     }
 
-    // -- markdown-aware tests --
-
     #[test]
     fn chunk_preserves_code_fence() {
         // Code fence block should never be split

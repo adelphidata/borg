@@ -440,7 +440,6 @@ impl Agent {
         }
     }
 
-    /// Create a new agent with the given config and metrics.
     pub async fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
         let common = build_common(&config).await?;
         let agent_control = if config.agents.enabled {

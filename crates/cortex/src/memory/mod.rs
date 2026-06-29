@@ -1165,8 +1165,6 @@ mod tests {
         assert!(enforce_memory_size("big", "global", MEMORY_ENTRY_REJECT_TOKENS + 5_000).is_err());
     }
 
-    // -- extra paths tests --
-
     #[test]
     fn scan_extra_paths_empty() {
         let files = scan_extra_paths(&[], &[]);

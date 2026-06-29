@@ -371,7 +371,6 @@ pub enum AgentControlError {
 }
 
 impl AgentControl {
-    /// Create a new controller for the given parent session and depth.
     pub fn new(
         config: &crate::config::MultiAgentConfig,
         parent_session_id: &str,

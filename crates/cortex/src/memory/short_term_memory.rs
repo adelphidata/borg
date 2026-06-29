@@ -61,7 +61,6 @@ pub struct ShortTermMemory {
 }
 
 impl ShortTermMemory {
-    /// Create a new empty short-term memory buffer.
     pub fn new(session_id: String, max_tokens: usize) -> Self {
         Self {
             session_id,
