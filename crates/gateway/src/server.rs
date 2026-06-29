@@ -328,6 +328,9 @@ impl GatewayServer {
         .is_some();
 
         if probe_ok {
+            // Another instance owns the port. Park until shutdown instead of
+            // erroring so the supervisor doesn't treat this as a crash and
+            // respawn-loop against the live instance.
             info!("Gateway already running on {addr}, skipping bind");
             self.shutdown.cancelled().await;
             return Ok(());

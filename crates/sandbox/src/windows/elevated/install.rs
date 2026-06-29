@@ -59,6 +59,7 @@ mod ffi {
     use super::super::setup::{self, SetupRecord, SCHEMA_VERSION};
     use crate::windows::dpapi;
     use crate::windows::wfp;
+    use crate::windows::AUDIT_TARGET;
 
     /// True if the current process token is elevated (running as admin).
     fn is_elevated() -> io::Result<bool> {
@@ -121,7 +122,7 @@ mod ffi {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
-                    target = "borg.sandbox.audit",
+                    target = AUDIT_TARGET,
                     error = %e,
                     "WFP offline block install failed; network=false will not be \
                      enforced at the kernel layer for the offline account",

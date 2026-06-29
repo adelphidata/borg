@@ -115,6 +115,10 @@ pub const RUNNER_SUBCOMMAND: &str = "__windows-sandbox-runner";
 /// Argument name carrying the runner's named-pipe path.
 pub const RUNNER_PIPE_ARG: &str = "--pipe";
 
+/// Value of the `target` field tagging sandbox audit events. A single
+/// constant keeps every emit site in agreement.
+pub(crate) const AUDIT_TARGET: &str = "borg.sandbox.audit";
+
 /// Extract the value following `--pipe` from the runner subcommand's
 /// argv (the slice *after* the `__windows-sandbox-runner` token).
 /// Platform-neutral so the argv-shape contract is testable everywhere;

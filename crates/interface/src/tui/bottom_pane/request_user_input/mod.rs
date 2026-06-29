@@ -160,7 +160,7 @@ impl RequestUserInputOverlay {
         self.current().options.len() + 1
     }
 
-    // ----- Geometric accessors consumed by layout.rs ---------------------
+    // Geometric accessors consumed by layout.rs.
 
     /// `true` when there are selectable options to render. `parse_questions`
     /// enforces ≥ 2 options per question and always auto-appends "Other", so
@@ -224,7 +224,7 @@ impl RequestUserInputOverlay {
         1
     }
 
-    // ----- State machine -------------------------------------------------
+    // State machine.
 
     /// Index of the auto-appended "Other" row for the current question.
     /// Always `current().options.len()`.

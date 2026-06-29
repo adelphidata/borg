@@ -255,7 +255,7 @@ impl RequestUserInputOverlay {
         Paragraph::new(Line::from(spans)).render(row, buf);
     }
 
-    // ----- Helpers consumed only by render ------------------------------
+    // Helpers consumed only by render.
 
     /// `true` when the current question already has at least one selection
     /// or a non-empty note. Used to drop the question's "unanswered" cyan

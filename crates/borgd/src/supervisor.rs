@@ -319,6 +319,9 @@ async fn supervised_loop<F, Fut, E>(
             .saturating_mul(1u32 << exp.saturating_sub(1));
         let backoff = raw_backoff.min(cfg.max_backoff);
 
+        // Fair select (no `biased`): on a backoff-vs-cancel tie either arm is
+        // safe — if sleep wins the loop head re-checks `cancel.is_cancelled()`
+        // and returns before respawning.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
             _ = cancel.cancelled() => return,

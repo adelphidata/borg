@@ -2,9 +2,9 @@ use ratatui::style::{Color, Modifier, Style};
 
 use super::themes;
 
-// Color accessors read from the active theme's palette every render. The
-// previous module-level color constants were removed on purpose so a stale
-// reference is a compile-time error rather than a silent legacy color.
+// Color accessors read from the active theme's palette every render. There are
+// deliberately no module-level color constants, so a stale reference is a
+// compile-time error rather than a silent legacy color.
 
 #[inline]
 pub fn cyan() -> Color {

@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::windows::AUDIT_TARGET;
+
 /// Current schema version. Bump only when the on-disk meaning of an
 /// existing field changes, or a new field becomes load-bearing.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -112,7 +114,7 @@ pub fn load(path: &Path) -> Option<SetupRecord> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             tracing::warn!(
-                target = "borg.sandbox.audit",
+                target = AUDIT_TARGET,
                 path = %path.display(),
                 error = %e,
                 "sandbox setup.json read failed; falling back to Tier 1",
@@ -124,7 +126,7 @@ pub fn load(path: &Path) -> Option<SetupRecord> {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
-                target = "borg.sandbox.audit",
+                target = AUDIT_TARGET,
                 path = %path.display(),
                 error = %e,
                 "sandbox setup.json malformed; falling back to Tier 1",
@@ -134,7 +136,7 @@ pub fn load(path: &Path) -> Option<SetupRecord> {
     };
     if record.schema_version < MIN_SCHEMA_VERSION || record.schema_version > SCHEMA_VERSION {
         tracing::warn!(
-            target = "borg.sandbox.audit",
+            target = AUDIT_TARGET,
             schema_version = record.schema_version,
             supported_range = format!("{MIN_SCHEMA_VERSION}..={SCHEMA_VERSION}"),
             "sandbox setup.json version unsupported; re-run `borg service install --windows-sandbox`",

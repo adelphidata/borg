@@ -34,7 +34,7 @@ use super::policy_resolve::resolve;
 use super::process::{spawn_with_token, SpawnStdio};
 use super::sid::{generate_random_cap_sid_string, LocalSid};
 use super::token::for_current_with_cap_sid;
-use super::{TrampolineInvocation, RUNNER_SUBCOMMAND};
+use super::{TrampolineInvocation, AUDIT_TARGET, RUNNER_SUBCOMMAND};
 
 /// Runner-side entry point for the Tier 2 elevated backend. Dispatched
 /// by `crates/interface/src/main.rs` when invoked as
@@ -44,7 +44,7 @@ use super::{TrampolineInvocation, RUNNER_SUBCOMMAND};
 pub fn run_elevated_runner(pipe_name: &str) -> io::Result<u32> {
     tracing::info!(
         event = "sandbox_runner_started",
-        target = "borg.sandbox.audit",
+        target = AUDIT_TARGET,
         "Tier 2 runner connecting to operator pipe",
     );
     runner_pipe::serve(pipe_name)
@@ -57,7 +57,7 @@ pub fn run(invocation: &TrampolineInvocation) -> io::Result<u32> {
     let policy_hash = policy_fingerprint(&invocation.policy);
     tracing::info!(
         event = "sandbox_spawn_started",
-        target = "borg.sandbox.audit",
+        target = AUDIT_TARGET,
         policy_hash = %policy_hash,
         program = %invocation.program,
         // arg_count + tool_dir give an operator-readable handle on
@@ -72,7 +72,7 @@ pub fn run(invocation: &TrampolineInvocation) -> io::Result<u32> {
     match &result {
         Ok(code) => tracing::info!(
             event = "sandbox_spawn_completed",
-            target = "borg.sandbox.audit",
+            target = AUDIT_TARGET,
             policy_hash = %policy_hash,
             program = %invocation.program,
             exit_code = code,
@@ -80,7 +80,7 @@ pub fn run(invocation: &TrampolineInvocation) -> io::Result<u32> {
         ),
         Err(e) => tracing::warn!(
             event = "sandbox_spawn_failed",
-            target = "borg.sandbox.audit",
+            target = AUDIT_TARGET,
             policy_hash = %policy_hash,
             program = %invocation.program,
             duration_ms,
@@ -123,7 +123,7 @@ fn run_inner(invocation: &TrampolineInvocation) -> io::Result<u32> {
             Err(e) if e.is_recoverable() => {
                 tracing::warn!(
                     event = "sandbox_tier2_fallback",
-                    target = "borg.sandbox.audit",
+                    target = AUDIT_TARGET,
                     error = %e.into_inner(),
                     "Tier 2 setup failed before spawn; falling back to Tier 1",
                 );
@@ -132,7 +132,7 @@ fn run_inner(invocation: &TrampolineInvocation) -> io::Result<u32> {
                 let err = e.into_inner();
                 tracing::warn!(
                     event = "sandbox_tier2_failed",
-                    target = "borg.sandbox.audit",
+                    target = AUDIT_TARGET,
                     error = %err,
                     "Tier 2 session failed after the child launched; not re-running under Tier 1",
                 );

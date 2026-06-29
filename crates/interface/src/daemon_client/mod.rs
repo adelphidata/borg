@@ -872,7 +872,6 @@ impl DaemonClient {
             .into_inner())
     }
 
-    /// Create a scheduled task.
     pub async fn create_scheduled_task(
         &mut self,
         spec: ScheduledTaskCreate,

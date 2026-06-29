@@ -206,6 +206,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         let token = orchestrator_token.clone();
         let mut sub = shutdown_tx.subscribe();
         tokio::spawn(async move {
+            // Any recv outcome means shutdown: a value is the stop signal, and
+            // a closed/lagged channel only happens as the daemon tears down.
             let _ = sub.recv().await;
             token.cancel();
         });

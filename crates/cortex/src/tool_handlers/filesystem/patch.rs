@@ -123,7 +123,7 @@ pub fn handle_apply_patch_with_context(
             Ok(msg)
         }
         Err(e) => {
-            // Ghost-commit rollback (M3): if the cwd is inside a git repo
+            // Ghost-commit rollback: if the cwd is inside a git repo
             // and we snapshotted before the failed patch attempt, restore
             // tracked files and clean up post-snapshot creations so a
             // multi-file patch that fails partway doesn't leave the working
@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn apply_patch_with_bridge_emits_advisory_when_unlinking() {
-        // Regression for M6: bridge-backed delete/move calls
+        // Regression: bridge-backed delete/move calls
         // `std::fs::remove_file` directly (ACP has no `fs/deleteFile`), so
         // the IDE's open buffer for the deleted path is left dangling.
         // Make the divergence visible to the user via an advisory in the
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn ghost_snapshot_round_trip_restores_tracked_files_in_git_repo() {
-        // M3 regression: validate that a snapshot taken before a disk-backed
+        // Regression: validate that a snapshot taken before a disk-backed
         // apply_patch can faithfully restore the working tree if the apply
         // fails partway. `coding::apply_patch_to_dir` already preflights
         // simple hunks, but I/O-level failures (disk full, EPERM, races)

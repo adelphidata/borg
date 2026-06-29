@@ -203,7 +203,7 @@ pub async fn handle_run_shell_with_context(
         filtered_creds.entry(k).or_insert(v);
     }
     // Resolve the shell to an absolute path so workspace-bounded sandbox
-    // profiles (M2) can validate it. Bare `sh` is rejected by Seatbelt
+    // profiles can validate it. Bare `sh` is rejected by Seatbelt
     // profile generation (paths must be absolute).
     #[cfg(unix)]
     let (shell, shell_flag) = ("/bin/sh", "-c");
