@@ -189,6 +189,18 @@ impl Agent {
         let configured = self.config.conversation.tool_output_max_tokens;
         let window_cap = (self.active_context_window() as usize / 4).max(256);
         let effective = configured.min(window_cap);
+        if effective < configured {
+            // The clamp engaged: the model's window is small enough that the
+            // operator-configured cap can't fit. Log it so the reduced ceiling
+            // is observable rather than a silent override.
+            tracing::debug!(
+                configured,
+                effective,
+                context_window = self.active_context_window(),
+                model = %self.config.llm.model,
+                "tool output cap clamped to model context window"
+            );
+        }
         self.maybe_redact(truncate_output(raw, effective))
     }
 

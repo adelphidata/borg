@@ -77,6 +77,18 @@ impl WaitCondition {
         }
     }
 
+    /// The raw JS expression for a `js` condition. This runs as arbitrary code
+    /// in the poll loop (`!!({expr})`), the same capability as `evaluate_js`, so
+    /// the caller must give it the same URL pre-scan. The other conditions embed
+    /// only escaped string literals and cannot issue requests, so they return
+    /// `None`.
+    pub fn js_expression(&self) -> Option<&str> {
+        match self {
+            Self::JsFunction(expr) => Some(expr),
+            _ => None,
+        }
+    }
+
     /// Human-readable description of what we're waiting for.
     fn description(&self) -> String {
         match self {

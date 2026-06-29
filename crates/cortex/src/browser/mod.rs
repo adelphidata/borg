@@ -510,11 +510,14 @@ impl BrowserSession {
     /// otherwise read and return the private page's content. This shared guard
     /// closes that window for every page-data reader.
     ///
-    /// Non-http(s) schemes (`about:blank`, `data:`, `blob:`, …) are *not*
+    /// The benign non-http(s) schemes `about:` / `data:` / `blob:` are *not*
     /// violations: they aren't network exfiltration, and a freshly opened tab
-    /// legitimately sits on `about:blank`. We therefore ignore the
-    /// `scheme_blocked` rule and act only on the SSRF rules (`private_ip`,
-    /// `cloud_metadata`, host blocklist).
+    /// legitimately sits on `about:blank`. We exempt only those three. Every
+    /// other `scheme_blocked` origin — notably `file://` (local-file read),
+    /// `ftp://`, `chrome://` — IS refused, alongside the SSRF rules
+    /// (`private_ip`, `cloud_metadata`, host blocklist). Exempting all
+    /// `scheme_blocked` verdicts would let a page sitting on `file:///etc/passwd`
+    /// be read back through this guard.
     ///
     /// Best-effort, fail-open: when the page URL can't be read we warn and
     /// allow, matching `navigate`'s posture and the no-silent-swallowing
@@ -533,7 +536,9 @@ impl BrowserSession {
                 if let ClassifyOutcome::Block { reason, rule } =
                     url_policy::classify_offline(&current_url, policy)
                 {
-                    if rule != "scheme_blocked" {
+                    // Exempt only the benign tab schemes; a `scheme_blocked`
+                    // verdict for file://, ftp://, etc. must still refuse.
+                    if !is_benign_blocked_scheme(&current_url, &rule) {
                         anyhow::bail!(
                             "{action} blocked: active page is on a disallowed origin: {reason} (rule: {rule})"
                         );
@@ -586,9 +591,31 @@ impl BrowserSession {
     }
 
     /// Wait for a condition to be met.
-    pub async fn wait_for(&self, args: &serde_json::Value, timeout: Duration) -> Result<String> {
+    ///
+    /// The `js` condition runs an arbitrary expression in a poll loop — the same
+    /// arbitrary-JS capability as `evaluate_js` — so it gets the same SSRF
+    /// pre-scan. Without it, `fetch("http://169.254.169.254/…")` stashed into
+    /// the DOM would exfiltrate cloud-metadata that a later (origin-guarded)
+    /// read could surface from the still-allowed page origin. We also re-check
+    /// the active origin afterward in case the expression navigated the page.
+    pub async fn wait_for(
+        &self,
+        args: &serde_json::Value,
+        timeout: Duration,
+        policy: &UrlPolicyConfig,
+    ) -> Result<String> {
         let condition = wait::WaitCondition::from_args(args)?;
-        wait::wait_for(self.tab_manager.active_page(), &condition, timeout).await
+        if let Some(expr) = condition.js_expression() {
+            if let Some(reason) = first_blocked_url_literal(expr, policy) {
+                anyhow::bail!("URL policy blocked wait JS expression: {reason}");
+            }
+        }
+        let result = wait::wait_for(self.tab_manager.active_page(), &condition, timeout).await;
+        // The expression may have driven the page to a disallowed origin; refuse
+        // to confirm from there (mirrors evaluate_js's post-eval recheck). The
+        // origin block takes precedence over a benign wait timeout.
+        self.ensure_active_origin_allowed("wait", policy).await?;
+        result
     }
 
     /// Navigate back in the page's session history.
@@ -898,6 +925,23 @@ pub fn validate_url_scheme(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a `scheme_blocked` origin is one of the benign tab schemes
+/// (`about:` / `data:` / `blob:`) a page can legitimately rest on without being
+/// network exfiltration or a local-resource read. `file://` (local-file read),
+/// `ftp://`, `chrome://`, etc. are NOT benign and must still be refused. The
+/// exemption is gated on the `scheme_blocked` rule so it can never widen an SSRF
+/// verdict (`private_ip`, `cloud_metadata`, host blocklist).
+fn is_benign_blocked_scheme(url: &str, rule: &str) -> bool {
+    rule == "scheme_blocked"
+        && matches!(
+            url.split(':')
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("about" | "data" | "blob")
+        )
+}
+
 /// Scan a JS expression for `http`/`https` URL literals and return a
 /// human-readable reason for the first one the policy would block, if any.
 /// Uses the no-DNS classifier so a literal that merely names a non-resolving
@@ -1026,6 +1070,68 @@ mod tests {
         assert!(
             first_blocked_url_literal(r#"fetch("http:\/\/169.254.169.254\/meta")"#, &policy)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn benign_blocked_scheme_exempts_only_about_data_blob() {
+        // The origin recheck skips a `scheme_blocked` verdict only for these
+        // benign tab schemes — a freshly opened tab sits on about:blank.
+        for u in [
+            "about:blank",
+            "data:text/html,x",
+            "blob:abc123",
+            "ABOUT:Blank",
+        ] {
+            assert!(
+                is_benign_blocked_scheme(u, "scheme_blocked"),
+                "{u} should be treated as a benign tab scheme"
+            );
+        }
+        // Dangerous non-network schemes must NOT be exempted — file:// would let
+        // a page on file:///etc/passwd be read back through the guard.
+        for u in ["file:///etc/passwd", "ftp://host/x", "chrome://settings"] {
+            assert!(
+                !is_benign_blocked_scheme(u, "scheme_blocked"),
+                "{u} must not be exempt from the origin recheck"
+            );
+        }
+        // The exemption is gated on scheme_blocked: an SSRF verdict is never
+        // softened even for an about:-looking origin.
+        assert!(!is_benign_blocked_scheme("about:blank", "private_ip"));
+        assert!(!is_benign_blocked_scheme("about:blank", "cloud_metadata"));
+    }
+
+    #[test]
+    fn wait_js_condition_is_subject_to_url_prescan() {
+        // The `wait` action's `js` condition runs arbitrary code in a poll loop,
+        // so its expression must hit the same SSRF pre-scan as evaluate_js — a
+        // second arbitrary-JS entry point that previously bypassed the guard.
+        // A metadata fetch literal must be extracted + blocked; a non-js
+        // condition must expose no expression (so it can't be false-blocked).
+        let policy = UrlPolicyConfig::default();
+
+        let js = wait::WaitCondition::from_args(&serde_json::json!({
+            "condition": "js",
+            "value": "fetch('http://169.254.169.254/latest')"
+        }))
+        .expect("js condition parses");
+        let expr = js
+            .js_expression()
+            .expect("js condition must expose its expression to the pre-scan");
+        assert!(
+            first_blocked_url_literal(expr, &policy).is_some(),
+            "metadata fetch in a wait js condition must be blocked by the pre-scan"
+        );
+
+        let text = wait::WaitCondition::from_args(&serde_json::json!({
+            "condition": "text",
+            "value": "http://169.254.169.254"
+        }))
+        .expect("text condition parses");
+        assert!(
+            text.js_expression().is_none(),
+            "non-js conditions expose no expression — pre-scan must not false-block them"
         );
     }
 

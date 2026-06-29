@@ -207,7 +207,9 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     r#"password="super-secret-shh""#,
     "password=hunter2trustno1",
     "postgresql://user:hunter2pw@localhost:5432/mydb",
-    "https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk@github.com/org/repo",
+    // A userinfo token NOT matched by any earlier pattern (not a ghp_/AWS/etc.
+    // shape) so this sample exercises the URL Credential pattern itself.
+    "https://AbCdEf0123456789GhIjKlMnOpQr@example.com/org/repo",
     "Authorization: Bearer abcDEF123456ghiJKL789",
     "x-api-key: AbCdEf0123456789TokenValue",
     "API_KEY=AbCdEf0123456789TokenValue",
@@ -238,14 +240,22 @@ mod tests {
 
     #[test]
     fn redacts_bare_token_url_credential() {
-        // A PAT in URL userinfo (e.g. from `git remote set-url`) must not leak.
-        let input = "remote: https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk@github.com/org/repo";
-        let result = redact_secrets(input);
+        // A bare token in URL userinfo (e.g. from `git remote set-url`) must not
+        // leak. The token deliberately is NOT a ghp_/AWS/sk- shape, so an earlier
+        // pattern can't claim it first — this proves the URL Credential pattern
+        // is the one doing the work (regression: a ghp_ token here was redacted
+        // by the GitHub Token pattern, leaving the new pattern untested).
+        let token = "AbCdEf0123456789GhIjKlMnOpQr";
+        let input = format!("remote: https://{token}@example.com/org/repo");
+        let result = redact_secrets(&input);
         assert!(
-            !result.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+            !result.contains(token),
             "bare URL token must not survive redaction: {result}"
         );
-        assert!(result.contains("[REDACTED"));
+        assert!(
+            result.contains("[REDACTED URL Credential]"),
+            "must be masked by the URL Credential pattern specifically: {result}"
+        );
     }
 
     #[test]

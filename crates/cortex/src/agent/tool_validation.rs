@@ -237,15 +237,19 @@ pub(super) fn partition_tool_calls(
             // gives the model no signal and it re-emits the same empty call.
             // We can't echo an empty function name to the provider (Anthropic /
             // OpenAI reject a nameless tool_use block), so the synthetic call
-            // carries a placeholder name; the reason stays terse so we don't
-            // prime further bad calls with a tool-catalog dump.
+            // carries a placeholder name. The placeholder MUST satisfy the
+            // provider tool-name pattern `^[a-zA-Z0-9_-]{1,64}$` — a name with
+            // spaces/parens is echoed back verbatim as the tool_use `name` on
+            // the next turn and 400s the whole conversation, strictly worse than
+            // the old silent drop. The reason stays terse so we don't prime
+            // further bad calls with a tool-catalog dump.
             warn!(
                 "Surfacing terse error for unnamed tool call (id={})",
                 ptc.id
             );
             invalid.push(InvalidToolCall {
                 id: ptc.id.clone(),
-                name: "(missing name)".to_string(),
+                name: "missing_name".to_string(),
                 reason: "tool call had no tool name — re-issue the call with a valid tool name"
                     .to_string(),
                 raw_arguments: ptc.arguments.clone(),
@@ -639,9 +643,17 @@ mod tests {
             "unnamed-but-addressable call must be surfaced"
         );
         assert_eq!(invalid[0].id, "call_1");
+        // The placeholder is echoed back as the provider tool_use `name`, so it
+        // must match `^[a-zA-Z0-9_-]{1,64}$` — spaces/parens 400 the whole
+        // conversation, worse than a silent drop.
+        let name = &invalid[0].name;
         assert!(
-            !invalid[0].name.is_empty(),
-            "echoed tool_call must not have an empty name (provider rejects it)",
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "placeholder name must satisfy the provider tool-name pattern, got: {name:?}",
         );
         assert!(
             invalid[0].reason.contains("no tool name"),

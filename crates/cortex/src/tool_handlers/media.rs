@@ -358,7 +358,13 @@ pub async fn handle_browser(
             browser_action_with_recovery!(browser, "fill", browser.fill(&fields, timeout).await)
         }
         "wait" => {
-            browser_action_with_recovery!(browser, "wait", browser.wait_for(args, timeout).await)
+            browser_action_with_recovery!(
+                browser,
+                "wait",
+                browser
+                    .wait_for(args, timeout, &config.security.url_policy)
+                    .await
+            )
         }
         "resize" => {
             let width = args

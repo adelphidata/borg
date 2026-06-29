@@ -252,8 +252,40 @@ pub fn sanitize_xml_boundaries(s: &str) -> String {
 
     static BOUNDARY_RE: OnceLock<Option<Regex>> = OnceLock::new();
     let re = BOUNDARY_RE.get_or_init(|| {
-        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file|compaction_summary|mcp_tool_result|untrusted_content|context|goal)\s*>")
+        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file|compaction_summary|mcp_tool_result|untrusted_content)\s*>")
             .map_err(|e| tracing::error!("Invalid boundary regex: {e}"))
+            .ok()
+    });
+
+    match re {
+        Some(re) => re
+            .replace_all(s, |caps: &regex::Captures| {
+                let tag = &caps[1];
+                format!("&lt;/{tag}&gt;")
+            })
+            .into_owned(),
+        None => s.to_owned(),
+    }
+}
+
+/// Escape `</context>` / `</goal>` close tags in untrusted text bound for the
+/// subagent trust frame (`<context trust="parent">…</context>`, `<goal>…</goal>`).
+///
+/// These two tag names are too common in ordinary prose, markup, and code to
+/// belong in the global [`sanitize_xml_boundaries`] set — that function is also
+/// applied to MCP tool output, where escaping a legitimate `</context>` in a
+/// returned document would corrupt the data the model and user see. The
+/// subagent preamble is the only surface that frames content with these tags,
+/// so it neutralizes them locally: a smuggled `</context>` in parent-supplied
+/// context can't close the frame early and land following text adjacent to the
+/// goal as if it were our own directive.
+pub fn escape_trust_frame_tags(s: &str) -> String {
+    use std::sync::OnceLock;
+
+    static FRAME_RE: OnceLock<Option<Regex>> = OnceLock::new();
+    let re = FRAME_RE.get_or_init(|| {
+        Regex::new(r"(?i)</\s*(context|goal)\s*>")
+            .map_err(|e| tracing::error!("Invalid trust-frame regex: {e}"))
             .ok()
     });
 
@@ -753,6 +785,31 @@ mod tests {
         let input = "this is regular text with <div> tags </div>";
         let output = sanitize_xml_boundaries(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn global_boundary_sanitizer_leaves_context_and_goal_untouched() {
+        // `context`/`goal` are too common to escape globally: this function is
+        // also applied to MCP tool output, where mangling a legitimate
+        // `</context>`/`</goal>` in a returned document corrupts the data the
+        // model and user see. They are handled by the scoped trust-frame
+        // escaper instead. Real boundary tags must still be escaped here.
+        let input = "see </context> and </goal> in the returned docs";
+        assert_eq!(sanitize_xml_boundaries(input), input);
+        assert!(sanitize_xml_boundaries("</tool_output>").contains("&lt;/tool_output&gt;"));
+    }
+
+    #[test]
+    fn trust_frame_escaper_neutralizes_only_context_and_goal() {
+        // The subagent preamble's local guard escapes exactly the two frame
+        // tags so a smuggled close tag can't break out of the trust boundary…
+        assert_eq!(
+            escape_trust_frame_tags("a </context> b </goal> c"),
+            "a &lt;/context&gt; b &lt;/goal&gt; c"
+        );
+        // …and is scoped: it does not touch the global boundary tags (those are
+        // neutralized at their own surfaces, not here).
+        assert_eq!(escape_trust_frame_tags("</tool_output>"), "</tool_output>");
     }
 
     #[test]
