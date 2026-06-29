@@ -280,6 +280,43 @@ pub struct SubAgentCompletion {
     pub files_written: Vec<String>,
 }
 
+/// Upper bound on the sub-agent error text echoed back to the parent agent.
+/// The full error is already persisted to the `sub_agents` row; this only
+/// caps what lands in the parent's LLM context so a runaway child message
+/// (a megabyte stack trace, a wedged-loop dump) can't blow the window.
+const SUB_AGENT_ERROR_MAX_CHARS: usize = 2000;
+
+/// Char-boundary-safe truncation of a sub-agent error string for parent
+/// consumption.
+fn bound_sub_agent_error(error: &str) -> String {
+    crate::util::truncate::truncate_with_ellipsis(error, SUB_AGENT_ERROR_MAX_CHARS, "…[truncated]")
+}
+
+impl SubAgentCompletion {
+    /// When this completion is a terminal *error*, return the bounded error
+    /// text plus an actionable recovery hint for the parent agent. `None` for
+    /// successful or shutdown terminals.
+    ///
+    /// This exists because a child that errored out used to reach the parent
+    /// as `{"status":"errored","result":null}` — indistinguishable from a
+    /// child that completed with an empty result. Under the
+    /// no-silent-swallowing invariant a failed delegation must surface *why*
+    /// it failed and *what the parent can do next*, so all three delegate
+    /// output paths (`blocking`, `batch`, `wait_for_agent`) fold these fields
+    /// in via this one helper rather than each rebuilding the shape.
+    pub fn error_detail(&self) -> Option<(String, &'static str)> {
+        match &self.status {
+            SubAgentStatus::Errored { error } => Some((
+                bound_sub_agent_error(error),
+                "This sub-agent's turn failed before returning a result. \
+                 Re-task it with send_to_agent, or spawn a fresh agent, if you \
+                 still need the work — do not treat the empty result as success.",
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Handle to a spawned sub-agent.
 struct SubAgentHandle {
     pub info: SubAgentInfo,
@@ -2084,6 +2121,106 @@ mod sub_agent_surface_tests {
             "second wait_for_agent must read the persisted files_written, \
              not an empty Vec from a never-populated metrics field"
         );
+    }
+
+    /// REGRESSION: a sub-agent that errors terminally must surface its actual
+    /// error text AND an actionable recovery hint to the parent — not collapse
+    /// to `{"status":"errored","result":null}`, which is indistinguishable from
+    /// an empty success and silently swallows the failure cause.
+    #[tokio::test]
+    async fn wait_for_agent_surfaces_terminal_error_and_recovery_hint() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        ctrl.insert_mock_handle("agent-x", "atlas");
+
+        let tx = ctrl.test_completion_tx();
+        tx.send(SubAgentCompletion {
+            agent_id: "agent-x".to_string(),
+            nickname: "atlas".to_string(),
+            status: SubAgentStatus::Errored {
+                error: "stream disconnected before completion".to_string(),
+            },
+            final_response: None,
+            files_written: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let out = super::tools::handle_wait_for_agent(
+            &serde_json::json!({ "agent_id": "agent-x" }),
+            &mut ctrl,
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["status"], "errored");
+        assert!(v["result"].is_null(), "errored child has no result");
+        assert_eq!(
+            v["error"], "stream disconnected before completion",
+            "parent must see the actual error text, got: {v}"
+        );
+        assert!(
+            v["next_action"]
+                .as_str()
+                .is_some_and(|s| s.contains("send_to_agent")),
+            "parent must get an actionable recovery hint, got: {v}"
+        );
+    }
+
+    /// A *successful* completion must NOT carry the error/next_action fields —
+    /// they are reserved for the terminal-error path so the parent can branch
+    /// on their presence.
+    #[tokio::test]
+    async fn wait_for_agent_success_omits_error_fields() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        ctrl.insert_mock_handle("agent-y", "aurora");
+
+        let tx = ctrl.test_completion_tx();
+        tx.send(SubAgentCompletion {
+            agent_id: "agent-y".to_string(),
+            nickname: "aurora".to_string(),
+            status: SubAgentStatus::Completed {
+                result: "done".to_string(),
+            },
+            final_response: Some("done".to_string()),
+            files_written: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let out = super::tools::handle_wait_for_agent(
+            &serde_json::json!({ "agent_id": "agent-y" }),
+            &mut ctrl,
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["result"], "done");
+        assert!(v.get("error").is_none(), "success must not carry error");
+        assert!(
+            v.get("next_action").is_none(),
+            "success must not carry next_action"
+        );
+    }
+
+    #[test]
+    fn bound_sub_agent_error_truncates_multibyte_safely() {
+        // A runaway child error must be bounded before it reaches the parent
+        // context, and truncation must never split a multi-byte char.
+        let huge = "é".repeat(SUB_AGENT_ERROR_MAX_CHARS * 3); // well over the char cap
+        let bounded = super::bound_sub_agent_error(&huge);
+        assert!(bounded.ends_with("…[truncated]"));
+        // Bounded to the cap plus the ellipsis, regardless of input size.
+        assert_eq!(
+            bounded.chars().count(),
+            SUB_AGENT_ERROR_MAX_CHARS + "…[truncated]".chars().count()
+        );
+
+        // Short errors pass through verbatim.
+        assert_eq!(super::bound_sub_agent_error("boom"), "boom");
     }
 
     /// REGRESSION: in a mixed batch, the per-task blocklist must be

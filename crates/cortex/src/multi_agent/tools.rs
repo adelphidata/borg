@@ -326,13 +326,15 @@ pub async fn handle_spawn_agent(
         let results: Vec<serde_json::Value> = completions
             .iter()
             .map(|c| {
-                json!({
+                let mut obj = json!({
                     "agent_id": c.agent_id,
                     "nickname": c.nickname,
                     "status": c.status.as_str(),
                     "result": c.final_response,
                     "files_written": c.files_written,
-                })
+                });
+                attach_error_detail(&mut obj, c.error_detail());
+                obj
             })
             .collect();
         return Ok(json!({
@@ -369,15 +371,16 @@ pub async fn handle_spawn_agent(
                 timeout_secs,
             )
             .await?;
-        return Ok(json!({
+        let mut obj = json!({
             "mode": "blocking",
             "agent_id": completion.agent_id,
             "nickname": completion.nickname,
             "status": completion.status.as_str(),
             "result": completion.final_response,
             "files_written": completion.files_written,
-        })
-        .to_string());
+        });
+        attach_error_detail(&mut obj, completion.error_detail());
+        return Ok(obj.to_string());
     }
 
     // Fire-and-forget (default, backward-compatible).
@@ -453,13 +456,25 @@ pub async fn handle_wait_for_agent(
 
     let completion = agent_control.wait_for_agent(agent_id, timeout_secs).await?;
 
-    Ok(json!({
+    let mut obj = json!({
         "agent_id": completion.agent_id,
         "nickname": completion.nickname,
         "status": completion.status.as_str(),
         "result": completion.final_response,
-    })
-    .to_string())
+    });
+    attach_error_detail(&mut obj, completion.error_detail());
+    Ok(obj.to_string())
+}
+
+/// Fold a sub-agent's terminal-error detail (bounded error text + recovery
+/// hint, from [`crate::multi_agent::SubAgentCompletion::error_detail`]) into the
+/// JSON object surfaced to the parent. No-op for non-error completions. Shared
+/// by all three delegate output paths so the failure shape stays consistent.
+fn attach_error_detail(obj: &mut serde_json::Value, detail: Option<(String, &'static str)>) {
+    if let Some((error, next_action)) = detail {
+        obj["error"] = json!(error);
+        obj["next_action"] = json!(next_action);
+    }
 }
 
 /// Handle the list_agents tool call.
