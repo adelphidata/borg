@@ -659,9 +659,14 @@ pub async fn initialize(config: &Config) -> Result<()> {
         }
         if let Err(e) = start_server(server_name, server_cfg, config, reg, &builtin_refs).await {
             let (error_kind, reauth_required) = classify_startup_failure(&e);
+            // Alternate Display (`{:#}`) walks the anyhow cause chain, so the
+            // underlying McpError (e.g. "authentication failed: 401") is kept —
+            // plain `{e}` would show only the outermost context line, hiding the
+            // reason this commit exists to surface.
+            let detail = format!("{e:#}");
             tracing::warn!(
                 server = %server_name,
-                error = %e,
+                error = %detail,
                 error_kind,
                 "MCP server failed to start — continuing without it",
             );
@@ -674,7 +679,7 @@ pub async fn initialize(config: &Config) -> Result<()> {
                 reg.set_health(
                     server_name,
                     mcp::registry::ServerHealth::AuthFailed {
-                        message: e.to_string(),
+                        message: detail.clone(),
                     },
                 );
             }
@@ -688,7 +693,7 @@ pub async fn initialize(config: &Config) -> Result<()> {
                 &serde_json::json!({
                     "server": server_name,
                     "phase": "initialize",
-                    "reason": format!("start_server failed: {e}"),
+                    "reason": format!("start_server failed: {detail}"),
                     "error_kind": error_kind,
                     "reauth_required": reauth_required,
                 }),
@@ -805,7 +810,10 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
             }
             Err(e) => {
                 let (error_kind, reauth_required) = classify_startup_failure(&e);
-                let err_msg = e.to_string();
+                // `{:#}` preserves the McpError cause through the context wrap;
+                // `err_msg` feeds the AuthFailed message, the audit reason, and
+                // the ReloadReport failures entry, so all three keep the detail.
+                let err_msg = format!("{e:#}");
                 tracing::warn!(server = %name, error = %err_msg, error_kind, "MCP reload: server failed to start");
                 if reauth_required {
                     reg.set_health(
@@ -928,9 +936,7 @@ async fn start_server(
                 // McpError class (connect/auth/transport_closed/…), so the
                 // metrics layer can aggregate failures without grepping the
                 // free-text Display string. Mirrors the tool-exec audit row.
-                let error_kind = e
-                    .downcast_ref::<mcp::errors::McpError>()
-                    .map_or("unknown", mcp::errors::McpError::kind);
+                let (error_kind, _) = classify_startup_failure(&e);
                 tracing::warn!(
                     target: "borg.mcp",
                     event = "transport_error",
@@ -1395,9 +1401,11 @@ async fn run_session_task(
                             "phase": "runtime",
                             "reason": "transport closed mid-session",
                             // This branch is entered only on a transport-level
-                            // teardown, so the structured kind is fixed. Keeps
-                            // `error_kind` present across all three failure rows.
-                            "error_kind": mcp::errors::McpError::TransportClosed(String::new()).kind(),
+                            // teardown, so the kind is fixed. Matches
+                            // `McpError::TransportClosed.kind()` — a stable audit
+                            // string contract. Keeps `error_kind` present across
+                            // all three failure rows.
+                            "error_kind": "transport_closed",
                             "reauth_required": false,
                         }),
                     )
@@ -1798,6 +1806,28 @@ mod tests {
         // A non-McpError failure degrades to "unknown", not a false auth signal.
         let opaque = anyhow::anyhow!("something unrelated blew up");
         assert_eq!(classify_startup_failure(&opaque), ("unknown", false));
+    }
+
+    #[test]
+    fn startup_failure_surfaces_render_underlying_cause() {
+        // The startup-failure surfaces (audit `reason`, AuthFailed health
+        // message, ReloadReport entry) render the context-wrapped error with
+        // alternate Display `{:#}`. That MUST keep the underlying McpError cause
+        // — plain `{}` shows only the outermost context line, which is exactly
+        // the "why did it fail" detail this commit set out to preserve.
+        let err = anyhow::Error::new(mcp::errors::McpError::Auth("401 Unauthorized".to_string()))
+            .context("handshake/discovery failed for server 'gh'");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("401 Unauthorized"),
+            "alternate Display must preserve the McpError cause; got: {rendered}"
+        );
+        // Documents WHY we use `{:#}`: plain Display drops the cause.
+        assert!(
+            !format!("{err}").contains("401 Unauthorized"),
+            "plain Display is expected to omit the cause (justifies the {{:#}} choice)"
+        );
     }
 
     #[test]
