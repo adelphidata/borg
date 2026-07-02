@@ -38,6 +38,17 @@ use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HooksFile {
+    /// Optional JSON-Schema pointer (`"$schema": "..."`). Tolerated so editor
+    /// tooling can annotate the file; ignored at runtime. Named explicitly
+    /// (rather than dropping `deny_unknown_fields`) so a *misplaced event key*
+    /// at the root is still a hard parse error.
+    #[serde(default, rename = "$schema")]
+    #[allow(dead_code)]
+    schema: Option<String>,
+    /// Optional human description of the hook profile. Logged at load, ignored
+    /// otherwise. Tolerated for the same reason as `$schema`.
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     hooks: HashMap<String, Vec<MatcherGroup>>,
 }
@@ -141,6 +152,10 @@ impl ScriptHook {
                 return Vec::new();
             }
         };
+
+        if let Some(desc) = file.description.as_deref() {
+            tracing::debug!("hooks: {} — {}", source.display(), desc);
+        }
 
         let mut hooks = Vec::new();
         // Sort for deterministic ordering (HashMap iteration is random).
@@ -578,6 +593,36 @@ mod tests {
                 "the same hook must load when correctly nested"
             );
             assert_eq!(loaded[0].points, vec![HookPoint::AfterToolCall]);
+        }
+
+        #[test]
+        fn top_level_metadata_is_tolerated_and_hooks_still_load() {
+            // A user-authored hooks.json may carry benign top-level metadata:
+            // `$schema` for editor tooling and a human `description`. These must
+            // not disable the hooks — regression against `deny_unknown_fields`
+            // rejecting the whole file (which degrades to zero hooks + a warn).
+            let dir = tmp();
+            let body = r#"{
+                "$schema": "https://example.com/hooks.schema.json",
+                "description": "stop-time review gate",
+                "hooks": {"PostToolUse":[{"hooks":[{"type":"command","command":"echo hi"}]}]}
+            }"#;
+            let path = write_hooks_file(dir.path(), body);
+            let hooks = ScriptHook::load_from_file(&path);
+            assert_eq!(
+                hooks.len(),
+                1,
+                "top-level $schema/description must be tolerated; hooks must still load"
+            );
+            assert_eq!(hooks[0].points, vec![HookPoint::AfterToolCall]);
+
+            // The tolerance is a deliberate allow-list of known metadata, not a
+            // blanket relaxation: an unrecognized top-level key is still a hard
+            // parse error (which the loader turns into a warn + zero hooks).
+            assert!(
+                serde_json::from_str::<HooksFile>(r#"{"version": 2, "hooks": {}}"#).is_err(),
+                "unknown top-level keys must still be rejected"
+            );
         }
 
         #[test]
