@@ -617,6 +617,22 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     Ok(Some(wrapped))
 }
 
+/// Classify a server *startup* failure for audit attribution and health
+/// surfacing. Returns the stable, machine-readable
+/// [`mcp::errors::McpError::kind`] (`"unknown"` when the failure isn't a typed
+/// `McpError`) and whether the failure requires operator re-authentication.
+///
+/// The typed error survives the `anyhow` context chain, so this keeps working
+/// even though the startup paths wrap the `McpError` with a human-readable
+/// context line — the reason the earlier free-text-flattening dropped the
+/// classification on the floor.
+fn classify_startup_failure(err: &anyhow::Error) -> (&'static str, bool) {
+    let kind = err
+        .downcast_ref::<mcp::errors::McpError>()
+        .map_or("unknown", mcp::errors::McpError::kind);
+    (kind, kind == "auth")
+}
+
 /// Initialize MCP sessions. Returns `Ok(())` immediately if
 /// `mcp.enabled` is false. Per-server connect failures are logged and
 /// *do not* fail the overall initialize — borg always boots, even when
@@ -642,14 +658,30 @@ pub async fn initialize(config: &Config) -> Result<()> {
             continue;
         }
         if let Err(e) = start_server(server_name, server_cfg, config, reg, &builtin_refs).await {
+            let (error_kind, reauth_required) = classify_startup_failure(&e);
             tracing::warn!(
                 server = %server_name,
                 error = %e,
+                error_kind,
                 "MCP server failed to start — continuing without it",
             );
+            // An auth failure needs operator action (fix/re-add credentials) and
+            // will not fix itself on retry, so mark the server AuthFailed. That
+            // renders "auth-failed" in `/mcp` and `/plugins` instead of the
+            // ambiguous "not-started", and set_health creates the status entry a
+            // never-started server otherwise lacks.
+            if reauth_required {
+                reg.set_health(
+                    server_name,
+                    mcp::registry::ServerHealth::AuthFailed {
+                        message: e.to_string(),
+                    },
+                );
+            }
             // Surface unreachable / mis-credentialled servers in the audit
             // chain so operators don't have to grep logs to see why their
-            // configured servers aren't contributing tools.
+            // configured servers aren't contributing tools. `error_kind` carries
+            // the structured McpError class for aggregation.
             crate::db::try_emit_global(
                 crate::db::audit_events::MCP_SERVER_FAILED,
                 server_name,
@@ -657,6 +689,8 @@ pub async fn initialize(config: &Config) -> Result<()> {
                     "server": server_name,
                     "phase": "initialize",
                     "reason": format!("start_server failed: {e}"),
+                    "error_kind": error_kind,
+                    "reauth_required": reauth_required,
                 }),
             )
             .await;
@@ -770,8 +804,17 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                 added.push(name);
             }
             Err(e) => {
+                let (error_kind, reauth_required) = classify_startup_failure(&e);
                 let err_msg = e.to_string();
-                tracing::warn!(server = %name, error = %err_msg, "MCP reload: server failed to start");
+                tracing::warn!(server = %name, error = %err_msg, error_kind, "MCP reload: server failed to start");
+                if reauth_required {
+                    reg.set_health(
+                        &name,
+                        mcp::registry::ServerHealth::AuthFailed {
+                            message: err_msg.clone(),
+                        },
+                    );
+                }
                 crate::db::try_emit_global(
                     crate::db::audit_events::MCP_SERVER_FAILED,
                     &name,
@@ -779,6 +822,8 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                         "server": name,
                         "phase": "reload",
                         "reason": format!("reload start_server failed: {err_msg}"),
+                        "error_kind": error_kind,
+                        "reauth_required": reauth_required,
                     }),
                 )
                 .await;
@@ -918,9 +963,11 @@ async fn start_server(
                     error = %e,
                     "mcp handshake/discovery failed",
                 );
-                return Err(anyhow!(
-                    "handshake/discovery failed for server '{server_name}': {e}"
-                ));
+                // Wrap with context instead of flattening to a string so the
+                // typed McpError survives for downcast-based classification
+                // (auth vs transport vs …) at the audit/health surface.
+                return Err(anyhow::Error::new(e)
+                    .context(format!("handshake/discovery failed for server '{server_name}'")));
             }
         }
     };
@@ -1016,7 +1063,10 @@ async fn handshake_and_register(
 ) -> Result<()> {
     let (session, discovered) = discover_session(manifest, session)
         .await
-        .map_err(|e| anyhow!("handshake/discovery failed for server '{server_name}': {e}"))?;
+        .map_err(|e| {
+            anyhow::Error::new(e)
+                .context(format!("handshake/discovery failed for server '{server_name}'"))
+        })?;
     register_discovered(
         server_name,
         server_cfg,
@@ -1344,6 +1394,11 @@ async fn run_session_task(
                             "server": &server_name,
                             "phase": "runtime",
                             "reason": "transport closed mid-session",
+                            // This branch is entered only on a transport-level
+                            // teardown, so the structured kind is fixed. Keeps
+                            // `error_kind` present across all three failure rows.
+                            "error_kind": mcp::errors::McpError::TransportClosed(String::new()).kind(),
+                            "reauth_required": false,
                         }),
                     )
                     .await;
@@ -1708,10 +1763,41 @@ mod tests {
         let mut s = base.clone();
         s.health = Some(ServerHealth::Healthy);
         assert_eq!(s.state_label(), "connected");
+        s.health = Some(ServerHealth::Reconnecting { attempts: 2 });
+        assert_eq!(s.state_label(), "reconnecting");
         s.health = Some(ServerHealth::Degraded);
         assert_eq!(s.state_label(), "degraded");
+        // A server whose startup hit an auth failure must render "auth-failed"
+        // (operator must fix credentials), not the ambiguous "not-started".
+        s.health = Some(ServerHealth::AuthFailed {
+            message: "401 Unauthorized".to_string(),
+        });
+        assert_eq!(s.state_label(), "auth-failed");
         s.health = None;
         assert_eq!(s.state_label(), "not-started");
+    }
+
+    #[test]
+    fn classify_startup_failure_preserves_typed_error_through_context() {
+        use mcp::errors::McpError;
+
+        // Regression: the startup paths wrap the typed McpError with a
+        // human-readable context line. Classification MUST still recover the
+        // kind through the anyhow chain — the previous `anyhow!("… {e}")`
+        // flattening lost it and emitted error_kind:"unknown"/reauth:false even
+        // for a genuine 401.
+        let auth = anyhow::Error::new(McpError::Auth("401 Unauthorized".to_string()))
+            .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(classify_startup_failure(&auth), ("auth", true));
+
+        // Non-auth typed failures classify by kind and never request re-auth.
+        let connect = anyhow::Error::new(McpError::Connect("dns".to_string()))
+            .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(classify_startup_failure(&connect), ("connect", false));
+
+        // A non-McpError failure degrades to "unknown", not a false auth signal.
+        let opaque = anyhow::anyhow!("something unrelated blew up");
+        assert_eq!(classify_startup_failure(&opaque), ("unknown", false));
     }
 
     #[test]
