@@ -229,7 +229,11 @@ fn path_within_root(path: &Path, root: &Path) -> bool {
 /// If a future caller passes a relative path the walk-up would terminate
 /// at the empty parent and we'd silently accept a lexically-normalized
 /// path with no security context — bail loudly instead.
-fn synthesize_canonical_for_write(candidate: &Path) -> Result<PathBuf> {
+///
+/// Shared with the blocklist guard (`tool_handlers::filesystem::blocked`) so the
+/// containment check and the blocklist check resolve write targets identically —
+/// a single implementation cannot diverge into a symlink-escape gap.
+pub(crate) fn synthesize_canonical_for_write(candidate: &Path) -> Result<PathBuf> {
     if !candidate.is_absolute() {
         bail!(
             "synthesize_canonical_for_write requires an absolute candidate; got {}",

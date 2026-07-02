@@ -33,10 +33,10 @@
 ///    access is allowed regardless of blocklist matches. This is the
 ///    escape hatch for specific `.env` files or `.aws/` directories that
 ///    the user legitimately wants the agent to read.
-/// 3. Otherwise, access is denied if **any path component** of the
-///    canonical path matches an entry in `blocked`. Blocked entries may be
-///    single components (e.g. `.ssh`) or multi-component suffixes (e.g.
-///    `.config/gh`) — both forms are supported.
+/// 3. Otherwise, access is denied if **any path component** of *either* the
+///    resolved or the literal form (see rule 1) matches an entry in `blocked`.
+///    Blocked entries may be single components (e.g. `.ssh`) or multi-component
+///    suffixes (e.g. `.config/gh`) — both forms are supported.
 ///
 /// This deliberately does **not** jail access to `$HOME` or CWD: absolute
 /// paths to non-sensitive files elsewhere on the system
@@ -117,41 +117,23 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
 }
 
 /// Canonicalize a path that may not exist yet (the `apply_patch` add-file
-/// case). `Path::canonicalize` fails for *any* missing component, so we walk
-/// upward to the deepest existing ancestor, canonicalize **that** (resolving
-/// symlinks anywhere in the existing prefix — including a symlinked parent or
-/// grand-parent that leads into a blocked or control-plane directory), then
-/// re-attach the missing tail with `..`/`.` normalized. Walking to the deepest
-/// ancestor (not just the immediate parent) is what defeats a symlinked
-/// ancestor sitting above a not-yet-created intermediate dir. If no ancestor
-/// exists (only possible for a relative or empty path), fall back to
-/// tilde-expand + lexical normalization so a raw `~/.borg/borg.db` or
-/// `./../.borg/borg.db` still resolves close enough for comparison.
+/// case), resolving symlinks anywhere in the existing prefix — including a
+/// symlinked parent or grand-parent that leads into a blocked or control-plane
+/// directory.
+///
+/// Delegates to [`crate::execution_context::synthesize_canonical_for_write`],
+/// the single walk-up-to-deepest-existing-ancestor resolver shared with the
+/// workspace-containment guard, so the two security checks cannot diverge. That
+/// helper requires an absolute path and can error if the existing prefix won't
+/// canonicalize; in either case fall back to tilde-expand + lexical
+/// normalization so a raw `~/.borg/borg.db` or `./../.borg/borg.db` still
+/// resolves close enough (with symlink names preserved) for comparison.
 fn canonicalize_write_target(path: &std::path::Path) -> std::path::PathBuf {
-    let mut probe = Some(path);
-    while let Some(current) = probe {
-        if let Ok(real_prefix) = current.canonicalize() {
-            // `current` is always a component-prefix of `path` (we only ascend
-            // via `parent()`), so `strip_prefix` succeeds; the tail is the
-            // portion that does not exist on disk yet.
-            let tail = path
-                .strip_prefix(current)
-                .unwrap_or_else(|_| std::path::Path::new(""));
-            let mut resolved = real_prefix;
-            for comp in tail.components() {
-                match comp {
-                    std::path::Component::ParentDir => {
-                        resolved.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    other => resolved.push(other.as_os_str()),
-                }
-            }
+    if path.is_absolute() {
+        if let Ok(resolved) = crate::execution_context::synthesize_canonical_for_write(path) {
             return resolved;
         }
-        probe = current.parent().filter(|p| !p.as_os_str().is_empty());
     }
-    // No part of the path exists yet. Tilde-expand + lexically normalize.
     lexically_normalized(path)
 }
 

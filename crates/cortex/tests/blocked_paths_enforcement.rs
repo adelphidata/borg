@@ -280,6 +280,42 @@ fn apply_patch_refuses_write_through_symlinked_parent_into_blocked_dir() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn apply_patch_refuses_write_through_dangling_symlinked_leaf_into_blocked_dir() {
+    // Variant where the write TARGET itself is a pre-planted (dangling) symlink
+    // pointing at a not-yet-existing file inside a blocked dir. The invariant is
+    // outcome-based: no file may land inside `.ssh`, whether the block comes
+    // from is_blocked_path or from the patch applicator refusing to follow the
+    // symlinked leaf.
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::default();
+    let ssh_dir = tmp.path().join(".ssh");
+    fs::create_dir(&ssh_dir).expect("mkdir .ssh");
+
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).expect("mkdir project");
+    // Dangling: `.ssh/authorized_keys` does not exist yet.
+    symlink(ssh_dir.join("authorized_keys"), project.join("key"))
+        .expect("symlink key -> .ssh/authorized_keys");
+
+    let ctx = ExecutionContext::unrestricted(project.clone());
+    let patch = "*** Begin Patch\n\
+                 *** Add File: key\n\
+                 +ssh-ed25519 AAAAinjected-by-test attacker\n\
+                 *** End Patch";
+    let result =
+        handle_apply_patch_with_context(&serde_json::json!({ "patch": patch }), &cfg, &ctx)
+            .expect("handler must return Ok");
+
+    assert!(
+        !ssh_dir.join("authorized_keys").exists(),
+        "add-file must not write into .ssh through a dangling symlinked leaf; result: {result}"
+    );
+}
+
 // ── list_dir: blocked entries surface as `[blocked]` markers, not raw leaves ──
 
 #[test]
