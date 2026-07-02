@@ -261,7 +261,7 @@ fn apply_patch_refuses_write_through_symlinked_parent_into_blocked_dir() {
     fs::create_dir(&project).expect("mkdir project");
     symlink(&ssh_dir, project.join("docs")).expect("symlink project/docs -> .ssh");
 
-    let ctx = ExecutionContext::unrestricted(project.clone());
+    let ctx = ExecutionContext::unrestricted(project);
     let patch = "*** Begin Patch\n\
                  *** Add File: docs/authorized_keys\n\
                  +ssh-ed25519 AAAAinjected-by-test attacker\n\
@@ -301,7 +301,7 @@ fn apply_patch_refuses_write_through_dangling_symlinked_leaf_into_blocked_dir() 
     symlink(ssh_dir.join("authorized_keys"), project.join("key"))
         .expect("symlink key -> .ssh/authorized_keys");
 
-    let ctx = ExecutionContext::unrestricted(project.clone());
+    let ctx = ExecutionContext::unrestricted(project);
     let patch = "*** Begin Patch\n\
                  *** Add File: key\n\
                  +ssh-ed25519 AAAAinjected-by-test attacker\n\

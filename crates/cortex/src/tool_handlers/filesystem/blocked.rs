@@ -42,6 +42,14 @@
 /// paths to non-sensitive files elsewhere on the system
 /// (`/etc/hosts`, `/Users/you/other-project/...`, `../sibling/file.rs`)
 /// remain fully accessible, as does cross-directory navigation via `@`.
+///
+/// **Caveat for future writers:** a symlinked *leaf* (the final component is
+/// itself a symlink pointing into a blocked dir) is NOT caught here — `resolved`
+/// resolves the existing *prefix*, not the leaf's target. On the `apply_patch`
+/// path this is covered downstream by the applicator (`coding`'s `reject_symlink`
+/// plus `fs_atomic::atomic_write`, which renames over the leaf rather than
+/// following it). Any new writer that consults `is_blocked_path` without going
+/// through that applicator must reject symlinked leaves on its own.
 pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[String]) -> bool {
     // Resolve the real on-disk path even when the leaf (or an intermediate
     // dir) does not exist yet — the `apply_patch` add-file case — so a
@@ -128,6 +136,12 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
 /// canonicalize; in either case fall back to tilde-expand + lexical
 /// normalization so a raw `~/.borg/borg.db` or `./../.borg/borg.db` still
 /// resolves close enough (with symlink names preserved) for comparison.
+///
+/// A **relative** input skips symlink resolution entirely (straight to lexical
+/// normalization). This is not a live gap: every production caller anchors to an
+/// absolute path before reaching here (`resolve_path_for_write` and friends), and
+/// `synthesize_canonical_for_write` bails on relative by contract. Relative input
+/// is exercised only by unit tests of the lexical fallback.
 fn canonicalize_write_target(path: &std::path::Path) -> std::path::PathBuf {
     if path.is_absolute() {
         if let Ok(resolved) = crate::execution_context::synthesize_canonical_for_write(path) {

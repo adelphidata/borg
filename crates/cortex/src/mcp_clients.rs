@@ -972,8 +972,9 @@ async fn start_server(
                 // Wrap with context instead of flattening to a string so the
                 // typed McpError survives for downcast-based classification
                 // (auth vs transport vs …) at the audit/health surface.
-                return Err(anyhow::Error::new(e)
-                    .context(format!("handshake/discovery failed for server '{server_name}'")));
+                return Err(anyhow::Error::new(e).context(format!(
+                    "handshake/discovery failed for server '{server_name}'"
+                )));
             }
         }
     };
@@ -1067,12 +1068,11 @@ async fn handshake_and_register(
     reg: &McpRegistry,
     builtin: &[&str],
 ) -> Result<()> {
-    let (session, discovered) = discover_session(manifest, session)
-        .await
-        .map_err(|e| {
-            anyhow::Error::new(e)
-                .context(format!("handshake/discovery failed for server '{server_name}'"))
-        })?;
+    let (session, discovered) = discover_session(manifest, session).await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "handshake/discovery failed for server '{server_name}'"
+        ))
+    })?;
     register_discovered(
         server_name,
         server_cfg,
