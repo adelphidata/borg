@@ -17,11 +17,19 @@
 /// allow list into account.
 ///
 /// Matching rules:
-/// 1. The path is canonicalized first (resolves symlinks, `..`, and
-///    tilde-expanded entries on the allow list). If canonicalization fails
-///    for a path that doesn't exist, the original path is used — this is
-///    fine because nonexistent paths are handled separately by callers.
-/// 2. If the canonical path starts with any entry in `allowed_paths`,
+/// 1. The path is resolved in TWO forms and denied if **either** matches the
+///    blocklist, so neither a symlinked parent nor a symlink named like a
+///    blocked component can slip a write past the guard:
+///    - `resolved`: the deepest existing ancestor canonicalized (resolving
+///      symlinks and tilde) with the possibly-not-yet-existing tail
+///      re-attached and `..` normalized. This catches an `apply_patch`
+///      add-file whose parent is a symlink into a blocked dir — a naive
+///      `canonicalize` fails on the missing leaf and would leave the parent
+///      unresolved.
+///    - `literal`: the tilde-expanded, lexically-normalized path with symlink
+///      names intact, so a symlink whose own name is a blocked component but
+///      which resolves elsewhere is still caught by name.
+/// 2. If the resolved path starts with any entry in `allowed_paths`,
 ///    access is allowed regardless of blocklist matches. This is the
 ///    escape hatch for specific `.env` files or `.aws/` directories that
 ///    the user legitimately wants the agent to read.
@@ -35,12 +43,14 @@
 /// (`/etc/hosts`, `/Users/you/other-project/...`, `../sibling/file.rs`)
 /// remain fully accessible, as does cross-directory navigation via `@`.
 pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[String]) -> bool {
-    // Canonicalize so we make decisions on the real on-disk path. If
-    // canonicalization fails (path doesn't exist, permissions), fall back to
-    // the literal path — callers handle nonexistent paths separately.
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Resolve the real on-disk path even when the leaf (or an intermediate
+    // dir) does not exist yet — the `apply_patch` add-file case — so a
+    // symlinked parent leading into a blocked dir cannot slip a write past the
+    // guard. Keep the name-preserving literal form too (see doc comment).
+    let resolved = canonicalize_write_target(path);
+    let literal = lexically_normalized(path);
 
-    // 1. Allow list: if the canonical path is under any allowed prefix,
+    // 1. Allow list: if the resolved path is under any allowed prefix,
     //    short-circuit to allow. Entries support tilde expansion.
     for raw_entry in allowed {
         let expanded = crate::util::unix_ext::expand_tilde(raw_entry);
@@ -48,15 +58,17 @@ pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[St
         // Canonicalize the allow entry too, so `~/work/.aws` and
         // `/Users/me/work/.aws` compare equal.
         let entry_canonical = entry_path.canonicalize().unwrap_or(entry_path);
-        if canonical.starts_with(&entry_canonical) {
+        if resolved.starts_with(&entry_canonical) {
             return false;
         }
     }
 
-    // 2. Block list: match any component or multi-component suffix against
-    //    the canonical path's components.
+    // 2. Block list: deny if either form contains a blocked component or
+    //    multi-component suffix.
     for raw_entry in blocked {
-        if path_contains_blocked_entry(&canonical, raw_entry) {
+        if path_contains_blocked_entry(&resolved, raw_entry)
+            || path_contains_blocked_entry(&literal, raw_entry)
+        {
             return true;
         }
     }
@@ -105,24 +117,49 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
 }
 
 /// Canonicalize a path that may not exist yet (the `apply_patch` add-file
-/// case). `Path::canonicalize` fails for missing leaves; the workaround is to
-/// canonicalize the *parent* and re-attach the file name. If even the parent
-/// is absent (an attacker patching `~/.borg/new-dir/borg.db` where `new-dir`
-/// doesn't exist), fall back to expanding tilde + lexical normalization so a
-/// raw `~/.borg/borg.db` or `./../.borg/borg.db` still resolves close enough
-/// for the control-plane comparison to fire.
+/// case). `Path::canonicalize` fails for *any* missing component, so we walk
+/// upward to the deepest existing ancestor, canonicalize **that** (resolving
+/// symlinks anywhere in the existing prefix — including a symlinked parent or
+/// grand-parent that leads into a blocked or control-plane directory), then
+/// re-attach the missing tail with `..`/`.` normalized. Walking to the deepest
+/// ancestor (not just the immediate parent) is what defeats a symlinked
+/// ancestor sitting above a not-yet-created intermediate dir. If no ancestor
+/// exists (only possible for a relative or empty path), fall back to
+/// tilde-expand + lexical normalization so a raw `~/.borg/borg.db` or
+/// `./../.borg/borg.db` still resolves close enough for comparison.
 fn canonicalize_write_target(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(real) = path.canonicalize() {
-        return real;
-    }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        if let Ok(real_parent) = parent.canonicalize() {
-            return real_parent.join(name);
+    let mut probe = Some(path);
+    while let Some(current) = probe {
+        if let Ok(real_prefix) = current.canonicalize() {
+            // `current` is always a component-prefix of `path` (we only ascend
+            // via `parent()`), so `strip_prefix` succeeds; the tail is the
+            // portion that does not exist on disk yet.
+            let tail = path
+                .strip_prefix(current)
+                .unwrap_or_else(|_| std::path::Path::new(""));
+            let mut resolved = real_prefix;
+            for comp in tail.components() {
+                match comp {
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => resolved.push(other.as_os_str()),
+                }
+            }
+            return resolved;
         }
+        probe = current.parent().filter(|p| !p.as_os_str().is_empty());
     }
-    // No part of the path exists yet. Tilde-expand + lexically normalize
-    // components so `~/.borg/borg.db` and `~/foo/../.borg/borg.db` still
-    // collapse to the literal `$HOME/.borg/borg.db` for comparison.
+    // No part of the path exists yet. Tilde-expand + lexically normalize.
+    lexically_normalized(path)
+}
+
+/// Tilde-expand `path` and lexically normalize it (drop `.`, resolve `..`)
+/// **without** touching the filesystem, so symlink names are preserved. Used
+/// as the name-preserving form in [`is_blocked_path`] and as the last-resort
+/// fallback in [`canonicalize_write_target`] when no ancestor exists on disk.
+fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
     let expanded = crate::util::unix_ext::expand_tilde(&path.to_string_lossy());
     let mut out = std::path::PathBuf::new();
     for comp in std::path::Path::new(&expanded).components() {
@@ -533,6 +570,80 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn is_blocked_path_denies_write_through_symlinked_parent_missing_leaf() {
+        // Regression (security): an `apply_patch` add-file whose parent is a
+        // symlink into a blocked dir must be denied even though the leaf does
+        // not exist yet. `canonicalize` fails on the missing leaf; the old
+        // literal fallback kept the un-resolved parent, so
+        // `notes/docs/authorized_keys` (docs -> .ssh) slipped past the
+        // blocklist and would have landed in ~/.ssh/authorized_keys.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocked_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&blocked_dir).expect("mkdir .ssh");
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes).expect("mkdir notes");
+        let docs = notes.join("docs");
+        symlink(&blocked_dir, &docs).expect("symlink docs -> .ssh");
+
+        let target = docs.join("authorized_keys");
+        assert!(!target.exists(), "precondition: leaf must not exist yet");
+
+        let blocked = vec![".ssh".to_string()];
+        assert!(
+            is_blocked_path(&target, &blocked, &[]),
+            "add-file through a symlinked parent into .ssh must be blocked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_blocked_path_denies_write_through_symlinked_ancestor_missing_intermediate() {
+        // Deeper variant: the symlink is a grand-parent AND an intermediate dir
+        // is missing, so resolving only the immediate parent would not reach
+        // the blocked target. The walk-up to the deepest existing ancestor must
+        // still resolve `data -> .aws` and block the write. A single-parent
+        // resolver would fail this.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocked_dir = tmp.path().join(".aws");
+        std::fs::create_dir_all(&blocked_dir).expect("mkdir .aws");
+        let link = tmp.path().join("data");
+        symlink(&blocked_dir, &link).expect("symlink data -> .aws");
+
+        // Neither `data/sub` nor the `credentials` leaf exists.
+        let target = link.join("sub").join("credentials");
+        let blocked = vec![".aws".to_string()];
+        assert!(
+            is_blocked_path(&target, &blocked, &[]),
+            "add-file through a symlinked ancestor must be blocked despite a missing intermediate dir"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_blocked_path_denies_symlink_named_like_blocked_component() {
+        // Defense-in-depth: a symlink whose own name matches a blocked
+        // component (`.aws`) but which resolves to a harmless dir must still be
+        // blocked by name — resolution alone would launder the blocked name
+        // away. This exercises the literal (name-preserving) form.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let harmless = tmp.path().join("harmless");
+        std::fs::create_dir_all(&harmless).expect("mkdir harmless");
+        let named = tmp.path().join(".aws");
+        symlink(&harmless, &named).expect("symlink .aws -> harmless");
+
+        let target = named.join("credentials");
+        let blocked = vec![".aws".to_string()];
+        assert!(
+            is_blocked_path(&target, &blocked, &[]),
+            "a symlink named like a blocked component must be blocked by name"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn is_blocked_path_resolves_symlink_chain_into_blocked() {
         // Regression guard: protect against an attacker creating a chain of
         // symlinks (`a -> b -> .ssh/id_rsa`) under a non-blocked directory and
@@ -555,6 +666,24 @@ mod tests {
         assert!(
             is_blocked_path(&entry, &blocked, &[]),
             "two-hop symlink into .ssh must canonicalize and be blocked"
+        );
+    }
+
+    #[test]
+    fn canonicalize_write_target_lexically_normalizes_when_no_ancestor_exists() {
+        // Pure-lexical fallback: when no component of the path exists on disk
+        // (a relative path with no real ancestor), `..` is resolved lexically
+        // so it cannot pop away a blocked component. Guards the last-resort
+        // branch that neither the walk-up nor the control-plane tests reach.
+        let p = std::path::Path::new("no_such_dir_zqx/ghost/../.ssh/id_rsa");
+        let out = canonicalize_write_target(p);
+        assert!(
+            out.components().any(|c| c.as_os_str() == ".ssh"),
+            "lexical fallback must keep the blocked component: {out:?}"
+        );
+        assert!(
+            !out.components().any(|c| c.as_os_str() == "ghost"),
+            "`..` should have popped `ghost`: {out:?}"
         );
     }
 }

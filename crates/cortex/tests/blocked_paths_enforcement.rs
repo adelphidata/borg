@@ -233,6 +233,53 @@ fn apply_patch_refuses_write_to_private_key_named_file() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn apply_patch_refuses_write_through_symlinked_parent_into_blocked_dir() {
+    // Regression (security): an add-file whose parent directory is a symlink
+    // into a blocked directory OUTSIDE the workspace must be refused. Uses the
+    // unrestricted context (production `from_process` behavior — no workspace
+    // jail) so the blocked-path guard, not workspace containment, is the only
+    // thing standing between the write and `.ssh`. The leaf does not exist yet,
+    // which is exactly where the old `canonicalize`-then-literal fallback left
+    // the symlinked parent unresolved and let the write through to
+    // `.ssh/authorized_keys`.
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::default();
+    assert_default_blocked_set(&cfg);
+
+    // A `.ssh` dir standing in for the user's real home key store, sitting
+    // OUTSIDE the project workspace.
+    let ssh_dir = tmp.path().join(".ssh");
+    fs::create_dir(&ssh_dir).expect("mkdir .ssh");
+
+    // The project the agent is working in, with an innocuous-looking symlink
+    // that actually points at the key store.
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).expect("mkdir project");
+    symlink(&ssh_dir, project.join("docs")).expect("symlink project/docs -> .ssh");
+
+    let ctx = ExecutionContext::unrestricted(project.clone());
+    let patch = "*** Begin Patch\n\
+                 *** Add File: docs/authorized_keys\n\
+                 +ssh-ed25519 AAAAinjected-by-test attacker\n\
+                 *** End Patch";
+    let result =
+        handle_apply_patch_with_context(&serde_json::json!({ "patch": patch }), &cfg, &ctx)
+            .expect("handler must return Ok for blocked rejection");
+
+    assert!(
+        result.contains("Access denied"),
+        "expected blocked-path denial for symlinked-parent write, got: {result}"
+    );
+    assert!(
+        !ssh_dir.join("authorized_keys").exists(),
+        "write must not land in the blocked .ssh dir via a symlinked parent"
+    );
+}
+
 // ── list_dir: blocked entries surface as `[blocked]` markers, not raw leaves ──
 
 #[test]
