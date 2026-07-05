@@ -1048,58 +1048,41 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     // Doctor's `check_heartbeat` reads `activity_log` to detect a stalled
     // scheduler — a missing entry would surface as "no heartbeat activity
     // recorded" even on a healthy fire.
-    crate::heartbeat::log_heartbeat_activity(
-        crate::heartbeat::HeartbeatSource::Scheduled,
-        "ran",
-        &result_text,
-    );
-    publish_ran_event(started_unix, &result_text, duration_ms as f64);
+    publish_heartbeat_event(started_unix, "ran", &result_text, None, duration_ms as f64);
 }
 
-fn publish_ran_event(started_unix: i64, message: &str, duration_ms: f64) {
+/// Log a scheduled-heartbeat outcome to the activity feed and publish it on
+/// the global heartbeat bus. `skip_reason` is `Some` only for skips; `ran`
+/// events carry a real duration, everything else reports `0.0`.
+fn publish_heartbeat_event(
+    started_unix: i64,
+    status: &'static str,
+    message: &str,
+    skip_reason: Option<&'static str>,
+    duration_ms: f64,
+) {
+    crate::heartbeat::log_heartbeat_activity(
+        crate::heartbeat::HeartbeatSource::Scheduled,
+        status,
+        message,
+    );
     crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
         source: crate::heartbeat::HeartbeatSource::Scheduled,
         started_at_unix: started_unix,
         finished_at_unix: chrono::Utc::now().timestamp(),
-        status: "ran",
+        status,
         message: message.to_string(),
-        skip_reason: None,
+        skip_reason,
         duration_ms,
     });
 }
 
 fn publish_skip_event(started_unix: i64, reason: &'static str) {
-    crate::heartbeat::log_heartbeat_activity(
-        crate::heartbeat::HeartbeatSource::Scheduled,
-        "skipped",
-        reason,
-    );
-    crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
-        source: crate::heartbeat::HeartbeatSource::Scheduled,
-        started_at_unix: started_unix,
-        finished_at_unix: chrono::Utc::now().timestamp(),
-        status: "skipped",
-        message: reason.to_string(),
-        skip_reason: Some(reason),
-        duration_ms: 0.0,
-    });
+    publish_heartbeat_event(started_unix, "skipped", reason, Some(reason), 0.0);
 }
 
 fn publish_failed_event(started_unix: i64, error: &str) {
-    crate::heartbeat::log_heartbeat_activity(
-        crate::heartbeat::HeartbeatSource::Scheduled,
-        "failed",
-        error,
-    );
-    crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
-        source: crate::heartbeat::HeartbeatSource::Scheduled,
-        started_at_unix: started_unix,
-        finished_at_unix: chrono::Utc::now().timestamp(),
-        status: "failed",
-        message: error.to_string(),
-        skip_reason: None,
-        duration_ms: 0.0,
-    });
+    publish_heartbeat_event(started_unix, "failed", error, None, 0.0);
 }
 
 fn response_hash(text: &str) -> String {
@@ -1110,52 +1093,60 @@ fn response_hash(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-async fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
-    let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
+/// Write a heartbeat run's completion row, warning (never failing) on DB
+/// errors — recording is best-effort and must not affect the tick outcome.
+async fn record_run_completion(
+    run_id: i64,
+    duration_ms: i64,
+    skip_marker: Option<&str>,
+    error: Option<&str>,
+    task_name: &str,
+    what: &str,
+) {
     match cortex::db::Database::open().await {
         Ok(db) => {
             if let Err(e) = db
-                .complete_task_run(run_id, duration_ms, Some(reason), None)
+                .complete_task_run(run_id, duration_ms, skip_marker, error)
                 .await
             {
-                tracing::warn!("Heartbeat '{task_name}': skip-record failed ({reason}): {e}");
+                tracing::warn!("Heartbeat '{task_name}': {what} failed: {e}");
             }
         }
-        Err(e) => tracing::warn!(
-            "Heartbeat '{task_name}': DB open for skip-record failed ({reason}): {e}"
-        ),
+        Err(e) => tracing::warn!("Heartbeat '{task_name}': DB open for {what} failed: {e}"),
     }
+}
+
+async fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
+    let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
+    let what = format!("skip-record ({reason})");
+    record_run_completion(run_id, duration_ms, Some(reason), None, task_name, &what).await;
     tracing::info!(task = %task_name, reason, "heartbeat: skipped tick");
 }
 
 async fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
-    match cortex::db::Database::open().await {
-        Ok(db) => {
-            if let Err(e) = db
-                .complete_task_run(run_id, duration_ms, Some(marker), None)
-                .await
-            {
-                tracing::warn!("Heartbeat '{task_name}': silent-record failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("Heartbeat '{task_name}': DB open for silent-record failed: {e}"),
-    }
+    record_run_completion(
+        run_id,
+        duration_ms,
+        Some(marker),
+        None,
+        task_name,
+        "silent-record",
+    )
+    .await;
     tracing::info!(task = %task_name, marker, "heartbeat: suppressed delivery");
 }
 
 async fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, task_name: &str) {
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-    match cortex::db::Database::open().await {
-        Ok(db) => {
-            if let Err(e) = db
-                .complete_task_run(run_id, duration_ms, None, Some(error))
-                .await
-            {
-                tracing::warn!("Heartbeat '{task_name}': failure-record failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("Heartbeat '{task_name}': DB open for failure-record failed: {e}"),
-    }
+    record_run_completion(
+        run_id,
+        duration_ms,
+        None,
+        Some(error),
+        task_name,
+        "failure-record",
+    )
+    .await;
     tracing::warn!(task = %task_name, error, "heartbeat: failed");
 }
 
