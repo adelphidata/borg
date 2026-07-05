@@ -47,11 +47,17 @@ use crate::types::{ContentPart, MediaData, ToolOutput};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ComputerUseAction {
     // ── Read-only (plan-mode-safe) ──
-    /// Capture the screen as a PNG. Returns a multimodal envelope so the
-    /// model gets pixels on the next turn.
+    /// Capture a window as a PNG (and, in `som`/`ax` mode, its accessibility
+    /// tree). Requires `window_id` (from `list_windows`) — the driver is
+    /// window-oriented and cannot capture the whole desktop. Returns a
+    /// multimodal envelope so the model gets pixels on the next turn.
     Capture,
     /// List the running macOS applications with pid + name.
     ListApps,
+    /// List on-screen windows with `window_id` + `pid` + title + bounds.
+    /// This is how the model discovers the `window_id`/`pid` that `capture`
+    /// and the pointer/AX actions require.
+    ListWindows,
     /// Block for `duration_ms` milliseconds. Useful for waiting on
     /// animations or async UI redraws between captures.
     Wait,
@@ -84,11 +90,14 @@ pub(crate) enum ComputerUseAction {
 }
 
 impl ComputerUseAction {
-    /// True for the three actions that don't mutate host state.
+    /// True for the actions that don't mutate host state.
     pub(crate) const fn is_readonly(&self) -> bool {
         matches!(
             self,
-            ComputerUseAction::Capture | ComputerUseAction::ListApps | ComputerUseAction::Wait
+            ComputerUseAction::Capture
+                | ComputerUseAction::ListApps
+                | ComputerUseAction::ListWindows
+                | ComputerUseAction::Wait
         )
     }
 }
@@ -620,11 +629,19 @@ pub(crate) async fn handle_with_driver(
     let result = match args.action {
         ComputerUseAction::Capture => return capture(args, driver).await,
         ComputerUseAction::ListApps => return list_apps(driver).await,
+        ComputerUseAction::ListWindows => return list_windows(driver).await,
         ComputerUseAction::Wait => return wait(args, None).await,
         ComputerUseAction::Click => click(args, "click", driver).await,
         ComputerUseAction::DoubleClick => click(args, "double_click", driver).await,
         ComputerUseAction::RightClick => click(args, "right_click", driver).await,
-        ComputerUseAction::MiddleClick => click(args, "middle_click", driver).await,
+        // cua-driver exposes only left/right/double click — there is no
+        // middle-click tool. Surface that as a clear error rather than
+        // dispatching a call the driver would reject.
+        ComputerUseAction::MiddleClick => Ok(ToolOutput::Text(
+            "Error: computer_use middle_click is not supported by cua-driver (it exposes only \
+             left, right, and double click)."
+                .into(),
+        )),
         ComputerUseAction::Drag => drag(args, driver).await,
         ComputerUseAction::Scroll => scroll(args, driver).await,
         ComputerUseAction::Type => type_text(args, driver).await,
@@ -784,20 +801,36 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
 
 async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
     let mode = args.mode.unwrap_or_default();
-    let mut params = json!({"mode": mode_str(mode)});
-    if let Some(pid) = args.pid {
-        params["pid"] = json!(pid);
-    }
-    if let Some(window_id) = args.window_id {
-        params["window_id"] = json!(window_id);
-    }
-    let method = match mode {
-        // `ax` returns the AX tree as text — cua-driver exposes it under
-        // `accessibility` per the SOM/AX split documented in the skill.
-        CaptureMode::Ax => "accessibility",
-        // SOM and Vision both come back from `screenshot`; SOM additionally
-        // emits a text part with the numbered overlay JSON.
-        CaptureMode::Som | CaptureMode::Vision => "screenshot",
+    // The driver is window-oriented: every capture needs a `window_id`
+    // (from `list_windows`), and the AX-tree modes additionally need the
+    // owning `pid`. There is no whole-desktop capture.
+    let window_id = args.window_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "computer_use.capture requires `window_id` — call action `list_windows` first to \
+             enumerate windows (each carries `window_id` + `pid`). The driver captures one \
+             window at a time; it has no whole-desktop capture."
+        )
+    })?;
+    let (method, params) = match mode {
+        // `som`/`ax` walk the AX tree via `get_window_state` (which also
+        // returns the screenshot in `som`). Both need pid + window_id.
+        CaptureMode::Som | CaptureMode::Ax => {
+            let pid = args.pid.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "computer_use.capture in mode={mode:?} requires `pid` (the window's owning \
+                     process, from `list_windows`) so the driver can walk its accessibility tree."
+                )
+            })?;
+            (
+                "get_window_state",
+                json!({"pid": pid, "window_id": window_id}),
+            )
+        }
+        // `vision` wants raw pixels only — `screenshot` skips the AX walk.
+        CaptureMode::Vision => (
+            "screenshot",
+            json!({"window_id": window_id, "format": "png"}),
+        ),
     };
     let mut resp = driver.call(method, params.clone()).await?;
 
@@ -885,28 +918,36 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
     })
 }
 
-fn mode_str(mode: CaptureMode) -> &'static str {
-    match mode {
-        CaptureMode::Vision => "vision",
-        CaptureMode::Som => "som",
-        CaptureMode::Ax => "ax",
-    }
-}
-
-async fn list_apps(driver: &dyn Driver) -> Result<ToolOutput> {
-    let resp = driver.call("list_apps", json!({})).await?;
-    // The driver returns its own pretty-rendered text for `list_apps`; we
-    // surface it verbatim so the model sees what the human user would.
-    let combined: String = resp
-        .content
+/// Collect all text parts of a driver reply into one string, dropping any
+/// image parts. Used by the pure-text enumeration actions (`list_apps`,
+/// `list_windows`) whose driver replies the model reads verbatim.
+fn driver_text_only(resp: DriverResponse) -> String {
+    resp.content
         .into_iter()
         .filter_map(|p| match p {
             DriverContent::Text(t) => Some(t),
             DriverContent::Image { .. } => None,
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    Ok(ToolOutput::Text(combined))
+        .join("\n")
+}
+
+async fn list_apps(driver: &dyn Driver) -> Result<ToolOutput> {
+    // The driver returns its own pretty-rendered text; we surface it verbatim
+    // so the model sees what the human user would.
+    let resp = driver.call("list_apps", json!({})).await?;
+    Ok(ToolOutput::Text(driver_text_only(resp)))
+}
+
+async fn list_windows(driver: &dyn Driver) -> Result<ToolOutput> {
+    // `on_screen_only: true` keeps the list to windows the user can actually
+    // see — the common case for "what can I drive right now". Each record
+    // carries the `window_id` + `pid` that `capture` and the pointer/AX
+    // actions require.
+    let resp = driver
+        .call("list_windows", json!({"on_screen_only": true}))
+        .await?;
+    Ok(ToolOutput::Text(driver_text_only(resp)))
 }
 
 /// Cap at 5 minutes so a runaway agent loop can't pin the worker
@@ -1276,7 +1317,15 @@ fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
 }
 
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
-    let mut params = json!({});
+    // Every click variant is posted to a target process, so `pid` is required
+    // by the driver (`required: [pid]`). Fail early with an actionable message
+    // rather than let the driver reject the call opaquely.
+    let pid = args.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "computer_use.{method} requires `pid` (the target process, from `list_windows`)"
+        )
+    })?;
+    let mut params = json!({"pid": pid});
     let summary;
     let modifiers = driver_modifiers(args)?;
     if let Some(idx) = args.element_index {
@@ -1284,7 +1333,15 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         // model saw it in the last capture(mode=som). Pixel coords are
         // omitted entirely so the driver can't fall back to them. The
         // driver ignores `modifier` on this AX path, so we don't send it.
+        // The element cache is keyed by (pid, window_id), so window_id is
+        // required to resolve the index against the right window.
+        let window_id = args.window_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.{method} with `element_index` requires `window_id` (the AX cache key, from `list_windows`)"
+            )
+        })?;
         params["element_index"] = json!(idx);
+        params["window_id"] = json!(window_id);
         summary = format!("{method} on element [{idx}]");
     } else {
         let x = args.x.ok_or_else(|| {
@@ -1300,9 +1357,6 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         // Modifiers are pixel-path only (the driver's AX path ignores them).
         let suffix = apply_modifiers(&mut params, &modifiers);
         summary = format!("{method} at ({x}, {y}){suffix}");
-    }
-    if let Some(pid) = args.pid {
-        params["pid"] = json!(pid);
     }
     let resp = driver.call(method, params).await?;
     Ok(merge_driver_text(summary, resp))
@@ -1321,10 +1375,13 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
     let to_y = args
         .to_y
         .ok_or_else(|| anyhow::anyhow!("computer_use.drag requires `to_x`/`to_y`"))?;
-    let mut params = json!({"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y});
-    if let Some(pid) = args.pid {
-        params["pid"] = json!(pid);
-    }
+    let pid = args.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "computer_use.drag requires `pid` (the target process, from `list_windows`)"
+        )
+    })?;
+    let mut params =
+        json!({"pid": pid, "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y});
     // Drag is pixel-only in the driver (AX has no drag), so modifiers always
     // apply when present — option-drag duplicates, shift-drag constrains.
     let with = apply_modifiers(&mut params, &driver_modifiers(args)?);
@@ -1390,9 +1447,19 @@ async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
         .text
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("computer_use.type requires `text`"))?;
-    let mut params = json!({"text": text});
-    if let Some(pid) = args.pid {
-        params["pid"] = json!(pid);
+    let pid = args.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "computer_use.type requires `pid` (the target process, from `list_windows`)"
+        )
+    })?;
+    let mut params = json!({"pid": pid, "text": text});
+    if let Some(idx) = args.element_index {
+        // Focus the element before typing; requires window_id to resolve the
+        // (pid, window_id)-keyed AX cache.
+        params["element_index"] = json!(idx);
+        if let Some(window_id) = args.window_id {
+            params["window_id"] = json!(window_id);
+        }
     }
     let resp = driver.call("type_text", params).await?;
     Ok(merge_driver_text(
@@ -1403,23 +1470,30 @@ async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
 
 async fn key(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
     // Branch: single key vs hotkey. The `key`/`keys` discrimination matches
-    // the cua-driver CLI's `press_key` vs `hotkey` split.
+    // the cua-driver CLI's `press_key` vs `hotkey` split. Both require `pid`
+    // (`required: [pid, ...]`) — the keystrokes are posted to a target process.
     if let Some(combo) = &args.keys {
-        let mut params = json!({"keys": combo});
-        if let Some(pid) = args.pid {
-            params["pid"] = json!(pid);
-        }
-        let resp = driver.call("hotkey", params).await?;
+        let pid = args.pid.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.key requires `pid` (the target process, from `list_windows`)"
+            )
+        })?;
+        let resp = driver
+            .call("hotkey", json!({"pid": pid, "keys": combo}))
+            .await?;
         Ok(merge_driver_text(
             format!("hotkey {}", combo.join("+")),
             resp,
         ))
     } else if let Some(k) = &args.key {
-        let mut params = json!({"key": k});
-        if let Some(pid) = args.pid {
-            params["pid"] = json!(pid);
-        }
-        let resp = driver.call("press_key", params).await?;
+        let pid = args.pid.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.key requires `pid` (the target process, from `list_windows`)"
+            )
+        })?;
+        let resp = driver
+            .call("press_key", json!({"pid": pid, "key": k}))
+            .await?;
         Ok(merge_driver_text(format!("press_key {k}"), resp))
     } else {
         Ok(ToolOutput::Text(
@@ -1456,22 +1530,19 @@ async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     ))
 }
 
-async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
-    let target = args.target.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("computer_use.focus_app requires `target` (bundle id or process name)")
-    })?;
-    // `raise_window` defaults to true (visible, focus-stealing) per the
-    // safer-default principle. Background co-work is opt-in.
-    let raise = args.raise_window.unwrap_or(true);
-    let mut params = json!({"target": target, "raise_window": raise});
-    if let Some(window_id) = args.window_id {
-        params["window_id"] = json!(window_id);
-    }
-    let resp = driver.call("focus_app", params).await?;
-    let mode = if raise { "raised" } else { "backgrounded" };
-    Ok(merge_driver_text(
-        format!("focus_app {target} ({mode})"),
-        resp,
+/// `focus_app` has no cua-driver equivalent: the driver is AX-driven and
+/// operates on backgrounded windows *by design* — it never raises a window
+/// to the foreground (`launch_app` even launches hidden). So there is nothing
+/// to call. We surface an actionable error rather than dispatch a nonexistent
+/// tool. The security denylist for login/screen-lock targets still runs ahead
+/// of this in `check_denylist`, so a denied target reports the security
+/// refusal, not this generic message.
+async fn focus_app(_args: &ComputerUseArgs, _driver: &dyn Driver) -> Result<ToolOutput> {
+    Ok(ToolOutput::Text(
+        "Error: computer_use focus_app is not supported by cua-driver, which drives windows \
+         in the background without raising them. Target a specific window instead: use \
+         `list_windows` to get its `window_id`+`pid`, then pass those to capture/click/etc."
+            .into(),
     ))
 }
 
@@ -1607,6 +1678,7 @@ mod tests {
         let cases: &[(ComputerUseAction, bool)] = &[
             (ComputerUseAction::Capture, true),
             (ComputerUseAction::ListApps, true),
+            (ComputerUseAction::ListWindows, true),
             (ComputerUseAction::Wait, true),
             (ComputerUseAction::Click, false),
             (ComputerUseAction::DoubleClick, false),
@@ -1643,7 +1715,8 @@ mod tests {
                 },
             ],
         }]);
-        let args = args_with_action(ComputerUseAction::Capture);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let (text, parts) = match out {
             ToolOutput::Multimodal { text, parts } => (text, parts),
@@ -1662,10 +1735,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_surfaces_pid_and_window_id() {
-        // Window-targeted capture needs (pid, window_id) to reach the driver
-        // intact — silently dropping them would always full-screen capture
-        // and the agent's "look at this app" intent would be lost.
+    async fn capture_som_surfaces_pid_and_window_id() {
+        // AX-walking capture (som/ax) goes to `get_window_state`, which is
+        // keyed by (pid, window_id). Both must reach the driver intact —
+        // dropping either would resolve the element overlay against the wrong
+        // window and the agent's "look at this app" intent would be lost.
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![DriverContent::Image {
                 mime_type: "image/png".into(),
@@ -1673,12 +1747,42 @@ mod tests {
             }],
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Som);
         args.pid = Some(1234);
         args.window_id = Some(42);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
-        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "get_window_state");
         assert_eq!(params["pid"], 1234);
         assert_eq!(params["window_id"], 42);
+    }
+
+    #[tokio::test]
+    async fn capture_without_window_id_errors_before_driver() {
+        // The driver has no whole-desktop capture; every capture needs a
+        // window_id. Missing it must fail loudly (pointing at list_windows)
+        // rather than send an unroutable call.
+        let driver = FakeDriver::new(vec![]);
+        let args = args_with_action(ComputerUseAction::Capture);
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(
+            err.to_string().contains("window_id") && err.to_string().contains("list_windows"),
+            "got: {err}"
+        );
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_som_without_pid_errors_before_driver() {
+        // som/ax walk the AX tree via get_window_state, which needs the
+        // owning pid. Missing it errors before the driver.
+        let driver = FakeDriver::new(vec![]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Som);
+        args.window_id = Some(42);
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(err.to_string().contains("pid"), "got: {err}");
+        assert!(driver.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1697,6 +1801,28 @@ mod tests {
         };
         assert!(text.contains("Safari"));
         assert!(text.contains("Finder"));
+    }
+
+    #[tokio::test]
+    async fn list_windows_calls_driver_and_returns_text() {
+        // list_windows is the discovery step that yields the window_id + pid
+        // every other window-oriented action needs. It must hit the driver's
+        // `list_windows` tool (with on_screen_only) and surface its text.
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(
+                "Safari — window_id=11 pid=1 \"Home\"".into(),
+            )],
+        }]);
+        let args = args_with_action(ComputerUseAction::ListWindows);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(text.contains("window_id=11"), "got: {text}");
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "list_windows");
+        assert_eq!(params["on_screen_only"], true);
     }
 
     #[tokio::test]
@@ -1926,6 +2052,7 @@ mod tests {
         for combo in combos {
             let driver = FakeDriver::new(vec![ok_response()]);
             let mut args = args_with_action(ComputerUseAction::Key);
+            args.pid = Some(1234);
             args.keys = Some(combo.iter().map(|s| s.to_string()).collect());
             let _ = handle_with_driver(&args, &driver).await.unwrap();
             assert_eq!(
@@ -1980,6 +2107,7 @@ mod tests {
         for payload in allowed {
             let driver = FakeDriver::new(vec![ok_response()]);
             let mut args = args_with_action(ComputerUseAction::Type);
+            args.pid = Some(1234);
             args.text = Some(payload.into());
             let _ = handle_with_driver(&args, &driver).await.unwrap();
             assert_eq!(
@@ -2031,11 +2159,13 @@ mod tests {
     async fn click_invokes_driver_with_coords() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(42);
         args.y = Some(13);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "click");
+        assert_eq!(params["pid"], 1234);
         assert_eq!(params["x"], 42);
         assert_eq!(params["y"], 13);
     }
@@ -2044,11 +2174,85 @@ mod tests {
     async fn type_invokes_driver_with_text() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Type);
+        args.pid = Some(1234);
         args.text = Some("Hello world".into());
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "type_text");
+        assert_eq!(params["pid"], 1234);
         assert_eq!(params["text"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn click_requires_pid_before_driver() {
+        // Every click variant is posted to a target process — a missing pid
+        // must error (pointing at list_windows) rather than send an
+        // unroutable call the driver would reject opaquely.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(1);
+        args.y = Some(2);
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(err.to_string().contains("pid"), "got: {err}");
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn type_requires_pid_before_driver() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.text = Some("hi".into());
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(err.to_string().contains("pid"), "got: {err}");
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_requires_pid_before_driver() {
+        // Both the single-key and hotkey branches post keystrokes to a target
+        // process, so both require pid.
+        for mut args in [
+            {
+                let mut a = args_with_action(ComputerUseAction::Key);
+                a.key = Some("Return".into());
+                a
+            },
+            {
+                let mut a = args_with_action(ComputerUseAction::Key);
+                a.keys = Some(vec!["cmd".into(), "a".into()]);
+                a
+            },
+        ] {
+            args.pid = None;
+            let driver = FakeDriver::new(vec![ok_response()]);
+            let err = handle_with_driver(&args, &driver).await.unwrap_err();
+            assert!(err.to_string().contains("pid"), "got: {err}");
+            assert!(driver.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn key_single_and_hotkey_forward_pid() {
+        // press_key (single) and hotkey (combo) must both carry pid.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut single = args_with_action(ComputerUseAction::Key);
+        single.pid = Some(1234);
+        single.key = Some("Return".into());
+        let _ = handle_with_driver(&single, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "press_key");
+        assert_eq!(params["pid"], 1234);
+        assert_eq!(params["key"], "Return");
+
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut combo = args_with_action(ComputerUseAction::Key);
+        combo.pid = Some(1234);
+        combo.keys = Some(vec!["cmd".into(), "a".into()]);
+        let _ = handle_with_driver(&combo, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "hotkey");
+        assert_eq!(params["pid"], 1234);
+        assert_eq!(params["keys"], json!(["cmd", "a"]));
     }
 
     // ── modifiers ──────────────────────────────────────────────────
@@ -2061,6 +2265,7 @@ mod tests {
     async fn click_forwards_canonicalised_modifiers_on_pixel_path() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(10);
         args.y = Some(20);
         args.modifiers = Some(vec!["command".into(), "alt".into()]);
@@ -2080,6 +2285,8 @@ mod tests {
     async fn click_omits_modifiers_on_element_index_path() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
+        args.window_id = Some(9);
         args.element_index = Some(4);
         args.modifiers = Some(vec!["cmd".into()]);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
@@ -2089,6 +2296,7 @@ mod tests {
             "modifier must not ride the element_index path: {params}"
         );
         assert_eq!(params["element_index"], 4);
+        assert_eq!(params["window_id"], 9);
     }
 
     /// Drag is pixel-only, so modifiers always apply — option-drag duplicates,
@@ -2097,6 +2305,7 @@ mod tests {
     async fn drag_forwards_modifiers() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Drag);
+        args.pid = Some(1234);
         args.x = Some(1);
         args.y = Some(2);
         args.to_x = Some(3);
@@ -2105,7 +2314,21 @@ mod tests {
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "drag");
+        assert_eq!(params["pid"], 1234);
         assert_eq!(params["modifier"], json!(["shift"]));
+    }
+
+    #[tokio::test]
+    async fn drag_requires_pid_before_driver() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Drag);
+        args.x = Some(1);
+        args.y = Some(2);
+        args.to_x = Some(3);
+        args.to_y = Some(4);
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(err.to_string().contains("pid"), "got: {err}");
+        assert!(driver.calls.lock().unwrap().is_empty());
     }
 
     /// An unknown modifier must be rejected pre-driver with a message naming
@@ -2115,6 +2338,7 @@ mod tests {
     async fn click_rejects_unknown_modifier_before_driver() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(1);
         args.y = Some(2);
         args.modifiers = Some(vec!["hyper".into()]);
@@ -2151,32 +2375,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_app_no_raise_passes_flag_through() {
-        // The whole point of the `raise_window: false` knob is that the
-        // user's frontmost app stays frontmost. If the flag silently
-        // becomes `true` somewhere along the way the no-foreground contract
-        // breaks — this guards exactly that.
+    async fn focus_app_is_unsupported_and_never_calls_driver() {
+        // cua-driver has no activation/raise tool — it drives windows in the
+        // background by design. focus_app must surface that as an actionable
+        // error (pointing at list_windows) and must NOT dispatch a
+        // nonexistent `focus_app` driver call.
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::FocusApp);
         args.target = Some("com.google.Chrome".into());
-        args.raise_window = Some(false);
-        let _ = handle_with_driver(&args, &driver).await.unwrap();
-        let (method, params) = driver.calls.lock().unwrap()[0].clone();
-        assert_eq!(method, "focus_app");
-        assert_eq!(params["target"], "com.google.Chrome");
-        assert_eq!(params["raise_window"], false);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        assert!(
+            text.contains("not supported") && text.contains("list_windows"),
+            "focus_app should explain it's unsupported: {text}"
+        );
+        assert!(
+            driver.calls.lock().unwrap().is_empty(),
+            "focus_app must not reach the driver"
+        );
     }
 
     #[tokio::test]
-    async fn focus_app_defaults_to_raise_true() {
-        // Safer default — anything that defaults to "stealth-mode UI driving"
-        // is too easy to misuse. Operators have to ask for backgrounded.
+    async fn middle_click_is_unsupported_and_never_calls_driver() {
+        // cua-driver exposes only left/right/double click. middle_click must
+        // surface a clear error rather than dispatch a call the driver rejects.
         let driver = FakeDriver::new(vec![ok_response()]);
-        let mut args = args_with_action(ComputerUseAction::FocusApp);
-        args.target = Some("com.apple.Finder".into());
-        let _ = handle_with_driver(&args, &driver).await.unwrap();
-        let (_, params) = driver.calls.lock().unwrap()[0].clone();
-        assert_eq!(params["raise_window"], true);
+        let mut args = args_with_action(ComputerUseAction::MiddleClick);
+        args.pid = Some(1234);
+        args.x = Some(1);
+        args.y = Some(2);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        assert!(text.contains("not supported"), "got: {text}");
+        assert!(driver.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2193,6 +2430,7 @@ mod tests {
             )],
         }]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(100);
         args.y = Some(200);
         let out = handle_with_driver(&args, &driver).await.unwrap();
@@ -2211,28 +2449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_app_surfaces_driver_soft_failure_text() {
-        // Covers the focus_app branch — the no-foreground contract makes this
-        // a particularly easy soft-failure surface to ignore (the driver
-        // can't raise a sandboxed app and shrugs back a text-part).
-        let driver = FakeDriver::new(vec![DriverResponse {
-            content: vec![DriverContent::Text(
-                "error: target app sandbox prevents activation".into(),
-            )],
-        }]);
-        let mut args = args_with_action(ComputerUseAction::FocusApp);
-        args.target = Some("com.google.Chrome".into());
-        args.raise_window = Some(false);
-        let out = handle_with_driver(&args, &driver).await.unwrap();
-        let text = match out {
-            ToolOutput::Text(t) => t,
-            other => panic!("expected text, got {other:?}"),
-        };
-        assert!(text.contains("focus_app com.google.Chrome"));
-        assert!(text.contains("error: target app sandbox prevents activation"));
-    }
-
-    #[tokio::test]
     async fn click_truncates_oversized_driver_text() {
         // A misbehaving cua-driver build could return arbitrarily large text;
         // every action's output flows into LLM context, so the merge must cap
@@ -2243,6 +2459,7 @@ mod tests {
             content: vec![DriverContent::Text(huge)],
         }]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(7);
         args.y = Some(8);
         let out = handle_with_driver(&args, &driver).await.unwrap();
@@ -2270,6 +2487,7 @@ mod tests {
         // expectations don't shift.
         let driver = FakeDriver::new(vec![DriverResponse { content: vec![] }]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
         args.x = Some(1);
         args.y = Some(2);
         let out = handle_with_driver(&args, &driver).await.unwrap();
@@ -2282,10 +2500,10 @@ mod tests {
 
     /// AX mode is text-only by contract — pixels would defeat the whole
     /// "keep bytes out of LLM context" purpose. The driver method must
-    /// route to `accessibility` and the response must NOT include an
-    /// ImageBase64 part even if the driver accidentally returned one.
+    /// route to `get_window_state` (which walks the AX tree) and the response
+    /// must NOT include an ImageBase64 part even if the driver returned one.
     #[tokio::test]
-    async fn capture_ax_mode_is_text_only_and_calls_accessibility() {
+    async fn capture_ax_mode_is_text_only_and_calls_get_window_state() {
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![
                 DriverContent::Text("AXWindow > AXButton \"Submit\"".into()),
@@ -2300,6 +2518,8 @@ mod tests {
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Ax);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
@@ -2308,13 +2528,15 @@ mod tests {
             }
             other => panic!("expected text-only output for AX mode, got {other:?}"),
         }
-        assert_eq!(driver.calls.lock().unwrap()[0].0, "accessibility");
-        assert_eq!(driver.calls.lock().unwrap()[0].1["mode"], "ax");
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "get_window_state");
+        assert_eq!(params["pid"], 1234);
+        assert_eq!(params["window_id"], 42);
     }
 
-    /// SOM mode keeps the image AND surfaces the overlay text from the
-    /// driver. The mode string is what the driver branches on for the
-    /// numbered-overlay render.
+    /// SOM mode keeps the image AND surfaces the overlay text. It walks the
+    /// AX tree via `get_window_state` (which returns both the element map and
+    /// the screenshot), keyed by (pid, window_id).
     #[tokio::test]
     async fn capture_som_mode_returns_image_plus_overlay_text() {
         let driver = FakeDriver::new(vec![DriverResponse {
@@ -2328,6 +2550,8 @@ mod tests {
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Som);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let (text, parts) = match out {
             ToolOutput::Multimodal { text, parts } => (text, parts),
@@ -2340,12 +2564,11 @@ mod tests {
         assert!(parts
             .iter()
             .any(|p| matches!(p, ContentPart::ImageBase64 { .. })));
-        assert_eq!(driver.calls.lock().unwrap()[0].0, "screenshot");
-        assert_eq!(driver.calls.lock().unwrap()[0].1["mode"], "som");
+        assert_eq!(driver.calls.lock().unwrap()[0].0, "get_window_state");
     }
 
-    /// Default mode keeps backward compatibility — no `mode` set must behave
-    /// exactly like the pre-parity tool: `screenshot`, `vision`, image inline.
+    /// Default (vision) mode captures raw pixels via `screenshot`, keyed by
+    /// window_id, requesting the png format the envelope decoder expects.
     #[tokio::test]
     async fn capture_default_mode_is_vision() {
         let driver = FakeDriver::new(vec![DriverResponse {
@@ -2354,11 +2577,13 @@ mod tests {
                 base64: png_b64_of_size(64, 64),
             }],
         }]);
-        let args = args_with_action(ComputerUseAction::Capture);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.window_id = Some(42);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "screenshot");
-        assert_eq!(params["mode"], "vision");
+        assert_eq!(params["window_id"], 42);
+        assert_eq!(params["format"], "png");
     }
 
     /// A no-image reply that carries an explicit text detail (e.g. a
@@ -2372,6 +2597,7 @@ mod tests {
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
@@ -2400,6 +2626,7 @@ mod tests {
         ]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
@@ -2425,7 +2652,8 @@ mod tests {
                 }],
             },
         ]);
-        let args = args_with_action(ComputerUseAction::Capture);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         assert!(
             matches!(out, ToolOutput::Multimodal { .. }),
@@ -2446,6 +2674,7 @@ mod tests {
         let driver = FakeDriver::new(vec![DriverResponse { content: vec![] }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
@@ -2473,6 +2702,8 @@ mod tests {
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Som);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
@@ -2497,7 +2728,8 @@ mod tests {
                     base64: png_b64_of_size(w, h),
                 }],
             }]);
-            let args = args_with_action(ComputerUseAction::Capture);
+            let mut args = args_with_action(ComputerUseAction::Capture);
+            args.window_id = Some(42);
             let out = handle_with_driver(&args, &driver).await.unwrap();
             assert!(
                 matches!(out, ToolOutput::Multimodal { .. }),
@@ -2515,6 +2747,8 @@ mod tests {
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Ax);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         assert_eq!(driver.calls.lock().unwrap().len(), 1);
     }
@@ -2529,11 +2763,14 @@ mod tests {
     async fn click_by_element_index_omits_coordinates() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
+        args.window_id = Some(9);
         args.element_index = Some(7);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(method, "click");
         assert_eq!(params["element_index"], 7);
+        assert_eq!(params["window_id"], 9);
         assert!(
             params.get("x").is_none(),
             "stray x in element_index click: {params}"
@@ -2542,6 +2779,20 @@ mod tests {
             params.get("y").is_none(),
             "stray y in element_index click: {params}"
         );
+    }
+
+    #[tokio::test]
+    async fn click_by_element_index_requires_window_id() {
+        // The element cache is keyed by (pid, window_id); an index click
+        // without window_id can't be resolved and must error before the
+        // driver rather than resolve against the wrong window.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
+        args.element_index = Some(7);
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(err.to_string().contains("window_id"), "got: {err}");
+        assert!(driver.calls.lock().unwrap().is_empty());
     }
 
     /// Ambiguous target: model sets both pixel coords and element_index.
@@ -2651,6 +2902,8 @@ mod tests {
             },
         ]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         args.x = Some(1);
         args.y = Some(2);
         args.capture_after = Some(true);
@@ -2712,6 +2965,8 @@ mod tests {
             // No second response queued — capture_internal will error.
         ]);
         let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         args.x = Some(5);
         args.y = Some(6);
         args.capture_after = Some(true);

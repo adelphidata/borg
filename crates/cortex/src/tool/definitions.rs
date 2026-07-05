@@ -260,21 +260,21 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     if config.computer_use.enabled {
         defs.push(ToolDefinition::new(
             tool_names::COMPUTER_USE,
-            "Drive the host macOS GUI via cua-driver. Readonly: `capture` returns a screenshot inline as a multimodal image part — pass `mode: \"som\"` for a numbered overlay (then target with `element_index`), `mode: \"ax\"` for the text-only accessibility tree, default `vision` for plain pixels; `list_apps` returns running applications with pids; `wait` blocks for duration_ms. Mutating: `click`/`double_click`/`right_click`/`middle_click` at (x,y) OR by `element_index` from a prior SOM capture — pass `modifiers` (e.g. [\"cmd\"], [\"shift\"]) to hold keys during a pixel-addressed click; `drag` from (x,y) to (to_x,to_y), also honouring `modifiers` (option-drag duplicates, shift-drag constrains); `scroll` by (delta_x,delta_y) intent (translated to a cardinal direction + keystroke count; needs `pid`, optionally focus an `element_index`); `type` literal text; `key` a single hotkey (e.g. 'cmd+c') or a sequence via `keys`; `set_value` writes directly to a focused AX text field (preferred for forms — bypasses typing entirely); `focus_app` brings a target app to front (or routes input without raising via raise_window=false). Pass `capture_after: true` on a mutating action to receive a follow-up screenshot in the same envelope. Denylist refuses logout/lock/force-quit hotkeys, catastrophic typed commands, and the loginwindow / Security settings focus targets before touching the driver.",
+            "Drive the host macOS GUI via cua-driver. The driver is window-oriented and works in the background — it never raises a window to the foreground, so there is no focus/activate action. Discover targets first: `list_apps` returns running applications with pids; `list_windows` returns their windows with window_ids. Then everything else takes a `pid` (and capture/element-addressed actions also take a `window_id`). Readonly: `capture` (requires `window_id`, and `pid` for som/ax modes) returns a screenshot inline as a multimodal image part — `mode: \"som\"` adds a numbered overlay (then target with `element_index`), `mode: \"ax\"` returns the text-only accessibility tree, default `vision` is plain pixels; `wait` blocks for duration_ms. Mutating (all need `pid`): `click`/`double_click`/`right_click` at (x,y) OR by `element_index`+`window_id` from a prior SOM capture — pass `modifiers` (e.g. [\"cmd\"], [\"shift\"]) to hold keys during a pixel-addressed click; `drag` from (x,y) to (to_x,to_y), also honouring `modifiers` (option-drag duplicates, shift-drag constrains); `scroll` by (delta_x,delta_y) intent (translated to a cardinal direction + keystroke count; optionally focus an `element_index`+`window_id`); `type` literal text; `key` a single key via `key` or a hotkey combo via `keys`; `set_value` writes directly to a focused AX text field (requires `window_id`+`element_index`; preferred for forms — bypasses typing entirely). Pass `capture_after: true` on a mutating action to receive a follow-up screenshot in the same envelope. Denylist refuses logout/lock/force-quit hotkeys and catastrophic typed commands before touching the driver.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": [
-                            "capture", "list_apps", "wait",
-                            "click", "double_click", "right_click", "middle_click",
-                            "drag", "scroll", "type", "key", "set_value", "focus_app"
+                            "capture", "list_apps", "list_windows", "wait",
+                            "click", "double_click", "right_click",
+                            "drag", "scroll", "type", "key", "set_value"
                         ],
                         "description": "Which action to take."
                     },
-                    "pid": {"type": "integer", "description": "Capture only. Target process id."},
-                    "window_id": {"type": "integer", "description": "Capture only. Target window id."},
+                    "pid": {"type": "integer", "description": "Target process id (from list_apps/list_windows). Required for capture som/ax modes and every mutating action; optional filter for list_windows."},
+                    "window_id": {"type": "integer", "description": "Target window id (from list_windows). Required for capture, set_value, and any element_index-addressed action."},
                     "duration_ms": {"type": "integer", "description": "Wait only. Milliseconds to sleep (capped at 300000)."},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
@@ -284,12 +284,10 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     "delta_y": {"type": "integer", "description": "Scroll only. Vertical intent: negative scrolls up, positive down. Magnitude becomes a 1–50 keystroke count; ties with delta_x resolve vertical."},
                     "modifiers": {"type": "array", "items": {"type": "string"}, "description": "Click family + drag, pixel-addressed only. Modifier keys held during the gesture: cmd, shift, option, ctrl. Ignored on the element_index path and on scroll."},
                     "text": {"type": "string", "description": "Type only."},
-                    "key": {"type": "string", "description": "Key only. e.g. 'cmd+c'."},
-                    "keys": {"type": "array", "items": {"type": "string"}},
-                    "element_index": {"type": "integer", "description": "Set_value + click family + scroll. The index a SOM-mode capture assigned the element."},
+                    "key": {"type": "string", "description": "Key only. A single key name, e.g. 'Return' or 'a'."},
+                    "keys": {"type": "array", "items": {"type": "string"}, "description": "Key only. A hotkey combo pressed together, e.g. [\"cmd\", \"c\"]."},
+                    "element_index": {"type": "integer", "description": "Set_value + click family + type + scroll. The index a SOM-mode capture assigned the element; pair with window_id."},
                     "value": {"type": "string", "description": "Set_value only."},
-                    "target": {"type": "string", "description": "Focus_app only. App name or bundle id."},
-                    "raise_window": {"type": "boolean"},
                     "mode": {"type": "string", "enum": ["vision", "som", "ax"], "description": "Capture only. `vision` = PNG inline (default); `som` = PNG + numbered overlay (target follow-ups with element_index); `ax` = text-only accessibility tree, no image bytes."},
                     "capture_after": {"type": "boolean", "description": "Mutating actions only. When true, after the action the handler appends a fresh capture to the multimodal envelope so the model can verify state without a second tool call."}
                 },
