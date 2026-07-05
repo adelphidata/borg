@@ -96,6 +96,45 @@ impl DaemonSessionExecutor {
         self.registry.insert(host.clone());
         Ok(host)
     }
+
+    /// Append an assistant-role message to the session identified by
+    /// `session_key`, preferring a live in-memory host (which updates both its
+    /// working history and the DB) and falling back to a direct DB append when
+    /// no host is live. Used to mirror a proactive/scheduled delivery into the
+    /// originating chat transcript so the agent remembers what it said and a
+    /// later user reply continues coherently.
+    ///
+    /// A live host is required for correctness when one exists: it answers off
+    /// its in-memory `history`, so a DB-only write would be invisible to it
+    /// until the session reloads. The DB fallback covers the common cron case
+    /// where no host is live. Does **not** create a session — if no channel
+    /// session exists for `session_key` (e.g. a non-default binding whose key
+    /// prefix this reconstruction doesn't carry), it is a logged no-op.
+    pub async fn append_assistant_message(
+        &self,
+        channel: &str,
+        session_key: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(host) = self.registry.get(session_key) {
+            return host.append_assistant_message(text).await;
+        }
+        let db = cortex::db::Database::open().await?;
+        match db.lookup_channel_session(channel, session_key).await? {
+            Some(session_id) => {
+                db.insert_message(&session_id, "assistant", Some(text), None, None, None, None)
+                    .await?;
+            }
+            None => {
+                tracing::debug!(
+                    session_key,
+                    channel,
+                    "no existing channel session to mirror delivery into; skipping"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

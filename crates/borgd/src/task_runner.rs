@@ -472,7 +472,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                     }
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                    deliver_task_result(ch, tgt, task_name, &combined, config).await;
+                    deliver_task_result(ch, tgt, task_name, &combined, config, None).await;
                 }
             } else {
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -504,6 +504,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                         &format!("{task_name} [FAILED]"),
                         &format!("Error: {error_msg}\n{combined}"),
                         config,
+                        None,
                     )
                     .await;
                 }
@@ -594,7 +595,7 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
                 }
             }
             if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                deliver_task_result(ch, tgt, task_name, &combined, config).await;
+                deliver_task_result(ch, tgt, task_name, &combined, config, None).await;
             }
         }
         Ok(Err(e)) => {
@@ -734,7 +735,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                     "scheduled-task: [SILENT] sentinel — suppressing channel delivery"
                 );
             } else if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                deliver_task_result(ch, tgt, task_name, result_text, config).await;
+                deliver_task_result(ch, tgt, task_name, result_text, config, ctx.executor.as_ref())
+                    .await;
             }
         }
         Ok(Err(e)) => {
@@ -1024,7 +1026,15 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         crate::heartbeat::deliver_to_channels(config, &result_text).await;
     } else if !delivery_channel.is_empty() {
         if let Some(tgt) = ctx.delivery_target.as_deref() {
-            deliver_task_result(delivery_channel, tgt, task_name, &result_text, config).await;
+            deliver_task_result(
+                delivery_channel,
+                tgt,
+                task_name,
+                &result_text,
+                config,
+                ctx.executor.as_ref(),
+            )
+            .await;
         }
     }
 
@@ -1194,7 +1204,7 @@ async fn handle_task_failure(
 
     if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
         let msg = format!("Error: {error}");
-        deliver_task_result(ch, tgt, &format!("{task_name} [FAILED]"), &msg, config).await;
+        deliver_task_result(ch, tgt, &format!("{task_name} [FAILED]"), &msg, config, None).await;
     }
 }
 
@@ -1217,6 +1227,7 @@ async fn deliver_task_result(
     task_name: &str,
     text: &str,
     config: &Config,
+    executor: Option<&Arc<DaemonSessionExecutor>>,
 ) {
     if channel == "origin" {
         tracing::warn!("Task '{task_name}' has unresolved 'origin' delivery — dropping");
@@ -1224,8 +1235,55 @@ async fn deliver_task_result(
     }
     let sender = parse_sender(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    if let Err(e) = crate::channel_delivery::send(config, channel, &sender, &msg).await {
-        tracing::warn!("Failed to deliver task result via {channel}: {e}");
+    match crate::channel_delivery::send(config, channel, &sender, &msg).await {
+        Ok(()) => {
+            // Mirror the delivered message into the originating chat session so
+            // the agent remembers its own proactive output and a later user
+            // reply stays coherent. Only origin-resolved deliveries carry the
+            // `{sender, thread_id}` JSON target needed to rebuild the session
+            // key; plain single-channel targets have no conversation to thread
+            // into and are skipped.
+            if let (Some(exec), Some(session_key)) = (executor, origin_session_key(target)) {
+                if let Err(e) = exec
+                    .append_assistant_message(channel, &session_key, &msg)
+                    .await
+                {
+                    tracing::warn!(
+                        "Task '{task_name}': failed to mirror delivery into session \
+                         {session_key}: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Failed to deliver task result via {channel}: {e}"),
+    }
+}
+
+/// Reconstruct the gateway session key from an origin-resolved delivery target
+/// (`{"sender":...,"thread_id":...}`), matching the key the gateway builds in
+/// its inbound handler: `{sender}:{sanitized_thread}` (or just `{sender}` when
+/// there is no thread). Returns `None` for a plain (non-origin) sender target,
+/// which maps to no specific conversation. Non-default channel bindings add a
+/// key prefix the target doesn't carry; such keys simply won't resolve a live
+/// host or a stored channel session, so the mirror becomes a safe no-op.
+fn origin_session_key(target: &str) -> Option<String> {
+    if !target.starts_with('{') {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(target).ok()?;
+    let sender = parsed.get("sender").and_then(|v| v.as_str())?;
+    if sender.is_empty() {
+        return None;
+    }
+    match parsed.get("thread_id").and_then(|v| v.as_str()) {
+        Some(tid) if !tid.is_empty() => Some(format!(
+            "{sender}:{}",
+            cortex::security::validation::sanitize_thread_id(
+                tid,
+                gateway::constants::MAX_THREAD_ID_LEN,
+            )
+        )),
+        _ => Some(sender.to_string()),
     }
 }
 
@@ -1375,6 +1433,50 @@ mod pre_run_tests {
         // dedup-empty path handles it). The sentinel matcher must not claim it.
         assert!(!is_silent_response(""));
         assert!(!is_silent_response("   \n\n  "));
+    }
+
+    // ── origin_session_key (proactive-delivery session mirror) ──
+
+    #[test]
+    fn origin_session_key_builds_sender_thread_key() {
+        let target = r#"{"sender":"u123","thread_id":"t456"}"#;
+        assert_eq!(origin_session_key(target).as_deref(), Some("u123:t456"));
+    }
+
+    #[test]
+    fn origin_session_key_sanitizes_thread_id() {
+        // A thread id with characters that would corrupt the `{sender}:{thread}`
+        // key (colons, spaces, punctuation) must be sanitized to match the key
+        // the gateway stored — otherwise the mirror targets a nonexistent session.
+        let target = r#"{"sender":"u1","thread_id":"chat:42 #x"}"#;
+        assert_eq!(origin_session_key(target).as_deref(), Some("u1:chat42x"));
+    }
+
+    #[test]
+    fn origin_session_key_without_thread_is_just_sender() {
+        assert_eq!(
+            origin_session_key(r#"{"sender":"u123"}"#).as_deref(),
+            Some("u123")
+        );
+        assert_eq!(
+            origin_session_key(r#"{"sender":"u123","thread_id":null}"#).as_deref(),
+            Some("u123")
+        );
+        assert_eq!(
+            origin_session_key(r#"{"sender":"u123","thread_id":""}"#).as_deref(),
+            Some("u123")
+        );
+    }
+
+    #[test]
+    fn origin_session_key_none_for_plain_or_malformed_targets() {
+        // A plain single-channel sender id (not origin-resolved JSON) maps to no
+        // conversation, and malformed/empty JSON must not panic or mis-key.
+        assert_eq!(origin_session_key("+15551234567"), None);
+        assert_eq!(origin_session_key("u123"), None);
+        assert_eq!(origin_session_key("{not json"), None);
+        assert_eq!(origin_session_key(r#"{"thread_id":"t1"}"#), None); // no sender
+        assert_eq!(origin_session_key(r#"{"sender":""}"#), None); // empty sender
     }
 
     // ── render_pre_run_block ──
