@@ -3,7 +3,8 @@
 //! Provides ghost commits (full repo snapshots for atomic undo), git context
 //! collection for system prompt enrichment, and turn diff tracking.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -182,6 +183,13 @@ pub struct GhostCommit {
 #[derive(Debug, Clone, Default)]
 pub struct GitContext {
     pub repo_root: Option<PathBuf>,
+    /// The main repository root when `repo_root` is a linked `git worktree`
+    /// checkout, resolved via the `.git` gitfile pointer. Equal to `repo_root`
+    /// for an ordinary checkout. `None` when outside any repository *or* when
+    /// `repo_root` is `Some` but its `.git` gitfile is not a worktree pointer
+    /// (e.g. a submodule) — so `main_repo_root.is_none()` does not imply
+    /// "not in a repository".
+    pub main_repo_root: Option<PathBuf>,
     pub branch: Option<String>,
     pub commit_hash: Option<String>,
     pub recent_commits: Vec<String>,
@@ -200,6 +208,86 @@ pub fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// Resolve the *main* repository root for `cwd`, following a linked
+/// `git worktree` checkout back to the repository it belongs to.
+///
+/// [`find_repo_root`] stops at the first ancestor containing a `.git` entry.
+/// For a worktree created with `git worktree add`, that `.git` is a *file*
+/// holding `gitdir: <main>/.git/worktrees/<name>`, so `find_repo_root` returns
+/// the worktree checkout rather than the repository it links to. This function
+/// parses that pointer and returns `<main>` instead. For an ordinary checkout
+/// (`.git` is a directory) it returns the repo root unchanged, and returns
+/// `None` when `cwd` is not inside any git repository or the `.git` file points
+/// somewhere that is not a worktree git dir (e.g. a submodule under
+/// `.git/modules/...`).
+///
+/// Pure filesystem inspection — never invokes the `git` binary, so it works
+/// even when git is unavailable or the tree is untrusted.
+pub fn resolve_main_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let repo_root = find_repo_root(cwd)?;
+    let dot_git = repo_root.join(".git");
+
+    // Ordinary checkout: `.git` is a directory, so this *is* the main root.
+    if dot_git.is_dir() {
+        return Some(repo_root);
+    }
+
+    // Linked worktree: `.git` is a file pointing at the worktree's git dir,
+    // which lives at `<main>/.git/worktrees/<name>`.
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir_rel = contents.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir_rel.is_empty() {
+        return None;
+    }
+
+    // The pointer is normally absolute; a relative pointer is resolved against
+    // the directory that holds the `.git` file, matching git's own semantics.
+    let git_dir_path = resolve_gitdir_against_base(git_dir_rel, &repo_root);
+
+    // Expect the tail `.../worktrees/<name>`. Anything else is not a linked
+    // worktree and gets no rewrite.
+    let worktrees_dir = git_dir_path.parent()?; // <main>/.git/worktrees
+    if worktrees_dir.file_name() != Some(OsStr::new("worktrees")) {
+        return None;
+    }
+    let common_dir = worktrees_dir.parent()?; // <main>/.git
+    if common_dir.file_name() != Some(OsStr::new(".git")) {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf) // <main>
+}
+
+/// Resolve a `gitdir:` pointer against the directory holding the `.git` file.
+/// Absolute pointers are taken as-is; relative pointers are joined onto `base`.
+/// The result is lexically normalized so `.parent()`/`.file_name()` see the
+/// clean `.../worktrees/<name>` tail even when the pointer contains `..`.
+fn resolve_gitdir_against_base(pointer: &str, base: &Path) -> PathBuf {
+    let p = Path::new(pointer);
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    normalize_lexically(&joined)
+}
+
+/// Collapse `.` and `..` components without touching the filesystem (no symlink
+/// resolution, unlike [`std::fs::canonicalize`]). Sufficient for reasoning about
+/// the git-managed `.git/worktrees/<name>` path suffix.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Run a git command with timeout, returns stdout on success.
@@ -241,6 +329,7 @@ async fn run_git_inner(
 #[instrument(skip_all)]
 pub async fn collect_git_context(cwd: &Path) -> GitContext {
     let repo_root = find_repo_root(cwd);
+    let main_repo_root = resolve_main_repo_root(cwd);
     let work_dir = repo_root.as_deref().unwrap_or(cwd);
 
     // Run all git commands in parallel — they're independent read-only operations.
@@ -254,6 +343,7 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
 
     GitContext {
         repo_root,
+        main_repo_root,
         branch: branch.ok().filter(|s| !s.is_empty()),
         commit_hash: commit_hash.ok(),
         recent_commits: recent_commits_raw
@@ -387,6 +477,13 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
 /// Format git context as a string block for system prompt injection.
 pub fn format_git_context(ctx: &GitContext) -> String {
     let mut out = String::new();
+    // Surface when the working tree is a linked worktree so the agent knows the
+    // canonical project it belongs to (its `.git` lives in the main repo).
+    if let (Some(main), Some(repo)) = (&ctx.main_repo_root, &ctx.repo_root) {
+        if main != repo {
+            out.push_str(&format!("Linked worktree of: {}\n", main.display()));
+        }
+    }
     if let Some(ref branch) = ctx.branch {
         out.push_str(&format!("Git branch: {branch}\n"));
     }
@@ -454,6 +551,7 @@ mod tests {
     fn format_git_context_full() {
         let ctx = GitContext {
             repo_root: Some(PathBuf::from("/repo")),
+            main_repo_root: Some(PathBuf::from("/repo")),
             branch: Some("main".into()),
             commit_hash: Some("abc1234".into()),
             recent_commits: vec!["abc1234 Fix bug".into(), "def5678 Add feature".into()],
@@ -465,6 +563,32 @@ mod tests {
         assert!(out.contains("Git commit: abc1234"));
         assert!(out.contains("Uncommitted changes: yes"));
         assert!(out.contains("abc1234 Fix bug"));
+    }
+
+    #[test]
+    fn format_git_context_shows_linked_worktree_when_roots_differ() {
+        let ctx = GitContext {
+            repo_root: Some(PathBuf::from("/tmp/wt")),
+            main_repo_root: Some(PathBuf::from("/tmp/repo")),
+            branch: Some("feature/x".into()),
+            ..Default::default()
+        };
+        let out = format_git_context(&ctx);
+        assert!(out.contains("Linked worktree of: /tmp/repo"));
+        assert!(out.contains("Git branch: feature/x"));
+    }
+
+    #[test]
+    fn format_git_context_omits_worktree_line_for_ordinary_repo() {
+        // Ordinary checkout: main root equals repo root → no worktree line.
+        let ctx = GitContext {
+            repo_root: Some(PathBuf::from("/tmp/repo")),
+            main_repo_root: Some(PathBuf::from("/tmp/repo")),
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        let out = format_git_context(&ctx);
+        assert!(!out.contains("Linked worktree of"));
     }
 
     #[test]
@@ -557,6 +681,121 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let root = find_repo_root(&sub);
         assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn normalize_lexically_collapses_dot_and_dot_dot() {
+        assert_eq!(
+            normalize_lexically(Path::new("/tmp/wt/../repo/./.git")),
+            PathBuf::from("/tmp/repo/.git")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("/a/b/c")),
+            PathBuf::from("/a/b/c")
+        );
+    }
+
+    #[test]
+    fn resolve_gitdir_relative_pointer_resolved_against_base() {
+        // A relative `gitdir:` pointer is joined onto the directory holding the
+        // `.git` file and normalized, matching git's own semantics.
+        let resolved =
+            resolve_gitdir_against_base("../repo/.git/worktrees/wt", Path::new("/tmp/wt"));
+        assert_eq!(resolved, PathBuf::from("/tmp/repo/.git/worktrees/wt"));
+    }
+
+    #[test]
+    fn resolve_main_repo_root_outside_repo_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_main_repo_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn resolve_main_repo_root_regular_repo_returns_repo_root() {
+        // `.git` is a directory → this is the main root, unchanged, and a nested
+        // subdirectory resolves to the same root.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("sub/dir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(resolve_main_repo_root(&repo), Some(repo.clone()));
+        assert_eq!(resolve_main_repo_root(&nested), Some(repo));
+    }
+
+    #[test]
+    fn resolve_main_repo_root_detects_worktree_pointer_without_git() {
+        // A linked worktree: `.git` is a *file* pointing at
+        // `<main>/.git/worktrees/<name>`. Resolution follows the pointer back to
+        // `<main>` using only filesystem reads — no `git` binary involved.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let worktree_git_dir = repo_root.join(".git").join("worktrees").join("feature-x");
+        let worktree_root = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::create_dir_all(worktree_root.join("nested")).unwrap();
+        std::fs::write(
+            worktree_root.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_main_repo_root(&worktree_root),
+            Some(repo_root.clone())
+        );
+        // A nested cwd inside the worktree still resolves to the main root.
+        assert_eq!(
+            resolve_main_repo_root(&worktree_root.join("nested")),
+            Some(repo_root)
+        );
+    }
+
+    #[test]
+    fn resolve_main_repo_root_non_worktrees_gitdir_returns_none() {
+        // `.git` is a file but the pointer does not live under `.../worktrees/`
+        // (e.g. a submodule gitdir). No rewrite — this is not a linked worktree.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("nested")).unwrap();
+        std::fs::write(
+            proj.join(".git"),
+            format!("gitdir: {}\n", tmp.path().join("some/other/loc").display()),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_main_repo_root(&proj), None);
+        assert_eq!(resolve_main_repo_root(&proj.join("nested")), None);
+    }
+
+    #[test]
+    fn resolve_main_repo_root_worktrees_dir_not_under_dot_git_returns_none() {
+        // The pointer tail is `worktrees/<name>` but its grandparent is not a
+        // `.git` dir. Real git always nests worktrees under `<main>/.git`, so
+        // this is not a linked worktree and must not resolve to `/foo`.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                tmp.path().join("foo/worktrees/bar").display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_main_repo_root(&proj), None);
+    }
+
+    #[test]
+    fn resolve_main_repo_root_empty_gitdir_pointer_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".git"), "gitdir:\n").unwrap();
+        assert_eq!(resolve_main_repo_root(&proj), None);
     }
 
     #[tokio::test]
@@ -845,5 +1084,95 @@ mod tests {
             !dir.join("c.txt").exists(),
             "post-snapshot file must be removed on restore"
         );
+    }
+
+    /// Create a linked worktree at `wt` off the repo at `repo`, isolated from
+    /// the developer's global/system git config for determinism.
+    #[cfg(unix)]
+    fn add_worktree(repo: &Path, wt: &Path, branch: &str) {
+        let ok = std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", branch])
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git worktree add")
+            .success();
+        assert!(ok, "git worktree add failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_main_repo_root_detects_real_worktree() {
+        // End-to-end against a real `git worktree add`: the worktree checkout's
+        // `.git` file must resolve back to the main repository root, both from
+        // the worktree root and from a nested subdirectory within it.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo_with_commit(&repo);
+
+        let wt = tmp.path().join("wt");
+        add_worktree(&repo, &wt, "feature/x");
+        assert!(wt.join(".git").is_file(), "worktree .git should be a file");
+
+        let expected = std::fs::canonicalize(&repo).unwrap();
+        let got = resolve_main_repo_root(&wt).expect("worktree resolves to main root");
+        assert_eq!(std::fs::canonicalize(&got).unwrap(), expected);
+
+        let nested = wt.join("nested/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let got_nested =
+            resolve_main_repo_root(&nested).expect("nested worktree cwd resolves to main root");
+        assert_eq!(std::fs::canonicalize(&got_nested).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_git_context_flags_linked_worktree() {
+        // The full pipeline: collecting context inside a real worktree records a
+        // `main_repo_root` distinct from `repo_root`, and the formatted block a
+        // system prompt sees announces the linked worktree.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo_with_commit(&repo);
+
+        let wt = tmp.path().join("wt");
+        add_worktree(&repo, &wt, "feature/y");
+
+        let ctx = collect_git_context(&wt).await;
+        let repo_root = ctx.repo_root.clone().expect("repo_root");
+        let main_root = ctx.main_repo_root.clone().expect("main_repo_root");
+        assert_ne!(
+            std::fs::canonicalize(&repo_root).unwrap(),
+            std::fs::canonicalize(&main_root).unwrap(),
+            "worktree repo_root must differ from the resolved main root"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&main_root).unwrap(),
+            std::fs::canonicalize(&repo).unwrap(),
+        );
+
+        let formatted = format_git_context(&ctx);
+        assert!(
+            formatted.contains("Linked worktree of:"),
+            "system prompt block should announce the linked worktree, got: {formatted:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_git_context_ordinary_repo_has_matching_roots() {
+        // Sanity counterpart: an ordinary checkout reports equal roots and emits
+        // no worktree line.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo_with_commit(&repo);
+
+        let ctx = collect_git_context(&repo).await;
+        assert_eq!(ctx.repo_root, ctx.main_repo_root);
+        assert!(!format_git_context(&ctx).contains("Linked worktree of"));
     }
 }
