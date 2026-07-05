@@ -3,8 +3,9 @@ use anyhow::{Context, Result};
 use super::{
     apply_message_cache_control, apply_openai_cache_markers, bedrock::url_for_model,
     build_anthropic_messages, build_cache_control_marker, classify_anthropic_stream_error,
-    normalize_cache_tokens, parse_anthropic_response, sanitize_openai_messages,
-    supports_anthropic_cache_control, ChatRequest, LlmConfig, LlmError, Message, Provider, Role,
+    normalize_cache_tokens, parse_anthropic_response, repair_message_sequence,
+    sanitize_openai_messages, supports_anthropic_cache_control, ChatRequest, LlmConfig, LlmError,
+    Message, Provider, Role,
     StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition, UsageData, UsageOptions,
 };
 use crate::llm::llm_error::FailoverReason;
@@ -865,10 +866,14 @@ pub(crate) fn build_openai_request(
     });
     let chat_request = ChatRequest {
         model: request.model.to_string(),
+        // Repair replayed/resumed histories (duplicate tool_call_ids, orphaned
+        // tool results, consecutive assistant turns) that strict providers 400
+        // on. A no-op on well-formed live-loop histories. Streaming also runs
+        // the null-content/empty-message sanitizer first.
         messages: if stream {
-            sanitize_openai_messages(request.messages)
+            repair_message_sequence(&sanitize_openai_messages(request.messages))
         } else {
-            request.messages.to_vec()
+            repair_message_sequence(request.messages)
         },
         tools,
         temperature: request.llm_config.temperature,

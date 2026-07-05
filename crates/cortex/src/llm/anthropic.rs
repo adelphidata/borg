@@ -44,6 +44,130 @@ pub(super) fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
+/// Repair a replayed/resumed message history so it satisfies strict
+/// OpenAI-compatible providers (DeepSeek, Kimi, OpenRouter, …). Live turns are
+/// already well-formed — the live loop substitutes synthetic tool results at
+/// dispatch — so this guards histories reconstructed from the session log or
+/// carried across a provider fallback, where three invalid shapes arise and
+/// 400 the request:
+///
+/// 1. **Duplicate `tool_call_id`** — a resumed or merged history can repeat an
+///    id across assistant `tool_calls` or `tool` results (DeepSeek: "Duplicate
+///    value"). Later duplicates are dropped, keeping the first.
+/// 2. **Orphaned `tool` result** — a `Role::Tool` message whose `tool_call_id`
+///    matches no *preceding* assistant `tool_calls` entry (the assistant turn
+///    that requested it was compacted away). Dropped.
+/// 3. **Consecutive `assistant` turns** — two adjacent assistant messages with
+///    no intervening tool/user message (an interrupted turn re-appended on
+///    resume). Coalesced into one: text joined, `tool_calls` unioned.
+///
+/// A well-formed history is returned unchanged — every pass is a no-op on it.
+pub(super) fn repair_message_sequence(messages: &[Message]) -> Vec<Message> {
+    let coalesced = coalesce_consecutive_assistants(messages);
+    prune_tool_call_ids(&coalesced)
+}
+
+/// True if `m`'s content is plain text or empty (not multimodal `Parts`). Only
+/// text/empty assistants are coalesced, so multimodal content is never mangled.
+fn content_is_text_or_empty(m: &Message) -> bool {
+    !matches!(m.content, Some(crate::types::MessageContent::Parts(_)))
+}
+
+/// Merge runs of adjacent `Role::Assistant` messages into a single message
+/// (see [`repair_message_sequence`] case 3). Only text/empty assistants merge.
+fn coalesce_consecutive_assistants(messages: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let can_merge = m.role == Role::Assistant
+            && content_is_text_or_empty(m)
+            && out
+                .last()
+                .is_some_and(|p| p.role == Role::Assistant && content_is_text_or_empty(p));
+        if can_merge {
+            let prev = out.last_mut().expect("checked non-empty above");
+            let prev_text = prev
+                .content
+                .as_ref()
+                .and_then(crate::types::MessageContent::text)
+                .unwrap_or("")
+                .to_string();
+            let cur_text = m
+                .content
+                .as_ref()
+                .and_then(crate::types::MessageContent::text)
+                .unwrap_or("");
+            let joined = match (prev_text.is_empty(), cur_text.is_empty()) {
+                (true, _) => cur_text.to_string(),
+                (false, true) => prev_text,
+                (false, false) => format!("{prev_text}\n{cur_text}"),
+            };
+            prev.content = if joined.is_empty() {
+                None
+            } else {
+                Some(crate::types::MessageContent::Text(joined))
+            };
+            match (prev.tool_calls.as_mut(), m.tool_calls.as_ref()) {
+                (Some(pc), Some(cc)) => pc.extend(cc.iter().cloned()),
+                (None, Some(cc)) => prev.tool_calls = Some(cc.clone()),
+                _ => {}
+            }
+        } else {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+/// Drop duplicate `tool_call_id`s and orphaned `tool` results (see
+/// [`repair_message_sequence`] cases 1 and 2) in a single forward scan.
+fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
+    use std::collections::HashSet;
+    // Every tool-call id emitted by a *preceding* assistant — a `tool` result
+    // is valid only if its id is in here. Accumulates for the whole history
+    // since ids are conversation-global.
+    let mut seen_call_ids: HashSet<String> = HashSet::new();
+    let mut seen_result_ids: HashSet<String> = HashSet::new();
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m.role {
+            Role::Assistant if m.tool_calls.is_some() => {
+                let mut kept: Vec<ToolCall> = Vec::new();
+                for call in m.tool_calls.as_ref().expect("is_some checked") {
+                    if seen_call_ids.insert(call.id.clone()) {
+                        kept.push(call.clone());
+                    } else {
+                        tracing::debug!(id = %call.id, "repair: dropping duplicate tool_call id");
+                    }
+                }
+                let content_empty = m.content.as_ref().is_none_or(|c| c.is_empty());
+                if kept.is_empty() && content_empty {
+                    // Assistant reduced to nothing (all calls were duplicates,
+                    // no text) — drop it entirely rather than send an empty turn.
+                    continue;
+                }
+                out.push(Message {
+                    tool_calls: (!kept.is_empty()).then_some(kept),
+                    ..m.clone()
+                });
+            }
+            Role::Tool => {
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                if !seen_call_ids.contains(id) {
+                    tracing::debug!(id = %id, "repair: dropping orphaned tool result");
+                    continue;
+                }
+                if !seen_result_ids.insert(id.to_string()) {
+                    tracing::debug!(id = %id, "repair: dropping duplicate tool result");
+                    continue;
+                }
+                out.push(m.clone());
+            }
+            _ => out.push(m.clone()),
+        }
+    }
+    out
+}
+
 // ── Anthropic message conversion helpers ──
 
 /// Convert internal Messages to Anthropic format.

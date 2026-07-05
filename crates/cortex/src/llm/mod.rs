@@ -117,7 +117,8 @@ pub(crate) mod vertex;
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
     apply_cache_control_to_message, apply_message_cache_control, build_anthropic_messages,
-    build_cache_control_marker, parse_anthropic_response, sanitize_openai_messages, strip_images,
+    build_cache_control_marker, parse_anthropic_response, repair_message_sequence,
+    sanitize_openai_messages, strip_images,
 };
 pub use cost::{CostEvent, CostEventContext, CostEventSink};
 pub use credential_pool::{

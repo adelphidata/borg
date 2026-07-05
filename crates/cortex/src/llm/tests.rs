@@ -1489,6 +1489,130 @@ fn openai_drops_none_content_assistant_without_tool_calls() {
     assert_eq!(sanitized.len(), 2);
 }
 
+// ── repair_message_sequence (strict-provider history repair) ──
+
+/// Assistant message that requests a single tool call `id` with no text.
+fn repair_asst_tool_call(id: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "noop".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+        seq: None,
+    }
+}
+
+/// All tool-call ids across the assistant messages, in order.
+fn repair_all_call_ids(msgs: &[Message]) -> Vec<String> {
+    msgs.iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+#[test]
+fn repair_dedups_duplicate_tool_call_ids() {
+    // A resumed history re-appended the same call+result. DeepSeek 400s on the
+    // duplicate id; repair must keep exactly one call and one result.
+    let messages = vec![
+        Message::user("a"),
+        repair_asst_tool_call("call_1"),
+        Message::tool_result("call_1", "ok"),
+        repair_asst_tool_call("call_1"), // duplicate id
+        Message::tool_result("call_1", "ok"), // duplicate result
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(
+        repair_all_call_ids(&repaired),
+        vec!["call_1".to_string()],
+        "exactly one tool_call id must survive"
+    );
+    let result_count = repaired
+        .iter()
+        .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .count();
+    assert_eq!(result_count, 1, "exactly one tool result must survive");
+}
+
+#[test]
+fn repair_drops_orphaned_tool_result() {
+    // A tool result whose requesting assistant turn was compacted away — no
+    // preceding call with that id — must be dropped (otherwise a 400).
+    let messages = vec![
+        Message::user("a"),
+        Message::tool_result("call_ghost", "stale"),
+        Message::assistant("answer"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert!(
+        !repaired.iter().any(|m| m.role == Role::Tool),
+        "orphaned tool result must be gone"
+    );
+    assert_eq!(repaired.len(), 2);
+}
+
+#[test]
+fn repair_coalesces_consecutive_assistant_text_turns() {
+    // Two adjacent assistant turns (interrupted turn re-appended) 400 on strict
+    // providers; repair joins them into one.
+    let messages = vec![
+        Message::user("a"),
+        Message::assistant("part one"),
+        Message::assistant("part two"),
+        Message::user("b"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(repaired.len(), 3, "the two assistants must merge into one");
+    assert_eq!(repaired[1].role, Role::Assistant);
+    assert_eq!(
+        repaired[1].content.as_ref().unwrap().text().unwrap(),
+        "part one\npart two"
+    );
+}
+
+#[test]
+fn repair_unions_tool_calls_when_merging_assistants() {
+    // Adjacent assistant tool-call turns merge, unioning their calls; both
+    // results remain valid afterward.
+    let messages = vec![
+        repair_asst_tool_call("call_1"),
+        repair_asst_tool_call("call_2"),
+        Message::tool_result("call_1", "r1"),
+        Message::tool_result("call_2", "r2"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(repair_all_call_ids(&repaired), vec!["call_1", "call_2"]);
+    // One merged assistant + two tool results.
+    assert_eq!(repaired.len(), 3);
+    assert_eq!(repaired[0].tool_calls.as_ref().unwrap().len(), 2);
+}
+
+#[test]
+fn repair_leaves_well_formed_history_unchanged() {
+    // The common case: a valid live-loop history must pass through untouched so
+    // repair never corrupts a healthy conversation.
+    let messages = vec![
+        Message::user("a"),
+        repair_asst_tool_call("call_1"),
+        Message::tool_result("call_1", "ok"),
+        Message::assistant("final"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(repaired.len(), 4);
+    assert_eq!(repair_all_call_ids(&repaired), vec!["call_1"]);
+    assert_eq!(repaired[0].role, Role::User);
+    assert_eq!(repaired[3].content.as_ref().unwrap().text().unwrap(), "final");
+}
+
 #[test]
 fn openai_preserves_tool_result_messages() {
     // Tool result messages (with tool_call_id) should never be dropped,
