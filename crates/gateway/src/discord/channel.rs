@@ -280,21 +280,17 @@ impl NativeChannel for DiscordChannel {
         let ctx: DiscordResponseContext = serde_json::from_value(response_context.clone()).ok()?;
         let client = self.client.clone();
 
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::spawn(async move {
-            let config = crate::typing_keepalive::TypingKeepaliveConfig {
+        Some(TypingHandle::spawn_keepalive(
+            crate::typing_keepalive::TypingKeepaliveConfig {
                 keepalive_interval: std::time::Duration::from_secs(8),
                 label: "discord",
-            };
-            crate::typing_keepalive::run_keepalive(config, stop_rx, || {
+            },
+            move || {
                 let client = client.clone();
                 let ch = ctx.channel_id.clone();
                 async move { client.trigger_typing_indicator(&ch).await }
-            })
-            .await;
-        });
-
-        Some(TypingHandle::new(stop_tx, join))
+            },
+        ))
     }
 }
 

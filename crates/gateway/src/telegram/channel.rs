@@ -160,21 +160,17 @@ impl NativeChannel for TelegramChannel {
         let ctx: TelegramResponseContext = serde_json::from_value(response_context.clone()).ok()?;
         let client = self.client.clone();
 
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::spawn(async move {
-            let config = crate::typing_keepalive::TypingKeepaliveConfig {
+        Some(TypingHandle::spawn_keepalive(
+            crate::typing_keepalive::TypingKeepaliveConfig {
                 // Telegram's "typing" action lasts ~5s; refresh just under that.
                 keepalive_interval: std::time::Duration::from_secs(4),
                 label: "telegram",
-            };
-            crate::typing_keepalive::run_keepalive(config, stop_rx, || {
+            },
+            move || {
                 let client = client.clone();
                 async move { client.send_typing(ctx.chat_id).await }
-            })
-            .await;
-        });
-
-        Some(TypingHandle::new(stop_tx, join))
+            },
+        ))
     }
 }
 

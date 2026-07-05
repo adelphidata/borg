@@ -131,6 +131,24 @@ impl TypingHandle {
         }
     }
 
+    /// Spawn a [`crate::typing_keepalive::run_keepalive`] loop and wrap it in
+    /// a handle. `tick` re-sends the platform's typing action every
+    /// `config.keepalive_interval` until the handle is stopped or dropped.
+    pub fn spawn_keepalive<F, Fut>(
+        config: crate::typing_keepalive::TypingKeepaliveConfig,
+        tick: F,
+    ) -> Self
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+    {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            crate::typing_keepalive::run_keepalive(config, stop_rx, tick).await;
+        });
+        Self::new(stop_tx, join)
+    }
+
     /// Send the stop signal and wait for the typing task to finish.
     pub async fn stop(mut self) {
         if let Some(tx) = self.stop_tx.take() {

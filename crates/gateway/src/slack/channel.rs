@@ -226,29 +226,23 @@ impl NativeChannel for SlackChannel {
         let ctx: SlackResponseContext = serde_json::from_value(response_context.clone()).ok()?;
         let client = self.client.clone();
 
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::spawn(async move {
-            let config = crate::typing_keepalive::TypingKeepaliveConfig {
+        Some(TypingHandle::spawn_keepalive(
+            crate::typing_keepalive::TypingKeepaliveConfig {
                 // Re-send before Slack's typing indicator decays (~5s) so it stays visible.
                 keepalive_interval: std::time::Duration::from_secs(3),
                 label: "slack",
-            };
-            let channel_id = ctx.channel_id.clone();
-            let thread_ts = ctx.thread_ts.clone();
-            crate::typing_keepalive::run_keepalive(config, stop_rx, || {
+            },
+            move || {
                 let client = client.clone();
-                let ch = channel_id.clone();
-                let ts = thread_ts.clone();
+                let ch = ctx.channel_id.clone();
+                let ts = ctx.thread_ts.clone();
                 async move {
                     client
                         .set_thread_status(&ch, ts.as_deref(), "is typing...")
                         .await
                 }
-            })
-            .await;
-        });
-
-        Some(TypingHandle::new(stop_tx, join))
+            },
+        ))
     }
 }
 

@@ -22,7 +22,6 @@ pub mod socket_mode;
 /// Slack API type definitions and envelope parsing.
 pub mod types;
 /// Typing indicator keepalive for Slack channels.
-pub mod typing;
 /// Request signature verification using signing secret.
 pub mod verify;
 

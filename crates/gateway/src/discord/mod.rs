@@ -11,7 +11,6 @@ pub mod parse;
 /// Discord API type definitions.
 pub mod types;
 /// Typing indicator keepalive for Discord channels.
-pub mod typing;
 /// Ed25519 signature verification for interaction webhooks.
 pub mod verify;
 /// Bidirectional Discord voice-channel manager (songbird-backed).
