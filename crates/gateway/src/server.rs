@@ -110,6 +110,32 @@ pub struct GatewayServer {
     poke_tx: Option<mpsc::Sender<()>>,
 }
 
+/// Native-channel clients and credentials produced once at startup by
+/// [`GatewayServer::init_channels`], then threaded through channel
+/// registration, `AppState`, and the polling/SSE spawn paths.
+struct ChannelInits {
+    telegram_client: Option<Arc<crate::telegram::api::TelegramClient>>,
+    telegram_bot_username: Option<String>,
+    telegram_secret: Option<String>,
+    telegram_dedup: Arc<Mutex<UpdateDeduplicator>>,
+    slack_client: Option<Arc<SlackClient>>,
+    slack_signing_secret: Option<String>,
+    slack_bot_user_id: Option<String>,
+    twilio_client: Option<Arc<crate::twilio::api::TwilioClient>>,
+    twilio_auth_token: Option<String>,
+    twilio_phone_number: Option<String>,
+    twilio_whatsapp_number: Option<String>,
+    discord_client: Option<Arc<crate::discord::api::DiscordClient>>,
+    discord_public_key: Option<String>,
+    teams_client: Option<Arc<crate::teams::api::TeamsClient>>,
+    teams_app_secret: Option<String>,
+    google_chat_client: Option<Arc<crate::google_chat::api::GoogleChatClient>>,
+    google_chat_token: Option<String>,
+    signal_client: Option<Arc<crate::signal::api::SignalClient>>,
+    /// TTS synthesizer (shared between webhook and polling paths).
+    tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>>,
+}
+
 impl GatewayServer {
     /// When `executor` is `Some`, it is installed as the process-wide handle so
     /// inbound channel messages route through `borgd::session::SessionRegistry`;
@@ -156,6 +182,109 @@ impl GatewayServer {
             None
         };
 
+        let inits = self.init_channels().await?;
+        let native_channels = self.register_native_channels(&inits);
+
+        let channel_count = registry.list_channels().len() + native_channels.list().len();
+
+        let state = Arc::new(AppState {
+            config: self.config.clone(),
+            registry,
+            native_channels,
+            session_queue: SessionQueue::new(gateway_config.max_concurrent),
+            request_timeout: Duration::from_millis(gateway_config.request_timeout_ms),
+            health: health.clone(),
+            rate_limiter,
+            metrics: self.metrics.clone(),
+            slack_client: inits.slack_client.clone(),
+            slack_signing_secret: inits.slack_signing_secret.clone(),
+            slack_bot_user_id: inits.slack_bot_user_id.clone(),
+            poke_tx: self.poke_tx.clone(),
+            auto_reply_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::auto_reply::AutoReplyState::default(),
+            )),
+            shutdown: self.shutdown.clone(),
+        });
+
+        let app = build_router(state.clone(), &self.config);
+
+        // Probe before bind: another borgd already serving this port is an
+        // idempotent no-op (parent will park on `shutdown`), avoiding a
+        // confusing AddrInUse on supervisord-style double-starts.
+        if probe_existing_instance(&addr).await {
+            // Another instance owns the port. Park until shutdown instead of
+            // erroring so the supervisor doesn't treat this as a crash and
+            // respawn-loop against the live instance.
+            info!("Gateway already running on {addr}, skipping bind");
+            self.shutdown.cancelled().await;
+            return Ok(());
+        }
+
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                anyhow::anyhow!(
+                    "Gateway port {addr} is already in use. Another borg instance may be running. \
+                     Stop it or change [gateway] port in config.toml"
+                )
+            } else {
+                anyhow::anyhow!("Failed to bind gateway to {addr}: {e}")
+            }
+        })?;
+        info!("Gateway listening on {addr} with {channel_count} channel(s)");
+        crate::activity::log_gateway_activity(
+            "info",
+            &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
+        )
+        .await;
+
+        // Crash-recovery: rows left in `sending` from the prior process are
+        // demoted to `pending` so the drain loop retries them.
+        if let Ok(db) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+            match db.replay_unfinished().await {
+                Ok(0) => {}
+                Ok(n) => info!("Reset {n} in-flight delivery(ies) to pending"),
+                Err(e) => warn!("Failed to replay unfinished deliveries: {e}"),
+            }
+        }
+
+        self.spawn_delivery_drain(state.clone(), health.clone());
+        self.spawn_telegram_polling(&inits, &health);
+        self.spawn_signal_sse(&inits, &health);
+        let poll_handles = self.spawn_poll_loops(&state, &health);
+
+        let shutdown = self.shutdown.clone();
+        let shutdown_tg_client = inits.telegram_client.clone();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+            info!("Gateway shutting down");
+
+            // Clean up Telegram webhook on shutdown
+            if let Some(client) = shutdown_tg_client {
+                if let Err(e) = client.delete_webhook().await {
+                    warn!("Failed to delete Telegram webhook on shutdown: {e}");
+                } else {
+                    info!("Telegram webhook removed");
+                }
+            }
+        })
+        .await?;
+
+        // Wait for poll tasks to finish after server shutdown
+        for handle in poll_handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+
+    /// Initialize every configured native-channel client (Telegram, Slack,
+    /// Twilio, Discord, Teams, Google Chat, Signal) plus the shared TTS
+    /// synthesizer, in startup order.
+    async fn init_channels(&self) -> Result<ChannelInits> {
         let (telegram_client, telegram_bot_username, telegram_secret) =
             crate::channel::channel_init::init_telegram(&self.config).await;
         let telegram_dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
@@ -197,66 +326,89 @@ impl GatewayServer {
         let tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>> =
             crate::voice::configured_tts_synthesizer(&self.config).map(Arc::new);
 
-        let native_channels = {
-            let mut reg = NativeChannelRegistry::new();
-            if let Some(ref client) = telegram_client {
-                reg.register(Arc::new(TelegramChannel {
-                    client: client.clone(),
-                    dedup: telegram_dedup.clone(),
-                    secret: telegram_secret.clone(),
-                    bot_username: telegram_bot_username.clone(),
-                    config: self.config.clone(),
-                    tts_synthesizer: tts_synth.clone(),
-                }));
-            }
-            if let Some(ref client) = slack_client {
-                reg.register(Arc::new(SlackChannel {
-                    client: client.clone(),
-                    signing_secret: slack_signing_secret.clone(),
-                    dedup: Arc::new(Mutex::new(EventDeduplicator::new())),
-                    bot_user_id: slack_bot_user_id.clone(),
-                    config: self.config.clone(),
-                }));
-            }
-            if let Some(ref client) = twilio_client {
-                reg.register(Arc::new(TwilioChannel {
-                    client: client.clone(),
-                    auth_token: twilio_auth_token.clone(),
-                    phone_number: twilio_phone_number.clone(),
-                    whatsapp_number: twilio_whatsapp_number.clone(),
-                    config: self.config.clone(),
-                }));
-            }
-            if let Some(ref client) = discord_client {
-                reg.register(Arc::new(DiscordChannel::new(
-                    client.clone(),
-                    discord_public_key.clone(),
-                    self.config.gateway.discord_guild_allowlist.clone(),
-                    self.config.clone(),
-                )));
-            }
-            if let Some(ref client) = teams_client {
-                reg.register(Arc::new(TeamsChannel {
-                    client: client.clone(),
-                    app_secret: teams_app_secret.clone(),
-                    dedup: Arc::new(std::sync::Mutex::new(
-                        crate::teams::dedup::ActivityDeduplicator::new(),
-                    )),
-                    config: self.config.clone(),
-                }));
-            }
-            if let Some(ref client) = google_chat_client {
-                reg.register(Arc::new(GoogleChatChannel {
-                    client: client.clone(),
-                    token: google_chat_token.clone(),
-                    config: self.config.clone(),
-                }));
-            }
-            reg
-        };
+        Ok(ChannelInits {
+            telegram_client,
+            telegram_bot_username,
+            telegram_secret,
+            telegram_dedup,
+            slack_client,
+            slack_signing_secret,
+            slack_bot_user_id,
+            twilio_client,
+            twilio_auth_token,
+            twilio_phone_number,
+            twilio_whatsapp_number,
+            discord_client,
+            discord_public_key,
+            teams_client,
+            teams_app_secret,
+            google_chat_client,
+            google_chat_token,
+            signal_client,
+            tts_synth,
+        })
+    }
+
+    /// Register each initialized client as a native channel and log the
+    /// resulting active set.
+    fn register_native_channels(&self, inits: &ChannelInits) -> NativeChannelRegistry {
+        let mut reg = NativeChannelRegistry::new();
+        if let Some(ref client) = inits.telegram_client {
+            reg.register(Arc::new(TelegramChannel {
+                client: client.clone(),
+                dedup: inits.telegram_dedup.clone(),
+                secret: inits.telegram_secret.clone(),
+                bot_username: inits.telegram_bot_username.clone(),
+                config: self.config.clone(),
+                tts_synthesizer: inits.tts_synth.clone(),
+            }));
+        }
+        if let Some(ref client) = inits.slack_client {
+            reg.register(Arc::new(SlackChannel {
+                client: client.clone(),
+                signing_secret: inits.slack_signing_secret.clone(),
+                dedup: Arc::new(Mutex::new(EventDeduplicator::new())),
+                bot_user_id: inits.slack_bot_user_id.clone(),
+                config: self.config.clone(),
+            }));
+        }
+        if let Some(ref client) = inits.twilio_client {
+            reg.register(Arc::new(TwilioChannel {
+                client: client.clone(),
+                auth_token: inits.twilio_auth_token.clone(),
+                phone_number: inits.twilio_phone_number.clone(),
+                whatsapp_number: inits.twilio_whatsapp_number.clone(),
+                config: self.config.clone(),
+            }));
+        }
+        if let Some(ref client) = inits.discord_client {
+            reg.register(Arc::new(DiscordChannel::new(
+                client.clone(),
+                inits.discord_public_key.clone(),
+                self.config.gateway.discord_guild_allowlist.clone(),
+                self.config.clone(),
+            )));
+        }
+        if let Some(ref client) = inits.teams_client {
+            reg.register(Arc::new(TeamsChannel {
+                client: client.clone(),
+                app_secret: inits.teams_app_secret.clone(),
+                dedup: Arc::new(std::sync::Mutex::new(
+                    crate::teams::dedup::ActivityDeduplicator::new(),
+                )),
+                config: self.config.clone(),
+            }));
+        }
+        if let Some(ref client) = inits.google_chat_client {
+            reg.register(Arc::new(GoogleChatChannel {
+                client: client.clone(),
+                token: inits.google_chat_token.clone(),
+                config: self.config.clone(),
+            }));
+        }
 
         {
-            let native_list = native_channels.list();
+            let native_list = reg.list();
             if native_list.is_empty() {
                 debug!("Gateway: no native channel integrations active");
             } else {
@@ -269,344 +421,264 @@ impl GatewayServer {
             }
         }
 
-        let channel_count = registry.list_channels().len() + native_channels.list().len();
+        reg
+    }
 
-        let state = Arc::new(AppState {
-            config: self.config.clone(),
-            registry,
-            native_channels,
-            session_queue: SessionQueue::new(gateway_config.max_concurrent),
-            request_timeout: Duration::from_millis(gateway_config.request_timeout_ms),
-            health: health.clone(),
-            rate_limiter,
-            metrics: self.metrics.clone(),
-            slack_client,
-            slack_signing_secret,
-            slack_bot_user_id,
-            poke_tx: self.poke_tx,
-            auto_reply_state: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::auto_reply::AutoReplyState::default(),
-            )),
-            shutdown: self.shutdown.clone(),
-        });
-
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .route("/healthz", get(health_handler))
-            .route("/readyz", get(readyz_handler))
-            .route("/health/channels", get(channel_health_handler))
-            .route("/channels", get(list_channels_handler))
-            .route("/internal/poke", post(poke_handler))
-            .route("/internal/restart", post(restart_handler))
-            .route("/internal/cancel", post(cancel_handler))
-            .route("/internal/away", post(away_handler))
-            .route("/internal/available", post(available_handler))
-            .route("/webhook/slack/command", post(slack_command_handler))
-            .route("/webhook/{name}", post(webhook_handler))
-            .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-            .with_state(state.clone())
-            .merge(build_openai_compat_router(&self.config))
-            .merge(build_generic_webhook_router(&self.config))
-            .merge(build_mcp_http_router(&self.config));
-
-        // Probe before bind: another borgd already serving this port is an
-        // idempotent no-op (parent will park on `shutdown`), avoiding a
-        // confusing AddrInUse on supervisord-style double-starts.
-        let probe_ok = async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .build()
-                .ok()?;
-            let resp = client
-                .get(format!("http://{addr}/healthz"))
-                .send()
-                .await
-                .ok()?;
-            resp.status().is_success().then_some(())
-        }
-        .await
-        .is_some();
-
-        if probe_ok {
-            // Another instance owns the port. Park until shutdown instead of
-            // erroring so the supervisor doesn't treat this as a crash and
-            // respawn-loop against the live instance.
-            info!("Gateway already running on {addr}, skipping bind");
-            self.shutdown.cancelled().await;
-            return Ok(());
-        }
-
-        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                anyhow::anyhow!(
-                    "Gateway port {addr} is already in use. Another borg instance may be running. \
-                     Stop it or change [gateway] port in config.toml"
-                )
-            } else {
-                anyhow::anyhow!("Failed to bind gateway to {addr}: {e}")
-            }
-        })?;
-        info!("Gateway listening on {addr} with {channel_count} channel(s)");
-        crate::activity::log_gateway_activity(
-            "info",
-            &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
-        )
-        .await;
-
-        // Crash-recovery: rows left in `sending` from the prior process are
-        // demoted to `pending` so the drain loop retries them.
-        if let Ok(db) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
-            match db.replay_unfinished().await {
-                Ok(0) => {}
-                Ok(n) => info!("Reset {n} in-flight delivery(ies) to pending"),
-                Err(e) => warn!("Failed to replay unfinished deliveries: {e}"),
-            }
-        }
-
+    /// Spawn the background loop that drains pending outbound deliveries
+    /// every 10 seconds until shutdown.
+    fn spawn_delivery_drain(
+        &self,
+        state: Arc<AppState>,
+        health: Arc<RwLock<ChannelHealthRegistry>>,
+    ) {
         let drain_shutdown = self.shutdown.clone();
-        let drain_state = state.clone();
-        let drain_health = health.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
                     _ = drain_shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        drain_pending_deliveries(&drain_state, &drain_health).await;
+                        drain_pending_deliveries(&state, &health).await;
                     }
                 }
             }
         });
+    }
 
-        // Spawn Telegram polling if no public_url (polling mode)
-        if self.config.gateway.public_url.is_none() {
-            if let Some(ref tg_client) = telegram_client {
-                info!("No public_url configured — starting Telegram long-polling mode");
-                let poll_client = tg_client.clone();
-                let poll_dedup = telegram_dedup.clone();
-                let poll_shutdown = self.shutdown.clone();
-                let poll_config = self.config.clone();
-                let poll_health = health.clone();
-                let poll_bot_username = telegram_bot_username.clone();
-                let poll_tts = tts_synth.clone();
-                let poll_request_timeout = Duration::from_millis(gateway_config.request_timeout_ms);
-
-                let callback: crate::telegram::polling::PollCallback = Arc::new(
-                    move |parsed, chat_id| {
-                        let poll_tts = poll_tts.clone();
-                        let config = poll_config.clone();
-                        let health = poll_health.clone();
-                        let tg = poll_client.clone();
-                        let bot_mention = poll_bot_username.as_deref().map(|u| format!("@{u}"));
-                        let request_timeout = poll_request_timeout;
-                        Box::pin(async move {
-                            let mut parsed = parsed;
-                            crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
-                            let inbound = parsed.inbound;
-
-                            let typing = crate::telegram::typing::TypingIndicator::start(
-                                tg.clone(),
-                                chat_id,
-                            );
-
-                            // Extract thread/reply IDs before passing inbound to invoke_agent
-                            let thread_id: Option<i64> =
-                                inbound.thread_id.as_deref().and_then(|id| id.parse().ok());
-                            let reply_to: Option<i64> =
-                                inbound.message_id.as_deref().and_then(|id| id.parse().ok());
-
-                            let agent_result = tokio::time::timeout(
-                                request_timeout,
-                                handler::invoke_agent(
-                                    "telegram",
-                                    &inbound,
-                                    &config,
-                                    Some(&health),
-                                    bot_mention.as_deref(),
-                                ),
-                            )
-                            .await;
-
-                            match agent_result {
-                                Ok(Ok((response_text, _))) => {
-                                    typing.stop().await;
-                                    let voice_reply_mode = match Database::open_with_timeout(
-                                        Database::GATEWAY_BUSY_TIMEOUT_MS,
-                                    )
-                                    .await
-                                    {
-                                        Ok(db) => match crate::voice::resolve_voice_reply_mode(
-                                            &db,
-                                            &config,
-                                            "telegram",
-                                            &chat_id.to_string(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(mode) => Some(mode),
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to resolve Telegram poll voice mode: {e}"
-                                                );
-                                                None
-                                            }
-                                        },
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to open DB for Telegram poll voice mode lookup: {e}"
-                                            );
-                                            None
-                                        }
-                                    };
-                                    crate::telegram::delivery::send_response(
-                                        &tg,
-                                        chat_id,
-                                        &response_text,
-                                        thread_id,
-                                        reply_to,
-                                        matches!(
-                                            parsed.input_kind,
-                                            crate::telegram::parse::TelegramInputKind::Voice
-                                        ),
-                                        voice_reply_mode,
-                                        &health,
-                                        poll_tts.as_deref(),
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        warn!("Failed to send Telegram poll response: {e}")
-                                    });
-                                }
-                                Ok(Err(e)) => {
-                                    typing.stop().await;
-                                    warn!("Agent error in Telegram poll mode: {e:#}");
-                                    let error_msg = handler::format_gateway_error(&e);
-                                    crate::telegram::delivery::send_response(
-                                        &tg, chat_id, &error_msg, thread_id, reply_to, false, None,
-                                        &health, None,
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        warn!("Failed to send Telegram poll error response: {e}")
-                                    });
-                                }
-                                Err(_) => {
-                                    typing.stop().await;
-                                    warn!("Agent timed out in Telegram poll mode");
-                                    let error_msg = cortex::error_format::format_error_with_context(
-                                        "request timed out",
-                                        cortex::error_format::ErrorContext::Gateway,
-                                    );
-                                    crate::telegram::delivery::send_response(
-                                        &tg, chat_id, &error_msg, thread_id, reply_to, false, None,
-                                        &health, None,
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        warn!("Failed to send Telegram poll timeout response: {e}")
-                                    });
-                                }
-                            }
-                        })
-                    },
-                );
-
-                let polling_client = tg_client.clone();
-                tokio::spawn(async move {
-                    crate::telegram::polling::run_polling(
-                        polling_client,
-                        poll_dedup,
-                        callback,
-                        poll_shutdown,
-                    )
-                    .await;
-                });
-            }
+    /// Spawn Telegram long-polling when no public_url is configured
+    /// (polling mode). No-op when a public_url is set (webhook mode) or
+    /// Telegram is not configured.
+    fn spawn_telegram_polling(
+        &self,
+        inits: &ChannelInits,
+        health: &Arc<RwLock<ChannelHealthRegistry>>,
+    ) {
+        if self.config.gateway.public_url.is_some() {
+            return;
         }
+        let Some(ref tg_client) = inits.telegram_client else {
+            return;
+        };
+        info!("No public_url configured — starting Telegram long-polling mode");
+        let poll_client = tg_client.clone();
+        let poll_dedup = inits.telegram_dedup.clone();
+        let poll_shutdown = self.shutdown.clone();
+        let poll_config = self.config.clone();
+        let poll_health = health.clone();
+        let poll_bot_username = inits.telegram_bot_username.clone();
+        let poll_tts = inits.tts_synth.clone();
+        let poll_request_timeout = Duration::from_millis(self.config.gateway.request_timeout_ms);
 
-        if let Some(ref sig_client) = signal_client {
-            info!("Starting Signal SSE inbound loop");
-            let sse_client = sig_client.clone();
-            let sse_config = self.config.clone();
-            let sse_health = health.clone();
-            let sse_shutdown = self.shutdown.clone();
+        let callback: crate::telegram::polling::PollCallback = Arc::new(move |parsed, chat_id| {
+            let poll_tts = poll_tts.clone();
+            let config = poll_config.clone();
+            let health = poll_health.clone();
+            let tg = poll_client.clone();
+            let bot_mention = poll_bot_username.as_deref().map(|u| format!("@{u}"));
+            let request_timeout = poll_request_timeout;
+            Box::pin(async move {
+                let mut parsed = parsed;
+                crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
+                let inbound = parsed.inbound;
 
-            let callback: crate::signal::sse::SseCallback =
-                Arc::new(move |inbound, recipient, group_id| {
-                    let config = sse_config.clone();
-                    let health = sse_health.clone();
-                    let client = sse_client.clone();
-                    Box::pin(async move {
-                        // Best-effort typing indicator; failure is a UX hint only,
-                        // never blocks the agent response below.
-                        let _ = client
-                            .send_typing(Some(&recipient), group_id.as_deref())
-                            .await;
+                let typing = crate::telegram::typing::TypingIndicator::start(tg.clone(), chat_id);
 
-                        // Bot mention identifier for group activation. Signal's
-                        // resolve_mentions renders the bot's mention as
-                        // `@<account>` (phone number) or `@<uuid>` — pass the
-                        // phone form so `check_activation` can require an
-                        // explicit @bot in group chats when
-                        // `gateway.group_activation = Mention` (the default).
-                        let bot_id = format!("@{}", client.account());
-                        match handler::invoke_agent(
-                            "signal",
-                            &inbound,
-                            &config,
-                            Some(&health),
-                            Some(&bot_id),
+                // Extract thread/reply IDs before passing inbound to invoke_agent
+                let thread_id: Option<i64> =
+                    inbound.thread_id.as_deref().and_then(|id| id.parse().ok());
+                let reply_to: Option<i64> =
+                    inbound.message_id.as_deref().and_then(|id| id.parse().ok());
+
+                let agent_result = tokio::time::timeout(
+                    request_timeout,
+                    handler::invoke_agent(
+                        "telegram",
+                        &inbound,
+                        &config,
+                        Some(&health),
+                        bot_mention.as_deref(),
+                    ),
+                )
+                .await;
+
+                match agent_result {
+                    Ok(Ok((response_text, _))) => {
+                        typing.stop().await;
+                        let voice_reply_mode = match Database::open_with_timeout(
+                            Database::GATEWAY_BUSY_TIMEOUT_MS,
                         )
                         .await
                         {
-                            Ok((response_text, _)) => {
-                                let send_result = if let Some(ref gid) = group_id {
-                                    client.send_group_message(gid, &response_text).await
-                                } else {
-                                    client.send_message(&recipient, &response_text).await
-                                };
-                                if let Err(e) = send_result {
-                                    warn!("Failed to send Signal response: {e}");
+                            Ok(db) => match crate::voice::resolve_voice_reply_mode(
+                                &db,
+                                &config,
+                                "telegram",
+                                &chat_id.to_string(),
+                            )
+                            .await
+                            {
+                                Ok(mode) => Some(mode),
+                                Err(e) => {
+                                    warn!("Failed to resolve Telegram poll voice mode: {e}");
+                                    None
                                 }
-                                if let Some(ref mid) = inbound.message_id {
-                                    if let Ok(ts) = mid.parse::<i64>() {
-                                        if let Err(e) =
-                                            client.send_read_receipt(&recipient, &[ts]).await
-                                        {
-                                            warn!("Failed to send Signal read receipt: {e}");
-                                        }
+                            },
+                            Err(e) => {
+                                warn!("Failed to open DB for Telegram poll voice mode lookup: {e}");
+                                None
+                            }
+                        };
+                        crate::telegram::delivery::send_response(
+                            &tg,
+                            chat_id,
+                            &response_text,
+                            thread_id,
+                            reply_to,
+                            matches!(
+                                parsed.input_kind,
+                                crate::telegram::parse::TelegramInputKind::Voice
+                            ),
+                            voice_reply_mode,
+                            &health,
+                            poll_tts.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_else(|e| warn!("Failed to send Telegram poll response: {e}"));
+                    }
+                    Ok(Err(e)) => {
+                        typing.stop().await;
+                        warn!("Agent error in Telegram poll mode: {e:#}");
+                        let error_msg = handler::format_gateway_error(&e);
+                        crate::telegram::delivery::send_response(
+                            &tg, chat_id, &error_msg, thread_id, reply_to, false, None, &health,
+                            None,
+                        )
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to send Telegram poll error response: {e}")
+                        });
+                    }
+                    Err(_) => {
+                        typing.stop().await;
+                        warn!("Agent timed out in Telegram poll mode");
+                        let error_msg = cortex::error_format::format_error_with_context(
+                            "request timed out",
+                            cortex::error_format::ErrorContext::Gateway,
+                        );
+                        crate::telegram::delivery::send_response(
+                            &tg, chat_id, &error_msg, thread_id, reply_to, false, None, &health,
+                            None,
+                        )
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to send Telegram poll timeout response: {e}")
+                        });
+                    }
+                }
+            })
+        });
+
+        let polling_client = tg_client.clone();
+        tokio::spawn(async move {
+            crate::telegram::polling::run_polling(
+                polling_client,
+                poll_dedup,
+                callback,
+                poll_shutdown,
+            )
+            .await;
+        });
+    }
+
+    /// Spawn the Signal SSE inbound loop. No-op when Signal is not configured.
+    fn spawn_signal_sse(&self, inits: &ChannelInits, health: &Arc<RwLock<ChannelHealthRegistry>>) {
+        let Some(ref sig_client) = inits.signal_client else {
+            return;
+        };
+        info!("Starting Signal SSE inbound loop");
+        let sse_client = sig_client.clone();
+        let sse_config = self.config.clone();
+        let sse_health = health.clone();
+        let sse_shutdown = self.shutdown.clone();
+
+        let callback: crate::signal::sse::SseCallback =
+            Arc::new(move |inbound, recipient, group_id| {
+                let config = sse_config.clone();
+                let health = sse_health.clone();
+                let client = sse_client.clone();
+                Box::pin(async move {
+                    // Best-effort typing indicator; failure is a UX hint only,
+                    // never blocks the agent response below.
+                    let _ = client
+                        .send_typing(Some(&recipient), group_id.as_deref())
+                        .await;
+
+                    // Bot mention identifier for group activation. Signal's
+                    // resolve_mentions renders the bot's mention as
+                    // `@<account>` (phone number) or `@<uuid>` — pass the
+                    // phone form so `check_activation` can require an
+                    // explicit @bot in group chats when
+                    // `gateway.group_activation = Mention` (the default).
+                    let bot_id = format!("@{}", client.account());
+                    match handler::invoke_agent(
+                        "signal",
+                        &inbound,
+                        &config,
+                        Some(&health),
+                        Some(&bot_id),
+                    )
+                    .await
+                    {
+                        Ok((response_text, _)) => {
+                            let send_result = if let Some(ref gid) = group_id {
+                                client.send_group_message(gid, &response_text).await
+                            } else {
+                                client.send_message(&recipient, &response_text).await
+                            };
+                            if let Err(e) = send_result {
+                                warn!("Failed to send Signal response: {e}");
+                            }
+                            if let Some(ref mid) = inbound.message_id {
+                                if let Ok(ts) = mid.parse::<i64>() {
+                                    if let Err(e) =
+                                        client.send_read_receipt(&recipient, &[ts]).await
+                                    {
+                                        warn!("Failed to send Signal read receipt: {e}");
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Agent error in Signal SSE mode: {e}");
-                                let error_msg = handler::format_gateway_error(&e);
-                                let send_result = if let Some(ref gid) = group_id {
-                                    client.send_group_message(gid, &error_msg).await
-                                } else {
-                                    client.send_message(&recipient, &error_msg).await
-                                };
-                                if let Err(send_err) = send_result {
-                                    warn!("Failed to send Signal error response: {send_err}");
-                                }
+                        }
+                        Err(e) => {
+                            warn!("Agent error in Signal SSE mode: {e}");
+                            let error_msg = handler::format_gateway_error(&e);
+                            let send_result = if let Some(ref gid) = group_id {
+                                client.send_group_message(gid, &error_msg).await
+                            } else {
+                                client.send_message(&recipient, &error_msg).await
+                            };
+                            if let Err(send_err) = send_result {
+                                warn!("Failed to send Signal error response: {send_err}");
                             }
                         }
-                    })
-                });
-
-            let sig_sse_client = sig_client.clone();
-            let sse_config = self.config.clone();
-            tokio::spawn(async move {
-                crate::signal::sse::run_sse_loop(
-                    sig_sse_client,
-                    callback,
-                    sse_shutdown,
-                    sse_config,
-                )
-                .await;
+                    }
+                })
             });
-        }
 
+        let sig_sse_client = sig_client.clone();
+        let sse_config = self.config.clone();
+        tokio::spawn(async move {
+            crate::signal::sse::run_sse_loop(sig_sse_client, callback, sse_shutdown, sse_config)
+                .await;
+        });
+    }
+
+    /// Spawn one generic poll loop per script channel with `mode = "poll"`,
+    /// returning the join handles so `run()` can await them after shutdown.
+    fn spawn_poll_loops(
+        &self,
+        state: &Arc<AppState>,
+        health: &Arc<RwLock<ChannelHealthRegistry>>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut poll_handles = Vec::new();
         for channel in state.registry.all_channels() {
             if channel.manifest.settings.mode != ChannelMode::Poll {
@@ -626,196 +698,224 @@ impl GatewayServer {
             }
 
             let poll_interval_ms = channel.manifest.settings.poll_interval_ms.unwrap_or(5000);
-            let channel_name = channel.manifest.name.clone();
-            let channel_dir = channel.dir.clone();
-            let manifest = channel.manifest.clone();
-            let config = state.config.clone();
-            let shutdown = self.shutdown.clone();
-            let poll_health = health.clone();
 
             info!(
                 "Starting poll loop for channel '{}' (interval: {}ms)",
-                channel_name, poll_interval_ms
+                channel.manifest.name, poll_interval_ms
             );
 
-            let request_timeout = state.request_timeout;
-            let handle = tokio::spawn(async move {
-                let start = tokio::time::Instant::now() + Duration::from_millis(poll_interval_ms);
-                let mut interval =
-                    tokio::time::interval_at(start, Duration::from_millis(poll_interval_ms));
-
-                let mut consecutive_errors: u32 = 0;
-                let mut total_error_cycles: u32 = 0;
-                let initial_backoff = POLL_INITIAL_BACKOFF;
-                let max_backoff = POLL_MAX_BACKOFF;
-                let max_consecutive_errors: u32 = POLL_MAX_CONSECUTIVE_ERRORS;
-
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            info!("Poll loop for '{}' shutting down", channel_name);
-                            break;
-                        }
-                        _ = interval.tick() => {
-                            // If in error state, apply backoff
-                            if consecutive_errors > 0 {
-                                let backoff_secs = initial_backoff.as_secs_f64()
-                                    * 2.0_f64.powi((consecutive_errors - 1) as i32);
-                                let backoff = Duration::from_secs_f64(
-                                    backoff_secs.min(max_backoff.as_secs_f64())
-                                );
-
-                                if consecutive_errors >= max_consecutive_errors {
-                                    total_error_cycles += 1;
-                                    if total_error_cycles >= 3 {
-                                        tracing::error!(
-                                            "Poll loop for '{}' permanently failed after {} error cycles ({} total errors). Restart gateway to retry.",
-                                            channel_name, total_error_cycles, consecutive_errors + (total_error_cycles - 1) * max_consecutive_errors
-                                        );
-                                        break;
-                                    }
-                                    warn!(
-                                        "Poll loop for '{}' hit {} consecutive errors (cycle {}/3), pausing for {:?}",
-                                        channel_name, consecutive_errors, total_error_cycles, max_backoff
-                                    );
-                                    tokio::time::sleep(max_backoff).await;
-                                    consecutive_errors = 0;
-                                    poll_health.write().await.record_reconnect(&channel_name);
-                                    continue;
-                                }
-
-                                tokio::time::sleep(backoff).await;
-                            }
-
-                            let executor =
-                                crate::executor::ChannelExecutor::new(&manifest, &channel_dir);
-                            let blocked_paths = &config.security.blocked_paths;
-
-                            let input = serde_json::json!({
-                                "channel_dir": channel_dir.to_string_lossy(),
-                            });
-
-                            let poll_result = executor
-                                .poll(&input.to_string(), blocked_paths)
-                                .await;
-
-                            let output = match poll_result {
-                                Ok(o) => {
-                                    if consecutive_errors > 0 {
-                                        info!(
-                                            "Poll loop for '{}' recovered after {} error(s)",
-                                            channel_name, consecutive_errors
-                                        );
-                                        poll_health.write().await.record_reconnect(&channel_name);
-                                        consecutive_errors = 0;
-                                    }
-                                    o
-                                }
-                                Err(e) => {
-                                    consecutive_errors += 1;
-                                    warn!(
-                                        "Poll error for '{}' (consecutive: {}): {e}",
-                                        channel_name, consecutive_errors
-                                    );
-                                    poll_health.write().await.record_error(&channel_name, &e.to_string());
-                                    continue;
-                                }
-                            };
-
-                            let trimmed = output.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-
-                            let messages: Vec<InboundMessage> =
-                                match serde_json::from_str(trimmed) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        consecutive_errors += 1;
-                                        warn!(
-                                            "Failed to parse poll output for '{}': {e}",
-                                            channel_name
-                                        );
-                                        poll_health.write().await.record_error(&channel_name, &e.to_string());
-                                        continue;
-                                    }
-                                };
-
-                            if messages.is_empty() {
-                                continue;
-                            }
-
-                            info!(
-                                "Poll for '{}' returned {} message(s)",
-                                channel_name,
-                                messages.len()
-                            );
-
-                            let reg_channel = crate::channel::registry::RegisteredChannel {
-                                manifest: manifest.clone(),
-                                dir: channel_dir.clone(),
-                            };
-
-                            for msg in messages {
-                                let result = tokio::time::timeout(
-                                    request_timeout,
-                                    handler::handle_polled_message(
-                                        &reg_channel,
-                                        msg,
-                                        &config,
-                                        Some(&poll_health),
-                                    ),
-                                )
-                                .await;
-
-                                match result {
-                                    Ok(Err(e)) => warn!(
-                                        "Failed to handle polled message for '{}': {e}",
-                                        channel_name
-                                    ),
-                                    Err(_) => warn!(
-                                        "Polled message for '{}' timed out",
-                                        channel_name
-                                    ),
-                                    Ok(Ok(_)) => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            let handle = tokio::spawn(run_channel_poll_loop(
+                channel.clone(),
+                poll_interval_ms,
+                state.config.clone(),
+                self.shutdown.clone(),
+                health.clone(),
+                state.request_timeout,
+            ));
 
             poll_handles.push(handle);
         }
+        poll_handles
+    }
+}
 
-        let shutdown = self.shutdown.clone();
-        let shutdown_tg_client = telegram_client.clone();
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-            info!("Gateway shutting down");
+/// Generic poll loop for one script-based channel (`mode = "poll"`): invokes
+/// the channel's poll script on its configured interval, applies exponential
+/// backoff on consecutive errors (giving up permanently after three exhausted
+/// error cycles), and routes returned messages through the agent.
+async fn run_channel_poll_loop(
+    channel: RegisteredChannel,
+    poll_interval_ms: u64,
+    config: Config,
+    shutdown: CancellationToken,
+    poll_health: Arc<RwLock<ChannelHealthRegistry>>,
+    request_timeout: Duration,
+) {
+    let channel_name = channel.manifest.name.clone();
+    let start = tokio::time::Instant::now() + Duration::from_millis(poll_interval_ms);
+    let mut interval = tokio::time::interval_at(start, Duration::from_millis(poll_interval_ms));
 
-            // Clean up Telegram webhook on shutdown
-            if let Some(client) = shutdown_tg_client {
-                if let Err(e) = client.delete_webhook().await {
-                    warn!("Failed to delete Telegram webhook on shutdown: {e}");
-                } else {
-                    info!("Telegram webhook removed");
+    let mut consecutive_errors: u32 = 0;
+    let mut total_error_cycles: u32 = 0;
+    let initial_backoff = POLL_INITIAL_BACKOFF;
+    let max_backoff = POLL_MAX_BACKOFF;
+    let max_consecutive_errors: u32 = POLL_MAX_CONSECUTIVE_ERRORS;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Poll loop for '{}' shutting down", channel_name);
+                break;
+            }
+            _ = interval.tick() => {
+                // If in error state, apply backoff
+                if consecutive_errors > 0 {
+                    let backoff_secs = initial_backoff.as_secs_f64()
+                        * 2.0_f64.powi((consecutive_errors - 1) as i32);
+                    let backoff = Duration::from_secs_f64(
+                        backoff_secs.min(max_backoff.as_secs_f64())
+                    );
+
+                    if consecutive_errors >= max_consecutive_errors {
+                        total_error_cycles += 1;
+                        if total_error_cycles >= 3 {
+                            tracing::error!(
+                                "Poll loop for '{}' permanently failed after {} error cycles ({} total errors). Restart gateway to retry.",
+                                channel_name, total_error_cycles, consecutive_errors + (total_error_cycles - 1) * max_consecutive_errors
+                            );
+                            break;
+                        }
+                        warn!(
+                            "Poll loop for '{}' hit {} consecutive errors (cycle {}/3), pausing for {:?}",
+                            channel_name, consecutive_errors, total_error_cycles, max_backoff
+                        );
+                        tokio::time::sleep(max_backoff).await;
+                        consecutive_errors = 0;
+                        poll_health.write().await.record_reconnect(&channel_name);
+                        continue;
+                    }
+
+                    tokio::time::sleep(backoff).await;
+                }
+
+                let executor = crate::executor::ChannelExecutor::new(
+                    &channel.manifest,
+                    &channel.dir,
+                );
+                let blocked_paths = &config.security.blocked_paths;
+
+                let input = serde_json::json!({
+                    "channel_dir": channel.dir.to_string_lossy(),
+                });
+
+                let poll_result = executor
+                    .poll(&input.to_string(), blocked_paths)
+                    .await;
+
+                let output = match poll_result {
+                    Ok(o) => {
+                        if consecutive_errors > 0 {
+                            info!(
+                                "Poll loop for '{}' recovered after {} error(s)",
+                                channel_name, consecutive_errors
+                            );
+                            poll_health.write().await.record_reconnect(&channel_name);
+                            consecutive_errors = 0;
+                        }
+                        o
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        warn!(
+                            "Poll error for '{}' (consecutive: {}): {e}",
+                            channel_name, consecutive_errors
+                        );
+                        poll_health.write().await.record_error(&channel_name, &e.to_string());
+                        continue;
+                    }
+                };
+
+                let trimmed = output.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let messages: Vec<InboundMessage> =
+                    match serde_json::from_str(trimmed) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            warn!(
+                                "Failed to parse poll output for '{}': {e}",
+                                channel_name
+                            );
+                            poll_health.write().await.record_error(&channel_name, &e.to_string());
+                            continue;
+                        }
+                    };
+
+                if messages.is_empty() {
+                    continue;
+                }
+
+                info!(
+                    "Poll for '{}' returned {} message(s)",
+                    channel_name,
+                    messages.len()
+                );
+
+                let reg_channel = channel.clone();
+
+                for msg in messages {
+                    let result = tokio::time::timeout(
+                        request_timeout,
+                        handler::handle_polled_message(
+                            &reg_channel,
+                            msg,
+                            &config,
+                            Some(&poll_health),
+                        ),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Err(e)) => warn!(
+                            "Failed to handle polled message for '{}': {e}",
+                            channel_name
+                        ),
+                        Err(_) => warn!(
+                            "Polled message for '{}' timed out",
+                            channel_name
+                        ),
+                        Ok(Ok(_)) => {}
+                    }
                 }
             }
-        })
-        .await?;
-
-        // Wait for poll tasks to finish after server shutdown
-        for handle in poll_handles {
-            let _ = handle.await;
         }
-
-        Ok(())
     }
+}
+
+/// Build the gateway's axum router: health/introspection routes, internal
+/// control routes, webhook routes, plus the merged OpenAI-compat, generic
+/// webhook, and MCP HTTP sub-routers.
+fn build_router(state: Arc<AppState>, config: &Config) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/healthz", get(health_handler))
+        .route("/readyz", get(readyz_handler))
+        .route("/health/channels", get(channel_health_handler))
+        .route("/channels", get(list_channels_handler))
+        .route("/internal/poke", post(poke_handler))
+        .route("/internal/restart", post(restart_handler))
+        .route("/internal/cancel", post(cancel_handler))
+        .route("/internal/away", post(away_handler))
+        .route("/internal/available", post(available_handler))
+        .route("/webhook/slack/command", post(slack_command_handler))
+        .route("/webhook/{name}", post(webhook_handler))
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .with_state(state)
+        .merge(build_openai_compat_router(config))
+        .merge(build_generic_webhook_router(config))
+        .merge(build_mcp_http_router(config))
+}
+
+/// Probe `http://{addr}/healthz` to detect an already-running gateway
+/// instance before binding the port.
+async fn probe_existing_instance(addr: &str) -> bool {
+    async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let resp = client
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .ok()?;
+        resp.status().is_success().then_some(())
+    }
+    .await
+    .is_some()
 }
 
 /// Per-request DB factory used by the three v1 HTTP surfaces.
