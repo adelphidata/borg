@@ -197,6 +197,27 @@ static XAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| 
 static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
         (
+            "gemini-3-pro",
+            ModelRate {
+                input_per_mtok: "1.25",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gemini-3-flash",
+            ModelRate {
+                input_per_mtok: "0.15",
+                output_per_mtok: "0.60",
+            },
+        ),
+        (
+            "gemini-3-flash-lite",
+            ModelRate {
+                input_per_mtok: "0.05",
+                output_per_mtok: "0.30",
+            },
+        ),
+        (
             "gemini-2.5-pro",
             ModelRate {
                 input_per_mtok: "1.25",

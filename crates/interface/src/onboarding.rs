@@ -66,27 +66,21 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
 ];
 
 /// Model choices per provider.
+///
+/// OpenRouter list is ordered newest-first: the open-weight flagships (GLM,
+/// MiniMax, Kimi) lead, followed by each proprietary family latest-first. The
+/// live catalog fetch ([`crate::openrouter_catalog`]) preserves this order and
+/// drops any IDs OpenRouter no longer serves, so keep the newest curated slug
+/// at the top of each family. See the `update-model-catalog` skill.
 pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
-    ("moonshotai/kimi-k2.5", "Kimi K2.5 (recommended)"),
+    ("z-ai/glm-5.1", "GLM 5.1 (recommended)"),
+    ("z-ai/glm-4.7", "GLM 4.7"),
+    ("minimax/minimax-m2.7", "MiniMax M2.7"),
+    ("moonshotai/kimi-k2.5", "Kimi K2.5"),
     (
         "moonshotai/kimi-k2-thinking",
         "Kimi K2 Thinking (reasoning)",
     ),
-    ("minimax/minimax-m2.7", "MiniMax M2.7"),
-    ("x-ai/grok-4.20", "Grok 4.20"),
-    ("x-ai/grok-4.20-multi-agent", "Grok 4.20 Multi-Agent"),
-    ("x-ai/grok-4.1-fast", "Grok 4.1 Fast"),
-    ("x-ai/grok-4-fast", "Grok 4 Fast"),
-    ("x-ai/grok-4", "Grok 4"),
-    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    ("google/gemini-3-flash-preview", "Gemini 3 Flash"),
-    (
-        "google/gemini-3.1-flash-lite-preview",
-        "Gemini 3.1 Flash Lite",
-    ),
-    ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
-    ("deepseek/deepseek-v3.2-exp", "DeepSeek V3.2 Exp"),
-    ("deepseek/deepseek-r1", "DeepSeek R1 (reasoning)"),
     ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
     ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
     (
@@ -100,11 +94,23 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
     ("openai/gpt-5.1-codex", "GPT-5.1 Codex (coding)"),
     ("openai/gpt-5", "GPT-5"),
     ("openai/gpt-5-mini", "GPT-5 Mini"),
+    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+    ("google/gemini-3-flash-preview", "Gemini 3 Flash"),
+    (
+        "google/gemini-3.1-flash-lite-preview",
+        "Gemini 3.1 Flash Lite",
+    ),
+    ("x-ai/grok-4.20", "Grok 4.20"),
+    ("x-ai/grok-4.20-multi-agent", "Grok 4.20 Multi-Agent"),
+    ("x-ai/grok-4.1-fast", "Grok 4.1 Fast"),
+    ("x-ai/grok-4-fast", "Grok 4 Fast"),
+    ("x-ai/grok-4", "Grok 4"),
     ("qwen/qwen3.6-max-preview", "Qwen3.6 Max"),
     ("qwen/qwen3.6-flash", "Qwen3.6 Flash"),
     ("qwen/qwen3-coder-next", "Qwen3 Coder Next (coding)"),
-    ("z-ai/glm-5.1", "GLM 5.1"),
-    ("z-ai/glm-4.7", "GLM 4.7"),
+    ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
+    ("deepseek/deepseek-v3.2-exp", "DeepSeek V3.2 Exp"),
+    ("deepseek/deepseek-r1", "DeepSeek R1 (reasoning)"),
     ("mistralai/mistral-large-2512", "Mistral Large 3"),
     ("mistralai/devstral-2512", "Devstral 2 (coding)"),
 ];

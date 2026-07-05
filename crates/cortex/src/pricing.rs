@@ -215,6 +215,12 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
         },
         BundledRateCardEntry {
             provider_id: "gemini",
+            model: "gemini-3-flash-lite",
+            prompt_per_mtok_usd: "0.05",
+            completion_per_mtok_usd: "0.30",
+        },
+        BundledRateCardEntry {
+            provider_id: "gemini",
             model: "gemini-2.5-pro",
             prompt_per_mtok_usd: "1.25",
             completion_per_mtok_usd: "10.00",

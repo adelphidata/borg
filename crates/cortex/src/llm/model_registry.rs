@@ -185,6 +185,21 @@ const REGISTRY: &[ModelMetadata] = &[
         supports_thinking: true,
     },
     // Gemini 3.x — longer slugs first (gemini-3-flash-lite before gemini-3-flash).
+    // The `3.1` refresh ships behind `-preview` slugs on OpenRouter; entries
+    // here so `google/gemini-3.1-pro-preview` resolves to the 2M window instead
+    // of falling through to the 200K default.
+    ModelMetadata {
+        slug: "gemini-3.1-flash-lite",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gemini-3.1-pro",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "gemini-3-flash-lite",
         context_window: 1_000_000,
@@ -345,6 +360,71 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 128_000,
         supports_thinking: false,
     },
+    // Open-weight flagships routed via OpenRouter (z-ai/, minimax/, moonshotai/,
+    // qwen/, mistralai/ prefixes stripped before matching). Without these the
+    // slugs fall through to the 200K default — wrong for the 256K/1M-class
+    // models and for the 32K `mistral` family entry that `mistral-large` would
+    // otherwise shadow-match.
+    ModelMetadata {
+        slug: "glm-5.1",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "glm-4.7",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "minimax-m2.7",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "kimi-k2-thinking",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "kimi-k2.5",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "qwen3.6-max",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "qwen3.6-flash",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "qwen3-coder",
+        context_window: 256_000,
+        max_context_window: 1_000_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "mistral-large",
+        context_window: 128_000,
+        max_context_window: 128_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "devstral",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: false,
+    },
     ModelMetadata {
         slug: "gpt-oss-120b",
         context_window: 131_072,
@@ -473,6 +553,9 @@ fn strip_vendor_prefix(model: &str) -> &str {
         "meta-llama/",
         "mistralai/",
         "qwen/",
+        "z-ai/",
+        "minimax/",
+        "moonshotai/",
     ] {
         if let Some(rest) = model.strip_prefix(prefix) {
             return rest;
@@ -645,6 +728,58 @@ mod tests {
             !lookup("grok-4-fast-non-reasoning")
                 .unwrap()
                 .supports_thinking
+        );
+    }
+
+    #[test]
+    fn openrouter_open_weight_flagships_resolve_off_default() {
+        // These OpenRouter-routed slugs were silently falling through to the
+        // 200K default before their registry entries + vendor prefixes landed.
+        // A regression here means airgapped budget math reverts to the wrong
+        // window for the open-weight flagships surfaced in onboarding.
+        assert_eq!(lookup("z-ai/glm-5.1").unwrap().slug, "glm-5.1");
+        assert_eq!(lookup("z-ai/glm-4.7").unwrap().slug, "glm-4.7");
+        assert_eq!(
+            lookup("minimax/minimax-m2.7").unwrap().slug,
+            "minimax-m2.7"
+        );
+        assert_eq!(
+            lookup("moonshotai/kimi-k2.5").unwrap().slug,
+            "kimi-k2.5"
+        );
+        assert_eq!(
+            lookup("moonshotai/kimi-k2-thinking").unwrap().slug,
+            "kimi-k2-thinking"
+        );
+        assert_eq!(context_window_for("moonshotai/kimi-k2.5"), 256_000);
+        assert!(
+            lookup("moonshotai/kimi-k2-thinking")
+                .unwrap()
+                .supports_thinking
+        );
+        // Qwen3 coder/max resolve above the generic `qwen3` (131K) entry.
+        assert_eq!(
+            lookup("qwen/qwen3-coder-next").unwrap().slug,
+            "qwen3-coder"
+        );
+        assert_eq!(context_window_for("qwen/qwen3.6-max-preview"), 256_000);
+        // `mistral-large` must win over the 32K `mistral` family entry, and
+        // `devstral` must resolve at all (no `mistral` prefix to catch it).
+        assert_eq!(
+            lookup("mistralai/mistral-large-2512").unwrap().slug,
+            "mistral-large"
+        );
+        assert_eq!(context_window_for("mistralai/mistral-large-2512"), 128_000);
+        assert_eq!(lookup("mistralai/devstral-2512").unwrap().slug, "devstral");
+        // Gemini 3.1 preview slugs land on the 2M/1M windows, not the default.
+        assert_eq!(
+            lookup("google/gemini-3.1-pro-preview").unwrap().slug,
+            "gemini-3.1-pro"
+        );
+        assert_eq!(context_window_for("google/gemini-3.1-pro-preview"), 2_000_000);
+        assert_eq!(
+            lookup("google/gemini-3.1-flash-lite-preview").unwrap().slug,
+            "gemini-3.1-flash-lite"
         );
     }
 

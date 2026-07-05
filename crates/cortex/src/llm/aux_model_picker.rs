@@ -20,7 +20,7 @@ const AUX_DEFAULTS: &[(&str, &str)] = &[
     ("anthropic", "claude-haiku-4-5"),
     ("openai", "gpt-5-mini"),
     ("openrouter", "anthropic/claude-haiku-4-5"),
-    ("gemini", "gemini-2.5-flash"),
+    ("gemini", "gemini-3-flash-lite"),
     ("deepseek", "deepseek-chat"),
     ("groq", "llama-3.3-70b-versatile"),
     ("xai", "grok-4-fast-non-reasoning"),
