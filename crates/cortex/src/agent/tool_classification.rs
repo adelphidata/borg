@@ -42,6 +42,18 @@ pub(crate) fn is_mutating_tool_call(name: &str, raw_args: &str) -> bool {
     !crate::tool::readonly_tool_call(name, raw_args)
 }
 
+/// Tools that pass the name-level Plan-mode allowlist but are only read-only
+/// for *some* of their actions — the mutation decision needs the call's
+/// arguments (see [`crate::tool::readonly_tool_call`]). A flat name list like
+/// [`mutating_tool_names`] structurally can't represent "sometimes mutating",
+/// so this is the single place that names them: the parent per-call gate
+/// dispatches per-action for these, and sub-agent delegation blocks the whole
+/// tool (a static blocklist can't express per-action). Both consumers read
+/// this slice so the two enforcement paths can't drift.
+pub fn conditionally_mutating_tool_names() -> &'static [&'static str] {
+    &[crate::tool::names::COMPUTER_USE]
+}
+
 /// Names of every tool that `is_mutating_tool` considers mutating.
 ///
 /// Kept in sync with that function so callers (e.g. sub-agent delegation in

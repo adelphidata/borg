@@ -453,14 +453,18 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
 
 /// Per-call Plan-mode read-only check: [`allowed_in_plan_mode_name`] plus the
 /// per-action inspection for tools whose read-only status depends on their
-/// arguments (today only `computer_use`). This is the single source of truth
-/// the agent loop's Plan-mode gate consumes — a new args-dependent tool gets
-/// its arm added HERE, next to the name allowlist, so the two can't drift.
-/// Unparseable args fail closed (treated as mutating). MCP tools (`mcp_*`)
-/// are not handled here; their trust policy lives in
-/// `agent::tool_classification::is_mutating_tool`.
+/// arguments. This is the single source of truth the agent loop's Plan-mode
+/// gate consumes. The args-dependent tools are named once in
+/// [`crate::agent::tool_classification::conditionally_mutating_tool_names`];
+/// a new one added there is picked up here AND by sub-agent delegation
+/// without editing this function. Unparseable args fail closed (treated as
+/// mutating). MCP tools (`mcp_*`) are not handled here; their trust policy
+/// lives in `agent::tool_classification::is_mutating_tool`.
 pub(crate) fn readonly_tool_call(name: &str, raw_args: &str) -> bool {
-    if matches_any(name, &[tn::COMPUTER_USE]) {
+    if crate::agent::conditionally_mutating_tool_names().contains(&name) {
+        // Today only `computer_use` is args-dependent; dispatch to its
+        // per-action check. Add a match arm here when a second one appears.
+        debug_assert_eq!(name, tn::COMPUTER_USE);
         return serde_json::from_str::<serde_json::Value>(raw_args)
             .is_ok_and(|v| computer_use::args_action_is_readonly(&v));
     }

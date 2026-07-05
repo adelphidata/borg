@@ -48,7 +48,7 @@ use stream_handler::{StreamEventOutcome, TextOnlyOutcome};
 use system_prompt_cache::SystemPromptCache;
 
 pub use btw::{parse_btw_command, run_btw};
-pub use tool_classification::mutating_tool_names;
+pub use tool_classification::{conditionally_mutating_tool_names, mutating_tool_names};
 // `tool_classification` is consumed by `agent::tool_execution`; nothing in
 // this module references it directly.
 

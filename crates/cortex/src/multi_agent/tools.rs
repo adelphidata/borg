@@ -220,17 +220,19 @@ pub fn assemble_delegate_blocklist(
         .collaboration_mode
         .blocks_mutations()
     {
-        for tool in crate::agent::mutating_tool_names() {
+        // Unconditionally-mutating tools plus the args-dependent ones
+        // (`computer_use` etc.): a static name-level blocklist can't express
+        // per-action nuance, so children get the whole conditionally-mutating
+        // tool blocked — the conservative reading of the Plan-mode guarantee.
+        // Both lists live in tool_classification so the parent per-call gate
+        // and this child blocklist can't drift.
+        for tool in crate::agent::mutating_tool_names()
+            .iter()
+            .chain(crate::agent::conditionally_mutating_tool_names())
+        {
             if !blocklist.contains(tool) {
                 blocklist.push(tool);
             }
-        }
-        // `computer_use` is per-action read-only (capture/list_apps/wait) and
-        // so is absent from `mutating_tool_names()`. A name-level blocklist
-        // can't express per-action nuance, so for children we block the whole
-        // tool — the conservative reading of the Plan-mode guarantee.
-        if !blocklist.contains(&crate::tool::names::COMPUTER_USE) {
-            blocklist.push(crate::tool::names::COMPUTER_USE);
         }
     }
     blocklist

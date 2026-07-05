@@ -257,17 +257,11 @@ impl CuaDriver {
 /// upstream).
 const CUA_TELEMETRY_ENV: &str = "CUA_DRIVER_RS_TELEMETRY_ENABLED";
 
-/// Vars a GUI-automation driver legitimately needs beyond the base MCP
-/// allowlist: display-server and session-bus plumbing for Linux X11/Wayland
-/// hosts. Harmless (absent) on macOS.
-const DRIVER_ENV_EXTRAS: &[&str] = &[
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "XAUTHORITY",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "XDG_SESSION_TYPE",
-    "XDG_CURRENT_DESKTOP",
-];
+/// Session-bus var the driver needs that isn't already covered by the shared
+/// subprocess allowlist (`crate::security::env_allowlist`, which already
+/// passes `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY` and the `XDG_` prefix).
+/// D-Bus plumbing for Linux hosts; harmless (absent) on macOS.
+const DRIVER_ENV_EXTRAS: &[&str] = &["DBUS_SESSION_BUS_ADDRESS"];
 
 /// Prefix for the driver's own configuration knobs. Vars under this prefix
 /// pass through from the parent env so operators keep their driver tuning
@@ -276,11 +270,14 @@ const DRIVER_ENV_EXTRAS: &[&str] = &[
 const DRIVER_ENV_PREFIX: &str = "CUA_DRIVER_RS_";
 
 /// Build the child environment for a cua-driver spawn. The driver is a
-/// third-party binary, so it gets the same treatment as stdio MCP servers:
-/// `env_clear` + allowlist, which strips every operator credential
-/// (`*_API_KEY`, `BORG_KEK_PASSPHRASE`, OAuth tokens) before spawn. An
-/// inherited telemetry var is also stripped by the filter, so the opt-out
-/// below can't be pre-empted from the parent shell.
+/// third-party binary, so it gets the same credential scrub as every other
+/// agent-spawned subprocess: `env_clear` + `env_allowlist`, which strips
+/// every operator credential (`*_API_KEY`, `BORG_KEK_PASSPHRASE`, OAuth
+/// tokens) before spawn via the closed allowlist + deny-substring tripwire.
+/// On top of that we pass the driver's own `CUA_DRIVER_RS_*` config knobs
+/// (except the telemetry toggle, which Borg controls) and force telemetry
+/// off unless the operator opted in — an inherited enable can't pre-empt it
+/// because the allowlist strips it before this runs.
 fn driver_child_env(
     telemetry_optin: bool,
     base: impl IntoIterator<Item = (String, String)>,
@@ -288,7 +285,7 @@ fn driver_child_env(
     let mut env: Vec<(String, String)> = base
         .into_iter()
         .filter(|(k, _)| {
-            mcp::transport::is_env_allowed(k)
+            crate::security::env_allowlist::is_allowed(k)
                 || DRIVER_ENV_EXTRAS.contains(&k.as_str())
                 || (k.starts_with(DRIVER_ENV_PREFIX) && k != CUA_TELEMETRY_ENV)
         })
@@ -425,7 +422,9 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
             match stderr.read(&mut chunk).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut buf = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut buf = writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     buf.extend_from_slice(&chunk[..n]);
                     if buf.len() > TAIL_CAP {
                         let excess = buf.len() - TAIL_CAP;
@@ -444,7 +443,9 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
 
 /// `" Driver stderr tail: …"` when the driver said anything, empty otherwise.
 fn stderr_suffix(tail: &StderrTail) -> String {
-    let bytes = tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes = tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim();
     if text.is_empty() {
@@ -1162,15 +1163,34 @@ fn driver_modifiers(args: &ComputerUseArgs) -> Result<Option<Vec<&'static str>>>
     Ok(Some(out))
 }
 
-/// Parse the pixel dimensions out of a base64-encoded image without decoding
-/// the pixels. PNG carries width/height as two big-endian u32s at bytes
-/// 16..24 (right after the 8-byte signature + `IHDR` length/type). Returns
-/// `None` for non-PNG or truncated data — the guard treats "unknown size" as
-/// "not too small" so a JPEG (or a parse miss) never suppresses a real image.
+/// Set the driver's `modifier` param from canonicalised modifiers and return
+/// the human-readable summary suffix (`" with cmd+shift"`, or `""` when there
+/// are none). `driver_modifiers` already guarantees `Some(_)` is non-empty,
+/// so a plain `Some`/`None` match is all that's needed here.
+fn apply_modifiers(params: &mut Value, modifiers: &Option<Vec<&'static str>>) -> String {
+    match modifiers {
+        Some(mods) => {
+            params["modifier"] = json!(mods);
+            format!(" with {}", mods.join("+"))
+        }
+        None => String::new(),
+    }
+}
+
+/// Parse the pixel dimensions out of a base64-encoded PNG without decoding
+/// the pixels — or even the whole base64 string. PNG carries width/height as
+/// two big-endian u32s at bytes 16..24 (right after the 8-byte signature +
+/// `IHDR` length/type), so decoding just the first 32 base64 chars (→ the
+/// first 24 bytes; 32 is a multiple of 4 so there's no padding ambiguity) is
+/// enough. This keeps a multi-MB screenshot from being fully decoded on every
+/// capture just to read 8 bytes. Returns `None` for non-PNG or truncated data
+/// — the guard treats "unknown size" as "not too small" so a JPEG (or a parse
+/// miss) never suppresses a real image.
 fn png_dimensions(base64_data: &str) -> Option<(u32, u32)> {
     use base64::Engine;
+    let header_b64 = base64_data.trim().get(..32)?;
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_data.trim())
+        .decode(header_b64)
         .ok()?;
     const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.len() < 24 || !bytes.starts_with(PNG_SIG) {
@@ -1278,15 +1298,8 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         params["x"] = json!(x);
         params["y"] = json!(y);
         // Modifiers are pixel-path only (the driver's AX path ignores them).
-        if let Some(mods) = &modifiers {
-            params["modifier"] = json!(mods);
-        }
-        summary = match &modifiers {
-            Some(mods) if !mods.is_empty() => {
-                format!("{method} at ({x}, {y}) with {}", mods.join("+"))
-            }
-            _ => format!("{method} at ({x}, {y})"),
-        };
+        let suffix = apply_modifiers(&mut params, &modifiers);
+        summary = format!("{method} at ({x}, {y}){suffix}");
     }
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
@@ -1314,14 +1327,7 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
     }
     // Drag is pixel-only in the driver (AX has no drag), so modifiers always
     // apply when present — option-drag duplicates, shift-drag constrains.
-    let modifiers = driver_modifiers(args)?;
-    if let Some(mods) = &modifiers {
-        params["modifier"] = json!(mods);
-    }
-    let with = match &modifiers {
-        Some(mods) if !mods.is_empty() => format!(" with {}", mods.join("+")),
-        _ => String::new(),
-    };
+    let with = apply_modifiers(&mut params, &driver_modifiers(args)?);
     let resp = driver.call("drag", params).await?;
     Ok(merge_driver_text(
         format!("drag ({from_x},{from_y}) → ({to_x},{to_y}){with}"),
