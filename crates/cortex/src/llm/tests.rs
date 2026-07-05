@@ -204,7 +204,7 @@ fn openrouter_sse_usage_total_cost_populates_provider_cost_usd() {
     // "openrouter_usage" rather than falling through to "unknown".
     use crate::sse::SseAction;
     let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"total_cost":0.000123}}"#;
-    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit"),
@@ -226,7 +226,7 @@ fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
     // the emitter then attributes as cost_source = "unknown".
     use crate::sse::SseAction;
     let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
-    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit"),
@@ -244,7 +244,7 @@ fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
 /// Helper: extract the parsed `UsageData` from an SSE line.
 fn parse_openrouter_usage_from_sse(line: &str) -> UsageData {
     use crate::sse::SseAction;
-    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit, got non-emit action"),
@@ -351,7 +351,7 @@ fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
     use crate::sse::SseAction;
 
     let line_first_terminal = r#"data: {"choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop"}]}"#;
-    let action = LlmClient::parse_openai_sse_line(
+    let action = transport::parse_openai_sse_line(
         line_first_terminal,
         "openrouter",
         "anthropic/claude-sonnet-4.5",
@@ -371,7 +371,7 @@ fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
 
     let done_line = "data: [DONE]";
     let done_action =
-        LlmClient::parse_openai_sse_line(done_line, "openrouter", "anthropic/claude-sonnet-4.5");
+        transport::parse_openai_sse_line(done_line, "openrouter", "anthropic/claude-sonnet-4.5");
     assert!(
         matches!(done_action, SseAction::Done(_)),
         "[DONE] sentinel must be the sole termination trigger"
@@ -380,7 +380,7 @@ fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
 
 #[test]
 fn openrouter_non_streaming_usage_cost_resolves_via_extractor() {
-    // Non-streaming `chat_openai` deserializes the same `StreamUsage`
+    // Non-streaming the OpenAI-compat wire path deserializes the same `StreamUsage`
     // struct out of the JSON response body. Lock in that the canonical
     // `cost` field on a non-streaming response resolves to
     // `provider_cost_usd` exactly as the streaming path does — this is
@@ -1265,7 +1265,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
 
     // Feed message_start with input_tokens=150 → should be stashed, no emit.
     let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":150,"output_tokens":0}}}"#;
-    let action = LlmClient::parse_anthropic_sse_line(
+    let action = transport::parse_anthropic_sse_line(
         start,
         "anthropic",
         "claude-opus-4",
@@ -1281,7 +1281,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
 
     // Feed message_delta with only output_tokens — emit should merge.
     let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":42},"delta":{"stop_reason":"end_turn"}}"#;
-    let action = LlmClient::parse_anthropic_sse_line(
+    let action = transport::parse_anthropic_sse_line(
         delta,
         "anthropic",
         "claude-opus-4",
@@ -1321,7 +1321,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
     let mut pending_created = 0u64;
 
     let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0}}}"#;
-    let _ = LlmClient::parse_anthropic_sse_line(
+    let _ = transport::parse_anthropic_sse_line(
         start,
         "anthropic",
         "claude-opus-4",
@@ -1334,7 +1334,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
     );
 
     let delta = r#"data: {"type":"message_delta","usage":{"input_tokens":120,"output_tokens":10},"delta":{"stop_reason":"end_turn"}}"#;
-    let action = LlmClient::parse_anthropic_sse_line(
+    let action = transport::parse_anthropic_sse_line(
         delta,
         "anthropic",
         "claude-opus-4",
@@ -1363,7 +1363,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
 #[test]
 fn openai_sanitizes_null_content_on_tool_call_messages() {
     // Gemini (via OpenRouter) rejects `"content": null`. The sanitization
-    // in stream_chat_openai_inner should replace None content on assistant
+    // on the OpenAI-compat streaming path should replace None content on assistant
     // tool-call messages with an empty string.
     let messages = vec![
         Message::user("hello"),
@@ -2172,7 +2172,7 @@ fn make_tool(name: &str) -> ToolDefinition {
 fn supports_anthropic_cache_control_table() {
     // Native Anthropic always wins; OpenRouter only on Claude-family
     // models; everything else is off. Locks the (provider, model)
-    // gating used by `stream_chat_openai_inner` and `chat_openai`.
+    // gating used by the streaming and non-streaming OpenAI-compat paths.
     let cases: &[(Provider, &str, bool)] = &[
         (Provider::Anthropic, "claude-sonnet-4", true),
         (Provider::Anthropic, "claude-opus-4-1", true),
@@ -2202,7 +2202,7 @@ fn supports_anthropic_cache_control_table() {
 }
 
 /// Build a synthetic OpenAI-compat request body for cache-marker tests.
-/// Mirrors what `stream_chat_openai_inner` would produce: a system
+/// Mirrors what the OpenAI-compat streaming path would produce: a system
 /// message, several user/assistant turns, and (optionally) a `role: tool`
 /// message in the rolling window.
 fn build_test_openai_body(include_tool_role: bool) -> serde_json::Value {
@@ -2644,7 +2644,7 @@ fn parse_anthropic_error_sse(err_type: &str, err_msg: &str) -> crate::sse::SseAc
     let mut pending_input = 0u64;
     let mut pending_cached = 0u64;
     let mut pending_created = 0u64;
-    LlmClient::parse_anthropic_sse_line(
+    transport::parse_anthropic_sse_line(
         &line,
         "anthropic",
         "claude-sonnet-4",

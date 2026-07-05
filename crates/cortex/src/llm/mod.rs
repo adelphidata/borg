@@ -148,6 +148,21 @@ enum WirePath {
     Anthropic,
 }
 
+impl WirePath {
+    /// The transport implementation for this wire path. Keeping the mapping
+    /// here means the streaming and non-streaming dispatch paths cannot
+    /// route the same [`WirePath`] to different transports.
+    fn transport(self) -> &'static dyn Transport {
+        match self {
+            WirePath::Bedrock => transport::bedrock_transport(),
+            WirePath::VertexAnthropic => transport::vertex_anthropic_transport(),
+            WirePath::Gemini => transport::gemini_transport(),
+            WirePath::OpenAi => transport::openai_compat_transport(),
+            WirePath::Anthropic => transport::anthropic_transport(),
+        }
+    }
+}
+
 /// Token usage statistics from an LLM call.
 #[derive(Debug, Clone, Default)]
 pub struct UsageData {
@@ -1419,28 +1434,14 @@ impl LlmClient {
                     self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
                         .await
                 } else {
-                    match self.wire_path() {
-                        WirePath::Bedrock => {
-                            self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
-                                .await
-                        }
-                        WirePath::VertexAnthropic => {
-                            self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
-                                .await
-                        }
-                        WirePath::Gemini => {
-                            self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
-                                .await
-                        }
-                        WirePath::OpenAi => {
-                            self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
-                                .await
-                        }
-                        WirePath::Anthropic => {
-                            self.stream_chat_anthropic_inner(messages, tools, &tx, &cancel)
-                                .await
-                        }
-                    }
+                    self.stream_http_transport_inner(
+                        self.wire_path().transport(),
+                        messages,
+                        tools,
+                        &tx,
+                        &cancel,
+                    )
+                    .await
                 };
 
                 // Lease drop happens here as we re-bind below; report outcome
@@ -1625,16 +1626,11 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        match self.wire_path() {
-            WirePath::Bedrock => self.chat_bedrock(messages, tools).await,
-            WirePath::VertexAnthropic => self.chat_vertex_anthropic(messages, tools).await,
-            WirePath::Gemini => self.chat_gemini(messages, tools).await,
-            WirePath::OpenAi => self.chat_openai(messages, tools).await,
-            WirePath::Anthropic => self.chat_anthropic(messages, tools).await,
-        }
+        self.chat_http_transport_inner(self.wire_path().transport(), messages, tools)
+            .await
     }
 
-    // ── OpenAI-compatible path ──
+    // ── Shared HTTP request path ──
 
     #[instrument(skip_all, fields(llm.provider = %self.provider))]
     async fn send_request(
@@ -2105,42 +2101,6 @@ impl LlmClient {
         .await
     }
 
-    #[instrument(skip_all, fields(llm.provider = "openai"))]
-    async fn stream_chat_openai_inner(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        tx: &mpsc::Sender<StreamEvent>,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), LlmError> {
-        self.stream_http_transport_inner(
-            transport::openai_compat_transport(),
-            messages,
-            tools,
-            tx,
-            cancel,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    /// Parse a single SSE line from an OpenAI-compatible provider.
-    fn parse_openai_sse_line(line: &str, provider: &str, model: &str) -> crate::sse::SseAction {
-        transport::parse_openai_sse_line(line, provider, model)
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "openai"))]
-    async fn chat_openai(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
-        self.chat_http_transport_inner(transport::openai_compat_transport(), messages, tools)
-            .await
-    }
-
-    // ── Anthropic path ──
-
     #[cfg(test)]
     fn build_anthropic_request(
         &self,
@@ -2151,139 +2111,6 @@ impl LlmClient {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
         transport::build_anthropic_request(&request, stream)
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "anthropic"))]
-    async fn stream_chat_anthropic_inner(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        tx: &mpsc::Sender<StreamEvent>,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), LlmError> {
-        self.stream_http_transport_inner(
-            transport::anthropic_transport(),
-            messages,
-            tools,
-            tx,
-            cancel,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    /// Parse a single SSE line from Anthropic's streaming API.
-    #[allow(clippy::too_many_arguments)]
-    fn parse_anthropic_sse_line(
-        line: &str,
-        provider: &str,
-        model: &str,
-        current_tool_index: &mut usize,
-        current_block_is_tool: &mut bool,
-        current_block_is_thinking: &mut bool,
-        pending_input_tokens: &mut u64,
-        pending_cached_input_tokens: &mut u64,
-        pending_cache_creation_tokens: &mut u64,
-    ) -> crate::sse::SseAction {
-        transport::parse_anthropic_sse_line(
-            line,
-            provider,
-            model,
-            current_tool_index,
-            current_block_is_tool,
-            current_block_is_thinking,
-            pending_input_tokens,
-            pending_cached_input_tokens,
-            pending_cache_creation_tokens,
-        )
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "anthropic"))]
-    async fn chat_anthropic(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
-        self.chat_http_transport_inner(transport::anthropic_transport(), messages, tools)
-            .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "bedrock"))]
-    async fn stream_chat_bedrock_inner(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        tx: &mpsc::Sender<StreamEvent>,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), LlmError> {
-        self.stream_http_transport_inner(
-            transport::bedrock_transport(),
-            messages,
-            tools,
-            tx,
-            cancel,
-        )
-        .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "bedrock"))]
-    async fn chat_bedrock(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
-        self.chat_http_transport_inner(transport::bedrock_transport(), messages, tools)
-            .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "vertex-ai"))]
-    async fn stream_chat_vertex_anthropic_inner(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        tx: &mpsc::Sender<StreamEvent>,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), LlmError> {
-        self.stream_http_transport_inner(
-            transport::vertex_anthropic_transport(),
-            messages,
-            tools,
-            tx,
-            cancel,
-        )
-        .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "vertex-ai"))]
-    async fn chat_vertex_anthropic(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
-        self.chat_http_transport_inner(transport::vertex_anthropic_transport(), messages, tools)
-            .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "gemini"))]
-    async fn stream_chat_gemini_inner(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        tx: &mpsc::Sender<StreamEvent>,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), LlmError> {
-        self.stream_http_transport_inner(transport::gemini_transport(), messages, tools, tx, cancel)
-            .await
-    }
-
-    #[instrument(skip_all, fields(llm.provider = "gemini"))]
-    async fn chat_gemini(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
-        self.chat_http_transport_inner(transport::gemini_transport(), messages, tools)
-            .await
     }
 }
 
