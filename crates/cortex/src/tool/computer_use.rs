@@ -425,7 +425,7 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
             match stderr.read(&mut chunk).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut buf = writer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     buf.extend_from_slice(&chunk[..n]);
                     if buf.len() > TAIL_CAP {
                         let excess = buf.len() - TAIL_CAP;
@@ -444,7 +444,7 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
 
 /// `" Driver stderr tail: …"` when the driver said anything, empty otherwise.
 fn stderr_suffix(tail: &StderrTail) -> String {
-    let bytes = tail.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim();
     if text.is_empty() {
