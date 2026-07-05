@@ -58,6 +58,15 @@ pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[St
     let resolved = canonicalize_write_target(path);
     let literal = lexically_normalized(path);
 
+    // 0. Unconditional pseudo-file deny (checked BEFORE the allow list, so an
+    //    allow-list entry cannot re-expose it): sensitive `/proc/<pid>/…` reads
+    //    that leak ASLR/secrets and never pass through the sandbox. Both the
+    //    canonicalized and name-preserving forms are checked so a symlinked
+    //    parent leading into `/proc` cannot slip past.
+    if is_sensitive_pseudo_path(&resolved) || is_sensitive_pseudo_path(&literal) {
+        return true;
+    }
+
     // 1. Allow list: if the resolved path is under any allowed prefix,
     //    short-circuit to allow. Entries support tilde expansion.
     for raw_entry in allowed {
@@ -168,6 +177,48 @@ fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     out
+}
+
+/// `/proc/<pid>/…` pseudo-files that leak ASLR layout, raw process memory, or
+/// secret environment/arguments. Reads of these are denied unconditionally —
+/// independent of the configured `blocked_paths` — because `read_file` reads via
+/// `std::fs` and never traverses the Linux sandbox, so a prompt-injected agent
+/// could otherwise read `/proc/self/maps` to defeat ASLR of the Borg process,
+/// `/proc/<pid>/environ` for another process's secrets, or `/proc/<pid>/mem`.
+const SENSITIVE_PROC_LEAVES: &[&str] = &[
+    "maps",
+    "smaps",
+    "smaps_rollup",
+    "numa_maps",
+    "mem",
+    "environ",
+    "cmdline",
+    "auxv",
+    "pagemap",
+    "stack",
+    "syscall",
+    "wchan",
+];
+
+/// True if `path` targets a sensitive `/proc/<pid>/…` pseudo-file (see
+/// [`SENSITIVE_PROC_LEAVES`]). Requires an **absolute** path rooted at `/proc`
+/// so a real `/proc/self/maps` matches while a user directory that merely
+/// happens to be named `proc` (`~/proc/maps` → `/Users/me/proc/maps`, or a
+/// relative `proc/maps` in a project) does not. Keying on the leaf name plus a
+/// `/proc` root also covers the per-thread alias `/proc/<pid>/task/<tid>/mem`,
+/// which shares the same sensitive leaves at a deeper depth.
+fn is_sensitive_pseudo_path(path: &std::path::Path) -> bool {
+    let mut comps = path.components();
+    if comps.next() != Some(std::path::Component::RootDir) {
+        return false;
+    }
+    if comps.next() != Some(std::path::Component::Normal(std::ffi::OsStr::new("proc"))) {
+        return false;
+    }
+    match path.file_name().and_then(|s| s.to_str()) {
+        Some(leaf) => SENSITIVE_PROC_LEAVES.contains(&leaf),
+        None => false,
+    }
 }
 
 /// Hard-coded write deny for Borg control-plane files inside `$BORG_HOME`.
@@ -429,6 +480,61 @@ mod tests {
         let blocked = vec![".aws".to_string()];
         let path = std::path::Path::new("/etc/hosts");
         assert!(!is_blocked_path(path, &blocked, &[]));
+    }
+
+    #[test]
+    fn is_blocked_path_denies_sensitive_proc_pseudo_files() {
+        // /proc/<pid>/… memory/secret leakers must be denied regardless of the
+        // configured blocklist — read_file bypasses the sandbox, so this is the
+        // only guard. Covers `self`, a numeric pid, and the per-thread alias.
+        let blocked: Vec<String> = vec![]; // empty on purpose: deny is unconditional
+        let denied = [
+            "/proc/self/maps",
+            "/proc/self/smaps",
+            "/proc/self/mem",
+            "/proc/self/auxv",
+            "/proc/self/pagemap",
+            "/proc/1/environ",
+            "/proc/1234/cmdline",
+            "/proc/1234/task/5678/mem",
+        ];
+        for p in denied {
+            assert!(
+                is_blocked_path(std::path::Path::new(p), &blocked, &[]),
+                "{p} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_path_allows_benign_proc_and_lookalikes() {
+        // Non-sensitive /proc entries stay readable, and paths that merely
+        // contain a `proc` component but are not the real /proc are not caught.
+        let blocked: Vec<String> = vec![];
+        let allowed = [
+            "/proc/cpuinfo",          // benign, not a per-pid leaker
+            "/proc/self/limits",      // not in the sensitive set
+            "/Users/me/project/maps", // leaf named `maps` but not under /proc
+            "/home/me/proc/self/mem", // `proc` mid-path, not the root
+        ];
+        for p in allowed {
+            assert!(
+                !is_blocked_path(std::path::Path::new(p), &blocked, &[]),
+                "{p} must remain readable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_path_proc_deny_not_overridable_by_allowlist() {
+        // The /proc deny is checked before the allow list, so even an explicit
+        // allow entry for /proc cannot re-expose the sensitive pseudo-files.
+        let allowed = vec!["/proc".to_string()];
+        assert!(is_blocked_path(
+            std::path::Path::new("/proc/self/maps"),
+            &[],
+            &allowed
+        ));
     }
 
     #[test]
