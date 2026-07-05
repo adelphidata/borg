@@ -5,12 +5,22 @@ use cortex::db::Database;
 use tracing::warn;
 
 /// Metadata for a single gateway slash command.
+///
+/// [`GATEWAY_COMMANDS`] is the single source of truth: parsing
+/// ([`Command::parse`]), `/help` output, and native platform menu
+/// registration all derive from this table, so adding a command means
+/// adding one entry (plus its dispatch arm, which the compiler enforces).
 pub struct CommandDef {
     pub name: &'static str,
     pub description: &'static str,
     pub accepts_args: bool,
     /// If true, the command is not intercepted — it passes through to the agent.
     pub pass_through: bool,
+    /// The parsed command this entry maps to.
+    cmd: Command,
+    /// Alternate names accepted by the parser (without the leading `/`),
+    /// e.g. `/stop` and `/abort` for `/cancel`. Not shown in menus.
+    aliases: &'static [&'static str],
 }
 
 /// All gateway slash commands. Used for text parsing, /help output, and native
@@ -18,162 +28,216 @@ pub struct CommandDef {
 pub const GATEWAY_COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "start",
+        cmd: Command::Start,
+        aliases: &[],
         description: "Start a conversation with Borg",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "help",
+        cmd: Command::Help,
+        aliases: &[],
         description: "Show help and available commands",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "commands",
+        cmd: Command::Commands,
+        aliases: &[],
         description: "List all slash commands",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "status",
+        cmd: Command::Status,
+        aliases: &[],
         description: "Show current session info",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "new",
+        cmd: Command::New,
+        aliases: &[],
         description: "Start a new session",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "reset",
+        cmd: Command::Reset,
+        aliases: &[],
         description: "Clear current session messages",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "usage",
+        cmd: Command::Usage,
+        aliases: &[],
         description: "Show token usage and budget",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "skill",
+        cmd: Command::Skill,
+        aliases: &[],
         description: "Run a skill by name",
         accepts_args: true,
         pass_through: true,
     },
     CommandDef {
         name: "skills",
+        cmd: Command::Skills,
+        aliases: &[],
         description: "List available skills",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "whoami",
+        cmd: Command::WhoAmI,
+        aliases: &[],
         description: "Show your sender identity",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "memory",
+        cmd: Command::Memory,
+        aliases: &[],
         description: "Show memory inventory",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "doctor",
+        cmd: Command::Doctor,
+        aliases: &[],
         description: "Run system diagnostics",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "dream",
+        cmd: Command::Dream,
+        aliases: &[],
         description: "Run memory consolidation now",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "pairing",
+        cmd: Command::Pairing,
+        aliases: &[],
         description: "Show pairing status",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "voice",
+        cmd: Command::Voice,
+        aliases: &[],
         description: "Show or change Telegram voice reply mode",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "cancel",
+        cmd: Command::Cancel,
+        aliases: &["stop", "abort"],
         description: "Stop the current in-progress turn",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "mode",
+        cmd: Command::Mode,
+        aliases: &[],
         description: "Show or switch collaboration mode (default/execute/plan)",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "plan",
+        cmd: Command::Plan,
+        aliases: &[],
         description: "Enter plan mode, optionally with a message",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "compact",
+        cmd: Command::Compact,
+        aliases: &[],
         description: "Trim session history, keeping last N messages",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "undo",
+        cmd: Command::Undo,
+        aliases: &[],
         description: "Undo the last agent turn",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "history",
+        cmd: Command::History,
+        aliases: &[],
         description: "Show recent conversation messages",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "schedule",
+        cmd: Command::Schedule,
+        aliases: &[],
         description: "List scheduled tasks",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "settings",
+        cmd: Command::Settings,
+        aliases: &[],
         description: "Show or change a setting",
         accepts_args: true,
         pass_through: false,
     },
     CommandDef {
         name: "poke",
+        cmd: Command::Poke,
+        aliases: &[],
         description: "Trigger an immediate heartbeat",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "evolution",
+        cmd: Command::Evolution,
+        aliases: &[],
         description: "Show evolution stage, archetype, readiness",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "xp",
+        cmd: Command::Xp,
+        aliases: &[],
         description: "Show XP totals, sources, and recent feed",
         accepts_args: false,
         pass_through: false,
     },
     CommandDef {
         name: "card",
+        cmd: Command::Card,
+        aliases: &[],
         description: "Show your shareable ASCII evolution card",
         accepts_args: true,
         pass_through: false,
@@ -186,6 +250,7 @@ pub trait NativeCommandRegistration {
     async fn register_commands(&self, commands: &[CommandDef]) -> Result<()>;
 }
 
+#[derive(Clone, Copy)]
 enum Command {
     Start,
     Help,
@@ -219,44 +284,19 @@ enum Command {
 impl Command {
     /// Parse a slash command from message text. Strips `@botname` suffix
     /// (Telegram group format: `/command@BotName`). Returns the command and
-    /// any trailing arguments.
+    /// any trailing arguments. Recognized names come from
+    /// [`GATEWAY_COMMANDS`], so the parser can't drift from the menu table.
     fn parse(text: &str) -> Option<(Self, &str)> {
         let first_word = text.split_whitespace().next()?;
         let lowered = first_word.to_ascii_lowercase();
         // Strip @botname suffix
         let cmd_str = lowered.split('@').next().unwrap_or(&lowered);
+        let name = cmd_str.strip_prefix('/')?;
         let args = text[first_word.len()..].trim_start();
-        let cmd = match cmd_str {
-            "/start" => Self::Start,
-            "/help" => Self::Help,
-            "/commands" => Self::Commands,
-            "/status" => Self::Status,
-            "/new" => Self::New,
-            "/reset" => Self::Reset,
-            "/usage" => Self::Usage,
-            "/skill" => Self::Skill,
-            "/skills" => Self::Skills,
-            "/whoami" => Self::WhoAmI,
-            "/memory" => Self::Memory,
-            "/doctor" => Self::Doctor,
-            "/dream" => Self::Dream,
-            "/pairing" => Self::Pairing,
-            "/voice" => Self::Voice,
-            "/cancel" | "/stop" | "/abort" => Self::Cancel,
-            "/mode" => Self::Mode,
-            "/plan" => Self::Plan,
-            "/compact" => Self::Compact,
-            "/undo" => Self::Undo,
-            "/history" => Self::History,
-            "/schedule" => Self::Schedule,
-            "/settings" => Self::Settings,
-            "/poke" => Self::Poke,
-            "/evolution" => Self::Evolution,
-            "/xp" => Self::Xp,
-            "/card" => Self::Card,
-            _ => return None,
-        };
-        Some((cmd, args))
+        let def = GATEWAY_COMMANDS
+            .iter()
+            .find(|d| d.name == name || d.aliases.contains(&name))?;
+        Some((def.cmd, args))
     }
 }
 
