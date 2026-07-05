@@ -14,7 +14,6 @@ use cortex::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -359,6 +358,7 @@ mod tests {
     use crate::heartbeat_augmenters::{
         check_gateway_unrecoverable, GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY,
     };
+    use std::time::Duration;
 
     async fn in_memory_db() -> cortex::db::Database {
         cortex::db::Database::test_db().await
