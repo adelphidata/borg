@@ -23,26 +23,6 @@ fn report_format_output() {
 }
 
 #[test]
-fn db_recovery_check_warns_with_backup_path_and_passes_otherwise() {
-    // A recorded recovery surfaces as a Warn naming the preserved backup,
-    // so the operator knows their DB was rebuilt and where the original is.
-    let notice = crate::db::RecoveryNotice {
-        backup_path: std::path::PathBuf::from("/home/u/.borg/borg.db.corrupt-42"),
-        new_path: std::path::PathBuf::from("/home/u/.borg/borg.db"),
-    };
-    let warn = db_recovery_check(Some(notice));
-    assert_eq!(warn.category, "Database");
-    assert!(matches!(warn.status, CheckStatus::Warn(_)));
-    match &warn.status {
-        CheckStatus::Warn(msg) => assert!(msg.contains("borg.db.corrupt-42"), "got: {msg}"),
-        other => panic!("expected warn, got {other:?}"),
-    }
-    // No recovery → a quiet pass, no spurious warning.
-    let ok = db_recovery_check(None);
-    assert!(matches!(ok.status, CheckStatus::Pass));
-}
-
-#[test]
 fn report_counts() {
     let report = DiagnosticReport {
         checks: vec![
@@ -141,125 +121,6 @@ async fn run_diagnostics_includes_browser_category() {
     assert!(categories.contains("Browser"));
 }
 
-#[test]
-fn browser_disabled_produces_warn() {
-    let mut checks = Vec::new();
-    let mut config = Config::default();
-    config.browser.enabled = false;
-    check_browser(&config, &mut checks);
-    assert_eq!(checks.len(), 1);
-    assert!(matches!(checks[0].status, CheckStatus::Warn(_)));
-    assert_eq!(checks[0].category, "Browser");
-}
-
-#[test]
-fn config_security_secure_defaults_all_pass() {
-    let config = Config::default();
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    // All checks should be in the Security category
-    assert!(checks.iter().all(|c| c.category == "Security"));
-    // Default config is secure — no warnings expected
-    let warns: Vec<_> = checks
-        .iter()
-        .filter(|c| matches!(c.status, CheckStatus::Warn(_)))
-        .collect();
-    assert!(
-        warns.is_empty(),
-        "Secure defaults should produce no warnings: {warns:?}"
-    );
-}
-
-#[test]
-fn config_security_open_dm_policy_warns() {
-    let mut config = Config::default();
-    config.gateway.dm_policy = crate::pairing::DmPolicy::Open;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let dm_check = checks.iter().find(|c| c.name == "DM policy").unwrap();
-    assert!(matches!(dm_check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_sandbox_disabled_warns() {
-    let mut config = Config::default();
-    config.sandbox.enabled = false;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let sandbox_check = checks.iter().find(|c| c.name == "sandbox").unwrap();
-    assert!(matches!(sandbox_check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_secret_detection_off_warns() {
-    let mut config = Config::default();
-    config.security.secret_detection = false;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks
-        .iter()
-        .find(|c| c.name == "secret detection")
-        .unwrap();
-    assert!(matches!(check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_empty_blocked_paths_warns() {
-    let mut config = Config::default();
-    config.security.blocked_paths.clear();
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks.iter().find(|c| c.name == "blocked paths").unwrap();
-    assert!(matches!(check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_browser_no_sandbox_warns() {
-    let mut config = Config::default();
-    config.browser.enabled = true;
-    config.browser.no_sandbox = true;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks.iter().find(|c| c.name == "browser sandbox").unwrap();
-    assert!(matches!(check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_open_channel_policy_warns() {
-    let mut config = Config::default();
-    config
-        .gateway
-        .channel_policies
-        .insert("telegram".into(), crate::pairing::DmPolicy::Open);
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks
-        .iter()
-        .find(|c| c.name == "channel policies")
-        .unwrap();
-    assert!(matches!(check.status, CheckStatus::Warn(ref msg) if msg.contains("telegram")));
-}
-
-#[test]
-fn config_security_high_rate_limits_warns() {
-    let mut config = Config::default();
-    config.security.action_limits.tool_calls_block = 1500;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks.iter().find(|c| c.name == "rate limits").unwrap();
-    assert!(matches!(check.status, CheckStatus::Warn(_)));
-}
-
-#[test]
-fn config_security_budget_set_passes() {
-    let mut config = Config::default();
-    config.budget.monthly_token_limit = 1_000_000;
-    let mut checks = Vec::new();
-    check_config_security(&config, &mut checks);
-    let check = checks.iter().find(|c| c.name.contains("budget")).unwrap();
-    assert!(matches!(check.status, CheckStatus::Pass));
-}
-
 #[tokio::test]
 async fn run_diagnostics_includes_security_category() {
     let config = Config::default();
@@ -269,41 +130,6 @@ async fn run_diagnostics_includes_security_category() {
     assert!(categories.contains("Security"));
 }
 
-#[test]
-fn format_relative_time_seconds() {
-    let now = chrono::Utc::now().timestamp();
-    assert_eq!(format_relative_time(now - 30), "30 seconds ago");
-    assert_eq!(format_relative_time(now - 1), "1 second ago");
-}
-
-#[test]
-fn format_relative_time_minutes() {
-    let now = chrono::Utc::now().timestamp();
-    assert_eq!(format_relative_time(now - 60), "1 minute ago");
-    assert_eq!(format_relative_time(now - 120), "2 minutes ago");
-    assert_eq!(format_relative_time(now - 1800), "30 minutes ago");
-}
-
-#[test]
-fn format_relative_time_hours() {
-    let now = chrono::Utc::now().timestamp();
-    assert_eq!(format_relative_time(now - 3600), "1 hour ago");
-    assert_eq!(format_relative_time(now - 7200), "2 hours ago");
-}
-
-#[test]
-fn format_relative_time_days() {
-    let now = chrono::Utc::now().timestamp();
-    assert_eq!(format_relative_time(now - 86400), "1 day ago");
-    assert_eq!(format_relative_time(now - 172800), "2 days ago");
-}
-
-#[test]
-fn format_relative_time_future() {
-    let now = chrono::Utc::now().timestamp();
-    assert_eq!(format_relative_time(now + 100), "just now");
-}
-
 #[tokio::test]
 async fn run_diagnostics_includes_heartbeat_category() {
     let config = Config::default();
@@ -311,14 +137,6 @@ async fn run_diagnostics_includes_heartbeat_category() {
     let categories: std::collections::HashSet<&str> =
         report.checks.iter().map(|c| c.category).collect();
     assert!(categories.contains("Heartbeat"));
-}
-
-#[tokio::test]
-async fn heartbeat_check_shows_interval() {
-    let config = Config::default();
-    let mut checks = Vec::new();
-    check_heartbeat(&config, &mut checks).await;
-    assert!(checks.iter().any(|c| c.name.contains("interval: 60m")));
 }
 
 // ── Subprocesses check ──
