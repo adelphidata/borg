@@ -323,6 +323,9 @@ pub async fn handle_spawn_agent(
         let completions = agent_control
             .spawn_batch_and_wait(tasks, parent_config, timeout_secs)
             .await?;
+        // Divide the summary budget across the batch so N children can't
+        // collectively blow the parent's context in one tool result.
+        let per_child = super::per_child_summary_cap(completions.len());
         let results: Vec<serde_json::Value> = completions
             .iter()
             .map(|c| {
@@ -330,7 +333,10 @@ pub async fn handle_spawn_agent(
                     "agent_id": c.agent_id,
                     "nickname": c.nickname,
                     "status": c.status.as_str(),
-                    "result": c.final_response,
+                    "result": c
+                        .final_response
+                        .as_deref()
+                        .map(|s| super::bound_sub_agent_summary(s, per_child)),
                     "files_written": c.files_written,
                 });
                 attach_error_detail(&mut obj, c.error_detail());
@@ -376,7 +382,10 @@ pub async fn handle_spawn_agent(
             "agent_id": completion.agent_id,
             "nickname": completion.nickname,
             "status": completion.status.as_str(),
-            "result": completion.final_response,
+            "result": completion
+                .final_response
+                .as_deref()
+                .map(|s| super::bound_sub_agent_summary(s, super::SUB_AGENT_SUMMARY_MAX_CHARS)),
             "files_written": completion.files_written,
         });
         attach_error_detail(&mut obj, completion.error_detail());
@@ -460,7 +469,10 @@ pub async fn handle_wait_for_agent(
         "agent_id": completion.agent_id,
         "nickname": completion.nickname,
         "status": completion.status.as_str(),
-        "result": completion.final_response,
+        "result": completion
+            .final_response
+            .as_deref()
+            .map(|s| super::bound_sub_agent_summary(s, super::SUB_AGENT_SUMMARY_MAX_CHARS)),
     });
     attach_error_detail(&mut obj, completion.error_detail());
     Ok(obj.to_string())

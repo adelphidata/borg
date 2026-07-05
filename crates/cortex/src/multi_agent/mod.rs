@@ -292,6 +292,37 @@ fn bound_sub_agent_error(error: &str) -> String {
     crate::util::truncate::truncate_with_ellipsis(error, SUB_AGENT_ERROR_MAX_CHARS, "…[truncated]")
 }
 
+/// Upper bound on a *successful* sub-agent summary echoed back to the parent.
+/// Like [`SUB_AGENT_ERROR_MAX_CHARS`] but for the success path: the full
+/// response is already persisted on the child's `sub_agents` row, so this only
+/// caps what lands in the parent's LLM context. A batch fan-out divides this
+/// budget across its children (see [`per_child_summary_cap`]) so N large
+/// summaries returned in one tool result can't blow the window before
+/// autocompaction reacts.
+const SUB_AGENT_SUMMARY_MAX_CHARS: usize = 8000;
+
+/// Floor on the per-child budget so that even a very large batch leaves each
+/// child summary minimally useful rather than truncating it to nothing.
+const SUB_AGENT_SUMMARY_MIN_CHARS: usize = 1000;
+
+/// Per-child summary budget for a batch of `batch_len` children: the total
+/// budget split evenly, floored at [`SUB_AGENT_SUMMARY_MIN_CHARS`]. A single
+/// child (blocking / wait) gets the full [`SUB_AGENT_SUMMARY_MAX_CHARS`].
+fn per_child_summary_cap(batch_len: usize) -> usize {
+    (SUB_AGENT_SUMMARY_MAX_CHARS / batch_len.max(1)).max(SUB_AGENT_SUMMARY_MIN_CHARS)
+}
+
+/// Char-boundary-safe truncation of a *successful* sub-agent summary, with a
+/// spill pointer so the parent knows output was clipped (the full text lives on
+/// the child's `sub_agents` row). Mirrors [`bound_sub_agent_error`].
+fn bound_sub_agent_summary(summary: &str, max_chars: usize) -> String {
+    crate::util::truncate::truncate_with_ellipsis(
+        summary,
+        max_chars,
+        "…[truncated — full output on the sub-agent record]",
+    )
+}
+
 impl SubAgentCompletion {
     /// When this completion is a terminal *error*, return the bounded error
     /// text plus an actionable recovery hint for the parent agent. `None` for
@@ -2262,6 +2293,39 @@ mod sub_agent_surface_tests {
 
         // Short errors pass through verbatim.
         assert_eq!(super::bound_sub_agent_error("boom"), "boom");
+    }
+
+    #[test]
+    fn bound_sub_agent_summary_truncates_multibyte_safely() {
+        // A runaway *successful* summary must be bounded before it reaches the
+        // parent context, with a spill pointer, and never split a multi-byte char.
+        const MARKER: &str = "…[truncated — full output on the sub-agent record]";
+        let huge = "é".repeat(SUB_AGENT_SUMMARY_MAX_CHARS * 3);
+        let bounded = super::bound_sub_agent_summary(&huge, SUB_AGENT_SUMMARY_MAX_CHARS);
+        assert!(bounded.ends_with(MARKER), "must carry the spill pointer");
+        assert_eq!(
+            bounded.chars().count(),
+            SUB_AGENT_SUMMARY_MAX_CHARS + MARKER.chars().count()
+        );
+        // A short summary passes through verbatim (no marker).
+        assert_eq!(super::bound_sub_agent_summary("done", 8000), "done");
+    }
+
+    #[test]
+    fn per_child_summary_cap_divides_and_floors() {
+        // A single child gets the full budget; a batch splits it evenly but
+        // never below the floor, so a large fan-out keeps each summary usable.
+        assert_eq!(super::per_child_summary_cap(1), SUB_AGENT_SUMMARY_MAX_CHARS);
+        assert_eq!(
+            super::per_child_summary_cap(2),
+            SUB_AGENT_SUMMARY_MAX_CHARS / 2
+        );
+        // 8000/10 = 800 < floor(1000) → floored.
+        assert_eq!(super::per_child_summary_cap(10), SUB_AGENT_SUMMARY_MIN_CHARS);
+        assert_eq!(
+            super::per_child_summary_cap(1000),
+            SUB_AGENT_SUMMARY_MIN_CHARS
+        );
     }
 
     /// REGRESSION: in a mixed batch, the per-task blocklist must be
