@@ -11,12 +11,12 @@
 //! surfaces the error verbatim so operators see the cause rather than
 //! a generic "RPC failed".
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use protocols::admin::{AgentEntry, AgentMetrics};
 
 use super::format_ts;
-use crate::daemon_client::{connect, default_socket_path};
+use crate::daemon_client::connect_default;
 
 #[derive(Subcommand)]
 pub(crate) enum AgentsAction {
@@ -83,8 +83,7 @@ pub(crate) async fn dispatch_agents(action: AgentsAction) -> Result<()> {
 }
 
 async fn list(session: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     let snap = client.list_agents(&session).await?;
     if snap.agents.is_empty() {
         println!("(no sub-agents for this session)");
@@ -95,8 +94,7 @@ async fn list(session: String) -> Result<()> {
 }
 
 async fn tree(session: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     let snap = client.list_agents(&session).await?;
     if snap.agents.is_empty() {
         println!("(no sub-agents for this session)");
@@ -107,8 +105,7 @@ async fn tree(session: String) -> Result<()> {
 }
 
 async fn history(session: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     let snaps = client.list_agent_snapshots(&session).await?;
     if snaps.snapshots.is_empty() {
         println!("(no snapshots for this session)");
@@ -127,8 +124,7 @@ async fn history(session: String) -> Result<()> {
 }
 
 async fn snapshot(session: String, turn_id: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     let snap = client.get_agent_snapshot(&session, &turn_id).await?;
     if snap.agents.is_empty() {
         println!("(snapshot is empty)");
@@ -139,8 +135,7 @@ async fn snapshot(session: String, turn_id: String) -> Result<()> {
 }
 
 async fn kill(id: String, subtree: bool) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     if subtree {
         client.kill_agent_subtree(&id).await?;
         println!("killed subtree rooted at {id}");
@@ -152,16 +147,14 @@ async fn kill(id: String, subtree: bool) -> Result<()> {
 }
 
 async fn pause(id: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     client.pause_agent(&id).await?;
     println!("paused {id}");
     Ok(())
 }
 
 async fn resume(id: String) -> Result<()> {
-    let socket = default_socket_path();
-    let mut client = connect(Some(&socket)).await.context("connect to daemon")?;
+    let mut client = connect_default().await?;
     client.resume_agent(&id).await?;
     println!("resumed {id}");
     Ok(())

@@ -1,7 +1,7 @@
 //! `borg tunnel {start|stop|status}` — operator surface for the public-
 //! internet tunnel that the daemon spawns under `tunnel_supervisor`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 
 use protocols::admin::TunnelStatusReply;
@@ -18,13 +18,7 @@ pub(crate) enum TunnelCliAction {
 }
 
 pub(crate) async fn run_tunnel(action: TunnelCliAction) -> Result<()> {
-    let socket = crate::daemon_client::default_socket_path();
-    if !socket.exists() {
-        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
-    }
-    let mut client = crate::daemon_client::connect(Some(&socket))
-        .await
-        .context("connect to borgd for tunnel command")?;
+    let mut client = crate::daemon_client::connect_default().await?;
 
     let reply = match action {
         TunnelCliAction::Start => client.tunnel_start().await?,

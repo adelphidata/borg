@@ -27,13 +27,7 @@ pub(crate) async fn dispatch_sessions(action: Option<SessionsAction>) -> Result<
 }
 
 async fn connect() -> Result<crate::daemon_client::DaemonClient> {
-    let socket = crate::daemon_client::default_socket_path();
-    if !socket.exists() {
-        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
-    }
-    crate::daemon_client::connect(Some(&socket))
-        .await
-        .context("connect to borgd")
+    crate::daemon_client::connect_default().await
 }
 
 async fn run_list(limit: usize) -> Result<()> {

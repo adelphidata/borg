@@ -25,13 +25,7 @@ pub(crate) enum BrowserAction {
 }
 
 pub(crate) async fn dispatch_browser(action: Option<BrowserAction>) -> Result<()> {
-    let socket = crate::daemon_client::default_socket_path();
-    if !socket.exists() {
-        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
-    }
-    let mut client = crate::daemon_client::connect(Some(&socket))
-        .await
-        .context("connect to borgd for browser")?;
+    let mut client = crate::daemon_client::connect_default().await?;
 
     let action = action.unwrap_or(BrowserAction::Status);
     let (verb, url): (&str, Option<String>) = match action {

@@ -128,6 +128,18 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     Ok(client)
 }
 
+/// Connect over the default UDS socket, failing with the operator-facing
+/// "start the service" hint when the daemon isn't running. This is the
+/// standard entrypoint for one-shot CLI subcommands that require a live
+/// daemon and must not auto-spawn one.
+pub async fn connect_default() -> Result<DaemonClient> {
+    let socket = default_socket_path();
+    if !socket.exists() {
+        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
+    }
+    connect(Some(&socket)).await.context("connect to borgd")
+}
+
 /// Like [`connect`] but launches `borgd` if the socket isn't present. The spawned daemon is detached — it lives on after this CLI
 /// process exits, so subsequent `borg` invocations reuse it. If you don't
 /// want that lifecycle, prefer [`connect`] + an externally supervised daemon.

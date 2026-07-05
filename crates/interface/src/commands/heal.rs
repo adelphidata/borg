@@ -1,13 +1,7 @@
 use anyhow::{Context, Result};
 
 pub(crate) async fn run_heal() -> Result<()> {
-    let socket = crate::daemon_client::default_socket_path();
-    if !socket.exists() {
-        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
-    }
-    let mut client = crate::daemon_client::connect(Some(&socket))
-        .await
-        .context("connect to borgd for heal")?;
+    let mut client = crate::daemon_client::connect_default().await?;
     let report = client.heal().await.context("Admin.Heal via borgd")?;
     print_heal_report(&report);
     Ok(())
