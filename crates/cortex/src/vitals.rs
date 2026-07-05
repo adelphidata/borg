@@ -351,15 +351,9 @@ pub fn deltas_for(category: EventCategory) -> StatDeltas {
 /// Validate that deltas match the expected values for this category.
 /// Returns Err if category is unknown or deltas don't match.
 pub(crate) fn validate_deltas(category: &str, deltas: StatDeltas) -> Result<(), &'static str> {
-    let expected = match category {
-        "interaction" => deltas_for(EventCategory::Interaction),
-        "success" => deltas_for(EventCategory::Success),
-        "failure" => deltas_for(EventCategory::Failure),
-        "correction" => deltas_for(EventCategory::Correction),
-        "creation" => deltas_for(EventCategory::Creation),
-        "negative_sentiment" => deltas_for(EventCategory::NegativeSentiment),
-        "telemetry" => deltas_for(EventCategory::Telemetry),
-        _ => return Err("unknown vitals category"),
+    let expected = match EventCategory::parse(category) {
+        Some(cat) => deltas_for(cat),
+        None => return Err("unknown vitals category"),
     };
     if deltas != expected {
         return Err("deltas do not match expected values for category");
