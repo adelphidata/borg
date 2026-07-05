@@ -34,6 +34,7 @@ pub mod schema_compact;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;
+pub(crate) mod coerce;
 pub(crate) mod computer_use;
 pub(crate) mod create_goal;
 pub(crate) mod generate_image;

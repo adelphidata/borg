@@ -528,7 +528,7 @@ impl Agent {
         // Single tagged-deser entry point. Schema-validation errors surface
         // here as structured tool output so the LLM can recover; the dispatch
         // arms below see only typed `Args`.
-        let tool = match crate::tool::Tool::parse(name, raw_args.clone()) {
+        let tool = match crate::tool::coerce::parse_with_coercion(name, raw_args.clone()) {
             Ok(t) => t,
             Err(crate::tool::ToolParseError::UnknownTool(n)) => {
                 // WASM plugin execution does async DB + FS + wasmtime compile + run.
@@ -819,7 +819,7 @@ pub(super) async fn dispatch_parallel_safe_tool(
             )));
         }
     };
-    let tool = match crate::tool::Tool::parse(name, raw_args) {
+    let tool = match crate::tool::coerce::parse_with_coercion(name, raw_args) {
         Ok(t) => t,
         Err(crate::tool::ToolParseError::UnknownTool(n)) => {
             return Err(anyhow::anyhow!(
