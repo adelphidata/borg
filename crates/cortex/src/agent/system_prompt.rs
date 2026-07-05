@@ -251,6 +251,11 @@ impl Agent {
             );
         }
 
+        // Deployment-specific context-window guidance. Static, operator-set, so
+        // it sits at the tail of the stable prefix (cached, zero per-turn cost)
+        // rather than in the dynamic suffix below. Empty setting → empty string.
+        system.push_str(&self.build_context_window_guidance_section());
+
         // === DYNAMIC SUFFIX === per-turn content that invalidates the prefix cache.
 
         // Active memory: per-turn hybrid search of memory + past sessions
@@ -311,6 +316,13 @@ impl Agent {
         }
 
         Ok(system)
+    }
+
+    /// Build the optional `<context_window_guidance>` developer section from
+    /// `conversation.context_window_guidance`. See
+    /// [`render_context_window_guidance`] for the rendering contract.
+    pub(super) fn build_context_window_guidance_section(&self) -> String {
+        render_context_window_guidance(&self.config.conversation.context_window_guidance)
     }
 
     /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
@@ -576,6 +588,37 @@ pub(super) async fn render_scheduled_tasks_snapshot(db: &crate::db::Database, no
     s
 }
 
+/// Render the optional `<context_window_guidance>` developer section.
+///
+/// Free function (not a method) so the empty/whitespace gating and byte cap are
+/// unit-testable without constructing an `Agent`. Contract:
+/// - unset or whitespace-only → empty string (no section; default prompt is
+///   byte-for-byte unchanged, and the value being static config keeps it in the
+///   cached stable prefix when present);
+/// - otherwise → the trimmed value wrapped in `<context_window_guidance>` tags,
+///   capped at [`MAX_CONTEXT_GUIDANCE_BYTES`] on a UTF-8 char boundary so a
+///   runaway or hostile setting can't bloat every turn or panic the slice.
+pub(super) fn render_context_window_guidance(guidance: &str) -> String {
+    let guidance = guidance.trim();
+    if guidance.is_empty() {
+        return String::new();
+    }
+    let capped = if guidance.len() > MAX_CONTEXT_GUIDANCE_BYTES {
+        let mut end = MAX_CONTEXT_GUIDANCE_BYTES;
+        while !guidance.is_char_boundary(end) {
+            end -= 1;
+        }
+        &guidance[..end]
+    } else {
+        guidance
+    };
+    format!("\n<context_window_guidance>\n{capped}\n</context_window_guidance>\n")
+}
+
+/// Byte cap for rendered `context_window_guidance` — small, matching the
+/// developer-note scale the section is meant for.
+const MAX_CONTEXT_GUIDANCE_BYTES: usize = 1000;
+
 /// Render the `<heartbeat_protocol>` section. Free function (not a method) so
 /// the remediation-guidance gating is unit-testable from a bare `Config`.
 ///
@@ -610,6 +653,58 @@ pub(super) fn build_heartbeat_protocol(config: &crate::config::Config) -> String
         {remediation}\
         </heartbeat_protocol>\n"
     )
+}
+
+#[cfg(test)]
+mod context_window_guidance_tests {
+    use super::{render_context_window_guidance, MAX_CONTEXT_GUIDANCE_BYTES};
+
+    #[test]
+    fn empty_or_whitespace_guidance_emits_no_section() {
+        // Default install ships an empty value; the prompt must be untouched so
+        // the stable cached prefix (and every existing snapshot/test) is
+        // unchanged. Whitespace-only is treated the same — no vacuous tags.
+        assert_eq!(render_context_window_guidance(""), "");
+        assert_eq!(render_context_window_guidance("   \n\t  "), "");
+    }
+
+    #[test]
+    fn configured_guidance_is_wrapped_in_developer_section() {
+        // Spec: a set value is surfaced to the model inside the tagged section
+        // so an operator can steer context-window behavior. Trimmed so stray
+        // surrounding whitespace doesn't leak into the prompt.
+        let out =
+            render_context_window_guidance("  Checkpoint state to memory before summarizing.  ");
+        assert_eq!(
+            out,
+            "\n<context_window_guidance>\nCheckpoint state to memory before summarizing.\n</context_window_guidance>\n"
+        );
+    }
+
+    #[test]
+    fn oversized_guidance_is_capped_on_a_char_boundary_without_panicking() {
+        // A runaway or hostile config value must not bloat every turn's prompt,
+        // and truncating multi-byte content must not panic. Use a 2-byte char
+        // ('é') repeated past the cap so a naive byte slice would split a char.
+        let huge = "é".repeat(MAX_CONTEXT_GUIDANCE_BYTES); // 2 * N bytes
+        let out = render_context_window_guidance(&huge);
+        let inner = out
+            .trim()
+            .strip_prefix("<context_window_guidance>")
+            .and_then(|s| s.strip_suffix("</context_window_guidance>"))
+            .expect("wrapped")
+            .trim();
+        assert!(
+            inner.len() <= MAX_CONTEXT_GUIDANCE_BYTES,
+            "capped body must respect the byte cap, got {} bytes",
+            inner.len()
+        );
+        assert!(
+            inner.chars().all(|c| c == 'é'),
+            "truncation must land on a char boundary — no replacement/partial chars"
+        );
+        assert!(!inner.is_empty(), "cap must still surface some guidance");
+    }
 }
 
 #[cfg(test)]

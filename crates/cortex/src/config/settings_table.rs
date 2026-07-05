@@ -104,6 +104,7 @@ define_settings! {
         "conversation.protect_first_n" => conversation.protect_first_n, parsed(usize);
         "conversation.concurrent_tools.enabled" => conversation.concurrent_tools.enabled, parsed(bool);
         "conversation.concurrent_tools.max_workers" => conversation.concurrent_tools.max_workers, parsed(usize);
+        "conversation.context_window_guidance" => conversation.context_window_guidance, string;
 
         // ── Security ──
         "security.secret_detection" => security.secret_detection, parsed(bool);

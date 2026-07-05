@@ -852,6 +852,15 @@ pub struct ConversationConfig {
     /// Concurrent tool execution settings.
     #[serde(default)]
     pub concurrent_tools: ConcurrentToolsConfig,
+    /// Optional deployment-specific guidance rendered as a
+    /// `<context_window_guidance>` developer section in the system prompt.
+    /// Lets an operator tell the model how to behave as the context window
+    /// fills (e.g. "checkpoint durable state to memory before it is
+    /// summarized"). Empty by default → no section is emitted and the prompt
+    /// is byte-for-byte unchanged. Capped when rendered so a runaway value
+    /// can't bloat every turn.
+    #[serde(default)]
+    pub context_window_guidance: String,
 }
 
 impl Default for ConversationConfig {
@@ -867,6 +876,7 @@ impl Default for ConversationConfig {
             age_based_degradation: true,
             protect_first_n: 3,
             concurrent_tools: ConcurrentToolsConfig::default(),
+            context_window_guidance: String::new(),
         }
     }
 }
