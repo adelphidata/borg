@@ -43,6 +43,19 @@ const fn default_driver_timeout_secs() -> u64 {
     30
 }
 
+impl ComputerUseConfig {
+    /// Effective per-phase driver timeout. `0` falls back to the default
+    /// (same convention as `mcp.max_response_bytes`) — this is the single
+    /// place that fallback lives, so bumping the default can't strand
+    /// operators who set `0` on a stale value.
+    pub fn driver_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self.driver_timeout_secs {
+            0 => default_driver_timeout_secs(),
+            s => s,
+        })
+    }
+}
+
 #[cfg(target_os = "macos")]
 const fn default_enabled() -> bool {
     true
@@ -107,8 +120,35 @@ mod tests {
     #[test]
     fn telemetry_defaults_off() {
         // Privacy spec: cua-driver ships telemetry ON upstream; Borg must
-        // default to opt-in. A `true` default here would silently ship
-        // usage events to PostHog for every operator.
-        assert!(!ComputerUseConfig::default().cua_telemetry);
+        // default to opt-in. Deserialize an empty config (the settings-table
+        // path every real boot takes) rather than calling Default directly.
+        let cfg: ComputerUseConfig = toml::from_str("").unwrap();
+        assert!(
+            !cfg.cua_telemetry,
+            "cua_telemetry must default off — a true default silently ships usage events to PostHog"
+        );
+    }
+
+    #[test]
+    fn driver_timeout_zero_falls_back_to_default_not_unbounded() {
+        // Spec: `0` means "use the default", never "no timeout". An
+        // unbounded interpretation would let a wedged driver pin a
+        // tool-call slot forever.
+        let cfg = ComputerUseConfig {
+            driver_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.driver_timeout(),
+            std::time::Duration::from_secs(default_driver_timeout_secs())
+        );
+        let explicit = ComputerUseConfig {
+            driver_timeout_secs: 90,
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.driver_timeout(),
+            std::time::Duration::from_secs(90)
+        );
     }
 }

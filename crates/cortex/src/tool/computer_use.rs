@@ -259,6 +259,12 @@ const DRIVER_ENV_EXTRAS: &[&str] = &[
     "XDG_CURRENT_DESKTOP",
 ];
 
+/// Prefix for the driver's own configuration knobs. Vars under this prefix
+/// pass through from the parent env so operators keep their driver tuning
+/// after the credential scrub — with one exception: the telemetry toggle,
+/// which stays under Borg's control (see `driver_child_env`).
+const DRIVER_ENV_PREFIX: &str = "CUA_DRIVER_RS_";
+
 /// Build the child environment for a cua-driver spawn. The driver is a
 /// third-party binary, so it gets the same treatment as stdio MCP servers:
 /// `env_clear` + allowlist, which strips every operator credential
@@ -272,7 +278,9 @@ fn driver_child_env(
     let mut env: Vec<(String, String)> = base
         .into_iter()
         .filter(|(k, _)| {
-            mcp::transport::is_env_allowed(k) || DRIVER_ENV_EXTRAS.contains(&k.as_str())
+            mcp::transport::is_env_allowed(k)
+                || DRIVER_ENV_EXTRAS.contains(&k.as_str())
+                || (k.starts_with(DRIVER_ENV_PREFIX) && k != CUA_TELEMETRY_ENV)
         })
         .collect();
     if !telemetry_optin {
@@ -290,7 +298,7 @@ impl Driver for CuaDriver {
         let mut child = Command::new(&self.binary)
             .arg("mcp")
             .env_clear()
-            .envs(driver_child_env(self.telemetry_optin, std::env::vars()))
+            .envs(driver_child_env(self.telemetry_optin, utf8_env_vars()))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -300,7 +308,14 @@ impl Driver for CuaDriver {
 
         let mut stdin = child.stdin.take().context("driver stdin missing")?;
         let stdout = child.stdout.take().context("driver stdout missing")?;
+        let stderr = child.stderr.take().context("driver stderr missing")?;
         let mut reader = BufReader::new(stdout).lines();
+        // Drain stderr concurrently into a capped tail. A chatty driver can
+        // fill the ~64KB OS pipe buffer and block *before* answering the
+        // handshake, which would read as a bogus "wedged" timeout here; and
+        // when the driver dies at startup, its stderr is the only diagnostic
+        // worth surfacing.
+        let stderr_tail = spawn_stderr_drain(stderr);
 
         // MCP handshake — `initialize`, then immediately the tool call.
         // Newline-delimited JSON, one message per line. Each read is bounded
@@ -317,12 +332,22 @@ impl Driver for CuaDriver {
                 "clientInfo": {"name": "borg", "version": env!("CARGO_PKG_VERSION")},
             }
         });
-        write_line(&mut stdin, &init).await?;
+        write_line(&mut stdin, &init).await.with_context(|| {
+            format!(
+                "send initialize to cua-driver (it may have exited at startup){}",
+                stderr_suffix(&stderr_tail)
+            )
+        })?;
         // Drain the initialize response — we don't currently inspect it, but
         // skipping the read would leave the driver waiting for backpressure.
-        let _ = tokio::time::timeout(self.timeout, reader.next_line())
-            .await
-            .map_err(|_| wedged(self.timeout, "initialize handshake"))??;
+        read_reply(
+            &mut reader,
+            1,
+            self.timeout,
+            "initialize handshake",
+            &stderr_tail,
+        )
+        .await?;
 
         let initialized = json!({
             "jsonrpc": "2.0",
@@ -339,23 +364,140 @@ impl Driver for CuaDriver {
         });
         write_line(&mut stdin, &call).await?;
 
-        let response_line = tokio::time::timeout(self.timeout, reader.next_line())
-            .await
-            .map_err(|_| wedged(self.timeout, "tools/call reply"))??
-            .context("driver closed stdout before reply")?;
+        let response_line = read_reply(
+            &mut reader,
+            2,
+            self.timeout,
+            "tools/call reply",
+            &stderr_tail,
+        )
+        .await?;
         // Make the child wind down: closing stdin signals graceful shutdown
-        // per MCP spec; `kill_on_drop` guards against a hung driver.
+        // per MCP spec. The wait is bounded — a driver that ignores stdin
+        // EOF must not pin the tool-call slot after the reply is already in
+        // hand (that would defeat the per-phase timeouts above).
         drop(stdin);
-        let _ = child.wait().await;
+        // Cleanup must never outlast the operator's per-phase budget either.
+        let winddown = DRIVER_WINDDOWN.min(self.timeout);
+        match tokio::time::timeout(winddown, child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("cua-driver wait() failed: {e}"),
+            Err(_) => {
+                tracing::warn!("cua-driver ignored stdin close for {winddown:?}; killing it");
+                if let Err(e) = child.kill().await {
+                    tracing::warn!("failed to kill lingering cua-driver: {e}");
+                }
+            }
+        }
 
         parse_response(&response_line)
     }
 }
 
+/// Grace period between closing the driver's stdin and force-killing it.
+/// Short on purpose: the reply is already in hand, this only bounds cleanup.
+const DRIVER_WINDDOWN: Duration = Duration::from_secs(5);
+
+/// Capped stderr tail shared between the drain task and error decoration.
+type StderrTail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Continuously drain the child's stderr, keeping only the last few KB. The
+/// task ends on its own when the child exits (pipe EOF); errors reading a
+/// dying pipe are expected and only worth a debug line.
+fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
+    use tokio::io::AsyncReadExt;
+    const TAIL_CAP: usize = 8 * 1024;
+    let tail: StderrTail = std::sync::Arc::default();
+    let writer = std::sync::Arc::clone(&tail);
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut buf = writer.lock().unwrap_or_else(|e| e.into_inner());
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > TAIL_CAP {
+                        let excess = buf.len() - TAIL_CAP;
+                        buf.drain(..excess);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("cua-driver stderr drain ended: {e}");
+                    break;
+                }
+            }
+        }
+    });
+    tail
+}
+
+/// `" Driver stderr tail: …"` when the driver said anything, empty otherwise.
+fn stderr_suffix(tail: &StderrTail) -> String {
+    let bytes = tail.lock().unwrap_or_else(|e| e.into_inner());
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(" Driver stderr tail: {text}")
+    }
+}
+
+/// Read stdout lines until the JSON-RPC reply carrying `id` arrives, skipping
+/// notifications and stray log lines the driver may interleave. The whole
+/// scan shares one `timeout` budget for the phase. EOF becomes an explicit
+/// "driver exited" error (with the stderr tail) instead of a bare broken pipe
+/// downstream.
+async fn read_reply(
+    reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    id: u64,
+    timeout: Duration,
+    phase: &str,
+    stderr_tail: &StderrTail,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let line = tokio::time::timeout_at(deadline, reader.next_line())
+            .await
+            .map_err(|_| wedged(timeout, phase, stderr_tail))?
+            .with_context(|| format!("read cua-driver stdout during {phase}"))?;
+        let Some(line) = line else {
+            anyhow::bail!(
+                "cua-driver exited during {phase} without replying — check the binary at \
+                 computer_use.driver_path speaks MCP (`cua-driver mcp`).{}",
+                stderr_suffix(stderr_tail)
+            );
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            let preview: String = line.chars().take(200).collect();
+            tracing::debug!("skipping non-JSON cua-driver stdout line during {phase}: {preview}");
+            continue;
+        };
+        if v.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(line);
+        }
+        // Notification or a reply to a different id — keep scanning.
+    }
+}
+
+/// Parent env as UTF-8 pairs. `std::env::vars()` panics on a non-UTF-8 key
+/// or value; a driver spawn must skip such entries instead of unwinding
+/// through the agent loop.
+fn utf8_env_vars() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+}
+
 /// Timeout error naming the round-trip phase that stalled.
-fn wedged(timeout: Duration, phase: &str) -> anyhow::Error {
+fn wedged(timeout: Duration, phase: &str, stderr_tail: &StderrTail) -> anyhow::Error {
+    let hint = if cfg!(target_os = "macos") {
+        "The driver may be waiting on a macOS permission prompt (Screen Recording / Accessibility)"
+    } else {
+        "The driver may be waiting on a display-server connection or a permission grant"
+    };
     anyhow::anyhow!(
-        "cua-driver timed out after {timeout:?} during {phase}. The driver may be waiting on a macOS permission prompt (Screen Recording / Accessibility) — run `cua-driver doctor` on the host to check."
+        "cua-driver timed out after {timeout:?} during {phase}. {hint} — run `cua-driver doctor` on the host to check.{}",
+        stderr_suffix(stderr_tail)
     )
 }
 
@@ -621,15 +763,9 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
     } else {
         config.computer_use.driver_path.clone()
     };
-    // `0` falls back to the default rather than meaning "unbounded" — the
-    // same convention as `mcp.max_response_bytes`.
-    let secs = match config.computer_use.driver_timeout_secs {
-        0 => 30,
-        s => s,
-    };
     Ok(Arc::new(CuaDriver::new(
         binary,
-        Duration::from_secs(secs),
+        config.computer_use.driver_timeout(),
         config.computer_use.cua_telemetry,
     )))
 }
@@ -654,18 +790,19 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
     let mut resp = driver.call(method, params.clone()).await?;
 
     // Silent-empty capture: some driver builds intermittently reply with a
-    // successful envelope that carries no image part. One re-fetch recovers
-    // the transient case; a persistent failure still hits the loud error
-    // below. A re-fetch *error* keeps the first response so the model sees
-    // the original no-image detail rather than a transport error.
+    // successful envelope that carries no content at all. One re-fetch
+    // recovers the transient case; a persistent failure still hits the loud
+    // error below. A reply that carries text but no image (e.g. an explicit
+    // "screenshot denied" detail) is a deterministic failure, NOT the
+    // transient shape — re-fetching those would double every permission
+    // failure's latency and driver activity, so it goes straight through.
+    // A re-fetch *error* keeps the first response so the model sees the
+    // original no-image detail rather than a transport error.
     let wants_image = mode != CaptureMode::Ax;
-    let has_image = |r: &DriverResponse| {
-        r.content
-            .iter()
-            .any(|p| matches!(p, DriverContent::Image { .. }))
-    };
-    if wants_image && !has_image(&resp) {
-        tracing::warn!("cua-driver returned no image for capture (mode={mode:?}); re-fetching once");
+    if wants_image && resp.content.is_empty() {
+        tracing::warn!(
+            "cua-driver returned an empty reply for capture (mode={mode:?}); re-fetching once"
+        );
         match driver.call(method, params).await {
             Ok(second) => resp = second,
             Err(e) => tracing::warn!("empty-capture re-fetch failed: {e}"),
@@ -1796,20 +1933,15 @@ mod tests {
         assert_eq!(params["mode"], "vision");
     }
 
-    /// Vision/SOM promised pixels — if the driver doesn't return any even
-    /// after the one re-fetch, the No-Silent-Swallowing invariant says we
-    /// surface a clear error rather than emit an empty multimodal envelope
-    /// the model would treat as a success.
+    /// A no-image reply that carries an explicit text detail (e.g. a
+    /// permission failure) is deterministic — re-fetching would double the
+    /// latency and driver activity of every such failure. It must surface
+    /// immediately, in one call, with the driver's detail intact.
     #[tokio::test]
-    async fn capture_vision_no_image_after_retry_surfaces_error() {
-        let driver = FakeDriver::new(vec![
-            DriverResponse {
-                content: vec![DriverContent::Text("screenshot denied".into())],
-            },
-            DriverResponse {
-                content: vec![DriverContent::Text("screenshot denied".into())],
-            },
-        ]);
+    async fn capture_vision_text_detail_surfaces_error_without_refetch() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("screenshot denied".into())],
+        }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
         let out = handle_with_driver(&args, &driver).await.unwrap();
@@ -1818,6 +1950,33 @@ mod tests {
                 assert!(t.starts_with("Error:"), "expected error prefix: {t}");
                 assert!(t.contains("no image"));
                 assert!(t.contains("screenshot denied"));
+            }
+            other => panic!("expected text error, got {other:?}"),
+        }
+        assert_eq!(
+            driver.calls.lock().unwrap().len(),
+            1,
+            "text-detail failure must not trigger the silent-empty re-fetch"
+        );
+    }
+
+    /// Vision/SOM promised pixels — if the driver replies silent-empty even
+    /// after the one re-fetch, the No-Silent-Swallowing invariant says we
+    /// surface a clear error rather than emit an empty multimodal envelope
+    /// the model would treat as a success.
+    #[tokio::test]
+    async fn capture_vision_empty_after_retry_surfaces_error() {
+        let driver = FakeDriver::new(vec![
+            DriverResponse { content: vec![] },
+            DriverResponse { content: vec![] },
+        ]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Vision);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.starts_with("Error:"), "expected error prefix: {t}");
+                assert!(t.contains("no image"));
             }
             other => panic!("expected text error, got {other:?}"),
         }
@@ -1850,23 +2009,24 @@ mod tests {
         assert_eq!(calls[1].0, "screenshot");
     }
 
-    /// A re-fetch transport error must not mask the original no-image
-    /// detail — the model should see what the driver actually said.
+    /// A re-fetch transport error must not replace the original silent-empty
+    /// reply — the capture still ends in the loud no-image error, not a
+    /// propagated transport failure that would hide what actually happened.
     #[tokio::test]
-    async fn capture_refetch_error_keeps_first_response_detail() {
-        // Only one response queued: the re-fetch call errors.
-        let driver = FakeDriver::new(vec![DriverResponse {
-            content: vec![DriverContent::Text("capture requires Screen Recording".into())],
-        }]);
+    async fn capture_refetch_error_keeps_first_response() {
+        // Only one (empty) response queued: the re-fetch call errors.
+        let driver = FakeDriver::new(vec![DriverResponse { content: vec![] }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         match out {
             ToolOutput::Text(t) => {
-                assert!(t.contains("capture requires Screen Recording"), "got: {t}");
+                assert!(t.starts_with("Error:"), "expected error prefix: {t}");
+                assert!(t.contains("no image"), "got: {t}");
             }
             other => panic!("expected text error, got {other:?}"),
         }
+        assert_eq!(driver.calls.lock().unwrap().len(), 2);
     }
 
     /// AX mode is text-only by contract — an image-less reply is the
@@ -2122,6 +2282,30 @@ mod tests {
         );
     }
 
+    /// Operator-set driver knobs (`CUA_DRIVER_RS_*`) must survive the scrub
+    /// — except the telemetry toggle, which stays under Borg's control so a
+    /// parent-shell export can't pre-empt the opt-out.
+    #[test]
+    fn driver_child_env_passes_driver_prefix_vars_except_telemetry() {
+        let base = vec![
+            ("CUA_DRIVER_RS_LOG_LEVEL".to_string(), "debug".to_string()),
+            (CUA_TELEMETRY_ENV.to_string(), "1".to_string()),
+        ];
+        let env = driver_child_env(false, base);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CUA_DRIVER_RS_LOG_LEVEL" && v == "debug"),
+            "driver-prefixed config vars must pass through: {env:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k == CUA_TELEMETRY_ENV)
+                .collect::<Vec<_>>(),
+            vec![&(CUA_TELEMETRY_ENV.to_string(), "0".to_string())],
+            "the prefix pass-through must not resurrect the parent's telemetry enable"
+        );
+    }
+
     // ── driver round-trip timeout ──────────────────────────────────
 
     /// Write an executable stub standing in for cua-driver. Unix-only
@@ -2170,7 +2354,10 @@ mod tests {
 printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
 cat > /dev/null"#,
         );
-        let driver = CuaDriver::new(binary, Duration::from_millis(200), false);
+        // 1s (not 200ms): the budget is per-phase, and under parallel test
+        // load the shell spawn alone can eat 200ms — the init reply must
+        // land inside the first phase for this test to reach tools/call.
+        let driver = CuaDriver::new(binary, Duration::from_secs(1), false);
         let err = driver.call("screenshot", json!({})).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("timed out"), "got: {msg}");
@@ -2197,6 +2384,121 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"stub
         assert!(
             matches!(&resp.content[0], DriverContent::Text(t) if t == "stub ok"),
             "unexpected response: {resp:?}"
+        );
+    }
+
+    /// MCP allows the server to interleave notifications (and real drivers
+    /// interleave plain log lines) on stdout. The reply reader must match on
+    /// JSON-RPC id, not take "whichever line comes next" — otherwise a
+    /// notification is parsed as the tool result and every call degrades to
+    /// an empty response.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_call_skips_notifications_and_log_lines_before_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"read line
+printf 'starting up, not json\n'
+printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n'
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read line
+read line
+printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n'
+printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"real reply"}]}}\n'"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_secs(5), false);
+        let resp = driver.call("list_apps", json!({})).await.unwrap();
+        assert!(
+            matches!(&resp.content[0], DriverContent::Text(t) if t == "real reply"),
+            "notification consumed as the reply: {resp:?}"
+        );
+    }
+
+    /// A binary that isn't an MCP server (wrong driver_path, wrong version)
+    /// prints usage and exits. That must surface as a clear "driver exited"
+    /// error carrying the child's stderr — not a bare broken-pipe write
+    /// error with zero diagnostics.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_startup_exit_surfaces_stderr_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"echo 'unknown subcommand: mcp' >&2
+exit 64"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_secs(5), false);
+        let err = driver.call("screenshot", json!({})).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exited") || msg.contains("startup"),
+            "error must say the driver died, got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown subcommand"),
+            "child stderr missing from error: {msg}"
+        );
+    }
+
+    /// A driver that floods stderr must not deadlock the round-trip: without
+    /// a concurrent drain, ~64KB of stderr fills the OS pipe and the child
+    /// blocks before ever answering the handshake, which then reads as a
+    /// bogus "wedged" timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_call_survives_stderr_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            // 128KB of noise — double the typical pipe buffer.
+            r#"i=0
+while [ $i -lt 128 ]; do
+  printf '%01024d' 0 >&2
+  i=$((i+1))
+done
+read line
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read line
+read line
+printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"survived"}]}}\n'"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_secs(5), false);
+        let resp = driver.call("list_apps", json!({})).await.unwrap();
+        assert!(
+            matches!(&resp.content[0], DriverContent::Text(t) if t == "survived"),
+            "stderr flood wedged the call: {resp:?}"
+        );
+    }
+
+    /// A driver that ignores stdin close must not pin the tool-call slot
+    /// after the reply is in hand — the wind-down is bounded and the child
+    /// gets killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_ignoring_stdin_close_is_killed_within_winddown() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"read line
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read line
+read line
+printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}\n'
+sleep 60"#,
+        );
+        // 1s per-phase budget also caps the wind-down (min of the two).
+        let driver = CuaDriver::new(binary, Duration::from_secs(1), false);
+        let start = std::time::Instant::now();
+        let resp = driver.call("list_apps", json!({})).await.unwrap();
+        assert!(
+            matches!(&resp.content[0], DriverContent::Text(t) if t == "done"),
+            "unexpected response: {resp:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "call pinned by a lingering child: {:?}",
+            start.elapsed()
         );
     }
 

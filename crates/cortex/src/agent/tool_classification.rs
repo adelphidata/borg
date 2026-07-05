@@ -29,18 +29,17 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
 }
 
 /// Args-aware variant of [`is_mutating_tool`] — the gate the agent loop must
-/// use. `computer_use` passes the name-level allowlist (some of its actions
-/// are read-only), so the per-action check has to happen here, on the raw
-/// argument JSON, before typed parsing. Unparseable args or a missing /
-/// unrecognised `action` are treated as mutating so malformed calls and
-/// future actions default to blocked in Plan mode. Only `computer_use` pays
-/// the parse cost; every other tool stays on the name-level check.
+/// use. Some tools (today `computer_use`) pass the name-level allowlist while
+/// only *some* of their actions are read-only; the per-action logic lives in
+/// [`crate::tool::readonly_tool_call`] next to the name allowlist so the two
+/// can't drift. Unparseable args or a missing / unrecognised `action` are
+/// treated as mutating so malformed calls and future actions default to
+/// blocked in Plan mode. MCP tools keep the name-level trust policy above.
 pub(crate) fn is_mutating_tool_call(name: &str, raw_args: &str) -> bool {
-    if name == crate::tool::names::COMPUTER_USE {
-        return !serde_json::from_str::<serde_json::Value>(raw_args)
-            .is_ok_and(|v| crate::tool::computer_use::args_action_is_readonly(&v));
+    if name.starts_with("mcp_") {
+        return is_mutating_tool(name);
     }
-    is_mutating_tool(name)
+    !crate::tool::readonly_tool_call(name, raw_args)
 }
 
 /// Names of every tool that `is_mutating_tool` considers mutating.

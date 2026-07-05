@@ -425,9 +425,9 @@ impl Tool {
 /// arg-parsing has happened).
 pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
     // Note: `COMPUTER_USE` is listed here because *some* of its actions are
-    // read-only. The agent loop enforces the per-action gate via
-    // `agent::tool_classification::is_mutating_tool_call`, which inspects the
-    // raw `action` arg — mutating actions MUST stay blocked in Plan mode.
+    // read-only. Callers that have the call's arguments MUST use
+    // [`readonly_tool_call`] instead — the per-action gate lives there, and
+    // this name-level answer alone would admit mutating actions in Plan mode.
     matches_any(
         name,
         &[
@@ -449,6 +449,22 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::COMPUTER_USE,
         ],
     )
+}
+
+/// Per-call Plan-mode read-only check: [`allowed_in_plan_mode_name`] plus the
+/// per-action inspection for tools whose read-only status depends on their
+/// arguments (today only `computer_use`). This is the single source of truth
+/// the agent loop's Plan-mode gate consumes — a new args-dependent tool gets
+/// its arm added HERE, next to the name allowlist, so the two can't drift.
+/// Unparseable args fail closed (treated as mutating). MCP tools (`mcp_*`)
+/// are not handled here; their trust policy lives in
+/// `agent::tool_classification::is_mutating_tool`.
+pub(crate) fn readonly_tool_call(name: &str, raw_args: &str) -> bool {
+    if matches_any(name, &[tn::COMPUTER_USE]) {
+        return serde_json::from_str::<serde_json::Value>(raw_args)
+            .is_ok_and(|v| computer_use::args_action_is_readonly(&v));
+    }
+    allowed_in_plan_mode_name(name)
 }
 
 /// True iff `name` corresponds to a tool variant whose [`Tool::parallel_safe`]
