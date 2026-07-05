@@ -20,6 +20,27 @@ pub struct ComputerUseConfig {
     /// (for example a per-user `~/.local/bin` install).
     #[serde(default)]
     pub driver_path: String,
+
+    /// Opt-in for cua-driver's anonymous usage telemetry (PostHog). The
+    /// driver ships with telemetry ON upstream; Borg disables it by
+    /// injecting `CUA_DRIVER_RS_TELEMETRY_ENABLED=0` into the child env
+    /// unless the operator flips this to `true` (then the var is left unset
+    /// so the driver applies its own default).
+    #[serde(default)]
+    pub cua_telemetry: bool,
+
+    /// Per-phase timeout for one driver round-trip (spawn → initialize →
+    /// tools/call), in seconds. Guards against a wedged driver pinning a
+    /// tool-call slot forever. `0` falls back to the default rather than
+    /// meaning "unbounded".
+    #[serde(default = "default_driver_timeout_secs")]
+    pub driver_timeout_secs: u64,
+}
+
+/// 30s mirrors the driver's worst observed cold-start (first-run permission
+/// prompts + AX cache warm) with headroom; normal calls complete in <2s.
+const fn default_driver_timeout_secs() -> u64 {
+    30
 }
 
 #[cfg(target_os = "macos")]
@@ -37,6 +58,8 @@ impl Default for ComputerUseConfig {
         Self {
             enabled: default_enabled(),
             driver_path: String::new(),
+            cua_telemetry: false,
+            driver_timeout_secs: default_driver_timeout_secs(),
         }
     }
 }
@@ -78,5 +101,14 @@ mod tests {
             toml::from_str(r#"driver_path = "/usr/local/bin/cua-driver""#).unwrap();
         assert_eq!(cfg.driver_path, "/usr/local/bin/cua-driver");
         assert_eq!(cfg.enabled, default_enabled());
+        assert_eq!(cfg.driver_timeout_secs, 30);
+    }
+
+    #[test]
+    fn telemetry_defaults_off() {
+        // Privacy spec: cua-driver ships telemetry ON upstream; Borg must
+        // default to opt-in. A `true` default here would silently ship
+        // usage events to PostHog for every operator.
+        assert!(!ComputerUseConfig::default().cua_telemetry);
     }
 }

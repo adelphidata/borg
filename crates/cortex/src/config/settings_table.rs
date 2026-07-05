@@ -146,6 +146,12 @@ define_settings! {
         "browser.firecrawl_base_url" => browser.firecrawl_base_url, opt_string;
         "browser.firecrawl_browser_ttl_secs" => browser.firecrawl_browser_ttl_secs, parsed(u64);
 
+        // ── Computer use ──
+        "computer_use.enabled" => computer_use.enabled, parsed(bool);
+        "computer_use.driver_path" => computer_use.driver_path, string;
+        "computer_use.cua_telemetry" => computer_use.cua_telemetry, parsed(bool);
+        "computer_use.driver_timeout_secs" => computer_use.driver_timeout_secs, parsed(u64);
+
         // ── TTS ──
         "tts.enabled" => tts.enabled, parsed(bool);
         "tts.auto_mode" => tts.auto_mode, parsed(bool);

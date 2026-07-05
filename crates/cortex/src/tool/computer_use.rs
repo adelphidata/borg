@@ -221,12 +221,64 @@ pub(crate) trait Driver: Send + Sync {
 /// Real driver: spawns `cua-driver mcp` per call, speaks MCP-stdio.
 struct CuaDriver {
     binary: String,
+    /// Per-phase budget for one round-trip. A wedged driver errors out with
+    /// the phase name in the message instead of pinning the tool-call slot
+    /// forever (the driver's cold start with permission prompts is the slow
+    /// path this has to accommodate).
+    timeout: Duration,
+    /// When `false` (the default), `CUA_DRIVER_RS_TELEMETRY_ENABLED=0` is
+    /// injected into the child env. On opt-in the var is left unset so the
+    /// driver applies its own default.
+    telemetry_optin: bool,
 }
 
 impl CuaDriver {
-    fn new(binary: String) -> Self {
-        Self { binary }
+    fn new(binary: String, timeout: Duration, telemetry_optin: bool) -> Self {
+        Self {
+            binary,
+            timeout,
+            telemetry_optin,
+        }
     }
+}
+
+/// Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
+/// `"0"` disables it; absence means the binary's own default (telemetry ON
+/// upstream).
+const CUA_TELEMETRY_ENV: &str = "CUA_DRIVER_RS_TELEMETRY_ENABLED";
+
+/// Vars a GUI-automation driver legitimately needs beyond the base MCP
+/// allowlist: display-server and session-bus plumbing for Linux X11/Wayland
+/// hosts. Harmless (absent) on macOS.
+const DRIVER_ENV_EXTRAS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+];
+
+/// Build the child environment for a cua-driver spawn. The driver is a
+/// third-party binary, so it gets the same treatment as stdio MCP servers:
+/// `env_clear` + allowlist, which strips every operator credential
+/// (`*_API_KEY`, `BORG_KEK_PASSPHRASE`, OAuth tokens) before spawn. An
+/// inherited telemetry var is also stripped by the filter, so the opt-out
+/// below can't be pre-empted from the parent shell.
+fn driver_child_env(
+    telemetry_optin: bool,
+    base: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = base
+        .into_iter()
+        .filter(|(k, _)| {
+            mcp::transport::is_env_allowed(k) || DRIVER_ENV_EXTRAS.contains(&k.as_str())
+        })
+        .collect();
+    if !telemetry_optin {
+        env.push((CUA_TELEMETRY_ENV.to_string(), "0".to_string()));
+    }
+    env
 }
 
 #[async_trait]
@@ -237,6 +289,8 @@ impl Driver for CuaDriver {
 
         let mut child = Command::new(&self.binary)
             .arg("mcp")
+            .env_clear()
+            .envs(driver_child_env(self.telemetry_optin, std::env::vars()))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -249,7 +303,10 @@ impl Driver for CuaDriver {
         let mut reader = BufReader::new(stdout).lines();
 
         // MCP handshake — `initialize`, then immediately the tool call.
-        // Newline-delimited JSON, one message per line.
+        // Newline-delimited JSON, one message per line. Each read is bounded
+        // by `self.timeout`, and the error names the phase that wedged so
+        // the operator can tell a hung cold-start (permission prompt) from
+        // a driver that accepted the call and then stalled.
         let init = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -263,7 +320,9 @@ impl Driver for CuaDriver {
         write_line(&mut stdin, &init).await?;
         // Drain the initialize response — we don't currently inspect it, but
         // skipping the read would leave the driver waiting for backpressure.
-        let _ = reader.next_line().await?;
+        let _ = tokio::time::timeout(self.timeout, reader.next_line())
+            .await
+            .map_err(|_| wedged(self.timeout, "initialize handshake"))??;
 
         let initialized = json!({
             "jsonrpc": "2.0",
@@ -280,9 +339,9 @@ impl Driver for CuaDriver {
         });
         write_line(&mut stdin, &call).await?;
 
-        let response_line = reader
-            .next_line()
-            .await?
+        let response_line = tokio::time::timeout(self.timeout, reader.next_line())
+            .await
+            .map_err(|_| wedged(self.timeout, "tools/call reply"))??
             .context("driver closed stdout before reply")?;
         // Make the child wind down: closing stdin signals graceful shutdown
         // per MCP spec; `kill_on_drop` guards against a hung driver.
@@ -291,6 +350,13 @@ impl Driver for CuaDriver {
 
         parse_response(&response_line)
     }
+}
+
+/// Timeout error naming the round-trip phase that stalled.
+fn wedged(timeout: Duration, phase: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cua-driver timed out after {timeout:?} during {phase}. The driver may be waiting on a macOS permission prompt (Screen Recording / Accessibility) — run `cua-driver doctor` on the host to check."
+    )
 }
 
 async fn write_line<W: tokio::io::AsyncWriteExt + Unpin>(w: &mut W, payload: &Value) -> Result<()> {
@@ -555,7 +621,17 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
     } else {
         config.computer_use.driver_path.clone()
     };
-    Ok(Arc::new(CuaDriver::new(binary)))
+    // `0` falls back to the default rather than meaning "unbounded" — the
+    // same convention as `mcp.max_response_bytes`.
+    let secs = match config.computer_use.driver_timeout_secs {
+        0 => 30,
+        s => s,
+    };
+    Ok(Arc::new(CuaDriver::new(
+        binary,
+        Duration::from_secs(secs),
+        config.computer_use.cua_telemetry,
+    )))
 }
 
 async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -575,7 +651,26 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
         // emits a text part with the numbered overlay JSON.
         CaptureMode::Som | CaptureMode::Vision => "screenshot",
     };
-    let resp = driver.call(method, params).await?;
+    let mut resp = driver.call(method, params.clone()).await?;
+
+    // Silent-empty capture: some driver builds intermittently reply with a
+    // successful envelope that carries no image part. One re-fetch recovers
+    // the transient case; a persistent failure still hits the loud error
+    // below. A re-fetch *error* keeps the first response so the model sees
+    // the original no-image detail rather than a transport error.
+    let wants_image = mode != CaptureMode::Ax;
+    let has_image = |r: &DriverResponse| {
+        r.content
+            .iter()
+            .any(|p| matches!(p, DriverContent::Image { .. }))
+    };
+    if wants_image && !has_image(&resp) {
+        tracing::warn!("cua-driver returned no image for capture (mode={mode:?}); re-fetching once");
+        match driver.call(method, params).await {
+            Ok(second) => resp = second,
+            Err(e) => tracing::warn!("empty-capture re-fetch failed: {e}"),
+        }
+    }
 
     let mut text_parts = Vec::new();
     let mut image: Option<(String, String)> = None;
@@ -1701,15 +1796,20 @@ mod tests {
         assert_eq!(params["mode"], "vision");
     }
 
-    /// Vision/SOM promised pixels — if the driver doesn't return any,
-    /// the No-Silent-Swallowing invariant says we surface a clear error
-    /// rather than emit an empty multimodal envelope the model would treat
-    /// as a success.
+    /// Vision/SOM promised pixels — if the driver doesn't return any even
+    /// after the one re-fetch, the No-Silent-Swallowing invariant says we
+    /// surface a clear error rather than emit an empty multimodal envelope
+    /// the model would treat as a success.
     #[tokio::test]
-    async fn capture_vision_no_image_surfaces_error() {
-        let driver = FakeDriver::new(vec![DriverResponse {
-            content: vec![DriverContent::Text("screenshot denied".into())],
-        }]);
+    async fn capture_vision_no_image_after_retry_surfaces_error() {
+        let driver = FakeDriver::new(vec![
+            DriverResponse {
+                content: vec![DriverContent::Text("screenshot denied".into())],
+            },
+            DriverResponse {
+                content: vec![DriverContent::Text("screenshot denied".into())],
+            },
+        ]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Vision);
         let out = handle_with_driver(&args, &driver).await.unwrap();
@@ -1721,6 +1821,65 @@ mod tests {
             }
             other => panic!("expected text error, got {other:?}"),
         }
+        // Exactly one re-fetch — a retry loop here would hammer the driver.
+        assert_eq!(driver.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Silent-empty capture recovery: a transient empty reply followed by a
+    /// good one must succeed with pixels, exactly one re-fetch deep.
+    #[tokio::test]
+    async fn capture_retries_once_on_silent_empty_reply() {
+        let driver = FakeDriver::new(vec![
+            DriverResponse { content: vec![] },
+            DriverResponse {
+                content: vec![DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: one_by_one_png_b64(),
+                }],
+            },
+        ]);
+        let args = args_with_action(ComputerUseAction::Capture);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        assert!(
+            matches!(out, ToolOutput::Multimodal { .. }),
+            "re-fetched image must reach the model: {out:?}"
+        );
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "screenshot");
+        assert_eq!(calls[1].0, "screenshot");
+    }
+
+    /// A re-fetch transport error must not mask the original no-image
+    /// detail — the model should see what the driver actually said.
+    #[tokio::test]
+    async fn capture_refetch_error_keeps_first_response_detail() {
+        // Only one response queued: the re-fetch call errors.
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("capture requires Screen Recording".into())],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Vision);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("capture requires Screen Recording"), "got: {t}");
+            }
+            other => panic!("expected text error, got {other:?}"),
+        }
+    }
+
+    /// AX mode is text-only by contract — an image-less reply is the
+    /// expected shape, so it must NOT trigger the empty-capture re-fetch.
+    #[tokio::test]
+    async fn capture_ax_mode_does_not_retry_on_missing_image() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("AXWindow".into())],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Ax);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
     }
 
     // ── element_index targeting ────────────────────────────────────
@@ -1898,6 +2057,147 @@ mod tests {
                 "capture must stay plan-mode-safe (mode={mode:?})"
             );
         }
+    }
+
+    // ── driver child env ───────────────────────────────────────────
+
+    /// The driver is a third-party binary: operator credentials MUST be
+    /// stripped from its environment (same invariant as stdio MCP servers),
+    /// while base session vars and display-server plumbing survive.
+    #[test]
+    fn driver_child_env_strips_credentials_keeps_session_vars() {
+        let base = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/Users/op".to_string()),
+            ("DISPLAY".to_string(), ":0".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret".to_string()),
+            ("OPENAI_API_KEY".to_string(), "sk-secret".to_string()),
+            ("BORG_KEK_PASSPHRASE".to_string(), "hunter2".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "aws-secret".to_string(),
+            ),
+        ];
+        let env = driver_child_env(false, base);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        for kept in ["PATH", "HOME", "DISPLAY"] {
+            assert!(keys.contains(&kept), "{kept} must survive the scrub");
+        }
+        for stripped in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "BORG_KEK_PASSPHRASE",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                !keys.contains(&stripped),
+                "{stripped} leaked into the cua-driver child env"
+            );
+        }
+        // No credential *value* may survive under any key.
+        for (_, v) in &env {
+            assert!(!v.contains("secret") && v != "hunter2", "value leak: {v}");
+        }
+    }
+
+    /// Telemetry is opt-in: default injects the disable var; an inherited
+    /// enable can't pre-empt it (the filter strips it first). Opt-in leaves
+    /// the var entirely unset so the driver applies its own default.
+    #[test]
+    fn driver_child_env_telemetry_default_off_optin_unset() {
+        let inherited = vec![(CUA_TELEMETRY_ENV.to_string(), "1".to_string())];
+        let default_env = driver_child_env(false, inherited.clone());
+        assert_eq!(
+            default_env
+                .iter()
+                .filter(|(k, _)| k == CUA_TELEMETRY_ENV)
+                .collect::<Vec<_>>(),
+            vec![&(CUA_TELEMETRY_ENV.to_string(), "0".to_string())],
+            "default must force telemetry off even when the parent shell enables it"
+        );
+        let optin_env = driver_child_env(true, inherited);
+        assert!(
+            !optin_env.iter().any(|(k, _)| k == CUA_TELEMETRY_ENV),
+            "opt-in must leave the var unset (driver default applies)"
+        );
+    }
+
+    // ── driver round-trip timeout ──────────────────────────────────
+
+    /// Write an executable stub standing in for cua-driver. Unix-only
+    /// (shell shebang) — the timeout machinery itself is platform-neutral.
+    #[cfg(unix)]
+    fn stub_driver(dir: &tempfile::TempDir, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("stub-driver");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// A driver that never answers the MCP handshake must fail within the
+    /// budget and name the wedged phase — not pin the tool-call slot forever
+    /// (the pre-timeout behaviour).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_call_times_out_during_initialize_with_phase_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Swallow stdin forever, never write a reply.
+        let binary = stub_driver(&dir, "cat > /dev/null");
+        let driver = CuaDriver::new(binary, Duration::from_millis(200), false);
+        let start = std::time::Instant::now();
+        let err = driver.call("screenshot", json!({})).await.unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed-out call must return promptly, took {:?}",
+            start.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(msg.contains("initialize handshake"), "got: {msg}");
+    }
+
+    /// A driver that completes the handshake and then stalls must report
+    /// the tools/call phase — distinguishing "cold-start wedge" from
+    /// "accepted the call, then hung".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_call_times_out_during_tools_call_with_phase_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"read line
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+cat > /dev/null"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_millis(200), false);
+        let err = driver.call("screenshot", json!({})).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(msg.contains("tools/call reply"), "got: {msg}");
+    }
+
+    /// Positive path through the real spawn machinery: a stub that answers
+    /// both phases in time produces a parsed response, proving the timeout
+    /// wrappers don't interfere with a healthy driver.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn driver_call_succeeds_against_prompt_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"read line
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read line
+read line
+printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"stub ok"}]}}\n'"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_secs(5), false);
+        let resp = driver.call("list_apps", json!({})).await.unwrap();
+        assert!(
+            matches!(&resp.content[0], DriverContent::Text(t) if t == "stub ok"),
+            "unexpected response: {resp:?}"
+        );
     }
 
     #[test]
