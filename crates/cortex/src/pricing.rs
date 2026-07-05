@@ -62,7 +62,7 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
         ("gemini-3-flash", 0.15, 0.60),
         ("gemini-3-flash-lite", 0.05, 0.30),
         ("gemini-2.5-pro", 1.25, 10.0),
-        ("gemini-2.5-flash", 0.15, 0.60),
+        ("gemini-2.5-flash", 0.30, 2.50),
         ("gemini-2.0-flash", 0.10, 0.40),
         // DeepSeek (deepseek-chat is V3.2 alias)
         ("deepseek-chat", 0.27, 1.10),
@@ -228,8 +228,8 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
         BundledRateCardEntry {
             provider_id: "gemini",
             model: "gemini-2.5-flash",
-            prompt_per_mtok_usd: "0.15",
-            completion_per_mtok_usd: "0.60",
+            prompt_per_mtok_usd: "0.30",
+            completion_per_mtok_usd: "2.50",
         },
         // DeepSeek
         BundledRateCardEntry {

@@ -67,11 +67,14 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
 
 /// Model choices per provider.
 ///
-/// OpenRouter list is ordered newest-first: the open-weight flagships (GLM,
-/// MiniMax, Kimi) lead, followed by each proprietary family latest-first. The
-/// live catalog fetch ([`crate::openrouter_catalog`]) preserves this order and
-/// drops any IDs OpenRouter no longer serves, so keep the newest curated slug
-/// at the top of each family. See the `update-model-catalog` skill.
+/// OpenRouter list leads with the open-weight flagships (GLM, MiniMax, Kimi) as
+/// the recommended defaults, then walks the remaining families — Anthropic,
+/// OpenAI, Gemini, Grok, Qwen, DeepSeek, Mistral — newest slug first within
+/// each. The live catalog fetch ([`crate::openrouter_catalog`]) preserves this
+/// order and drops any IDs OpenRouter no longer serves, so keep the newest
+/// curated slug at the top of its family. New open-weight flagships go up top
+/// with GLM/MiniMax/Kimi; everything else keeps its family grouping. See the
+/// `update-model-catalog` skill.
 pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
     ("z-ai/glm-5.1", "GLM 5.1 (recommended)"),
     ("z-ai/glm-4.7", "GLM 4.7"),

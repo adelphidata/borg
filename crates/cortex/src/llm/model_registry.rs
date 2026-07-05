@@ -271,6 +271,15 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 2_000_000,
         supports_thinking: false,
     },
+    // `grok-4.1-fast` uses a dot, so it does NOT prefix-match `grok-4-fast`
+    // (the `.` at index 6 differs from `-`) and would otherwise fall through to
+    // the 256k `grok-4`. Explicit entry keeps the fast family's 2M window.
+    ModelMetadata {
+        slug: "grok-4.1-fast",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: false,
+    },
     // grok-4.20 — reasoning/non-reasoning/multi-agent split. The dated `0309`
     // revision is in the middle of the slug (`grok-4.20-0309-reasoning`), so
     // the family entries embed the date — prefix matching needs the literal
@@ -781,6 +790,13 @@ mod tests {
             lookup("google/gemini-3.1-flash-lite-preview").unwrap().slug,
             "gemini-3.1-flash-lite"
         );
+        // `grok-4.1-fast` (dot, not dash) must not fall through to the 256K
+        // bare `grok-4` — it carries the fast family's 2M window.
+        assert_eq!(
+            lookup("x-ai/grok-4.1-fast").unwrap().slug,
+            "grok-4.1-fast"
+        );
+        assert_eq!(context_window_for("x-ai/grok-4.1-fast"), 2_000_000);
     }
 
     #[test]
