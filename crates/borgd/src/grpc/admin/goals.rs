@@ -2,15 +2,12 @@
 
 use super::*;
 
-/// Boxed goal-event stream; structurally identical to the
-/// `Admin::SubscribeGoalEventsStream` associated type in the parent impl.
+/// Boxed goal-event stream; used as the `Admin::SubscribeGoalEventsStream`
+/// associated type in the parent impl.
 pub(super) type GoalEventsStream =
     Pin<Box<dyn Stream<Item = Result<PbGoalEvent, TStatus>> + Send + 'static>>;
 
-pub(super) async fn get_goal(
-    _svc: &AdminSvc,
-    req: Request<GoalRef>,
-) -> Result<Response<GoalDetail>, TStatus> {
+pub(super) async fn get_goal(req: Request<GoalRef>) -> Result<Response<GoalDetail>, TStatus> {
     let session_id_req = req.into_inner().session_id;
     let detail = async {
         let db = Database::open().await?;
@@ -24,7 +21,7 @@ pub(super) async fn get_goal(
             .unwrap_or_default())
     }
     .await
-    .map_err(|e| TStatus::internal(format!("get_goal failed: {e}")))?;
+    .map_err(map_internal("get_goal"))?;
     Ok(Response::new(detail))
 }
 
@@ -252,7 +249,7 @@ pub(super) async fn clear_goal(
         Ok(if did_remove { Some(session_id) } else { None })
     }
     .await
-    .map_err(|e| TStatus::internal(format!("clear_goal failed: {e}")))?;
+    .map_err(map_internal("clear_goal"))?;
     if let (Some(bus), Some(session_id)) = (bus, removed) {
         bus.publish(crate::goal_bus::DaemonGoalEvent {
             session_id,
@@ -278,7 +275,7 @@ pub(super) async fn pause_goal_on_interrupt(
         db.pause_active_goal(&session_id).await
     }
     .await
-    .map_err(|e: anyhow::Error| TStatus::internal(format!("pause_goal failed: {e}")))?;
+    .map_err(map_internal("pause_goal"))?;
     let detail = paused.as_ref().map(goal_to_detail).unwrap_or_default();
     if let (Some(bus), Some(goal)) = (bus, paused.as_ref()) {
         bus.publish(crate::goal_bus::DaemonGoalEvent {

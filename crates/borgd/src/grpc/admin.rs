@@ -365,63 +365,63 @@ impl Admin for AdminSvc {
         &self,
         req: Request<Empty>,
     ) -> Result<Response<ScheduledTaskList>, TStatus> {
-        scheduled_tasks::list_scheduled_tasks(self, req).await
+        scheduled_tasks::list_scheduled_tasks(req).await
     }
 
     async fn create_scheduled_task(
         &self,
         req: Request<ScheduledTaskCreate>,
     ) -> Result<Response<ScheduledTask>, TStatus> {
-        scheduled_tasks::create_scheduled_task(self, req).await
+        scheduled_tasks::create_scheduled_task(req).await
     }
 
     async fn delete_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        scheduled_tasks::delete_scheduled_task(self, req).await
+        scheduled_tasks::delete_scheduled_task(req).await
     }
 
     async fn update_scheduled_task(
         &self,
         req: Request<ScheduledTaskUpdate>,
     ) -> Result<Response<ScheduledTask>, TStatus> {
-        scheduled_tasks::update_scheduled_task(self, req).await
+        scheduled_tasks::update_scheduled_task(req).await
     }
 
     async fn pause_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        scheduled_tasks::pause_scheduled_task(self, req).await
+        update_task_status(req.into_inner().id, "paused").await
     }
 
     async fn resume_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        scheduled_tasks::resume_scheduled_task(self, req).await
+        update_task_status(req.into_inner().id, "active").await
     }
 
     async fn run_scheduled_task_now(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        scheduled_tasks::run_scheduled_task_now(self, req).await
+        scheduled_tasks::run_scheduled_task_now(req).await
     }
 
     async fn get_scheduled_task_runs(
         &self,
         req: Request<GetScheduledTaskRunsRequest>,
     ) -> Result<Response<ScheduledTaskRunList>, TStatus> {
-        scheduled_tasks::get_scheduled_task_runs(self, req).await
+        scheduled_tasks::get_scheduled_task_runs(req).await
     }
 
     async fn get_scheduled_task_detail(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<ScheduledTaskDetail>, TStatus> {
-        scheduled_tasks::get_scheduled_task_detail(self, req).await
+        scheduled_tasks::get_scheduled_task_detail(req).await
     }
 
     async fn export_session(
@@ -813,19 +813,19 @@ impl Admin for AdminSvc {
     // routing metadata.
 
     async fn get_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<ApiKeyValue>, TStatus> {
-        credentials::get_api_key(self, req).await
+        credentials::get_api_key(req).await
     }
 
     async fn set_api_key(&self, req: Request<ApiKeyValue>) -> Result<Response<Empty>, TStatus> {
-        credentials::set_api_key(self, req).await
+        credentials::set_api_key(req).await
     }
 
     async fn unset_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<Empty>, TStatus> {
-        credentials::unset_api_key(self, req).await
+        credentials::unset_api_key(req).await
     }
 
     async fn list_api_keys(&self, req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
-        credentials::list_api_keys(self, req).await
+        credentials::list_api_keys(req).await
     }
 
     async fn get_monthly_token_total(
@@ -869,14 +869,14 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AddProviderRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        credentials::add_provider(self, req).await
+        credentials::add_provider(req).await
     }
 
     async fn remove_provider(
         &self,
         req: Request<RemoveProviderRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        credentials::remove_provider(self, req).await
+        credentials::remove_provider(req).await
     }
 
     // ── Webhook CRUD (writer-only) ───────────────────────────────────────
@@ -1029,7 +1029,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<CredentialList>, TStatus> {
-        credentials::list_credentials(self, req).await
+        credentials::list_credentials(req).await
     }
 
     async fn add_credential(
@@ -1085,25 +1085,25 @@ impl Admin for AdminSvc {
         &self,
         req: Request<HandoffRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        handoff::request_handoff(self, req).await
+        handoff::request_handoff(req).await
     }
 
     async fn claim_handoff(
         &self,
         req: Request<HandoffClaimRequest>,
     ) -> Result<Response<HandoffClaimResponse>, TStatus> {
-        handoff::claim_handoff(self, req).await
+        handoff::claim_handoff(req).await
     }
 
     async fn complete_handoff(&self, req: Request<SessionRef>) -> Result<Response<Empty>, TStatus> {
-        handoff::complete_handoff(self, req).await
+        handoff::complete_handoff(req).await
     }
 
     async fn fail_handoff(
         &self,
         req: Request<HandoffFailRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        handoff::fail_handoff(self, req).await
+        handoff::fail_handoff(req).await
     }
 
     async fn browser_manage(
@@ -1117,11 +1117,11 @@ impl Admin for AdminSvc {
         &self,
         req: Request<SessionRef>,
     ) -> Result<Response<HandoffStatusReply>, TStatus> {
-        handoff::get_handoff_status(self, req).await
+        handoff::get_handoff_status(req).await
     }
 
     async fn get_goal(&self, req: Request<GoalRef>) -> Result<Response<GoalDetail>, TStatus> {
-        goals::get_goal(self, req).await
+        goals::get_goal(req).await
     }
 
     async fn set_goal(&self, req: Request<GoalMutation>) -> Result<Response<GoalDetail>, TStatus> {
@@ -1139,11 +1139,9 @@ impl Admin for AdminSvc {
         goals::pause_goal_on_interrupt(self, req).await
     }
 
-    type SubscribeGoalEventsStream =
-        Pin<Box<dyn Stream<Item = Result<PbGoalEvent, TStatus>> + Send + 'static>>;
+    type SubscribeGoalEventsStream = goals::GoalEventsStream;
 
-    type SubscribeAgentTreeEventsStream =
-        Pin<Box<dyn Stream<Item = Result<PbAgentTreeEvent, TStatus>> + Send + 'static>>;
+    type SubscribeAgentTreeEventsStream = agents::AgentTreeEventsStream;
 
     async fn subscribe_goal_events(
         &self,
@@ -1261,7 +1259,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AgentListRequest>,
     ) -> Result<Response<PbAgentList>, TStatus> {
-        agents::list_agents(self, req).await
+        agents::list_agents(req).await
     }
 
     /// Kill an agent. Today returns Unimplemented — the in-memory registry
@@ -1269,23 +1267,23 @@ impl Admin for AdminSvc {
     /// the daemon session executor. The wire format is stable so the CLI
     /// and TUI can be built against it and the executor lands separately.
     async fn kill_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        agents::kill_agent(self, req).await
+        agents::kill_agent(req).await
     }
 
     /// Kill an agent and every descendant. See `kill_agent` for the same
     /// executor-wiring caveat.
     async fn kill_agent_subtree(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        agents::kill_agent_subtree(self, req).await
+        agents::kill_agent_subtree(req).await
     }
 
     /// Pause an agent at its next iteration boundary. See `kill_agent`.
     async fn pause_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        agents::pause_agent(self, req).await
+        agents::pause_agent(req).await
     }
 
     /// Resume a paused agent. See `kill_agent`.
     async fn resume_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        agents::resume_agent(self, req).await
+        agents::resume_agent(req).await
     }
 
     /// Stream tree-lifecycle events. Returns `Unimplemented` until the
@@ -1296,7 +1294,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<SessionRef>,
     ) -> Result<Response<Self::SubscribeAgentTreeEventsStream>, TStatus> {
-        agents::subscribe_agent_tree_events(self, req).await
+        agents::subscribe_agent_tree_events(req).await
     }
 
     /// List persisted spawn-tree snapshots for a session (newest first,
@@ -1305,7 +1303,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<SessionRef>,
     ) -> Result<Response<AgentSnapshotList>, TStatus> {
-        agents::list_agent_snapshots(self, req).await
+        agents::list_agent_snapshots(req).await
     }
 
     /// Fetch the agents captured in one persisted snapshot. The snapshot
@@ -1314,7 +1312,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AgentSnapshotRefRequest>,
     ) -> Result<Response<PbAgentList>, TStatus> {
-        agents::get_agent_snapshot(self, req).await
+        agents::get_agent_snapshot(req).await
     }
 }
 

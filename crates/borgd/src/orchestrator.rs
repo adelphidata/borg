@@ -6,7 +6,7 @@ use crate::heartbeat::HeartbeatTrigger;
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
-use crate::supervisor::{spawn_supervised, DbHandle, SupervisorConfig, DEFAULT_RESTART_WINDOW};
+use crate::supervisor::{spawn_supervised, DbHandle, SupervisorConfig};
 use crate::task_runner;
 use anyhow::Result;
 use cortex::config::Config;
@@ -160,12 +160,11 @@ pub async fn start(
     // pre-supervisor ad-hoc loop did so behavior is unchanged: max 5
     // crashes in a 10-minute window, exp backoff capped by base × 2^4.
     let gw_cfg = SupervisorConfig {
-        name: "gateway",
         max_restarts: GATEWAY_MAX_CRASH_RESPAWNS,
-        restart_window: DEFAULT_RESTART_WINDOW,
         base_backoff: GATEWAY_RESPAWN_BASE_DELAY,
         max_backoff: GATEWAY_RESPAWN_BASE_DELAY * 16,
         on_degraded: Some(Box::new(mark_gateway_unrecoverable)),
+        ..SupervisorConfig::new("gateway")
     };
     let gw_poke_tx = poke_tx.clone();
     let gw_outer_shutdown = shutdown.clone();

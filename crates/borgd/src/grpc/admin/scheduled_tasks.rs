@@ -3,7 +3,6 @@
 use super::*;
 
 pub(super) async fn list_scheduled_tasks(
-    _svc: &AdminSvc,
     _req: Request<Empty>,
 ) -> Result<Response<ScheduledTaskList>, TStatus> {
     let rows = async {
@@ -11,14 +10,13 @@ pub(super) async fn list_scheduled_tasks(
         db.list_tasks().await
     }
     .await
-    .map_err(|e: anyhow::Error| TStatus::internal(format!("list_tasks failed: {e}")))?;
+    .map_err(map_internal("list_tasks"))?;
     Ok(Response::new(ScheduledTaskList {
         tasks: rows.into_iter().map(scheduled_task_row_to_proto).collect(),
     }))
 }
 
 pub(super) async fn create_scheduled_task(
-    _svc: &AdminSvc,
     req: Request<ScheduledTaskCreate>,
 ) -> Result<Response<ScheduledTask>, TStatus> {
     let req = req.into_inner();
@@ -65,7 +63,6 @@ pub(super) async fn create_scheduled_task(
 }
 
 pub(super) async fn delete_scheduled_task(
-    _svc: &AdminSvc,
     req: Request<ScheduledTaskRef>,
 ) -> Result<Response<Empty>, TStatus> {
     let id = req.into_inner().id;
@@ -74,7 +71,7 @@ pub(super) async fn delete_scheduled_task(
         db.delete_task(&id).await
     }
     .await
-    .map_err(|e: anyhow::Error| TStatus::internal(format!("delete_task failed: {e}")))?;
+    .map_err(map_internal("delete_task"))?;
     if !removed {
         return Err(TStatus::not_found("scheduled task not found"));
     }
@@ -82,7 +79,6 @@ pub(super) async fn delete_scheduled_task(
 }
 
 pub(super) async fn update_scheduled_task(
-    _svc: &AdminSvc,
     req: Request<ScheduledTaskUpdate>,
 ) -> Result<Response<ScheduledTask>, TStatus> {
     let req = req.into_inner();
@@ -113,22 +109,7 @@ pub(super) async fn update_scheduled_task(
     Ok(Response::new(scheduled_task_row_to_proto(updated)))
 }
 
-pub(super) async fn pause_scheduled_task(
-    _svc: &AdminSvc,
-    req: Request<ScheduledTaskRef>,
-) -> Result<Response<Empty>, TStatus> {
-    update_task_status(req.into_inner().id, "paused").await
-}
-
-pub(super) async fn resume_scheduled_task(
-    _svc: &AdminSvc,
-    req: Request<ScheduledTaskRef>,
-) -> Result<Response<Empty>, TStatus> {
-    update_task_status(req.into_inner().id, "active").await
-}
-
 pub(super) async fn run_scheduled_task_now(
-    _svc: &AdminSvc,
     req: Request<ScheduledTaskRef>,
 ) -> Result<Response<Empty>, TStatus> {
     let id = req.into_inner().id;
@@ -144,7 +125,7 @@ pub(super) async fn run_scheduled_task_now(
         Ok(true)
     }
     .await
-    .map_err(|e| TStatus::internal(format!("run_scheduled_task_now failed: {e}")))?;
+    .map_err(map_internal("run_scheduled_task_now"))?;
     if !found {
         return Err(TStatus::not_found(format!(
             "scheduled task `{id_for_err}` not found"
@@ -154,7 +135,6 @@ pub(super) async fn run_scheduled_task_now(
 }
 
 pub(super) async fn get_scheduled_task_runs(
-    _svc: &AdminSvc,
     req: Request<GetScheduledTaskRunsRequest>,
 ) -> Result<Response<ScheduledTaskRunList>, TStatus> {
     let req = req.into_inner();
@@ -170,16 +150,13 @@ pub(super) async fn get_scheduled_task_runs(
         db.task_run_history(&id, limit).await
     }
     .await
-    .map_err(|e: anyhow::Error| {
-        TStatus::internal(format!("get_scheduled_task_runs failed: {e}"))
-    })?;
+    .map_err(map_internal("get_scheduled_task_runs"))?;
     Ok(Response::new(ScheduledTaskRunList {
         runs: runs.into_iter().map(task_run_row_to_proto).collect(),
     }))
 }
 
 pub(super) async fn get_scheduled_task_detail(
-    _svc: &AdminSvc,
     req: Request<ScheduledTaskRef>,
 ) -> Result<Response<ScheduledTaskDetail>, TStatus> {
     let id = req.into_inner().id;
@@ -203,7 +180,7 @@ pub(super) async fn get_scheduled_task_detail(
         }))
     }
     .await
-    .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
+    .map_err(map_internal("get_scheduled_task_detail"))?;
     let detail = detail
         .ok_or_else(|| TStatus::not_found(format!("scheduled task `{id_for_err}` not found")))?;
     Ok(Response::new(detail))

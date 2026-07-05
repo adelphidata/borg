@@ -3,22 +3,19 @@
 
 use super::*;
 
-/// Boxed agent-tree-event stream; structurally identical to the
+/// Boxed agent-tree-event stream; used as the
 /// `Admin::SubscribeAgentTreeEventsStream` associated type in the parent impl.
 pub(super) type AgentTreeEventsStream =
     Pin<Box<dyn Stream<Item = Result<PbAgentTreeEvent, TStatus>> + Send + 'static>>;
 
 pub(super) async fn list_agents(
-    _svc: &AdminSvc,
     req: Request<AgentListRequest>,
 ) -> Result<Response<PbAgentList>, TStatus> {
     let session_id = req.into_inner().session_id;
-    let db = Database::open()
-        .await
-        .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+    let db = Database::open().await.map_err(map_internal("db open"))?;
     let resolved = resolve_agent_session_id(&db, &session_id)
         .await
-        .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        .map_err(map_internal("session resolve"))?;
     let Some(resolved) = resolved else {
         return Ok(Response::new(PbAgentList::default()));
     };
@@ -35,17 +32,13 @@ pub(super) async fn list_agents(
     Ok(Response::new(PbAgentList { agents, history }))
 }
 
-pub(super) async fn kill_agent(
-    _svc: &AdminSvc,
-    _req: Request<AgentRef>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn kill_agent(_req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
     Err(TStatus::unimplemented(
         "kill_agent: executor wiring pending — only ListAgents/snapshots are live in this slice",
     ))
 }
 
 pub(super) async fn kill_agent_subtree(
-    _svc: &AdminSvc,
     _req: Request<AgentRef>,
 ) -> Result<Response<Empty>, TStatus> {
     Err(TStatus::unimplemented(
@@ -53,26 +46,19 @@ pub(super) async fn kill_agent_subtree(
     ))
 }
 
-pub(super) async fn pause_agent(
-    _svc: &AdminSvc,
-    _req: Request<AgentRef>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn pause_agent(_req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
     Err(TStatus::unimplemented(
         "pause_agent: executor wiring pending",
     ))
 }
 
-pub(super) async fn resume_agent(
-    _svc: &AdminSvc,
-    _req: Request<AgentRef>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn resume_agent(_req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
     Err(TStatus::unimplemented(
         "resume_agent: executor wiring pending",
     ))
 }
 
 pub(super) async fn subscribe_agent_tree_events(
-    _svc: &AdminSvc,
     _req: Request<SessionRef>,
 ) -> Result<Response<AgentTreeEventsStream>, TStatus> {
     Err(TStatus::unimplemented(
@@ -81,16 +67,13 @@ pub(super) async fn subscribe_agent_tree_events(
 }
 
 pub(super) async fn list_agent_snapshots(
-    _svc: &AdminSvc,
     req: Request<SessionRef>,
 ) -> Result<Response<AgentSnapshotList>, TStatus> {
     let session_id = req.into_inner().id;
-    let db = Database::open()
-        .await
-        .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+    let db = Database::open().await.map_err(map_internal("db open"))?;
     let resolved = resolve_agent_session_id(&db, &session_id)
         .await
-        .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        .map_err(map_internal("session resolve"))?;
     let Some(resolved) = resolved else {
         return Ok(Response::new(AgentSnapshotList::default()));
     };
@@ -104,19 +87,16 @@ pub(super) async fn list_agent_snapshots(
 }
 
 pub(super) async fn get_agent_snapshot(
-    _svc: &AdminSvc,
     req: Request<AgentSnapshotRefRequest>,
 ) -> Result<Response<PbAgentList>, TStatus> {
     let inner = req.into_inner();
     if inner.turn_id.trim().is_empty() {
         return Err(TStatus::invalid_argument("turn_id is required"));
     }
-    let db = Database::open()
-        .await
-        .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
+    let db = Database::open().await.map_err(map_internal("db open"))?;
     let resolved = resolve_agent_session_id(&db, &inner.session_id)
         .await
-        .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
+        .map_err(map_internal("session resolve"))?;
     let Some(resolved) = resolved else {
         return Err(TStatus::failed_precondition("no active session"));
     };
@@ -128,8 +108,8 @@ pub(super) async fn get_agent_snapshot(
     // Snapshot JSON is `Vec<PbAgentEntry>` serialized through serde-json
     // by the writer; tolerate both bare array and `{agents: [...]}` so
     // the format can grow without forcing a migration.
-    let agents: Vec<PbAgentEntry> = parse_snapshot_payload(&row.snapshot_json)
-        .map_err(|e| TStatus::internal(format!("snapshot decode failed: {e}")))?;
+    let agents: Vec<PbAgentEntry> =
+        parse_snapshot_payload(&row.snapshot_json).map_err(map_internal("snapshot decode"))?;
     Ok(Response::new(PbAgentList {
         agents,
         history: Vec::new(),

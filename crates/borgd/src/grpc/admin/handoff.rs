@@ -3,7 +3,6 @@
 use super::*;
 
 pub(super) async fn request_handoff(
-    _svc: &AdminSvc,
     req: Request<HandoffRequest>,
 ) -> Result<Response<Empty>, TStatus> {
     let req = req.into_inner();
@@ -26,7 +25,6 @@ pub(super) async fn request_handoff(
 }
 
 pub(super) async fn claim_handoff(
-    _svc: &AdminSvc,
     req: Request<HandoffClaimRequest>,
 ) -> Result<Response<HandoffClaimResponse>, TStatus> {
     let req = req.into_inner();
@@ -35,17 +33,14 @@ pub(super) async fn claim_handoff(
         db.claim_handoff_for_platform(&req.platform).await
     }
     .await
-    .map_err(|e: anyhow::Error| TStatus::internal(format!("claim_handoff failed: {e}")))?;
+    .map_err(map_internal("claim_handoff"))?;
     Ok(Response::new(HandoffClaimResponse {
         session_id: claimed.clone().unwrap_or_default(),
         claimed: claimed.is_some(),
     }))
 }
 
-pub(super) async fn complete_handoff(
-    _svc: &AdminSvc,
-    req: Request<SessionRef>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn complete_handoff(req: Request<SessionRef>) -> Result<Response<Empty>, TStatus> {
     let id = req.into_inner().id;
     async {
         let db = Database::open().await?;
@@ -59,7 +54,6 @@ pub(super) async fn complete_handoff(
 }
 
 pub(super) async fn fail_handoff(
-    _svc: &AdminSvc,
     req: Request<HandoffFailRequest>,
 ) -> Result<Response<Empty>, TStatus> {
     let req = req.into_inner();
@@ -75,7 +69,6 @@ pub(super) async fn fail_handoff(
 }
 
 pub(super) async fn get_handoff_status(
-    _svc: &AdminSvc,
     req: Request<SessionRef>,
 ) -> Result<Response<HandoffStatusReply>, TStatus> {
     let id = req.into_inner().id;
@@ -87,7 +80,7 @@ pub(super) async fn get_handoff_status(
         db.handoff_status(&session_id).await
     }
     .await
-    .map_err(|e: anyhow::Error| TStatus::internal(format!("get_handoff_status failed: {e}")))?;
+    .map_err(map_internal("get_handoff_status"))?;
     Ok(Response::new(HandoffStatusReply {
         state: status
             .state

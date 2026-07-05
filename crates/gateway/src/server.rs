@@ -844,13 +844,11 @@ async fn run_channel_poll_loop(
                     messages.len()
                 );
 
-                let reg_channel = channel.clone();
-
                 for msg in messages {
                     let result = tokio::time::timeout(
                         request_timeout,
                         handler::handle_polled_message(
-                            &reg_channel,
+                            &channel,
                             msg,
                             &config,
                             Some(&poll_health),

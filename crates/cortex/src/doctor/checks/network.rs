@@ -139,18 +139,8 @@ pub(in crate::doctor) fn check_mcp(config: &Config, checks: &mut Vec<DiagnosticC
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{fails, passes, warns};
     use super::*;
-    use crate::doctor::CheckStatus;
-
-    fn fails(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Fail(_))
-    }
-    fn warns(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Warn(_))
-    }
-    fn passes(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Pass)
-    }
 
     #[test]
     fn tunnel_classification_gates_on_provider_and_binary() {

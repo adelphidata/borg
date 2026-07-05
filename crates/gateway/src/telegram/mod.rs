@@ -27,6 +27,7 @@ use anyhow::Result;
 use axum::http::HeaderMap;
 use tokio::sync::Mutex;
 
+use crate::message_processing::voice::VOICE_TRANSCRIPT_PREFIX;
 use dedup::UpdateDeduplicator;
 pub use parse::{TelegramAudioRef, TelegramInputKind, TelegramParsed, TelegramPhotoRef};
 
@@ -92,7 +93,7 @@ pub async fn enrich_parsed_message(
             .await
             {
                 Ok((transcript, _attempts)) => {
-                    parsed.inbound.text = format!("[Voice transcript]: {transcript}");
+                    parsed.inbound.text = format!("{VOICE_TRANSCRIPT_PREFIX}{transcript}");
                     if config.audio.echo_transcript {
                         let echo_chat_id: i64 = parsed
                             .inbound

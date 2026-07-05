@@ -11,6 +11,7 @@ use cortex::config::Config;
 
 use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
+use crate::message_processing::voice;
 
 use super::api::TwilioClient;
 use super::types::TwilioChannelType;
@@ -86,16 +87,17 @@ impl NativeChannel for TwilioChannel {
                             "twilio-{}.audio",
                             parsed.message.message_id.as_deref().unwrap_or("unknown")
                         );
-                        match transcriber
-                            .transcribe(&bytes, &audio_mime, &filename, None)
-                            .await
+                        if let Some(transcript) = voice::transcribe_or_warn(
+                            &transcriber,
+                            &bytes,
+                            &audio_mime,
+                            &filename,
+                            "twilio",
+                        )
+                        .await
                         {
-                            Ok((transcript, _attempts)) => {
-                                parsed.message.text = format!("[Voice transcript]: {transcript}");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "twilio: audio transcription failed");
-                            }
+                            parsed.message.text =
+                                format!("{}{transcript}", voice::VOICE_TRANSCRIPT_PREFIX);
                         }
                     }
                     Err(e) => {

@@ -97,7 +97,7 @@ pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Va
                     json!({
                         "id": idx.to_string(),
                         "title": step.title,
-                        "status": plan_step_status_to_acp(&step.status),
+                        "status": step.status.as_wire_str(),
                         "priority": "medium"
                     })
                 }).collect::<Vec<_>>()
@@ -132,16 +132,4 @@ pub(super) fn history_replay_update(session_id: &str, message: &HistoryMessage) 
             "text": strip_internal_tags(&message.text),
         }
     }))
-}
-
-/// Map Borg's `PlanStepStatus` to ACP's plan-entry status string. Explicit
-/// `match` (not `Debug`-stringification) so a future variant addition forces
-/// a compile-error decision rather than silently emitting a non-spec value.
-fn plan_step_status_to_acp(status: &cortex::types::PlanStepStatus) -> &'static str {
-    use cortex::types::PlanStepStatus;
-    match status {
-        PlanStepStatus::Pending => "pending",
-        PlanStepStatus::InProgress => "in_progress",
-        PlanStepStatus::Completed => "completed",
-    }
 }

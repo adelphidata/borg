@@ -4,7 +4,6 @@ use crate::process_registry::ProcessRegistry;
 mod checks;
 pub mod repair;
 mod types;
-pub use checks::runtime::format_relative_time;
 pub use types::{CheckStatus, DiagnosticCheck, DiagnosticReport, RemediationKind};
 
 /// Stepped diagnostic runner that yields one check category at a time.

@@ -204,3 +204,213 @@ fn ip_is_local(ip: IpAddr) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_policy() -> HttpPolicy {
+        HttpPolicy::default()
+    }
+
+    #[test]
+    fn syntactic_rejects_plaintext_http_by_default() {
+        let err = check_url_syntactic("http://example.com/mcp", &default_policy()).unwrap_err();
+        match err {
+            McpError::UrlRefused {
+                reason: UrlRefusalReason::NotHttps,
+                ..
+            } => {}
+            e => panic!("expected NotHttps, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn syntactic_admits_plaintext_when_explicitly_allowed() {
+        let policy = HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        };
+        check_url_syntactic("http://example.com/mcp", &policy).unwrap();
+    }
+
+    #[test]
+    fn syntactic_rejects_loopback_literals_by_default() {
+        // SSRF guard, literal-host slice: encodes the spec that an operator
+        // pasting any IP-literal in private space, or any of the loopback
+        // hostname aliases / cloud metadata FQDNs, gets refused without
+        // requiring DNS.
+        for url in [
+            "https://localhost/mcp",
+            "https://127.0.0.1/mcp",
+            "https://[::1]/mcp",
+            "https://10.0.0.5/mcp",
+            "https://192.168.1.1/mcp",
+            "https://172.16.0.1/mcp",
+            "https://[fc00::1]/mcp",
+            "https://[fe80::1]/mcp",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let err = check_url_syntactic(url, &default_policy()).unwrap_err();
+            match err {
+                McpError::UrlRefused {
+                    reason: UrlRefusalReason::LocalNetworkBlocked,
+                    ..
+                } => {}
+                e => panic!("expected LocalNetworkBlocked for {url}, got {e:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_resolution_rejects_hostname_pointing_at_private_ip() {
+        // SSRF guard, DNS slice: encodes the spec that a *DNS hostname* that
+        // resolves to a private IP must be refused. This is the bypass class
+        // the code review caught — without DNS resolution, an operator's
+        // typo of `https://internal-jira/mcp` sailed through.
+        //
+        // We use `127.0.0.1.nip.io` which is a public DNS service that
+        // canonically resolves arbitrary hostnames to embedded IPs without
+        // requiring our test to hit a host we control. If DNS is unavailable
+        // (offline CI), the test surfaces as a Connect error which we accept
+        // — the alternative is to skip the test, but a regression that breaks
+        // resolution entirely should not silently pass.
+        let err = resolve_endpoint("https://127.0.0.1.nip.io/mcp", &default_policy()).await;
+        match err {
+            Err(McpError::UrlRefused {
+                reason: UrlRefusalReason::LocalNetworkBlocked,
+                ..
+            }) => {}
+            Err(McpError::Connect(msg)) if msg.contains("dns lookup failed") => {
+                // Offline test environment — log and skip the spec assertion.
+                eprintln!("dns_resolution_rejects test skipped: {msg}");
+            }
+            other => panic!("expected LocalNetworkBlocked (or DNS unavailable), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_check_admits_loopback_when_explicitly_allowed() {
+        let policy = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true,
+        };
+        resolve_endpoint("https://localhost/mcp", &policy)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn syntactic_rejects_malformed() {
+        let err = check_url_syntactic("not a url", &default_policy()).unwrap_err();
+        match err {
+            McpError::UrlRefused {
+                reason: UrlRefusalReason::Malformed,
+                ..
+            } => {}
+            e => panic!("expected Malformed, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoint_returns_pins_for_domain_host() {
+        // DNS-rebinding defence: encodes the spec that domain-host URLs surface
+        // pinned `(host, addrs)` entries so the caller can hand them to
+        // `reqwest::ClientBuilder::resolve_to_addrs`. Without this pin list
+        // the connector would re-resolve at connect time and a hostile
+        // authoritative DNS server could swap in a private IP.
+        let policy = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true, // we use localhost-resolving DNS to stay hermetic
+        };
+        match resolve_endpoint("https://localhost/mcp", &policy).await {
+            Ok(r) => {
+                assert_eq!(
+                    r.pins.len(),
+                    1,
+                    "expected exactly one pinned hostname, got {:?}",
+                    r.pins
+                );
+                let (host, addrs) = &r.pins[0];
+                assert_eq!(host, "localhost");
+                assert!(
+                    !addrs.is_empty(),
+                    "pinned address list must be non-empty (got {:?})",
+                    addrs
+                );
+            }
+            Err(McpError::Connect(msg)) if msg.contains("dns lookup failed") => {
+                // Offline CI — `localhost` failed to resolve. Skip rather than
+                // mask a real regression with an unconditional pass.
+                eprintln!("resolve_endpoint pin test skipped: {msg}");
+            }
+            Err(e) => panic!("expected Ok or DNS-unavailable, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoint_returns_no_pins_for_ip_literal() {
+        // IP-literal hosts have no DNS to rebind, so they must surface an
+        // empty pin list — otherwise we'd be telling reqwest to "resolve"
+        // an address that's already an IP, which is meaningless and risks
+        // confusing the connector.
+        let policy = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true,
+        };
+        let r = resolve_endpoint("https://127.0.0.1/mcp", &policy)
+            .await
+            .unwrap();
+        assert!(
+            r.pins.is_empty(),
+            "ip literals must not produce pins, got {:?}",
+            r.pins
+        );
+    }
+
+    #[test]
+    fn always_forbidden_hostnames_refused_even_when_local_network_allowed() {
+        // The unconditional SSRF list (cloud-metadata FQDNs) must NOT be
+        // unlocked when an operator flips `allow_local_network=true` for a
+        // legitimate intranet need. A regression that conflated the two
+        // lists would re-open the GCP IMDS escape hatch.
+        let permissive = HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        };
+        for url in [
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.goog/foo",
+        ] {
+            let err = check_url_syntactic(url, &permissive).unwrap_err();
+            match err {
+                McpError::UrlRefused {
+                    reason: UrlRefusalReason::LocalNetworkBlocked,
+                    ..
+                } => {}
+                e => panic!("expected LocalNetworkBlocked (unconditional) for {url}, got {e:?}",),
+            }
+        }
+    }
+
+    #[test]
+    fn imds_ip_literal_admitted_by_syntactic_layer_when_local_network_allowed() {
+        // Spec pin (syntactic layer only): the IMDS IP literal
+        // 169.254.169.254 sits in link-local space, which `allow_local_network`
+        // legitimately unlocks for operators talking to their own subnet.
+        // Domain hosts in the cloud-metadata FQDN list stay refused
+        // unconditionally (see `always_forbidden_hostnames_…`), but the
+        // matching IP literal does NOT. This asymmetry is intentional —
+        // operators must use the kill switch / URL allowlist (not the
+        // local-network policy) to keep IMDS out — and it deserves a
+        // tracking note in the user-facing settings docs. This test pins
+        // the syntactic gate's behavior only; deeper layers may still
+        // refuse and that would not break this assertion.
+        let permissive = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true,
+        };
+        check_url_syntactic("https://169.254.169.254/", &permissive).unwrap();
+    }
+}

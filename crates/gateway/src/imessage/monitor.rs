@@ -21,6 +21,7 @@ use super::types::{
 };
 use crate::channel::registry::RegisteredChannel;
 use crate::handler::{self, InboundAttachment, InboundMessage};
+use crate::message_processing::voice;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 const STATE_FILE: &str = "state.json";
@@ -157,23 +158,19 @@ async fn monitor_loop(
                                                 .filename
                                                 .clone()
                                                 .unwrap_or_else(|| "imessage-voice.audio".to_string());
-                                            match transcriber
-                                                .transcribe(&bytes, &att.mime_type, &filename, None)
-                                                .await
+                                            if let Some(transcript) = voice::transcribe_or_warn(
+                                                &transcriber,
+                                                &bytes,
+                                                &att.mime_type,
+                                                &filename,
+                                                "iMessage",
+                                            )
+                                            .await
                                             {
-                                                Ok((transcript, _)) => {
-                                                    text = if text.trim().is_empty() {
-                                                        format!("[Voice transcript]: {transcript}")
-                                                    } else {
-                                                        format!(
-                                                            "{text}\n[Voice transcript]: {transcript}"
-                                                        )
-                                                    };
-                                                }
-                                                Err(e) => warn!(
-                                                    error = %e,
-                                                    "iMessage: audio transcription failed"
-                                                ),
+                                                voice::append_voice_transcripts(
+                                                    &mut text,
+                                                    &[transcript],
+                                                );
                                             }
                                         }
                                     }

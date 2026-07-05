@@ -283,18 +283,9 @@ pub(in crate::doctor) fn check_supply_chain(checks: &mut Vec<DiagnosticCheck>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{fails, passes, warns};
     use super::*;
     use crate::doctor::CheckStatus;
-
-    fn fails(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Fail(_))
-    }
-    fn warns(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Warn(_))
-    }
-    fn passes(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Pass)
-    }
 
     #[test]
     fn keychain_classification_reflects_backend_and_file_presence() {

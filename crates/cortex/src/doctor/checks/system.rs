@@ -324,18 +324,9 @@ pub(in crate::doctor) fn check_browser(config: &Config, checks: &mut Vec<Diagnos
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{fails, passes, warns};
     use super::*;
     use crate::doctor::CheckStatus;
-
-    fn fails(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Fail(_))
-    }
-    fn warns(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Warn(_))
-    }
-    fn passes(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Pass)
-    }
 
     #[test]
     fn settings_check_passes_default_and_fails_out_of_range() {

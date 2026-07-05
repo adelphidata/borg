@@ -1434,14 +1434,8 @@ impl LlmClient {
                     self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
                         .await
                 } else {
-                    self.stream_http_transport_inner(
-                        self.wire_path().transport(),
-                        messages,
-                        tools,
-                        &tx,
-                        &cancel,
-                    )
-                    .await
+                    self.stream_http_transport_inner(messages, tools, &tx, &cancel)
+                        .await
                 };
 
                 // Lease drop happens here as we re-bind below; report outcome
@@ -1626,8 +1620,7 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        self.chat_http_transport_inner(self.wire_path().transport(), messages, tools)
-            .await
+        self.chat_http_transport_inner(messages, tools).await
     }
 
     // ── Shared HTTP request path ──
@@ -1823,15 +1816,15 @@ impl LlmClient {
             })
     }
 
-    #[instrument(skip_all, fields(llm.wire_path = transport.protocol_name()))]
+    #[instrument(skip_all, fields(llm.wire_path = self.wire_path().transport().protocol_name()))]
     async fn stream_http_transport_inner(
         &self,
-        transport: &'static dyn Transport,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         tx: &mpsc::Sender<StreamEvent>,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), LlmError> {
+        let transport = self.wire_path().transport();
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
         let request_url = if self.transport_composes_url() {
@@ -1993,13 +1986,13 @@ impl LlmClient {
         result
     }
 
-    #[instrument(skip_all, fields(llm.wire_path = transport.protocol_name()))]
+    #[instrument(skip_all, fields(llm.wire_path = self.wire_path().transport().protocol_name()))]
     async fn chat_http_transport_inner(
         &self,
-        transport: &'static dyn Transport,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
+        let transport = self.wire_path().transport();
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
         let request_url = if self.transport_composes_url() {

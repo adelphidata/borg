@@ -10,15 +10,13 @@ pub(super) async fn browser_manage(
     let action = req.action.trim().to_lowercase();
     let mut messages: Vec<String> = Vec::new();
 
-    let resolver = SettingsResolver::load()
-        .await
-        .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
+    let resolver = open_settings_resolver().await?;
 
     // Helper: probe + return final BrowserManageResponse for the current setting.
     let read_status = |messages: Vec<String>| async {
         let cfg = cortex::config::Config::load_from_db()
             .await
-            .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
+            .map_err(map_internal("config load"))?;
         let url = cfg.browser.cdp_url.clone().unwrap_or_default();
         let connected = if url.is_empty() {
             false
@@ -52,12 +50,12 @@ pub(super) async fn browser_manage(
             let (_, source) = resolver
                 .get_with_source("browser.cdp_url")
                 .await
-                .map_err(|e| TStatus::internal(format!("settings get failed: {e}")))?;
+                .map_err(map_internal("settings get"))?;
             if matches!(source, cortex::settings::SettingSource::Database) {
                 resolver
                     .unset("browser.cdp_url")
                     .await
-                    .map_err(|e| TStatus::internal(format!("settings unset failed: {e}")))?;
+                    .map_err(map_internal("settings unset"))?;
                 notify_runtime_config_reload(&svc.config_notify_tx).await;
                 messages.push("browser disconnected from CDP endpoint".to_string());
             } else {
@@ -202,7 +200,7 @@ async fn connect(
     resolver
         .set("browser.cdp_url", &parsed.url)
         .await
-        .map_err(|e| TStatus::invalid_argument(format!("settings set failed: {e}")))?;
+        .map_err(map_invalid_arg("settings set"))?;
     notify_runtime_config_reload(&svc.config_notify_tx).await;
 
     // Be honest about what this RPC confirmed: a successful

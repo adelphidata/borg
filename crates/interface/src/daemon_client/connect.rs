@@ -97,7 +97,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     };
     if !path.exists() {
         return Err(anyhow!(
-            "no borgd socket at {}. Start the daemon (`borgd`) or use connect_or_spawn for auto-launch.",
+            "no borgd socket at {} — daemon not running? Start it with: borg service start",
             path.display()
         ));
     }
@@ -128,16 +128,12 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     Ok(client)
 }
 
-/// Connect over the default UDS socket, failing with the operator-facing
-/// "start the service" hint when the daemon isn't running. This is the
-/// standard entrypoint for one-shot CLI subcommands that require a live
-/// daemon and must not auto-spawn one.
+/// Connect over the default UDS socket. This is the standard entrypoint for
+/// one-shot CLI subcommands that require a live daemon and must not
+/// auto-spawn one; [`connect`] already surfaces the operator-facing
+/// "start it with: borg service start" hint when the socket is missing.
 pub async fn connect_default() -> Result<DaemonClient> {
-    let socket = default_socket_path();
-    if !socket.exists() {
-        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
-    }
-    connect(Some(&socket)).await.context("connect to borgd")
+    connect(None).await
 }
 
 /// Like [`connect`] but launches `borgd` if the socket isn't present. The spawned daemon is detached — it lives on after this CLI

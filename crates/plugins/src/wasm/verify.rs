@@ -177,7 +177,7 @@ pub fn compute_local_hmac_current(
     compute_local_hmac(key, manifest_bytes, wasm)
 }
 
-pub(super) fn compute_local_hmac(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
+fn compute_local_hmac(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key length"))?;
     // Length-prefix framing so the two segments can't be ambiguously concatenated.
@@ -288,7 +288,7 @@ pub mod legacy_hmac {
     }
 }
 
-pub(super) fn safe_plugin_dir_name(id: &str) -> Result<String> {
+fn safe_plugin_dir_name(id: &str) -> Result<String> {
     validate_plugin_id(id)?;
     Ok(sha256_hex(id.as_bytes()))
 }
@@ -344,4 +344,240 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use wasm_encoder::Instruction;
+
+    use super::super::test_util::{abi_wasm_with_call_body, manifest_for, minimal_wasm};
+    use super::*;
+
+    #[test]
+    fn package_verification_requires_trusted_signature() {
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let verified = verify_package(
+            &canonical,
+            &sig,
+            &wasm,
+            &[manifest.publisher.public_key.clone()],
+            b"local-key",
+        )
+        .expect("trusted signed package verifies");
+        assert_eq!(verified.manifest.id, "dev/echo");
+
+        let err = verify_package(&canonical, &sig, &wasm, &[], b"local-key")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not trusted"));
+    }
+
+    #[test]
+    fn package_verification_requires_local_hmac_key() {
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+
+        let err = verify_package(
+            &canonical,
+            &sig,
+            &wasm,
+            &[manifest.publisher.public_key.clone()],
+            b"",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("local HMAC key is required"));
+    }
+
+    #[test]
+    fn verify_installed_hmac_rejects_empty_key() {
+        // Mirrors `package_verification_requires_local_hmac_key`. Without a key
+        // the HMAC degenerates to a publicly recomputable value, so both sides
+        // would "verify" after tampering. The empty-key path must bail before
+        // we ever reach the constant-time compare.
+        let err = verify_installed_hmac(b"", b"manifest", b"wasm", "0".repeat(64).as_str())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local HMAC key is required"),
+            "expected empty-key bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn safe_plugin_dir_name_cannot_collide_on_slashes() {
+        let nested = safe_plugin_dir_name("dev/echo").unwrap();
+        let literal = safe_plugin_dir_name("dev__echo").unwrap();
+        assert_ne!(nested, literal);
+        assert!(nested.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn verify_package_rejects_wasm_hash_mismatch() {
+        let wasm = minimal_wasm();
+        let other_wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::I64Const(0));
+            call.instruction(&Instruction::End);
+        });
+        assert_ne!(sha256_hex(&wasm), sha256_hex(&other_wasm));
+
+        let signing = SigningKey::from_bytes(&[3u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+
+        let err = verify_package(
+            &canonical,
+            &sig,
+            &other_wasm,
+            &[manifest.publisher.public_key.clone()],
+            b"local-key",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("WASM hash mismatch"),
+            "expected hash-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_package_rejects_post_signing_manifest_tamper() {
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let trusted = vec![manifest.publisher.public_key.clone()];
+
+        let canonical_original = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical_original).to_bytes());
+
+        // Untampered: baseline must verify so the negative below can only fail
+        // on the signature path.
+        verify_package(&canonical_original, &sig, &wasm, &trusted, b"local-key")
+            .expect("baseline signed package verifies");
+
+        let mut tampered = manifest.clone();
+        tampered.version = "9.9.9".to_string();
+        let canonical_tampered = canonical_manifest_bytes(&tampered).unwrap();
+
+        let err = verify_package(&canonical_tampered, &sig, &wasm, &trusted, b"local-key")
+            .unwrap_err()
+            .to_string();
+        // Must be the signature-verification failure specifically — not an
+        // earlier gate firing for an unrelated reason.
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("signature") || lower.contains("verif"),
+            "expected signature verification failure, got: {err}"
+        );
+        assert!(
+            !err.contains("WASM hash mismatch")
+                && !err.contains("invalid plugin manifest JSON")
+                && !err.contains("not trusted"),
+            "signature path not exercised, got an earlier-gate error: {err}"
+        );
+    }
+
+    #[test]
+    fn installed_hmac_detects_single_byte_tamper() {
+        let wasm = minimal_wasm();
+        let manifest_bytes = canonical_manifest_bytes(&manifest_for(&wasm)).unwrap();
+        let key = b"hmac-key-v1";
+        let hmac = compute_local_hmac(key, &manifest_bytes, &wasm).unwrap();
+
+        verify_installed_hmac(key, &manifest_bytes, &wasm, &hmac)
+            .expect("untampered round-trip verifies");
+
+        let mut wasm_tamper = wasm.clone();
+        let last = wasm_tamper.len() - 1;
+        wasm_tamper[last] ^= 0x01;
+        let err = verify_installed_hmac(key, &manifest_bytes, &wasm_tamper, &hmac)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("integrity check failed"),
+            "wasm byte flip must trip integrity check, got: {err}"
+        );
+
+        let mut manifest_tamper = manifest_bytes.clone();
+        manifest_tamper[0] ^= 0x01;
+        let err = verify_installed_hmac(key, &manifest_tamper, &wasm, &hmac)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("integrity check failed"),
+            "manifest byte flip must trip integrity check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_hmac_length_prefix_resists_boundary_shifting() {
+        // With NUL-separator framing, shifting bytes across the manifest/wasm
+        // boundary while keeping concatenation byte-identical would yield the
+        // same MAC. Length-prefix framing must produce a different MAC if the
+        // split moves, even when the concatenated bytes happen to match.
+        let key = b"hmac-key-v1";
+
+        // Build two (manifest_bytes, wasm) pairs that concatenate to the same
+        // material but split at different lengths. NUL-separator framing
+        // (`manifest || 0x00 || wasm`) would only be ambiguous when the
+        // manifest itself contains a NUL — we just demonstrate the more general
+        // property: differently-split inputs MUST yield distinct MACs.
+        let mac_a = compute_local_hmac(key, b"AAAAA", b"BBBBBBBBBB").unwrap();
+        let mac_b = compute_local_hmac(key, b"AAAAABBBBB", b"BBBBB").unwrap();
+        assert_ne!(
+            mac_a, mac_b,
+            "moving the manifest/wasm boundary must change the HMAC"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_verified_package_sets_0700_on_unix() {
+        // The install directory holds verified plugin source bytes that are
+        // moral siblings to credentials once paired with a quarantine bypass —
+        // we want the same 0700 posture as `~/.borg/secrets/`. Asserting on
+        // the post-condition (`mode() & 0o777 == 0o700`) means a future change
+        // that drops the chmod call fails this test for a real reason.
+        use std::os::unix::fs::PermissionsExt;
+
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let trusted = vec![manifest.publisher.public_key.clone()];
+        let package =
+            verify_package(&canonical, &sig, &wasm, &trusted, b"local-key").expect("verify");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let installed = install_verified_package(tmp.path(), &package).expect("install");
+
+        let dir = installed.manifest_path.parent().expect("manifest parent");
+        let mode = std::fs::metadata(dir)
+            .expect("stat install dir")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            SECRETS_DIR_MODE,
+            "install dir {} has mode {:o}, expected 0o700",
+            dir.display(),
+            mode & 0o777
+        );
+    }
 }

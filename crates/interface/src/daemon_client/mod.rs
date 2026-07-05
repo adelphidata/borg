@@ -72,14 +72,16 @@ use tonic::Streaming;
 #[allow(unused_imports)]
 pub use connect::connect_or_spawn;
 
-/// Turn a goal-RPC `tonic::Status` into an `anyhow::Error` that preserves both
-/// the daemon's specific message AND the gRPC code. `.context("…failed")?`
-/// would chain the Status inside anyhow but its outer `Display` — what the
-/// TUI footer shows — drops both. Without this, users see "Admin.SetGoal
-/// {Replace} failed" with no clue the daemon actually said "no active
-/// session — start a turn first" and no way to tell `FailedPrecondition`
-/// (terminal, user-visible) from `Unavailable` (transient, retry).
-fn goal_rpc_err(op: &str, status: &tonic::Status) -> anyhow::Error {
+/// Turn a unary-RPC `tonic::Status` into an `anyhow::Error` that preserves
+/// both the daemon's specific message AND the gRPC code. This is the single
+/// error path for every [`rpc_wrappers!`]-generated method.
+/// `.context("… failed")?` would chain the Status inside anyhow but its
+/// outer `Display` — what the TUI footer shows — drops both. Without this,
+/// users see "Admin.SetGoal{Replace} failed" with no clue the daemon
+/// actually said "no active session — start a turn first" and no way to
+/// tell `FailedPrecondition` (terminal, user-visible) from `Unavailable`
+/// (transient, retry).
+fn rpc_err(op: &'static str, status: tonic::Status) -> anyhow::Error {
     let code = status.code();
     let msg = status.message();
     if msg.is_empty() {
@@ -113,24 +115,29 @@ pub trait AcpFsClient: Clone + Send + Sync + 'static {
 ///
 /// ```text
 /// /// doc comment(s), attached verbatim to the generated method
-/// <stub> fn <name>(<arg>: <Ty>, …) [-> <ReplyTy>] = <rpc>(["<Ctx>",] <request expr>);
+/// <stub> fn <name>(<arg>: <Ty>, …) [-> <ReplyTy>] = <rpc>("<Op>", <request expr>)[.<field>];
 /// ```
 ///
 /// - `<stub>` is a `DaemonClient` field: `admin`, `session`, `status`, `pki`.
 /// - `<rpc>` is the tonic stub method invoked with `<request expr>` (which
 ///   may reference the row's args).
-/// - `"<Ctx>"` is the error-context prefix using the PascalCase RPC name
-///   (e.g. `"Admin.TunnelStart"`); the macro appends `" failed"`. Omitting it
-///   (the pki rows) surfaces the raw `tonic::Status` via `?` instead of
-///   wrapping with `.context(…)`.
+/// - `"<Op>"` is the mandatory operation name using the PascalCase RPC name
+///   (e.g. `"Admin.TunnelStart"`). Every error goes through [`rpc_err`], so
+///   what users see is `"<Op> failed (<Code>): <daemon message>"` — the
+///   daemon's Status message and gRPC code are always preserved.
 /// - With `-> ReplyTy` the wrapper returns `Ok(reply.into_inner())`; without
-///   it the reply is discarded and `Ok(())` returned.
+///   it the reply is discarded and `Ok(())` returned. A trailing `.<field>`
+///   projects one field out of the decoded reply (the row's `ReplyTy` is
+///   then the field's type, e.g. `-> bool = …(…).removed`).
+/// - `Streaming<T>` reply types work as plain `-> ReplyTy` rows: tonic's
+///   server-streaming stubs return `Response<Streaming<T>>`, so
+///   `into_inner()` yields the stream.
 macro_rules! rpc_wrappers {
-    // Internal: reply-returning wrapper with `.context("… failed")`.
+    // Internal: reply-returning wrapper (optional one-field projection).
     (@method
         $(#[$doc:meta])*
         $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( $reply:ty )
-            = $rpc:ident ( $ctx:literal, $req:expr );
+            = $rpc:ident ( $op:literal, $req:expr ) $(. $proj:ident)?;
     ) => {
         $(#[$doc])*
         pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<$reply> {
@@ -138,45 +145,23 @@ macro_rules! rpc_wrappers {
                 .$stub
                 .$rpc($req)
                 .await
-                .context(concat!($ctx, " failed"))?
-                .into_inner())
+                .map_err(|status| rpc_err($op, status))?
+                .into_inner()
+                $(.$proj)?)
         }
     };
-    // Internal: reply-discarding wrapper with `.context("… failed")`.
+    // Internal: reply-discarding wrapper.
     (@method
         $(#[$doc:meta])*
         $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( )
-            = $rpc:ident ( $ctx:literal, $req:expr );
+            = $rpc:ident ( $op:literal, $req:expr );
     ) => {
         $(#[$doc])*
         pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<()> {
             self.$stub
                 .$rpc($req)
                 .await
-                .context(concat!($ctx, " failed"))?;
-            Ok(())
-        }
-    };
-    // Internal: reply-returning wrapper, raw `tonic::Status` error (no context).
-    (@method
-        $(#[$doc:meta])*
-        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( $reply:ty )
-            = $rpc:ident ( $req:expr );
-    ) => {
-        $(#[$doc])*
-        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<$reply> {
-            Ok(self.$stub.$rpc($req).await?.into_inner())
-        }
-    };
-    // Internal: reply-discarding wrapper, raw `tonic::Status` error (no context).
-    (@method
-        $(#[$doc:meta])*
-        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( )
-            = $rpc:ident ( $req:expr );
-    ) => {
-        $(#[$doc])*
-        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<()> {
-            self.$stub.$rpc($req).await?;
+                .map_err(|status| rpc_err($op, status))?;
             Ok(())
         }
     };
@@ -185,7 +170,7 @@ macro_rules! rpc_wrappers {
         $(
             $(#[$doc:meta])*
             $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $reply:ty)?
-                = $rpc:ident ( $($call:tt)+ );
+                = $rpc:ident ( $op:literal, $req:expr ) $(. $proj:ident)?;
         )*
     ) => {
         impl DaemonClient {
@@ -193,7 +178,7 @@ macro_rules! rpc_wrappers {
                 rpc_wrappers!(@method
                     $(#[$doc])*
                     $stub fn $name ( $($arg : $argty),* ) ( $($reply)? )
-                        = $rpc ( $($call)+ );
+                        = $rpc ( $op, $req ) $(. $proj)?;
                 );
             )*
         }
@@ -541,251 +526,44 @@ impl DaemonClient {
             .into_inner();
         Ok(stream)
     }
-
-    /// Reply to a `ShellConfirmation` or `UserInputRequest`. The `value` is
-    /// `"true"`/`"false"` (or `"yes"`/`"no"`) for confirmations, free-form
-    /// text for user-input requests.
-    pub async fn respond_to_prompt(
-        &mut self,
-        session_id: &str,
-        prompt_id: &str,
-        value: &str,
-    ) -> Result<()> {
-        self.session
-            .respond_to_prompt(PromptResponse {
-                session_id: session_id.to_string(),
-                prompt_id: prompt_id.to_string(),
-                value: value.to_string(),
-            })
-            .await
-            .map_err(|e| anyhow!("Session.RespondToPrompt failed: {e}"))?;
-        Ok(())
-    }
-
-    // Goal RPC wrappers — see `goal_rpc_err` (top of file) for why these use
-    // `map_err` instead of `.context()`.
-
-    /// Read the goal for `session_id`. Empty `session_id` resolves to the
-    /// most-recently-active session (matches the TUI's "current session"
-    /// semantics). Returns the wire `GoalDetail`; callers check `present`
-    /// before reading other fields.
-    pub async fn get_goal(&mut self, session_id: &str) -> Result<GoalDetail> {
-        Ok(self
-            .admin
-            .get_goal(GoalRef {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.GetGoal", &s))?
-            .into_inner())
-    }
-
-    /// Create a brand-new goal. Fails when one already exists.
-    pub async fn set_goal_create(
-        &mut self,
-        session_id: &str,
-        objective: &str,
-        token_budget: Option<i64>,
-    ) -> Result<GoalDetail> {
-        Ok(self
-            .admin
-            .set_goal(GoalMutation {
-                session_id: session_id.to_string(),
-                op: protocols::admin::goal_mutation::Op::Create as i32,
-                objective: objective.to_string(),
-                token_budget_present: token_budget.is_some(),
-                token_budget: token_budget.unwrap_or(0),
-                status: String::new(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.SetGoal{Create}", &s))?
-            .into_inner())
-    }
-
-    /// Create or replace the goal. Regenerates `goal_id` and resets
-    /// accounting on replace.
-    pub async fn set_goal_replace(
-        &mut self,
-        session_id: &str,
-        objective: &str,
-        token_budget: Option<i64>,
-    ) -> Result<GoalDetail> {
-        Ok(self
-            .admin
-            .set_goal(GoalMutation {
-                session_id: session_id.to_string(),
-                op: protocols::admin::goal_mutation::Op::Replace as i32,
-                objective: objective.to_string(),
-                token_budget_present: token_budget.is_some(),
-                token_budget: token_budget.unwrap_or(0),
-                status: String::new(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.SetGoal{Replace}", &s))?
-            .into_inner())
-    }
-
-    /// Change goal status. Accepted values: `active` (resume), `paused`,
-    /// `complete`. Daemon rejects illegal transitions.
-    pub async fn set_goal_status(&mut self, session_id: &str, status: &str) -> Result<GoalDetail> {
-        Ok(self
-            .admin
-            .set_goal(GoalMutation {
-                session_id: session_id.to_string(),
-                op: protocols::admin::goal_mutation::Op::SetStatus as i32,
-                objective: String::new(),
-                token_budget_present: false,
-                token_budget: 0,
-                status: status.to_string(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.SetGoal{SetStatus}", &s))?
-            .into_inner())
-    }
-
-    /// Delete the goal row. No-op when none exists.
-    pub async fn clear_goal(&mut self, session_id: &str) -> Result<()> {
-        self.admin
-            .clear_goal(GoalRef {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.ClearGoal", &s))?;
-        Ok(())
-    }
-
-    /// Flip an Active goal to Paused — wired to `/cancel` so an in-flight
-    /// turn aborted by the operator also pauses the Ralph loop. Returns
-    /// `present=false` on the detail when there was nothing to pause
-    /// (matches the no-op semantics on the server side).
-    pub async fn pause_goal_on_interrupt(&mut self, session_id: &str) -> Result<GoalDetail> {
-        Ok(self
-            .admin
-            .pause_goal_on_interrupt(GoalRef {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .map_err(|s| goal_rpc_err("Admin.PauseGoalOnInterrupt", &s))?
-            .into_inner())
-    }
-
-    /// Subscribe to goal lifecycle events. Caller drains the stream;
-    /// dropping it cleans up the daemon-side subscriber.
-    pub async fn subscribe_goal_events(&mut self) -> Result<Streaming<PbGoalEvent>> {
-        Ok(self
-            .admin
-            .subscribe_goal_events(AdminEmpty {})
-            .await
-            .context("Admin.SubscribeGoalEvents failed")?
-            .into_inner())
-    }
-
-    /// Subscribe to tree-lifecycle events. Caller drains the stream;
-    /// dropping it cleans up the daemon-side subscriber.
-    pub async fn subscribe_agent_tree_events(
-        &mut self,
-        session_id: &str,
-    ) -> Result<Streaming<PbAgentTreeEvent>> {
-        Ok(self
-            .admin
-            .subscribe_agent_tree_events(SessionRef {
-                id: session_id.to_string(),
-            })
-            .await
-            .context("Admin.SubscribeAgentTreeEvents failed")?
-            .into_inner())
-    }
-
-    /// Subscribe to heartbeat lifecycle events. Caller drains the stream;
-    /// dropping it cleans up the daemon-side subscriber.
-    pub async fn subscribe_heartbeat_events(&mut self) -> Result<Streaming<PbHeartbeatEvent>> {
-        Ok(self
-            .admin
-            .subscribe_heartbeat_events(AdminEmpty {})
-            .await
-            .context("Admin.SubscribeHeartbeatEvents failed")?
-            .into_inner())
-    }
-
-    /// Drop a previously-set doctor squelch. Returns whether a row was
-    /// removed (`false` = no active squelch existed for this pair).
-    pub async fn doctor_squelch_clear(&mut self, category: &str, name: &str) -> Result<bool> {
-        Ok(self
-            .admin
-            .doctor_squelch_clear(DoctorSquelchClearRequest {
-                category: category.to_string(),
-                name: name.to_string(),
-            })
-            .await
-            .context("Admin.DoctorSquelchClear failed")?
-            .into_inner()
-            .removed)
-    }
-
-    /// Clear all cooled credentials. Returns the count cleared (does not
-    /// touch removed entries).
-    pub async fn reset_credentials(&mut self, provider: &str) -> Result<u64> {
-        Ok(self
-            .admin
-            .reset_credentials(ResetCredentialsRequest {
-                provider: provider.to_string(),
-            })
-            .await
-            .context("Admin.ResetCredentials failed")?
-            .into_inner()
-            .cleared)
-    }
-
-    /// Pair an OAuth credential. Runs the discoverer for `kind` against the
-    /// daemon's home directory and seeds whatever it finds. Returns one entry
-    /// per detected account (empty if the on-disk store is missing).
-    pub async fn pair_credential(&mut self, kind: &str) -> Result<Vec<CredentialEntry>> {
-        Ok(self
-            .admin
-            .pair_credential(protocols::admin::PairCredentialRequest {
-                kind: kind.to_string(),
-            })
-            .await
-            .context("Admin.PairCredential failed")?
-            .into_inner()
-            .entries)
-    }
 }
 
 rpc_wrappers! {
-    // ── PKI (no context literal — errors surface the raw tonic Status) ────
+    // ── PKI ────────────────────────────────────────────────────────────────
 
     /// Mint a fresh pairing code on the daemon. Returns the plaintext code
     /// and its expiry. The code is shown to the operator and used by a
     /// separate `borg pair <code>` invocation that drives the SPAKE2 exchange
     /// over the bootstrap UDS.
     pki fn start_pairing(device_label: &str) -> StartPairingResponse =
-        start_pairing(StartPairingRequest {
+        start_pairing("Pki.StartPairing", StartPairingRequest {
             device_label: device_label.to_string(),
         });
 
     pki fn revoke_device(fingerprint: &str, reason: &str) =
-        revoke_device(RevokeDeviceRequest {
+        revoke_device("Pki.RevokeDevice", RevokeDeviceRequest {
             fingerprint: fingerprint.to_string(),
             reason: reason.to_string(),
         });
 
     pki fn list_paired_devices() -> PairedDeviceList =
-        list_paired_devices(PkiEmpty {});
+        list_paired_devices("Pki.ListPairedDevices", PkiEmpty {});
 
     pki fn verify_audit_chain() -> VerifyAuditResponse =
-        verify_audit_chain(PkiEmpty {});
+        verify_audit_chain("Pki.VerifyAuditChain", PkiEmpty {});
 
     /// Ask the daemon whether the calling client's mTLS cert is within the
     /// 14-day silent-renewal window. Cheap call (single indexed lookup).
+    /// [`Self::ensure_cert_fresh`] deliberately bypasses this wrapper and
+    /// calls the raw stub — it needs the untouched `Status::code()`.
     pki fn get_cert_lifecycle() -> CertLifecycleResponse =
-        get_cert_lifecycle(PkiEmpty {});
+        get_cert_lifecycle("Pki.GetCertLifecycle", PkiEmpty {});
 
     /// Ask the daemon to mint a fresh client cert for `fingerprint` (must
     /// match the connection's principal — daemon enforces). Returned PEM
     /// is the caller's responsibility to persist into the OS keychain.
     pki fn renew_cert(fingerprint: &str) -> RenewCertResponse =
-        renew_cert(RenewCertRequest {
+        renew_cert("Pki.RenewCert", RenewCertRequest {
             fingerprint: fingerprint.to_string(),
         });
 
@@ -803,6 +581,102 @@ rpc_wrappers! {
         close("Session.Close", CloseRequest {
             session_id: session_id.to_string(),
         });
+
+    /// Reply to a `ShellConfirmation` or `UserInputRequest`. The `value` is
+    /// `"true"`/`"false"` (or `"yes"`/`"no"`) for confirmations, free-form
+    /// text for user-input requests.
+    session fn respond_to_prompt(session_id: &str, prompt_id: &str, value: &str) =
+        respond_to_prompt("Session.RespondToPrompt", PromptResponse {
+            session_id: session_id.to_string(),
+            prompt_id: prompt_id.to_string(),
+            value: value.to_string(),
+        });
+
+    // ── Goals ──────────────────────────────────────────────────────────────
+
+    /// Read the goal for `session_id`. Empty `session_id` resolves to the
+    /// most-recently-active session (matches the TUI's "current session"
+    /// semantics). Returns the wire `GoalDetail`; callers check `present`
+    /// before reading other fields.
+    admin fn get_goal(session_id: &str) -> GoalDetail =
+        get_goal("Admin.GetGoal", GoalRef {
+            session_id: session_id.to_string(),
+        });
+
+    /// Create a brand-new goal. Fails when one already exists.
+    admin fn set_goal_create(
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> GoalDetail = set_goal("Admin.SetGoal{Create}", GoalMutation {
+        session_id: session_id.to_string(),
+        op: protocols::admin::goal_mutation::Op::Create as i32,
+        objective: objective.to_string(),
+        token_budget_present: token_budget.is_some(),
+        token_budget: token_budget.unwrap_or(0),
+        status: String::new(),
+    });
+
+    /// Create or replace the goal. Regenerates `goal_id` and resets
+    /// accounting on replace.
+    admin fn set_goal_replace(
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> GoalDetail = set_goal("Admin.SetGoal{Replace}", GoalMutation {
+        session_id: session_id.to_string(),
+        op: protocols::admin::goal_mutation::Op::Replace as i32,
+        objective: objective.to_string(),
+        token_budget_present: token_budget.is_some(),
+        token_budget: token_budget.unwrap_or(0),
+        status: String::new(),
+    });
+
+    /// Change goal status. Accepted values: `active` (resume), `paused`,
+    /// `complete`. Daemon rejects illegal transitions.
+    admin fn set_goal_status(session_id: &str, status: &str) -> GoalDetail =
+        set_goal("Admin.SetGoal{SetStatus}", GoalMutation {
+            session_id: session_id.to_string(),
+            op: protocols::admin::goal_mutation::Op::SetStatus as i32,
+            objective: String::new(),
+            token_budget_present: false,
+            token_budget: 0,
+            status: status.to_string(),
+        });
+
+    /// Delete the goal row. No-op when none exists.
+    admin fn clear_goal(session_id: &str) =
+        clear_goal("Admin.ClearGoal", GoalRef {
+            session_id: session_id.to_string(),
+        });
+
+    /// Flip an Active goal to Paused — wired to `/cancel` so an in-flight
+    /// turn aborted by the operator also pauses the Ralph loop. Returns
+    /// `present=false` on the detail when there was nothing to pause
+    /// (matches the no-op semantics on the server side).
+    admin fn pause_goal_on_interrupt(session_id: &str) -> GoalDetail =
+        pause_goal_on_interrupt("Admin.PauseGoalOnInterrupt", GoalRef {
+            session_id: session_id.to_string(),
+        });
+
+    // ── Event subscriptions (server-streaming) ─────────────────────────────
+
+    /// Subscribe to goal lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    admin fn subscribe_goal_events() -> Streaming<PbGoalEvent> =
+        subscribe_goal_events("Admin.SubscribeGoalEvents", AdminEmpty {});
+
+    /// Subscribe to tree-lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    admin fn subscribe_agent_tree_events(session_id: &str) -> Streaming<PbAgentTreeEvent> =
+        subscribe_agent_tree_events("Admin.SubscribeAgentTreeEvents", SessionRef {
+            id: session_id.to_string(),
+        });
+
+    /// Subscribe to heartbeat lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    admin fn subscribe_heartbeat_events() -> Streaming<PbHeartbeatEvent> =
+        subscribe_heartbeat_events("Admin.SubscribeHeartbeatEvents", AdminEmpty {});
 
     // ── Admin ──────────────────────────────────────────────────────────────
 
@@ -1350,6 +1224,14 @@ rpc_wrappers! {
         reason: reason.unwrap_or("").to_string(),
     });
 
+    /// Drop a previously-set doctor squelch. Returns whether a row was
+    /// removed (`false` = no active squelch existed for this pair).
+    admin fn doctor_squelch_clear(category: &str, name: &str) -> bool =
+        doctor_squelch_clear("Admin.DoctorSquelchClear", DoctorSquelchClearRequest {
+            category: category.to_string(),
+            name: name.to_string(),
+        }).removed;
+
     // ── Credential pool ────────────────────────────────────────────────
 
     /// List credential pools. `provider` empty = all configured providers.
@@ -1380,11 +1262,26 @@ rpc_wrappers! {
             provider: provider.to_string(),
             strategy: strategy.to_string(),
         });
+
+    /// Clear all cooled credentials. Returns the count cleared (does not
+    /// touch removed entries).
+    admin fn reset_credentials(provider: &str) -> u64 =
+        reset_credentials("Admin.ResetCredentials", ResetCredentialsRequest {
+            provider: provider.to_string(),
+        }).cleared;
+
+    /// Pair an OAuth credential. Runs the discoverer for `kind` against the
+    /// daemon's home directory and seeds whatever it finds. Returns one entry
+    /// per detected account (empty if the on-disk store is missing).
+    admin fn pair_credential(kind: &str) -> Vec<CredentialEntry> =
+        pair_credential("Admin.PairCredential", protocols::admin::PairCredentialRequest {
+            kind: kind.to_string(),
+        }).entries;
 }
 
 #[cfg(test)]
-mod goal_rpc_err_tests {
-    use super::goal_rpc_err;
+mod rpc_err_tests {
+    use super::rpc_err;
 
     #[test]
     fn preserves_daemon_message_for_user_visibility() {
@@ -1392,9 +1289,11 @@ mod goal_rpc_err_tests {
         // failed")?` chained the tonic Status inside anyhow but only the
         // outer label rendered in the TUI footer. Users saw the opaque
         // "Admin.SetGoal{Replace} failed" instead of the actual reason.
+        // `rpc_err` is the single error path for every `rpc_wrappers!` row,
+        // so this guarantee holds for all generated wrappers.
         let status =
             tonic::Status::failed_precondition("set_goal: no active session — start a turn first");
-        let err = goal_rpc_err("Admin.SetGoal{Replace}", &status);
+        let err = rpc_err("Admin.SetGoal{Replace}", status);
         let display = format!("{err}");
         assert!(
             display.contains("Admin.SetGoal{Replace}"),
@@ -1414,12 +1313,38 @@ mod goal_rpc_err_tests {
     #[test]
     fn includes_code_when_message_empty() {
         let status = tonic::Status::new(tonic::Code::Unavailable, "");
-        let err = goal_rpc_err("Admin.GetGoal", &status);
+        let err = rpc_err("Admin.GetGoal", status);
         let display = format!("{err}");
         assert!(display.contains("Admin.GetGoal"));
         assert!(
             display.contains("Unavailable"),
             "must include the code, got: {display}"
+        );
+    }
+
+    /// Guard: every `rpc_wrappers!` arm must route errors through `rpc_err`
+    /// — no arm may quietly reintroduce `.context(…)`, which drops the
+    /// daemon's Status message and gRPC code from the user-visible Display.
+    /// Source-grep is the only way to express this invariant (macro arms
+    /// have no type-level surface); scoped to the macro definition only.
+    #[test]
+    fn all_generated_wrappers_use_rpc_err() {
+        let src = include_str!("mod.rs");
+        let macro_body = src
+            .split("macro_rules! rpc_wrappers")
+            .nth(1)
+            .and_then(|rest| rest.split("impl DaemonClient").next())
+            .expect("rpc_wrappers! macro definition present in mod.rs");
+        assert!(
+            !macro_body.contains(".context("),
+            "rpc_wrappers! arms must not use .context() — it hides the \
+             daemon's Status message and code; route through rpc_err instead"
+        );
+        assert_eq!(
+            macro_body.matches("rpc_err(").count(),
+            2,
+            "both rpc_wrappers! arms (reply + unit) must map errors \
+             through rpc_err"
         );
     }
 }

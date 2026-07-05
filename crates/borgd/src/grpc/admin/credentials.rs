@@ -4,7 +4,6 @@
 use super::*;
 
 pub(super) async fn list_credentials(
-    _svc: &AdminSvc,
     req: Request<ListCredentialsRequest>,
 ) -> Result<Response<CredentialList>, TStatus> {
     let req = req.into_inner();
@@ -18,7 +17,7 @@ pub(super) async fn list_credentials(
         Ok(vec![credential_pool_to_proto(&config, &pool)])
     }
     .await
-    .map_err(|e| TStatus::internal(format!("list_credentials failed: {e}")))?;
+    .map_err(map_internal("list_credentials"))?;
     Ok(Response::new(CredentialList { providers }))
 }
 
@@ -250,10 +249,7 @@ pub(super) async fn set_credential_strategy(
     Ok(Response::new(Empty {}))
 }
 
-pub(super) async fn get_api_key(
-    _svc: &AdminSvc,
-    req: Request<ApiKeyRef>,
-) -> Result<Response<ApiKeyValue>, TStatus> {
+pub(super) async fn get_api_key(req: Request<ApiKeyRef>) -> Result<Response<ApiKeyValue>, TStatus> {
     let provider = req.into_inner().provider;
     if provider.is_empty() {
         return Err(TStatus::invalid_argument("provider required"));
@@ -269,7 +265,7 @@ pub(super) async fn get_api_key(
         }
     }
     .await
-    .map_err(|e| TStatus::internal(format!("get_api_key failed: {e}")))?;
+    .map_err(map_internal("get_api_key"))?;
 
     let value = match body {
         None => ApiKeyValue {
@@ -290,10 +286,7 @@ pub(super) async fn get_api_key(
     Ok(Response::new(value))
 }
 
-pub(super) async fn set_api_key(
-    _svc: &AdminSvc,
-    req: Request<ApiKeyValue>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn set_api_key(req: Request<ApiKeyValue>) -> Result<Response<Empty>, TStatus> {
     let req = req.into_inner();
     if req.provider.is_empty() {
         return Err(TStatus::invalid_argument("provider required"));
@@ -331,14 +324,11 @@ pub(super) async fn set_api_key(
         anyhow::Ok(())
     }
     .await
-    .map_err(|e| TStatus::internal(format!("set_api_key failed: {e}")))?;
+    .map_err(map_internal("set_api_key"))?;
     Ok(Response::new(Empty {}))
 }
 
-pub(super) async fn unset_api_key(
-    _svc: &AdminSvc,
-    req: Request<ApiKeyRef>,
-) -> Result<Response<Empty>, TStatus> {
+pub(super) async fn unset_api_key(req: Request<ApiKeyRef>) -> Result<Response<Empty>, TStatus> {
     let provider = req.into_inner().provider;
     if provider.is_empty() {
         return Err(TStatus::invalid_argument("provider required"));
@@ -350,14 +340,11 @@ pub(super) async fn unset_api_key(
         anyhow::Ok(())
     }
     .await
-    .map_err(|e| TStatus::internal(format!("unset_api_key failed: {e}")))?;
+    .map_err(map_internal("unset_api_key"))?;
     Ok(Response::new(Empty {}))
 }
 
-pub(super) async fn list_api_keys(
-    _svc: &AdminSvc,
-    _req: Request<Empty>,
-) -> Result<Response<ApiKeyList>, TStatus> {
+pub(super) async fn list_api_keys(_req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
     let entries = async {
         let db = Database::open().await?;
         let rows = db.list_settings().await?;
@@ -386,12 +373,11 @@ pub(super) async fn list_api_keys(
         anyhow::Ok(out)
     }
     .await
-    .map_err(|e| TStatus::internal(format!("list_api_keys failed: {e}")))?;
+    .map_err(map_internal("list_api_keys"))?;
     Ok(Response::new(ApiKeyList { entries }))
 }
 
 pub(super) async fn add_provider(
-    _svc: &AdminSvc,
     req: Request<AddProviderRequest>,
 ) -> Result<Response<Empty>, TStatus> {
     let req = req.into_inner();
@@ -440,7 +426,6 @@ pub(super) async fn add_provider(
 }
 
 pub(super) async fn remove_provider(
-    _svc: &AdminSvc,
     req: Request<RemoveProviderRequest>,
 ) -> Result<Response<Empty>, TStatus> {
     let id = req.into_inner().id;

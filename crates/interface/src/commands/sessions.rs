@@ -26,12 +26,8 @@ pub(crate) async fn dispatch_sessions(action: Option<SessionsAction>) -> Result<
     }
 }
 
-async fn connect() -> Result<crate::daemon_client::DaemonClient> {
-    crate::daemon_client::connect_default().await
-}
-
 async fn run_list(limit: usize) -> Result<()> {
-    let mut client = connect().await?;
+    let mut client = crate::daemon_client::connect_default().await?;
     let list = client
         .list_sessions()
         .await
@@ -55,7 +51,7 @@ async fn run_list(limit: usize) -> Result<()> {
 }
 
 async fn run_show(id: &str) -> Result<()> {
-    let mut client = connect().await?;
+    let mut client = crate::daemon_client::connect_default().await?;
     let detail = client
         .get_session(id)
         .await

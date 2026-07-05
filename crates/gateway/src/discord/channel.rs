@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::channel::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
+use crate::message_processing::voice;
 
 use super::api::DiscordClient;
 use super::dedup::InteractionDeduplicator;
@@ -163,9 +164,10 @@ impl NativeChannel for DiscordChannel {
                                                                     "discord-voice.audio"
                                                                         .to_string()
                                                                 });
-                                                            if let Ok((transcript, _)) = t
-                                                                .transcribe(
-                                                                    &bytes, mime, &fname, None,
+                                                            if let Some(transcript) =
+                                                                voice::transcribe_or_warn(
+                                                                    t, &bytes, mime, &fname,
+                                                                    "discord",
                                                                 )
                                                                 .await
                                                             {
@@ -173,7 +175,7 @@ impl NativeChannel for DiscordChannel {
                                                                     line_text.push(' ');
                                                                 }
                                                                 line_text.push_str(
-                                                                    "[Voice transcript]: ",
+                                                                    voice::VOICE_TRANSCRIPT_PREFIX,
                                                                 );
                                                                 line_text.push_str(&transcript);
                                                             }

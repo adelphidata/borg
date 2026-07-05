@@ -309,3 +309,499 @@ pub fn classify_execute_error(err: &anyhow::Error) -> WasmExecuteErrorKind {
 
     WasmExecuteErrorKind::GuestTrap
 }
+
+#[cfg(test)]
+mod tests {
+    use wasm_encoder::{
+        BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
+        FunctionSection, Instruction, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    use super::super::test_util::{abi_wasm_with_call_body, manifest_for, minimal_wasm};
+    use super::super::{WasmToolManifest, MAX_FUEL_LIMIT};
+    use super::*;
+
+    /// Positive end-to-end ABI: alloc + borg_tool_call + memory read flow
+    /// returns the bytes the guest staged at the packed pointer.
+    #[test]
+    fn execute_tool_runs_minimal_abi_end_to_end() {
+        let wasm = minimal_wasm();
+        let manifest = manifest_for(&wasm);
+        let output = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .expect("minimal ABI module executes");
+        assert_eq!(
+            output, "OK",
+            "execute_tool must decode packed (ptr,len) and read the guest's staged bytes"
+        );
+    }
+
+    #[test]
+    fn execute_tool_traps_on_fuel_exhaustion() {
+        let wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::Loop(BlockType::Empty));
+            call.instruction(&Instruction::Br(0));
+            call.instruction(&Instruction::End);
+            call.instruction(&Instruction::Unreachable);
+            call.instruction(&Instruction::End);
+        });
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.fuel = 1_000;
+
+        // Run under a hard wall-clock timeout so a regression that removes
+        // the fuel limit produces a clear test failure rather than a hung CI.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manifest_thread = manifest.clone();
+        let wasm_thread = wasm.clone();
+        std::thread::spawn(move || {
+            let r = execute_tool(
+                &manifest_thread,
+                &wasm_thread,
+                "echo_wasm",
+                &serde_json::json!({}),
+            );
+            let _ = tx.send(r);
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("fuel-bounded execution must terminate within 15s");
+
+        let err = result.expect_err("infinite loop must be terminated by fuel exhaustion");
+        // anyhow's Display only shows the topmost context; walk the chain so a
+        // wasmtime `Trap::OutOfFuel` deep in the cause chain is visible.
+        let chain: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chain.to_lowercase().contains("fuel"),
+            "expected wasmtime fuel-exhaustion trap, got chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_output_exceeding_max_output_bytes() {
+        let max_out: u64 = 1_048_576; // upper bound permitted by validate_manifest
+        let packed: i64 = (max_out + 1) as i64; // ptr=0, len = max_out + 1
+        let wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::I64Const(packed));
+            call.instruction(&Instruction::End);
+        });
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.max_output_bytes = max_out;
+
+        let err = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("output exceeded"),
+            "expected output-cap bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_alloc_returning_oob_pointer() {
+        // alloc returns i32::MAX (positive, so it bypasses the `< 0` host
+        // guard) but lies far outside the single memory page. The host's
+        // `memory.write` must trap, not silently succeed or wrap.
+        let wasm = {
+            let mut module = Module::new();
+            let mut types = TypeSection::new();
+            types.ty().function([ValType::I32], [ValType::I32]);
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32], [ValType::I64]);
+            module.section(&types);
+            let mut funcs = FunctionSection::new();
+            funcs.function(0);
+            funcs.function(1);
+            module.section(&funcs);
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            module.section(&memories);
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("alloc", ExportKind::Func, 0);
+            exports.export("borg_tool_call", ExportKind::Func, 1);
+            module.section(&exports);
+            let mut code = CodeSection::new();
+            let mut alloc = Function::new([]);
+            alloc.instruction(&Instruction::I32Const(i32::MAX));
+            alloc.instruction(&Instruction::End);
+            code.function(&alloc);
+            let mut call = Function::new([]);
+            call.instruction(&Instruction::I64Const(0));
+            call.instruction(&Instruction::End);
+            code.function(&call);
+            module.section(&code);
+            module.finish()
+        };
+        let manifest = manifest_for(&wasm);
+        let err = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("out of bounds") || lower.contains("memory"),
+            "expected memory access trap on OOB alloc pointer, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_non_utf8_output() {
+        // Guest stages 0xff 0xfe at offset 2048 (a known-invalid UTF-8 prefix)
+        // and points the packed result there. The host must refuse to surface
+        // arbitrary bytes as a String — only UTF-8 may cross the boundary.
+        let wasm = {
+            let mut module = Module::new();
+            let mut types = TypeSection::new();
+            types.ty().function([ValType::I32], [ValType::I32]);
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32], [ValType::I64]);
+            module.section(&types);
+            let mut funcs = FunctionSection::new();
+            funcs.function(0);
+            funcs.function(1);
+            module.section(&funcs);
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            module.section(&memories);
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("alloc", ExportKind::Func, 0);
+            exports.export("borg_tool_call", ExportKind::Func, 1);
+            module.section(&exports);
+            let mut code = CodeSection::new();
+            let mut alloc = Function::new([]);
+            alloc.instruction(&Instruction::I32Const(1024));
+            alloc.instruction(&Instruction::End);
+            code.function(&alloc);
+            let mut call = Function::new([]);
+            call.instruction(&Instruction::I64Const(((2048u64) << 32 | 2u64) as i64));
+            call.instruction(&Instruction::End);
+            code.function(&call);
+            module.section(&code);
+            let mut data = DataSection::new();
+            data.active(0, &ConstExpr::i32_const(2048), [0xffu8, 0xfeu8]);
+            module.section(&data);
+            module.finish()
+        };
+        let manifest = manifest_for(&wasm);
+        let err = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "expected non-UTF-8 rejection at host boundary, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_traps_on_runtime_memory_grow_past_limit() {
+        // Build a module that declares 1 page but calls memory.grow(N) in
+        // borg_tool_call where N pushes total pages past `max_memory_pages`.
+        // Static validation only checks declared memory; without the runtime
+        // ResourceLimiter the grow would succeed and breach the manifest cap.
+        // Memory grow N pages with max_memory_pages=2 attempting to grow by 8 pages.
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(1);
+        module.section(&funcs);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            // Leave max unset so the static-validation cap doesn't pre-empt the
+            // runtime check; the limiter is what must reject the grow.
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("borg_tool_call", ExportKind::Func, 1);
+        module.section(&exports);
+        let mut code = CodeSection::new();
+        let mut alloc = Function::new([]);
+        alloc.instruction(&Instruction::I32Const(0));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+        let mut call = Function::new([]);
+        // memory.grow returns -1 on failure, new page count on success.
+        // Grow by 32 pages — well past max_memory_pages=2.
+        call.instruction(&Instruction::I32Const(32));
+        call.instruction(&Instruction::MemoryGrow(0));
+        // Trap unless grow returned -1 (i.e. host limiter denied).
+        call.instruction(&Instruction::I32Const(-1));
+        call.instruction(&Instruction::I32Ne);
+        call.instruction(&Instruction::If(BlockType::Empty));
+        call.instruction(&Instruction::Unreachable);
+        call.instruction(&Instruction::End);
+        // Return packed (0, 0) — empty output, signals "limiter denied".
+        call.instruction(&Instruction::I64Const(0));
+        call.instruction(&Instruction::End);
+        code.function(&call);
+        module.section(&code);
+        let wasm = module.finish();
+
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.max_memory_pages = 2;
+
+        // Successful execution with empty output means the limiter rejected
+        // the grow (guest's branch returned packed=0). A regression that
+        // removes the limiter would let grow succeed, the guest would trap on
+        // Unreachable, and execute_tool would return an error.
+        let output = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .expect("limiter denies grow");
+        assert_eq!(
+            output, "",
+            "limiter must deny memory.grow(32) when max_memory_pages=2"
+        );
+    }
+
+    #[test]
+    fn execute_tool_traps_on_wall_clock_timeout() {
+        // Tight infinite loop. With fuel maxed out and timeout_ms set to a
+        // short window, the epoch ticker must trip the call well before fuel
+        // exhaustion. Pre-fix this was a no-op (deadline only checked after
+        // call returned) — fuel was the only stop and a manifest claiming
+        // 100ms timeout would actually run for whatever the fuel budget paid
+        // for.
+        let wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::Loop(BlockType::Empty));
+            call.instruction(&Instruction::Br(0));
+            call.instruction(&Instruction::End);
+            call.instruction(&Instruction::Unreachable);
+            call.instruction(&Instruction::End);
+        });
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.timeout_ms = 100;
+        manifest.limits.fuel = MAX_FUEL_LIMIT; // make fuel-exhaustion path unlikely to win
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manifest_thread = manifest.clone();
+        let wasm_thread = wasm.clone();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let r = execute_tool(
+                &manifest_thread,
+                &wasm_thread,
+                "echo_wasm",
+                &serde_json::json!({}),
+            );
+            let _ = tx.send((r, std::time::Instant::now()));
+        });
+        let (result, finished) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("epoch deadline must terminate execution within 5s");
+        let elapsed = finished.duration_since(started);
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_000),
+            "epoch ticker should trap well under 2s for a 100ms timeout, took: {elapsed:?}"
+        );
+
+        let err = result.expect_err("infinite loop must be terminated by the epoch deadline");
+        let chain: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let lower = chain.to_lowercase();
+        // Either an explicit epoch trap or a generic interrupted trap; the
+        // important property is termination plus an error surfaced to the
+        // caller, not a specific wasmtime error-string spelling.
+        assert!(
+            lower.contains("epoch") || lower.contains("interrupt") || lower.contains("trap"),
+            "expected an interruption-related trap, got chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_undeclared_tool_name() {
+        // A misconfigured caller asking for a tool the plugin doesn't declare
+        // must be rejected before any wasm code runs. Without this guard the
+        // host would silently pass an unknown name through to the guest.
+        let wasm = minimal_wasm();
+        let manifest = manifest_for(&wasm);
+        let err = execute_tool(&manifest, &wasm, "not_a_tool", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not declared"),
+            "expected undeclared-tool rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_routes_tool_name_to_guest_via_reserved_key() {
+        // Multi-tool routing: the guest reads its dispatched name from the
+        // injected `_borg_tool` field of the args JSON and stages it as
+        // output. We build a module that reads the JSON the host wrote, finds
+        // the `_borg_tool` substring, and returns the bytes after it.
+        //
+        // For test simplicity we hard-code expected byte positions instead of
+        // parsing JSON inside wasm: we just stage the input pointer back as
+        // output. The host wrote the JSON containing the routed tool name at
+        // `input_ptr`; returning (input_ptr, input_len) lets the test inspect
+        // it.
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(1);
+        module.section(&funcs);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: Some(1),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("borg_tool_call", ExportKind::Func, 1);
+        module.section(&exports);
+        let mut code = CodeSection::new();
+        let mut alloc = Function::new([]);
+        alloc.instruction(&Instruction::I32Const(1024));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+        // borg_tool_call(input_ptr, input_len) -> packed(input_ptr<<32 | input_len)
+        // i.e. echo the input back to the host as output.
+        let mut call = Function::new([]);
+        // input_ptr (param 0) zero-extended to i64, shifted left by 32
+        call.instruction(&Instruction::LocalGet(0));
+        call.instruction(&Instruction::I64ExtendI32U);
+        call.instruction(&Instruction::I64Const(32));
+        call.instruction(&Instruction::I64Shl);
+        // OR in input_len (param 1) zero-extended to i64
+        call.instruction(&Instruction::LocalGet(1));
+        call.instruction(&Instruction::I64ExtendI32U);
+        call.instruction(&Instruction::I64Or);
+        call.instruction(&Instruction::End);
+        code.function(&call);
+        module.section(&code);
+        let wasm = module.finish();
+
+        let mut manifest = manifest_for(&wasm);
+        // Two tools sharing the same wasm; differentiated only by the
+        // injected `_borg_tool` field in the args JSON the host writes.
+        manifest.tools = vec![
+            WasmToolManifest {
+                name: "echo_a".to_string(),
+                description: "Echo variant A".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            WasmToolManifest {
+                name: "echo_b".to_string(),
+                description: "Echo variant B".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        ];
+
+        let out_a = execute_tool(&manifest, &wasm, "echo_a", &serde_json::json!({})).unwrap();
+        let parsed_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert_eq!(
+            parsed_a.get("_borg_tool").and_then(|v| v.as_str()),
+            Some("echo_a"),
+            "host must inject _borg_tool=echo_a into guest args, got: {out_a}"
+        );
+
+        let out_b = execute_tool(&manifest, &wasm, "echo_b", &serde_json::json!({})).unwrap();
+        let parsed_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert_eq!(
+            parsed_b.get("_borg_tool").and_then(|v| v.as_str()),
+            Some("echo_b"),
+            "second tool must see its own routed name, got: {out_b}"
+        );
+    }
+
+    /// `classify_execute_error` is built from string-grep fallbacks tied to
+    /// literal `bail!` messages in this crate. Drift between the two surfaces
+    /// turns rich audit data into a wall of `guest_trap`. Exercise each
+    /// non-trap arm against an `anyhow!` whose text matches the production
+    /// `bail!` site — anyone renaming an error string will see this test
+    /// fail and either update the classifier or pick a different name.
+    #[test]
+    fn classify_execute_error_covers_string_matched_arms() {
+        use anyhow::anyhow;
+
+        let cases: &[(&str, WasmExecuteErrorKind)] = &[
+            (
+                "growing memory failed: out of pages",
+                WasmExecuteErrorKind::MemoryExceeded,
+            ),
+            (
+                "output exceeded 1048576 bytes",
+                WasmExecuteErrorKind::OutputTooLarge,
+            ),
+            (
+                "log budget exhausted",
+                WasmExecuteErrorKind::LogBytesExceeded,
+            ),
+            (
+                "endpoint not allowed: https://example.com/x",
+                WasmExecuteErrorKind::HostHttpDenied,
+            ),
+            (
+                "plugin http secret-leak scan refused the request",
+                WasmExecuteErrorKind::HostHttpSecretLeak,
+            ),
+            (
+                "http request failed: dns error",
+                WasmExecuteErrorKind::HostHttpUpstream,
+            ),
+            (
+                "undeclared credential 'STRIPE_KEY'",
+                WasmExecuteErrorKind::CredentialDenied,
+            ),
+            (
+                "guest returned non-utf-8 output",
+                WasmExecuteErrorKind::InvalidGuestOutput,
+            ),
+            (
+                "something the classifier has no opinion about",
+                WasmExecuteErrorKind::GuestTrap,
+            ),
+        ];
+
+        for (msg, expected) in cases {
+            let err = anyhow!(*msg);
+            let got = classify_execute_error(&err);
+            assert_eq!(
+                got, *expected,
+                "classifier drift: `{msg}` should map to {expected:?}, got {got:?}",
+            );
+        }
+    }
+}

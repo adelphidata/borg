@@ -433,16 +433,10 @@ pub(in crate::doctor) async fn check_scheduled_tasks(checks: &mut Vec<Diagnostic
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{passes, warns};
     use super::*;
     use crate::db::NewTask;
     use crate::doctor::CheckStatus;
-
-    fn warns(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Warn(_))
-    }
-    fn passes(c: &DiagnosticCheck) -> bool {
-        matches!(c.status, CheckStatus::Pass)
-    }
 
     #[test]
     fn format_relative_time_seconds() {
