@@ -249,6 +249,15 @@ pub(crate) fn build_client(
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .timeout(timeout)
+        // Per-client in-memory cookie jar. Streamable-HTTP MCP servers fronted
+        // by a load balancer (e.g. Cloudflare `__cf*`, or a sticky-session
+        // affinity cookie) depend on the client echoing `Set-Cookie` values so
+        // every request in a session lands on the same backend. Without this,
+        // only the explicit `Mcp-Session-Id` header round-trips and affinity is
+        // lost mid-session. Each transport builds its own `Client`, so the jar
+        // is scoped to a single server — cookies never cross server boundaries,
+        // and with redirects disabled they can't leak cross-origin either.
+        .cookie_store(true)
         .redirect(reqwest::redirect::Policy::none());
     for (host, addrs) in pins {
         builder = builder.resolve_to_addrs(host, addrs);

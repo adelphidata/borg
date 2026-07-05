@@ -48,6 +48,10 @@ struct ServerLog {
     /// Force the next response to a non-2xx status. Useful for the 404
     /// (session-not-found) regression test.
     next_status: Arc<std::sync::atomic::AtomicU16>,
+    /// `Set-Cookie` value to attach to the *response*. Models a load
+    /// balancer's sticky-session / affinity cookie; the client jar should
+    /// store it and echo it on subsequent requests.
+    next_set_cookie: Arc<Mutex<Option<String>>>,
 }
 
 impl ServerLog {
@@ -64,6 +68,10 @@ impl ServerLog {
 
     async fn emit_session_id(&self, sid: &str) {
         *self.next_session_id.lock().await = Some(sid.to_string());
+    }
+
+    async fn emit_set_cookie(&self, cookie: &str) {
+        *self.next_set_cookie.lock().await = Some(cookie.to_string());
     }
 
     async fn next_request_headers(&self) -> HeaderMap {
@@ -95,6 +103,12 @@ async fn rpc_handler(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    if let Some(cookie) = state.next_set_cookie.lock().await.take() {
+        resp_headers.insert(
+            axum::http::header::SET_COOKIE,
+            HeaderValue::from_str(&cookie).expect("bad set-cookie header"),
+        );
+    }
 
     let body_value = state
         .next_response
@@ -195,6 +209,55 @@ async fn session_id_is_echoed_on_subsequent_requests() {
             .and_then(|v| v.to_str().ok()),
         Some("session-A"),
         "second request must echo Mcp-Session-Id captured from first response",
+    );
+}
+
+#[tokio::test]
+async fn affinity_cookie_is_stored_and_echoed_on_subsequent_requests() {
+    // Spec: a streamable-HTTP MCP server behind a load balancer may set a
+    // sticky-session / affinity cookie (e.g. Cloudflare `__cf*`) on its first
+    // response. The transport's client must persist that cookie and resend it
+    // on every subsequent request so the whole session lands on one backend.
+    // Without the per-client cookie jar, only `Mcp-Session-Id` round-trips and
+    // affinity is lost mid-session. This is the regression guard for that jar.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
+    server.emit_set_cookie("affinity=backend-7; Path=/").await;
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect("send 1");
+    let _ = transport.recv().await.expect("recv 1");
+
+    // First request predates the server's Set-Cookie, so it must carry none.
+    let first = server.requests.lock().await[0].clone();
+    assert!(
+        first.get(axum::http::header::COOKIE).is_none(),
+        "first request must not carry a cookie",
+    );
+
+    // Second send: the jar must now echo the affinity cookie back.
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .await
+        .expect("send 2");
+    let _ = transport.recv().await.expect("recv 2");
+
+    let second = server.next_request_headers().await;
+    let cookie = second
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        cookie.contains("affinity=backend-7"),
+        "second request must echo the affinity cookie, got: {cookie:?}",
     );
 }
 
