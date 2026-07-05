@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
+use crate::message_processing::voice;
 
 use super::api::GoogleChatClient;
 
@@ -62,27 +63,21 @@ impl NativeChannel for GoogleChatChannel {
                             .filename
                             .clone()
                             .unwrap_or_else(|| "gchat-voice.audio".to_string());
-                        match transcriber
-                            .transcribe(&bytes, &att.mime_type, &fname, None)
-                            .await
-                        {
-                            Ok((transcript, _)) => transcripts.push(transcript),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "google_chat: audio transcription failed")
-                            }
-                        }
+                        transcripts.extend(
+                            voice::transcribe_or_warn(
+                                &transcriber,
+                                &bytes,
+                                &att.mime_type,
+                                &fname,
+                                "google_chat",
+                            )
+                            .await,
+                        );
                     }
                     Err(e) => tracing::warn!(error = %e, "google_chat: attachment download failed"),
                 }
             }
-            if !transcripts.is_empty() {
-                let joined = transcripts.join(" ");
-                inbound.text = if inbound.text.trim().is_empty() {
-                    format!("[Voice transcript]: {joined}")
-                } else {
-                    format!("{}\n[Voice transcript]: {joined}", inbound.text)
-                };
-            }
+            voice::append_voice_transcripts(&mut inbound.text, &transcripts);
         }
 
         let space_name = inbound.channel_id.clone().unwrap_or_default();

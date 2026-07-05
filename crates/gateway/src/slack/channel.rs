@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::channel::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
+use crate::message_processing::voice;
 
 use super::api::SlackClient;
 use super::dedup::EventDeduplicator;
@@ -82,19 +83,22 @@ impl NativeChannel for SlackChannel {
             if att.data.starts_with("https://") {
                 match self.client.download_file(&att.data).await {
                     Ok((bytes, content_type)) => {
-                        let is_audio = content_type.starts_with("audio/");
-                        if is_audio {
+                        if content_type.starts_with("audio/") {
                             if let Some(ref t) = transcriber {
                                 let filename = att
                                     .filename
                                     .clone()
                                     .unwrap_or_else(|| "slack-voice.audio".to_string());
-                                match t.transcribe(&bytes, &content_type, &filename, None).await {
-                                    Ok((transcript, _)) => voice_transcripts.push(transcript),
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "slack: audio transcription failed")
-                                    }
-                                }
+                                voice_transcripts.extend(
+                                    voice::transcribe_or_warn(
+                                        t,
+                                        &bytes,
+                                        &content_type,
+                                        &filename,
+                                        "slack",
+                                    )
+                                    .await,
+                                );
                             }
                         }
                         use base64::Engine;
@@ -116,14 +120,7 @@ impl NativeChannel for SlackChannel {
             }
         }
         inbound.attachments = resolved_attachments;
-        if !voice_transcripts.is_empty() {
-            let joined = voice_transcripts.join(" ");
-            inbound.text = if inbound.text.trim().is_empty() {
-                format!("[Voice transcript]: {joined}")
-            } else {
-                format!("{}\n[Voice transcript]: {joined}", inbound.text)
-            };
-        }
+        voice::append_voice_transcripts(&mut inbound.text, &voice_transcripts);
 
         // Only inject channel history for top-level @mentions: a threaded reply
         // already carries its own conversation context, so re-injecting full

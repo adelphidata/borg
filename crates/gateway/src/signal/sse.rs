@@ -10,6 +10,7 @@ use super::dedup::MessageDeduplicator;
 use super::parse::{enrich_attachments, parse_envelope};
 use super::types::{Attachment, SignalEnvelope};
 use crate::handler::InboundMessage;
+use crate::message_processing::voice;
 
 use cortex::config::Config;
 use cortex::constants;
@@ -199,24 +200,21 @@ pub async fn run_sse_loop(
                                             .filename
                                             .clone()
                                             .unwrap_or_else(|| "signal-voice.audio".to_string());
-                                        if let Ok((transcript, _)) = transcriber
-                                            .transcribe(&bytes, &att.mime_type, &fname, None)
-                                            .await
-                                        {
-                                            transcripts.push(transcript);
-                                        }
-                                    }
-                                    if !transcripts.is_empty() {
-                                        let joined = transcripts.join(" ");
-                                        inbound.text = if inbound.text.trim().is_empty() {
-                                            format!("[Voice transcript]: {joined}")
-                                        } else {
-                                            format!(
-                                                "{}\n[Voice transcript]: {joined}",
-                                                inbound.text
+                                        transcripts.extend(
+                                            voice::transcribe_or_warn(
+                                                &transcriber,
+                                                &bytes,
+                                                &att.mime_type,
+                                                &fname,
+                                                "signal",
                                             )
-                                        };
+                                            .await,
+                                        );
                                     }
+                                    voice::append_voice_transcripts(
+                                        &mut inbound.text,
+                                        &transcripts,
+                                    );
                                 }
                             }
                             callback(inbound, recipient, group_id).await;

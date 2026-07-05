@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
+use crate::message_processing::voice;
 
 use super::api::TeamsClient;
 use super::dedup::ActivityDeduplicator;
@@ -96,27 +97,21 @@ impl NativeChannel for TeamsChannel {
                                 .name
                                 .clone()
                                 .unwrap_or_else(|| "teams-voice.audio".to_string());
-                            match transcriber
-                                .transcribe(&bytes, &att.content_type, &fname, None)
-                                .await
-                            {
-                                Ok((transcript, _)) => transcripts.push(transcript),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "teams: audio transcription failed")
-                                }
-                            }
+                            transcripts.extend(
+                                voice::transcribe_or_warn(
+                                    &transcriber,
+                                    &bytes,
+                                    &att.content_type,
+                                    &fname,
+                                    "teams",
+                                )
+                                .await,
+                            );
                         }
                         Err(e) => tracing::warn!(error = %e, "teams: attachment download failed"),
                     }
                 }
-                if !transcripts.is_empty() {
-                    let joined = transcripts.join(" ");
-                    inbound.text = if inbound.text.trim().is_empty() {
-                        format!("[Voice transcript]: {joined}")
-                    } else {
-                        format!("{}\n[Voice transcript]: {joined}", inbound.text)
-                    };
-                }
+                voice::append_voice_transcripts(&mut inbound.text, &transcripts);
             }
         }
 

@@ -12,3 +12,5 @@ pub mod inbound_prep;
 pub mod link_understanding;
 /// Plain-text rendering for SMS/iMessage and similar channels.
 pub mod plain_text;
+/// Shared inbound voice-transcription helpers.
+pub(crate) mod voice;
