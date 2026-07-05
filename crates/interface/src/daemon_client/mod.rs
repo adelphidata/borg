@@ -105,6 +105,101 @@ pub trait AcpFsClient: Clone + Send + Sync + 'static {
     fn capabilities(&self) -> AcpFsCapabilities;
 }
 
+/// Generates the thin `DaemonClient` unary-RPC wrapper methods from a compact
+/// table. Each row expands to a `pub async fn` that calls one tonic stub
+/// method, awaits it, and either decodes or discards the reply.
+///
+/// Row grammar:
+///
+/// ```text
+/// /// doc comment(s), attached verbatim to the generated method
+/// <stub> fn <name>(<arg>: <Ty>, …) [-> <ReplyTy>] = <rpc>(["<Ctx>",] <request expr>);
+/// ```
+///
+/// - `<stub>` is a `DaemonClient` field: `admin`, `session`, `status`, `pki`.
+/// - `<rpc>` is the tonic stub method invoked with `<request expr>` (which
+///   may reference the row's args).
+/// - `"<Ctx>"` is the error-context prefix using the PascalCase RPC name
+///   (e.g. `"Admin.TunnelStart"`); the macro appends `" failed"`. Omitting it
+///   (the pki rows) surfaces the raw `tonic::Status` via `?` instead of
+///   wrapping with `.context(…)`.
+/// - With `-> ReplyTy` the wrapper returns `Ok(reply.into_inner())`; without
+///   it the reply is discarded and `Ok(())` returned.
+macro_rules! rpc_wrappers {
+    // Internal: reply-returning wrapper with `.context("… failed")`.
+    (@method
+        $(#[$doc:meta])*
+        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( $reply:ty )
+            = $rpc:ident ( $ctx:literal, $req:expr );
+    ) => {
+        $(#[$doc])*
+        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<$reply> {
+            Ok(self
+                .$stub
+                .$rpc($req)
+                .await
+                .context(concat!($ctx, " failed"))?
+                .into_inner())
+        }
+    };
+    // Internal: reply-discarding wrapper with `.context("… failed")`.
+    (@method
+        $(#[$doc:meta])*
+        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( )
+            = $rpc:ident ( $ctx:literal, $req:expr );
+    ) => {
+        $(#[$doc])*
+        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<()> {
+            self.$stub
+                .$rpc($req)
+                .await
+                .context(concat!($ctx, " failed"))?;
+            Ok(())
+        }
+    };
+    // Internal: reply-returning wrapper, raw `tonic::Status` error (no context).
+    (@method
+        $(#[$doc:meta])*
+        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( $reply:ty )
+            = $rpc:ident ( $req:expr );
+    ) => {
+        $(#[$doc])*
+        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<$reply> {
+            Ok(self.$stub.$rpc($req).await?.into_inner())
+        }
+    };
+    // Internal: reply-discarding wrapper, raw `tonic::Status` error (no context).
+    (@method
+        $(#[$doc:meta])*
+        $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* ) ( )
+            = $rpc:ident ( $req:expr );
+    ) => {
+        $(#[$doc])*
+        pub async fn $name(&mut self $(, $arg: $argty)*) -> Result<()> {
+            self.$stub.$rpc($req).await?;
+            Ok(())
+        }
+    };
+    // Entry point: one impl block from the whole table.
+    (
+        $(
+            $(#[$doc:meta])*
+            $stub:ident fn $name:ident ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $reply:ty)?
+                = $rpc:ident ( $($call:tt)+ );
+        )*
+    ) => {
+        impl DaemonClient {
+            $(
+                rpc_wrappers!(@method
+                    $(#[$doc])*
+                    $stub fn $name ( $($arg : $argty),* ) ( $($reply)? )
+                        = $rpc ( $($call)+ );
+                );
+            )*
+        }
+    };
+}
+
 impl DaemonClient {
     /// Construct a client whose channel is lazily connected (and will fail
     /// every RPC). Test-only — used by TUI unit tests that build an `App`
@@ -143,61 +238,6 @@ impl DaemonClient {
             status: StatusClient::new(channel.clone()),
             pki: PkiClient::new(channel),
         }
-    }
-
-    /// Mint a fresh pairing code on the daemon. Returns the plaintext code
-    /// and its expiry. The code is shown to the operator and used by a
-    /// separate `borg pair <code>` invocation that drives the SPAKE2 exchange
-    /// over the bootstrap UDS.
-    pub async fn start_pairing(&mut self, device_label: &str) -> Result<StartPairingResponse> {
-        Ok(self
-            .pki
-            .start_pairing(StartPairingRequest {
-                device_label: device_label.to_string(),
-            })
-            .await?
-            .into_inner())
-    }
-
-    pub async fn revoke_device(&mut self, fingerprint: &str, reason: &str) -> Result<()> {
-        self.pki
-            .revoke_device(RevokeDeviceRequest {
-                fingerprint: fingerprint.to_string(),
-                reason: reason.to_string(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn list_paired_devices(&mut self) -> Result<PairedDeviceList> {
-        Ok(self
-            .pki
-            .list_paired_devices(PkiEmpty {})
-            .await?
-            .into_inner())
-    }
-
-    pub async fn verify_audit_chain(&mut self) -> Result<VerifyAuditResponse> {
-        Ok(self.pki.verify_audit_chain(PkiEmpty {}).await?.into_inner())
-    }
-
-    /// Ask the daemon whether the calling client's mTLS cert is within the
-    /// 14-day silent-renewal window. Cheap call (single indexed lookup).
-    pub async fn get_cert_lifecycle(&mut self) -> Result<CertLifecycleResponse> {
-        Ok(self.pki.get_cert_lifecycle(PkiEmpty {}).await?.into_inner())
-    }
-
-    /// Ask the daemon to mint a fresh client cert for `fingerprint` (must
-    /// match the connection's principal — daemon enforces). Returned PEM
-    /// is the caller's responsibility to persist into the OS keychain.
-    pub async fn renew_cert(&mut self, fingerprint: &str) -> Result<RenewCertResponse> {
-        Ok(self
-            .pki
-            .renew_cert(RenewCertRequest {
-                fingerprint: fingerprint.to_string(),
-            })
-            .await?
-            .into_inner())
     }
 
     /// If the daemon reports the calling client's mTLS cert is inside the
@@ -522,772 +562,6 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Cancel the in-flight turn for `session_id`. No-op if the session is
-    /// idle.
-    pub async fn cancel(&mut self, session_id: &str) -> Result<()> {
-        self.session
-            .cancel(CancelRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.Cancel failed")?;
-        Ok(())
-    }
-
-    /// Close a session. Returns `Err` if the id is unknown.
-    pub async fn close_session(&mut self, session_id: &str) -> Result<()> {
-        self.session
-            .close(CloseRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.Close failed")?;
-        Ok(())
-    }
-
-    // ── Admin ──────────────────────────────────────────────────────────────
-
-    /// Trigger an immediate heartbeat. Bypasses quiet hours per the in-process
-    /// `/poke` semantics.
-    pub async fn poke(&mut self) -> Result<()> {
-        self.admin
-            .poke(AdminEmpty {})
-            .await
-            .context("Admin.Poke failed")?;
-        Ok(())
-    }
-
-    /// Trigger a specific heartbeat source on the daemon.
-    pub async fn trigger_heartbeat(
-        &mut self,
-        source: &str,
-        bypass_quiet_hours: bool,
-    ) -> Result<()> {
-        self.admin
-            .trigger_heartbeat(TriggerHeartbeatRequest {
-                source: source.to_string(),
-                bypass_quiet_hours,
-            })
-            .await
-            .context("Admin.TriggerHeartbeat failed")?;
-        Ok(())
-    }
-
-    /// Start (or restart) the daemon's public-internet tunnel using the
-    /// `tunnel.*` settings. Returns the post-apply snapshot, with the
-    /// public URL when the start succeeded and `error` populated otherwise.
-    pub async fn tunnel_start(&mut self) -> Result<TunnelStatusReply> {
-        let reply = self
-            .admin
-            .tunnel_start(AdminEmpty {})
-            .await
-            .context("Admin.TunnelStart failed")?
-            .into_inner();
-        Ok(reply)
-    }
-
-    /// Stop the daemon's tunnel. Idempotent — no error when no tunnel runs.
-    pub async fn tunnel_stop(&mut self) -> Result<()> {
-        self.admin
-            .tunnel_stop(AdminEmpty {})
-            .await
-            .context("Admin.TunnelStop failed")?;
-        Ok(())
-    }
-
-    /// Manage the browser CDP attach setting. `action` is one of
-    /// `"connect"`, `"disconnect"`, `"status"`; `url` is only honored for
-    /// `"connect"` and may be empty to use the default.
-    pub async fn browser_manage(
-        &mut self,
-        action: &str,
-        url: Option<&str>,
-    ) -> Result<BrowserManageResponse> {
-        let reply = self
-            .admin
-            .browser_manage(BrowserManageRequest {
-                action: action.to_string(),
-                url: url.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.BrowserManage failed")?
-            .into_inner();
-        Ok(reply)
-    }
-
-    /// Snapshot of the daemon's tunnel state.
-    pub async fn tunnel_status(&mut self) -> Result<TunnelStatusReply> {
-        let reply = self
-            .admin
-            .tunnel_status(AdminEmpty {})
-            .await
-            .context("Admin.TunnelStatus failed")?
-            .into_inner();
-        Ok(reply)
-    }
-
-    /// Run a daily-maintenance sweep on the daemon. Same code path as the
-    /// nightly scheduled task and the in-process `/heal`.
-    pub async fn heal(&mut self) -> Result<HealReport> {
-        let report = self
-            .admin
-            .heal(AdminEmpty {})
-            .await
-            .context("Admin.Heal failed")?
-            .into_inner();
-        Ok(report)
-    }
-
-    /// Hot-reload MCP servers and/or user skills on the daemon without restart.
-    /// `target` selects the subsystem; `0`/`Unspecified` means everything.
-    pub async fn reload(&mut self, target: i32) -> Result<ReloadResponse> {
-        let resp = self
-            .admin
-            .reload(ReloadRequest { target })
-            .await
-            .context("Admin.Reload failed")?
-            .into_inner();
-        Ok(resp)
-    }
-
-    /// Run memory consolidation on the daemon.
-    pub async fn dream(&mut self) -> Result<DreamReport> {
-        let report = self
-            .admin
-            .dream(AdminEmpty {})
-            .await
-            .context("Admin.Dream failed")?
-            .into_inner();
-        Ok(report)
-    }
-
-    /// Get every setting (db + default).
-    pub async fn get_settings(&mut self) -> Result<SettingsSnapshot> {
-        Ok(self
-            .admin
-            .get_settings(AdminEmpty {})
-            .await
-            .context("Admin.GetSettings failed")?
-            .into_inner())
-    }
-
-    /// Set a setting value (validated and persisted to the daemon's DB).
-    pub async fn set_setting(&mut self, key: &str, value: &str) -> Result<()> {
-        self.admin
-            .set_setting(SettingMutation {
-                key: key.to_string(),
-                value: value.to_string(),
-            })
-            .await
-            .context("Admin.SetSetting failed")?;
-        Ok(())
-    }
-
-    /// Remove a setting override (revert to default).
-    pub async fn unset_setting(&mut self, key: &str) -> Result<()> {
-        self.admin
-            .unset_setting(SettingKey {
-                key: key.to_string(),
-            })
-            .await
-            .context("Admin.UnsetSetting failed")?;
-        Ok(())
-    }
-
-    /// List recent sessions. Live sessions are tagged `(live)` in the title.
-    pub async fn list_sessions(&mut self) -> Result<SessionList> {
-        Ok(self
-            .admin
-            .list_sessions(AdminEmpty {})
-            .await
-            .context("Admin.ListSessions failed")?
-            .into_inner())
-    }
-
-    /// Fetch a single session's transcript.
-    pub async fn get_session(&mut self, id: &str) -> Result<SessionDetail> {
-        Ok(self
-            .admin
-            .get_session(SessionRef { id: id.to_string() })
-            .await
-            .context("Admin.GetSession failed")?
-            .into_inner())
-    }
-
-    // ── Session-state RPCs (replace direct agent calls in TUI) ────────────
-
-    /// Snapshot of agent state for the given session_id.
-    pub async fn get_state(&mut self, session_id: &str) -> Result<SessionState> {
-        Ok(self
-            .session
-            .get_state(SessionStateRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.GetState failed")?
-            .into_inner())
-    }
-
-    /// Compact the agent's history.
-    pub async fn compact(&mut self, session_id: &str) -> Result<CompactResponse> {
-        Ok(self
-            .session
-            .compact(CompactRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.Compact failed")?
-            .into_inner())
-    }
-
-    /// Wipe history.
-    pub async fn clear_history(&mut self, session_id: &str) -> Result<()> {
-        self.session
-            .clear_history(ClearRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.ClearHistory failed")?;
-        Ok(())
-    }
-
-    /// Drop the most recent assistant turn.
-    pub async fn undo(&mut self, session_id: &str) -> Result<UndoResponse> {
-        Ok(self
-            .session
-            .undo(UndoRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.Undo failed")?
-            .into_inner())
-    }
-
-    /// Rewind to the Nth user message.
-    pub async fn rewind(&mut self, session_id: &str, n: u64) -> Result<RewindResponse> {
-        Ok(self
-            .session
-            .rewind_to_nth_user_message(RewindRequest {
-                session_id: session_id.to_string(),
-                n,
-            })
-            .await
-            .context("Session.RewindToNthUserMessage failed")?
-            .into_inner())
-    }
-
-    /// Persist the agent's current state.
-    pub async fn auto_save(&mut self, session_id: &str) -> Result<()> {
-        self.session
-            .auto_save(AutoSaveRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.AutoSave failed")?;
-        Ok(())
-    }
-
-    /// Start a fresh agent session inside the existing host.
-    pub async fn new_agent_session(&mut self, session_id: &str) -> Result<NewSessionResponse> {
-        Ok(self
-            .session
-            .new_session(NewSessionRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.NewSession failed")?
-            .into_inner())
-    }
-
-    /// Load an existing agent session by id inside the existing host.
-    pub async fn load_agent_session(
-        &mut self,
-        session_id: &str,
-        agent_session_id: &str,
-    ) -> Result<LoadSessionResponse> {
-        Ok(self
-            .session
-            .load_session(LoadSessionRequest {
-                session_id: session_id.to_string(),
-                agent_session_id: agent_session_id.to_string(),
-            })
-            .await
-            .context("Session.LoadSession failed")?
-            .into_inner())
-    }
-
-    /// Push a steer message into the in-flight turn.
-    pub async fn steer(&mut self, session_id: &str, text: &str) -> Result<()> {
-        self.session
-            .steer(SteerRequest {
-                session_id: session_id.to_string(),
-                text: text.to_string(),
-            })
-            .await
-            .context("Session.Steer failed")?;
-        Ok(())
-    }
-
-    /// Mirror a system-injected assistant message (e.g. a heartbeat the
-    /// daemon streamed to this TUI) into the active session's history,
-    /// so the next user reply has the message in context.
-    pub async fn append_assistant_message(
-        &mut self,
-        session_id: &str,
-        content: &str,
-    ) -> Result<()> {
-        self.session
-            .append_assistant_message(AppendAssistantMessageRequest {
-                session_id: session_id.to_string(),
-                content: content.to_string(),
-            })
-            .await
-            .context("Session.AppendAssistantMessage failed")?;
-        Ok(())
-    }
-
-    /// Fork the active agent session at its last message. Daemon-side
-    /// execution — the TUI must NOT open a SQLite writer to do this itself,
-    /// since `borgd` is the single writer (CLAUDE.md "DB writer split-brain").
-    pub async fn fork_session(&mut self, session_id: &str) -> Result<ForkResponse> {
-        Ok(self
-            .session
-            .fork(ForkRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Session.Fork failed")?
-            .into_inner())
-    }
-
-    // ── Scheduled tasks ───────────────────────────────────────────────────
-
-    /// List all scheduled tasks.
-    pub async fn list_scheduled_tasks(&mut self) -> Result<ScheduledTaskList> {
-        Ok(self
-            .admin
-            .list_scheduled_tasks(AdminEmpty {})
-            .await
-            .context("Admin.ListScheduledTasks failed")?
-            .into_inner())
-    }
-
-    pub async fn create_scheduled_task(
-        &mut self,
-        spec: ScheduledTaskCreate,
-    ) -> Result<ScheduledTask> {
-        Ok(self
-            .admin
-            .create_scheduled_task(spec)
-            .await
-            .context("Admin.CreateScheduledTask failed")?
-            .into_inner())
-    }
-
-    /// Delete a scheduled task by id.
-    pub async fn delete_scheduled_task(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .delete_scheduled_task(ScheduledTaskRef { id: id.to_string() })
-            .await
-            .context("Admin.DeleteScheduledTask failed")?;
-        Ok(())
-    }
-
-    /// Pause a scheduled task.
-    pub async fn pause_scheduled_task(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .pause_scheduled_task(ScheduledTaskRef { id: id.to_string() })
-            .await
-            .context("Admin.PauseScheduledTask failed")?;
-        Ok(())
-    }
-
-    /// Resume a paused scheduled task.
-    pub async fn resume_scheduled_task(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .resume_scheduled_task(ScheduledTaskRef { id: id.to_string() })
-            .await
-            .context("Admin.ResumeScheduledTask failed")?;
-        Ok(())
-    }
-
-    /// Queue a scheduled task for immediate execution.
-    pub async fn run_scheduled_task_now(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .run_scheduled_task_now(ScheduledTaskRef { id: id.to_string() })
-            .await
-            .context("Admin.RunScheduledTaskNow failed")?;
-        Ok(())
-    }
-
-    /// Fetch the most recent run history for a scheduled task.
-    pub async fn get_scheduled_task_runs(
-        &mut self,
-        id: &str,
-        limit: u32,
-    ) -> Result<ScheduledTaskRunList> {
-        Ok(self
-            .admin
-            .get_scheduled_task_runs(GetScheduledTaskRunsRequest {
-                id: id.to_string(),
-                limit,
-            })
-            .await
-            .context("Admin.GetScheduledTaskRuns failed")?
-            .into_inner())
-    }
-
-    /// Detailed view of a scheduled task: full row + last run summary.
-    pub async fn get_scheduled_task_detail(&mut self, id: &str) -> Result<ScheduledTaskDetail> {
-        Ok(self
-            .admin
-            .get_scheduled_task_detail(ScheduledTaskRef { id: id.to_string() })
-            .await
-            .context("Admin.GetScheduledTaskDetail failed")?
-            .into_inner())
-    }
-
-    /// Render a session via the daemon's export pipeline.
-    pub async fn export_session(
-        &mut self,
-        session_id: &str,
-        format: &str,
-    ) -> Result<ExportSessionResponse> {
-        Ok(self
-            .admin
-            .export_session(ExportSessionRequest {
-                session_id: session_id.to_string(),
-                format: format.to_string(),
-            })
-            .await
-            .context("Admin.ExportSession failed")?
-            .into_inner())
-    }
-
-    // ── Pairing ───────────────────────────────────────────────────────────
-
-    /// List pairing requests, optionally filtered by channel.
-    pub async fn list_pairing_requests(
-        &mut self,
-        channel: Option<&str>,
-    ) -> Result<PairingRequestList> {
-        Ok(self
-            .admin
-            .list_pairing_requests(PairingFilter {
-                channel_name: channel.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.ListPairingRequests failed")?
-            .into_inner())
-    }
-
-    /// Mark `session_id` as pending handoff to `target_platform`. The
-    /// destination gateway picks the row up on its next claim sweep.
-    pub async fn request_handoff(&mut self, session_id: &str, target_platform: &str) -> Result<()> {
-        self.admin
-            .request_handoff(AdminHandoffRequest {
-                session_id: session_id.to_string(),
-                target_platform: target_platform.to_string(),
-            })
-            .await
-            .context("Admin.RequestHandoff failed")?;
-        Ok(())
-    }
-
-    /// Mark a running handoff as completed.
-    pub async fn complete_handoff(&mut self, session_id: &str) -> Result<()> {
-        self.admin
-            .complete_handoff(SessionRef {
-                id: session_id.to_string(),
-            })
-            .await
-            .context("Admin.CompleteHandoff failed")?;
-        Ok(())
-    }
-
-    /// Mark a pending/running handoff as failed with a human-readable reason.
-    pub async fn fail_handoff(&mut self, session_id: &str, reason: &str) -> Result<()> {
-        self.admin
-            .fail_handoff(HandoffFailRequest {
-                session_id: session_id.to_string(),
-                reason: reason.to_string(),
-            })
-            .await
-            .context("Admin.FailHandoff failed")?;
-        Ok(())
-    }
-
-    /// Fetch the current handoff status for a session.
-    pub async fn get_handoff_status(&mut self, session_id: &str) -> Result<HandoffStatusReply> {
-        Ok(self
-            .admin
-            .get_handoff_status(SessionRef {
-                id: session_id.to_string(),
-            })
-            .await
-            .context("Admin.GetHandoffStatus failed")?
-            .into_inner())
-    }
-
-    /// Approve a pairing request by code.
-    pub async fn approve_pairing(&mut self, channel: &str, code: &str) -> Result<()> {
-        self.admin
-            .approve_pairing(PairingApproval {
-                channel_name: channel.to_string(),
-                code: code.to_string(),
-            })
-            .await
-            .context("Admin.ApprovePairing failed")?;
-        Ok(())
-    }
-
-    /// List approved senders, optionally filtered by channel.
-    pub async fn list_approved_senders(
-        &mut self,
-        channel: Option<&str>,
-    ) -> Result<ApprovedSenderList> {
-        Ok(self
-            .admin
-            .list_approved_senders(PairingFilter {
-                channel_name: channel.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.ListApprovedSenders failed")?
-            .into_inner())
-    }
-
-    /// Revoke an approved sender.
-    pub async fn revoke_approved_sender(&mut self, channel: &str, sender_id: &str) -> Result<()> {
-        self.admin
-            .revoke_approved_sender(ApprovedSenderRef {
-                channel_name: channel.to_string(),
-                sender_id: sender_id.to_string(),
-            })
-            .await
-            .context("Admin.RevokeApprovedSender failed")?;
-        Ok(())
-    }
-
-    /// Update a scheduled task. Empty-string fields are left unchanged
-    /// (mirrors `cortex::db::UpdateTask`'s `Option<&str>` semantics).
-    pub async fn update_scheduled_task(
-        &mut self,
-        spec: ScheduledTaskUpdate,
-    ) -> Result<ScheduledTask> {
-        Ok(self
-            .admin
-            .update_scheduled_task(spec)
-            .await
-            .context("Admin.UpdateScheduledTask failed")?
-            .into_inner())
-    }
-
-    /// Ambient status (the `class:` line in the TUI header).
-    pub async fn get_ambient_status(&mut self) -> Result<AmbientStatus> {
-        Ok(self
-            .admin
-            .get_ambient_status(AdminEmpty {})
-            .await
-            .context("Admin.GetAmbientStatus failed")?
-            .into_inner())
-    }
-
-    /// Snapshot of running + recently-finished subprocesses tracked by the
-    /// daemon's `ProcessRegistry`. Empty when the daemon has no registry
-    /// wired (older daemon builds, test harnesses without the registry).
-    pub async fn get_subprocesses(&mut self) -> Result<SubprocessSnapshot> {
-        Ok(self
-            .admin
-            .get_subprocesses(AdminEmpty {})
-            .await
-            .context("Admin.GetSubprocesses failed")?
-            .into_inner())
-    }
-
-    /// Toggle the auto-reap pin on a specific subprocess entry. Pinning a
-    /// running workload exempts it from the daily maintenance sweep's
-    /// 24h auto-kill and downgrades its doctor surface.
-    pub async fn set_subprocess_pinned(&mut self, id: u64, pinned: bool) -> Result<()> {
-        let _ = self
-            .admin
-            .set_subprocess_pinned(SetSubprocessPinnedRequest { id, pinned })
-            .await
-            .context("Admin.SetSubprocessPinned failed")?;
-        Ok(())
-    }
-
-    /// Latest doctor-run persistent warnings.
-    pub async fn get_persistent_warnings(&mut self) -> Result<WarningList> {
-        Ok(self
-            .admin
-            .get_persistent_warnings(AdminEmpty {})
-            .await
-            .context("Admin.GetPersistentWarnings failed")?
-            .into_inner())
-    }
-
-    // ── Status ────────────────────────────────────────────────────────────
-
-    /// Vitals snapshot — already decay-applied, with optional drift_notice.
-    pub async fn get_vitals(&mut self) -> Result<Vitals> {
-        Ok(self
-            .status
-            .get_vitals(StatusEmpty {})
-            .await
-            .context("Status.GetVitals failed")?
-            .into_inner())
-    }
-
-    /// Evolution state snapshot (replay-derived).
-    pub async fn get_evolution(&mut self) -> Result<EvolutionStateProto> {
-        Ok(self
-            .status
-            .get_evolution(StatusEmpty {})
-            .await
-            .context("Status.GetEvolution failed")?
-            .into_inner())
-    }
-
-    /// Bond state snapshot.
-    pub async fn get_bond_state(&mut self) -> Result<BondStateProto> {
-        Ok(self
-            .status
-            .get_bond_state(StatusEmpty {})
-            .await
-            .context("Status.GetBondState failed")?
-            .into_inner())
-    }
-
-    /// Bond events since a unix timestamp (DESC).
-    pub async fn get_bond_events_since(&mut self, since_unix: i64) -> Result<BondEventList> {
-        Ok(self
-            .status
-            .get_bond_events_since(Int64Cursor { since_unix })
-            .await
-            .context("Status.GetBondEventsSince failed")?
-            .into_inner())
-    }
-
-    /// Evolution events since a unix timestamp (DESC).
-    pub async fn get_evolution_events_since(
-        &mut self,
-        since_unix: i64,
-    ) -> Result<EvolutionEventList> {
-        Ok(self
-            .status
-            .get_evolution_events_since(Int64Cursor { since_unix })
-            .await
-            .context("Status.GetEvolutionEventsSince failed")?
-            .into_inner())
-    }
-
-    /// Vitals events since a unix timestamp (DESC).
-    pub async fn get_vitals_events_since(&mut self, since_unix: i64) -> Result<VitalsEventList> {
-        Ok(self
-            .status
-            .get_vitals_events_since(Int64Cursor { since_unix })
-            .await
-            .context("Status.GetVitalsEventsSince failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered text for the status popup's Overview tab. `card_width` is
-    /// the popup's inner width (passed verbatim to the daemon's evolution-card
-    /// formatter); pass 0 for a sane default.
-    pub async fn get_status_overview_text(&mut self, card_width: u32) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_status_overview_text(StatusTextRequest { card_width })
-            .await
-            .context("Status.GetStatusOverviewText failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered `/evolution` text for the status popup's Evolution tab.
-    pub async fn get_evolution_text(&mut self) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_evolution_text(StatusEmpty {})
-            .await
-            .context("Status.GetEvolutionText failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered `/xp` text for the status popup's XP tab.
-    pub async fn get_xp_text(&mut self) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_xp_text(StatusEmpty {})
-            .await
-            .context("Status.GetXpText failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered archetype-scores text for the status popup.
-    pub async fn get_archetype_scores_text(&mut self) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_archetype_scores_text(StatusEmpty {})
-            .await
-            .context("Status.GetArchetypeScoresText failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered evolution-history text for the status popup.
-    pub async fn get_evolution_history_text(&mut self) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_evolution_history_text(StatusEmpty {})
-            .await
-            .context("Status.GetEvolutionHistoryText failed")?
-            .into_inner())
-    }
-
-    /// Pre-rendered `/usage` text for the usage popup. `days = 0`
-    /// asks the daemon to use its default window (30); the daemon clamps
-    /// large values to 365 — the cli does not validate.
-    pub async fn get_usage_text(&mut self, days: u32) -> Result<StatusText> {
-        Ok(self
-            .status
-            .get_usage_text(UsageRequest { days })
-            .await
-            .context("Status.GetUsageText failed")?
-            .into_inner())
-    }
-
-    /// XP snapshot (`/xp` data).
-    pub async fn get_xp(&mut self) -> Result<XpSnapshot> {
-        Ok(self
-            .status
-            .get_xp(StatusEmpty {})
-            .await
-            .context("Status.GetXp failed")?
-            .into_inner())
-    }
-
-    /// Ask the daemon to shut down gracefully. Returns once the daemon has
-    /// acknowledged the request — the daemon's drain loop runs in the
-    /// background. Subsequent `borg` invocations re-spawn the daemon.
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.admin
-            .shutdown(AdminEmpty {})
-            .await
-            .context("Admin.Shutdown failed")?;
-        Ok(())
-    }
-
-    /// Generate + deliver a personalized greeting for a newly approved sender.
-    pub async fn send_approval_greeting(&mut self, channel: &str, sender_id: &str) -> Result<()> {
-        self.admin
-            .send_approval_greeting(ApprovalGreetingRequest {
-                channel: channel.to_string(),
-                sender_id: sender_id.to_string(),
-            })
-            .await
-            .context("Admin.SendApprovalGreeting failed")?;
-        Ok(())
-    }
-
     // Goal RPC wrappers — see `goal_rpc_err` (top of file) for why these use
     // `map_err` instead of `.context()`.
 
@@ -1406,65 +680,6 @@ impl DaemonClient {
             .into_inner())
     }
 
-    // -- Sub-agent control (`/agents`) --------------------------------------
-
-    /// List sub-agents owned by `session_id`. Empty `session_id` resolves to
-    /// the most-recently active session daemon-side.
-    pub async fn list_agents(&mut self, session_id: &str) -> Result<PbAgentList> {
-        Ok(self
-            .admin
-            .list_agents(AgentListRequest {
-                session_id: session_id.to_string(),
-            })
-            .await
-            .context("Admin.ListAgents failed")?
-            .into_inner())
-    }
-
-    /// Kill a single sub-agent.
-    pub async fn kill_agent(&mut self, agent_id: &str) -> Result<()> {
-        self.admin
-            .kill_agent(PbAgentRef {
-                agent_id: agent_id.to_string(),
-            })
-            .await
-            .context("Admin.KillAgent failed")?;
-        Ok(())
-    }
-
-    /// Kill an agent and every descendant in its subtree.
-    pub async fn kill_agent_subtree(&mut self, agent_id: &str) -> Result<()> {
-        self.admin
-            .kill_agent_subtree(PbAgentRef {
-                agent_id: agent_id.to_string(),
-            })
-            .await
-            .context("Admin.KillAgentSubtree failed")?;
-        Ok(())
-    }
-
-    /// Pause an agent at its next iteration boundary.
-    pub async fn pause_agent(&mut self, agent_id: &str) -> Result<()> {
-        self.admin
-            .pause_agent(PbAgentRef {
-                agent_id: agent_id.to_string(),
-            })
-            .await
-            .context("Admin.PauseAgent failed")?;
-        Ok(())
-    }
-
-    /// Resume a paused agent.
-    pub async fn resume_agent(&mut self, agent_id: &str) -> Result<()> {
-        self.admin
-            .resume_agent(PbAgentRef {
-                agent_id: agent_id.to_string(),
-            })
-            .await
-            .context("Admin.ResumeAgent failed")?;
-        Ok(())
-    }
-
     /// Subscribe to tree-lifecycle events. Caller drains the stream;
     /// dropping it cleans up the daemon-side subscriber.
     pub async fn subscribe_agent_tree_events(
@@ -1481,35 +696,6 @@ impl DaemonClient {
             .into_inner())
     }
 
-    /// List persisted spawn-tree snapshots for a session.
-    pub async fn list_agent_snapshots(&mut self, session_id: &str) -> Result<AgentSnapshotList> {
-        Ok(self
-            .admin
-            .list_agent_snapshots(SessionRef {
-                id: session_id.to_string(),
-            })
-            .await
-            .context("Admin.ListAgentSnapshots failed")?
-            .into_inner())
-    }
-
-    /// Fetch the agents captured in one persisted snapshot.
-    pub async fn get_agent_snapshot(
-        &mut self,
-        session_id: &str,
-        turn_id: &str,
-    ) -> Result<PbAgentList> {
-        Ok(self
-            .admin
-            .get_agent_snapshot(AgentSnapshotRefRequest {
-                session_id: session_id.to_string(),
-                turn_id: turn_id.to_string(),
-            })
-            .await
-            .context("Admin.GetAgentSnapshot failed")?
-            .into_inner())
-    }
-
     /// Subscribe to heartbeat lifecycle events. Caller drains the stream;
     /// dropping it cleans up the daemon-side subscriber.
     pub async fn subscribe_heartbeat_events(&mut self) -> Result<Streaming<PbHeartbeatEvent>> {
@@ -1519,276 +705,6 @@ impl DaemonClient {
             .await
             .context("Admin.SubscribeHeartbeatEvents failed")?
             .into_inner())
-    }
-
-    /// Append a row to `activity_log` via the daemon (avoids opening the DB
-    /// from the cli).
-    pub async fn log_activity(&mut self, level: &str, source: &str, message: &str) -> Result<()> {
-        self.admin
-            .log_activity(LogActivityRequest {
-                level: level.to_string(),
-                source: source.to_string(),
-                message: message.to_string(),
-            })
-            .await
-            .context("Admin.LogActivity failed")?;
-        Ok(())
-    }
-
-    /// Pre-rendered activity-log tail. `min_level` accepts the same level
-    /// strings as `cortex::db::query_activity` (`"error"`, `"warn"`,
-    /// `"info"`, `"debug"`, `"all"`); empty falls back to `"info"`.
-    pub async fn get_activity_log_text(
-        &mut self,
-        count: u32,
-        min_level: &str,
-        category: &str,
-    ) -> Result<ActivityLogText> {
-        Ok(self
-            .admin
-            .get_activity_log_text(ActivityLogQuery {
-                count,
-                min_level: min_level.to_string(),
-                category: category.to_string(),
-            })
-            .await
-            .context("Admin.GetActivityLogText failed")?
-            .into_inner())
-    }
-
-    /// Persist plugin install metadata + file hashes in a single round-trip.
-    pub async fn plugin_install(
-        &mut self,
-        req: PluginInstallRequest,
-    ) -> Result<PluginInstallResponse> {
-        Ok(self
-            .admin
-            .plugin_install(req)
-            .await
-            .context("Admin.PluginInstall failed")?
-            .into_inner())
-    }
-
-    // ── API key routing ──────────────────────────────────────────────────
-
-    /// Fetch the routing metadata for a provider's API key. Returns an
-    /// `ApiKeyValue` whose `body` is one of `literal`/`keychain`/`unset`.
-    /// The cli does the keychain lookup locally — the daemon only stores
-    /// the routing.
-    pub async fn get_api_key(&mut self, provider: &str) -> Result<ApiKeyValue> {
-        Ok(self
-            .admin
-            .get_api_key(ApiKeyRef {
-                provider: provider.to_string(),
-            })
-            .await
-            .context("Admin.GetApiKey failed")?
-            .into_inner())
-    }
-
-    /// Persist API-key routing metadata for `provider`. The body must be a
-    /// `literal` or `keychain` ref — `unset` is rejected here; use
-    /// [`unset_api_key`](Self::unset_api_key) to clear.
-    pub async fn set_api_key(&mut self, value: ApiKeyValue) -> Result<()> {
-        self.admin
-            .set_api_key(value)
-            .await
-            .context("Admin.SetApiKey failed")?;
-        Ok(())
-    }
-
-    /// Clear the stored routing metadata for `provider`. The cli is
-    /// responsible for deleting any companion keychain entry.
-    pub async fn unset_api_key(&mut self, provider: &str) -> Result<()> {
-        self.admin
-            .unset_api_key(ApiKeyRef {
-                provider: provider.to_string(),
-            })
-            .await
-            .context("Admin.UnsetApiKey failed")?;
-        Ok(())
-    }
-
-    /// List every provider with routing metadata stored, with the backend
-    /// kind ("literal" or "keychain") so the cli can render which backend
-    /// is in use without leaking the secret.
-    pub async fn list_api_keys(&mut self) -> Result<ApiKeyList> {
-        Ok(self
-            .admin
-            .list_api_keys(AdminEmpty {})
-            .await
-            .context("Admin.ListApiKeys failed")?
-            .into_inner())
-    }
-
-    // ── Onboarding ───────────────────────────────────────────────────────
-
-    /// Read the `onboarded` sentinel from the daemon's settings table.
-    pub async fn get_onboarding_state(&mut self) -> Result<OnboardingState> {
-        Ok(self
-            .admin
-            .get_onboarding_state(AdminEmpty {})
-            .await
-            .context("Admin.GetOnboardingState failed")?
-            .into_inner())
-    }
-
-    /// Mark first-run onboarding complete (`onboarded=true` in settings).
-    pub async fn set_onboarding_complete(&mut self) -> Result<()> {
-        self.admin
-            .set_onboarding_complete(AdminEmpty {})
-            .await
-            .context("Admin.SetOnboardingComplete failed")?;
-        Ok(())
-    }
-
-    /// Monthly token total across `token_usage` rows in the current calendar
-    /// month (UTC). Used by the TUI `/usage` view.
-    pub async fn get_monthly_token_total(&mut self) -> Result<MonthlyTokenTotal> {
-        Ok(self
-            .admin
-            .get_monthly_token_total(AdminEmpty {})
-            .await
-            .context("Admin.GetMonthlyTokenTotal failed")?
-            .into_inner())
-    }
-
-    /// Monthly cost total. `present=false` means there are no rows this
-    /// month — caller should hide the line rather than render `$0.00`.
-    pub async fn get_monthly_total_cost(&mut self) -> Result<MonthlyTotalCost> {
-        Ok(self
-            .admin
-            .get_monthly_total_cost(AdminEmpty {})
-            .await
-            .context("Admin.GetMonthlyTotalCost failed")?
-            .into_inner())
-    }
-
-    /// Daemon-wide status snapshot.
-    pub async fn get_daemon_status(&mut self) -> Result<DaemonStatus> {
-        Ok(self
-            .admin
-            .get_daemon_status(AdminEmpty {})
-            .await
-            .context("Admin.GetDaemonStatus failed")?
-            .into_inner())
-    }
-
-    // ── Provider / webhook / client-token writes ──────────────────────────
-
-    /// Insert a BYO provider row. Reads stay on `Database::open_readonly`.
-    pub async fn add_provider(
-        &mut self,
-        id: &str,
-        display_name: &str,
-        base_url: &str,
-        api_key_env: Option<&str>,
-        category: &str,
-    ) -> Result<()> {
-        self.admin
-            .add_provider(AddProviderRequest {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                base_url: base_url.to_string(),
-                api_key_env: api_key_env.unwrap_or("").to_string(),
-                category: category.to_string(),
-            })
-            .await
-            .context("Admin.AddProvider failed")?;
-        Ok(())
-    }
-
-    /// Remove a BYO provider row by id. Idempotent — succeeds even if the id
-    /// is already absent.
-    pub async fn remove_provider(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .remove_provider(RemoveProviderRequest { id: id.to_string() })
-            .await
-            .context("Admin.RemoveProvider failed")?;
-        Ok(())
-    }
-
-    /// Create a webhook definition; returns the raw HMAC secret bytes —
-    /// the caller is responsible for printing the hex once and discarding.
-    pub async fn create_webhook(
-        &mut self,
-        name: &str,
-        sender_path: &str,
-        thread_path: Option<&str>,
-        body_path: &str,
-    ) -> Result<CreateWebhookResponse> {
-        Ok(self
-            .admin
-            .create_webhook(CreateWebhookRequest {
-                name: name.to_string(),
-                sender_path: sender_path.to_string(),
-                thread_path: thread_path.unwrap_or("").to_string(),
-                body_path: body_path.to_string(),
-            })
-            .await
-            .context("Admin.CreateWebhook failed")?
-            .into_inner())
-    }
-
-    /// Mark a webhook revoked. Idempotent.
-    pub async fn revoke_webhook(&mut self, name: &str) -> Result<()> {
-        self.admin
-            .revoke_webhook(WebhookRef {
-                name: name.to_string(),
-            })
-            .await
-            .context("Admin.RevokeWebhook failed")?;
-        Ok(())
-    }
-
-    /// Issue a bearer client token; the plaintext is returned exactly once.
-    pub async fn issue_client_token(
-        &mut self,
-        label: &str,
-        scopes: &str,
-    ) -> Result<IssueClientTokenResponse> {
-        Ok(self
-            .admin
-            .issue_client_token(IssueClientTokenRequest {
-                label: label.to_string(),
-                scopes: scopes.to_string(),
-            })
-            .await
-            .context("Admin.IssueClientToken failed")?
-            .into_inner())
-    }
-
-    /// Revoke a bearer token by label.
-    pub async fn revoke_client_token(&mut self, label: &str) -> Result<RevokedClientToken> {
-        Ok(self
-            .admin
-            .revoke_client_token(ClientTokenRef {
-                label: label.to_string(),
-            })
-            .await
-            .context("Admin.RevokeClientToken failed")?
-            .into_inner())
-    }
-
-    /// Squelch a doctor finding `(category, name)` until `expires_at_unix`.
-    /// Re-squelching an existing pair refreshes the timestamps + reason.
-    pub async fn doctor_squelch_set(
-        &mut self,
-        category: &str,
-        name: &str,
-        expires_at_unix: i64,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        self.admin
-            .doctor_squelch_set(DoctorSquelchSetRequest {
-                category: category.to_string(),
-                name: name.to_string(),
-                expires_at_unix,
-                reason: reason.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.DoctorSquelchSet failed")?;
-        Ok(())
     }
 
     /// Drop a previously-set doctor squelch. Returns whether a row was
@@ -1804,57 +720,6 @@ impl DaemonClient {
             .context("Admin.DoctorSquelchClear failed")?
             .into_inner()
             .removed)
-    }
-
-    // ── Credential pool ────────────────────────────────────────────────
-
-    /// List credential pools. `provider` empty = all configured providers.
-    pub async fn list_credentials(&mut self, provider: Option<&str>) -> Result<CredentialList> {
-        Ok(self
-            .admin
-            .list_credentials(ListCredentialsRequest {
-                provider: provider.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.ListCredentials failed")?
-            .into_inner())
-    }
-
-    /// Add a credential to a pool. Returns the persisted entry with its
-    /// fingerprint (plaintext key is not echoed back).
-    pub async fn add_credential(
-        &mut self,
-        provider: &str,
-        key: &str,
-        label: Option<&str>,
-    ) -> Result<CredentialEntry> {
-        Ok(self
-            .admin
-            .add_credential(AddCredentialRequest {
-                provider: provider.to_string(),
-                key: key.to_string(),
-                label: label.unwrap_or("").to_string(),
-            })
-            .await
-            .context("Admin.AddCredential failed")?
-            .into_inner())
-    }
-
-    /// Remove a credential (soft-delete + write suppression row).
-    pub async fn remove_credential(
-        &mut self,
-        provider: &str,
-        target: &str,
-    ) -> Result<CredentialEntry> {
-        Ok(self
-            .admin
-            .remove_credential(RemoveCredentialRequest {
-                provider: provider.to_string(),
-                target: target.to_string(),
-            })
-            .await
-            .context("Admin.RemoveCredential failed")?
-            .into_inner())
     }
 
     /// Clear all cooled credentials. Returns the count cleared (does not
@@ -1885,18 +750,636 @@ impl DaemonClient {
             .into_inner()
             .entries)
     }
+}
+
+rpc_wrappers! {
+    // ── PKI (no context literal — errors surface the raw tonic Status) ────
+
+    /// Mint a fresh pairing code on the daemon. Returns the plaintext code
+    /// and its expiry. The code is shown to the operator and used by a
+    /// separate `borg pair <code>` invocation that drives the SPAKE2 exchange
+    /// over the bootstrap UDS.
+    pki fn start_pairing(device_label: &str) -> StartPairingResponse =
+        start_pairing(StartPairingRequest {
+            device_label: device_label.to_string(),
+        });
+
+    pki fn revoke_device(fingerprint: &str, reason: &str) =
+        revoke_device(RevokeDeviceRequest {
+            fingerprint: fingerprint.to_string(),
+            reason: reason.to_string(),
+        });
+
+    pki fn list_paired_devices() -> PairedDeviceList =
+        list_paired_devices(PkiEmpty {});
+
+    pki fn verify_audit_chain() -> VerifyAuditResponse =
+        verify_audit_chain(PkiEmpty {});
+
+    /// Ask the daemon whether the calling client's mTLS cert is within the
+    /// 14-day silent-renewal window. Cheap call (single indexed lookup).
+    pki fn get_cert_lifecycle() -> CertLifecycleResponse =
+        get_cert_lifecycle(PkiEmpty {});
+
+    /// Ask the daemon to mint a fresh client cert for `fingerprint` (must
+    /// match the connection's principal — daemon enforces). Returned PEM
+    /// is the caller's responsibility to persist into the OS keychain.
+    pki fn renew_cert(fingerprint: &str) -> RenewCertResponse =
+        renew_cert(RenewCertRequest {
+            fingerprint: fingerprint.to_string(),
+        });
+
+    // ── Session lifecycle ──────────────────────────────────────────────────
+
+    /// Cancel the in-flight turn for `session_id`. No-op if the session is
+    /// idle.
+    session fn cancel(session_id: &str) =
+        cancel("Session.Cancel", CancelRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Close a session. Returns `Err` if the id is unknown.
+    session fn close_session(session_id: &str) =
+        close("Session.Close", CloseRequest {
+            session_id: session_id.to_string(),
+        });
+
+    // ── Admin ──────────────────────────────────────────────────────────────
+
+    /// Trigger an immediate heartbeat. Bypasses quiet hours per the in-process
+    /// `/poke` semantics.
+    admin fn poke() = poke("Admin.Poke", AdminEmpty {});
+
+    /// Trigger a specific heartbeat source on the daemon.
+    admin fn trigger_heartbeat(source: &str, bypass_quiet_hours: bool) =
+        trigger_heartbeat("Admin.TriggerHeartbeat", TriggerHeartbeatRequest {
+            source: source.to_string(),
+            bypass_quiet_hours,
+        });
+
+    /// Start (or restart) the daemon's public-internet tunnel using the
+    /// `tunnel.*` settings. Returns the post-apply snapshot, with the
+    /// public URL when the start succeeded and `error` populated otherwise.
+    admin fn tunnel_start() -> TunnelStatusReply =
+        tunnel_start("Admin.TunnelStart", AdminEmpty {});
+
+    /// Stop the daemon's tunnel. Idempotent — no error when no tunnel runs.
+    admin fn tunnel_stop() = tunnel_stop("Admin.TunnelStop", AdminEmpty {});
+
+    /// Manage the browser CDP attach setting. `action` is one of
+    /// `"connect"`, `"disconnect"`, `"status"`; `url` is only honored for
+    /// `"connect"` and may be empty to use the default.
+    admin fn browser_manage(action: &str, url: Option<&str>) -> BrowserManageResponse =
+        browser_manage("Admin.BrowserManage", BrowserManageRequest {
+            action: action.to_string(),
+            url: url.unwrap_or("").to_string(),
+        });
+
+    /// Snapshot of the daemon's tunnel state.
+    admin fn tunnel_status() -> TunnelStatusReply =
+        tunnel_status("Admin.TunnelStatus", AdminEmpty {});
+
+    /// Run a daily-maintenance sweep on the daemon. Same code path as the
+    /// nightly scheduled task and the in-process `/heal`.
+    admin fn heal() -> HealReport = heal("Admin.Heal", AdminEmpty {});
+
+    /// Hot-reload MCP servers and/or user skills on the daemon without restart.
+    /// `target` selects the subsystem; `0`/`Unspecified` means everything.
+    admin fn reload(target: i32) -> ReloadResponse =
+        reload("Admin.Reload", ReloadRequest { target });
+
+    /// Run memory consolidation on the daemon.
+    admin fn dream() -> DreamReport = dream("Admin.Dream", AdminEmpty {});
+
+    /// Get every setting (db + default).
+    admin fn get_settings() -> SettingsSnapshot =
+        get_settings("Admin.GetSettings", AdminEmpty {});
+
+    /// Set a setting value (validated and persisted to the daemon's DB).
+    admin fn set_setting(key: &str, value: &str) =
+        set_setting("Admin.SetSetting", SettingMutation {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+
+    /// Remove a setting override (revert to default).
+    admin fn unset_setting(key: &str) =
+        unset_setting("Admin.UnsetSetting", SettingKey {
+            key: key.to_string(),
+        });
+
+    /// List recent sessions. Live sessions are tagged `(live)` in the title.
+    admin fn list_sessions() -> SessionList =
+        list_sessions("Admin.ListSessions", AdminEmpty {});
+
+    /// Fetch a single session's transcript.
+    admin fn get_session(id: &str) -> SessionDetail =
+        get_session("Admin.GetSession", SessionRef { id: id.to_string() });
+
+    // ── Session-state RPCs (replace direct agent calls in TUI) ────────────
+
+    /// Snapshot of agent state for the given session_id.
+    session fn get_state(session_id: &str) -> SessionState =
+        get_state("Session.GetState", SessionStateRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Compact the agent's history.
+    session fn compact(session_id: &str) -> CompactResponse =
+        compact("Session.Compact", CompactRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Wipe history.
+    session fn clear_history(session_id: &str) =
+        clear_history("Session.ClearHistory", ClearRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Drop the most recent assistant turn.
+    session fn undo(session_id: &str) -> UndoResponse =
+        undo("Session.Undo", UndoRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Rewind to the Nth user message.
+    session fn rewind(session_id: &str, n: u64) -> RewindResponse =
+        rewind_to_nth_user_message("Session.RewindToNthUserMessage", RewindRequest {
+            session_id: session_id.to_string(),
+            n,
+        });
+
+    /// Persist the agent's current state.
+    session fn auto_save(session_id: &str) =
+        auto_save("Session.AutoSave", AutoSaveRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Start a fresh agent session inside the existing host.
+    session fn new_agent_session(session_id: &str) -> NewSessionResponse =
+        new_session("Session.NewSession", NewSessionRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Load an existing agent session by id inside the existing host.
+    session fn load_agent_session(session_id: &str, agent_session_id: &str) -> LoadSessionResponse =
+        load_session("Session.LoadSession", LoadSessionRequest {
+            session_id: session_id.to_string(),
+            agent_session_id: agent_session_id.to_string(),
+        });
+
+    /// Push a steer message into the in-flight turn.
+    session fn steer(session_id: &str, text: &str) =
+        steer("Session.Steer", SteerRequest {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+        });
+
+    /// Mirror a system-injected assistant message (e.g. a heartbeat the
+    /// daemon streamed to this TUI) into the active session's history,
+    /// so the next user reply has the message in context.
+    session fn append_assistant_message(session_id: &str, content: &str) =
+        append_assistant_message("Session.AppendAssistantMessage", AppendAssistantMessageRequest {
+            session_id: session_id.to_string(),
+            content: content.to_string(),
+        });
+
+    /// Fork the active agent session at its last message. Daemon-side
+    /// execution — the TUI must NOT open a SQLite writer to do this itself,
+    /// since `borgd` is the single writer (CLAUDE.md "DB writer split-brain").
+    session fn fork_session(session_id: &str) -> ForkResponse =
+        fork("Session.Fork", ForkRequest {
+            session_id: session_id.to_string(),
+        });
+
+    // ── Scheduled tasks ───────────────────────────────────────────────────
+
+    /// List all scheduled tasks.
+    admin fn list_scheduled_tasks() -> ScheduledTaskList =
+        list_scheduled_tasks("Admin.ListScheduledTasks", AdminEmpty {});
+
+    admin fn create_scheduled_task(spec: ScheduledTaskCreate) -> ScheduledTask =
+        create_scheduled_task("Admin.CreateScheduledTask", spec);
+
+    /// Delete a scheduled task by id.
+    admin fn delete_scheduled_task(id: &str) =
+        delete_scheduled_task("Admin.DeleteScheduledTask", ScheduledTaskRef {
+            id: id.to_string(),
+        });
+
+    /// Pause a scheduled task.
+    admin fn pause_scheduled_task(id: &str) =
+        pause_scheduled_task("Admin.PauseScheduledTask", ScheduledTaskRef {
+            id: id.to_string(),
+        });
+
+    /// Resume a paused scheduled task.
+    admin fn resume_scheduled_task(id: &str) =
+        resume_scheduled_task("Admin.ResumeScheduledTask", ScheduledTaskRef {
+            id: id.to_string(),
+        });
+
+    /// Queue a scheduled task for immediate execution.
+    admin fn run_scheduled_task_now(id: &str) =
+        run_scheduled_task_now("Admin.RunScheduledTaskNow", ScheduledTaskRef {
+            id: id.to_string(),
+        });
+
+    /// Fetch the most recent run history for a scheduled task.
+    admin fn get_scheduled_task_runs(id: &str, limit: u32) -> ScheduledTaskRunList =
+        get_scheduled_task_runs("Admin.GetScheduledTaskRuns", GetScheduledTaskRunsRequest {
+            id: id.to_string(),
+            limit,
+        });
+
+    /// Detailed view of a scheduled task: full row + last run summary.
+    admin fn get_scheduled_task_detail(id: &str) -> ScheduledTaskDetail =
+        get_scheduled_task_detail("Admin.GetScheduledTaskDetail", ScheduledTaskRef {
+            id: id.to_string(),
+        });
+
+    /// Render a session via the daemon's export pipeline.
+    admin fn export_session(session_id: &str, format: &str) -> ExportSessionResponse =
+        export_session("Admin.ExportSession", ExportSessionRequest {
+            session_id: session_id.to_string(),
+            format: format.to_string(),
+        });
+
+    // ── Pairing ───────────────────────────────────────────────────────────
+
+    /// List pairing requests, optionally filtered by channel.
+    admin fn list_pairing_requests(channel: Option<&str>) -> PairingRequestList =
+        list_pairing_requests("Admin.ListPairingRequests", PairingFilter {
+            channel_name: channel.unwrap_or("").to_string(),
+        });
+
+    /// Mark `session_id` as pending handoff to `target_platform`. The
+    /// destination gateway picks the row up on its next claim sweep.
+    admin fn request_handoff(session_id: &str, target_platform: &str) =
+        request_handoff("Admin.RequestHandoff", AdminHandoffRequest {
+            session_id: session_id.to_string(),
+            target_platform: target_platform.to_string(),
+        });
+
+    /// Mark a running handoff as completed.
+    admin fn complete_handoff(session_id: &str) =
+        complete_handoff("Admin.CompleteHandoff", SessionRef {
+            id: session_id.to_string(),
+        });
+
+    /// Mark a pending/running handoff as failed with a human-readable reason.
+    admin fn fail_handoff(session_id: &str, reason: &str) =
+        fail_handoff("Admin.FailHandoff", HandoffFailRequest {
+            session_id: session_id.to_string(),
+            reason: reason.to_string(),
+        });
+
+    /// Fetch the current handoff status for a session.
+    admin fn get_handoff_status(session_id: &str) -> HandoffStatusReply =
+        get_handoff_status("Admin.GetHandoffStatus", SessionRef {
+            id: session_id.to_string(),
+        });
+
+    /// Approve a pairing request by code.
+    admin fn approve_pairing(channel: &str, code: &str) =
+        approve_pairing("Admin.ApprovePairing", PairingApproval {
+            channel_name: channel.to_string(),
+            code: code.to_string(),
+        });
+
+    /// List approved senders, optionally filtered by channel.
+    admin fn list_approved_senders(channel: Option<&str>) -> ApprovedSenderList =
+        list_approved_senders("Admin.ListApprovedSenders", PairingFilter {
+            channel_name: channel.unwrap_or("").to_string(),
+        });
+
+    /// Revoke an approved sender.
+    admin fn revoke_approved_sender(channel: &str, sender_id: &str) =
+        revoke_approved_sender("Admin.RevokeApprovedSender", ApprovedSenderRef {
+            channel_name: channel.to_string(),
+            sender_id: sender_id.to_string(),
+        });
+
+    /// Update a scheduled task. Empty-string fields are left unchanged
+    /// (mirrors `cortex::db::UpdateTask`'s `Option<&str>` semantics).
+    admin fn update_scheduled_task(spec: ScheduledTaskUpdate) -> ScheduledTask =
+        update_scheduled_task("Admin.UpdateScheduledTask", spec);
+
+    /// Ambient status (the `class:` line in the TUI header).
+    admin fn get_ambient_status() -> AmbientStatus =
+        get_ambient_status("Admin.GetAmbientStatus", AdminEmpty {});
+
+    /// Snapshot of running + recently-finished subprocesses tracked by the
+    /// daemon's `ProcessRegistry`. Empty when the daemon has no registry
+    /// wired (older daemon builds, test harnesses without the registry).
+    admin fn get_subprocesses() -> SubprocessSnapshot =
+        get_subprocesses("Admin.GetSubprocesses", AdminEmpty {});
+
+    /// Toggle the auto-reap pin on a specific subprocess entry. Pinning a
+    /// running workload exempts it from the daily maintenance sweep's
+    /// 24h auto-kill and downgrades its doctor surface.
+    admin fn set_subprocess_pinned(id: u64, pinned: bool) =
+        set_subprocess_pinned("Admin.SetSubprocessPinned", SetSubprocessPinnedRequest {
+            id,
+            pinned,
+        });
+
+    /// Latest doctor-run persistent warnings.
+    admin fn get_persistent_warnings() -> WarningList =
+        get_persistent_warnings("Admin.GetPersistentWarnings", AdminEmpty {});
+
+    // ── Status ────────────────────────────────────────────────────────────
+
+    /// Vitals snapshot — already decay-applied, with optional drift_notice.
+    status fn get_vitals() -> Vitals = get_vitals("Status.GetVitals", StatusEmpty {});
+
+    /// Evolution state snapshot (replay-derived).
+    status fn get_evolution() -> EvolutionStateProto =
+        get_evolution("Status.GetEvolution", StatusEmpty {});
+
+    /// Bond state snapshot.
+    status fn get_bond_state() -> BondStateProto =
+        get_bond_state("Status.GetBondState", StatusEmpty {});
+
+    /// Bond events since a unix timestamp (DESC).
+    status fn get_bond_events_since(since_unix: i64) -> BondEventList =
+        get_bond_events_since("Status.GetBondEventsSince", Int64Cursor { since_unix });
+
+    /// Evolution events since a unix timestamp (DESC).
+    status fn get_evolution_events_since(since_unix: i64) -> EvolutionEventList =
+        get_evolution_events_since("Status.GetEvolutionEventsSince", Int64Cursor { since_unix });
+
+    /// Vitals events since a unix timestamp (DESC).
+    status fn get_vitals_events_since(since_unix: i64) -> VitalsEventList =
+        get_vitals_events_since("Status.GetVitalsEventsSince", Int64Cursor { since_unix });
+
+    /// Pre-rendered text for the status popup's Overview tab. `card_width` is
+    /// the popup's inner width (passed verbatim to the daemon's evolution-card
+    /// formatter); pass 0 for a sane default.
+    status fn get_status_overview_text(card_width: u32) -> StatusText =
+        get_status_overview_text("Status.GetStatusOverviewText", StatusTextRequest { card_width });
+
+    /// Pre-rendered `/evolution` text for the status popup's Evolution tab.
+    status fn get_evolution_text() -> StatusText =
+        get_evolution_text("Status.GetEvolutionText", StatusEmpty {});
+
+    /// Pre-rendered `/xp` text for the status popup's XP tab.
+    status fn get_xp_text() -> StatusText =
+        get_xp_text("Status.GetXpText", StatusEmpty {});
+
+    /// Pre-rendered archetype-scores text for the status popup.
+    status fn get_archetype_scores_text() -> StatusText =
+        get_archetype_scores_text("Status.GetArchetypeScoresText", StatusEmpty {});
+
+    /// Pre-rendered evolution-history text for the status popup.
+    status fn get_evolution_history_text() -> StatusText =
+        get_evolution_history_text("Status.GetEvolutionHistoryText", StatusEmpty {});
+
+    /// Pre-rendered `/usage` text for the usage popup. `days = 0`
+    /// asks the daemon to use its default window (30); the daemon clamps
+    /// large values to 365 — the cli does not validate.
+    status fn get_usage_text(days: u32) -> StatusText =
+        get_usage_text("Status.GetUsageText", UsageRequest { days });
+
+    /// XP snapshot (`/xp` data).
+    status fn get_xp() -> XpSnapshot = get_xp("Status.GetXp", StatusEmpty {});
+
+    /// Ask the daemon to shut down gracefully. Returns once the daemon has
+    /// acknowledged the request — the daemon's drain loop runs in the
+    /// background. Subsequent `borg` invocations re-spawn the daemon.
+    admin fn shutdown() = shutdown("Admin.Shutdown", AdminEmpty {});
+
+    /// Generate + deliver a personalized greeting for a newly approved sender.
+    admin fn send_approval_greeting(channel: &str, sender_id: &str) =
+        send_approval_greeting("Admin.SendApprovalGreeting", ApprovalGreetingRequest {
+            channel: channel.to_string(),
+            sender_id: sender_id.to_string(),
+        });
+
+    // -- Sub-agent control (`/agents`) --------------------------------------
+
+    /// List sub-agents owned by `session_id`. Empty `session_id` resolves to
+    /// the most-recently active session daemon-side.
+    admin fn list_agents(session_id: &str) -> PbAgentList =
+        list_agents("Admin.ListAgents", AgentListRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Kill a single sub-agent.
+    admin fn kill_agent(agent_id: &str) =
+        kill_agent("Admin.KillAgent", PbAgentRef {
+            agent_id: agent_id.to_string(),
+        });
+
+    /// Kill an agent and every descendant in its subtree.
+    admin fn kill_agent_subtree(agent_id: &str) =
+        kill_agent_subtree("Admin.KillAgentSubtree", PbAgentRef {
+            agent_id: agent_id.to_string(),
+        });
+
+    /// Pause an agent at its next iteration boundary.
+    admin fn pause_agent(agent_id: &str) =
+        pause_agent("Admin.PauseAgent", PbAgentRef {
+            agent_id: agent_id.to_string(),
+        });
+
+    /// Resume a paused agent.
+    admin fn resume_agent(agent_id: &str) =
+        resume_agent("Admin.ResumeAgent", PbAgentRef {
+            agent_id: agent_id.to_string(),
+        });
+
+    /// List persisted spawn-tree snapshots for a session.
+    admin fn list_agent_snapshots(session_id: &str) -> AgentSnapshotList =
+        list_agent_snapshots("Admin.ListAgentSnapshots", SessionRef {
+            id: session_id.to_string(),
+        });
+
+    /// Fetch the agents captured in one persisted snapshot.
+    admin fn get_agent_snapshot(session_id: &str, turn_id: &str) -> PbAgentList =
+        get_agent_snapshot("Admin.GetAgentSnapshot", AgentSnapshotRefRequest {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        });
+
+    /// Append a row to `activity_log` via the daemon (avoids opening the DB
+    /// from the cli).
+    admin fn log_activity(level: &str, source: &str, message: &str) =
+        log_activity("Admin.LogActivity", LogActivityRequest {
+            level: level.to_string(),
+            source: source.to_string(),
+            message: message.to_string(),
+        });
+
+    /// Pre-rendered activity-log tail. `min_level` accepts the same level
+    /// strings as `cortex::db::query_activity` (`"error"`, `"warn"`,
+    /// `"info"`, `"debug"`, `"all"`); empty falls back to `"info"`.
+    admin fn get_activity_log_text(count: u32, min_level: &str, category: &str) -> ActivityLogText =
+        get_activity_log_text("Admin.GetActivityLogText", ActivityLogQuery {
+            count,
+            min_level: min_level.to_string(),
+            category: category.to_string(),
+        });
+
+    /// Persist plugin install metadata + file hashes in a single round-trip.
+    admin fn plugin_install(req: PluginInstallRequest) -> PluginInstallResponse =
+        plugin_install("Admin.PluginInstall", req);
+
+    // ── API key routing ──────────────────────────────────────────────────
+
+    /// Fetch the routing metadata for a provider's API key. Returns an
+    /// `ApiKeyValue` whose `body` is one of `literal`/`keychain`/`unset`.
+    /// The cli does the keychain lookup locally — the daemon only stores
+    /// the routing.
+    admin fn get_api_key(provider: &str) -> ApiKeyValue =
+        get_api_key("Admin.GetApiKey", ApiKeyRef {
+            provider: provider.to_string(),
+        });
+
+    /// Persist API-key routing metadata for `provider`. The body must be a
+    /// `literal` or `keychain` ref — `unset` is rejected here; use
+    /// [`unset_api_key`](Self::unset_api_key) to clear.
+    admin fn set_api_key(value: ApiKeyValue) =
+        set_api_key("Admin.SetApiKey", value);
+
+    /// Clear the stored routing metadata for `provider`. The cli is
+    /// responsible for deleting any companion keychain entry.
+    admin fn unset_api_key(provider: &str) =
+        unset_api_key("Admin.UnsetApiKey", ApiKeyRef {
+            provider: provider.to_string(),
+        });
+
+    /// List every provider with routing metadata stored, with the backend
+    /// kind ("literal" or "keychain") so the cli can render which backend
+    /// is in use without leaking the secret.
+    admin fn list_api_keys() -> ApiKeyList =
+        list_api_keys("Admin.ListApiKeys", AdminEmpty {});
+
+    // ── Onboarding ───────────────────────────────────────────────────────
+
+    /// Read the `onboarded` sentinel from the daemon's settings table.
+    admin fn get_onboarding_state() -> OnboardingState =
+        get_onboarding_state("Admin.GetOnboardingState", AdminEmpty {});
+
+    /// Mark first-run onboarding complete (`onboarded=true` in settings).
+    admin fn set_onboarding_complete() =
+        set_onboarding_complete("Admin.SetOnboardingComplete", AdminEmpty {});
+
+    /// Monthly token total across `token_usage` rows in the current calendar
+    /// month (UTC). Used by the TUI `/usage` view.
+    admin fn get_monthly_token_total() -> MonthlyTokenTotal =
+        get_monthly_token_total("Admin.GetMonthlyTokenTotal", AdminEmpty {});
+
+    /// Monthly cost total. `present=false` means there are no rows this
+    /// month — caller should hide the line rather than render `$0.00`.
+    admin fn get_monthly_total_cost() -> MonthlyTotalCost =
+        get_monthly_total_cost("Admin.GetMonthlyTotalCost", AdminEmpty {});
+
+    /// Daemon-wide status snapshot.
+    admin fn get_daemon_status() -> DaemonStatus =
+        get_daemon_status("Admin.GetDaemonStatus", AdminEmpty {});
+
+    // ── Provider / webhook / client-token writes ──────────────────────────
+
+    /// Insert a BYO provider row. Reads stay on `Database::open_readonly`.
+    admin fn add_provider(
+        id: &str,
+        display_name: &str,
+        base_url: &str,
+        api_key_env: Option<&str>,
+        category: &str,
+    ) = add_provider("Admin.AddProvider", AddProviderRequest {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        base_url: base_url.to_string(),
+        api_key_env: api_key_env.unwrap_or("").to_string(),
+        category: category.to_string(),
+    });
+
+    /// Remove a BYO provider row by id. Idempotent — succeeds even if the id
+    /// is already absent.
+    admin fn remove_provider(id: &str) =
+        remove_provider("Admin.RemoveProvider", RemoveProviderRequest {
+            id: id.to_string(),
+        });
+
+    /// Create a webhook definition; returns the raw HMAC secret bytes —
+    /// the caller is responsible for printing the hex once and discarding.
+    admin fn create_webhook(
+        name: &str,
+        sender_path: &str,
+        thread_path: Option<&str>,
+        body_path: &str,
+    ) -> CreateWebhookResponse = create_webhook("Admin.CreateWebhook", CreateWebhookRequest {
+        name: name.to_string(),
+        sender_path: sender_path.to_string(),
+        thread_path: thread_path.unwrap_or("").to_string(),
+        body_path: body_path.to_string(),
+    });
+
+    /// Mark a webhook revoked. Idempotent.
+    admin fn revoke_webhook(name: &str) =
+        revoke_webhook("Admin.RevokeWebhook", WebhookRef {
+            name: name.to_string(),
+        });
+
+    /// Issue a bearer client token; the plaintext is returned exactly once.
+    admin fn issue_client_token(label: &str, scopes: &str) -> IssueClientTokenResponse =
+        issue_client_token("Admin.IssueClientToken", IssueClientTokenRequest {
+            label: label.to_string(),
+            scopes: scopes.to_string(),
+        });
+
+    /// Revoke a bearer token by label.
+    admin fn revoke_client_token(label: &str) -> RevokedClientToken =
+        revoke_client_token("Admin.RevokeClientToken", ClientTokenRef {
+            label: label.to_string(),
+        });
+
+    /// Squelch a doctor finding `(category, name)` until `expires_at_unix`.
+    /// Re-squelching an existing pair refreshes the timestamps + reason.
+    admin fn doctor_squelch_set(
+        category: &str,
+        name: &str,
+        expires_at_unix: i64,
+        reason: Option<&str>,
+    ) = doctor_squelch_set("Admin.DoctorSquelchSet", DoctorSquelchSetRequest {
+        category: category.to_string(),
+        name: name.to_string(),
+        expires_at_unix,
+        reason: reason.unwrap_or("").to_string(),
+    });
+
+    // ── Credential pool ────────────────────────────────────────────────
+
+    /// List credential pools. `provider` empty = all configured providers.
+    admin fn list_credentials(provider: Option<&str>) -> CredentialList =
+        list_credentials("Admin.ListCredentials", ListCredentialsRequest {
+            provider: provider.unwrap_or("").to_string(),
+        });
+
+    /// Add a credential to a pool. Returns the persisted entry with its
+    /// fingerprint (plaintext key is not echoed back).
+    admin fn add_credential(provider: &str, key: &str, label: Option<&str>) -> CredentialEntry =
+        add_credential("Admin.AddCredential", AddCredentialRequest {
+            provider: provider.to_string(),
+            key: key.to_string(),
+            label: label.unwrap_or("").to_string(),
+        });
+
+    /// Remove a credential (soft-delete + write suppression row).
+    admin fn remove_credential(provider: &str, target: &str) -> CredentialEntry =
+        remove_credential("Admin.RemoveCredential", RemoveCredentialRequest {
+            provider: provider.to_string(),
+            target: target.to_string(),
+        });
 
     /// Change the selection strategy.
-    pub async fn set_credential_strategy(&mut self, provider: &str, strategy: &str) -> Result<()> {
-        self.admin
-            .set_credential_strategy(SetCredentialStrategyRequest {
-                provider: provider.to_string(),
-                strategy: strategy.to_string(),
-            })
-            .await
-            .context("Admin.SetCredentialStrategy failed")?;
-        Ok(())
-    }
+    admin fn set_credential_strategy(provider: &str, strategy: &str) =
+        set_credential_strategy("Admin.SetCredentialStrategy", SetCredentialStrategyRequest {
+            provider: provider.to_string(),
+            strategy: strategy.to_string(),
+        });
 }
 
 #[cfg(test)]
