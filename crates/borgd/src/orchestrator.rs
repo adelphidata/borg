@@ -6,7 +6,7 @@ use crate::heartbeat::HeartbeatTrigger;
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
-use crate::supervisor::{spawn_supervised, DbHandle, SupervisorConfig};
+use crate::supervisor::{spawn_supervised, DbHandle, SupervisorConfig, DEFAULT_RESTART_WINDOW};
 use crate::task_runner;
 use anyhow::Result;
 use cortex::config::Config;
@@ -163,7 +163,7 @@ pub async fn start(
     let gw_cfg = SupervisorConfig {
         name: "gateway",
         max_restarts: GATEWAY_MAX_CRASH_RESPAWNS,
-        restart_window: Duration::from_secs(600),
+        restart_window: DEFAULT_RESTART_WINDOW,
         base_backoff: GATEWAY_RESPAWN_BASE_DELAY,
         max_backoff: GATEWAY_RESPAWN_BASE_DELAY * 16,
         on_degraded: Some(Box::new(mark_gateway_unrecoverable)),

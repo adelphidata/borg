@@ -56,6 +56,11 @@ async fn try_observe_issue(db: &DbHandle, key: &str, ts: i64, status: &str) {
     }
 }
 
+/// Default sliding window for counting restarts before degrading
+/// (the "5 crashes in 10 minutes" rule). Shared by every subsystem
+/// that doesn't have a concrete reason to differ.
+pub const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
+
 /// Knobs for one supervised subsystem. Every field has a default
 /// suitable for borgd's long-running daemon tasks; override only
 /// when there's a concrete reason.
@@ -105,7 +110,7 @@ impl SupervisorConfig {
         Self {
             name,
             max_restarts: 5,
-            restart_window: Duration::from_secs(600),
+            restart_window: DEFAULT_RESTART_WINDOW,
             base_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(300),
             on_degraded: None,
