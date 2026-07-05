@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub mod http;
 pub mod sse;
 pub mod stdio;
+pub mod url_guard;
 
 /// Open the transport described by `manifest` under `policy`.
 ///
