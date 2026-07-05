@@ -363,210 +363,65 @@ impl Admin for AdminSvc {
 
     async fn list_scheduled_tasks(
         &self,
-        _req: Request<Empty>,
+        req: Request<Empty>,
     ) -> Result<Response<ScheduledTaskList>, TStatus> {
-        let rows = async {
-            let db = Database::open().await?;
-            db.list_tasks().await
-        }
-        .await
-        .map_err(|e: anyhow::Error| TStatus::internal(format!("list_tasks failed: {e}")))?;
-        Ok(Response::new(ScheduledTaskList {
-            tasks: rows.into_iter().map(scheduled_task_row_to_proto).collect(),
-        }))
+        scheduled_tasks::list_scheduled_tasks(self, req).await
     }
 
     async fn create_scheduled_task(
         &self,
         req: Request<ScheduledTaskCreate>,
     ) -> Result<Response<ScheduledTask>, TStatus> {
-        let req = req.into_inner();
-        let id = uuid::Uuid::new_v4().to_string();
-        let id_for_lookup = id.clone();
-        let inserted = async {
-            use cortex::db::NewTask;
-            let db = Database::open().await?;
-            let task_type = if req.task_type.is_empty() {
-                "prompt"
-            } else {
-                req.task_type.as_str()
-            };
-            let new_task = NewTask {
-                id: &id,
-                name: &req.name,
-                prompt: &req.prompt,
-                schedule_type: &req.schedule_type,
-                schedule_expr: &req.schedule_expr,
-                timezone: &req.timezone,
-                next_run: opt_if_positive_i64(req.next_run_unix),
-                max_retries: opt_if_non_negative_i32(req.max_retries),
-                timeout_ms: opt_if_positive_i64(req.timeout_ms),
-                delivery_channel: opt_if_not_empty(&req.delivery_channel),
-                delivery_target: opt_if_not_empty(&req.delivery_target),
-                allowed_tools: opt_if_not_empty(&req.allowed_tools),
-                task_type,
-                pre_run_command: None,
-                pre_run_cwd: None,
-                pre_run_timeout_ms: None,
-                min_interval_secs: None,
-            };
-            db.create_task(&new_task).await?;
-            anyhow::Ok(db.list_tasks().await?.into_iter().find(|t| t.id == id))
-        }
-        .await
-        .map_err(map_invalid_arg("create_task"))?
-        .ok_or_else(|| {
-            TStatus::internal(format!(
-                "create_task: row `{id_for_lookup}` not found after insert"
-            ))
-        })?;
-        Ok(Response::new(scheduled_task_row_to_proto(inserted)))
+        scheduled_tasks::create_scheduled_task(self, req).await
     }
 
     async fn delete_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        let id = req.into_inner().id;
-        let removed = async {
-            let db = Database::open().await?;
-            db.delete_task(&id).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| TStatus::internal(format!("delete_task failed: {e}")))?;
-        if !removed {
-            return Err(TStatus::not_found("scheduled task not found"));
-        }
-        Ok(Response::new(Empty {}))
+        scheduled_tasks::delete_scheduled_task(self, req).await
     }
 
     async fn update_scheduled_task(
         &self,
         req: Request<ScheduledTaskUpdate>,
     ) -> Result<Response<ScheduledTask>, TStatus> {
-        let req = req.into_inner();
-        let id_for_lookup = req.id.clone();
-        let updated = async {
-            use cortex::db::UpdateTask;
-            let db = Database::open().await?;
-            // Empty string sentinel = "leave unchanged", matching the
-            // ScheduledTaskUpdate proto semantics + Option<&str> on UpdateTask.
-            let update = UpdateTask {
-                name: opt_if_not_empty(&req.name),
-                prompt: opt_if_not_empty(&req.prompt),
-                schedule_type: opt_if_not_empty(&req.schedule_type),
-                schedule_expr: opt_if_not_empty(&req.schedule_expr),
-                timezone: opt_if_not_empty(&req.timezone),
-            };
-            let found = db.update_task(&req.id, &update).await?;
-            if !found {
-                return anyhow::Ok(None);
-            }
-            // Re-read the row so the caller observes the persisted state, not
-            // a locally-merged copy that could drift if a column gets added.
-            Ok(db.list_tasks().await?.into_iter().find(|t| t.id == req.id))
-        }
-        .await
-        .map_err(map_invalid_arg("update_task"))?
-        .ok_or_else(|| TStatus::not_found(format!("scheduled task `{id_for_lookup}` not found")))?;
-        Ok(Response::new(scheduled_task_row_to_proto(updated)))
+        scheduled_tasks::update_scheduled_task(self, req).await
     }
 
     async fn pause_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        update_task_status(req.into_inner().id, "paused").await
+        scheduled_tasks::pause_scheduled_task(self, req).await
     }
 
     async fn resume_scheduled_task(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        update_task_status(req.into_inner().id, "active").await
+        scheduled_tasks::resume_scheduled_task(self, req).await
     }
 
     async fn run_scheduled_task_now(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        let id = req.into_inner().id;
-        let id_for_err = id.clone();
-        let found = async {
-            let db = Database::open().await?;
-            if db.get_task_by_id(&id).await?.is_none() {
-                return anyhow::Ok(false);
-            }
-            let now = chrono::Utc::now().timestamp();
-            db.update_task_next_run(&id, Some(now)).await?;
-            db.clear_task_retry(&id).await?;
-            Ok(true)
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("run_scheduled_task_now failed: {e}")))?;
-        if !found {
-            return Err(TStatus::not_found(format!(
-                "scheduled task `{id_for_err}` not found"
-            )));
-        }
-        Ok(Response::new(Empty {}))
+        scheduled_tasks::run_scheduled_task_now(self, req).await
     }
 
     async fn get_scheduled_task_runs(
         &self,
         req: Request<GetScheduledTaskRunsRequest>,
     ) -> Result<Response<ScheduledTaskRunList>, TStatus> {
-        let req = req.into_inner();
-        let id = req.id;
-        // 0 = caller didn't pin a limit; pick a sane default.
-        let limit = if req.limit == 0 {
-            10
-        } else {
-            req.limit as usize
-        };
-        let runs = async {
-            let db = Database::open().await?;
-            db.task_run_history(&id, limit).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| {
-            TStatus::internal(format!("get_scheduled_task_runs failed: {e}"))
-        })?;
-        Ok(Response::new(ScheduledTaskRunList {
-            runs: runs.into_iter().map(task_run_row_to_proto).collect(),
-        }))
+        scheduled_tasks::get_scheduled_task_runs(self, req).await
     }
 
     async fn get_scheduled_task_detail(
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<ScheduledTaskDetail>, TStatus> {
-        let id = req.into_inner().id;
-        let id_for_err = id.clone();
-        let detail = async {
-            let db = Database::open().await?;
-            let Some(row) = db.get_task_by_id(&id).await? else {
-                return anyhow::Ok(None);
-            };
-            let last = db.last_task_run(&id).await?;
-            let proto_task = scheduled_task_row_to_proto(row.clone());
-            Ok(Some(ScheduledTaskDetail {
-                task: Some(proto_task),
-                max_retries: row.max_retries,
-                retry_count: row.retry_count,
-                retry_after_unix: row.retry_after.unwrap_or(0),
-                last_error: row.last_error.unwrap_or_default(),
-                timeout_ms: row.timeout_ms,
-                has_last_run: last.is_some(),
-                last_run: last.map(task_run_row_to_proto),
-            }))
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
-        let detail = detail.ok_or_else(|| {
-            TStatus::not_found(format!("scheduled task `{id_for_err}` not found"))
-        })?;
-        Ok(Response::new(detail))
+        scheduled_tasks::get_scheduled_task_detail(self, req).await
     }
 
     async fn export_session(
@@ -958,133 +813,19 @@ impl Admin for AdminSvc {
     // routing metadata.
 
     async fn get_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<ApiKeyValue>, TStatus> {
-        let provider = req.into_inner().provider;
-        if provider.is_empty() {
-            return Err(TStatus::invalid_argument("provider required"));
-        }
-        let provider_for_lookup = provider.clone();
-        let body = async {
-            let db = Database::open().await?;
-            let key = format!("credentials.{provider_for_lookup}");
-            let raw = db.get_setting(&key).await?;
-            match raw {
-                Some(s) if !s.is_empty() => anyhow::Ok(Some(serde_json::from_str(&s)?)),
-                _ => Ok(None),
-            }
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("get_api_key failed: {e}")))?;
-
-        let value = match body {
-            None => ApiKeyValue {
-                provider,
-                body: Some(protocols::admin::api_key_value::Body::Unset(Empty {})),
-            },
-            Some(ApiKeyRouting::Literal { value }) => ApiKeyValue {
-                provider,
-                body: Some(protocols::admin::api_key_value::Body::Literal(value)),
-            },
-            Some(ApiKeyRouting::Keychain { service, account }) => ApiKeyValue {
-                provider,
-                body: Some(protocols::admin::api_key_value::Body::Keychain(
-                    KeychainRef { service, account },
-                )),
-            },
-        };
-        Ok(Response::new(value))
+        credentials::get_api_key(self, req).await
     }
 
     async fn set_api_key(&self, req: Request<ApiKeyValue>) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        if req.provider.is_empty() {
-            return Err(TStatus::invalid_argument("provider required"));
-        }
-        let routing = match req.body {
-            Some(protocols::admin::api_key_value::Body::Literal(v)) => {
-                if v.is_empty() {
-                    return Err(TStatus::invalid_argument("literal value must be non-empty"));
-                }
-                ApiKeyRouting::Literal { value: v }
-            }
-            Some(protocols::admin::api_key_value::Body::Keychain(kr)) => {
-                if kr.service.is_empty() || kr.account.is_empty() {
-                    return Err(TStatus::invalid_argument(
-                        "keychain ref requires service and account",
-                    ));
-                }
-                ApiKeyRouting::Keychain {
-                    service: kr.service,
-                    account: kr.account,
-                }
-            }
-            Some(protocols::admin::api_key_value::Body::Unset(_)) | None => {
-                return Err(TStatus::invalid_argument(
-                    "set_api_key requires literal or keychain body; use unset_api_key to clear",
-                ));
-            }
-        };
-        let provider = req.provider;
-        async {
-            let db = Database::open().await?;
-            let key = format!("credentials.{provider}");
-            let json = serde_json::to_string(&routing)?;
-            db.set_setting(&key, &json).await?;
-            anyhow::Ok(())
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("set_api_key failed: {e}")))?;
-        Ok(Response::new(Empty {}))
+        credentials::set_api_key(self, req).await
     }
 
     async fn unset_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<Empty>, TStatus> {
-        let provider = req.into_inner().provider;
-        if provider.is_empty() {
-            return Err(TStatus::invalid_argument("provider required"));
-        }
-        async {
-            let db = Database::open().await?;
-            let key = format!("credentials.{provider}");
-            db.delete_setting(&key).await?;
-            anyhow::Ok(())
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("unset_api_key failed: {e}")))?;
-        Ok(Response::new(Empty {}))
+        credentials::unset_api_key(self, req).await
     }
 
-    async fn list_api_keys(&self, _req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
-        let entries = async {
-            let db = Database::open().await?;
-            let rows = db.list_settings().await?;
-            let mut out = Vec::new();
-            for (key, value, _) in rows {
-                if !key.starts_with("credentials.") {
-                    continue;
-                }
-                let provider = match key.strip_prefix("credentials.") {
-                    Some(p) if !p.is_empty() => p.to_string(),
-                    _ => continue,
-                };
-                let backend = match serde_json::from_str::<ApiKeyRouting>(&value) {
-                    Ok(ApiKeyRouting::Literal { .. }) => "literal",
-                    Ok(ApiKeyRouting::Keychain { .. }) => "keychain",
-                    Err(e) => {
-                        tracing::warn!(
-                            "list_api_keys: unparseable credentials.{provider} JSON: {e}"
-                        );
-                        "unset"
-                    }
-                };
-                out.push(ApiKeyEntry {
-                    provider,
-                    backend: backend.to_string(),
-                });
-            }
-            anyhow::Ok(out)
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("list_api_keys failed: {e}")))?;
-        Ok(Response::new(ApiKeyList { entries }))
+    async fn list_api_keys(&self, req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
+        credentials::list_api_keys(self, req).await
     }
 
     async fn get_monthly_token_total(
@@ -1128,69 +869,14 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AddProviderRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        if req.id.is_empty() || req.id.contains(char::is_whitespace) {
-            return Err(TStatus::invalid_argument(
-                "id must be non-empty and contain no whitespace",
-            ));
-        }
-        let category = match req.category.to_ascii_lowercase().as_str() {
-            "byo" | "byo_endpoint" => cortex::providers::ProviderCategory::BYOEndpoint,
-            "local" => cortex::providers::ProviderCategory::Local,
-            "public" | "public_cloud" => cortex::providers::ProviderCategory::PublicCloud,
-            other => {
-                return Err(TStatus::invalid_argument(format!(
-                    "unknown category '{other}'; expected byo, local, or public_cloud"
-                )));
-            }
-        };
-        let id_for_err = req.id.clone();
-        async {
-            let db = Database::open().await?;
-            let display_name = if req.display_name.is_empty() {
-                req.id.clone()
-            } else {
-                req.display_name
-            };
-            let api_key_env = if req.api_key_env.is_empty() {
-                None
-            } else {
-                Some(req.api_key_env)
-            };
-            let row = cortex::providers::ProviderRow {
-                id: req.id,
-                category,
-                display_name,
-                endpoint_url: req.base_url,
-                api_key_env,
-                enabled: true,
-            };
-            row.insert(&db).await?;
-            anyhow::Ok(())
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("add_provider '{id_for_err}' failed: {e}")))?;
-        Ok(Response::new(Empty {}))
+        credentials::add_provider(self, req).await
     }
 
     async fn remove_provider(
         &self,
         req: Request<RemoveProviderRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let id = req.into_inner().id;
-        if id.is_empty() {
-            return Err(TStatus::invalid_argument("id must be non-empty"));
-        }
-        let id_for_err = id.clone();
-        async {
-            let db = Database::open().await?;
-            // Idempotent — `false` (already absent) is a successful no-op.
-            cortex::providers::ProviderRow::delete(&db, &id).await?;
-            anyhow::Ok(())
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("remove_provider '{id_for_err}' failed: {e}")))?;
-        Ok(Response::new(Empty {}))
+        credentials::remove_provider(self, req).await
     }
 
     // ── Webhook CRUD (writer-only) ───────────────────────────────────────
@@ -1343,881 +1029,114 @@ impl Admin for AdminSvc {
         &self,
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<CredentialList>, TStatus> {
-        let req = req.into_inner();
-        let providers = async {
-            let db = Database::open().await?;
-            let config = cortex::config::Config::load_from_db().await?;
-            let pool = build_primary_pool(&config, &db).await?;
-            if !req.provider.is_empty() && !pool_provider_matches(&pool, &req.provider) {
-                return anyhow::Ok(vec![]);
-            }
-            Ok(vec![credential_pool_to_proto(&config, &pool)])
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("list_credentials failed: {e}")))?;
-        Ok(Response::new(CredentialList { providers }))
+        credentials::list_credentials(self, req).await
     }
 
     async fn add_credential(
         &self,
         req: Request<AddCredentialRequest>,
     ) -> Result<Response<CredentialEntry>, TStatus> {
-        let req = req.into_inner();
-        let key = req.key.trim().to_string();
-        if key.is_empty() {
-            return Err(TStatus::invalid_argument("key must not be empty"));
-        }
-        let provider = req.provider;
-        let label_in = req.label;
-        let entry = async {
-            let db = Database::open().await?;
-            let config = cortex::config::Config::load_from_db().await?;
-            let pool = build_primary_pool(&config, &db).await?;
-            require_provider_match(&pool, &provider)?;
-            let label = if label_in.trim().is_empty() {
-                // Count live entries only — tombstones shouldn't bump the
-                // default label counter ("manual-7" after one add post-remove
-                // looks like a bug to operators).
-                let live = pool
-                    .entries()
-                    .iter()
-                    .filter(|c| c.removed_at_ms.is_none())
-                    .count();
-                format!("manual-{}", live + 1)
-            } else {
-                label_in.trim().to_string()
-            };
-            let cred = pool.add_entry(
-                key,
-                label,
-                cortex::llm::credential_pool::CredentialSource::Manual,
-            );
-            anyhow::Ok(pooled_to_proto(pool.provider_str(), &cred))
-        }
-        .await
-        .map_err(|e| TStatus::invalid_argument(format!("add_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx).await;
-        Ok(Response::new(entry))
+        credentials::add_credential(self, req).await
     }
 
     async fn remove_credential(
         &self,
         req: Request<RemoveCredentialRequest>,
     ) -> Result<Response<CredentialEntry>, TStatus> {
-        let req = req.into_inner();
-        if req.target.trim().is_empty() {
-            return Err(TStatus::invalid_argument("target must not be empty"));
-        }
-        let entry = async {
-            let db = Database::open().await?;
-            let config = cortex::config::Config::load_from_db().await?;
-            let pool = build_primary_pool(&config, &db).await?;
-            require_provider_match(&pool, &req.provider)?;
-            let (idx_zero, _existing) = pool
-                .resolve_target(&req.target)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let removed = pool
-                .remove_index(idx_zero + 1)
-                .ok_or_else(|| anyhow::anyhow!("index out of range after resolve"))?;
-            anyhow::Ok(pooled_to_proto(pool.provider_str(), &removed))
-        }
-        .await
-        .map_err(|e| TStatus::invalid_argument(format!("remove_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx).await;
-        Ok(Response::new(entry))
+        credentials::remove_credential(self, req).await
     }
 
     async fn reset_credentials(
         &self,
         req: Request<ResetCredentialsRequest>,
     ) -> Result<Response<ResetCredentialsResponse>, TStatus> {
-        let req = req.into_inner();
-        let cleared = async {
-            let db = Database::open().await?;
-            let config = cortex::config::Config::load_from_db().await?;
-            let pool = build_primary_pool(&config, &db).await?;
-            require_provider_match(&pool, &req.provider)?;
-            anyhow::Ok(pool.reset_cooldowns() as u64)
-        }
-        .await
-        .map_err(|e| TStatus::invalid_argument(format!("reset_credentials: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx).await;
-        Ok(Response::new(ResetCredentialsResponse { cleared }))
+        credentials::reset_credentials(self, req).await
     }
 
     async fn pair_credential(
         &self,
         req: Request<PairCredentialRequest>,
     ) -> Result<Response<PairCredentialResponse>, TStatus> {
-        let raw_kind = req.into_inner().kind.trim().to_ascii_lowercase();
-        if raw_kind.is_empty() {
-            return Err(TStatus::invalid_argument("kind must not be empty"));
-        }
-        // Normalize hyphenated forms (`claude-code`) to the discoverer's
-        // canonical `name()` (`claude_code`) — the registry keys on underscores.
-        let kind = raw_kind.replace('-', "_");
-        let entries = async {
-            use anyhow::Context;
-            use cortex::llm::credential_pool::{
-                is_safe_base_url, pool_load_config_for_provider, AuthType, CredentialPool,
-                PoolLoadConfig,
-            };
-            use cortex::llm::credential_sources::discoverer_by_name;
-            use cortex::llm::provider::Provider;
-
-            let discoverer = discoverer_by_name(&kind).ok_or_else(|| {
-                anyhow::anyhow!("unknown OAuth kind `{kind}` — try claude_code | codex | qwen_cli")
-            })?;
-            let provider = discoverer.provider();
-
-            let db = Database::open().await?;
-            let db_path = cortex::config::Config::db_path()?;
-            let config = cortex::config::Config::load_from_db().await?;
-
-            // Build a load config pointing at this OAuth provider. Pairing
-            // seeds the pool regardless of whether the operator has switched
-            // their primary to that flavor yet, so we bypass
-            // `config.llm.provider`. Env-var seeding is disabled — pairing
-            // is an explicit operator action, not an env scan.
-            let mut load_cfg: PoolLoadConfig = pool_load_config_for_provider(
-                provider,
-                config.llm.credential_strategy,
-                config.llm.credential_cooldown_secs,
-                config.llm.max_concurrent_per_credential,
-                vec![],
-            );
-            load_cfg.proactive_rate_limit_threshold_pct =
-                config.llm.proactive_rate_limit_threshold_pct;
-            load_cfg.proactive_rate_limit_min_window_secs =
-                config.llm.proactive_rate_limit_min_window_secs;
-            load_cfg.env_vars.clear();
-            let pool = CredentialPool::load(&db, &db_path, provider, load_cfg).await?;
-
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME for OAuth discovery"))?;
-            let discovered = discoverer
-                .discover(&home)
-                .with_context(|| format!("running discoverer `{}`", discoverer.name()))?;
-
-            let mut out = Vec::new();
-            for disc in discovered {
-                // Custom-endpoint sources carry a per-credential base_url
-                // that needs SSRF-style validation before it lands in the
-                // pool — operator-writable files can otherwise redirect
-                // traffic on next request.
-                if let Some(url) = disc.base_url.as_deref() {
-                    if !is_safe_base_url(url) {
-                        anyhow::bail!(
-                            "discoverer `{}` returned unsafe base_url `{}` — must be https or http+loopback",
-                            discoverer.name(),
-                            url
-                        );
-                    }
-                }
-                let source = match provider {
-                    Provider::Custom => cortex::llm::credential_pool::CredentialSource::Custom {
-                        name: discoverer.name().to_string(),
-                        base_url: disc.base_url.clone().unwrap_or_default(),
-                    },
-                    _ => cortex::llm::credential_pool::CredentialSource::OAuth {
-                        name: discoverer.name().to_string(),
-                    },
-                };
-                let auth_type = if disc.refresh_token.is_some() {
-                    AuthType::OAuth
-                } else {
-                    AuthType::ApiKey
-                };
-                let cred = pool.add_entry_full(
-                    disc.access_token,
-                    disc.label,
-                    source,
-                    auth_type,
-                    disc.refresh_token,
-                    disc.expires_at_ms,
-                    disc.base_url,
-                    disc.extra_json,
-                );
-                out.push(pooled_to_proto(pool.provider_str(), &cred));
-            }
-            anyhow::Ok(out)
-        }
-        .await
-        .map_err(|e| TStatus::invalid_argument(format!("pair_credential: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx).await;
-        Ok(Response::new(PairCredentialResponse { entries }))
+        credentials::pair_credential(self, req).await
     }
 
     async fn set_credential_strategy(
         &self,
         req: Request<SetCredentialStrategyRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        // Validate input early so we don't write garbage to settings.
-        use std::str::FromStr;
-        cortex::llm::credential_pool::CredentialStrategy::from_str(&req.strategy).map_err(
-            |_| {
-                TStatus::invalid_argument(format!(
-                    "unknown strategy `{}` — try fill_first, round_robin, least_used, random",
-                    req.strategy
-                ))
-            },
-        )?;
-        let provider = req.provider;
-        let strategy_value = req.strategy;
-        async {
-            let db = Database::open().await?;
-            let config = cortex::config::Config::load_from_db().await?;
-            let pool = build_primary_pool(&config, &db).await?;
-            require_provider_match(&pool, &provider)?;
-            // Persist via the settings registry so it's restart-stable, and
-            // notify the runtime config reload so the live LlmClient picks
-            // up the new strategy on its next rebuild.
-            let resolver = cortex::settings::SettingsResolver::load().await?;
-            // The `json_quoted` setter wraps the value itself before
-            // deserializing — we pass the raw variant string.
-            resolver
-                .set("llm.credential_strategy", &strategy_value)
-                .await
-                .map_err(|e| anyhow::anyhow!("set llm.credential_strategy: {e}"))?;
-            anyhow::Ok(())
-        }
-        .await
-        .map_err(|e| TStatus::invalid_argument(format!("set_credential_strategy: {e}")))?;
-        notify_runtime_config_reload(&self.config_notify_tx).await;
-        Ok(Response::new(Empty {}))
+        credentials::set_credential_strategy(self, req).await
     }
 
     async fn get_subprocesses(
         &self,
-        _req: Request<Empty>,
+        req: Request<Empty>,
     ) -> Result<Response<SubprocessSnapshot>, TStatus> {
-        let reg = self.process_registry_handle();
-        let Some(reg) = reg else {
-            return Ok(Response::new(SubprocessSnapshot::default()));
-        };
-        let snap = reg.snapshot();
-        Ok(Response::new(SubprocessSnapshot {
-            running: snap
-                .running
-                .into_iter()
-                .map(process_entry_to_proto)
-                .collect(),
-            finished: snap
-                .finished
-                .into_iter()
-                .map(process_entry_to_proto)
-                .collect(),
-        }))
+        agents::get_subprocesses(self, req).await
     }
 
     async fn set_subprocess_pinned(
         &self,
         req: Request<SetSubprocessPinnedRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        let reg = self
-            .process_registry_handle()
-            .ok_or_else(|| TStatus::failed_precondition("process registry not wired"))?;
-        let result = if req.pinned {
-            reg.pin(req.id)
-        } else {
-            reg.unpin(req.id)
-        };
-        result.map_err(|e| TStatus::not_found(e.to_string()))?;
-        Ok(Response::new(Empty {}))
+        agents::set_subprocess_pinned(self, req).await
     }
 
     async fn request_handoff(
         &self,
         req: Request<HandoffRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        async {
-            let db = Database::open().await?;
-            // Empty session_id means "the most recently active session" —
-            // same convention `/goal` uses so operators don't have to look
-            // up an id to operate on their current session.
-            let session_id = match resolve_goal_session_id(&db, &req.session_id).await? {
-                Some(id) => id,
-                None => anyhow::bail!("no session to hand off — start one first"),
-            };
-            db.request_handoff(&session_id, &req.target_platform).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| {
-            TStatus::failed_precondition(format!("request_handoff failed: {e}"))
-        })?;
-        Ok(Response::new(Empty {}))
+        handoff::request_handoff(self, req).await
     }
 
     async fn claim_handoff(
         &self,
         req: Request<HandoffClaimRequest>,
     ) -> Result<Response<HandoffClaimResponse>, TStatus> {
-        let req = req.into_inner();
-        let claimed = async {
-            let db = Database::open().await?;
-            db.claim_handoff_for_platform(&req.platform).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| TStatus::internal(format!("claim_handoff failed: {e}")))?;
-        Ok(Response::new(HandoffClaimResponse {
-            session_id: claimed.clone().unwrap_or_default(),
-            claimed: claimed.is_some(),
-        }))
+        handoff::claim_handoff(self, req).await
     }
 
     async fn complete_handoff(&self, req: Request<SessionRef>) -> Result<Response<Empty>, TStatus> {
-        let id = req.into_inner().id;
-        async {
-            let db = Database::open().await?;
-            db.complete_handoff(&id).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| {
-            TStatus::failed_precondition(format!("complete_handoff failed: {e}"))
-        })?;
-        Ok(Response::new(Empty {}))
+        handoff::complete_handoff(self, req).await
     }
 
     async fn fail_handoff(
         &self,
         req: Request<HandoffFailRequest>,
     ) -> Result<Response<Empty>, TStatus> {
-        let req = req.into_inner();
-        async {
-            let db = Database::open().await?;
-            db.fail_handoff(&req.session_id, &req.reason).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| {
-            TStatus::failed_precondition(format!("fail_handoff failed: {e}"))
-        })?;
-        Ok(Response::new(Empty {}))
+        handoff::fail_handoff(self, req).await
     }
 
     async fn browser_manage(
         &self,
         req: Request<BrowserManageRequest>,
     ) -> Result<Response<BrowserManageResponse>, TStatus> {
-        let req = req.into_inner();
-        let action = req.action.trim().to_lowercase();
-        let mut messages: Vec<String> = Vec::new();
-
-        let resolver = SettingsResolver::load()
-            .await
-            .map_err(|e| TStatus::internal(format!("settings load failed: {e}")))?;
-
-        // Helper: probe + return final BrowserManageResponse for the current setting.
-        let read_status = |messages: Vec<String>| async {
-            let cfg = cortex::config::Config::load_from_db()
-                .await
-                .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
-            let url = cfg.browser.cdp_url.clone().unwrap_or_default();
-            let connected = if url.is_empty() {
-                false
-            } else {
-                tokio::task::spawn_blocking({
-                    let url = url.clone();
-                    move || match cortex::browser::cdp_attach::parse_cdp_url(&url) {
-                        Ok(parsed) => cortex::browser::cdp_attach::is_cdp_ready_blocking(
-                            &parsed,
-                            std::time::Duration::from_secs(1),
-                        ),
-                        Err(_) => false,
-                    }
-                })
-                .await
-                .unwrap_or(false)
-            };
-            Ok::<BrowserManageResponse, TStatus>(BrowserManageResponse {
-                connected,
-                url,
-                messages,
-            })
-        };
-
-        match action.as_str() {
-            "status" | "" => {
-                let resp = read_status(messages).await?;
-                Ok(Response::new(resp))
-            }
-            "disconnect" => {
-                let (_, source) = resolver
-                    .get_with_source("browser.cdp_url")
-                    .await
-                    .map_err(|e| TStatus::internal(format!("settings get failed: {e}")))?;
-                if matches!(source, cortex::settings::SettingSource::Database) {
-                    resolver
-                        .unset("browser.cdp_url")
-                        .await
-                        .map_err(|e| TStatus::internal(format!("settings unset failed: {e}")))?;
-                    notify_runtime_config_reload(&self.config_notify_tx).await;
-                    messages.push("browser disconnected from CDP endpoint".to_string());
-                } else {
-                    messages.push("browser is not connected (already in default mode)".to_string());
-                }
-                let resp = read_status(messages).await?;
-                Ok(Response::new(resp))
-            }
-            "connect" => {
-                let parsed = match cortex::browser::cdp_attach::parse_cdp_url(&req.url) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        messages.push(format!("⚠ {e}"));
-                        return Ok(Response::new(BrowserManageResponse {
-                            connected: false,
-                            url: String::new(),
-                            messages,
-                        }));
-                    }
-                };
-
-                messages.push(format!(
-                    "checking Chromium-family browser remote debugging at {}…",
-                    parsed.url
-                ));
-
-                let probe_url = parsed.clone();
-                let mut reachable = tokio::task::spawn_blocking(move || {
-                    cortex::browser::cdp_attach::is_cdp_ready_blocking(
-                        &probe_url,
-                        std::time::Duration::from_millis(1000),
-                    )
-                })
-                .await
-                .unwrap_or(false);
-
-                // Auto-launch path: only attempted when the user is targeting
-                // the default URL — we won't spawn a Chrome aimed at someone
-                // else's port.
-                if !reachable && parsed.url == cortex::browser::cdp_attach::DEFAULT_CDP_URL {
-                    messages.push(
-                        "Chromium-family browser isn't running with remote debugging — attempting to launch…"
-                            .to_string(),
-                    );
-                    let port = parsed.port;
-                    let launched = tokio::task::spawn_blocking(move || {
-                        cortex::browser::cdp_attach::try_launch_chrome_debug(port)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn failed: {e}")));
-
-                    match launched {
-                        Ok(()) => {
-                            for _ in 0..10 {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                let probe_url = parsed.clone();
-                                let ok = tokio::task::spawn_blocking(move || {
-                                    cortex::browser::cdp_attach::is_cdp_ready_blocking(
-                                        &probe_url,
-                                        std::time::Duration::from_millis(500),
-                                    )
-                                })
-                                .await
-                                .unwrap_or(false);
-                                if ok {
-                                    reachable = true;
-                                    break;
-                                }
-                            }
-                            if reachable {
-                                messages.push(format!(
-                                    "✓ Chromium-family browser launched and listening on port {}",
-                                    parsed.port
-                                ));
-                                if let Ok(dir) =
-                                    cortex::browser::cdp_attach::chrome_debug_data_dir()
-                                {
-                                    // Surfacing the profile dir tells the user this isn't
-                                    // their everyday Chrome — its cookies and history are
-                                    // isolated under ~/.borg/chrome-debug. Otherwise an
-                                    // operator could mistake the new window for their main
-                                    // browser and be surprised when logged-in sites aren't.
-                                    messages.push(format!(
-                                        "   Using isolated profile: {}",
-                                        dir.display()
-                                    ));
-                                }
-                            } else {
-                                messages.push(format!(
-                                    "⚠ Browser launched but port {} isn't responding yet — retry /browser connect in a few seconds",
-                                    parsed.port
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            messages.push(format!(
-                                "⚠ Could not auto-launch a Chromium-family browser: {e}"
-                            ));
-                            if let Some(cmd) =
-                                cortex::browser::cdp_attach::manual_chrome_debug_command(
-                                    parsed.port,
-                                )
-                            {
-                                messages.push("Launch one manually:".to_string());
-                                messages.push(format!("    {cmd}"));
-                            }
-                        }
-                    }
-                }
-
-                if !reachable {
-                    messages.push(format!(
-                        "browser not connected — port {} is not reachable at {}",
-                        parsed.port, parsed.url
-                    ));
-                    // For non-default URLs we skipped auto-launch (we won't
-                    // spawn a Chrome aimed at someone else's port). Still
-                    // emit the manual command so the user has an actionable
-                    // next step instead of just "not reachable".
-                    if parsed.url != cortex::browser::cdp_attach::DEFAULT_CDP_URL {
-                        if let Some(cmd) =
-                            cortex::browser::cdp_attach::manual_chrome_debug_command(parsed.port)
-                        {
-                            messages.push("Start a debug Chromium yourself with:".to_string());
-                            messages.push(format!("    {cmd}"));
-                        }
-                    }
-                    return Ok(Response::new(BrowserManageResponse {
-                        connected: false,
-                        url: String::new(),
-                        messages,
-                    }));
-                }
-
-                resolver
-                    .set("browser.cdp_url", &parsed.url)
-                    .await
-                    .map_err(|e| TStatus::invalid_argument(format!("settings set failed: {e}")))?;
-                notify_runtime_config_reload(&self.config_notify_tx).await;
-
-                // Be honest about what this RPC confirmed: a successful
-                // /json/version probe + a persisted setting. The actual
-                // chromiumoxide attach happens on the next browser tool
-                // call; if it fails (rare — Chrome rejects WS upgrade,
-                // process died between probe and use) the user gets the
-                // actionable hint from `handle_browser` pointing at
-                // `/browser disconnect`. Overclaiming "connected" here
-                // would set the wrong expectation.
-                messages.push(
-                    "🌐 CDP endpoint reachable — agent will attach on next browser tool call"
-                        .to_string(),
-                );
-                messages.push(format!("   Endpoint: {}", parsed.url));
-
-                Ok(Response::new(BrowserManageResponse {
-                    connected: true,
-                    url: parsed.url,
-                    messages,
-                }))
-            }
-            other => Err(TStatus::invalid_argument(format!(
-                "unknown browser action '{other}' (expected connect|disconnect|status)"
-            ))),
-        }
+        browser::browser_manage(self, req).await
     }
 
     async fn get_handoff_status(
         &self,
         req: Request<SessionRef>,
     ) -> Result<Response<HandoffStatusReply>, TStatus> {
-        let id = req.into_inner().id;
-        let status = async {
-            let db = Database::open().await?;
-            let session_id = resolve_goal_session_id(&db, &id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("no session to inspect"))?;
-            db.handoff_status(&session_id).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| TStatus::internal(format!("get_handoff_status failed: {e}")))?;
-        Ok(Response::new(HandoffStatusReply {
-            state: status
-                .state
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_default(),
-            target_platform: status.target.unwrap_or_default(),
-            error: status.error.unwrap_or_default(),
-            requested_at_unix: status.requested_at.unwrap_or(0),
-        }))
+        handoff::get_handoff_status(self, req).await
     }
 
     async fn get_goal(&self, req: Request<GoalRef>) -> Result<Response<GoalDetail>, TStatus> {
-        let session_id_req = req.into_inner().session_id;
-        let detail = async {
-            let db = Database::open().await?;
-            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
-                return anyhow::Ok(GoalDetail::default());
-            };
-            Ok(db
-                .get_goal(&session_id)
-                .await?
-                .map(|g| goal_to_detail(&g))
-                .unwrap_or_default())
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("get_goal failed: {e}")))?;
-        Ok(Response::new(detail))
+        goals::get_goal(self, req).await
     }
 
     async fn set_goal(&self, req: Request<GoalMutation>) -> Result<Response<GoalDetail>, TStatus> {
-        let req = req.into_inner();
-        let op = GoalMutationOp::try_from(req.op).map_err(|_| {
-            TStatus::invalid_argument(format!("unknown op discriminator: {}", req.op))
-        })?;
-        if op == GoalMutationOp::Unspecified {
-            return Err(TStatus::invalid_argument("op is required (UNSPECIFIED)"));
-        }
-        let session_id_req = req.session_id.clone();
-        let objective = req.objective.clone();
-        let status_raw = req.status.clone();
-        let token_budget = if req.token_budget_present {
-            Some(req.token_budget)
-        } else {
-            None
-        };
-        let bus = self.goal_bus_handle();
-        let outcome = async {
-            let db = Database::open().await.map_err(SetGoalError::Internal)?;
-            // Create/Replace autocreate a session when none exists so `/goal
-            // <text>` works on a freshly-launched TUI without forcing the user
-            // to send a message first. Status/budget mutations still require
-            // an existing goal row, so they use the strict resolver below.
-            let session_id = match op {
-                GoalMutationOp::Create | GoalMutationOp::Replace => {
-                    resolve_or_create_goal_session_id(&db, &session_id_req)
-                        .await
-                        .map_err(SetGoalError::Internal)?
-                }
-                _ => resolve_goal_session_id(&db, &session_id_req)
-                    .await
-                    .map_err(SetGoalError::Internal)?
-                    .ok_or_else(|| {
-                        SetGoalError::Precondition("no active session — start a turn first".into())
-                    })?,
-            };
-            match op {
-                GoalMutationOp::Unspecified => unreachable!(),
-                GoalMutationOp::Create => {
-                    let obj = cortex::goals::validate_objective(&objective)
-                        .map_err(SetGoalError::Invalid)?;
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(SetGoalError::Invalid)?;
-                    let inserted = db
-                        .insert_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
-                        .await
-                        .map_err(SetGoalError::Internal)?;
-                    let goal = inserted.ok_or_else(|| {
-                        SetGoalError::AlreadyExists("goal already exists for this session".into())
-                    })?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind: cortex::goals::event_kind::CREATED,
-                    })
-                }
-                GoalMutationOp::Replace => {
-                    let obj = cortex::goals::validate_objective(&objective)
-                        .map_err(SetGoalError::Invalid)?;
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(SetGoalError::Invalid)?;
-                    let existed = db
-                        .get_goal(&session_id)
-                        .await
-                        .map_err(SetGoalError::Internal)?
-                        .is_some();
-                    let g = db
-                        .replace_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
-                        .await
-                        .map_err(SetGoalError::Internal)?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(g),
-                        kind: if existed {
-                            cortex::goals::event_kind::REPLACED
-                        } else {
-                            cortex::goals::event_kind::CREATED
-                        },
-                    })
-                }
-                GoalMutationOp::SetStatus => {
-                    let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
-                        .ok_or_else(|| {
-                            SetGoalError::Invalid(format!(
-                                "status must be one of active|paused|complete (got {status_raw:?}); blocked and budget_limited are system-only"
-                            ))
-                        })?;
-                    if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
-                        return Err(SetGoalError::Invalid(
-                            "budget_limited is system-only; cannot be set via RPC".into(),
-                        ));
-                    }
-                    if matches!(new_status, cortex::goals::GoalStatus::Blocked) {
-                        return Err(SetGoalError::Invalid(
-                            "blocked is agent-only; cannot be set via RPC".into(),
-                        ));
-                    }
-                    let current = db
-                        .get_goal(&session_id)
-                        .await
-                        .map_err(SetGoalError::Internal)?
-                        .ok_or_else(|| {
-                            SetGoalError::Precondition("no goal set for this session".into())
-                        })?;
-                    use cortex::goals::GoalStatus as S;
-                    let allowed = matches!(
-                        (current.status, new_status),
-                        (S::Active, S::Paused)
-                            | (S::Paused, S::Active)
-                            | (S::Active, S::Complete)
-                            | (S::Paused, S::Complete)
-                            | (S::BudgetLimited, S::Complete)
-                            // Blocked is set by the agent; the user resumes
-                            // it back to Active or marks it Complete.
-                            | (S::Blocked, S::Active)
-                            | (S::Blocked, S::Complete)
-                    );
-                    if !allowed {
-                        return Err(SetGoalError::Invalid(format!(
-                            "illegal transition {} -> {}",
-                            current.status.as_str(),
-                            new_status.as_str()
-                        )));
-                    }
-                    let updated = db
-                        .update_goal(
-                            &session_id,
-                            cortex::db::GoalUpdate {
-                                status: Some(new_status),
-                                expected_goal_id: Some(current.goal_id),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(SetGoalError::Internal)?;
-                    let goal = updated.ok_or_else(|| {
-                        SetGoalError::Precondition(
-                            "goal changed concurrently during status update".into(),
-                        )
-                    })?;
-                    let kind = if goal.status == cortex::goals::GoalStatus::Complete {
-                        cortex::goals::event_kind::COMPLETED
-                    } else {
-                        cortex::goals::event_kind::STATUS_CHANGED
-                    };
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind,
-                    })
-                }
-                GoalMutationOp::SetBudget => {
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(SetGoalError::Invalid)?;
-                    let current = db
-                        .get_goal(&session_id)
-                        .await
-                        .map_err(SetGoalError::Internal)?
-                        .ok_or_else(|| {
-                            SetGoalError::Precondition("no goal set for this session".into())
-                        })?;
-                    let updated = db
-                        .update_goal(
-                            &session_id,
-                            cortex::db::GoalUpdate {
-                                token_budget: Some(budget),
-                                expected_goal_id: Some(current.goal_id),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(SetGoalError::Internal)?;
-                    let goal = updated.ok_or_else(|| {
-                        SetGoalError::Precondition(
-                            "goal changed concurrently during budget update".into(),
-                        )
-                    })?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind: cortex::goals::event_kind::BUDGET_CHANGED,
-                    })
-                }
-            }
-        }
-        .await
-        .map_err(|e| match e {
-            SetGoalError::Invalid(msg) => TStatus::invalid_argument(format!("set_goal: {msg}")),
-            SetGoalError::Precondition(msg) => {
-                TStatus::failed_precondition(format!("set_goal: {msg}"))
-            }
-            SetGoalError::AlreadyExists(msg) => TStatus::already_exists(format!("set_goal: {msg}")),
-            SetGoalError::Internal(err) => TStatus::internal(format!("set_goal: {err}")),
-        })?;
-
-        let detail = outcome
-            .goal
-            .as_ref()
-            .map(goal_to_detail)
-            .unwrap_or_default();
-        if let (Some(bus), Some(goal)) = (bus, outcome.goal.as_ref()) {
-            bus.publish(crate::goal_bus::DaemonGoalEvent {
-                session_id: goal.session_id.clone(),
-                kind: outcome.kind.to_string(),
-                goal: Some(goal.clone()),
-                emitted_at_unix: now_unix(),
-            });
-        }
-        Ok(Response::new(detail))
+        goals::set_goal(self, req).await
     }
 
     async fn clear_goal(&self, req: Request<GoalRef>) -> Result<Response<Empty>, TStatus> {
-        let session_id_req = req.into_inner().session_id;
-        let bus = self.goal_bus_handle();
-        let removed = async {
-            let db = Database::open().await?;
-            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
-                return anyhow::Ok(None);
-            };
-            let did_remove = db.delete_goal(&session_id).await?;
-            Ok(if did_remove { Some(session_id) } else { None })
-        }
-        .await
-        .map_err(|e| TStatus::internal(format!("clear_goal failed: {e}")))?;
-        if let (Some(bus), Some(session_id)) = (bus, removed) {
-            bus.publish(crate::goal_bus::DaemonGoalEvent {
-                session_id,
-                kind: cortex::goals::event_kind::CLEARED.to_string(),
-                goal: None,
-                emitted_at_unix: now_unix(),
-            });
-        }
-        Ok(Response::new(Empty {}))
+        goals::clear_goal(self, req).await
     }
 
     async fn pause_goal_on_interrupt(
         &self,
         req: Request<GoalRef>,
     ) -> Result<Response<GoalDetail>, TStatus> {
-        let session_id_req = req.into_inner().session_id;
-        let bus = self.goal_bus_handle();
-        let paused = async {
-            let db = Database::open().await?;
-            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req).await? else {
-                return anyhow::Ok(None);
-            };
-            db.pause_active_goal(&session_id).await
-        }
-        .await
-        .map_err(|e: anyhow::Error| TStatus::internal(format!("pause_goal failed: {e}")))?;
-        let detail = paused.as_ref().map(goal_to_detail).unwrap_or_default();
-        if let (Some(bus), Some(goal)) = (bus, paused.as_ref()) {
-            bus.publish(crate::goal_bus::DaemonGoalEvent {
-                session_id: goal.session_id.clone(),
-                kind: cortex::goals::event_kind::STATUS_CHANGED.to_string(),
-                goal: Some(goal.clone()),
-                emitted_at_unix: now_unix(),
-            });
-        }
-        Ok(Response::new(detail))
+        goals::pause_goal_on_interrupt(self, req).await
     }
 
     type SubscribeGoalEventsStream =
@@ -2228,35 +1147,9 @@ impl Admin for AdminSvc {
 
     async fn subscribe_goal_events(
         &self,
-        _req: Request<Empty>,
+        req: Request<Empty>,
     ) -> Result<Response<Self::SubscribeGoalEventsStream>, TStatus> {
-        let bus = self
-            .goal_bus_handle()
-            .ok_or_else(|| TStatus::failed_precondition("goal event bus not wired"))?;
-        let mut sub = bus.subscribe();
-        let (tx, rx) = mpsc::channel::<Result<PbGoalEvent, TStatus>>(16);
-        tokio::spawn(async move {
-            loop {
-                match sub.recv().await {
-                    Ok(evt) => {
-                        let pb = PbGoalEvent {
-                            session_id: evt.session_id,
-                            kind: evt.kind,
-                            goal: Some(evt.goal.as_ref().map(goal_to_detail).unwrap_or_default()),
-                            emitted_at_unix: evt.emitted_at_unix,
-                        };
-                        if tx.send(Ok(pb)).await.is_err() {
-                            return; // client gone
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("goal stream subscriber lagged by {n}; continuing");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        goals::subscribe_goal_events(self, req).await
     }
 
     async fn tunnel_start(
@@ -2368,62 +1261,31 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AgentListRequest>,
     ) -> Result<Response<PbAgentList>, TStatus> {
-        let session_id = req.into_inner().session_id;
-        let db = Database::open()
-            .await
-            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
-        let resolved = resolve_agent_session_id(&db, &session_id)
-            .await
-            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Ok(Response::new(PbAgentList::default()));
-        };
-        let rows = db
-            .list_sub_agent_runs(&resolved)
-            .await
-            .map_err(|e| TStatus::internal(format!("list_sub_agent_runs: {e}")))?;
-        let agents: Vec<PbAgentEntry> = rows.iter().map(sub_agent_row_to_pb).collect();
-        let snapshots = db
-            .list_agent_tree_snapshots(&resolved)
-            .await
-            .map_err(|e| TStatus::internal(format!("list_agent_tree_snapshots: {e}")))?;
-        let history: Vec<PbAgentSnapshotRef> = snapshots.iter().map(snapshot_row_to_pb).collect();
-        Ok(Response::new(PbAgentList { agents, history }))
+        agents::list_agents(self, req).await
     }
 
     /// Kill an agent. Today returns Unimplemented — the in-memory registry
     /// handle the cancellation token lives behind is not yet plumbed through
     /// the daemon session executor. The wire format is stable so the CLI
     /// and TUI can be built against it and the executor lands separately.
-    async fn kill_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        Err(TStatus::unimplemented(
-            "kill_agent: executor wiring pending — only ListAgents/snapshots are live in this slice",
-        ))
+    async fn kill_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        agents::kill_agent(self, req).await
     }
 
     /// Kill an agent and every descendant. See `kill_agent` for the same
     /// executor-wiring caveat.
-    async fn kill_agent_subtree(
-        &self,
-        _req: Request<AgentRef>,
-    ) -> Result<Response<Empty>, TStatus> {
-        Err(TStatus::unimplemented(
-            "kill_agent_subtree: executor wiring pending",
-        ))
+    async fn kill_agent_subtree(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        agents::kill_agent_subtree(self, req).await
     }
 
     /// Pause an agent at its next iteration boundary. See `kill_agent`.
-    async fn pause_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        Err(TStatus::unimplemented(
-            "pause_agent: executor wiring pending",
-        ))
+    async fn pause_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        agents::pause_agent(self, req).await
     }
 
     /// Resume a paused agent. See `kill_agent`.
-    async fn resume_agent(&self, _req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
-        Err(TStatus::unimplemented(
-            "resume_agent: executor wiring pending",
-        ))
+    async fn resume_agent(&self, req: Request<AgentRef>) -> Result<Response<Empty>, TStatus> {
+        agents::resume_agent(self, req).await
     }
 
     /// Stream tree-lifecycle events. Returns `Unimplemented` until the
@@ -2432,11 +1294,9 @@ impl Admin for AdminSvc {
     /// confuse "no events yet" with "not wired".
     async fn subscribe_agent_tree_events(
         &self,
-        _req: Request<SessionRef>,
+        req: Request<SessionRef>,
     ) -> Result<Response<Self::SubscribeAgentTreeEventsStream>, TStatus> {
-        Err(TStatus::unimplemented(
-            "subscribe_agent_tree_events: AgentTreeBus wiring pending — poll ListAgents instead",
-        ))
+        agents::subscribe_agent_tree_events(self, req).await
     }
 
     /// List persisted spawn-tree snapshots for a session (newest first,
@@ -2445,23 +1305,7 @@ impl Admin for AdminSvc {
         &self,
         req: Request<SessionRef>,
     ) -> Result<Response<AgentSnapshotList>, TStatus> {
-        let session_id = req.into_inner().id;
-        let db = Database::open()
-            .await
-            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
-        let resolved = resolve_agent_session_id(&db, &session_id)
-            .await
-            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Ok(Response::new(AgentSnapshotList::default()));
-        };
-        let rows = db
-            .list_agent_tree_snapshots(&resolved)
-            .await
-            .map_err(|e| TStatus::internal(format!("list_agent_tree_snapshots: {e}")))?;
-        Ok(Response::new(AgentSnapshotList {
-            snapshots: rows.iter().map(snapshot_row_to_pb).collect(),
-        }))
+        agents::list_agent_snapshots(self, req).await
     }
 
     /// Fetch the agents captured in one persisted snapshot. The snapshot
@@ -2470,37 +1314,17 @@ impl Admin for AdminSvc {
         &self,
         req: Request<AgentSnapshotRefRequest>,
     ) -> Result<Response<PbAgentList>, TStatus> {
-        let inner = req.into_inner();
-        if inner.turn_id.trim().is_empty() {
-            return Err(TStatus::invalid_argument("turn_id is required"));
-        }
-        let db = Database::open()
-            .await
-            .map_err(|e| TStatus::internal(format!("db open failed: {e}")))?;
-        let resolved = resolve_agent_session_id(&db, &inner.session_id)
-            .await
-            .map_err(|e| TStatus::internal(format!("session resolve failed: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Err(TStatus::failed_precondition("no active session"));
-        };
-        let row = db
-            .get_agent_tree_snapshot(&resolved, &inner.turn_id)
-            .await
-            .map_err(|e| TStatus::internal(format!("get_agent_tree_snapshot: {e}")))?
-            .ok_or_else(|| TStatus::not_found("snapshot not found"))?;
-        // Snapshot JSON is `Vec<PbAgentEntry>` serialized through serde-json
-        // by the writer; tolerate both bare array and `{agents: [...]}` so
-        // the format can grow without forcing a migration.
-        let agents: Vec<PbAgentEntry> = parse_snapshot_payload(&row.snapshot_json)
-            .map_err(|e| TStatus::internal(format!("snapshot decode failed: {e}")))?;
-        Ok(Response::new(PbAgentList {
-            agents,
-            history: Vec::new(),
-        }))
+        agents::get_agent_snapshot(self, req).await
     }
 }
 
+mod agents;
+mod browser;
+mod credentials;
+mod goals;
+mod handoff;
 mod helpers;
+mod scheduled_tasks;
 use helpers::{
     approved_sender_row_to_proto, build_primary_pool, credential_pool_to_proto, goal_to_detail,
     load_ambient_status, map_internal, map_invalid_arg, notify_runtime_config_reload,
