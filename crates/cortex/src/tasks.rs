@@ -85,7 +85,9 @@ fn resolve_cron_timezone(timezone: &str) -> Option<Tz> {
                 tracing::warn!(
                     timezone = %other,
                     error = %e,
-                    "unrecognized IANA timezone on scheduled task — falling back to UTC"
+                    "unrecognized IANA timezone on scheduled task — ignoring; \
+                     applying the schedule's default zone (UTC for cron, \
+                     system-local for once)"
                 );
                 None
             }
