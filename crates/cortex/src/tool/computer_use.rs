@@ -1329,23 +1329,51 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
     ))
 }
 
+/// Translate the model's `(delta_x, delta_y)` into the driver's scroll
+/// contract (`direction` + `amount`). cua-driver scrolls by synthesised
+/// arrow/page keystrokes, so it takes a cardinal `direction` and an `amount`
+/// of key repeats (clamped 1–50) — NOT a pixel delta. The dominant axis wins;
+/// vertical breaks ties (mouse wheels are vertical by default). `amount` is
+/// the magnitude of that axis' delta, treated as key-repeat count.
+fn scroll_direction_amount(dx: i32, dy: i32) -> Option<(&'static str, i64)> {
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    let (dir, magnitude) = if dy.unsigned_abs() >= dx.unsigned_abs() {
+        (if dy > 0 { "down" } else { "up" }, dy.unsigned_abs())
+    } else {
+        (if dx > 0 { "right" } else { "left" }, dx.unsigned_abs())
+    };
+    let amount = i64::from(magnitude).clamp(1, 50);
+    Some((dir, amount))
+}
+
 async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
     let dx = args.delta_x.unwrap_or(0);
     let dy = args.delta_y.unwrap_or(0);
-    if dx == 0 && dy == 0 {
+    let Some((direction, amount)) = scroll_direction_amount(dx, dy) else {
         return Ok(ToolOutput::Text(
             "Error: computer_use.scroll requires non-zero `delta_x` or `delta_y`".into(),
         ));
-    }
-    let mut params = json!({"delta_x": dx, "delta_y": dy});
+    };
+    // The driver requires `pid` for scroll (keystrokes are posted to a target
+    // process). Without it the call can't be routed.
+    let pid = args.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "computer_use.scroll requires `pid` (the target process the scroll keystrokes go to)"
+        )
+    })?;
+    let mut params = json!({"pid": pid, "direction": direction, "amount": amount});
     let summary;
     if let Some(idx) = args.element_index {
+        // Focuses the element before the keystrokes fire; requires window_id.
         params["element_index"] = json!(idx);
-        summary = format!("scroll element [{idx}] by ({dx},{dy})");
+        if let Some(window_id) = args.window_id {
+            params["window_id"] = json!(window_id);
+        }
+        summary = format!("scroll element [{idx}] {direction} x{amount}");
     } else {
-        params["x"] = json!(args.x.unwrap_or(0));
-        params["y"] = json!(args.y.unwrap_or(0));
-        summary = format!("scroll ({dx},{dy})");
+        summary = format!("scroll {direction} x{amount}");
     }
     let resp = driver.call("scroll", params).await?;
     Ok(merge_driver_text(summary, resp))
@@ -2534,21 +2562,70 @@ mod tests {
         );
     }
 
-    /// Scroll by element_index is the SOM equivalent of "scroll inside the
-    /// list with overlay box [N]". Driver must see the index and the
-    /// deltas; pixel coords are omitted entirely.
+    /// Delta → (direction, amount) translation. The driver scrolls by
+    /// keystroke repeats, not pixel deltas: the dominant axis picks the
+    /// cardinal direction, the magnitude becomes the (1–50 clamped) amount,
+    /// and ties go vertical. A regression here would send the driver a shape
+    /// its `additionalProperties: false` schema rejects outright.
+    #[test]
+    fn scroll_direction_amount_table() {
+        let cases = [
+            ((0, -3), Some(("up", 3))),
+            ((0, 5), Some(("down", 5))),
+            ((-4, 0), Some(("left", 4))),
+            ((7, 0), Some(("right", 7))),
+            ((3, -10), Some(("up", 10))),    // vertical dominates
+            ((10, -3), Some(("right", 10))), // horizontal dominates
+            ((2, 2), Some(("down", 2))),     // tie → vertical
+            ((0, 500), Some(("down", 50))),  // clamp to 50
+            ((0, 0), None),
+        ];
+        for ((dx, dy), expected) in cases {
+            assert_eq!(
+                scroll_direction_amount(dx, dy),
+                expected,
+                "scroll ({dx},{dy})"
+            );
+        }
+    }
+
+    /// Scroll requires `pid` (keystrokes are posted to a target process) —
+    /// a scroll without it must error before the driver rather than send an
+    /// unroutable call.
     #[tokio::test]
-    async fn scroll_by_element_index_passes_index_and_deltas() {
+    async fn scroll_without_pid_errors_before_driver() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Scroll);
+        args.delta_y = Some(-3);
+        let out = handle_with_driver(&args, &driver).await;
+        assert!(out.is_err(), "scroll without pid must error: {out:?}");
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    /// Scroll by element_index is the SOM equivalent of "scroll inside the
+    /// list with overlay box [N]". Driver must see the index, the derived
+    /// direction/amount, pid, and window_id; pixel coords are never sent.
+    #[tokio::test]
+    async fn scroll_by_element_index_sends_direction_and_focus_keys() {
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::Scroll);
         args.element_index = Some(2);
+        args.window_id = Some(99);
+        args.pid = Some(1234);
         args.delta_y = Some(-50);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
-        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "scroll");
         assert_eq!(params["element_index"], 2);
-        assert_eq!(params["delta_y"], -50);
+        assert_eq!(params["window_id"], 99);
+        assert_eq!(params["pid"], 1234);
+        assert_eq!(params["direction"], "up");
+        assert_eq!(params["amount"], 50);
+        assert!(
+            params.get("delta_y").is_none(),
+            "pixel delta must not leak: {params}"
+        );
         assert!(params.get("x").is_none());
-        assert!(params.get("y").is_none());
     }
 
     // ── capture_after ──────────────────────────────────────────────
