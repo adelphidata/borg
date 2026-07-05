@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 
 use crate::config::ImageGenConfig;
 use crate::constants;
+use crate::media::core::ensure_success;
 
 /// Supported image generation providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,11 +161,7 @@ async fn generate_openai(
         .send()
         .await?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("OpenAI image generation failed ({status}): {body}");
-    }
+    let resp = ensure_success(resp, "OpenAI image generation").await?;
 
     let data: OpenAiImageResponse = resp.json().await?;
     Ok(data
@@ -271,11 +268,7 @@ async fn generate_fal(
         .send()
         .await?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("FAL queue submission failed ({status}): {body}");
-    }
+    let resp = ensure_success(resp, "FAL queue submission").await?;
 
     let queue: FalQueueResponse = resp.json().await?;
     debug!("FAL queued request: {}", queue.request_id);

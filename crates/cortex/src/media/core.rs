@@ -12,6 +12,21 @@ const DIMENSION_STEPS: &[u32] = &[2048, 1536, 1280, 1024, 800];
 /// JPEG quality levels to try, descending.
 const QUALITY_STEPS: &[u8] = &[85, 75, 65, 55, 45, 35];
 
+/// Pass the response through when its status is a success; otherwise bail
+/// with `"<label> returned <status>: <body>"`, consuming the response so the
+/// provider's error body lands in the message.
+pub(crate) async fn ensure_success(
+    resp: reqwest::Response,
+    label: &str,
+) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::bail!("{label} returned {status}: {body}")
+}
+
 /// Parse a data URI like `data:image/png;base64,abc123` into a MediaData struct.
 ///
 /// Validates the `;base64` marker is present and the data portion is non-empty.

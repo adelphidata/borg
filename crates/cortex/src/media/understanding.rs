@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config::{AudioModelConfig, Config};
+use crate::media::core::ensure_success;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaUnderstandingConfig {
@@ -104,11 +105,7 @@ impl TranscriptionProvider for WhisperProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("{} returned {status}: {body}", self.provider_name);
-        }
+        let resp = ensure_success(resp, &self.provider_name).await?;
 
         let json: serde_json::Value = resp.json().await?;
         json["text"]
@@ -149,11 +146,7 @@ impl TranscriptionProvider for DeepgramProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Deepgram returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "Deepgram").await?;
 
         let json: serde_json::Value = resp.json().await?;
         parse_deepgram_response(&json)
@@ -328,11 +321,7 @@ impl TranscriptionProvider for XaiSttProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("xAI STT returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "xAI STT").await?;
 
         let json: serde_json::Value = resp.json().await?;
         let text = json["text"].as_str().map(str::trim).unwrap_or("");

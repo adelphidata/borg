@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config::{Config, TtsModelConfig};
+use crate::media::core::ensure_success;
 
 // ── Audio Format ──
 
@@ -164,11 +165,7 @@ impl TtsProvider for OpenAiTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("OpenAI TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "OpenAI TTS").await?;
 
         Ok(resp.bytes().await?.to_vec())
     }
@@ -229,11 +226,7 @@ impl TtsProvider for ElevenLabsTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("ElevenLabs TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "ElevenLabs TTS").await?;
 
         Ok(resp.bytes().await?.to_vec())
     }
@@ -387,11 +380,7 @@ impl TtsProvider for GeminiTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Gemini TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "Gemini TTS").await?;
 
         let json: serde_json::Value = resp.json().await?;
         let parts = json
@@ -502,11 +491,7 @@ impl TtsProvider for MiniMaxTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("MiniMax TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "MiniMax TTS").await?;
 
         let json: serde_json::Value = resp.json().await?;
         let status_code = json
@@ -686,11 +671,7 @@ impl TtsProvider for XaiTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("xAI TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "xAI TTS").await?;
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -749,11 +730,7 @@ impl TtsProvider for MistralTtsProvider {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Mistral TTS returned {status}: {body}");
-        }
+        let resp = ensure_success(resp, "Mistral TTS").await?;
 
         // Mistral's content-type header is application/json; the audio
         // is base64 inside `audio_data`. Some Mistral deployments may
