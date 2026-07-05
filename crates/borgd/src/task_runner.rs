@@ -26,13 +26,22 @@ const SCHEDULED_TURN_MEMORY_TOKENS: usize = 4000;
 pub const SILENT_SENTINEL: &str = "[SILENT]";
 
 /// Returns true if the LLM's response should suppress delivery — i.e. its
-/// first non-empty, trimmed line *equals* `[SILENT]`. Substring matches
-/// (e.g. discussing the sentinel in prose) MUST NOT trigger suppression.
+/// first non-empty, trimmed line is `[SILENT]`, tolerating trailing punctuation
+/// or whitespace the model may append (`[SILENT].`, `[SILENT]!`). Substring
+/// matches (e.g. discussing the sentinel in prose, or `status=[SILENT]`) MUST
+/// NOT trigger suppression: the sentinel must be the whole line up to that
+/// trailing punctuation. Note we can't just trim trailing punctuation off the
+/// line, since the sentinel itself ends in `]`.
 pub(crate) fn is_silent_response(text: &str) -> bool {
     text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .map(|first| first == SILENT_SENTINEL)
+        .map(|first| match first.strip_prefix(SILENT_SENTINEL) {
+            Some(rest) => rest
+                .chars()
+                .all(|c| c.is_ascii_punctuation() || c.is_whitespace()),
+            None => false,
+        })
         .unwrap_or(false)
 }
 
@@ -1327,6 +1336,19 @@ mod pre_run_tests {
     fn silent_sentinel_exact_match_suppresses() {
         assert!(is_silent_response("[SILENT]"));
         assert!(is_silent_response("  [SILENT]  "));
+    }
+
+    #[test]
+    fn silent_sentinel_tolerates_trailing_punctuation() {
+        // Models routinely append a stray period/bang/whitespace to the marker;
+        // that must still suppress. Regression for `[SILENT].` leaking to chat.
+        for s in ["[SILENT].", "[SILENT]!", "[SILENT]?", "  [SILENT].  ", "[SILENT] ."] {
+            assert!(is_silent_response(s), "{s:?} should suppress delivery");
+        }
+        // Trailing *words* (real content, not a decorated marker) must NOT
+        // suppress — otherwise a genuine reply beginning with the marker text
+        // would be silenced.
+        assert!(!is_silent_response("[SILENT] but actually here's an update"));
     }
 
     #[test]
