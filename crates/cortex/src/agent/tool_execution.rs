@@ -625,6 +625,7 @@ impl Agent {
             }
             crate::tool::Tool::ListSkills => crate::tool::list::handle_list_skills(&self.config),
             crate::tool::Tool::ListChannels => crate::tool::list::handle_list_channels(&self.config),
+            crate::tool::Tool::SearchTools(args) => Ok(crate::tool::search_tools::handle(args)),
             crate::tool::Tool::ApplyPatch(args) => {
                 crate::tool::apply_patch::handle_apply_patch_with_context(
                     args,
@@ -850,6 +851,9 @@ pub(super) async fn dispatch_parallel_safe_tool(
         }
         crate::tool::Tool::ListChannels => {
             crate::tool::list::handle_list_channels(config).map(ToolOutput::Text)
+        }
+        crate::tool::Tool::SearchTools(args) => {
+            Ok(ToolOutput::Text(crate::tool::search_tools::handle(args)))
         }
         crate::tool::Tool::ListDir(args) => match execution_context {
             Some(ctx) => crate::tool::list_dir::handle_with_context(args, config, ctx),

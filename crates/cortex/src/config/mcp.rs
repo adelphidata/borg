@@ -61,6 +61,17 @@ pub struct McpConfig {
     /// doubles each attempt. Default: 250.
     #[serde(default = "default_startup_retry_base_ms")]
     pub startup_retry_base_ms: u64,
+    /// Defer MCP tool schemas out of the per-turn LLM tool list and expose
+    /// them through the `search_tools` meta-tool instead. The model searches
+    /// registered MCP tools by keyword and receives matching specs on demand,
+    /// then calls them directly the next turn (dispatch is registry-keyed, not
+    /// advertisement-keyed, so a discovered tool is immediately callable).
+    ///
+    /// Off by default — existing behaviour (every MCP schema sent every turn)
+    /// is unchanged. Turn on to reclaim context when many MCP tools are
+    /// registered. Native/compiled-in tools are never deferred.
+    #[serde(default)]
+    pub tool_search: bool,
 }
 
 impl Default for McpConfig {
@@ -75,7 +86,17 @@ impl Default for McpConfig {
             max_response_bytes: default_max_response_bytes(),
             startup_max_retries: default_startup_max_retries(),
             startup_retry_base_ms: default_startup_retry_base_ms(),
+            tool_search: false,
         }
+    }
+}
+
+impl McpConfig {
+    /// True when MCP tool-search deferral is in effect. Requires MCP itself to
+    /// be enabled — `tool_search` alone with `enabled = false` is a no-op (no
+    /// sessions, no tools to defer).
+    pub fn tool_search_active(&self) -> bool {
+        self.enabled && self.tool_search
     }
 }
 

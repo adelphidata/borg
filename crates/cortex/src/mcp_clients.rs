@@ -203,6 +203,159 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Search registered MCP tools by keyword and return the result as a JSON
+/// string. Backs the `search_tools` meta-tool used when
+/// [`crate::config::McpConfig::tool_search_active`] holds MCP schemas out of
+/// the per-turn tool list.
+///
+/// Dispatch is registry-keyed, not advertisement-keyed, so any tool surfaced
+/// here is immediately callable by its `name` on the next turn even though it
+/// was never advertised. Filtering mirrors [`tool_definitions`] exactly
+/// (`disabled_servers` are excluded live).
+///
+/// Contract (never a silent empty string — errors-never-swallowed):
+/// - no registry / no live tools → `{"tools":[],"note":...}` explaining why;
+/// - empty/whitespace query → a compact browse index (`name` + first-sentence
+///   `summary`), name-sorted and capped, so the model can survey cheaply;
+/// - non-empty query → full specs (`name` + `description` + `input_schema`) for
+///   the best keyword matches, ordered `(score desc, name asc)` for
+///   determinism, capped by `limit` (clamped to `1..=15`).
+pub fn search_registered_tools(query: Option<&str>, limit: usize) -> String {
+    let entries: Vec<ToolSearchEntry> = match REGISTRY.get() {
+        Some(reg) => reg
+            .tools()
+            .into_iter()
+            .filter(|t: &RegisteredTool| !is_server_disabled(&t.server))
+            .map(|t: RegisteredTool| ToolSearchEntry {
+                name: t.full_name,
+                description: t.description.unwrap_or_default(),
+                input_schema: t.input_schema,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    render_tool_search(&entries, query, limit)
+}
+
+/// Slim projection of a registered MCP tool used for search rendering.
+/// Decouples [`render_tool_search`] from `mcp::RegisteredTool`'s full (and
+/// evolving) shape so the rendering logic is unit-testable in isolation.
+struct ToolSearchEntry {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+/// Upper bound on a tool-search `limit` so one search can't dump every schema
+/// back. Advertised to the model via the `search_tools` definition — kept
+/// `pub(crate)` so the definition builds its description from this single
+/// source rather than restating the number.
+pub(crate) const TOOL_SEARCH_LIMIT_MAX: usize = 15;
+
+/// Pure renderer behind [`search_registered_tools`]. Separated from the global
+/// `REGISTRY` read so it can be exhaustively unit-tested. See
+/// [`search_registered_tools`] for the contract.
+fn render_tool_search(entries: &[ToolSearchEntry], query: Option<&str>, limit: usize) -> String {
+    /// Max entries returned by the empty-query browse index.
+    const INDEX_CAP: usize = 60;
+
+    if entries.is_empty() {
+        return serde_json::json!({
+            "tools": [],
+            "note": "no MCP tools are registered (MCP disabled or no servers connected)",
+        })
+        .to_string();
+    }
+
+    let query = query.unwrap_or("").trim().to_ascii_lowercase();
+
+    if query.is_empty() {
+        let total = entries.len();
+        // Name-sorted for a stable, predictable browse order.
+        let mut sorted: Vec<&ToolSearchEntry> = entries.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let index: Vec<serde_json::Value> = sorted
+            .iter()
+            .take(INDEX_CAP)
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "summary": first_sentence(&t.description),
+                })
+            })
+            .collect();
+        let note = if total > INDEX_CAP {
+            format!(
+                "{total} MCP tools available; showing first {INDEX_CAP} by name. \
+                 Pass a `query` to search by keyword and get full specs."
+            )
+        } else {
+            format!(
+                "{total} MCP tools available. Pass a `query` to search by keyword \
+                 and get full specs."
+            )
+        };
+        return serde_json::json!({ "tools": index, "note": note }).to_string();
+    }
+
+    let limit = limit.clamp(1, TOOL_SEARCH_LIMIT_MAX);
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    let mut scored: Vec<(usize, &ToolSearchEntry)> = entries
+        .iter()
+        .filter_map(|t| {
+            let hay = format!("{} {}", t.name, t.description).to_ascii_lowercase();
+            let score = terms.iter().filter(|term| hay.contains(**term)).count();
+            (score > 0).then_some((score, t))
+        })
+        .collect();
+    // Higher score first; ties broken by name for deterministic output.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let matches: Vec<serde_json::Value> = scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, t)| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
+        .collect();
+    let note = if matches.is_empty() {
+        format!(
+            "no MCP tools matched {query:?}; call search_tools with no query to \
+             browse everything"
+        )
+    } else {
+        "call the tool you want by its `name` (with args per its input_schema) on \
+         your next turn"
+            .to_string()
+    };
+    serde_json::json!({ "tools": matches, "note": note }).to_string()
+}
+
+/// First sentence (or first line) of a tool description, for the cheap browse
+/// index. Falls back to a length-capped slice when there's no sentence break.
+fn first_sentence(desc: &str) -> String {
+    const MAX: usize = 140;
+    let desc = desc.trim();
+    if desc.is_empty() {
+        return String::new();
+    }
+    // Prefer the first sentence / line boundary.
+    let end = desc
+        .find(". ")
+        .map(|i| i + 1)
+        .or_else(|| desc.find('\n'))
+        .unwrap_or(desc.len())
+        .min(desc.len());
+    let mut cut = end.min(MAX);
+    while !desc.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    desc[..cut].trim().to_string()
+}
+
 /// One server's runtime view, joining the operator-side config (is it
 /// enabled? what transport?) with the live registry (is it healthy? how
 /// many tools landed?). Returned by [`server_status_snapshot`] for
@@ -630,7 +783,30 @@ fn classify_startup_failure(err: &anyhow::Error) -> (&'static str, bool) {
     let kind = err
         .downcast_ref::<mcp::errors::McpError>()
         .map_or("unknown", mcp::errors::McpError::kind);
-    (kind, kind == "auth")
+    if kind == "auth" {
+        return ("auth", true);
+    }
+    // Nested-auth rescue: the typed error may be a transport/HTTP wrapper
+    // (`TransportClosed` / `TransientHttp` / `Connect`) whose message carries an
+    // unambiguous auth signal the `McpError` variant itself doesn't encode —
+    // e.g. a gateway returning a 401 body under a 5xx, or an auth failure that
+    // reached us flattened into a "transport closed" string. The JSON-RPC code
+    // path (`session::send_request` → `McpError::Auth`) can't see those, so we
+    // scan the alternate-Display cause chain (`{:#}`) and re-classify as auth.
+    //
+    // We scan with the *word-only* matcher, NOT the full `message_looks_like_auth`:
+    // the flattened chain embeds connect `host:port`, timeouts, byte offsets,
+    // trace ids, and the operator-chosen server name, any of which can contain
+    // the bare substrings "401"/"403" and trip a spurious "re-credential"
+    // verdict on a purely transient outage. Word markers (`unauthorized`,
+    // `forbidden`, `authentication`, …) carry the auth signal without that
+    // collision, keeping the "auth-failed → operator must re-credential"
+    // surface consistent without false-flagging connect/timeout failures.
+    let flattened = format!("{err:#}");
+    if mcp::protocol::message_has_auth_wording(&flattened) {
+        return ("auth", true);
+    }
+    (kind, false)
 }
 
 /// Initialize MCP sessions. Returns `Ok(())` immediately if
@@ -1806,6 +1982,192 @@ mod tests {
         // A non-McpError failure degrades to "unknown", not a false auth signal.
         let opaque = anyhow::anyhow!("something unrelated blew up");
         assert_eq!(classify_startup_failure(&opaque), ("unknown", false));
+    }
+
+    #[test]
+    fn classify_startup_failure_rescues_auth_nested_in_transport_error() {
+        use mcp::errors::McpError;
+
+        // Regression: an auth failure can reach startup wrapped in a
+        // *transport* variant rather than `McpError::Auth` — e.g. a gateway
+        // that answers the streamable-HTTP handshake with a 5xx whose body
+        // says "401 Unauthorized", surfacing as `TransientHttp`, or an auth
+        // rejection flattened into a `TransportClosed` string. The plain
+        // downcast sees `transient_http`/`transport_closed` and would emit
+        // reauth:false, leaving the operator staring at a spurious "transient"
+        // instead of the "fix your credentials" they actually need.
+        let nested_transient = anyhow::Error::new(McpError::TransientHttp {
+            status: 502,
+            msg: "upstream returned 401 Unauthorized".to_string(),
+        })
+        .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(classify_startup_failure(&nested_transient), ("auth", true));
+
+        let nested_closed = anyhow::Error::new(McpError::TransportClosed(
+            "stream closed: forbidden".to_string(),
+        ))
+        .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(classify_startup_failure(&nested_closed), ("auth", true));
+
+        // A benign transport failure with no auth marker must NOT be dragged
+        // into the auth bucket — that would falsely demand re-credentialing.
+        let benign_closed = anyhow::Error::new(McpError::TransportClosed(
+            "peer closed mid-request".to_string(),
+        ))
+        .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(
+            classify_startup_failure(&benign_closed),
+            ("transport_closed", false)
+        );
+    }
+
+    #[test]
+    fn classify_startup_failure_does_not_auth_flag_transient_failures_with_status_digits() {
+        use mcp::errors::McpError;
+
+        // Regression: the flattened `{err:#}` chain embeds ports, timeouts,
+        // byte counts, and the operator's server name — none of which are auth
+        // signals even when they contain the bare substrings "401"/"403". A
+        // connect failure to a `:8403` port or a `4013ms` timeout must stay in
+        // its transient bucket, or the operator is told to re-credential a
+        // server that is merely unreachable.
+        let connect_port = anyhow::Error::new(McpError::Connect(
+            "connect failed: tcp connect error: 10.0.0.5:8403: connection refused".to_string(),
+        ))
+        .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(classify_startup_failure(&connect_port), ("connect", false));
+
+        let timeout = anyhow::Error::new(McpError::TransportClosed(
+            "read timed out after 4013ms".to_string(),
+        ))
+        .context("handshake/discovery failed for server 'gh'");
+        assert_eq!(
+            classify_startup_failure(&timeout),
+            ("transport_closed", false)
+        );
+
+        // The operator-chosen server name is part of the context line; a name
+        // containing "401" must not force every failure into the auth bucket.
+        let named = anyhow::Error::new(McpError::TransportClosed(
+            "peer closed mid-request".to_string(),
+        ))
+        .context("handshake/discovery failed for server 'my401k-bot'");
+        assert_eq!(
+            classify_startup_failure(&named),
+            ("transport_closed", false)
+        );
+    }
+
+    fn entry(name: &str, desc: &str, schema: serde_json::Value) -> ToolSearchEntry {
+        ToolSearchEntry {
+            name: name.to_string(),
+            description: desc.to_string(),
+            input_schema: schema,
+        }
+    }
+
+    #[test]
+    fn render_tool_search_matches_name_and_description_and_returns_full_spec() {
+        // A keyword search must find tools by name OR description and return the
+        // full input_schema so the model can call the tool next turn.
+        let entries = vec![
+            entry(
+                "mcp_github_create_issue",
+                "Open a new issue on a repository",
+                serde_json::json!({"type":"object","properties":{"title":{"type":"string"}}}),
+            ),
+            entry(
+                "mcp_slack_post_message",
+                "Send a message to a channel",
+                serde_json::json!({"type":"object"}),
+            ),
+        ];
+        let out = render_tool_search(&entries, Some("issue"), 5);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "only the github tool matches 'issue'");
+        assert_eq!(tools[0]["name"], "mcp_github_create_issue");
+        assert!(
+            tools[0]["input_schema"]["properties"]["title"].is_object(),
+            "keyword hits must carry the full callable schema"
+        );
+    }
+
+    #[test]
+    fn render_tool_search_respects_limit_and_orders_by_score_then_name() {
+        // Two tools carry both query terms (score 2), one carries a single term
+        // (score 1). With limit=2 only the two top scorers return, and the
+        // score-2 tie is broken by name ascending — deterministic output keeps
+        // the tool-result history (and its cache) stable across identical calls.
+        let entries = vec![
+            entry("mcp_b_issue_create", "create issue", serde_json::json!({})),
+            entry("mcp_a_issue_create", "create issue", serde_json::json!({})),
+            entry("mcp_c_issue_only", "issue", serde_json::json!({})),
+        ];
+        let out = render_tool_search(&entries, Some("create issue"), 2);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "limit caps the result count");
+        assert_eq!(tools[0]["name"], "mcp_a_issue_create");
+        assert_eq!(tools[1]["name"], "mcp_b_issue_create");
+    }
+
+    #[test]
+    fn render_tool_search_empty_query_returns_name_sorted_index_without_schemas() {
+        // An empty query is a cheap browse: name-sorted, first-sentence summary,
+        // and crucially NOT the full schemas (that's what a keyword search is
+        // for), so surveying the surface stays token-cheap.
+        let entries = vec![
+            entry(
+                "mcp_z_tool",
+                "Zeta does things. Second sentence ignored.",
+                serde_json::json!({"type":"object","properties":{"x":{}}}),
+            ),
+            entry("mcp_a_tool", "Alpha", serde_json::json!({})),
+        ];
+        let out = render_tool_search(&entries, None, 5);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(
+            tools[0]["name"], "mcp_a_tool",
+            "browse index is name-sorted"
+        );
+        assert_eq!(tools[1]["name"], "mcp_z_tool");
+        assert!(
+            tools[0].get("input_schema").is_none(),
+            "browse index must not dump full schemas"
+        );
+        assert_eq!(
+            tools[1]["summary"].as_str().unwrap(),
+            "Zeta does things.",
+            "summary is the first sentence only"
+        );
+    }
+
+    #[test]
+    fn render_tool_search_no_entries_returns_explicit_note_never_empty() {
+        // Errors/empties are never a silent empty string — the model always gets
+        // a structured, actionable payload.
+        let out = render_tool_search(&[], Some("issue"), 5);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["tools"].as_array().unwrap().is_empty());
+        assert!(
+            v["note"].as_str().unwrap().contains("no MCP tools"),
+            "must explain the empty result rather than return a bare empty array"
+        );
+    }
+
+    #[test]
+    fn render_tool_search_no_match_tells_model_how_to_browse() {
+        let entries = vec![entry(
+            "mcp_github_create_issue",
+            "Open an issue",
+            serde_json::json!({}),
+        )];
+        let out = render_tool_search(&entries, Some("zzzznomatch"), 5);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["tools"].as_array().unwrap().is_empty());
+        assert!(v["note"].as_str().unwrap().contains("no MCP tools matched"));
     }
 
     #[test]

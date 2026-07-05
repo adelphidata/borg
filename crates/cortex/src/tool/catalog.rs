@@ -55,6 +55,7 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     // Discovery
     (crate::tool::names::LIST, ToolGroup::Discovery),
     (crate::tool::names::REQUEST_USER_INPUT, ToolGroup::Discovery),
+    (crate::tool::names::SEARCH_TOOLS, ToolGroup::Discovery),
     // Web
     (crate::tool::names::WEB_FETCH, ToolGroup::Web),
     (crate::tool::names::WEB_SEARCH, ToolGroup::Web),
@@ -783,6 +784,7 @@ mod tests {
             tool_names::LIST_SKILLS,
             tool_names::LIST_CHANNELS,
             tool_names::LIST_AGENTS,
+            tool_names::SEARCH_TOOLS,
             tool_names::SPAWN_AGENT,
             tool_names::SEND_TO_AGENT,
             tool_names::WAIT_FOR_AGENT,

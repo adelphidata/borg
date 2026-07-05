@@ -101,17 +101,60 @@ impl RpcError {
         if AUTH_CODES.contains(&self.code) {
             return true;
         }
-        let m = self.message.to_ascii_lowercase();
-        m.contains("unauthor")
-            || m.contains("forbidden")
-            || m.contains("401")
-            || m.contains("403")
-            // "auth" alone is broad but in combination with these terms is
-            // unambiguous about credentials.
-            || m.contains("auth required")
-            || m.contains("auth failed")
-            || m.contains("authentication")
+        message_looks_like_auth(&self.message)
     }
+}
+
+/// Substring heuristic: does this free-text error message unambiguously
+/// indicate an authentication/authorization failure?
+///
+/// Extracted from [`RpcError::looks_like_auth`] so the startup-failure
+/// classifier can reuse the *exact same* markers when an auth signal is
+/// buried inside a transport-wrapped error (e.g. a gateway that returns an
+/// auth body under a 5xx, or an auth failure flattened into a "transport
+/// closed" string) — the JSON-RPC code path can't see those, but the message
+/// text still carries the signal.
+///
+/// Conservative on purpose: `"permission"` and a bare `"auth"` are NOT
+/// matched (servers use them for recoverable per-call runtime errors). A
+/// false positive here only mislabels a server as `auth-failed` instead of
+/// its transient reason — strictly safer than a credential-spamming retry
+/// loop, matching the posture already documented above.
+pub fn message_looks_like_auth(message: &str) -> bool {
+    if message_has_auth_wording(message) {
+        return true;
+    }
+    // Bare HTTP status codes are meaningful in a *short, server-supplied*
+    // JSON-RPC error message, so the direct-peer path admits them. They are
+    // deliberately NOT part of [`message_has_auth_wording`]: over a verbose,
+    // multi-cause error chain "401"/"403" collides with ports, timeouts, byte
+    // counts, and trace ids (see that fn's doc), so the startup classifier
+    // must not scan for them.
+    let m = message.to_ascii_lowercase();
+    m.contains("401") || m.contains("403")
+}
+
+/// Word-only auth markers, safe to scan over *verbose, multi-cause* error text
+/// (a flattened `{err:#}` anyhow chain full of transport strings, connect
+/// `host:port`, and operator-chosen server names).
+///
+/// Unlike [`message_looks_like_auth`], this omits the bare `"401"`/`"403"`
+/// status-code substrings: those are unambiguous in a short JSON-RPC message
+/// but false-positive badly over a full error chain — a connect failure to
+/// `:8403`, a `4013ms` timeout, a `req-4013ab` trace id, or a server literally
+/// named `my401k-bot` would each be misread as an auth failure and send the
+/// operator down a spurious "re-credential" path for a transient outage. Word
+/// markers (`unauthorized`, `forbidden`, `authentication`, `auth required`,
+/// `auth failed`) carry no such collision risk.
+pub fn message_has_auth_wording(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("unauthor")
+        || m.contains("forbidden")
+        // "auth" alone is broad but in combination with these terms is
+        // unambiguous about credentials.
+        || m.contains("auth required")
+        || m.contains("auth failed")
+        || m.contains("authentication")
 }
 
 /// `initialize` request params we send.
@@ -378,6 +421,73 @@ mod tests {
                 data: None,
             };
             assert!(!e.looks_like_auth(), "{msg} should NOT be auth");
+        }
+    }
+
+    #[test]
+    fn message_looks_like_auth_matches_only_unambiguous_credential_markers() {
+        // The extracted predicate backs both the direct-peer `RpcError` path
+        // and the nested-in-transport startup rescue, so its marker set is the
+        // single source of truth for "this is a credential failure". Lock the
+        // admits and the rejects (case-insensitively) so neither path can drift.
+        for msg in [
+            "Unauthorized",
+            "HTTP 401",
+            "got a 403 back",
+            "FORBIDDEN",
+            "authentication failed",
+            "auth required to continue",
+            "upstream returned 401 Unauthorized", // nested-in-5xx shape
+        ] {
+            assert!(
+                message_looks_like_auth(msg),
+                "{msg:?} should be classified as auth"
+            );
+        }
+        for msg in [
+            "permission denied for tool foo",
+            "missing required permission scope: read",
+            "internal server error",
+            "peer closed mid-request",
+            "rate limited",
+            "timeout after 2000ms",
+        ] {
+            assert!(
+                !message_looks_like_auth(msg),
+                "{msg:?} should NOT be classified as auth"
+            );
+        }
+    }
+
+    #[test]
+    fn message_has_auth_wording_ignores_bare_status_digits_but_admits_words() {
+        // The startup classifier scans this over the whole flattened error
+        // chain, so it MUST match auth *words* while ignoring bare "401"/"403"
+        // digits that collide with ports, timeouts, and trace ids.
+        for msg in [
+            "Unauthorized",
+            "FORBIDDEN",
+            "authentication failed",
+            "auth required to continue",
+            "upstream returned 401 Unauthorized", // word present alongside code
+        ] {
+            assert!(
+                message_has_auth_wording(msg),
+                "{msg:?} should be auth wording"
+            );
+        }
+        for msg in [
+            "connect failed: tcp connect error: 10.0.0.5:8403: connection refused",
+            "read timed out after 4013ms",
+            "handshake failed for server 'my401k-bot'",
+            "connection reset after 4015 bytes",
+            "trace id req-4013ab",
+            "HTTP 401", // bare code with no word: rejected by the word-only matcher
+        ] {
+            assert!(
+                !message_has_auth_wording(msg),
+                "{msg:?} must NOT be treated as auth wording"
+            );
         }
     }
 

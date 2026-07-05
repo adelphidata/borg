@@ -47,6 +47,9 @@ pub const CREATE_CHANNEL: &str = "create_channel";
 pub const LIST_SKILLS: &str = "list_skills";
 pub const LIST_CHANNELS: &str = "list_channels";
 pub const LIST_AGENTS: &str = "list_agents";
+/// Meta-tool that searches deferred external (MCP) tools by keyword and
+/// returns their specs on demand. Only advertised when `mcp.tool_search` is on.
+pub const SEARCH_TOOLS: &str = "search_tools";
 
 // ── Multi-agent tools ──
 pub const SPAWN_AGENT: &str = "spawn_agent";
@@ -94,6 +97,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     LIST_SKILLS,
     LIST_CHANNELS,
     LIST_AGENTS,
+    SEARCH_TOOLS,
     SPAWN_AGENT,
     SEND_TO_AGENT,
     WAIT_FOR_AGENT,

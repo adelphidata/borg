@@ -47,6 +47,7 @@ pub(crate) mod read_memory;
 pub(crate) mod request_user_input;
 pub(crate) mod run_shell;
 pub(crate) mod schedule;
+pub(crate) mod search_tools;
 pub(crate) mod text_to_speech;
 pub(crate) mod transcribe_audio;
 pub(crate) mod update_goal;
@@ -71,6 +72,7 @@ pub(crate) use read_memory::ReadMemoryArgs;
 pub(crate) use request_user_input::RequestUserInputArgs;
 pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
+pub(crate) use search_tools::SearchToolsArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
 pub(crate) use transcribe_audio::TranscribeAudioArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
@@ -111,6 +113,9 @@ pub(crate) enum Tool {
     List(ListArgs),
     ListSkills,
     ListChannels,
+    /// Keyword search over deferred MCP tools; only advertised when
+    /// `mcp.tool_search` is on.
+    SearchTools(SearchToolsArgs),
 
     // Scheduling — `manage_tasks` and `manage_cron` are aliases for `schedule`
     Schedule(ScheduleArgs),
@@ -200,6 +205,7 @@ impl Tool {
             tn::LIST => Tool::List(from(tn::LIST, args)?),
             tn::LIST_SKILLS => Tool::ListSkills,
             tn::LIST_CHANNELS => Tool::ListChannels,
+            tn::SEARCH_TOOLS => Tool::SearchTools(from(tn::SEARCH_TOOLS, args)?),
 
             // Scheduling
             tn::SCHEDULE => Tool::Schedule(from(tn::SCHEDULE, args)?),
@@ -252,6 +258,7 @@ impl Tool {
             Tool::List(_) => tn::LIST,
             Tool::ListSkills => tn::LIST_SKILLS,
             Tool::ListChannels => tn::LIST_CHANNELS,
+            Tool::SearchTools(_) => tn::SEARCH_TOOLS,
             Tool::Schedule(_) => tn::SCHEDULE,
             Tool::ManageTasks(_) => tn::MANAGE_TASKS,
             Tool::ManageCron(_) => tn::MANAGE_CRON,
@@ -287,6 +294,7 @@ impl Tool {
             | Tool::MemorySearch(_)
             | Tool::ListSkills
             | Tool::ListChannels
+            | Tool::SearchTools(_)
             | Tool::ListDir(_)
             | Tool::WebFetch(_)
             | Tool::WebSearch(_)
@@ -336,6 +344,7 @@ impl Tool {
             | Tool::ListSkills
             | Tool::ListChannels
             | Tool::ListAgents(_)
+            | Tool::SearchTools(_)
             | Tool::ReadMemory(_)
             | Tool::MemorySearch(_)
             | Tool::WebFetch(_)
@@ -388,6 +397,7 @@ impl Tool {
             | Tool::ListSkills
             | Tool::ListChannels
             | Tool::ListAgents(_)
+            | Tool::SearchTools(_)
             | Tool::RequestUserInput(_) => ToolGroup::Discovery,
             Tool::WebFetch(_) | Tool::WebSearch(_) => ToolGroup::Web,
             Tool::Browser(_) => ToolGroup::Ui,
@@ -426,6 +436,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::LIST_SKILLS,
             tn::LIST_CHANNELS,
             tn::LIST_AGENTS,
+            tn::SEARCH_TOOLS,
             tn::READ_MEMORY,
             tn::MEMORY_SEARCH,
             tn::WEB_FETCH,
@@ -452,6 +463,7 @@ pub(crate) const fn is_parallel_safe_name(name: &str) -> bool {
             tn::MEMORY_SEARCH,
             tn::LIST_SKILLS,
             tn::LIST_CHANNELS,
+            tn::SEARCH_TOOLS,
             tn::LIST_DIR,
             tn::WEB_FETCH,
             tn::WEB_SEARCH,
@@ -520,6 +532,7 @@ mod tests {
             (tn::LIST, json!({"what":"skills"})),
             (tn::LIST_SKILLS, json!({})),
             (tn::LIST_CHANNELS, json!({})),
+            (tn::SEARCH_TOOLS, json!({})),
             (tn::SCHEDULE, json!({})),
             (tn::MANAGE_TASKS, json!({})),
             (tn::MANAGE_CRON, json!({})),
@@ -620,6 +633,7 @@ mod tests {
             (tn::LIST, json!({"what":"skills"})),
             (tn::LIST_SKILLS, json!({})),
             (tn::LIST_CHANNELS, json!({})),
+            (tn::SEARCH_TOOLS, json!({})),
             (tn::SCHEDULE, json!({})),
             (tn::MANAGE_TASKS, json!({})),
             (tn::MANAGE_CRON, json!({})),
@@ -672,6 +686,7 @@ mod tests {
             tn::MEMORY_SEARCH,
             tn::LIST_SKILLS,
             tn::LIST_CHANNELS,
+            tn::SEARCH_TOOLS,
             tn::LIST_DIR,
             tn::WEB_FETCH,
             tn::WEB_SEARCH,

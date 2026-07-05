@@ -300,6 +300,7 @@ define_settings! {
         "mcp.max_response_bytes" => mcp.max_response_bytes, parsed(usize);
         "mcp.startup_max_retries" => mcp.startup_max_retries, parsed(u32);
         "mcp.startup_retry_base_ms" => mcp.startup_retry_base_ms, parsed(u64);
+        "mcp.tool_search" => mcp.tool_search, parsed(bool);
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
@@ -875,6 +876,7 @@ define_settings! {
         // (edited via the Slice 3 CLI), so only the kill switch surfaces
         // in the TUI popup.
         "mcp.enabled" => "MCP", Bool, "MCP";
+        "mcp.tool_search" => "MCP tool search", Bool, "MCP";
 
         // — Appearance — TUI theme picker (also reachable as `/theme`)
         "ui.theme" => "Theme", Select, "Appearance";

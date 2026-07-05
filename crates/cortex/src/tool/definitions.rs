@@ -26,6 +26,10 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
     ),
     (tool_names::LIST, "List resources (skills, channels, agents)"),
     (
+        tool_names::SEARCH_TOOLS,
+        "Search external (MCP) tools by keyword and get their specs on demand",
+    ),
+    (
         tool_names::APPLY_PATCH,
         "Create/update/delete files via patch DSL",
     ),
@@ -111,7 +115,15 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     defs.push(build_schedule_tool_def());
 
     defs.extend(crate::wasm_plugins::tool_definitions().await);
-    defs.extend(crate::mcp_clients::tool_definitions());
+    // MCP tools: either advertised directly (default) or held back behind the
+    // `search_tools` meta-tool when deferral is on. Only the MCP surface is
+    // gated — native and WASM-plugin tools above are always advertised. Dispatch
+    // is registry-keyed, so a deferred tool stays callable once discovered.
+    if config.mcp.tool_search_active() {
+        defs.push(build_search_tools_def());
+    } else {
+        defs.extend(crate::mcp_clients::tool_definitions());
+    }
 
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
@@ -400,6 +412,42 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     defs
 }
 
+/// Build the `search_tools` meta-tool definition, advertised in place of the
+/// individual MCP tool schemas when `mcp.tool_search` is on.
+///
+/// The description is deliberately **static** (no dynamic tool count) so the
+/// advertised tools array stays byte-identical every turn, preserving the
+/// prompt-cache prefix regardless of what the model has searched.
+fn build_search_tools_def() -> ToolDefinition {
+    ToolDefinition::new(
+        tool_names::SEARCH_TOOLS,
+        "Search external tools provided by connected MCP servers, which are not \
+         listed directly here. Call with a `query` of keywords (e.g. \"create \
+         github issue\") to get matching tools and their input schemas, then call \
+         the returned tool by its `name` on your next turn. Call with no arguments \
+         to browse the full list of available external tools.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords matched against external tool names and descriptions. Omit to browse all available external tools."
+                },
+                "limit": {
+                    "type": "integer",
+                    // Built from the same constants that drive the default and the
+                    // clamp, so the advertised contract can't drift from behavior.
+                    "description": format!(
+                        "Maximum number of matching tools to return (default: {}, max: {}).",
+                        crate::tool::search_tools::DEFAULT_LIMIT,
+                        crate::mcp_clients::TOOL_SEARCH_LIMIT_MAX,
+                    )
+                }
+            }
+        }),
+    )
+}
+
 /// Build the schedule tool definition.
 ///
 /// Supports two task kinds — `prompt` (LLM-driven) and `command` (shell cron).
@@ -529,6 +577,10 @@ mod tests {
         config.audio.enabled = true;
         config.image_gen.enabled = true;
         config.goals.enabled = true;
+        // Turn on MCP tool-search deferral so `search_tools` is produced and
+        // matched against its summary (both directions of the guard).
+        config.mcp.enabled = true;
+        config.mcp.tool_search = true;
         let defs = core_tool_definitions(&config).await;
 
         let summary_names: std::collections::HashSet<&str> =
@@ -555,6 +607,99 @@ mod tests {
                  that tool definition — remove the stale summary"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_tools_meta_tool_gated_by_tool_search_flag() {
+        // The gate is observable without a populated registry: when deferral is
+        // active the `search_tools` meta-tool is advertised (in place of the MCP
+        // surface); when inactive it must be absent and the direct MCP extend
+        // path is taken instead. Guards the flag being honored in both directions.
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+
+        config.mcp.tool_search = true;
+        let deferred = core_tool_definitions(&config).await;
+        assert!(
+            deferred
+                .iter()
+                .any(|d| d.function.name == tool_names::SEARCH_TOOLS),
+            "search_tools must be advertised when mcp.tool_search is on"
+        );
+
+        config.mcp.tool_search = false;
+        let direct = core_tool_definitions(&config).await;
+        assert!(
+            !direct
+                .iter()
+                .any(|d| d.function.name == tool_names::SEARCH_TOOLS),
+            "search_tools must NOT be advertised when mcp.tool_search is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tools_requires_mcp_enabled() {
+        // `tool_search` with mcp disabled is a no-op — no sessions exist, so
+        // deferring would hide nothing and strand the model with a search over an
+        // empty set. The meta-tool must only appear when MCP is actually on.
+        let mut config = Config::default();
+        config.mcp.enabled = false;
+        config.mcp.tool_search = true;
+        let defs = core_tool_definitions(&config).await;
+        assert!(
+            !defs
+                .iter()
+                .any(|d| d.function.name == tool_names::SEARCH_TOOLS),
+            "search_tools must not appear when mcp.enabled is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tools_present_regardless_of_deferral() {
+        // Deferral only gates the MCP surface — native/compiled-in tools must be
+        // advertised in both modes so the agent never loses its core toolset.
+        for tool_search in [true, false] {
+            let mut config = Config::default();
+            config.mcp.enabled = true;
+            config.mcp.tool_search = tool_search;
+            let defs = core_tool_definitions(&config).await;
+            let names: std::collections::HashSet<&str> =
+                defs.iter().map(|d| d.function.name.as_str()).collect();
+            for expected in [
+                tool_names::WRITE_MEMORY,
+                tool_names::RUN_SHELL,
+                tool_names::READ_FILE,
+            ] {
+                assert!(
+                    names.contains(expected),
+                    "native tool `{expected}` must be present (tool_search={tool_search})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_tools_def_schema_is_static_and_valid() {
+        // The advertised description must stay static (no dynamic tool count) so
+        // the tools array — and thus the prompt-cache prefix — is byte-identical
+        // every turn. Also lock the optional-args schema the model relies on.
+        let def = build_search_tools_def();
+        assert_eq!(def.function.name, tool_names::SEARCH_TOOLS);
+        let props = &def.function.parameters["properties"];
+        assert_eq!(props["query"]["type"], "string");
+        assert_eq!(props["limit"]["type"], "integer");
+        // No required fields — the tool must be callable with `{}` to browse.
+        assert!(
+            def.function.parameters.get("required").is_none(),
+            "search_tools must have no required args"
+        );
+        // Steers the model to the discover→call flow. (Static-ness itself is
+        // compile-enforced: `build_search_tools_def` takes no args, so it cannot
+        // interpolate a per-turn tool count.)
+        assert!(
+            def.function.description.contains("connected MCP servers"),
+            "description must explain these are external MCP tools"
+        );
     }
 
     #[test]
