@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Feature #12: Gateway bindings config tests ──
+// ── Gateway bindings config tests ──
 
 #[test]
 fn parse_gateway_bindings_config() {

@@ -1,11 +1,8 @@
-//! Typed cooldown registry for heartbeat augmenters.
+//! Typed cooldown registry for heartbeat augmenters, so callers consume a
+//! `Cooldown` handle rather than parsing `meta` strings ad-hoc.
 //!
-//! Replaces the inline `meta` table reads/writes that previously sprinkled
-//! through `collect_matching` in `heartbeat_augmenters.rs`. Augmenters now
-//! consume a `Cooldown` handle rather than parsing meta strings ad-hoc.
-//!
-//! Cooldown state remains persisted under `heartbeat_augmenter_last_fired_*`
-//! meta keys — this is purely a representation change at the caller side.
+//! Cooldown state is persisted under `heartbeat_augmenter_last_fired_*`
+//! meta keys.
 
 use cortex::db::Database;
 

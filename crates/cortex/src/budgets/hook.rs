@@ -168,7 +168,6 @@ impl fmt::Debug for BudgetHook {
     }
 }
 
-// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

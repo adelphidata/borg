@@ -2217,8 +2217,6 @@ async fn delete_suppression(
     Ok(())
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
-
 // TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;

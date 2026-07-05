@@ -76,7 +76,7 @@ api_key_env = "ELEVENLABS_API_KEY"
     );
 }
 
-// ── Feature #10: Audio config tests ──
+// ── Audio config tests ──
 
 #[test]
 fn parse_audio_config() {

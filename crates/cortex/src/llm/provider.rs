@@ -340,10 +340,8 @@ impl Provider {
                 // authenticates raw API keys with `x-goog-api-key`, NOT
                 // `Authorization: Bearer` (which is reserved for OAuth /
                 // service-account access tokens and returns 401 for an
-                // API key). The pre-M4 OpenAI-compat façade did accept
-                // Bearer, which is why this lived in the same arm; M4
-                // splits it because the native endpoint rejects Bearer
-                // for static API keys.
+                // API key). The native endpoint rejects Bearer for static
+                // API keys, so this must stay in its own arm.
                 let val = HeaderValue::from_str(api_key)
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("x-goog-api-key", val);
@@ -384,9 +382,7 @@ impl Provider {
             }
             Provider::AzureOpenAi => {
                 // Azure OpenAI uses the `api-key` header for static-key auth;
-                // `Authorization: Bearer` is reserved for AAD (Entra ID)
-                // tokens, which v2 will wire through the credential-pool
-                // auth_type seam landing with Bedrock on main.
+                // `Authorization: Bearer` is reserved for AAD (Entra ID) tokens.
                 let val = HeaderValue::from_str(api_key)
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("api-key", val);

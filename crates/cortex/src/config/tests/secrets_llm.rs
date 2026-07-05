@@ -294,7 +294,7 @@ fn resolve_api_keys_multi() {
     std::env::remove_var(env2);
 }
 
-// ── Feature #11: Provider Failover config tests ──
+// ── Provider failover config tests ──
 
 #[test]
 fn parse_llm_fallback_config() {

@@ -118,13 +118,11 @@ pub fn generate_profile(
         "(allow file-write* (subpath \"{tool_dir_str}\"))\n"
     ));
 
-    // Additional read paths from policy
     for path in &policy.fs_read {
         validate_seatbelt_path(path)?;
         profile.push_str(&format!("(allow file-read* (subpath \"{path}\"))\n"));
     }
 
-    // Additional write paths from policy
     for path in &policy.fs_write {
         validate_seatbelt_path(path)?;
         profile.push_str(&format!("(allow file-write* (subpath \"{path}\"))\n"));
@@ -143,7 +141,6 @@ pub fn generate_profile(
         profile.push_str(&format!("(deny file-write* (subpath \"{path}\"))\n"));
     }
 
-    // Network access
     if policy.network {
         profile.push_str("(allow network*)\n");
     }

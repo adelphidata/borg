@@ -686,7 +686,6 @@ impl Agent {
     // `append_assistant_message`, `maybe_redact`, `truncate_and_redact`)
     // live in `agent::session_manager`.
 
-    /// Get a reference to the current session.
     pub fn session(&self) -> &Session {
         &self.session
     }
@@ -695,24 +694,20 @@ impl Agent {
         &self.history
     }
 
-    /// Get a reference to the current config.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Get a mutable reference to the current config.
     pub fn config_mut(&mut self) -> &mut Config {
         &mut self.config
     }
 
-    /// Get a reference to the telemetry metrics.
     pub fn metrics(&self) -> &BorgMetrics {
         &self.metrics
     }
 
-    /// Compact conversation history using LLM summarization, returning (before_tokens, after_tokens).
+    /// Compact conversation history via LLM summarization. Returns (before, after) message counts.
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
-    /// Compact conversation history to fit within context limits. Returns (before, after) message counts.
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
         let llm = match self.make_llm_client_from_config(&self.config).await {

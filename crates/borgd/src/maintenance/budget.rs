@@ -1,15 +1,12 @@
 //! Typed budget handle consumed by the heartbeat `budget_threshold`
-//! augmenter.
-//!
-//! Wraps the meta-table bucket bookkeeping that the augmenter previously
-//! implemented inline. Augmenter consumes this typed handle rather than
-//! parsing meta-table strings directly.
+//! augmenter, so the augmenter reads a typed handle instead of parsing
+//! meta-table strings directly.
 
 use cortex::db::Database;
 
 /// Bucket the heartbeat `budget_threshold` augmenter has already announced
-/// for the current calendar month. Wraps the meta-table reads/writes that
-/// the augmenter previously did inline against `heartbeat_budget_last_bucket_*`.
+/// for the current calendar month, persisted under
+/// `heartbeat_budget_last_bucket_*` meta keys.
 pub(crate) struct MonthlyBudgetTracker<'a> {
     db: &'a Database,
 }

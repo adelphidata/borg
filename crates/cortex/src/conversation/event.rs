@@ -379,8 +379,8 @@ mod tests {
 
     #[test]
     fn project_history_matches_legacy_row_decode() {
-        // The Phase 0 invariant: projecting the log must yield exactly what the
-        // old row→Message loop produced, including dropping unknown-role rows.
+        // Invariant: projecting the log must yield exactly what the old
+        // row→Message loop produced, including dropping unknown-role rows.
         let rows = vec![
             row(1, "user", Some("hello")),
             row(2, "assistant", Some("hi")),

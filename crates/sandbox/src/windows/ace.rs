@@ -1,9 +1,7 @@
-//! Platform-neutral ACE request types.
-//!
-//! Split out from `acl.rs` so [`policy_resolve`](super::policy_resolve)
-//! and its tests compile and run on every host. The actual ACE
-//! application (`SetEntriesInAclW` + `SetNamedSecurityInfoW`) lives in
-//! `acl.rs` and is `cfg(target_os = "windows")`.
+//! Platform-neutral ACE request types, kept separate so
+//! [`policy_resolve`](super::policy_resolve) and its tests compile and run
+//! on every host. The actual ACE application (`SetEntriesInAclW` +
+//! `SetNamedSecurityInfoW`) lives in `acl.rs` and is `cfg(target_os = "windows")`.
 
 use std::path::PathBuf;
 

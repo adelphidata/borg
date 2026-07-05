@@ -97,12 +97,11 @@ impl Transport for GeminiTransport {
         } else {
             "generateContent"
         };
-        // M2 deliberately does NOT include `?key=...` in the URL. The caller
+        // Deliberately does NOT include `?key=...` in the URL. The caller
         // layer threads credentials in via its existing auth path (mirroring
-        // every other transport). M4's dispatch wiring will route Gemini to
-        // either the API-key header (`x-goog-api-key`) or the query param
-        // depending on operator config — both are accepted by AI Studio. We
-        // keep the endpoint pure here so URL-shape tests don't depend on a
+        // every other transport) — either the API-key header (`x-goog-api-key`)
+        // or the query param depending on operator config; both are accepted by
+        // AI Studio. We keep the endpoint pure here so URL-shape tests don't depend on a
         // secret being present.
         if stream {
             Ok(format!("{base}/v1beta/models/{model}:{verb}?alt=sse"))
@@ -136,10 +135,9 @@ impl Transport for GeminiTransport {
         let state = match state {
             super::transport::StreamState::Gemini(s) => s,
             // Defensive: this can only fire if the dispatcher wires a
-            // non-Gemini provider through this transport. M4 routes only
-            // Gemini here, so the only realistic trigger is a stray test
-            // wiring. Continuing keeps the stream alive instead of crashing
-            // the agent loop on a misconfiguration.
+            // non-Gemini provider through this transport (realistically only a
+            // stray test wiring). Continuing keeps the stream alive instead of
+            // crashing the agent loop on a misconfiguration.
             _ => return SseAction::Continue,
         };
         parse_gemini_sse_line(line, provider, model, state)
@@ -351,8 +349,8 @@ fn content_part_to_value(part: &ContentPart) -> Value {
             }
         }),
         ContentPart::ImageUrl { url } => {
-            // M2 surfaces this as a text placeholder; SSRF-safe URL fetch
-            // belongs in the vision_analyze path (M5), not the LLM adapter.
+            // Surfaced as a text placeholder; SSRF-safe URL fetch belongs in
+            // the vision_analyze path, not the LLM adapter.
             json!({"text": format!("[image: {url}]")})
         }
         ContentPart::AudioBase64 { media } => json!({

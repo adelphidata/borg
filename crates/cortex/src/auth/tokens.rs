@@ -243,7 +243,6 @@ fn hash_token(plaintext: &str) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

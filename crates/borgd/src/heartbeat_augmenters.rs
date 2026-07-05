@@ -447,9 +447,8 @@ async fn check_budget_threshold_inner(config: &Config, db: Option<&Database>) ->
     };
 
     let total = db.monthly_token_total().await.ok()?;
-    // Typed handle replaces the inline meta-string bookkeeping. The
-    // tracker owns the per-month key and the "is this bucket new?"
-    // bookkeeping; the augmenter just decides whether to emit text.
+    // Tracker owns the per-month key and the "is this bucket new?" check;
+    // the augmenter only decides whether to emit text.
     let tracker = MonthlyBudgetTracker::new(db);
     if !tracker.should_announce(chrono::Utc::now(), bucket).await {
         return None;
