@@ -1823,6 +1823,7 @@ impl LlmClient {
             })
     }
 
+    #[instrument(skip_all, fields(llm.wire_path = transport.protocol_name()))]
     async fn stream_http_transport_inner(
         &self,
         transport: &'static dyn Transport,
@@ -1992,6 +1993,7 @@ impl LlmClient {
         result
     }
 
+    #[instrument(skip_all, fields(llm.wire_path = transport.protocol_name()))]
     async fn chat_http_transport_inner(
         &self,
         transport: &'static dyn Transport,

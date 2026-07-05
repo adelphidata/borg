@@ -158,18 +158,9 @@ impl NativeChannel for TelegramChannel {
 
     fn start_typing(&self, response_context: &serde_json::Value) -> Option<TypingHandle> {
         let ctx: TelegramResponseContext = serde_json::from_value(response_context.clone()).ok()?;
-        let client = self.client.clone();
-
-        Some(TypingHandle::spawn_keepalive(
-            crate::typing_keepalive::TypingKeepaliveConfig {
-                // Telegram's "typing" action lasts ~5s; refresh just under that.
-                keepalive_interval: std::time::Duration::from_secs(4),
-                label: "telegram",
-            },
-            move || {
-                let client = client.clone();
-                async move { client.send_typing(ctx.chat_id).await }
-            },
+        Some(super::typing::start_typing_keepalive(
+            self.client.clone(),
+            ctx.chat_id,
         ))
     }
 }

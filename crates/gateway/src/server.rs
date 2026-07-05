@@ -481,7 +481,7 @@ impl GatewayServer {
                 crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
                 let inbound = parsed.inbound;
 
-                let typing = crate::telegram::typing::TypingIndicator::start(tg.clone(), chat_id);
+                let typing = crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id);
 
                 // Extract thread/reply IDs before passing inbound to invoke_agent
                 let thread_id: Option<i64> =
