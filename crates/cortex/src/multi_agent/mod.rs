@@ -2321,7 +2321,10 @@ mod sub_agent_surface_tests {
             SUB_AGENT_SUMMARY_MAX_CHARS / 2
         );
         // 8000/10 = 800 < floor(1000) → floored.
-        assert_eq!(super::per_child_summary_cap(10), SUB_AGENT_SUMMARY_MIN_CHARS);
+        assert_eq!(
+            super::per_child_summary_cap(10),
+            SUB_AGENT_SUMMARY_MIN_CHARS
+        );
         assert_eq!(
             super::per_child_summary_cap(1000),
             SUB_AGENT_SUMMARY_MIN_CHARS

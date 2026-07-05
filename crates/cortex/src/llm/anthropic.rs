@@ -83,36 +83,38 @@ fn coalesce_consecutive_assistants(messages: &[Message]) -> Vec<Message> {
             && out
                 .last()
                 .is_some_and(|p| p.role == Role::Assistant && content_is_text_or_empty(p));
-        if can_merge {
-            let prev = out.last_mut().expect("checked non-empty above");
-            let prev_text = prev
-                .content
-                .as_ref()
-                .and_then(crate::types::MessageContent::text)
-                .unwrap_or("")
-                .to_string();
-            let cur_text = m
-                .content
-                .as_ref()
-                .and_then(crate::types::MessageContent::text)
-                .unwrap_or("");
-            let joined = match (prev_text.is_empty(), cur_text.is_empty()) {
-                (true, _) => cur_text.to_string(),
-                (false, true) => prev_text,
-                (false, false) => format!("{prev_text}\n{cur_text}"),
-            };
-            prev.content = if joined.is_empty() {
-                None
-            } else {
-                Some(crate::types::MessageContent::Text(joined))
-            };
-            match (prev.tool_calls.as_mut(), m.tool_calls.as_ref()) {
-                (Some(pc), Some(cc)) => pc.extend(cc.iter().cloned()),
-                (None, Some(cc)) => prev.tool_calls = Some(cc.clone()),
-                _ => {}
+        // `can_merge` already established the previous message exists, so the
+        // `Some` arm always binds when merging; the `_` arm handles the rest.
+        match out.last_mut() {
+            Some(prev) if can_merge => {
+                let prev_text = prev
+                    .content
+                    .as_ref()
+                    .and_then(crate::types::MessageContent::text)
+                    .unwrap_or("")
+                    .to_string();
+                let cur_text = m
+                    .content
+                    .as_ref()
+                    .and_then(crate::types::MessageContent::text)
+                    .unwrap_or("");
+                let joined = match (prev_text.is_empty(), cur_text.is_empty()) {
+                    (true, _) => cur_text.to_string(),
+                    (false, true) => prev_text,
+                    (false, false) => format!("{prev_text}\n{cur_text}"),
+                };
+                prev.content = if joined.is_empty() {
+                    None
+                } else {
+                    Some(crate::types::MessageContent::Text(joined))
+                };
+                match (prev.tool_calls.as_mut(), m.tool_calls.as_ref()) {
+                    (Some(pc), Some(cc)) => pc.extend(cc.iter().cloned()),
+                    (None, Some(cc)) => prev.tool_calls = Some(cc.clone()),
+                    _ => {}
+                }
             }
-        } else {
-            out.push(m.clone());
+            _ => out.push(m.clone()),
         }
     }
     out
@@ -129,17 +131,20 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
     let mut seen_result_ids: HashSet<String> = HashSet::new();
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for m in messages {
-        match m.role {
-            Role::Assistant if m.tool_calls.is_some() => {
+        match (&m.role, m.tool_calls.as_ref()) {
+            (Role::Assistant, Some(calls)) => {
                 let mut kept: Vec<ToolCall> = Vec::new();
-                for call in m.tool_calls.as_ref().expect("is_some checked") {
+                for call in calls {
                     if seen_call_ids.insert(call.id.clone()) {
                         kept.push(call.clone());
                     } else {
                         tracing::debug!(id = %call.id, "repair: dropping duplicate tool_call id");
                     }
                 }
-                let content_empty = m.content.as_ref().is_none_or(|c| c.is_empty());
+                let content_empty = m
+                    .content
+                    .as_ref()
+                    .is_none_or(crate::types::MessageContent::is_empty);
                 if kept.is_empty() && content_empty {
                     // Assistant reduced to nothing (all calls were duplicates,
                     // no text) — drop it entirely rather than send an empty turn.
@@ -150,7 +155,7 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
                     ..m.clone()
                 });
             }
-            Role::Tool => {
+            (Role::Tool, _) => {
                 let id = m.tool_call_id.as_deref().unwrap_or("");
                 if !seen_call_ids.contains(id) {
                     tracing::debug!(id = %id, "repair: dropping orphaned tool result");

@@ -735,8 +735,15 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                     "scheduled-task: [SILENT] sentinel — suppressing channel delivery"
                 );
             } else if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                deliver_task_result(ch, tgt, task_name, result_text, config, ctx.executor.as_ref())
-                    .await;
+                deliver_task_result(
+                    ch,
+                    tgt,
+                    task_name,
+                    result_text,
+                    config,
+                    ctx.executor.as_ref(),
+                )
+                .await;
             }
         }
         Ok(Err(e)) => {
@@ -1204,7 +1211,15 @@ async fn handle_task_failure(
 
     if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
         let msg = format!("Error: {error}");
-        deliver_task_result(ch, tgt, &format!("{task_name} [FAILED]"), &msg, config, None).await;
+        deliver_task_result(
+            ch,
+            tgt,
+            &format!("{task_name} [FAILED]"),
+            &msg,
+            config,
+            None,
+        )
+        .await;
     }
 }
 
@@ -1400,13 +1415,21 @@ mod pre_run_tests {
     fn silent_sentinel_tolerates_trailing_punctuation() {
         // Models routinely append a stray period/bang/whitespace to the marker;
         // that must still suppress. Regression for `[SILENT].` leaking to chat.
-        for s in ["[SILENT].", "[SILENT]!", "[SILENT]?", "  [SILENT].  ", "[SILENT] ."] {
+        for s in [
+            "[SILENT].",
+            "[SILENT]!",
+            "[SILENT]?",
+            "  [SILENT].  ",
+            "[SILENT] .",
+        ] {
             assert!(is_silent_response(s), "{s:?} should suppress delivery");
         }
         // Trailing *words* (real content, not a decorated marker) must NOT
         // suppress — otherwise a genuine reply beginning with the marker text
         // would be silenced.
-        assert!(!is_silent_response("[SILENT] but actually here's an update"));
+        assert!(!is_silent_response(
+            "[SILENT] but actually here's an update"
+        ));
     }
 
     #[test]

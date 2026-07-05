@@ -1527,7 +1527,7 @@ fn repair_dedups_duplicate_tool_call_ids() {
         Message::user("a"),
         repair_asst_tool_call("call_1"),
         Message::tool_result("call_1", "ok"),
-        repair_asst_tool_call("call_1"), // duplicate id
+        repair_asst_tool_call("call_1"),      // duplicate id
         Message::tool_result("call_1", "ok"), // duplicate result
     ];
     let repaired = repair_message_sequence(&messages);
@@ -1610,7 +1610,10 @@ fn repair_leaves_well_formed_history_unchanged() {
     assert_eq!(repaired.len(), 4);
     assert_eq!(repair_all_call_ids(&repaired), vec!["call_1"]);
     assert_eq!(repaired[0].role, Role::User);
-    assert_eq!(repaired[3].content.as_ref().unwrap().text().unwrap(), "final");
+    assert_eq!(
+        repaired[3].content.as_ref().unwrap().text().unwrap(),
+        "final"
+    );
 }
 
 #[test]

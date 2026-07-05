@@ -5,8 +5,8 @@ use super::{
     build_anthropic_messages, build_cache_control_marker, classify_anthropic_stream_error,
     normalize_cache_tokens, parse_anthropic_response, repair_message_sequence,
     sanitize_openai_messages, supports_anthropic_cache_control, ChatRequest, LlmConfig, LlmError,
-    Message, Provider, Role,
-    StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition, UsageData, UsageOptions,
+    Message, Provider, Role, StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition,
+    UsageData, UsageOptions,
 };
 use crate::llm::llm_error::FailoverReason;
 
