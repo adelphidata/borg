@@ -19,6 +19,12 @@ pub struct GatewayOriginContext {
     pub sender_id: String,
     /// Thread identifier, if the inbound message was part of a thread.
     pub thread_id: Option<String>,
+    /// The exact gateway session routing key for this turn
+    /// (`{binding:}{sender}:{thread}`). Carried so proactive/scheduled
+    /// deliveries can be mirrored back into the *originating* transcript —
+    /// including non-default bindings, whose key prefix a `{sender}:{thread}`
+    /// reconstruction could not recover.
+    pub session_key: String,
 }
 
 tokio::task_local! {
@@ -54,12 +60,14 @@ mod tests {
             channel_name: "slack".into(),
             sender_id: "U123".into(),
             thread_id: Some("1700000000.000100".into()),
+            session_key: "U123:1700000000.000100".into(),
         };
         scope(ctx.clone(), async {
             let got = current().expect("context present");
             assert_eq!(got.channel_name, "slack");
             assert_eq!(got.sender_id, "U123");
             assert_eq!(got.thread_id.as_deref(), Some("1700000000.000100"));
+            assert_eq!(got.session_key, "U123:1700000000.000100");
         })
         .await;
         assert!(current().is_none(), "context leaks outside scope");

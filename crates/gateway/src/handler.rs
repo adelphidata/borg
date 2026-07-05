@@ -269,12 +269,24 @@ pub async fn invoke_agent_with_auto_reply(
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
     progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
-    // Expose the originating (channel, sender, thread) to tool handlers via a
-    // task-local so e.g. the `schedule` tool can resolve `delivery="origin"`.
+    // Expose the originating (channel, sender, thread) plus the exact gateway
+    // session key to tool handlers via a task-local so e.g. the `schedule` tool
+    // can resolve `delivery="origin"` and later mirror the delivery back into
+    // this precise session. `resolve_route` is a pure, cheap function of
+    // (config, channel, sender, peer_kind); `invoke_agent_inner` re-resolves it
+    // (and reads `route.config`), so we only borrow `binding_id` here to build
+    // the key — matching the key `resolve_session_and_commands` will compute.
+    let route = crate::channel::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
     let origin = cortex::gateway_context::GatewayOriginContext {
         channel_name: channel_name.to_string(),
         sender_id: inbound.sender_id.clone(),
         thread_id: inbound.thread_id.clone(),
+        session_key: build_session_key(inbound, &route.binding_id),
     };
     cortex::gateway_context::scope(
         origin,
@@ -355,14 +367,14 @@ async fn command_resolution(
     }
 }
 
-/// Resolve the session and handle slash commands (`/cancel`, `/poke`, other commands).
-async fn resolve_session_and_commands(
-    channel_name: &str,
-    inbound: &InboundMessage,
-    config: &Config,
-    route: &crate::channel::routing::ResolvedRoute,
-) -> Result<SessionResolution> {
-    // Resolve session — include thread_id and binding_id in the key for isolation
+/// Build the gateway session routing key for an inbound message under a
+/// resolved binding: `{binding_id:}{sender}:{thread}`, with the thread segment
+/// sanitized and length-capped. Non-default bindings prefix their id so
+/// separate bindings for the same `(sender, thread)` stay isolated.
+///
+/// This is the single source of truth for the routing key, shared by session
+/// resolution and by the origin context that proactive deliveries mirror into.
+fn build_session_key(inbound: &InboundMessage, binding_id: &str) -> String {
     let base_key = match &inbound.thread_id {
         Some(tid) => format!(
             "{}:{}",
@@ -371,11 +383,22 @@ async fn resolve_session_and_commands(
         ),
         None => inbound.sender_id.clone(),
     };
-    let session_key = if route.binding_id != DEFAULT_BINDING_ID {
-        format!("{}:{}", route.binding_id, base_key)
+    if binding_id != DEFAULT_BINDING_ID {
+        format!("{binding_id}:{base_key}")
     } else {
         base_key
-    };
+    }
+}
+
+/// Resolve the session and handle slash commands (`/cancel`, `/poke`, other commands).
+async fn resolve_session_and_commands(
+    channel_name: &str,
+    inbound: &InboundMessage,
+    config: &Config,
+    route: &crate::channel::routing::ResolvedRoute,
+) -> Result<SessionResolution> {
+    // Resolve session — include thread_id and binding_id in the key for isolation
+    let session_key = build_session_key(inbound, &route.binding_id);
     let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
         .await
         .context("Failed to open database")?;

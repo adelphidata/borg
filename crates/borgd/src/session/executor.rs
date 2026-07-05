@@ -110,29 +110,33 @@ impl DaemonSessionExecutor {
     /// where no host is live. Does **not** create a session — if no channel
     /// session exists for `session_key` (e.g. a non-default binding whose key
     /// prefix this reconstruction doesn't carry), it is a logged no-op.
+    ///
+    /// `session_key` is the gateway routing key (`{sender_id}:{thread_id}`,
+    /// optionally binding-prefixed). The `channel_sessions` table maps that key
+    /// to the actual `session_id` (a UUID), which is what both the
+    /// [`SessionRegistry`] and the transcript are keyed by. We therefore resolve
+    /// the UUID first, then prefer the live host under it, falling back to a
+    /// direct DB append under the same UUID.
     pub async fn append_assistant_message(
         &self,
         channel: &str,
         session_key: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        if let Some(host) = self.registry.get(session_key) {
+        let db = cortex::db::Database::open().await?;
+        let Some(session_id) = db.lookup_channel_session(channel, session_key).await? else {
+            tracing::debug!(
+                session_key,
+                channel,
+                "no existing channel session to mirror delivery into; skipping"
+            );
+            return Ok(());
+        };
+        if let Some(host) = self.registry.get(&session_id) {
             return host.append_assistant_message(text).await;
         }
-        let db = cortex::db::Database::open().await?;
-        match db.lookup_channel_session(channel, session_key).await? {
-            Some(session_id) => {
-                db.insert_message(&session_id, "assistant", Some(text), None, None, None, None)
-                    .await?;
-            }
-            None => {
-                tracing::debug!(
-                    session_key,
-                    channel,
-                    "no existing channel session to mirror delivery into; skipping"
-                );
-            }
-        }
+        db.insert_message(&session_id, "assistant", Some(text), None, None, None, None)
+            .await?;
         Ok(())
     }
 }

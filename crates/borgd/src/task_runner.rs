@@ -1274,18 +1274,26 @@ async fn deliver_task_result(
     }
 }
 
-/// Reconstruct the gateway session key from an origin-resolved delivery target
-/// (`{"sender":...,"thread_id":...}`), matching the key the gateway builds in
-/// its inbound handler: `{sender}:{sanitized_thread}` (or just `{sender}` when
-/// there is no thread). Returns `None` for a plain (non-origin) sender target,
-/// which maps to no specific conversation. Non-default channel bindings add a
-/// key prefix the target doesn't carry; such keys simply won't resolve a live
-/// host or a stored channel session, so the mirror becomes a safe no-op.
+/// Recover the gateway session key from an origin-resolved delivery target
+/// (`{"sender":...,"thread_id":...,"session_key":...}`).
+///
+/// Prefers the exact `session_key` the gateway recorded at schedule time — this
+/// is binding-aware, so non-default bindings (`{binding}:{sender}:{thread}`)
+/// mirror into the correct transcript. For targets written before that field
+/// existed, falls back to reconstructing `{sender}:{sanitized_thread}` (or just
+/// `{sender}` when there is no thread), matching the default-binding key the
+/// gateway inbound handler builds. Returns `None` for a plain (non-origin)
+/// sender target, which maps to no specific conversation.
 fn origin_session_key(target: &str) -> Option<String> {
     if !target.starts_with('{') {
         return None;
     }
     let parsed: serde_json::Value = serde_json::from_str(target).ok()?;
+    if let Some(key) = parsed.get("session_key").and_then(|v| v.as_str()) {
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
     let sender = parsed.get("sender").and_then(|v| v.as_str())?;
     if sender.is_empty() {
         return None;
@@ -1464,6 +1472,32 @@ mod pre_run_tests {
     fn origin_session_key_builds_sender_thread_key() {
         let target = r#"{"sender":"u123","thread_id":"t456"}"#;
         assert_eq!(origin_session_key(target).as_deref(), Some("u123:t456"));
+    }
+
+    #[test]
+    fn origin_session_key_prefers_exact_stored_key() {
+        // When the gateway recorded the exact (binding-aware) session key, it is
+        // used verbatim — including a non-default binding prefix that a
+        // `{sender}:{thread}` reconstruction could never recover. This is what
+        // lets a non-default-binding conversation mirror into its own transcript
+        // rather than a coincident default session (or nowhere).
+        let target = r#"{"sender":"u1","thread_id":"t2","session_key":"work:u1:t2"}"#;
+        assert_eq!(origin_session_key(target).as_deref(), Some("work:u1:t2"));
+    }
+
+    #[test]
+    fn origin_session_key_falls_back_when_stored_key_absent_or_empty() {
+        // Targets written before the `session_key` field existed (or with an
+        // empty one) must still resolve via the legacy reconstruction so
+        // in-flight scheduled tasks keep mirroring correctly.
+        assert_eq!(
+            origin_session_key(r#"{"sender":"u1","thread_id":"t2"}"#).as_deref(),
+            Some("u1:t2")
+        );
+        assert_eq!(
+            origin_session_key(r#"{"sender":"u1","thread_id":"t2","session_key":""}"#).as_deref(),
+            Some("u1:t2")
+        );
     }
 
     #[test]

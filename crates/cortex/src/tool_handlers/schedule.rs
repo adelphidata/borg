@@ -155,6 +155,9 @@ fn resolve_origin_delivery(
     let target_json = serde_json::json!({
         "sender": origin.sender_id,
         "thread_id": origin.thread_id,
+        // Exact gateway session key (binding-aware) so delivery can mirror the
+        // reply back into this precise transcript, not a reconstructed one.
+        "session_key": origin.session_key,
     })
     .to_string();
     (Some(origin.channel_name), Some(target_json))
