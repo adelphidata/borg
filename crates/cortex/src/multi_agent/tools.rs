@@ -225,6 +225,13 @@ pub fn assemble_delegate_blocklist(
                 blocklist.push(tool);
             }
         }
+        // `computer_use` is per-action read-only (capture/list_apps/wait) and
+        // so is absent from `mutating_tool_names()`. A name-level blocklist
+        // can't express per-action nuance, so for children we block the whole
+        // tool — the conservative reading of the Plan-mode guarantee.
+        if !blocklist.contains(&crate::tool::names::COMPUTER_USE) {
+            blocklist.push(crate::tool::names::COMPUTER_USE);
+        }
     }
     blocklist
 }

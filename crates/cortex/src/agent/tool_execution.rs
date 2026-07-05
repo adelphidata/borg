@@ -21,7 +21,7 @@ use crate::hooks::{HookAction, HookData, HookPoint};
 use crate::rate_guard::RateDecision;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolOutput};
 
-use super::tool_classification::{classify_action, is_mutating_tool};
+use super::tool_classification::{classify_action, is_mutating_tool_call};
 use super::tool_validation::{
     format_invalid_tool_result, repeated_tool_call_block_message, unknown_tool_refusal_message,
     InvalidToolCall, RepeatDecision,
@@ -168,7 +168,7 @@ impl Agent {
                 .conversation
                 .collaboration_mode
                 .blocks_mutations()
-                && is_mutating_tool(name)
+                && is_mutating_tool_call(name, args)
             {
                 self.skip_tool_call(
                     &tool_call.id,
@@ -356,7 +356,7 @@ impl Agent {
                 .conversation
                 .collaboration_mode
                 .blocks_mutations()
-                && is_mutating_tool(&name)
+                && is_mutating_tool_call(&name, &args)
             {
                 slots.push(Slot::Skipped {
                     reason: "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.".into(),

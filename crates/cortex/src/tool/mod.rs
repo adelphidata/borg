@@ -425,9 +425,9 @@ impl Tool {
 /// arg-parsing has happened).
 pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
     // Note: `COMPUTER_USE` is listed here because *some* of its actions are
-    // read-only. The agent loop must additionally consult
-    // [`Tool::allowed_in_plan_mode`] after parsing to enforce the per-action
-    // gate — mutating actions MUST stay blocked in Plan mode.
+    // read-only. The agent loop enforces the per-action gate via
+    // `agent::tool_classification::is_mutating_tool_call`, which inspects the
+    // raw `action` arg — mutating actions MUST stay blocked in Plan mode.
     matches_any(
         name,
         &[

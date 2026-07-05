@@ -28,6 +28,21 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
     !crate::tool::allowed_in_plan_mode_name(name)
 }
 
+/// Args-aware variant of [`is_mutating_tool`] — the gate the agent loop must
+/// use. `computer_use` passes the name-level allowlist (some of its actions
+/// are read-only), so the per-action check has to happen here, on the raw
+/// argument JSON, before typed parsing. Unparseable args or a missing /
+/// unrecognised `action` are treated as mutating so malformed calls and
+/// future actions default to blocked in Plan mode. Only `computer_use` pays
+/// the parse cost; every other tool stays on the name-level check.
+pub(crate) fn is_mutating_tool_call(name: &str, raw_args: &str) -> bool {
+    if name == crate::tool::names::COMPUTER_USE {
+        return !serde_json::from_str::<serde_json::Value>(raw_args)
+            .is_ok_and(|v| crate::tool::computer_use::args_action_is_readonly(&v));
+    }
+    is_mutating_tool(name)
+}
+
 /// Names of every tool that `is_mutating_tool` considers mutating.
 ///
 /// Kept in sync with that function so callers (e.g. sub-agent delegation in
@@ -177,6 +192,62 @@ mod tests {
                 "mutating_tool_names() must NOT include read-only tool {read_only}"
             );
         }
+    }
+
+    /// Plan-mode regression guard for the per-action computer_use gate.
+    /// The name-level allowlist admits `computer_use` (capture/list_apps/
+    /// wait are read-only), so before this gate existed a Plan-mode agent
+    /// could click/type on the host. Read-only actions pass; every mutating
+    /// action and every malformed payload is blocked.
+    #[test]
+    fn computer_use_gate_blocks_mutating_actions_only() {
+        let readonly = [
+            r#"{"action":"capture"}"#,
+            r#"{"action":"list_apps"}"#,
+            r#"{"action":"wait","duration_ms":100}"#,
+        ];
+        for args in readonly {
+            assert!(
+                !is_mutating_tool_call("computer_use", args),
+                "read-only computer_use call must pass Plan mode: {args}"
+            );
+        }
+        let mutating = [
+            r#"{"action":"click","x":1,"y":2}"#,
+            r#"{"action":"double_click","x":1,"y":2}"#,
+            r#"{"action":"right_click","x":1,"y":2}"#,
+            r#"{"action":"middle_click","x":1,"y":2}"#,
+            r#"{"action":"drag","x":1,"y":2,"to_x":3,"to_y":4}"#,
+            r#"{"action":"scroll","delta_y":-3}"#,
+            r#"{"action":"type","text":"hi"}"#,
+            r#"{"action":"key","key":"Return"}"#,
+            r#"{"action":"set_value","element_index":1,"value":"x"}"#,
+            r#"{"action":"focus_app","target":"Finder"}"#,
+        ];
+        for args in mutating {
+            assert!(
+                is_mutating_tool_call("computer_use", args),
+                "mutating computer_use call must be blocked in Plan mode: {args}"
+            );
+        }
+        // Fail-closed rows: unparseable JSON, missing action, unknown action.
+        for args in ["not json", "{}", r#"{"action":"launch_missiles"}"#, ""] {
+            assert!(
+                is_mutating_tool_call("computer_use", args),
+                "malformed computer_use call must fail closed: {args:?}"
+            );
+        }
+    }
+
+    /// Non-computer_use tools must keep name-level semantics: the args
+    /// string is irrelevant even when it *looks* like a read-only action.
+    #[test]
+    fn gate_ignores_args_for_name_classified_tools() {
+        assert!(is_mutating_tool_call(
+            "run_shell",
+            r#"{"action":"capture"}"#
+        ));
+        assert!(!is_mutating_tool_call("read_file", "not json at all"));
     }
 
     #[test]

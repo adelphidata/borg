@@ -1839,7 +1839,15 @@ mod sub_agent_surface_tests {
             super::tools::assemble_delegate_blocklist(&cfg, AgentRoleKind::Orchestrator, true);
         // Every mutating tool blocked — including the delegation surface,
         // even though an orchestrator role would otherwise re-permit it.
-        for must_block in ["run_shell", "apply_patch", "spawn_agent", "write_memory"] {
+        // `computer_use` is name-allowlisted for the parent (per-action gate)
+        // but children get the conservative whole-tool block.
+        for must_block in [
+            "run_shell",
+            "apply_patch",
+            "spawn_agent",
+            "write_memory",
+            "computer_use",
+        ] {
             assert!(
                 blocklist.contains(&must_block),
                 "Plan mode must block '{must_block}' even for orchestrator: {blocklist:?}"

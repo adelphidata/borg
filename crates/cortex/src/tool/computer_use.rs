@@ -693,6 +693,16 @@ pub(crate) const fn action_allowed_in_plan_mode(action: &ComputerUseAction) -> b
     action.is_readonly()
 }
 
+/// Raw-args Plan-mode check for the agent loop's gate, which runs before
+/// typed `Tool::parse`. Only the `action` discriminator is inspected; a
+/// missing or unrecognised action returns `false` (treated as mutating) so
+/// malformed calls and future actions default to blocked.
+pub(crate) fn args_action_is_readonly(args: &Value) -> bool {
+    args.get("action")
+        .and_then(|a| serde_json::from_value::<ComputerUseAction>(a.clone()).ok())
+        .is_some_and(|a| action_allowed_in_plan_mode(&a))
+}
+
 /// Hotkey combos that are always blocked. The strings match a normalised
 /// form (modifiers lowercased, sorted alphabetically, joined by `+`) so
 /// trivial reorderings ("shift+cmd+q" vs "cmd+shift+q") collapse to the
