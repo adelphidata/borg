@@ -122,7 +122,7 @@ pub fn calculate_next_run(
             Ok(Some(Utc::now().timestamp() + duration.as_secs() as i64))
         }
         SCHEDULE_TYPE_ONCE => {
-            let ts = parse_once_timestamp(schedule_expr)?;
+            let ts = parse_once_timestamp(schedule_expr, timezone)?;
             Ok(Some(ts))
         }
         other => {
@@ -131,14 +131,35 @@ pub fn calculate_next_run(
     }
 }
 
+/// Convert a `chrono` local-time resolution into a Unix timestamp, generic
+/// over the timezone so the same DST-gap handling applies whether the naive
+/// time was interpreted in `Local` or a specific IANA `Tz`.
+fn local_result_to_timestamp<Z: TimeZone>(
+    result: chrono::LocalResult<DateTime<Z>>,
+    trimmed: &str,
+) -> Result<i64> {
+    match result {
+        chrono::LocalResult::Single(dt) => Ok(dt.timestamp()),
+        chrono::LocalResult::Ambiguous(a, _) => Ok(a.timestamp()),
+        chrono::LocalResult::None => {
+            anyhow::bail!("Ambiguous local time (likely DST gap): {trimmed}")
+        }
+    }
+}
+
 /// Parse a one-shot schedule expression into a Unix timestamp.
 ///
 /// Accepts RFC3339 (`2026-04-22T09:00:00Z`, `2026-04-22T09:00:00-07:00`) and
-/// timezone-naive forms interpreted in the system's local timezone:
-/// `2026-04-22T09:00:00`, `2026-04-22 09:00:00`, `2026-04-22 09:00`.
+/// timezone-naive forms (`2026-04-22T09:00:00`, `2026-04-22 09:00:00`,
+/// `2026-04-22 09:00`). A naive form is interpreted in `timezone` — an IANA
+/// zone name such as `America/New_York` — so a one-shot fires at the user's
+/// wall-clock time regardless of the host's zone (critical on a UTC VPS). The
+/// strings `""`, `"local"`, and `"UTC"` preserve the historical system-local
+/// interpretation, matching how `calculate_next_run` treats them for cron. An
+/// RFC3339 input already carries an offset and ignores `timezone`.
 ///
 /// Rejects timestamps more than 60 seconds in the past.
-pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
+pub fn parse_once_timestamp(expr: &str, timezone: &str) -> Result<i64> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         anyhow::bail!(
@@ -157,11 +178,18 @@ pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
                     "Invalid ISO-8601 timestamp: {trimmed}. Examples: '2026-04-22T09:00:00', '2026-04-22T09:00:00-07:00'"
                 )
             })?;
-        match Local.from_local_datetime(&naive) {
-            chrono::LocalResult::Single(dt) => dt.timestamp(),
-            chrono::LocalResult::Ambiguous(a, _) => a.timestamp(),
-            chrono::LocalResult::None => {
-                anyhow::bail!("Ambiguous local time (likely DST gap): {trimmed}")
+        match resolve_cron_timezone(timezone) {
+            Some(tz) => local_result_to_timestamp(tz.from_local_datetime(&naive), trimmed)?,
+            None => {
+                // `resolve_cron_timezone` folds "UTC"/"utc" into `None` because
+                // its cron default is already UTC. One-shots default `None` to
+                // system-local (historical behavior), so honor an explicit UTC
+                // request here rather than silently resolving it as local.
+                if matches!(timezone.trim(), "UTC" | "utc") {
+                    local_result_to_timestamp(Utc.from_local_datetime(&naive), trimmed)?
+                } else {
+                    local_result_to_timestamp(Local.from_local_datetime(&naive), trimmed)?
+                }
             }
         }
     };
@@ -345,7 +373,9 @@ pub fn validate_schedule(schedule_type: &str, schedule_expr: &str) -> Result<()>
             Ok(())
         }
         SCHEDULE_TYPE_ONCE => {
-            parse_once_timestamp(schedule_expr)?;
+            // Validation only checks parseability + not-in-past; the concrete
+            // timezone is applied by `calculate_next_run`. Local is fine here.
+            parse_once_timestamp(schedule_expr, "")?;
             Ok(())
         }
         other => {
@@ -499,6 +529,84 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!((next - future.timestamp()).abs() <= 1);
+    }
+
+    #[test]
+    fn parse_once_timestamp_honors_iana_timezone() {
+        // Same wall-clock string, two zones → two different, offset-correct
+        // instants. On 2027-06-15 New York is EDT (UTC-4) and Tokyo is JST
+        // (UTC+9), so 09:00 local is 13:00Z in NY and 00:00Z in Tokyo — a 13h
+        // gap. If the impl ignored `timezone` and used the host's Local zone,
+        // these would be equal; the regression is that they must not be.
+        let wall = "2027-06-15T09:00:00";
+        let ny = parse_once_timestamp(wall, "America/New_York").unwrap();
+        let tokyo = parse_once_timestamp(wall, "Asia/Tokyo").unwrap();
+        assert_ne!(ny, tokyo, "timezone arg must change the resolved instant");
+        assert_eq!(
+            ny - tokyo,
+            13 * 3600,
+            "NY (UTC-4) is 13h behind Tokyo (UTC+9) on the clock, so the same \
+             wall time is a later instant in NY"
+        );
+
+        // Independent cross-check against chrono_tz.
+        let naive = NaiveDateTime::parse_from_str(wall, "%Y-%m-%dT%H:%M:%S").unwrap();
+        let tz: Tz = "America/New_York".parse().unwrap();
+        assert_eq!(ny, tz.from_local_datetime(&naive).unwrap().timestamp());
+    }
+
+    #[test]
+    fn parse_once_timestamp_local_sentinels_preserve_historical_behavior() {
+        // "" and "local" resolve in system-local time — the exact pre-timezone
+        // behavior for one-shots must be unchanged for these sentinels.
+        let wall = "2027-06-15T09:00:00";
+        let naive = NaiveDateTime::parse_from_str(wall, "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected = match Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => dt.timestamp(),
+            chrono::LocalResult::Ambiguous(a, _) => a.timestamp(),
+            chrono::LocalResult::None => panic!("test wall clock unexpectedly hit a DST gap"),
+        };
+        for tz in ["", "local"] {
+            assert_eq!(
+                parse_once_timestamp(wall, tz).unwrap(),
+                expected,
+                "sentinel {tz:?} must resolve in system-local time"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_once_timestamp_explicit_utc_resolves_in_utc() {
+        // An explicit "UTC" request must be UTC, not host-local — otherwise a
+        // task on a non-UTC host silently drifts by the host offset.
+        let wall = "2027-06-15T09:00:00";
+        let naive = NaiveDateTime::parse_from_str(wall, "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected_utc = Utc.from_local_datetime(&naive).unwrap().timestamp();
+        assert_eq!(parse_once_timestamp(wall, "UTC").unwrap(), expected_utc);
+        assert_eq!(parse_once_timestamp(wall, "utc").unwrap(), expected_utc);
+    }
+
+    #[test]
+    fn parse_once_timestamp_rfc3339_ignores_timezone_arg() {
+        // An offset-carrying timestamp is an absolute instant; the timezone
+        // arg is moot and must not shift it.
+        let future = Utc::now().timestamp() + 7200;
+        let iso = DateTime::from_timestamp(future, 0).unwrap().to_rfc3339();
+        let a = parse_once_timestamp(&iso, "Asia/Tokyo").unwrap();
+        let b = parse_once_timestamp(&iso, "America/New_York").unwrap();
+        assert_eq!(a, b, "RFC3339 offset input must ignore the timezone arg");
+        assert!((a - future).abs() <= 1);
+    }
+
+    #[test]
+    fn parse_once_timestamp_unparseable_zone_falls_back_to_local() {
+        // A corrupt zone must warn-and-continue (never fail to schedule),
+        // resolving in system-local time exactly like the "" sentinel.
+        let wall = "2027-06-15T09:00:00";
+        assert_eq!(
+            parse_once_timestamp(wall, "Not/ARealZone").unwrap(),
+            parse_once_timestamp(wall, "").unwrap(),
+        );
     }
 
     #[test]
