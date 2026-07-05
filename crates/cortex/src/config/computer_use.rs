@@ -1,9 +1,11 @@
-//! `[computer_use]` config — drives the macOS-only `computer_use` tool.
+//! `[computer_use]` config — drives the `computer_use` tool.
 //!
-//! The tool spawns the external `cua-driver` binary over stdio and speaks a
-//! framed JSON-RPC dialect for screen capture, app enumeration, and (in the
-//! mutating-actions commit) UI control. The settings here are the operator
-//! knobs surfaced through `/settings` and the SQLite settings table.
+//! The tool spawns the external `cua-driver` binary over stdio and speaks
+//! newline-delimited MCP JSON-RPC for screen capture, app enumeration, and
+//! UI control (click/type/drag/…). The settings here are the operator knobs
+//! surfaced through `/settings` and the SQLite settings table. The tool
+//! defaults on only for macOS (the driver's primary platform); elsewhere the
+//! operator opts in once their host has a driver build.
 
 use serde::{Deserialize, Serialize};
 

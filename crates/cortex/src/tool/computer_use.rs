@@ -1,4 +1,4 @@
-//! `computer_use` tool — macOS-only screen capture and (eventually) UI control.
+//! `computer_use` tool — screen capture and UI control via `cua-driver`.
 //!
 //! Spawns the external `cua-driver` binary as an MCP-over-stdio child process
 //! per tool call and speaks newline-delimited JSON-RPC 2.0 to it. We
@@ -18,8 +18,10 @@
 //! ## Action allowlist
 //!
 //! Read-only actions (`capture`, `list_apps`, `wait`) are allowed in Plan
-//! mode. Mutating actions (`click`, `type`, …) are added in a follow-up commit
-//! and stay blocked in Plan mode.
+//! mode. Mutating actions (`click`, `type`, …) are blocked in Plan mode —
+//! the per-action gate is `crate::tool::readonly_tool_call`, which the agent
+//! loop consults on the raw args before typed parsing. Mutating actions also
+//! pass a hard denylist (`check_denylist`) before any driver dispatch.
 //!
 //! ## Test seam
 //!
@@ -132,6 +134,14 @@ pub(crate) struct ComputerUseArgs {
     /// `action == Wait`.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+
+    /// Click family + drag. Modifier keys held during the gesture, e.g.
+    /// `["cmd"]` for cmd-click or `["shift"]` for a range-select drag.
+    /// Only the pixel-addressed path honours these (the driver's AX
+    /// element_index path ignores them). Scroll takes no modifiers — the
+    /// driver has no such parameter there.
+    #[serde(default)]
+    pub modifiers: Option<Vec<String>>,
 
     /// Click family + drag start. Pixel x.
     #[serde(default)]
@@ -571,7 +581,7 @@ pub(crate) async fn handle(
 ) -> Result<ToolOutput> {
     if !config.computer_use.enabled {
         return Ok(ToolOutput::Text(
-            "Error: computer_use is disabled. Enable it via `/settings` (computer_use.enabled = true) — note the driver only ships for macOS today.".into(),
+            "Error: computer_use is disabled. Enable it via `/settings` (computer_use.enabled = true) and install cua-driver on this host.".into(),
         ));
     }
 
@@ -731,6 +741,7 @@ async fn capture_internal(args: &ComputerUseArgs, driver: &dyn Driver) -> Result
         pid: args.pid,
         window_id: args.window_id,
         duration_ms: None,
+        modifiers: None,
         x: None,
         y: None,
         to_x: None,
@@ -838,6 +849,25 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
             "Error: cua-driver returned no image for capture (mode={mode:?}). Detail: {summary}"
         )));
     };
+
+    // Small-image guard: providers reject images below a few pixels a side
+    // (a 1×1 window, a fully-occluded surface). Below the floor the pixels
+    // are worthless, and an oversized-context image part would be rejected
+    // downstream anyway — so drop the image and keep the text. In `som` the
+    // element index still lets follow-up clicks work; in `vision` the model
+    // at least learns why no pixels arrived.
+    if let Some((w, h)) = png_dimensions(&data) {
+        if w < MIN_PROVIDER_IMAGE_DIMENSION || h < MIN_PROVIDER_IMAGE_DIMENSION {
+            tracing::warn!(
+                "cua-driver capture image is {w}x{h}, below the {MIN_PROVIDER_IMAGE_DIMENSION}px \
+                 provider floor (mode={mode:?}); dropping the image, keeping text"
+            );
+            return Ok(ToolOutput::Text(format!(
+                "{summary}\n(screenshot omitted: {w}x{h} is below the \
+                 {MIN_PROVIDER_IMAGE_DIMENSION}x{MIN_PROVIDER_IMAGE_DIMENSION} provider minimum)"
+            )));
+        }
+    }
 
     Ok(ToolOutput::Multimodal {
         text: summary.clone(),
@@ -1092,6 +1122,71 @@ fn normalised_hotkey(args: &ComputerUseArgs) -> Option<String> {
     Some(lowered.join("+"))
 }
 
+/// The modifier names cua-driver accepts on the pixel-addressed pointer path
+/// (`click`/`double_click`/`right_click`/`drag`). The driver's own schema
+/// lists `cmd/shift/option/ctrl`; we canonicalise the usual aliases onto
+/// those so a model that says `command` or `alt` still works.
+fn canonical_modifier(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "cmd" | "command" | "⌘" => Some("cmd"),
+        "shift" | "⇧" => Some("shift"),
+        "option" | "opt" | "alt" | "⌥" => Some("option"),
+        "ctrl" | "control" | "⌃" => Some("ctrl"),
+        _ => None,
+    }
+}
+
+/// Validate + canonicalise `args.modifiers` into the driver's `modifier`
+/// array. `Ok(None)` means "no modifiers to send"; `Err` names the offending
+/// token so the model can correct it rather than have the driver silently
+/// drop an unknown modifier (its schema is `additionalProperties: false`, so
+/// an out-of-set value would fail the whole call opaquely).
+fn driver_modifiers(args: &ComputerUseArgs) -> Result<Option<Vec<&'static str>>> {
+    let Some(raw) = args.modifiers.as_ref() else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for m in raw {
+        let canon = canonical_modifier(m).ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use: unknown modifier {m:?} — accepted: cmd, shift, option, ctrl"
+            )
+        })?;
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Parse the pixel dimensions out of a base64-encoded image without decoding
+/// the pixels. PNG carries width/height as two big-endian u32s at bytes
+/// 16..24 (right after the 8-byte signature + `IHDR` length/type). Returns
+/// `None` for non-PNG or truncated data — the guard treats "unknown size" as
+/// "not too small" so a JPEG (or a parse miss) never suppresses a real image.
+fn png_dimensions(base64_data: &str) -> Option<(u32, u32)> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data.trim())
+        .ok()?;
+    const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || !bytes.starts_with(PNG_SIG) {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
+/// Providers reject images smaller than a few pixels on a side. Mirrors the
+/// reference driver's 8×8 floor: below it, the pixels are worthless to the
+/// model anyway, so we drop the image and keep the text so element-indexed
+/// follow-ups still work.
+const MIN_PROVIDER_IMAGE_DIMENSION: u32 = 8;
+
 #[allow(clippy::expect_used)]
 static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     // `:(){...}` or `bomb(){...}` — function definitions that recursively
@@ -1163,10 +1258,12 @@ fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
     let mut params = json!({});
     let summary;
+    let modifiers = driver_modifiers(args)?;
     if let Some(idx) = args.element_index {
         // SOM-targeted click: address the element by index, the way the
         // model saw it in the last capture(mode=som). Pixel coords are
-        // omitted entirely so the driver can't fall back to them.
+        // omitted entirely so the driver can't fall back to them. The
+        // driver ignores `modifier` on this AX path, so we don't send it.
         params["element_index"] = json!(idx);
         summary = format!("{method} on element [{idx}]");
     } else {
@@ -1180,7 +1277,16 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         })?;
         params["x"] = json!(x);
         params["y"] = json!(y);
-        summary = format!("{method} at ({x}, {y})");
+        // Modifiers are pixel-path only (the driver's AX path ignores them).
+        if let Some(mods) = &modifiers {
+            params["modifier"] = json!(mods);
+        }
+        summary = match &modifiers {
+            Some(mods) if !mods.is_empty() => {
+                format!("{method} at ({x}, {y}) with {}", mods.join("+"))
+            }
+            _ => format!("{method} at ({x}, {y})"),
+        };
     }
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
@@ -1206,9 +1312,19 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
+    // Drag is pixel-only in the driver (AX has no drag), so modifiers always
+    // apply when present — option-drag duplicates, shift-drag constrains.
+    let modifiers = driver_modifiers(args)?;
+    if let Some(mods) = &modifiers {
+        params["modifier"] = json!(mods);
+    }
+    let with = match &modifiers {
+        Some(mods) if !mods.is_empty() => format!(" with {}", mods.join("+")),
+        _ => String::new(),
+    };
     let resp = driver.call("drag", params).await?;
     Ok(merge_driver_text(
-        format!("drag ({from_x},{from_y}) → ({to_x},{to_y})"),
+        format!("drag ({from_x},{from_y}) → ({to_x},{to_y}){with}"),
         resp,
     ))
 }
@@ -1375,6 +1491,35 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(png_bytes)
     }
 
+    /// Base64 PNG whose IHDR advertises `w`x`h`. Only the 24-byte header is
+    /// meaningful to `png_dimensions`; the rest of a real PNG isn't needed
+    /// to exercise the dimension sniff / small-image guard.
+    fn png_b64_of_size(w: u32, h: u32) -> String {
+        use base64::Engine;
+        let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]); // IHDR length
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[0x08, 0x06, 0x00, 0x00, 0x00]); // bit depth etc.
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn png_dimensions_reads_ihdr_and_ignores_non_png() {
+        assert_eq!(
+            png_dimensions(&png_b64_of_size(1920, 1080)),
+            Some((1920, 1080))
+        );
+        assert_eq!(png_dimensions(&one_by_one_png_b64()), Some((1, 1)));
+        // Non-PNG (e.g. a JPEG or garbage) → None, so the guard never fires
+        // on data it can't measure.
+        use base64::Engine;
+        let jpeg = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xD8, 0xFF, 0xE0]);
+        assert_eq!(png_dimensions(&jpeg), None);
+        assert_eq!(png_dimensions("not base64 %%%"), None);
+    }
+
     #[test]
     fn parse_response_extracts_image_and_text() {
         // The driver returns a result object with an array of {type, ...}
@@ -1454,10 +1599,10 @@ mod tests {
         // The whole reason the tool exists: pixels reach the LLM on the
         // next turn. If this regresses, the model sees only the summary
         // string and the screenshot might as well not have happened.
-        let b64 = one_by_one_png_b64();
+        let b64 = png_b64_of_size(64, 64);
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![
-                DriverContent::Text("captured 1x1".into()),
+                DriverContent::Text("captured window".into()),
                 DriverContent::Image {
                     mime_type: "image/png".into(),
                     base64: b64.clone(),
@@ -1470,7 +1615,7 @@ mod tests {
             ToolOutput::Multimodal { text, parts } => (text, parts),
             other => panic!("expected multimodal, got {other:?}"),
         };
-        assert!(text.contains("captured 1x1"));
+        assert!(text.contains("captured window"));
         assert_eq!(parts.len(), 2);
         match &parts[1] {
             ContentPart::ImageBase64 { media } => {
@@ -1490,7 +1635,7 @@ mod tests {
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![DriverContent::Image {
                 mime_type: "image/png".into(),
-                base64: one_by_one_png_b64(),
+                base64: png_b64_of_size(64, 64),
             }],
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
@@ -1585,6 +1730,7 @@ mod tests {
             pid: None,
             window_id: None,
             duration_ms: None,
+            modifiers: None,
             x: None,
             y: None,
             to_x: None,
@@ -1871,6 +2017,105 @@ mod tests {
         assert_eq!(params["text"], "Hello world");
     }
 
+    // ── modifiers ──────────────────────────────────────────────────
+
+    /// Pixel-addressed click with modifiers must send the driver's `modifier`
+    /// array (singular key name — the driver schema is
+    /// `additionalProperties: false`, so the exact key matters). Aliases
+    /// canonicalise: `command`/`alt` → `cmd`/`option`.
+    #[tokio::test]
+    async fn click_forwards_canonicalised_modifiers_on_pixel_path() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(10);
+        args.y = Some(20);
+        args.modifiers = Some(vec!["command".into(), "alt".into()]);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            params["modifier"],
+            json!(["cmd", "option"]),
+            "modifier must be sent under the singular `modifier` key, canonicalised"
+        );
+    }
+
+    /// The driver ignores `modifier` on the AX element_index path, so we must
+    /// NOT send it there — a stray key on a schema with
+    /// `additionalProperties: false` would fail the whole call.
+    #[tokio::test]
+    async fn click_omits_modifiers_on_element_index_path() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.element_index = Some(4);
+        args.modifiers = Some(vec!["cmd".into()]);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        assert!(
+            params.get("modifier").is_none(),
+            "modifier must not ride the element_index path: {params}"
+        );
+        assert_eq!(params["element_index"], 4);
+    }
+
+    /// Drag is pixel-only, so modifiers always apply — option-drag duplicates,
+    /// shift-drag constrains. The `modifier` array must reach the driver.
+    #[tokio::test]
+    async fn drag_forwards_modifiers() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Drag);
+        args.x = Some(1);
+        args.y = Some(2);
+        args.to_x = Some(3);
+        args.to_y = Some(4);
+        args.modifiers = Some(vec!["shift".into()]);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "drag");
+        assert_eq!(params["modifier"], json!(["shift"]));
+    }
+
+    /// An unknown modifier must be rejected pre-driver with a message naming
+    /// the offending token — better than the driver failing the whole call
+    /// opaquely on its `additionalProperties: false` schema.
+    #[tokio::test]
+    async fn click_rejects_unknown_modifier_before_driver() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(1);
+        args.y = Some(2);
+        args.modifiers = Some(vec!["hyper".into()]);
+        let out = handle_with_driver(&args, &driver).await;
+        // driver_modifiers returns Err → handler surfaces it; the driver is
+        // never called.
+        assert!(
+            out.is_err()
+                || matches!(&out, Ok(ToolOutput::Text(t)) if t.contains("unknown modifier")),
+            "unknown modifier must not silently pass: {out:?}"
+        );
+        assert!(
+            driver.calls.lock().unwrap().is_empty(),
+            "unknown-modifier click must not reach the driver"
+        );
+    }
+
+    /// Duplicate modifiers collapse — the driver doesn't want `["cmd","cmd"]`.
+    #[test]
+    fn driver_modifiers_dedupes_and_canonicalises() {
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.modifiers = Some(vec!["cmd".into(), "command".into(), "SHIFT".into()]);
+        let out = driver_modifiers(&args).unwrap().unwrap();
+        assert_eq!(out, vec!["cmd", "shift"]);
+    }
+
+    /// Empty / absent modifiers must produce no `modifier` key at all.
+    #[test]
+    fn driver_modifiers_absent_and_empty_are_none() {
+        let mut args = args_with_action(ComputerUseAction::Click);
+        assert!(driver_modifiers(&args).unwrap().is_none());
+        args.modifiers = Some(vec![]);
+        assert!(driver_modifiers(&args).unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn focus_app_no_raise_passes_flag_through() {
         // The whole point of the `raise_window: false` knob is that the
@@ -2015,7 +2260,7 @@ mod tests {
                 // tree silently getting padded with image bytes.
                 DriverContent::Image {
                     mime_type: "image/png".into(),
-                    base64: one_by_one_png_b64(),
+                    base64: png_b64_of_size(64, 64),
                 },
             ],
         }]);
@@ -2043,7 +2288,7 @@ mod tests {
                 DriverContent::Text("[{\"index\":0,\"role\":\"button\"}]".into()),
                 DriverContent::Image {
                     mime_type: "image/png".into(),
-                    base64: one_by_one_png_b64(),
+                    base64: png_b64_of_size(64, 64),
                 },
             ],
         }]);
@@ -2072,7 +2317,7 @@ mod tests {
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![DriverContent::Image {
                 mime_type: "image/png".into(),
-                base64: one_by_one_png_b64(),
+                base64: png_b64_of_size(64, 64),
             }],
         }]);
         let args = args_with_action(ComputerUseAction::Capture);
@@ -2142,7 +2387,7 @@ mod tests {
             DriverResponse {
                 content: vec![DriverContent::Image {
                     mime_type: "image/png".into(),
-                    base64: one_by_one_png_b64(),
+                    base64: png_b64_of_size(64, 64),
                 }],
             },
         ]);
@@ -2176,6 +2421,55 @@ mod tests {
             other => panic!("expected text error, got {other:?}"),
         }
         assert_eq!(driver.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Small-image guard: a sub-8×8 capture is worthless to the provider, so
+    /// the image is dropped and the text kept (SOM element indices still let
+    /// follow-up clicks work). The user-visible note explains the omission.
+    #[tokio::test]
+    async fn capture_below_min_dimension_drops_image_keeps_text() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![
+                DriverContent::Text("[1] button Save".into()),
+                DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: png_b64_of_size(4, 4),
+                },
+            ],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Som);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("[1] button Save"), "text dropped: {t}");
+                assert!(
+                    t.contains("screenshot omitted") && t.contains("4x4"),
+                    "omission note missing: {t}"
+                );
+            }
+            other => panic!("expected text (image dropped), got {other:?}"),
+        }
+    }
+
+    /// The guard must NOT fire on a normal-sized capture — an 8×8 image (at
+    /// the floor) and anything larger passes through as a multimodal image.
+    #[tokio::test]
+    async fn capture_at_or_above_min_dimension_keeps_image() {
+        for (w, h) in [(8, 8), (1920, 1080)] {
+            let driver = FakeDriver::new(vec![DriverResponse {
+                content: vec![DriverContent::Image {
+                    mime_type: "image/png".into(),
+                    base64: png_b64_of_size(w, h),
+                }],
+            }]);
+            let args = args_with_action(ComputerUseAction::Capture);
+            let out = handle_with_driver(&args, &driver).await.unwrap();
+            assert!(
+                matches!(out, ToolOutput::Multimodal { .. }),
+                "{w}x{h} image must pass through: {out:?}"
+            );
+        }
     }
 
     /// AX mode is text-only by contract — an image-less reply is the
@@ -2269,7 +2563,7 @@ mod tests {
             DriverResponse {
                 content: vec![DriverContent::Image {
                     mime_type: "image/png".into(),
-                    base64: one_by_one_png_b64(),
+                    base64: png_b64_of_size(64, 64),
                 }],
             },
         ]);
