@@ -183,12 +183,28 @@ impl Pki for PkiSvc {
         &self,
         req: Request<RevokeDeviceRequest>,
     ) -> Result<Response<PkiEmpty>, Status> {
-        let principal = req
-            .extensions()
-            .get::<Principal>()
+        // Trust model: the Pki service is mounted twice. On the local UDS
+        // socket there is NO auth interceptor, so no `Principal` is stamped —
+        // that is the host-local admin plane (filesystem-isolated) and may
+        // revoke any device (this is how `borg revoke <lost-device>` works).
+        // On the mTLS TCP listener every request carries a `Principal`; such a
+        // remote, paired device may revoke ONLY its own certificate. Without
+        // this, any low-trust paired device could revoke the operator's laptop
+        // — a self-lockout DoS (finding M5).
+        let principal = req.extensions().get::<Principal>().cloned();
+        let r = req.into_inner();
+        if let Some(p) = &principal {
+            if r.fingerprint != p.fingerprint {
+                return Err(Status::permission_denied(
+                    "remote callers may only revoke their own device; \
+                     revoke other devices from the host with the local `borg` CLI",
+                ));
+            }
+        }
+        let actor = principal
+            .as_ref()
             .map(|p| p.id.clone())
             .unwrap_or_else(|| "system".to_string());
-        let r = req.into_inner();
         let reason = if r.reason.is_empty() {
             None
         } else {
@@ -203,7 +219,7 @@ impl Pki for PkiSvc {
         self.audit
             .emit(
                 audit_events::CERT_REVOKED,
-                &principal,
+                &actor,
                 &json!({"fingerprint": r.fingerprint, "reason": r.reason}),
             )
             .await;
@@ -212,8 +228,18 @@ impl Pki for PkiSvc {
 
     async fn list_paired_devices(
         &self,
-        _req: Request<PkiEmpty>,
+        req: Request<PkiEmpty>,
     ) -> Result<Response<PairedDeviceList>, Status> {
+        // The full device roster (labels + fingerprints) is admin-only. A
+        // remote paired device carries a `Principal` (mTLS TCP path); letting it
+        // enumerate every other device would hand it the exact fingerprints to
+        // target with `revoke_device`. Only the local UDS admin plane (no
+        // `Principal`) may list. Finding M5.
+        if req.extensions().get::<Principal>().is_some() {
+            return Err(Status::permission_denied(
+                "listing paired devices is restricted to the host-local admin plane",
+            ));
+        }
         let rows = {
             let g = self.db.lock().await;
             g.list_paired_devices()
@@ -287,5 +313,90 @@ impl Pki for PkiSvc {
             },
         };
         Ok(Response::new(resp))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    async fn svc() -> PkiSvc {
+        let db = Arc::new(Mutex::new(Database::test_db().await));
+        let audit = AuditWriter::new(db.clone());
+        PkiSvc::new(db, audit, "ca-cert".into(), "ca-key".into())
+    }
+
+    fn revoke_req(target_fp: &str, principal: Option<Principal>) -> Request<RevokeDeviceRequest> {
+        let mut req = Request::new(RevokeDeviceRequest {
+            fingerprint: target_fp.into(),
+            reason: "test".into(),
+        });
+        if let Some(p) = principal {
+            req.extensions_mut().insert(p);
+        }
+        req
+    }
+
+    fn principal(fp: &str) -> Principal {
+        Principal {
+            id: format!("dev-{fp}"),
+            fingerprint: fp.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_device_cannot_revoke_another_device() {
+        // M5: a remote (mTLS) caller carries a Principal and must not revoke a
+        // fingerprint that isn't its own — otherwise any paired device could
+        // lock out the operator's laptop.
+        let svc = svc().await;
+        let err = svc
+            .revoke_device(revoke_req("fp-victim", Some(principal("fp-attacker"))))
+            .await
+            .expect_err("cross-device revoke must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn remote_device_can_revoke_itself() {
+        // Self-revoke (e.g. a device retiring its own compromised key) stays
+        // allowed for remote callers.
+        let svc = svc().await;
+        svc.revoke_device(revoke_req("fp-self", Some(principal("fp-self"))))
+            .await
+            .expect("self-revoke must succeed");
+    }
+
+    #[tokio::test]
+    async fn local_admin_plane_can_revoke_any_device() {
+        // No Principal ⟺ the host-local UDS admin plane (no interceptor). The
+        // operator revoking a lost device via `borg revoke` must still work.
+        let svc = svc().await;
+        svc.revoke_device(revoke_req("fp-lost-device", None))
+            .await
+            .expect("local admin revoke of any device must succeed");
+    }
+
+    #[tokio::test]
+    async fn remote_device_cannot_list_paired_devices() {
+        // M5: the device roster (labels + fingerprints) is admin-only; a remote
+        // caller must not be able to enumerate targets to revoke.
+        let svc = svc().await;
+        let mut req = Request::new(PkiEmpty {});
+        req.extensions_mut().insert(principal("fp-remote"));
+        let err = svc
+            .list_paired_devices(req)
+            .await
+            .expect_err("remote list must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn local_admin_plane_can_list_paired_devices() {
+        let svc = svc().await;
+        svc.list_paired_devices(Request::new(PkiEmpty {}))
+            .await
+            .expect("local admin list must succeed");
     }
 }

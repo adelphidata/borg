@@ -82,14 +82,30 @@ impl BootstrapListener {
     pub async fn serve(self, state: BootstrapState) -> Result<()> {
         // Best-effort cleanup of stale socket.
         let _ = std::fs::remove_file(&self.socket_path);
-        let listener = UnixListener::bind(&self.socket_path)
-            .with_context(|| format!("bind bootstrap socket {:?}", self.socket_path))?;
-        // Restrict to owner-only, like the main UDS.
+        // Tighten umask *around* the bind so the socket is created 0600
+        // atomically — mirroring `daemon::bind_uds`. A plain post-bind chmod
+        // leaves a window where a permissive process umask (Docker/systemd/root)
+        // exposes this always-on plaintext SPAKE2 socket as group/other-
+        // writable (finding L2).
+        #[cfg(unix)]
+        let prev_umask = unsafe { libc::umask(0o177) };
+        let bind_result = UnixListener::bind(&self.socket_path);
+        #[cfg(unix)]
+        unsafe {
+            libc::umask(prev_umask);
+        }
+        let listener =
+            bind_result.with_context(|| format!("bind bootstrap socket {:?}", self.socket_path))?;
+        // Re-assert owner-only perms and, unlike before, surface a failure
+        // rather than swallowing it — a socket we can't lock down must not go
+        // live silently.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("setting 0600 on bootstrap socket {:?}", self.socket_path)
+                })?;
         }
         tracing::info!(path = %self.socket_path.display(), "pairing bootstrap listener ready");
 

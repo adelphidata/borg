@@ -3,8 +3,15 @@
 //! Cross-checks the connecting peer's IP against `tailscale status --json`
 //! before delegating device lookup to the inner TOFU verifier. Refuses any
 //! peer whose IP does not appear as a known non-self Tailscale node, even
-//! when the cert fingerprint matches a paired device — the spec calls for
-//! binding pairs to a Tailscale node identity, not just to a key.
+//! when the cert fingerprint matches a paired device.
+//!
+//! Scope of the guarantee (do NOT overstate it): this binds a connection to
+//! *tailnet membership*, not to a specific node's identity. It checks only
+//! that the peer IP belongs to *some* non-self node in the tailnet — there is
+//! no fingerprint→node mapping, so any paired device connecting from any
+//! tailnet node IP passes. It is a defense-in-depth network gate layered on
+//! top of mTLS (which remains the real device-identity boundary), not a
+//! standalone per-node attestation (finding L3).
 
 use std::collections::HashSet;
 use std::net::IpAddr;

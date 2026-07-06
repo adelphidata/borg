@@ -99,6 +99,18 @@ pub fn resolve_borg_home(override_path: Option<&Path>) -> Result<PathBuf> {
     if !home.exists() {
         std::fs::create_dir_all(&home)
             .with_context(|| format!("creating BORG_HOME at {}", home.display()))?;
+        // Lock the data dir down to owner-only instead of leaving it at the
+        // process umask (~0755, world-readable). Everything sensitive lives
+        // under here — the DB, secrets/, identity/ — so a defensive default
+        // matters even though those leaves set their own tighter modes
+        // (finding L6). Only applied on creation so we don't fight an operator
+        // who deliberately relaxed perms on an existing dir.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting 0700 on BORG_HOME at {}", home.display()))?;
+        }
     }
     Ok(home)
 }
@@ -333,6 +345,26 @@ mod tests {
         assert_eq!(pid_path(&home).parent().unwrap(), home);
         assert_eq!(pairing_socket_path(&home).parent().unwrap(), home);
         assert_eq!(tick_lock_path(&home).parent().unwrap(), home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_borg_home_creates_dir_with_owner_only_perms() {
+        // Finding L6: the data dir holds the DB, secrets/, and identity/. When
+        // `resolve_borg_home` has to create it, it must land at 0700 rather than
+        // inheriting a ~0755 (world-readable) umask default. Pass an explicit
+        // override so this never touches the process-global BORG_HOME env var.
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let fresh = parent.path().join("borg-home-l6");
+        assert!(!fresh.exists(), "precondition: dir must not pre-exist");
+        let home = resolve_borg_home(Some(&fresh)).unwrap();
+        assert_eq!(home, fresh);
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "newly-created BORG_HOME must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]
