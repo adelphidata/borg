@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use scraper::{Html, Selector};
-use std::sync::LazyLock;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock};
 
 use crate::config::{UrlPolicyConfig, WebConfig};
 use crate::constants;
-use crate::url_policy::{self, ClassifyOutcome};
+use crate::url_policy::{self, ssrf, ClassifyOutcome};
 
 const MAX_FETCH_CHARS: usize = constants::WEB_FETCH_MAX_CHARS;
 const MAX_SEARCH_RESULTS: usize = constants::WEB_MAX_SEARCH_RESULTS;
@@ -16,6 +17,57 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .map_err(Into::into)
+}
+
+/// Filter a set of resolved IPs down to those the SSRF policy permits,
+/// returning `SocketAddr`s (port 0 — the HTTP connector overrides it with the
+/// destination port). Mirrors the IP gate in [`url_policy::classify`]:
+/// always-blocked cloud-metadata/link-local addresses are dropped, and private
+/// addresses are dropped unless `allow_private` is set. This is the pure core
+/// of [`SsrfGuardResolver`], extracted so it can be unit-tested without DNS.
+fn ssrf_filter_addrs(ips: Vec<IpAddr>, allow_private: bool) -> Vec<SocketAddr> {
+    ips.into_iter()
+        .filter(|ip| !ssrf::is_always_blocked_ip(ip))
+        .filter(|ip| allow_private || !url_policy::is_private_class(ip))
+        .map(|ip| SocketAddr::new(ip, 0))
+        .collect()
+}
+
+/// A reqwest DNS resolver that enforces the SSRF IP policy at connect time.
+///
+/// reqwest/hyper invoke this for the initial request AND for every redirect hop
+/// (each new host is resolved through it), so a hostname that resolves — right
+/// now, at the moment of connection — to a blocked or private address is
+/// refused. This is what closes the DNS-rebinding / redirect-to-internal window
+/// that a pre-flight `classify()` alone leaves open: the pre-flight lookup and
+/// the connect-time lookup are no longer allowed to disagree, because the
+/// connection uses exactly the addresses this resolver validated.
+#[derive(Debug, Clone)]
+struct SsrfGuardResolver {
+    allow_private: bool,
+}
+
+impl reqwest::dns::Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_private = self.allow_private;
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let ips = ssrf::resolve_host(&host).await?;
+            let allowed = ssrf_filter_addrs(ips, allow_private);
+            if allowed.is_empty() {
+                // All resolved addresses are blocked (or the host resolves only
+                // to internal space). Fail the connection rather than fall back
+                // to an OS resolve that would skip the policy.
+                let err: Box<dyn std::error::Error + Send + Sync> = format!(
+                    "SSRF policy: host '{host}' resolves only to blocked/private addresses"
+                )
+                .into();
+                return Err(err);
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
+            Ok(addrs)
+        })
+    }
 }
 
 /// Attach the active trace context to an outbound request as a `traceparent`
@@ -138,12 +190,21 @@ pub async fn web_fetch(
         }
     });
 
+    // Pin SSRF enforcement into the connector's DNS resolver so the addresses
+    // actually connected to — on the initial request and on every redirect hop —
+    // are exactly the ones validated against the policy. This closes the
+    // DNS-rebinding / redirect-to-internal window: the connect-time resolve can
+    // no longer differ from a pre-flight lookup, because there is only one
+    // resolve and it enforces the IP gate.
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(
             constants::WEB_FETCH_TIMEOUT_SECS,
         ))
         .redirect(redirect)
+        .dns_resolver(Arc::new(SsrfGuardResolver {
+            allow_private: policy.allow_private_urls,
+        }))
         .build()?;
 
     let resp = with_trace_context(client.get(&effective_url))
@@ -152,17 +213,11 @@ pub async fn web_fetch(
         .with_context(|| format!("Failed to fetch {effective_url}"))?;
     tracing::Span::current().record("http.status_code", resp.status().as_u16());
 
-    // Post-fetch: re-validate the final landing URL with full DNS,
-    // *unconditionally*, to defend against DNS rebinding. Even a
-    // no-redirect 200 can have IPs at connect time that differ from the
-    // pre-flight lookup (TOCTOU), so we re-resolve regardless of whether
-    // a redirect occurred. The cost is one cached DNS lookup.
-    //
-    // True end-to-end DNS-rebinding defense requires pinning the
-    // pre-flight IPs into the connector (e.g. a custom
-    // `reqwest::dns::Resolve`). That's tracked as future work; the
-    // post-fetch recheck closes the window for the common case where the
-    // attacker's DNS TTL has not yet expired between resolves.
+    // Post-fetch: re-validate the final landing URL with full DNS as
+    // defense-in-depth. The connector's `SsrfGuardResolver` is the primary
+    // guard — it already enforced the IP policy on the addresses actually
+    // connected to, for every hop — so this recheck is a belt-and-suspenders
+    // catch for the final host rather than the sole rebinding defense.
     let final_url = resp.url().to_string();
     let post = url_policy::classify_no_throttle(&final_url, policy).await;
     if !matches!(post, ClassifyOutcome::Allow { .. }) {
@@ -496,6 +551,40 @@ mod tests {
         let text = html_to_text(html);
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
+    }
+
+    #[test]
+    fn ssrf_filter_drops_metadata_and_link_local() {
+        // The IMDS IP and link-local space must be dropped regardless of the
+        // allow-private toggle — this is the core SSRF gate the resolver pins
+        // into the connector for every hop (initial + redirects).
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        let azure_wire: IpAddr = "168.63.129.16".parse().unwrap();
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        for allow_private in [false, true] {
+            let out = ssrf_filter_addrs(vec![imds, azure_wire, public], allow_private);
+            let ips: Vec<IpAddr> = out.iter().map(|s| s.ip()).collect();
+            assert!(!ips.contains(&imds), "IMDS IP must be dropped");
+            assert!(!ips.contains(&azure_wire), "Azure wireserver must be dropped");
+            assert!(ips.contains(&public), "public IP must survive");
+        }
+    }
+
+    #[test]
+    fn ssrf_filter_gates_private_on_allow_flag() {
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        // Default: private addresses are refused (empty → connection fails).
+        assert!(ssrf_filter_addrs(vec![private], false).is_empty());
+        // Only when the operator opts in are they allowed.
+        assert_eq!(ssrf_filter_addrs(vec![private], true).len(), 1);
+    }
+
+    #[test]
+    fn ssrf_filter_addrs_use_zero_port() {
+        // Port 0 — hyper's HTTP connector overrides it with the destination port.
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let out = ssrf_filter_addrs(vec![public], false);
+        assert_eq!(out[0].port(), 0);
     }
 
     #[test]
