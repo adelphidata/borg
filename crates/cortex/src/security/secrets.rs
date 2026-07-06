@@ -10,12 +10,29 @@ struct SecretPattern {
 
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     let patterns: Vec<(&str, &str, bool)> = vec![
-        (r"AKIA[0-9A-Z]{16}", "AWS Access Key", false),
+        // AWS key IDs share a 4-letter prefix + 16 base32 chars. Beyond the
+        // long-lived `AKIA` access key, cover temporary/STS creds (`ASIA`) and
+        // the unique-ID prefixes for users/roles/groups (`AIDA`/`AROA`/`AGPA`)
+        // so a leaked temporary credential is masked too.
+        (
+            r"(?:AKIA|ASIA|AIDA|AROA|AGPA)[0-9A-Z]{16}",
+            "AWS Access Key",
+            false,
+        ),
         (
             r"(?:ghp|ghs|gho|ghu|ghm)_[A-Za-z0-9_]{36,}",
             "GitHub Token",
             false,
         ),
+        // GitHub fine-grained personal access tokens (`github_pat_...`) — a
+        // distinct shape from the classic `ghp_` prefix above.
+        (r"github_pat_[0-9A-Za-z_]{20,}", "GitHub Token", false),
+        // Google API keys are `AIza` + 35 url-safe base64 chars. The prefix is
+        // distinctive enough that a 30+ char lower bound won't false-positive.
+        (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false),
+        // Stripe live secret/restricted keys (`sk_live_`/`rk_live_`). Test-mode
+        // keys are deliberately left alone.
+        (r"[sr]k_live_[0-9A-Za-z]{16,}", "Stripe Key", false),
         (
             r"sk[-_]ant[-_][A-Za-z0-9_-]{32,}",
             "Anthropic API Key",
@@ -38,13 +55,16 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             false,
         ),
         (r"xox[bpsar]-[A-Za-z0-9-]{24,}", "Slack Token", false),
+        // Slack app-level tokens (`xapp-1-...`) are distinct from the `xox*`
+        // bot/user tokens above.
+        (r"xapp-[0-9]-[A-Za-z0-9-]{10,}", "Slack Token", false),
         (
-            r#"(?:password|passwd|pwd)\s*[=:]\s*"[^"]{8,}""#,
+            r#"(?:password|passwd|pwd|passphrase)\s*[=:]\s*"[^"]{8,}""#,
             "Quoted Password",
             false,
         ),
         (
-            r"(?:password|passwd|pwd)\s*[=:]\s*(\S{8,64})",
+            r"(?:password|passwd|pwd|passphrase)\s*[=:]\s*(\S{8,64})",
             "Password Assignment",
             true,
         ),
@@ -94,8 +114,13 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // — `spring.datasource.password=…`, `app.config.api_key=…`, Java
         // `.properties` files — are covered, not just bare `API_KEY=…`. Dots are
         // a superset of the prior word-char prefix, so no existing match is lost.
+        // `PASSPHRASE` is included so the master-KEK env line
+        // (`BORG_KEK_PASSPHRASE=...`, written to ~/.borg/secrets/kek.env) is
+        // masked on every sink. It matches neither `KEY` (that's "KEK") nor the
+        // `password|passwd|pwd` value patterns above, so without it the KEK
+        // passphrase leaked through redaction entirely.
         (
-            r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
+            r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
             "Credential Assignment",
             true,
         ),
@@ -198,12 +223,16 @@ pub fn contains_secrets(text: &str) -> bool {
 pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "AKIAIOSFODNN7EXAMPLE",
     "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
+    "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
+    "AIzaSyA1234567890abcdefghijklmnopqrstuvwx",
+    "sk_live_0123456789abcdefABCDEFghijkl",
     "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
     "sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
     "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678aBcDeFgHiJkLm",
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
     "-----BEGIN RSA PRIVATE KEY-----",
     "xoxb-1234567890-abcdefghijklmnopqrstuvwx",
+    "xapp-1-A012345678BCDEFGHIJ",
     r#"password="super-secret-shh""#,
     "password=hunter2trustno1",
     "postgresql://user:hunter2pw@localhost:5432/mydb",
@@ -437,6 +466,72 @@ mod tests {
         assert!(
             result.contains("PGPASSWORD="),
             "variable name prefix must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_kek_passphrase_env_line() {
+        // Regression: BORG_KEK_PASSPHRASE is the master-KEK secret written to
+        // ~/.borg/secrets/kek.env. It contains "KEK" (not "KEY") and the value
+        // keyword is "PASSPHRASE", so the pre-fix word list missed it entirely
+        // and the passphrase leaked through redaction on every sink.
+        let input = "BORG_KEK_PASSPHRASE=Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZg";
+        let result = redact_secrets(input);
+        assert!(
+            result.contains("[REDACTED"),
+            "KEK passphrase env line must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZg"),
+            "raw KEK passphrase must not survive redaction: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_lowercase_passphrase_assignment() {
+        for input in [
+            "passphrase=correct-horse-battery-staple",
+            r#"passphrase: "correct-horse-battery-staple""#,
+        ] {
+            let result = redact_secrets(input);
+            assert!(
+                !result.contains("correct-horse-battery-staple"),
+                "passphrase value leaked: {input} -> {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_additional_token_formats() {
+        // L5: coverage for credential shapes that were previously missed.
+        let cases = [
+            ("ASIAIOSFODNN7EXAMPLE", "AWS temporary key"),
+            ("github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123", "GitHub fine-grained PAT"),
+            ("AIzaSyA1234567890abcdefghijklmnopqrstuvwx", "Google API key"),
+            ("sk_live_0123456789abcdefABCDEFghijkl", "Stripe live key"),
+            ("xapp-1-A012345678BCDEFGHIJ", "Slack app token"),
+        ];
+        for (secret, what) in cases {
+            let input = format!("value = {secret} end");
+            let result = redact_secrets(&input);
+            assert!(
+                result.contains("[REDACTED"),
+                "{what} not redacted: {result}"
+            );
+            assert!(
+                !result.contains(secret),
+                "{what} leaked through redaction: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_test_mode_key_not_over_redacted() {
+        // Test-mode Stripe keys are deliberately left alone (documented scope).
+        let input = "sk_test_0123456789abcdefABCDEFghijkl";
+        assert!(
+            !redact_secrets(input).contains("[REDACTED Stripe Key]"),
+            "test-mode Stripe key must not match the live-key pattern"
         );
     }
 
