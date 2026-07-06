@@ -96,18 +96,6 @@ pub fn generate_profile(
     // manifest level via the blocked_paths security config.
     profile.push_str("(allow file-read*)\n");
 
-    // Defense-in-depth: deny reads to well-known sensitive directories even
-    // though file-read* is broadly allowed. If the manifest-level
-    // blocked_paths filter has a bug, these rules are the backstop.
-    if let Ok(home_str) = std::env::var("HOME") {
-        for sensitive in SENSITIVE_HOME_PATHS {
-            let path = format!("{home_str}/{sensitive}");
-            if validate_seatbelt_path(&path).is_ok() {
-                profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));
-            }
-        }
-    }
-
     // Allow writing to /dev (stdout/stderr file descriptors)
     profile.push_str("(allow file-write* (subpath \"/dev\"))\n");
     // Allow writing to /tmp
@@ -126,6 +114,20 @@ pub fn generate_profile(
     for path in &policy.fs_write {
         validate_seatbelt_path(path)?;
         profile.push_str(&format!("(allow file-write* (subpath \"{path}\"))\n"));
+    }
+
+    // Defense-in-depth: deny reads to well-known sensitive directories even
+    // though file-read* is broadly allowed. Emitted AFTER the fs_read allows so
+    // that under last-match-wins these denies still hold when a policy grants a
+    // broad read root (e.g. the `trusted` profile's `/`) — previously this block
+    // came before the allows, so a broad fs_read could override it.
+    if let Ok(home_str) = std::env::var("HOME") {
+        for sensitive in SENSITIVE_HOME_PATHS {
+            let path = format!("{home_str}/{sensitive}");
+            if validate_seatbelt_path(&path).is_ok() {
+                profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));
+            }
+        }
     }
 
     // Deny read access to specific paths (overrides the blanket allow).
@@ -503,5 +505,33 @@ mod tests {
                 "missing deny rule for {sensitive}; profile:\n{profile}"
             );
         }
+    }
+
+    #[test]
+    fn sensitive_deny_wins_over_broad_fs_read() {
+        // M2: under last-match-wins, the sensitive-home deny must be emitted
+        // AFTER a broad fs_read allow (e.g. the `trusted` profile's `/`), or a
+        // tool granted read of `/` could read ~/.ssh anyway.
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("skipping: HOME unset in test env");
+            return;
+        };
+        let policy = SandboxPolicy {
+            fs_read: vec!["/".to_string()],
+            deny_read: vec![format!("{home}/.borg/secrets")],
+            ..Default::default()
+        };
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
+        let allow_root = profile.find("(allow file-read* (subpath \"/\"))").unwrap();
+        let deny_ssh = profile
+            .find(&format!("(deny file-read* (subpath \"{home}/.ssh\"))"))
+            .expect("sensitive .ssh deny must be present");
+        let deny_secrets = profile
+            .find(&format!("(deny file-read* (subpath \"{home}/.borg/secrets\"))"))
+            .expect("borg secrets deny must be present");
+        assert!(
+            allow_root < deny_ssh && allow_root < deny_secrets,
+            "sensitive/secret denies must come AFTER the broad fs_read allow"
+        );
     }
 }

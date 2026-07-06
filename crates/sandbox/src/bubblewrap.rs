@@ -58,6 +58,31 @@ fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
     args.extend([flag.to_string(), path.to_string(), path.to_string()]);
 }
 
+/// Make `path` unreadable inside the sandbox by overlaying it: an empty tmpfs
+/// for directories, a read-only bind of `/dev/null` for regular files. Skips
+/// non-existent paths — bwrap errors on a mount target that doesn't exist.
+fn hide_path(args: &mut Vec<String>, path: &str) {
+    let p = Path::new(path);
+    match std::fs::symlink_metadata(p) {
+        Ok(meta) if meta.is_dir() => {
+            args.extend(["--tmpfs".to_string(), path.to_string()]);
+        }
+        Ok(_) => {
+            // Regular file or symlink: shadow it with /dev/null (unreadable
+            // content) rather than a tmpfs, which cannot mount over a file.
+            args.extend([
+                "--ro-bind".to_string(),
+                "/dev/null".to_string(),
+                path.to_string(),
+            ]);
+        }
+        Err(_) => {
+            // Path doesn't exist — nothing to hide, and mounting over a missing
+            // target would make bwrap fail the whole spawn.
+        }
+    }
+}
+
 /// Build bwrap args with an explicit version for testability.
 pub fn build_bwrap_args_versioned(
     policy: &SandboxPolicy,
@@ -94,6 +119,26 @@ pub fn build_bwrap_args_versioned(
     for path in &policy.deny_write {
         if Path::new(path).exists() {
             push_bind(&mut args, "--ro-bind", path);
+        }
+    }
+
+    // Deny reads. Emitted AFTER the fs_read `--ro-bind`s so these overlays win
+    // when a deny_read path sits under a broadly-bound read root (e.g. the
+    // `trusted` profile binds `/`). Directories are hidden with an empty tmpfs;
+    // regular files are shadowed by a read-only bind of /dev/null. Previously
+    // bwrap ignored deny_read entirely, so on Linux a tool could read
+    // ~/.ssh / ~/.aws / ~/.borg/secrets despite the policy.
+    for path in &policy.deny_read {
+        hide_path(&mut args, path);
+    }
+
+    // Defense-in-depth backstop: hide the well-known sensitive home directories
+    // even if they were not explicitly in deny_read, matching the Seatbelt
+    // backend's SENSITIVE_HOME_PATHS behavior.
+    if let Some(home) = dirs::home_dir() {
+        for sensitive in crate::constants::SENSITIVE_HOME_PATHS {
+            let path = format!("{}/{sensitive}", home.to_string_lossy());
+            hide_path(&mut args, &path);
         }
     }
 
@@ -139,6 +184,44 @@ mod tests {
     fn network_isolated_by_default() {
         let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
         assert!(args.contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn deny_read_dir_is_tmpfs_and_file_is_dev_null() {
+        // M1: bwrap must actually enforce deny_read — a directory is hidden
+        // with an empty tmpfs, a regular file is shadowed by /dev/null.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("secretdir");
+        std::fs::create_dir(&dir).unwrap();
+        let file = tmp.path().join("secret.db");
+        std::fs::write(&file, b"secret").unwrap();
+
+        let policy = SandboxPolicy {
+            fs_read: vec![tmp.path().to_string_lossy().into_owned()],
+            deny_read: vec![
+                dir.to_string_lossy().into_owned(),
+                file.to_string_lossy().into_owned(),
+            ],
+            ..SandboxPolicy::default()
+        };
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
+
+        let dir_s = dir.to_string_lossy().into_owned();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == dir_s),
+            "deny_read directory must be tmpfs-hidden: {args:?}"
+        );
+        let file_s = file.to_string_lossy().into_owned();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == file_s),
+            "deny_read file must be shadowed by /dev/null: {args:?}"
+        );
+        // The overlay must come AFTER the broad read bind so it wins.
+        let read_bind_idx = args.iter().position(|a| a == &tmp.path().to_string_lossy());
+        let tmpfs_idx = args.iter().position(|a| a == &dir_s);
+        assert!(read_bind_idx < tmpfs_idx, "hide must be emitted after fs_read bind");
     }
 
     #[test]

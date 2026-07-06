@@ -207,7 +207,16 @@ impl SandboxPolicy {
             .with_blocked_paths_filtered(blocked_paths)
     }
 
-    /// Add `~/.borg/` to deny_write to protect agent config, consuming self.
+    /// Add `~/.borg/` to deny_write to protect agent config, and deny *read* of
+    /// the credential/key material inside it, consuming self.
+    ///
+    /// The whole `~/.borg` is write-protected. For reads we deny the specific
+    /// secret stores (`secrets/`, `identity/`, `borg.db`) rather than all of
+    /// `~/.borg`, because the sandboxed tool's own directory lives under
+    /// `~/.borg/tools/<tool>` and is bound in explicitly. These deny-read
+    /// entries are emitted last by the backends, so they win even under a broad
+    /// `fs_read` (e.g. the `trusted` profile's `/`), closing the gap where a
+    /// sandboxed tool could `cat ~/.borg/secrets/kek.enc` and exfiltrate it.
     pub fn with_borg_dir_protected(mut self) -> Self {
         let borg_dir = dirs::home_dir()
             .map(|h| format!("{}/.borg", h.display()))
@@ -217,7 +226,14 @@ impl SandboxPolicy {
             });
 
         if !self.deny_write.iter().any(|p| p == &borg_dir) {
-            self.deny_write.push(borg_dir);
+            self.deny_write.push(borg_dir.clone());
+        }
+
+        for sensitive in ["secrets", "identity", "borg.db"] {
+            let path = format!("{borg_dir}/{sensitive}");
+            if !self.deny_read.iter().any(|p| p == &path) {
+                self.deny_read.push(path);
+            }
         }
         self
     }
@@ -477,6 +493,28 @@ mod tests {
             .filter(|p| p.ends_with("/.borg"))
             .count();
         assert_eq!(borg_count, 1);
+        // deny_read entries for the secret stores must also be de-duplicated.
+        let secrets_count = protected
+            .deny_read
+            .iter()
+            .filter(|p| p.ends_with("/.borg/secrets"))
+            .count();
+        assert_eq!(secrets_count, 1);
+    }
+
+    #[test]
+    fn with_borg_dir_protected_denies_read_of_secret_stores() {
+        // M2/M1: the credential/key material inside ~/.borg must be deny-read,
+        // not just deny-write, so a sandboxed tool can't exfiltrate kek.enc /
+        // borg.db even under a broad fs_read.
+        let protected = SandboxPolicy::default().with_borg_dir_protected();
+        for suffix in ["/.borg/secrets", "/.borg/identity", "/.borg/borg.db"] {
+            assert!(
+                protected.deny_read.iter().any(|p| p.ends_with(suffix)),
+                "deny_read missing {suffix}: {:?}",
+                protected.deny_read
+            );
+        }
     }
 
     #[test]
