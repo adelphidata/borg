@@ -284,8 +284,18 @@ impl Default for SecurityConfig {
                 ".gnupg".into(),
                 ".config/gh".into(),
                 ".env".into(),
+                // direnv file: not a dotted `.env.` family member, so it needs
+                // its own entry to be covered.
+                ".envrc".into(),
                 "credentials".into(),
                 "private_key".into(),
+                // SSH private keys copied outside ~/.ssh are otherwise readable.
+                // Component-family matching also covers the `.pub` counterparts,
+                // which is harmless (fail-secure).
+                "id_rsa".into(),
+                "id_ed25519".into(),
+                "id_ecdsa".into(),
+                "id_dsa".into(),
             ],
             allowed_paths: Vec::new(),
             host_audit: true,
@@ -384,14 +394,17 @@ mod tests {
         );
         assert_eq!(cfg.verifier, VerifierKind::Tofu);
         assert_eq!(cfg.kek_backend, KekBackend::Auto);
-        assert_eq!(cfg.blocked_paths.len(), 7);
+        assert_eq!(cfg.blocked_paths.len(), 12);
         assert!(cfg.blocked_paths.contains(&".ssh".to_string()));
         assert!(cfg.blocked_paths.contains(&".aws".to_string()));
         assert!(cfg.blocked_paths.contains(&".gnupg".to_string()));
         assert!(cfg.blocked_paths.contains(&".config/gh".to_string()));
         assert!(cfg.blocked_paths.contains(&".env".to_string()));
+        assert!(cfg.blocked_paths.contains(&".envrc".to_string()));
         assert!(cfg.blocked_paths.contains(&"credentials".to_string()));
         assert!(cfg.blocked_paths.contains(&"private_key".to_string()));
+        assert!(cfg.blocked_paths.contains(&"id_rsa".to_string()));
+        assert!(cfg.blocked_paths.contains(&"id_ed25519".to_string()));
         assert!(cfg.allowed_paths.is_empty());
     }
 

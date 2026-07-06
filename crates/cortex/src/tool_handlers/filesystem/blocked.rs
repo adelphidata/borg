@@ -122,15 +122,44 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
         return false;
     }
 
-    // Sliding window match.
+    // The last entry component is filename-like; all preceding ones must match
+    // exactly. `split_last` is safe — emptiness was checked above.
+    let (entry_last, entry_head) = entry_components
+        .split_last()
+        .expect("entry_components checked non-empty");
+
+    // Sliding window match. Preceding components match exactly; the final
+    // (filename-like) component also matches a "family" suffix so a blocked
+    // `.env` / `private_key` / `credentials` entry covers `.env.local`,
+    // `private_key.pem`, `credentials.json` etc. A component-suffix rule
+    // (`entry` followed by a `.`) is used rather than a substring match so
+    // unrelated files like `.environment` or `foo.ssh.txt` are not over-blocked.
     for start in 0..=path_components.len() - entry_components.len() {
         let window = &path_components[start..start + entry_components.len()];
-        if window == entry_components.as_slice() {
+        let (win_last, win_head) = window.split_last().expect("window has entry len");
+        if win_head == entry_head && component_matches_family(win_last, entry_last) {
             return true;
         }
     }
 
     false
+}
+
+/// Whether a path component matches a blocked entry component, either exactly or
+/// as a dotted "family" member (`entry` immediately followed by `.` and any
+/// suffix). Family matching lets `.env` cover `.env.local`, `private_key` cover
+/// `private_key.pem`, and `credentials` cover `credentials.json`, without the
+/// false positives a substring match would produce (`.environment`, `.sshrc`).
+fn component_matches_family(component: &std::ffi::OsStr, entry: &std::ffi::OsStr) -> bool {
+    if component == entry {
+        return true;
+    }
+    match (component.to_str(), entry.to_str()) {
+        (Some(c), Some(e)) => c
+            .strip_prefix(e)
+            .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1),
+        _ => false,
+    }
 }
 
 /// Canonicalize a path that may not exist yet (the `apply_patch` add-file
@@ -468,11 +497,51 @@ mod tests {
     #[test]
     fn is_blocked_path_allowed_overrides_blocked() {
         let home = dirs::home_dir().unwrap();
-        let path = home.join(".env.example");
+        let path = home.join(".env.local");
         let blocked = vec![".env".to_string()];
-        // The path has ".env" as a substring of the component ".env.example"
-        // but component matching should only match exact components
-        assert!(!is_blocked_path(&path, &blocked, &[]));
+        // Family matching blocks `.env.local` by default (fail-secure)...
+        assert!(is_blocked_path(&path, &blocked, &[]));
+        // ...but an explicit allow entry for the file overrides the blocklist.
+        let allowed = vec![path.to_string_lossy().to_string()];
+        assert!(!is_blocked_path(&path, &blocked, &allowed));
+    }
+
+    #[test]
+    fn is_blocked_path_family_match_covers_dotted_variants() {
+        let home = dirs::home_dir().unwrap();
+        // `.env` covers `.env.*`; `private_key`/`credentials` cover `*.pem`/`*.json`.
+        let cases = [
+            (".env", ".env.production"),
+            (".env", ".env.local"),
+            ("private_key", "private_key.pem"),
+            ("credentials", "credentials.json"),
+        ];
+        for (entry, filename) in cases {
+            let path = home.join(filename);
+            assert!(
+                is_blocked_path(&path, &[entry.to_string()], &[]),
+                "{filename} should be blocked by family match on {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_path_family_match_does_not_overblock() {
+        let home = dirs::home_dir().unwrap();
+        // Names that merely share a prefix (no dot boundary) must stay allowed.
+        let cases = [
+            (".env", ".environment"),
+            (".env", ".envrc"), // covered by its own entry, NOT by `.env` family
+            (".ssh", ".sshrc"),
+            ("credentials", "credentialsstore"),
+        ];
+        for (entry, filename) in cases {
+            let path = home.join(filename);
+            assert!(
+                !is_blocked_path(&path, &[entry.to_string()], &[]),
+                "{filename} must NOT be blocked by family match on {entry}"
+            );
+        }
     }
 
     #[test]

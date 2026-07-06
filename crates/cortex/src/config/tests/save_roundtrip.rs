@@ -96,7 +96,7 @@ llm_logging = false
 
 [security]
 secret_detection = true
-blocked_paths = [".ssh", ".aws", ".gnupg", ".config/gh", ".env", "credentials", "private_key"]
+blocked_paths = [".ssh", ".aws", ".gnupg", ".config/gh", ".env", ".envrc", "credentials", "private_key", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
 
 [web]
 enabled = true
