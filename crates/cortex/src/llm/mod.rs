@@ -1702,7 +1702,7 @@ impl LlmClient {
             let use_fips = self.llm_config.bedrock_use_fips;
             async move {
                 let (region, credentials) =
-                    crate::llm::bedrock::load_region_and_credentials(region_hint.as_deref())
+                    crate::llm::bedrock::load_region_and_credentials(&client, region_hint.as_deref())
                         .await
                         .map_err(|e| anyhow::anyhow!("resolve AWS credentials for Bedrock: {e}"))?;
                 // Rebuild the URL against the *resolved* region/endpoint so the

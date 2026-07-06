@@ -1,9 +1,12 @@
-use anyhow::{Context, Result};
-use chrono::Utc;
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, Request};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use url::Url;
 
 use crate::llm::{FailoverReason, LlmError};
@@ -12,11 +15,40 @@ type HmacSha256 = Hmac<Sha256>;
 
 const SERVICE: &str = "bedrock";
 
+/// Default ECS/EKS container-credential metadata endpoint (link-local; the
+/// relative URI from `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` hangs off this).
+const ECS_CREDENTIALS_DEFAULT_BASE: &str = "http://169.254.170.2";
+/// Default EC2 Instance Metadata Service (IMDSv2) base.
+const IMDS_DEFAULT_BASE: &str = "http://169.254.169.254";
+/// TTL requested for the IMDSv2 session token (seconds, AWS max 21600).
+const IMDS_TOKEN_TTL_SECS: u32 = 21600;
+/// Per-request timeout for credential-metadata fetches. Short so hosts that are
+/// not on EC2/ECS fail fast to the next chain link instead of hanging.
+const CREDENTIAL_FETCH_TIMEOUT_SECS: u64 = 2;
+/// Refresh cached temporary credentials this many seconds before their real
+/// expiry so an in-flight signing can't race the deadline with a dead key.
+const CREDENTIAL_CACHE_SKEW_SECS: i64 = 60;
+
 #[derive(Clone, Debug)]
 pub(crate) struct AwsCredentials {
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
     pub(crate) session_token: Option<String>,
+    /// Expiry for temporary credentials (ECS/IMDS). `None` for long-lived
+    /// static credentials (env / `~/.aws`), which never need refreshing.
+    pub(crate) expires_at: Option<DateTime<Utc>>,
+}
+
+impl AwsCredentials {
+    /// Whether these credentials are safe to reuse from cache — static
+    /// credentials always are; temporary ones only until the skew window
+    /// before their expiry.
+    fn is_fresh(&self) -> bool {
+        match self.expires_at {
+            None => true,
+            Some(expiry) => Utc::now() + chrono::Duration::seconds(CREDENTIAL_CACHE_SKEW_SECS) < expiry,
+        }
+    }
 }
 
 /// Compose the full Converse / ConverseStream URL for a model against a
@@ -219,6 +251,7 @@ pub(crate) fn resolve_region(explicit_region: Option<&str>) -> Option<String> {
 }
 
 pub(crate) async fn load_region_and_credentials(
+    client: &Client,
     explicit_region: Option<&str>,
 ) -> Result<(String, AwsCredentials)> {
     let profile = std::env::var("AWS_PROFILE")
@@ -234,11 +267,293 @@ pub(crate) async fn load_region_and_credentials(
     let region = resolve_region(explicit_region)
         .ok_or_else(|| anyhow::anyhow!("AWS region chain did not resolve a region"))?;
 
-    let credentials = resolve_env_credentials()
-        .or_else(|| resolve_profile_credentials(&profile))
-        .context("AWS credential chain did not resolve credentials from env or ~/.aws profiles")?;
+    // Static sources first — no network, no caching, highest precedence
+    // (mirrors the AWS SDK default provider chain).
+    if let Some(credentials) =
+        resolve_env_credentials().or_else(|| resolve_profile_credentials(&profile))
+    {
+        return Ok((region, credentials));
+    }
 
-    Ok((region, credentials))
+    // Temporary sources (ECS container metadata, then EC2 IMDS). These return
+    // short-lived credentials with an expiry, so a fresh cached copy is reused
+    // across requests until the skew window before it lapses.
+    if let Some(credentials) = cached_dynamic_credentials() {
+        return Ok((region, credentials));
+    }
+    if let Some(credentials) = resolve_container_credentials(client).await? {
+        return Ok((region, store_dynamic_credentials(credentials)));
+    }
+    if let Some(credentials) = resolve_imds_credentials(client).await? {
+        return Ok((region, store_dynamic_credentials(credentials)));
+    }
+
+    bail!(
+        "AWS credential chain did not resolve credentials from env, ~/.aws profiles, \
+         ECS container metadata, or EC2 IMDS"
+    )
+}
+
+/// Cached temporary credentials from the ECS/IMDS providers. Keyed by nothing —
+/// a process signs for a single AWS identity, so one slot suffices; the entry is
+/// discarded once [`AwsCredentials::is_fresh`] turns false.
+static DYNAMIC_CREDENTIAL_CACHE: OnceLock<Mutex<Option<AwsCredentials>>> = OnceLock::new();
+
+fn dynamic_credential_cache() -> &'static Mutex<Option<AwsCredentials>> {
+    DYNAMIC_CREDENTIAL_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_dynamic_credentials() -> Option<AwsCredentials> {
+    let guard = dynamic_credential_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clone().filter(AwsCredentials::is_fresh)
+}
+
+fn store_dynamic_credentials(credentials: AwsCredentials) -> AwsCredentials {
+    let mut guard = dynamic_credential_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(credentials.clone());
+    credentials
+}
+
+#[cfg(test)]
+pub(crate) fn clear_dynamic_credential_cache_for_tests() {
+    let mut guard = dynamic_credential_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+/// AWS container/IMDS credential JSON payload. Both the ECS credential relative
+/// URI and the IMDS `iam/security-credentials/<role>` document share this shape
+/// (extra fields like `Code`/`RoleArn` are ignored).
+#[derive(Deserialize)]
+struct AwsJsonCredentials {
+    #[serde(rename = "AccessKeyId")]
+    access_key_id: String,
+    #[serde(rename = "SecretAccessKey")]
+    secret_access_key: String,
+    #[serde(rename = "Token", default)]
+    token: Option<String>,
+    #[serde(rename = "Expiration", default)]
+    expiration: Option<String>,
+}
+
+async fn parse_aws_json_credentials(resp: reqwest::Response, label: &str) -> Result<AwsCredentials> {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read {label} response body"))?;
+    if !status.is_success() {
+        bail!("{label} request returned HTTP {status}: {}", truncate(&body));
+    }
+    let parsed: AwsJsonCredentials =
+        serde_json::from_str(&body).with_context(|| format!("parse {label} response"))?;
+    if parsed.access_key_id.trim().is_empty() || parsed.secret_access_key.trim().is_empty() {
+        bail!("{label} response missing AccessKeyId/SecretAccessKey");
+    }
+    let expires_at = parsed
+        .expiration
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            DateTime::parse_from_rfc3339(s.trim())
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| format!("parse {label} Expiration timestamp {s:?}"))
+        })
+        .transpose()?;
+    Ok(AwsCredentials {
+        access_key_id: parsed.access_key_id,
+        secret_access_key: parsed.secret_access_key,
+        session_token: parsed.token.filter(|t| !t.trim().is_empty()),
+        expires_at,
+    })
+}
+
+/// Resolve ECS/EKS container credentials when `AWS_CONTAINER_CREDENTIALS_*` is
+/// configured. Returns `Ok(None)` when the container provider is not configured
+/// (so the chain falls through to IMDS); a configured-but-failing endpoint is a
+/// hard error, matching the AWS SDK.
+async fn resolve_container_credentials(client: &Client) -> Result<Option<AwsCredentials>> {
+    let url = if let Some(full) = env_nonempty("AWS_CONTAINER_CREDENTIALS_FULL_URI") {
+        validate_container_full_uri(&full)?;
+        full
+    } else if let Some(relative) = env_nonempty("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+        let base = env_nonempty("BORG_AWS_ECS_CREDENTIALS_BASE")
+            .unwrap_or_else(|| ECS_CREDENTIALS_DEFAULT_BASE.to_string());
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        )
+    } else {
+        return Ok(None);
+    };
+
+    let mut request = client
+        .get(&url)
+        .timeout(Duration::from_secs(CREDENTIAL_FETCH_TIMEOUT_SECS));
+    if let Some(auth) = container_auth_token()? {
+        request = request.header(reqwest::header::AUTHORIZATION, auth);
+    }
+    let resp = request
+        .send()
+        .await
+        .with_context(|| format!("ECS container credential request to {url} failed"))?;
+    parse_aws_json_credentials(resp, "ECS container credentials")
+        .await
+        .map(Some)
+}
+
+/// Validate an `AWS_CONTAINER_CREDENTIALS_FULL_URI`: https to any host, or http
+/// only to loopback/link-local (ECS agent, EKS pod identity). Refuses cleartext
+/// to arbitrary hosts so a poisoned env var cannot exfiltrate the auth token.
+fn validate_container_full_uri(raw: &str) -> Result<()> {
+    let url = Url::parse(raw)
+        .with_context(|| format!("parse AWS_CONTAINER_CREDENTIALS_FULL_URI {raw:?}"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = url
+                .host_str()
+                .context("AWS_CONTAINER_CREDENTIALS_FULL_URI missing host")?;
+            let loopback_or_link_local = host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback() || is_link_local_ip(&ip))
+                .unwrap_or(false)
+                || host.eq_ignore_ascii_case("localhost");
+            if loopback_or_link_local {
+                Ok(())
+            } else {
+                bail!(
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI over http must target loopback or \
+                     link-local (got host {host}); refusing to send the credential token in \
+                     cleartext to an arbitrary host"
+                )
+            }
+        }
+        other => bail!("AWS_CONTAINER_CREDENTIALS_FULL_URI must be http or https, got {other}://"),
+    }
+}
+
+fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+fn container_auth_token() -> Result<Option<String>> {
+    if let Some(file) = env_nonempty("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+        let token = std::fs::read_to_string(&file)
+            .with_context(|| format!("read AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE {file}"))?;
+        return Ok(Some(token.trim().to_string()));
+    }
+    Ok(env_nonempty("AWS_CONTAINER_AUTHORIZATION_TOKEN"))
+}
+
+/// Resolve EC2 instance-role credentials via IMDSv2 (token-guarded). Returns
+/// `Ok(None)` when no session token can be obtained (host is not an EC2 instance
+/// or IMDS is disabled) so the chain ends with a clear "no credentials" error
+/// rather than a confusing metadata failure.
+async fn resolve_imds_credentials(client: &Client) -> Result<Option<AwsCredentials>> {
+    let base = env_nonempty("BORG_AWS_IMDS_ENDPOINT")
+        .unwrap_or_else(|| IMDS_DEFAULT_BASE.to_string());
+    let base = base.trim_end_matches('/');
+
+    let token = match client
+        .put(format!("{base}/latest/api/token"))
+        .header(
+            "x-aws-ec2-metadata-token-ttl-seconds",
+            IMDS_TOKEN_TTL_SECS.to_string(),
+        )
+        .timeout(Duration::from_secs(CREDENTIAL_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .text()
+            .await
+            .context("read IMDSv2 session token")?
+            .trim()
+            .to_string(),
+        Ok(resp) => {
+            tracing::warn!(
+                status = %resp.status(),
+                "IMDSv2 token endpoint returned non-success; skipping IMDS credentials"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "IMDSv2 token request failed; host is likely not an EC2 instance"
+            );
+            return Ok(None);
+        }
+    };
+    if token.is_empty() {
+        return Ok(None);
+    }
+
+    let role_resp = client
+        .get(format!("{base}/latest/meta-data/iam/security-credentials/"))
+        .header("x-aws-ec2-metadata-token", &token)
+        .timeout(Duration::from_secs(CREDENTIAL_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .context("IMDS instance-role lookup failed")?;
+    let role_status = role_resp.status();
+    let role_body = role_resp
+        .text()
+        .await
+        .context("read IMDS instance-role list")?;
+    if !role_status.is_success() {
+        bail!(
+            "IMDS instance-role lookup returned HTTP {role_status}: {}",
+            truncate(&role_body)
+        );
+    }
+    let role = role_body
+        .lines()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .context("IMDS returned no IAM role attached to this instance")?;
+
+    let resp = client
+        .get(format!(
+            "{base}/latest/meta-data/iam/security-credentials/{role}"
+        ))
+        .header("x-aws-ec2-metadata-token", &token)
+        .timeout(Duration::from_secs(CREDENTIAL_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .context("IMDS credential request failed")?;
+    parse_aws_json_credentials(resp, "EC2 IMDS credentials")
+        .await
+        .map(Some)
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn truncate(s: &str) -> String {
+    const MAX: usize = 512;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &s[..end])
 }
 
 pub(crate) fn signed_request(
@@ -434,6 +749,7 @@ fn resolve_env_credentials() -> Option<AwsCredentials> {
         access_key_id,
         secret_access_key,
         session_token,
+        expires_at: None,
     })
 }
 
@@ -444,6 +760,7 @@ fn resolve_profile_credentials(profile: &str) -> Option<AwsCredentials> {
         access_key_id: section.get("aws_access_key_id")?.clone(),
         secret_access_key: section.get("aws_secret_access_key")?.clone(),
         session_token: section.get("aws_session_token").cloned(),
+        expires_at: None,
     })
 }
 
@@ -505,6 +822,8 @@ pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::fs;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
         key: &'static str,
@@ -833,6 +1152,7 @@ mod tests {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: Some("session-token-xyz".to_string()),
+            expires_at: None,
         };
         let client = Client::new();
         let url = url_for_model(
@@ -923,5 +1243,266 @@ mod tests {
 
         let region = resolve_region(None).expect("region from shared config");
         assert_eq!(region, "eu-central-1");
+    }
+
+    fn creds_json(expiration: &str) -> serde_json::Value {
+        serde_json::json!({
+            "AccessKeyId": "ASIADYNAMIC",
+            "SecretAccessKey": "dynamic-secret",
+            "Token": "dynamic-session-token",
+            "Expiration": expiration,
+            "Code": "Success",
+        })
+    }
+
+    #[test]
+    fn is_fresh_reflects_expiry_with_skew() {
+        let mut creds = AwsCredentials {
+            access_key_id: "a".into(),
+            secret_access_key: "b".into(),
+            session_token: None,
+            expires_at: None,
+        };
+        // Static creds (no expiry) are always reusable.
+        assert!(creds.is_fresh());
+        // Expiry comfortably in the future → fresh.
+        creds.expires_at = Some(Utc::now() + chrono::Duration::seconds(3600));
+        assert!(creds.is_fresh());
+        // Already past → stale.
+        creds.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(!creds.is_fresh());
+        // Inside the refresh-skew window → treated as stale so we refresh early.
+        creds.expires_at =
+            Some(Utc::now() + chrono::Duration::seconds(CREDENTIAL_CACHE_SKEW_SECS - 5));
+        assert!(!creds.is_fresh());
+    }
+
+    #[test]
+    fn dynamic_credential_cache_round_trips_and_evicts_stale() {
+        let _lock = super::env_test_lock();
+        clear_dynamic_credential_cache_for_tests();
+        assert!(cached_dynamic_credentials().is_none());
+
+        let fresh = AwsCredentials {
+            access_key_id: "ASIAFRESH".into(),
+            secret_access_key: "s".into(),
+            session_token: Some("t".into()),
+            expires_at: Some(Utc::now() + chrono::Duration::seconds(3600)),
+        };
+        store_dynamic_credentials(fresh);
+        assert_eq!(
+            cached_dynamic_credentials().expect("fresh cached").access_key_id,
+            "ASIAFRESH"
+        );
+
+        let stale = AwsCredentials {
+            access_key_id: "ASIASTALE".into(),
+            secret_access_key: "s".into(),
+            session_token: None,
+            expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+        };
+        store_dynamic_credentials(stale);
+        assert!(
+            cached_dynamic_credentials().is_none(),
+            "stale credentials must not be served from cache"
+        );
+        clear_dynamic_credential_cache_for_tests();
+    }
+
+    #[test]
+    fn full_uri_over_http_rejected_for_public_host() {
+        let err = validate_container_full_uri("http://169.254.169.254/creds")
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            validate_container_full_uri("http://example.com/creds").is_err(),
+            "cleartext to arbitrary host must be refused"
+        );
+        // Link-local (ECS agent) and loopback over http are allowed.
+        assert!(validate_container_full_uri("http://127.0.0.1:9000/creds").is_ok());
+        assert!(
+            err.is_none(),
+            "link-local http endpoint should be accepted: {err:?}"
+        );
+        // https to any host is fine.
+        assert!(validate_container_full_uri("https://creds.example.com/x").is_ok());
+        // A non-http(s) scheme is refused.
+        assert!(validate_container_full_uri("file:///etc/passwd").is_err());
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn container_credentials_from_relative_uri_parse_and_expire() {
+        let _lock = super::env_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/credentials/abc"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(creds_json("2999-01-01T00:00:00Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _full = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_FULL_URI");
+        let _rel = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/abc");
+        let _base = EnvGuard::set("BORG_AWS_ECS_CREDENTIALS_BASE", &server.uri());
+        let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let _auth = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN");
+
+        let creds = resolve_container_credentials(&Client::new())
+            .await
+            .expect("container request ok")
+            .expect("credentials present");
+        assert_eq!(creds.access_key_id, "ASIADYNAMIC");
+        assert_eq!(creds.secret_access_key, "dynamic-secret");
+        assert_eq!(creds.session_token.as_deref(), Some("dynamic-session-token"));
+        assert_eq!(
+            creds.expires_at,
+            Some(
+                DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn container_credentials_full_uri_sends_auth_token() {
+        let _lock = super::env_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/creds"))
+            .and(header("authorization", "Bearer ecs-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(creds_json("2999-01-01T00:00:00Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _rel = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        let _full = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            &format!("{}/creds", server.uri()),
+        );
+        let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let _auth = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", "Bearer ecs-token");
+
+        let creds = resolve_container_credentials(&Client::new())
+            .await
+            .expect("container request ok")
+            .expect("credentials present");
+        assert_eq!(creds.access_key_id, "ASIADYNAMIC");
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn container_credentials_none_when_unconfigured() {
+        let _lock = super::env_test_lock();
+        let _full = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_FULL_URI");
+        let _rel = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        let got = resolve_container_credentials(&Client::new())
+            .await
+            .expect("no error when unconfigured");
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn imds_v2_happy_path_signs_token_and_reads_role() {
+        let _lock = super::env_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/latest/api/token"))
+            .and(header("x-aws-ec2-metadata-token-ttl-seconds", "21600"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("imds-token-xyz"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/latest/meta-data/iam/security-credentials/"))
+            .and(header("x-aws-ec2-metadata-token", "imds-token-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("borg-instance-role\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/latest/meta-data/iam/security-credentials/borg-instance-role",
+            ))
+            .and(header("x-aws-ec2-metadata-token", "imds-token-xyz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(creds_json("2999-01-01T00:00:00Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _endpoint = EnvGuard::set("BORG_AWS_IMDS_ENDPOINT", &server.uri());
+        let creds = resolve_imds_credentials(&Client::new())
+            .await
+            .expect("imds request ok")
+            .expect("credentials present");
+        assert_eq!(creds.access_key_id, "ASIADYNAMIC");
+        assert_eq!(creds.session_token.as_deref(), Some("dynamic-session-token"));
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn imds_returns_none_when_token_forbidden() {
+        let _lock = super::env_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/latest/api/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let _endpoint = EnvGuard::set("BORG_AWS_IMDS_ENDPOINT", &server.uri());
+        let got = resolve_imds_credentials(&Client::new())
+            .await
+            .expect("no hard error when IMDS unavailable");
+        assert!(
+            got.is_none(),
+            "a host without IMDSv2 must fall through, not error"
+        );
+    }
+
+    #[tokio::test]
+    // Holds `env_test_lock` across `.await` on purpose: the resolver reads
+    // AWS_* env vars, so the vars must stay put for the whole request.
+    #[allow(clippy::await_holding_lock)]
+    async fn load_credentials_prefers_env_over_dynamic_metadata() {
+        let _lock = super::env_test_lock();
+        clear_dynamic_credential_cache_for_tests();
+        let _region = EnvGuard::set("AWS_REGION", "us-gov-west-1");
+        let _access = EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIASTATIC");
+        let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "static-secret");
+        let _sess = EnvGuard::remove("AWS_SESSION_TOKEN");
+        // A metadata endpoint is configured but must never be consulted.
+        let _full = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://127.0.0.1:1/creds",
+        );
+
+        let (region, creds) = load_region_and_credentials(&Client::new(), None)
+            .await
+            .expect("static env credentials resolve");
+        assert_eq!(region, "us-gov-west-1");
+        assert_eq!(creds.access_key_id, "AKIASTATIC");
+        assert_eq!(creds.expires_at, None);
+        clear_dynamic_credential_cache_for_tests();
     }
 }
