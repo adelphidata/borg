@@ -83,9 +83,9 @@ pub(crate) enum ComputerUseAction {
     Key,
     /// Replace an AX-element's `AXValue` directly.
     SetValue,
-    /// Bring an app to the foreground or route input without raising. When
-    /// `raise_window` is `false`, focus is preserved — see the no-foreground
-    /// contract in `docs/computer-use.md`.
+    /// Select an app's window for subsequent driving — resolves its
+    /// pid/window_id without raising it. The driver never steals focus (there
+    /// is no activate tool), so this is a pure selector, not an activation.
     FocusApp,
 }
 
@@ -131,9 +131,10 @@ pub(crate) enum CaptureMode {
 pub(crate) struct ComputerUseArgs {
     pub action: ComputerUseAction,
 
-    /// Capture only. Optional `pid` to capture a specific app's frontmost
-    /// window (delegates to cua-driver's window-targeted capture). When
-    /// `None`, captures the full screen.
+    /// Target process id. Required by every mutating action (the driver posts
+    /// events to a pid). For `capture` som/ax it is auto-resolved when omitted
+    /// (via `app`/frontmost through `list_windows`). Optional filter for
+    /// `list_windows`.
     #[serde(default)]
     pub pid: Option<i64>,
 
@@ -199,13 +200,9 @@ pub(crate) struct ComputerUseArgs {
     /// denylist.
     #[serde(default, alias = "app")]
     pub target: Option<String>,
-    /// Retained for wire back-compat; `focus_app` is unsupported by
-    /// cua-driver 0.1.9, so this is no longer read on any active path.
-    #[serde(default)]
-    pub raise_window: Option<bool>,
 
-    /// `capture` only — selects between `vision` (default, PNG inline),
-    /// `som` (image + numbered overlay), and `ax` (text-only). Optional
+    /// `capture` only — selects between `som` (default: image + numbered
+    /// overlay), `vision` (plain PNG inline), and `ax` (text-only). Optional
     /// everywhere else.
     #[serde(default)]
     pub mode: Option<CaptureMode>,
@@ -722,7 +719,11 @@ fn check_arg_coherence(args: &ComputerUseArgs) -> Option<String> {
     // screen change worth verifying.
     if args.capture_after.unwrap_or(false) {
         match args.action {
-            ComputerUseAction::Capture | ComputerUseAction::ListApps | ComputerUseAction::Wait => {
+            ComputerUseAction::Capture
+            | ComputerUseAction::ListApps
+            | ComputerUseAction::ListWindows
+            | ComputerUseAction::Wait
+            | ComputerUseAction::FocusApp => {
                 return Some(format!(
                     "capture_after is not valid for action '{:?}' — only mutating actions take a follow-up capture",
                     args.action
@@ -824,7 +825,6 @@ async fn capture_internal(args: &ComputerUseArgs, driver: &dyn Driver) -> Result
         element_index: None,
         value: None,
         target: None,
-        raise_window: None,
         mode: Some(CaptureMode::Vision),
         capture_after: None,
     };
@@ -1281,6 +1281,23 @@ const DENIED_FOCUS_TARGETS: &[&str] = &[
     "Security & Privacy",
 ];
 
+/// If `name` names or contains a macOS security surface we must never drive,
+/// returns which one. Shared by the pre-dispatch input screen and the
+/// post-resolution window re-check in `focus_app`: the substring resolver in
+/// `pick_window` can land on a denied surface the raw input didn't literally
+/// spell out (e.g. `app="settings"` resolves the "System Settings" window),
+/// so the input check alone is not sufficient.
+fn denied_focus_surface(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    DENIED_FOCUS_TARGETS
+        .iter()
+        .copied()
+        .find(|denied| lower.contains(&denied.to_ascii_lowercase()))
+}
+
 /// Returns `Some(reason)` if the action is denied. `None` means proceed.
 fn check_denylist(args: &ComputerUseArgs) -> Option<String> {
     match args.action {
@@ -1324,19 +1341,16 @@ fn check_denylist(args: &ComputerUseArgs) -> Option<String> {
             None
         }
         ComputerUseAction::FocusApp => {
+            // Screen the raw input before resolution — fail fast when the model
+            // literally names a denied surface. `focus_app` additionally
+            // re-checks the *resolved* window (see `denied_focus_surface`),
+            // which is the authoritative guard against substring bypass.
             let target = args.target.as_deref().unwrap_or("");
-            for denied in DENIED_FOCUS_TARGETS {
-                if target.eq_ignore_ascii_case(denied)
-                    || target
-                        .to_ascii_lowercase()
-                        .contains(&denied.to_ascii_lowercase())
-                {
-                    return Some(format!(
-                        "computer_use denied focus_app target '{target}': matches '{denied}', a macOS security surface that must not be driven."
-                    ));
-                }
-            }
-            None
+            denied_focus_surface(target).map(|denied| {
+                format!(
+                    "computer_use denied focus_app target '{target}': matches '{denied}', a macOS security surface that must not be driven."
+                )
+            })
         }
         _ => None,
     }
@@ -1652,11 +1666,17 @@ async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutpu
     let mut params = json!({"pid": pid, "direction": direction, "amount": amount});
     let summary;
     if let Some(idx) = args.element_index {
-        // Focuses the element before the keystrokes fire; requires window_id.
+        // Focuses the element before the keystrokes fire. The element cache is
+        // keyed by (pid, window_id), so window_id is required to resolve the
+        // index against the right window — same contract as `click`. Sending
+        // an index without it would silently target the wrong window.
+        let window_id = args.window_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.scroll with `element_index` requires `window_id` (the AX cache key, from `list_windows`)"
+            )
+        })?;
         params["element_index"] = json!(idx);
-        if let Some(window_id) = args.window_id {
-            params["window_id"] = json!(window_id);
-        }
+        params["window_id"] = json!(window_id);
         summary = format!("scroll element [{idx}] {direction} x{amount}");
     } else {
         summary = format!("scroll {direction} x{amount}");
@@ -1677,12 +1697,17 @@ async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     })?;
     let mut params = json!({"pid": pid, "text": text});
     if let Some(idx) = args.element_index {
-        // Focus the element before typing; requires window_id to resolve the
-        // (pid, window_id)-keyed AX cache.
+        // Focus the element before typing. The AX cache is keyed by
+        // (pid, window_id), so window_id is required to resolve the index
+        // against the right window — same contract as `click`. Sending an
+        // index without it would silently type into the wrong window.
+        let window_id = args.window_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.type with `element_index` requires `window_id` (the AX cache key, from `list_windows`)"
+            )
+        })?;
         params["element_index"] = json!(idx);
-        if let Some(window_id) = args.window_id {
-            params["window_id"] = json!(window_id);
-        }
+        params["window_id"] = json!(window_id);
     }
     let resp = driver.call("type_text", params).await?;
     Ok(merge_driver_text(
@@ -1753,9 +1778,8 @@ async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     ))
 }
 
-/// `focus_app` is a window-selector, matching the reference: the cua-driver
-/// is background-automation, so "focus" doesn't raise a window (there is no
-/// activate tool, and `raise_window` is intentionally ignored — never
+/// `focus_app` is a window-selector: the cua-driver is background-automation,
+/// so "focus" never raises a window (there is no activate tool — never
 /// stealing the user's focus is the whole point). It resolves the named app's
 /// frontmost on-screen window via `list_windows` and reports its `pid` +
 /// `window_id` so the model can drive that process on subsequent calls (borg
@@ -1773,6 +1797,16 @@ async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
         })?;
     let entries = list_window_entries(driver).await?;
     let chosen = pick_window(&entries, Some(app), "focus_app")?;
+    // Authoritative denylist guard: the input passed `check_denylist`, but the
+    // substring resolver may still have landed on a denied surface (e.g.
+    // `app="settings"` → the "System Settings" window). Re-check the resolved
+    // app name and refuse before handing its pid/window_id back to the model.
+    if let Some(denied) = denied_focus_surface(&chosen.app) {
+        return Ok(ToolOutput::Text(format!(
+            "Error: computer_use denied focus_app: `app={app}` resolved to '{}', which matches '{denied}', a macOS security surface that must not be driven.",
+            chosen.app
+        )));
+    }
     Ok(ToolOutput::Text(format!(
         "Targeted {} (pid {}, window_id {}). The driver drives it in the background — no window \
          raise. Pass this pid/window_id to click/type/etc.",
@@ -2297,7 +2331,6 @@ mod tests {
             element_index: None,
             value: None,
             target: None,
-            raise_window: None,
             mode: None,
             capture_after: None,
         }
@@ -2531,6 +2564,42 @@ mod tests {
             );
             assert!(driver.calls.lock().unwrap().is_empty());
         }
+    }
+
+    /// Denylist bypass regression: a short `app` substring that does NOT
+    /// literally name a denied surface passes the pre-dispatch input screen,
+    /// but `pick_window` resolves it to the denied "System Settings" window.
+    /// The post-resolution re-check must catch that and refuse to hand back
+    /// its pid/window_id.
+    #[tokio::test]
+    async fn focus_app_denies_resolved_security_surface_via_substring() {
+        let listing = DriverResponse {
+            content: vec![DriverContent::Text(
+                "✅ Found 2 window(s)\n\
+                 - Code (pid 2446) \"SKILL.md\" [window_id: 1923]\n\
+                 - System Settings (pid 700) \"Privacy\" [window_id: 88]"
+                    .into(),
+            )],
+        };
+        let driver = FakeDriver::new(vec![listing]);
+        let mut args = args_with_action(ComputerUseAction::FocusApp);
+        // "settings" is NOT a substring-superset of "System Settings", so it
+        // slips the input denylist — but it resolves the denied window.
+        args.target = Some("settings".into());
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(
+            text.contains("denied focus_app") && text.contains("System Settings"),
+            "resolved denied surface must be refused: {text}"
+        );
+        // The resolved pid/window_id must NOT be leaked to the model.
+        assert!(
+            !text.contains("pid 700"),
+            "must not surface denied ids: {text}"
+        );
     }
 
     #[tokio::test]
@@ -3346,6 +3415,46 @@ mod tests {
         assert!(params.get("x").is_none());
     }
 
+    /// The element cache is keyed by (pid, window_id). An element-addressed
+    /// scroll without `window_id` would resolve the index against the wrong
+    /// window — same silent-mis-target hazard `click` guards. Fail before the
+    /// driver, matching `click`'s contract.
+    #[tokio::test]
+    async fn scroll_by_element_index_requires_window_id() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Scroll);
+        args.pid = Some(1234);
+        args.element_index = Some(2);
+        args.delta_y = Some(-50);
+        let err = handle_with_driver(&args, &driver)
+            .await
+            .expect_err("scroll element_index without window_id must error");
+        assert!(
+            err.to_string().contains("requires `window_id`"),
+            "got: {err}"
+        );
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    /// Same guard for `type`: an element-addressed type without `window_id`
+    /// could type into the wrong window. Fail before the driver.
+    #[tokio::test]
+    async fn type_by_element_index_requires_window_id() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.pid = Some(1234);
+        args.text = Some("hi".into());
+        args.element_index = Some(3);
+        let err = handle_with_driver(&args, &driver)
+            .await
+            .expect_err("type element_index without window_id must error");
+        assert!(
+            err.to_string().contains("requires `window_id`"),
+            "got: {err}"
+        );
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
     // ── capture_after ──────────────────────────────────────────────
 
     /// `capture_after: true` on a successful click must produce two driver
@@ -3413,6 +3522,36 @@ mod tests {
             other => panic!("expected text error, got {other:?}"),
         }
         assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    /// `capture_after` is only meaningful for mutating actions. The read-only
+    /// / selector actions (`list_windows`, `focus_app`, plus the already-tested
+    /// `capture`/`list_apps`/`wait`) must reject it pre-driver rather than
+    /// silently ignore it.
+    #[tokio::test]
+    async fn capture_after_rejected_for_readonly_actions() {
+        for action in [
+            ComputerUseAction::ListWindows,
+            ComputerUseAction::FocusApp,
+            ComputerUseAction::ListApps,
+            ComputerUseAction::Wait,
+        ] {
+            let driver = FakeDriver::new(vec![]);
+            let mut args = args_with_action(action.clone());
+            args.capture_after = Some(true);
+            let out = handle_with_driver(&args, &driver).await.unwrap();
+            match out {
+                ToolOutput::Text(t) => assert!(
+                    t.contains("capture_after is not valid"),
+                    "{action:?} should reject capture_after: {t}"
+                ),
+                other => panic!("expected text error for {action:?}, got {other:?}"),
+            }
+            assert!(
+                driver.calls.lock().unwrap().is_empty(),
+                "{action:?} must not reach the driver"
+            );
+        }
     }
 
     /// capture_after fail-safe: when the follow-up capture itself errors
@@ -3596,10 +3735,13 @@ mod tests {
 printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
 cat > /dev/null"#,
         );
-        // 1s (not 200ms): the budget is per-phase, and under parallel test
-        // load the shell spawn alone can eat 200ms — the init reply must
-        // land inside the first phase for this test to reach tools/call.
-        let driver = CuaDriver::new(binary, Duration::from_secs(1), false);
+        // 3s per-phase budget: this test exercises the *tools/call* timeout,
+        // so the init handshake must reliably succeed first. Under a full
+        // parallel `--workspace` run the shell spawn + first read can spike
+        // well past 1s, which used to time out in `initialize` instead and
+        // flake the phase-name assertion. Generous headroom keeps init inside
+        // phase one; the tools/call phase then times out deterministically.
+        let driver = CuaDriver::new(binary, Duration::from_secs(3), false);
         let err = driver.call("screenshot", json!({})).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("timed out"), "got: {msg}");
@@ -3729,8 +3871,14 @@ read line
 printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}\n'
 sleep 60"#,
         );
-        // 1s per-phase budget also caps the wind-down (min of the two).
-        let driver = CuaDriver::new(binary, Duration::from_secs(1), false);
+        // 3s per-phase budget (also caps the wind-down, min of the two). Both
+        // phases are answered promptly, so this budget only bounds the
+        // post-reply wind-down kill — but it must also comfortably cover the
+        // spawn + handshake under a parallel `--workspace` run, where a 1s
+        // budget occasionally timed the handshake out and flaked the
+        // `unwrap()`. Headroom keeps the happy path green; the < 10s assertion
+        // still proves the lingering child is killed, not awaited.
+        let driver = CuaDriver::new(binary, Duration::from_secs(3), false);
         let start = std::time::Instant::now();
         let resp = driver.call("list_apps", json!({})).await.unwrap();
         assert!(
