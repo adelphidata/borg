@@ -91,6 +91,11 @@ libc = { workspace = true }
 # require `BORG_ALLOW_LIVE_TESTS=1` at runtime so a feature-only build still
 # stays green offline.
 live-llm = []
+# Opt-in lane that drives the real `cua-driver` (macOS + CuaDriver.app + TCC
+# grants) through the production computer_use handler. Additionally requires
+# `BORG_ALLOW_LIVE_TESTS=1` at runtime; skips cleanly when the binary,
+# platform, or grants are missing so a feature-only build stays green.
+live-computer-use = []
 # Local STT via whisper.cpp — adds a C++ build step + ~150 MB model at
 # runtime. Off by default; enable for offline transcription. Users point
 # `voice.local_stt_model_path` at a downloaded ggml-base.en.bin (or

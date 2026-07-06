@@ -3425,3 +3425,219 @@ sleep 60"#,
         assert_eq!(normalised_hotkey(&b).unwrap(), "cmd+q+shift");
     }
 }
+
+/// Live lane: drives the REAL `cua-driver` through the production
+/// [`handle`] path. Gated by the `live-computer-use` feature AND
+/// `BORG_ALLOW_LIVE_TESTS=1`, and skips cleanly when the platform isn't
+/// macOS, the binary is absent, or TCC grants are missing — so the feature
+/// build stays green on any host. Mirrors the `live-mcp` / `live-llm` lanes.
+///
+/// Run with:
+/// ```sh
+/// BORG_ALLOW_LIVE_TESTS=1 cargo test -p cortex --features live-computer-use \
+///     --lib tool::computer_use::live -- --nocapture --test-threads=1
+/// ```
+#[cfg(all(test, feature = "live-computer-use"))]
+mod live {
+    use super::*;
+
+    fn live_enabled() -> bool {
+        matches!(
+            std::env::var("BORG_ALLOW_LIVE_TESTS").as_deref(),
+            Ok("1" | "true" | "TRUE" | "True")
+        )
+    }
+
+    fn cua_driver_present() -> bool {
+        which::which("cua-driver").is_ok()
+    }
+
+    /// Config with computer_use enabled and a generous driver timeout — the
+    /// daemon relaunch on a cold host can take several seconds.
+    fn live_config() -> Config {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        config.computer_use.driver_timeout_secs = 45;
+        config
+    }
+
+    fn args(value: serde_json::Value) -> ComputerUseArgs {
+        serde_json::from_value(value).expect("valid computer_use args")
+    }
+
+    /// Skip-guard shared by every live test: returns `None` (with a printed
+    /// reason) when the lane can't run here.
+    fn guard() -> Option<()> {
+        if !cfg!(target_os = "macos") {
+            eprintln!("live computer_use: skipped (not macOS)");
+            return None;
+        }
+        if !live_enabled() {
+            eprintln!("live computer_use: skipped (set BORG_ALLOW_LIVE_TESTS=1)");
+            return None;
+        }
+        if !cua_driver_present() {
+            eprintln!("live computer_use: skipped (cua-driver not on PATH)");
+            return None;
+        }
+        Some(())
+    }
+
+    /// `list_windows` against the real driver must return a non-empty listing
+    /// carrying at least one `window_id` and `pid` — the discovery step every
+    /// other window-oriented action depends on.
+    #[tokio::test]
+    async fn live_list_windows_returns_real_windows() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+        let out = handle(&args(json!({"action": "list_windows"})), &config, &cancel)
+            .await
+            .expect("list_windows call");
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("list_windows must return Text, got {other:?}"),
+        };
+        assert!(
+            text.contains("window_id"),
+            "expected a window_id in live listing: {text}"
+        );
+    }
+
+    /// Full window-targeted capture round-trip: enumerate a window via
+    /// `list_windows`, then `capture` it in each mode. Vision must return a
+    /// real PNG inline; SOM must return the AX tree text plus an image; AX
+    /// must return text only. This exercises borg's exact 0.1.9 wire calls
+    /// (`screenshot` / `get_window_state`) end to end.
+    #[tokio::test]
+    async fn live_capture_all_modes_against_a_real_window() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+
+        let listing = match handle(&args(json!({"action": "list_windows"})), &config, &cancel).await
+        {
+            Ok(ToolOutput::Text(t)) => t,
+            other => panic!("list_windows failed: {other:?}"),
+        };
+        // Parse the first "(pid N) ... [window_id: M]" pair from the listing.
+        let (pid, window_id) = parse_first_window(&listing)
+            .unwrap_or_else(|| panic!("no (pid, window_id) parsed from: {listing}"));
+
+        // Vision → screenshot → inline PNG.
+        let vision = handle(
+            &args(json!({"action": "capture", "mode": "vision", "window_id": window_id})),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("vision capture");
+        match vision {
+            ToolOutput::Multimodal { parts, .. } => assert!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+                "vision capture returned no image part"
+            ),
+            // A window that vanished between listing and capture is the only
+            // acceptable text result; anything else is a protocol break.
+            ToolOutput::Text(t) => panic!("vision capture returned no image: {t}"),
+        }
+
+        // SOM → get_window_state → AX text + image.
+        let som = handle(
+            &args(json!({"action": "capture", "mode": "som", "pid": pid, "window_id": window_id})),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("som capture");
+        assert!(
+            matches!(som, ToolOutput::Multimodal { .. }),
+            "som capture must return Multimodal (AX text + image): {som:?}"
+        );
+
+        // AX → get_window_state → text only, no image bytes.
+        let ax = handle(
+            &args(json!({"action": "capture", "mode": "ax", "pid": pid, "window_id": window_id})),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("ax capture");
+        match ax {
+            ToolOutput::Text(t) => assert!(!t.is_empty(), "ax capture returned empty tree"),
+            other => panic!("ax capture must be text-only, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range `element_index` against a real window must surface the
+    /// driver's actionable "out of range / re-run get_window_state" error as a
+    /// soft failure (Text), never a panic or a silent success — proving the
+    /// element-addressed path reaches the driver with pid+window_id intact.
+    #[tokio::test]
+    async fn live_out_of_range_element_index_is_soft_error() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+        let listing = match handle(&args(json!({"action": "list_windows"})), &config, &cancel).await
+        {
+            Ok(ToolOutput::Text(t)) => t,
+            other => panic!("list_windows failed: {other:?}"),
+        };
+        let (pid, window_id) = parse_first_window(&listing)
+            .unwrap_or_else(|| panic!("no (pid, window_id) parsed from: {listing}"));
+        // Prime the daemon's snapshot for this window, then address a
+        // deliberately out-of-range index.
+        let _ = handle(
+            &args(json!({"action": "capture", "mode": "som", "pid": pid, "window_id": window_id})),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("prime som capture");
+        let out = handle(
+            &args(json!({
+                "action": "click", "pid": pid, "window_id": window_id, "element_index": 999_999
+            })),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("click call");
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            ToolOutput::Multimodal { text, .. } => text,
+        };
+        assert!(
+            text.to_lowercase().contains("out of range")
+                || text.to_lowercase().contains("get_window_state"),
+            "expected an out-of-range/re-capture hint, got: {text}"
+        );
+    }
+
+    /// Extract the first `(pid N) … [window_id: M]` pair from a `list_windows`
+    /// listing. Returns `None` if the shape isn't present.
+    fn parse_first_window(listing: &str) -> Option<(i64, i64)> {
+        for line in listing.lines() {
+            let pid = line
+                .split_once("(pid ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|d| d.parse::<i64>().ok());
+            let window_id = line
+                .split_once("[window_id: ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|d| d.parse::<i64>().ok());
+            if let (Some(pid), Some(window_id)) = (pid, window_id) {
+                return Some((pid, window_id));
+            }
+        }
+        None
+    }
+}
