@@ -102,20 +102,22 @@ impl ComputerUseAction {
     }
 }
 
-/// Capture mode. `Vision` keeps the current behaviour (raw PNG inline).
-/// `Som` (Set-of-Marks) overlays numbered boxes the model can reference
-/// by `element_index` on the next turn. `Ax` returns the
-/// accessibility tree as text only — for non-vision models or when the
-/// operator wants to keep image bytes out of LLM context.
+/// Capture mode. `Som` (Set-of-Marks, the default) returns a screenshot plus
+/// a numbered overlay the model can reference by `element_index` on the next
+/// turn — the richest surface for driving a UI, so it leads. `Vision` is a
+/// plain PNG with no overlay. `Ax` returns the accessibility tree as text
+/// only — for non-vision models or when the operator wants to keep image
+/// bytes out of LLM context.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CaptureMode {
-    /// Plain screenshot. The historical default — bytes go straight to the LLM.
+    /// Screenshot plus a numbered overlay of `{index, role, name, bounds}`.
+    /// Pair with `element_index` on a follow-up click/drag. The default —
+    /// element-addressable capture is the most useful starting point.
     #[default]
-    Vision,
-    /// Screenshot plus a JSON overlay of `{index, role, name, bounds}`.
-    /// Pair with `element_index` on a follow-up click/drag.
     Som,
+    /// Plain screenshot — raw PNG inline, no overlay.
+    Vision,
     /// Accessibility tree only — no image bytes. Useful with text-only models.
     Ax,
 }
@@ -1902,6 +1904,7 @@ mod tests {
             ],
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Vision);
         args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let (text, parts) = match out {
@@ -1968,15 +1971,20 @@ mod tests {
     #[tokio::test]
     async fn capture_without_window_id_resolves_frontmost_window() {
         // No window_id, no target: capture must enumerate list_windows and
-        // grab the frontmost (first) window, then screenshot it — mirroring
-        // the reference's zero-arg capture.
+        // grab the frontmost (first) window — mirroring the reference's
+        // zero-arg capture, which defaults to `som` (get_window_state). The
+        // resolver supplies both the pid and window_id the AX walk needs.
         let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
         let args = args_with_action(ComputerUseAction::Capture);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let calls = driver.calls.lock().unwrap();
         assert_eq!(calls[0].0, "list_windows");
-        assert_eq!(calls[1].0, "screenshot");
+        assert_eq!(calls[1].0, "get_window_state");
         assert_eq!(calls[1].1["window_id"], 1923, "must pick frontmost window");
+        assert_eq!(
+            calls[1].1["pid"], 2446,
+            "must carry the frontmost window's pid"
+        );
         // The resolved-target note reaches the model so it can reuse the ids.
         if let ToolOutput::Multimodal { text, .. } = out {
             assert!(text.contains("targeting Code") && text.contains("window_id 1923"));
@@ -2930,10 +2938,11 @@ mod tests {
         assert_eq!(driver.calls.lock().unwrap()[0].0, "get_window_state");
     }
 
-    /// Default (vision) mode captures raw pixels via `screenshot`, keyed by
-    /// window_id, requesting the png format the envelope decoder expects.
+    /// Default mode is `som` (parity with the reference's zero-arg capture):
+    /// it walks the AX tree via `get_window_state`, keyed by (pid, window_id),
+    /// so the model gets an element-addressable overlay without asking for it.
     #[tokio::test]
-    async fn capture_default_mode_is_vision() {
+    async fn capture_default_mode_is_som() {
         let driver = FakeDriver::new(vec![DriverResponse {
             content: vec![DriverContent::Image {
                 mime_type: "image/png".into(),
@@ -2941,12 +2950,14 @@ mod tests {
             }],
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
+        args.pid = Some(1234);
         args.window_id = Some(42);
+        assert!(args.mode.is_none(), "test exercises the defaulted mode");
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (method, params) = driver.calls.lock().unwrap()[0].clone();
-        assert_eq!(method, "screenshot");
+        assert_eq!(method, "get_window_state");
+        assert_eq!(params["pid"], 1234);
         assert_eq!(params["window_id"], 42);
-        assert_eq!(params["format"], "png");
     }
 
     /// A no-image reply that carries an explicit text detail (e.g. a
@@ -3016,6 +3027,7 @@ mod tests {
             },
         ]);
         let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Vision);
         args.window_id = Some(42);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         assert!(
@@ -3092,6 +3104,7 @@ mod tests {
                 }],
             }]);
             let mut args = args_with_action(ComputerUseAction::Capture);
+            args.mode = Some(CaptureMode::Vision);
             args.window_id = Some(42);
             let out = handle_with_driver(&args, &driver).await.unwrap();
             assert!(
