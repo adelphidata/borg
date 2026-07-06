@@ -30,7 +30,7 @@ jobs:
             echo "::error::Invalid version format '${{ inputs.version }}'. Expected: X.Y.Z or X.Y.Z-pre.N"
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Check tag does not exist
@@ -68,7 +68,7 @@ jobs:
             asset: borg-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@master
@@ -78,7 +78,7 @@ jobs:
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -123,7 +123,7 @@ jobs:
           cd artifacts
           sha256sum *.tar.gz *.zip 2>/dev/null > checksums.txt || true
           cat checksums.txt
-      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.tag.outputs.tag || github.ref_name }}
           name: ${{ needs.tag.outputs.tag || github.ref_name }}
