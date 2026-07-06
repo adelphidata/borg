@@ -132,8 +132,17 @@ define_settings! {
         // ── Browser ──
         "browser.enabled" => browser.enabled, parsed(bool);
         "browser.headless" => browser.headless, parsed(bool);
+        "browser.executable" => browser.executable, opt_string;
         "browser.snapshot_max_elements" => browser.snapshot_max_elements, parsed(usize);
         "browser.cdp_url" => browser.cdp_url, opt_string;
+        // backend / engine are FromStr enums → custom_apply / custom_extract.
+        // API keys are JSON SecretRefs → custom_apply / custom_extract.
+        "browser.browserbase_project_id" => browser.browserbase_project_id, opt_string;
+        "browser.browserbase_proxies" => browser.browserbase_proxies, parsed(bool);
+        "browser.browserbase_base_url" => browser.browserbase_base_url, opt_string;
+        "browser.browser_use_base_url" => browser.browser_use_base_url, opt_string;
+        "browser.firecrawl_base_url" => browser.firecrawl_base_url, opt_string;
+        "browser.firecrawl_browser_ttl_secs" => browser.firecrawl_browser_ttl_secs, parsed(u64);
 
         // ── TTS ──
         "tts.enabled" => tts.enabled, parsed(bool);
@@ -457,6 +466,56 @@ define_settings! {
             Ok(format!("{key} = {mode}"))
         };
 
+        // browser.backend: FromStr enum (local | browserbase | browser_use | firecrawl | cdp_attach)
+        "browser.backend" => |s, key, value| {
+            let backend: crate::config::BrowserBackend = value.parse()?;
+            s.browser.backend = backend;
+            Ok(format!("{key} = {backend}"))
+        };
+
+        // browser.engine: FromStr enum (chrome | brave | edge | chromium | lightpanda | custom)
+        "browser.engine" => |s, key, value| {
+            let engine: crate::config::BrowserEngine = value.parse()?;
+            s.browser.engine = engine;
+            Ok(format!("{key} = {engine}"))
+        };
+
+        // browser.*_api_key: optional JSON SecretRef (empty clears to None).
+        // Same shape as llm.api_key above.
+        "browser.browserbase_api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.browser.browserbase_api_key = None;
+            } else {
+                s.browser.browserbase_api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "browser.browser_use_api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.browser.browser_use_api_key = None;
+            } else {
+                s.browser.browser_use_api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "browser.firecrawl_api_key" => |s, key, value| {
+            if value.is_empty() {
+                s.browser.firecrawl_api_key = None;
+            } else {
+                s.browser.firecrawl_api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+
         // tts.default_format: validated set
         "tts.default_format" => |s, key, value| {
             let allowed = ["mp3", "opus", "aac", "flac", "wav"];
@@ -693,6 +752,19 @@ define_settings! {
         "sandbox.mode" => |c| c.sandbox.mode.clone();
         "memory.extra_paths" => |c| c.memory.extra_paths.join(", ");
         "conversation.collaboration_mode" => |c| format!("{}", c.conversation.collaboration_mode);
+        // browser backend / engine: FromStr-validated enums, round-trip via Display.
+        "browser.backend" => |c| format!("{}", c.browser.backend);
+        "browser.engine" => |c| format!("{}", c.browser.engine);
+        // browser.*_api_key: round-trip the SecretRef as JSON, empty when unset.
+        "browser.browserbase_api_key" => |c| c.browser.browserbase_api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "browser.browser_use_api_key" => |c| c.browser.browser_use_api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "browser.firecrawl_api_key" => |c| c.browser.firecrawl_api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
         "tts.default_format" => |c| c.tts.default_format.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
         "security.verifier" => |c| format!("{}", c.security.verifier);
@@ -878,6 +950,22 @@ define_settings! {
         "mcp.enabled" => "MCP", Bool, "MCP";
         "mcp.tool_search" => "MCP tool search", Bool, "MCP";
 
+        // — Browser — automation backend + engine picker and cloud creds.
+        // Cloud backends (browserbase / browser_use / firecrawl) create a
+        // remote session and are driven over CDP; `local` launches the chosen
+        // engine; `cdp_attach` uses the CDP attach URL.
+        "browser.enabled" => "Browser automation", Bool, "Browser";
+        "browser.backend" => "Browser backend", Select, "Browser";
+        "browser.engine" => "Browser engine", Select, "Browser";
+        "browser.headless" => "Headless", Bool, "Browser";
+        "browser.executable" => "Custom exe path", Text, "Browser";
+        "browser.snapshot_max_elements" => "Snapshot max elems", Uint, "Browser";
+        "browser.cdp_url" => "CDP attach URL", Text, "Browser";
+        "browser.browserbase_api_key" => "Browserbase API key", Secret, "Browser";
+        "browser.browserbase_project_id" => "Browserbase project", Text, "Browser";
+        "browser.browser_use_api_key" => "Browser Use API key", Secret, "Browser";
+        "browser.firecrawl_api_key" => "Firecrawl API key", Secret, "Browser";
+
         // — Appearance — TUI theme picker (also reachable as `/theme`)
         "ui.theme" => "Theme", Select, "Appearance";
 
@@ -914,6 +1002,27 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         &["fill_first", "round_robin", "least_used", "random"],
     ),
     ("security.verifier", &["tofu", "tailscale"]),
+    (
+        "browser.backend",
+        &[
+            "local",
+            "browserbase",
+            "browser_use",
+            "firecrawl",
+            "cdp_attach",
+        ],
+    ),
+    (
+        "browser.engine",
+        &[
+            "chrome",
+            "brave",
+            "edge",
+            "chromium",
+            "lightpanda",
+            "custom",
+        ],
+    ),
     ("gateway.group_activation", &["mention", "always"]),
     (
         "llm.thinking",

@@ -7,6 +7,7 @@
 use super::*;
 
 mod basics;
+mod browser_settings;
 mod channels;
 mod consolidation_settings;
 mod credentials;
