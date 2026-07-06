@@ -188,12 +188,15 @@ pub(crate) struct ComputerUseArgs {
     #[serde(default)]
     pub value: Option<String>,
 
-    /// `focus_app` target — accepts a bundle id ("com.apple.Finder"),
-    /// a process name, or a pid (string-encoded).
+    /// `capture` app-name targeting: a case-insensitive substring of the app
+    /// name (e.g. "Finder", "chrome"). When set and `window_id` is omitted,
+    /// capture resolves the frontmost matching window via `list_windows` and
+    /// reports the resolved `pid`/`window_id` so follow-up actions can target
+    /// it. Still honoured by the `focus_app` security denylist.
     #[serde(default)]
     pub target: Option<String>,
-    /// `focus_app` — when `false`, route input without stealing focus from
-    /// the user's frontmost app. Default `true` (safe — raises and activates).
+    /// Retained for wire back-compat; `focus_app` is unsupported by
+    /// cua-driver 0.1.9, so this is no longer read on any active path.
     #[serde(default)]
     pub raise_window: Option<bool>,
 
@@ -850,26 +853,121 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
     )))
 }
 
+/// A single window as parsed from `list_windows` text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowEntry {
+    app: String,
+    pid: i64,
+    window_id: i64,
+}
+
+/// Parse the driver's `list_windows` text into structured entries. The lines
+/// look like `- Code (pid 2446) "Title" [window_id: 1923]`; entries that don't
+/// carry both a pid and a window_id are skipped. Order is preserved (the
+/// driver lists frontmost-first by z-index), so `first()` is the frontmost.
+fn parse_window_entries(text: &str) -> Vec<WindowEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((before_pid, after_pid)) = line.split_once("(pid ") else {
+            continue;
+        };
+        let Some(pid) = after_pid
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|d| d.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let Some((_, after_wid)) = line.split_once("[window_id: ") else {
+            continue;
+        };
+        let Some(window_id) = after_wid
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|d| d.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        // App name is everything before " (pid", trimmed of the leading "- ".
+        let app = before_pid.trim().trim_start_matches('-').trim().to_string();
+        if !app.is_empty() {
+            out.push(WindowEntry {
+                app,
+                pid,
+                window_id,
+            });
+        }
+    }
+    out
+}
+
+/// Resolve which window a capture targets. Explicit `window_id` wins (paired
+/// with the caller's optional `pid`). Otherwise enumerate `list_windows` and
+/// pick the frontmost window matching `target` (case-insensitive substring),
+/// or the frontmost window overall when no `target` is given — mirroring the
+/// reference's `capture(app=optional)` ergonomics. The returned note is
+/// surfaced to the model so it can reuse the resolved ids for follow-up
+/// actions (borg spawns the driver per call, so it can't hold the context).
+async fn resolve_capture_window(
+    args: &ComputerUseArgs,
+    driver: &dyn Driver,
+) -> Result<(Option<i64>, i64, Option<String>)> {
+    if let Some(window_id) = args.window_id {
+        return Ok((args.pid, window_id, None));
+    }
+    let resp = driver
+        .call("list_windows", json!({"on_screen_only": true}))
+        .await?;
+    let text = driver_text_only(resp);
+    let entries = parse_window_entries(&text);
+    if entries.is_empty() {
+        anyhow::bail!(
+            "computer_use.capture found no on-screen windows to target. Provide an explicit \
+             `window_id` (via action `list_windows`), or open a window first."
+        );
+    }
+    let chosen = match args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(query) => entries
+            .iter()
+            .find(|e| e.app.to_lowercase().contains(&query.to_lowercase()))
+            .ok_or_else(|| {
+                let names: Vec<&str> = entries.iter().map(|e| e.app.as_str()).collect();
+                anyhow::anyhow!(
+                    "computer_use.capture found no on-screen window whose app matches '{query}'. \
+                     On-screen apps: {}",
+                    names.join(", ")
+                )
+            })?,
+        // No target → frontmost window (first entry, driver lists by z-index).
+        None => &entries[0],
+    };
+    let note = format!(
+        "(targeting {} — pid {}, window_id {})",
+        chosen.app, chosen.pid, chosen.window_id
+    );
+    Ok((Some(chosen.pid), chosen.window_id, Some(note)))
+}
+
 async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
     let mode = args.mode.unwrap_or_default();
-    // The driver is window-oriented: every capture needs a `window_id`
-    // (from `list_windows`), and the AX-tree modes additionally need the
-    // owning `pid`. There is no whole-desktop capture.
-    let window_id = args.window_id.ok_or_else(|| {
-        anyhow::anyhow!(
-            "computer_use.capture requires `window_id` — call action `list_windows` first to \
-             enumerate windows (each carries `window_id` + `pid`). The driver captures one \
-             window at a time; it has no whole-desktop capture."
-        )
-    })?;
+    // Resolve the target window: explicit `window_id`, an app-name match on
+    // `target`, or the frontmost on-screen window. AX-tree modes additionally
+    // need the owning `pid`, which resolution always supplies.
+    let (resolved_pid, window_id, target_note) = resolve_capture_window(args, driver).await?;
     let (method, params) = match mode {
         // `som`/`ax` walk the AX tree via `get_window_state` (which also
         // returns the screenshot in `som`). Both need pid + window_id.
         CaptureMode::Som | CaptureMode::Ax => {
-            let pid = args.pid.ok_or_else(|| {
+            let pid = resolved_pid.ok_or_else(|| {
                 anyhow::anyhow!(
                     "computer_use.capture in mode={mode:?} requires `pid` (the window's owning \
-                     process, from `list_windows`) so the driver can walk its accessibility tree."
+                     process) — pass it alongside `window_id`, or use `target`/no id to \
+                     auto-resolve via `list_windows`."
                 )
             })?;
             (
@@ -914,10 +1012,17 @@ async fn capture(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutp
         }
     }
 
-    let summary = if text_parts.is_empty() {
+    let body = if text_parts.is_empty() {
         "Captured screen.".to_string()
     } else {
         text_parts.join("\n")
+    };
+    // Prepend the resolved-target note (when capture auto-resolved a window by
+    // app name / frontmost) so the model can reuse the pid+window_id for
+    // follow-up actions — borg is stateless across tool calls.
+    let summary = match &target_note {
+        Some(note) => format!("{note}\n{body}"),
+        None => body,
     };
 
     // `ax` mode: text-only by contract. If the driver also sent an image
@@ -1808,19 +1913,134 @@ mod tests {
         assert_eq!(params["window_id"], 42);
     }
 
+    /// A three-window listing, frontmost-first (as the driver emits it).
+    fn windows_listing() -> DriverResponse {
+        DriverResponse {
+            content: vec![DriverContent::Text(
+                "✅ Found 3 window(s)\n\
+                 - Code (pid 2446) \"SKILL.md\" [window_id: 1923]\n\
+                 - Google Chrome (pid 20922) \"Home\" [window_id: 2542]\n\
+                 - Finder (pid 863) \"Downloads\" [window_id: 2522]"
+                    .into(),
+            )],
+        }
+    }
+
+    fn png_image_response() -> DriverResponse {
+        DriverResponse {
+            content: vec![DriverContent::Image {
+                mime_type: "image/png".into(),
+                base64: png_b64_of_size(64, 64),
+            }],
+        }
+    }
+
     #[tokio::test]
-    async fn capture_without_window_id_errors_before_driver() {
-        // The driver has no whole-desktop capture; every capture needs a
-        // window_id. Missing it must fail loudly (pointing at list_windows)
-        // rather than send an unroutable call.
-        let driver = FakeDriver::new(vec![]);
+    async fn capture_without_window_id_resolves_frontmost_window() {
+        // No window_id, no target: capture must enumerate list_windows and
+        // grab the frontmost (first) window, then screenshot it — mirroring
+        // the reference's zero-arg capture.
+        let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
+        let args = args_with_action(ComputerUseAction::Capture);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "list_windows");
+        assert_eq!(calls[1].0, "screenshot");
+        assert_eq!(calls[1].1["window_id"], 1923, "must pick frontmost window");
+        // The resolved-target note reaches the model so it can reuse the ids.
+        if let ToolOutput::Multimodal { text, .. } = out {
+            assert!(text.contains("targeting Code") && text.contains("window_id 1923"));
+        } else {
+            panic!("expected Multimodal, got {out:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_with_target_resolves_matching_app_case_insensitively() {
+        // `target` is a case-insensitive substring; it must select the
+        // matching window even when it isn't frontmost.
+        let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.target = Some("finder".into());
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "list_windows");
+        assert_eq!(
+            calls[1].1["window_id"], 2522,
+            "must resolve Finder's window, not the frontmost"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_som_target_resolves_pid_and_window_id() {
+        // som needs pid; resolving by target must supply BOTH pid and
+        // window_id to get_window_state without the caller passing either.
+        let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.mode = Some(CaptureMode::Som);
+        args.target = Some("Chrome".into());
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls[1].0, "get_window_state");
+        assert_eq!(calls[1].1["pid"], 20922);
+        assert_eq!(calls[1].1["window_id"], 2542);
+    }
+
+    #[tokio::test]
+    async fn capture_target_no_match_errors_with_app_list() {
+        // A target that matches nothing must fail with the on-screen app
+        // names so the model can correct itself — not silently grab a wrong
+        // window.
+        let driver = FakeDriver::new(vec![windows_listing()]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.target = Some("Spotify".into());
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no on-screen window"), "got: {msg}");
+        assert!(
+            msg.contains("Finder") && msg.contains("Code"),
+            "app list missing: {msg}"
+        );
+        // Only the list_windows probe ran; no capture attempted.
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_no_on_screen_windows_errors() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("✅ Found 0 window(s)".into())],
+        }]);
         let args = args_with_action(ComputerUseAction::Capture);
         let err = handle_with_driver(&args, &driver).await.unwrap_err();
         assert!(
-            err.to_string().contains("window_id") && err.to_string().contains("list_windows"),
+            err.to_string().contains("no on-screen windows"),
             "got: {err}"
         );
-        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_window_entries_extracts_app_pid_window_id() {
+        let entries = parse_window_entries(
+            "✅ Found 2 window(s)\n\
+             - Google Chrome (pid 20922) \"Home / X\" [window_id: 2542]\n\
+             - Notes (pid 71459) (no title) [window_id: 916]\n\
+             - garbage line without ids",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                WindowEntry {
+                    app: "Google Chrome".into(),
+                    pid: 20922,
+                    window_id: 2542
+                },
+                WindowEntry {
+                    app: "Notes".into(),
+                    pid: 71459,
+                    window_id: 916
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3506,6 +3726,36 @@ mod live {
         );
     }
 
+    /// Zero-argument capture must auto-resolve the frontmost on-screen window
+    /// (via `list_windows`) and return a real PNG — the reference's headline
+    /// "just capture" ergonomics, end to end against the live driver.
+    #[tokio::test]
+    async fn live_capture_no_args_resolves_frontmost() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+        let out = handle(&args(json!({"action": "capture"})), &config, &cancel)
+            .await
+            .expect("frontmost capture");
+        match out {
+            ToolOutput::Multimodal { text, parts } => {
+                assert!(
+                    text.contains("targeting") && text.contains("window_id"),
+                    "resolved-target note missing: {text}"
+                );
+                assert!(
+                    parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+                    "frontmost capture returned no image"
+                );
+            }
+            other => panic!("frontmost capture must be Multimodal, got {other:?}"),
+        }
+    }
+
     /// Full window-targeted capture round-trip: enumerate a window via
     /// `list_windows`, then `capture` it in each mode. Vision must return a
     /// real PNG inline; SOM must return the AX tree text plus an image; AX
@@ -3524,9 +3774,12 @@ mod live {
             Ok(ToolOutput::Text(t)) => t,
             other => panic!("list_windows failed: {other:?}"),
         };
-        // Parse the first "(pid N) ... [window_id: M]" pair from the listing.
-        let (pid, window_id) = parse_first_window(&listing)
+        // Reuse the production parser; the frontmost window is the first entry.
+        let first = parse_window_entries(&listing)
+            .into_iter()
+            .next()
             .unwrap_or_else(|| panic!("no (pid, window_id) parsed from: {listing}"));
+        let (pid, window_id) = (first.pid, first.window_id);
 
         // Vision → screenshot → inline PNG.
         let vision = handle(
@@ -3591,8 +3844,11 @@ mod live {
             Ok(ToolOutput::Text(t)) => t,
             other => panic!("list_windows failed: {other:?}"),
         };
-        let (pid, window_id) = parse_first_window(&listing)
+        let first = parse_window_entries(&listing)
+            .into_iter()
+            .next()
             .unwrap_or_else(|| panic!("no (pid, window_id) parsed from: {listing}"));
+        let (pid, window_id) = (first.pid, first.window_id);
         // Prime the daemon's snapshot for this window, then address a
         // deliberately out-of-range index.
         let _ = handle(
@@ -3620,24 +3876,5 @@ mod live {
                 || text.to_lowercase().contains("get_window_state"),
             "expected an out-of-range/re-capture hint, got: {text}"
         );
-    }
-
-    /// Extract the first `(pid N) … [window_id: M]` pair from a `list_windows`
-    /// listing. Returns `None` if the shape isn't present.
-    fn parse_first_window(listing: &str) -> Option<(i64, i64)> {
-        for line in listing.lines() {
-            let pid = line
-                .split_once("(pid ")
-                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|d| d.parse::<i64>().ok());
-            let window_id = line
-                .split_once("[window_id: ")
-                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|d| d.parse::<i64>().ok());
-            if let (Some(pid), Some(window_id)) = (pid, window_id) {
-                return Some((pid, window_id));
-            }
-        }
-        None
     }
 }
