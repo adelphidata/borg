@@ -46,7 +46,17 @@ pub struct HttpConfig {
     pub policy: HttpPolicy,
     /// Optional client certificate for mutual TLS. Loaded at connect time.
     pub client_identity: Option<crate::manifest::ClientIdentity>,
+    /// Hard cap on a single response body, enforced *while streaming* so a
+    /// hostile/compromised server can't OOM the process by streaming a huge
+    /// chunked body before any downstream truncation runs. 0 means "unset" and
+    /// falls back to [`DEFAULT_MAX_RESPONSE_BYTES`].
+    pub max_response_bytes: usize,
 }
+
+/// Fallback body cap when `HttpConfig::max_response_bytes` is 0 (unset). Matches
+/// the cortex-side 1 MiB default; a real per-server value is threaded in from
+/// `mcp.max_response_bytes` at construction.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Build a reqwest client with: timeout, no redirects, rustls TLS, and DNS
 /// resolution pinned to the supplied `(host, addrs)` pairs.
@@ -120,6 +130,11 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         &resolved.pins,
         config.client_identity.as_ref(),
     )?;
+    let max_response_bytes = if config.max_response_bytes == 0 {
+        DEFAULT_MAX_RESPONSE_BYTES
+    } else {
+        config.max_response_bytes
+    };
     Ok(HttpTransport {
         client,
         url: resolved.url,
@@ -127,6 +142,7 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         server_name: config.server_name,
         inbox: VecDeque::new(),
         session_id: None,
+        max_response_bytes,
     })
 }
 
@@ -156,6 +172,7 @@ pub struct HttpTransport {
     server_name: String,
     inbox: VecDeque<Message>,
     session_id: Option<String>,
+    max_response_bytes: usize,
 }
 
 impl HttpTransport {
@@ -193,7 +210,7 @@ impl Transport for HttpTransport {
         if let Some(sid) = &self.session_id {
             req = req.header(MCP_SESSION_ID_HEADER, sid);
         }
-        let resp = req.json(&msg).send().await.map_err(|e| {
+        let mut resp = req.json(&msg).send().await.map_err(|e| {
             // A connect/timeout failure (server not yet listening, momentary
             // network blip) is transient and retryable on the idempotent startup
             // path; any other send failure tears the transport down.
@@ -269,9 +286,31 @@ impl Transport for HttpTransport {
             }
         }
 
-        let body = resp.bytes().await.map_err(|e| {
-            McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
-        })?;
+        // Read the body chunk-by-chunk with a hard cap enforced *as we read*,
+        // rather than `resp.bytes()` which buffers the whole body first. A
+        // hostile server streaming a multi-GB chunked response is aborted after
+        // ~max_response_bytes instead of OOMing the process.
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > self.max_response_bytes {
+                        return Err(McpError::Protocol(format!(
+                            "{}: response body exceeds max_response_bytes ({} bytes)",
+                            self.server_name, self.max_response_bytes
+                        )));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(McpError::TransportClosed(format!(
+                        "{}: body read failed: {e}",
+                        self.server_name
+                    )))
+                }
+            }
+        }
         // Streamable HTTP framing: either one JSON object, or newline-delimited
         // JSON objects when the server batches a response + notifications.
         for line in body.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
@@ -405,5 +444,83 @@ mod tests {
         // Regression guard: the common server-auth-only path (no client cert)
         // must keep working after the mTLS plumbing was added.
         build_client(Duration::from_secs(5), &[], None).expect("no-identity client should build");
+    }
+
+    /// Bind a one-shot plaintext HTTP server on loopback that answers the first
+    /// request with `body`, then returns the bound port. Used to drive the
+    /// streaming body-cap path without a real MCP server.
+    async fn spawn_oneshot_http(body: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request headers so the client's write completes
+                // before we reply; we don't care about the contents.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        port
+    }
+
+    fn local_http_config(port: u16, max_response_bytes: usize) -> HttpConfig {
+        HttpConfig {
+            server_name: "capped".to_string(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            policy: HttpPolicy {
+                // Loopback plaintext is required to talk to the throwaway test
+                // server; production endpoints stay HTTPS + non-local.
+                allow_plaintext_http: true,
+                allow_local_network: true,
+            },
+            client_identity: None,
+            max_response_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_over_cap_is_rejected_not_buffered() {
+        // A server that returns a body larger than the transport ceiling must be
+        // stopped with a Protocol error rather than buffered whole — the guard
+        // against a hostile server OOMing the process.
+        let oversized = vec![b'x'; 8192];
+        let port = spawn_oneshot_http(oversized).await;
+        let mut transport = open(local_http_config(port, 64)).await.unwrap();
+        let err = transport
+            .send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .await
+            .expect_err("body over the cap must error");
+        match err {
+            McpError::Protocol(msg) => assert!(
+                msg.contains("exceeds max_response_bytes"),
+                "unexpected message: {msg}"
+            ),
+            e => panic!("expected Protocol error, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_under_cap_is_parsed() {
+        // Control case: a well-formed response comfortably under the ceiling is
+        // read and decoded normally, proving the cap doesn't reject valid bodies.
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.to_vec();
+        let port = spawn_oneshot_http(body).await;
+        let mut transport = open(local_http_config(port, 1024)).await.unwrap();
+        transport
+            .send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .await
+            .expect("body under the cap should parse");
+        let msg = transport.recv().await.expect("recv should succeed");
+        assert!(msg.is_some(), "a message should have been decoded");
     }
 }

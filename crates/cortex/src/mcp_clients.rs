@@ -69,6 +69,16 @@ static MAX_RESPONSE_BYTES: std::sync::atomic::AtomicUsize =
 /// fail-closed-on-zero convention at [`try_consume_rate_token`].
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Headroom multiple applied to the display cap to derive the *transport*
+/// buffer ceiling. The display cap (`MAX_RESPONSE_BYTES`) bounds how much of a
+/// parsed response we hand the LLM; the transport must still buffer the whole
+/// HTTP body to JSON-parse it, so its ceiling has to be larger or legitimate
+/// responses that would merely be truncated-for-display would hard-fail at the
+/// socket. This factor keeps graceful truncation working for moderately large
+/// responses while still bounding worst-case memory to a small multiple of the
+/// cap (defeating unbounded-body OOM from a hostile server).
+const TRANSPORT_BODY_HEADROOM_FACTOR: usize = 8;
+
 /// Resolve the operator-configured `max_response_bytes` to the value the
 /// dispatch path should actually use. Centralises the
 /// "0 means default, not unbounded" rule so every `MAX_RESPONSE_BYTES.store`
@@ -1364,6 +1374,12 @@ async fn open_transport(
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
+            // Transport buffer ceiling = display cap × headroom, so a hostile
+            // server can't stream an unbounded body into memory before the
+            // per-call display truncation (which runs post-parse) ever fires.
+            let max_response_bytes = MAX_RESPONSE_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_mul(TRANSPORT_BODY_HEADROOM_FACTOR);
             let cfg = mcp::transport::http::HttpConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),
@@ -1371,6 +1387,7 @@ async fn open_transport(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
+                max_response_bytes,
             };
             let t = mcp::transport::http::open(cfg).await?;
             Ok(Box::new(t))

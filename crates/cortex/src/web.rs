@@ -70,6 +70,22 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
     }
 }
 
+/// Read a response body chunk-by-chunk, aborting as soon as the cumulative size
+/// exceeds `max_bytes`. Unlike `Response::bytes()` (which buffers the entire body
+/// before any size check), this bounds peak memory: a hostile or compromised
+/// server that streams a multi-GB chunked response is stopped after ~`max_bytes`
+/// rather than OOMing the process.
+async fn read_body_capped(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("error reading response chunk")? {
+        if buf.len() + chunk.len() > max_bytes {
+            anyhow::bail!("Response body too large (exceeds {max_bytes} bytes)");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Attach the active trace context to an outbound request as a `traceparent`
 /// header so collectors can stitch the HTTP call to the agent span. Inert when
 /// telemetry is disabled or there is no recording span (no header is added).
@@ -238,17 +254,10 @@ pub async fn web_fetch(
         .unwrap_or("")
         .to_string();
 
-    let bytes = resp
-        .bytes()
+    const MAX_BODY_BYTES: usize = constants::WEB_MAX_BODY_BYTES;
+    let bytes = read_body_capped(resp, MAX_BODY_BYTES)
         .await
         .with_context(|| format!("Failed to read body from {effective_url}"))?;
-    const MAX_BODY_BYTES: usize = constants::WEB_MAX_BODY_BYTES;
-    if bytes.len() > MAX_BODY_BYTES {
-        anyhow::bail!(
-            "Response body too large ({} bytes, max {MAX_BODY_BYTES})",
-            bytes.len()
-        );
-    }
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let text = if content_type.contains("text/html") || content_type.contains("application/xhtml") {
@@ -577,6 +586,57 @@ mod tests {
         assert!(ssrf_filter_addrs(vec![private], false).is_empty());
         // Only when the operator opts in are they allowed.
         assert_eq!(ssrf_filter_addrs(vec![private], true).len(), 1);
+    }
+
+    /// One-shot loopback HTTP server that replies with `body`, returning its
+    /// port. Lets us exercise `read_body_capped` against a real
+    /// `reqwest::Response` stream.
+    async fn spawn_oneshot_http(body: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_body() {
+        // A body larger than the cap must error rather than buffer whole — the
+        // guard against a hostile server OOMing the fetch path.
+        let port = spawn_oneshot_http(vec![b'x'; 8192]).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        let err = read_body_capped(resp, 64)
+            .await
+            .expect_err("oversized body must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_returns_body_under_cap() {
+        // Control case: a body under the cap is returned intact.
+        let port = spawn_oneshot_http(b"hello world".to_vec()).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        let out = read_body_capped(resp, 1024).await.unwrap();
+        assert_eq!(out, b"hello world");
     }
 
     #[test]
