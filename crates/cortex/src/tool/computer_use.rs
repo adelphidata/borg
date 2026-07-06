@@ -603,7 +603,58 @@ pub(crate) async fn handle(
     }
 
     let driver = build_driver(config)?;
-    handle_with_driver(args, driver.as_ref()).await
+    let out = handle_with_driver(args, driver.as_ref()).await?;
+    // A non-vision main model can't see the screenshot. The generic LLM-layer
+    // `strip_images` safety net would silently drop it, leaving the model
+    // believing it "looked" when it saw nothing. Instead downgrade to a text
+    // summary that names the limitation, so the model (and operator) know to
+    // switch to a vision-capable model rather than flying blind.
+    Ok(downgrade_for_non_vision_model(out, config))
+}
+
+/// Whether the configured main model accepts image input. Unknown/unset
+/// providers default to `true` — matching [`Provider::supports_vision`]'s
+/// "avoid false negatives that would silently downgrade multimodal" stance,
+/// so we never wrongly strip a screenshot from a model that could see it.
+fn main_model_supports_vision(config: &Config) -> bool {
+    let raw = config.llm.provider.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        return true;
+    }
+    match raw.parse::<crate::llm::provider::Provider>() {
+        Ok(provider) => provider.supports_vision(&config.llm.model),
+        Err(_) => true,
+    }
+}
+
+/// Replace a multimodal (image-bearing) computer_use result with a text-only
+/// one when the main model can't accept images. Vision-capable models — and
+/// any already-text result — pass through untouched. The returned text keeps
+/// the driver's own summary and prepends an actionable note so the model
+/// doesn't mistake "image silently dropped" for "nothing to see".
+fn downgrade_for_non_vision_model(out: ToolOutput, config: &Config) -> ToolOutput {
+    let ToolOutput::Multimodal { text, parts } = &out else {
+        return out;
+    };
+    let has_image = parts
+        .iter()
+        .any(|p| matches!(p, ContentPart::ImageBase64 { .. }));
+    if !has_image || main_model_supports_vision(config) {
+        return out;
+    }
+    let summary = if text.trim().is_empty() {
+        "(no text detail)".to_string()
+    } else {
+        text.clone()
+    };
+    ToolOutput::Text(format!(
+        "Note: computer_use captured a screenshot, but the active model \
+         ({}) does not support image input, so the pixels were dropped. Switch \
+         to a vision-capable model for desktop computer use, or use `capture` \
+         with `mode: \"ax\"` for a text-only accessibility tree. Captured text \
+         summary:\n{summary}",
+        config.llm.model
+    ))
 }
 
 /// Test seam: the handler logic without the production driver. Production
@@ -3281,6 +3332,85 @@ sleep 60"#,
             "call pinned by a lingering child: {:?}",
             start.elapsed()
         );
+    }
+
+    // ── non-vision main model downgrade ────────────────────────────
+
+    fn multimodal_capture() -> ToolOutput {
+        ToolOutput::Multimodal {
+            text: "captured window".into(),
+            parts: vec![
+                ContentPart::Text("captured window".into()),
+                ContentPart::ImageBase64 {
+                    media: MediaData {
+                        mime_type: "image/png".into(),
+                        data: png_b64_of_size(64, 64),
+                        filename: Some("capture.png".into()),
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn non_vision_model_downgrades_screenshot_to_text_with_guidance() {
+        // A text-only model would have its screenshot silently stripped by the
+        // LLM layer, leaving it blind but "confident". The downgrade must turn
+        // the image into a text note that names the limitation and points at
+        // the fix (vision model / ax mode) — and keep the driver's summary.
+        let mut config = Config::default();
+        config.llm.provider = Some("groq".into());
+        config.llm.model = "llama-3.1-8b-instant".into(); // no vision
+        assert!(!main_model_supports_vision(&config));
+        let out = downgrade_for_non_vision_model(multimodal_capture(), &config);
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("does not support image input"), "got: {t}");
+                assert!(t.contains("vision-capable"), "no remedy named: {t}");
+                assert!(t.contains("captured window"), "driver summary dropped: {t}");
+            }
+            other => panic!("non-vision model must get Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_model_keeps_multimodal_screenshot() {
+        // The common case: a vision model must receive the pixels untouched.
+        let mut config = Config::default();
+        config.llm.provider = Some("anthropic".into());
+        config.llm.model = "claude-sonnet-5".into();
+        assert!(main_model_supports_vision(&config));
+        let out = downgrade_for_non_vision_model(multimodal_capture(), &config);
+        assert!(
+            matches!(out, ToolOutput::Multimodal { .. }),
+            "vision model must keep the image: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_defaults_to_vision_capable() {
+        // Unset/unknown provider must NOT strip images — mirrors
+        // Provider::supports_vision's "avoid false negatives" stance.
+        let mut config = Config::default();
+        config.llm.provider = None;
+        config.llm.model = "some-model".into();
+        assert!(main_model_supports_vision(&config));
+        config.llm.provider = Some("not-a-real-provider".into());
+        assert!(main_model_supports_vision(&config));
+    }
+
+    #[test]
+    fn downgrade_leaves_text_only_output_untouched() {
+        // ax-mode captures and error strings are already Text — the downgrade
+        // must be a no-op for them regardless of vision support.
+        let mut config = Config::default();
+        config.llm.provider = Some("groq".into());
+        config.llm.model = "llama-3.1-8b-instant".into();
+        let text = ToolOutput::Text("AXWindow > AXButton".into());
+        match downgrade_for_non_vision_model(text, &config) {
+            ToolOutput::Text(t) => assert_eq!(t, "AXWindow > AXButton"),
+            other => panic!("text output must pass through, got {other:?}"),
+        }
     }
 
     #[test]
