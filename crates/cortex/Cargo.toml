@@ -11,7 +11,7 @@ coding = { path = "../coding" }
 sandbox = { path = "../sandbox" }
 plugins = { path = "../plugins" }
 mcp = { path = "../mcp" }
-lru = "0.12"
+lru = "0.16"
 tokio = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 url = { workspace = true }
@@ -128,7 +128,7 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 libc = { workspace = true }
-wiremock = "0.5"
+wiremock = "0.6"
 libsql = { workspace = true }
 wasm-encoder = "0.244"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

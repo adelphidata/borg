@@ -28,7 +28,7 @@ use std::num::NonZeroU64;
 use cortex::config::Config as CortexConfig;
 use songbird::driver::Driver;
 use songbird::events::{Event, EventContext, EventHandler};
-use songbird::id::{GuildId, UserId};
+use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::{Config as SongbirdConfig, ConnectionInfo};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -231,6 +231,11 @@ type TranscriptInbox = Arc<Mutex<Vec<String>>>;
 
 struct GuildState {
     driver: Driver,
+    /// Target voice channel for this guild's connection. songbird 0.6's
+    /// `ConnectionInfo.channel_id` is mandatory (was optional in 0.4); the
+    /// raw `Driver::connect` still ignores it, but we thread the real id
+    /// through so it's correct rather than a placeholder.
+    channel_id: u64,
     pending_session_id: Option<String>,
     pending_endpoint_token: Option<(String, String)>,
     join_replies: Vec<oneshot::Sender<Result<()>>>,
@@ -408,11 +413,14 @@ where
             let mut g = guilds.lock().await;
             let entry = g.entry(guild_id).or_insert_with(|| GuildState {
                 driver: Driver::new(SongbirdConfig::default()),
+                channel_id,
                 pending_session_id: None,
                 pending_endpoint_token: None,
                 join_replies: Vec::new(),
                 inbox: Arc::new(Mutex::new(Vec::new())),
             });
+            // Reflect the current target channel on rejoin to a different one.
+            entry.channel_id = channel_id;
             entry.join_replies.push(reply);
             // Register inbound voice handler the first time we touch
             // this guild (no-op on repeat). Bridges songbird's decoded
@@ -597,8 +605,18 @@ async fn try_complete_join(state: &mut GuildState, guild_id: u64, our_user_id: u
         warn!("our_user_id 0 — Gateway READY didn't arrive yet?");
         return;
     };
+    let Some(cid_nz) = NonZeroU64::new(state.channel_id) else {
+        // Terminal branch: channel_id never transitions to non-zero, so unblock
+        // any queued join() callers with an error instead of leaving them
+        // hanging until a later leave() drops the reply sender.
+        warn!("channel_id 0 — invalid");
+        for reply in state.join_replies.drain(..) {
+            let _ = reply.send(Err(anyhow!("invalid voice channel_id 0")));
+        }
+        return;
+    };
     let info = ConnectionInfo {
-        channel_id: None, // not required by Driver::connect
+        channel_id: ChannelId::from(cid_nz),
         endpoint: ep,
         guild_id: GuildId::from(gid_nz),
         session_id: sid,

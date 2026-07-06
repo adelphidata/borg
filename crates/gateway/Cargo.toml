@@ -48,7 +48,7 @@ opentelemetry = { workspace = true }
 # Off by default; the audio stack adds ~30 transitive crates and is only
 # useful when borg is deployed against a Discord server with voice usage.
 # Enable with `cargo build -p gateway --features discord-voice-channels`.
-songbird = { version = "0.4", default-features = false, features = ["driver", "gateway", "rustls", "receive"], optional = true }
+songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "rustls", "receive", "tungstenite"], optional = true }
 hound = { version = "3.5", optional = true }
 
 [features]

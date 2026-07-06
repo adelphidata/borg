@@ -10,6 +10,30 @@ ignore = [
     # Pulled transitively (reqwest/rustls-native-certs); revisit when upstream
     # deps drop it.
     "RUSTSEC-2025-0134",
+    # --- songbird lockfile artifacts NOT compiled into borg's voice build ---
+    # All five reach Cargo.lock only via songbird 0.6, behind the opt-in
+    # `discord-voice-channels` feature, and none is actually built:
+    #
+    #  * rustls-webpki 0.102.8 (0049/0098/0099/0104) is pulled by songbird's
+    #    OPTIONAL `serenity` feature (→ tokio-tungstenite 0.21 → rustls 0.22).
+    #    borg does not enable `serenity` — it uses the twilight-style manual
+    #    ConnectionInfo + `tungstenite` backend — so the compiled tree resolves
+    #    rustls-webpki 0.103.13 only.
+    #  * libcrux-chacha20poly1305 (0124) is pulled by songbird's MANDATORY DAVE
+    #    (E2EE) dep `davey` → openmls → hpke-rs → hpke-rs-libcrux → libcrux-aead.
+    #    It is not built because openmls selects the `hpke-rs-rust-crypto`
+    #    backend, not `hpke-rs-libcrux`, in the resolved feature set.
+    #
+    # `deny.toml` uses `all-features=true`, which force-activates the serenity /
+    # libcrux paths that borg never ships, hence the ignore. Verified with
+    # `cargo tree -e normal --features discord-voice-channels`: none is reachable.
+    # Revisit when serenity's tokio-tungstenite/rustls stack modernizes, when
+    # openmls drops the libcrux backend from its graph, or if voice is dropped.
+    "RUSTSEC-2026-0049", # rustls-webpki: CRLs not authoritative by Distribution Point
+    "RUSTSEC-2026-0098", # rustls-webpki: URI-name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard-name constraints accepted
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext
 ]
 
 [licenses]
