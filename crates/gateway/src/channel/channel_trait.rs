@@ -358,22 +358,16 @@ pub async fn dispatch_webhook(
                         // Output-redaction chokepoint. Strip any detected
                         // secrets from agent output before it enters the
                         // delivery queue (so a queued retry can't replay a
-                        // secret) and before live `send_response`. The
-                        // policy is process-wide; toggle gated by
-                        // `security.output_redaction`. See
-                        // crates/cortex/src/output_redaction.rs.
-                        let redaction_context = format!(
-                            "{}:{}",
-                            inbound.sender_id,
-                            inbound.channel_id.as_deref().unwrap_or("-")
+                        // secret) and before live `send_response`. Shares the
+                        // single `redact_channel_output` helper with the
+                        // synchronous return path so both stay in lockstep.
+                        // Toggle gated by `security.output_redaction`.
+                        let response_text = crate::handler::redact_channel_output(
+                            &channel_name,
+                            &inbound.sender_id,
+                            inbound.channel_id.as_deref(),
+                            &response_text,
                         );
-                        let response_text = cortex::output_redaction::current_policy()
-                            .apply(
-                                cortex::output_redaction::OutputSink::Channel(&channel_name),
-                                Some(&redaction_context),
-                                &response_text,
-                            )
-                            .into_owned();
 
                         // Persist to delivery queue for at-least-once guarantee.
                         // A single DB connection is reused for enqueue + status update.

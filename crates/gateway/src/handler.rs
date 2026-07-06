@@ -236,6 +236,31 @@ pub fn check_activation(
 /// `bot_identifier` is the platform-specific mention string (e.g. `@botname` for Telegram,
 /// `<@U123>` for Slack) used for group chat activation filtering.
 #[instrument(skip_all, fields(channel = %channel_name))]
+/// Apply the process-wide output-redaction policy to text bound for a channel
+/// recipient.
+///
+/// Single chokepoint shared by the synchronous return path (`invoke_agent_inner`)
+/// and the asynchronous push/delivery-queue path (`channel_trait::dispatch_webhook`)
+/// so that no outbound sink — including the polled iMessage monitor, which does
+/// not re-redact — can ever deliver un-redacted agent output. The policy is
+/// process-wide and toggle-gated by `security.output_redaction`; redaction is
+/// idempotent so applying it more than once along a path is harmless.
+pub(crate) fn redact_channel_output(
+    channel_name: &str,
+    sender_id: &str,
+    channel_id: Option<&str>,
+    text: &str,
+) -> String {
+    let redaction_context = format!("{}:{}", sender_id, channel_id.unwrap_or("-"));
+    cortex::output_redaction::current_policy()
+        .apply(
+            cortex::output_redaction::OutputSink::Channel(channel_name),
+            Some(&redaction_context),
+            text,
+        )
+        .into_owned()
+}
+
 pub async fn invoke_agent(
     channel_name: &str,
     inbound: &InboundMessage,
@@ -992,22 +1017,19 @@ async fn invoke_agent_inner(
         response_text = "(no response)".to_string();
     }
 
-    // Log outbound message — route through the same output-redaction policy
-    // as live channel delivery so the toggle and audit trail apply uniformly.
-    // `channel_messages` is a persisted DB surface; an operator inspecting it
-    // must see the same redacted text the recipient saw.
-    let redaction_context = format!(
-        "{}:{}",
-        inbound.sender_id,
-        inbound.channel_id.as_deref().unwrap_or("-")
+    // Redact the outbound response ONCE here and return the redacted text as the
+    // canonical result, so every delivery sink (polled iMessage monitor,
+    // process_message chunking, push queue) and the persisted `channel_messages`
+    // log all emit the same scrubbed string. Returning the raw text previously
+    // meant only the DB copy was redacted while the recipient received the raw
+    // secret. Redaction is idempotent (`[REDACTED …]` markers don't re-match),
+    // so any sink that re-applies the policy downstream is harmless.
+    let redacted_response = redact_channel_output(
+        channel_name,
+        &inbound.sender_id,
+        inbound.channel_id.as_deref(),
+        &response_text,
     );
-    let redacted_response = cortex::output_redaction::current_policy()
-        .apply(
-            cortex::output_redaction::OutputSink::Channel(channel_name),
-            Some(&redaction_context),
-            &response_text,
-        )
-        .into_owned();
     if let Err(e) = db
         .log_channel_message(
             channel_name,
@@ -1022,7 +1044,7 @@ async fn invoke_agent_inner(
         warn!("Failed to log outbound message for channel '{channel_name}': {e}");
     }
 
-    Ok((response_text, session_id))
+    Ok((redacted_response, session_id))
 }
 
 /// Shared message processing: session resolution, agent invocation, outbound with retry + chunking.
@@ -1222,6 +1244,35 @@ pub fn format_gateway_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_channel_output_scrubs_secrets_for_delivery() {
+        // Regression (H4): the value returned to every delivery sink must be
+        // redacted. Previously invoke_agent_inner redacted only the DB log copy
+        // and returned raw text, so the iMessage recipient received the secret.
+        // The default policy is enabled, so no global install is needed here.
+        let raw = "here is the key AKIAIOSFODNN7EXAMPLE and passphrase \
+                   BORG_KEK_PASSPHRASE=Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZg";
+        let out = redact_channel_output("imessage", "+15551234567", None, raw);
+        assert!(
+            !out.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key must not survive delivery redaction: {out}"
+        );
+        assert!(
+            !out.contains("Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZg"),
+            "KEK passphrase must not survive delivery redaction: {out}"
+        );
+        assert!(out.contains("[REDACTED"), "expected redaction markers: {out}");
+    }
+
+    #[test]
+    fn redact_channel_output_is_idempotent() {
+        // A sink that re-applies the policy (the push queue does) must not
+        // corrupt already-redacted text.
+        let once = redact_channel_output("slack", "U1", Some("C1"), "k=AKIAIOSFODNN7EXAMPLE");
+        let twice = redact_channel_output("slack", "U1", Some("C1"), &once);
+        assert_eq!(once, twice, "redaction must be idempotent: {once} != {twice}");
+    }
 
     #[test]
     fn format_dream_report_minimal() {
