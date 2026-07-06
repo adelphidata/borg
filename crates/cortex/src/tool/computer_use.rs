@@ -188,12 +188,14 @@ pub(crate) struct ComputerUseArgs {
     #[serde(default)]
     pub value: Option<String>,
 
-    /// `capture` app-name targeting: a case-insensitive substring of the app
-    /// name (e.g. "Finder", "chrome"). When set and `window_id` is omitted,
-    /// capture resolves the frontmost matching window via `list_windows` and
-    /// reports the resolved `pid`/`window_id` so follow-up actions can target
-    /// it. Still honoured by the `focus_app` security denylist.
-    #[serde(default)]
+    /// App-name targeting for `capture` and `focus_app`: a case-insensitive
+    /// substring of the app name (e.g. "Finder", "chrome"). For `capture`,
+    /// when set and `window_id` is omitted, the frontmost matching window is
+    /// resolved via `list_windows` and its `pid`/`window_id` reported so
+    /// follow-up actions can target it. Accepts either `app` (the reference's
+    /// name) or the legacy `target` key. Still honoured by the security
+    /// denylist.
+    #[serde(default, alias = "app")]
     pub target: Option<String>,
     /// Retained for wire back-compat; `focus_app` is unsupported by
     /// cua-driver 0.1.9, so this is no longer read on any active path.
@@ -688,14 +690,8 @@ pub(crate) async fn handle_with_driver(
         ComputerUseAction::Click => click(args, "click", driver).await,
         ComputerUseAction::DoubleClick => click(args, "double_click", driver).await,
         ComputerUseAction::RightClick => click(args, "right_click", driver).await,
-        // cua-driver exposes only left/right/double click — there is no
-        // middle-click tool. Surface that as a clear error rather than
-        // dispatching a call the driver would reject.
-        ComputerUseAction::MiddleClick => Ok(ToolOutput::Text(
-            "Error: computer_use middle_click is not supported by cua-driver (it exposes only \
-             left, right, and double click)."
-                .into(),
-        )),
+        // middle_click maps to `click {button: "middle"}` inside click().
+        ComputerUseAction::MiddleClick => click(args, "middle_click", driver).await,
         ComputerUseAction::Drag => drag(args, driver).await,
         ComputerUseAction::Scroll => scroll(args, driver).await,
         ComputerUseAction::Type => type_text(args, driver).await,
@@ -901,6 +897,47 @@ fn parse_window_entries(text: &str) -> Vec<WindowEntry> {
     out
 }
 
+/// Enumerate on-screen windows via the driver's `list_windows` tool.
+async fn list_window_entries(driver: &dyn Driver) -> Result<Vec<WindowEntry>> {
+    let resp = driver
+        .call("list_windows", json!({"on_screen_only": true}))
+        .await?;
+    Ok(parse_window_entries(&driver_text_only(resp)))
+}
+
+/// Pick a window from a listing: the frontmost window matching `app_query`
+/// (case-insensitive substring), or the frontmost window overall when no
+/// query is given. A non-empty query that matches nothing errors with the
+/// available app names rather than silently grabbing the frontmost — that
+/// would hide real failures (e.g. a localized macOS app name).
+fn pick_window<'a>(
+    entries: &'a [WindowEntry],
+    app_query: Option<&str>,
+    action: &str,
+) -> Result<&'a WindowEntry> {
+    if entries.is_empty() {
+        anyhow::bail!(
+            "computer_use.{action} found no on-screen windows. Open a window first, or pass an \
+             explicit `window_id` (via action `list_windows`)."
+        );
+    }
+    match app_query.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(query) => entries
+            .iter()
+            .find(|e| e.app.to_lowercase().contains(&query.to_lowercase()))
+            .ok_or_else(|| {
+                let names: Vec<&str> = entries.iter().map(|e| e.app.as_str()).collect();
+                anyhow::anyhow!(
+                    "computer_use.{action} found no on-screen window whose app matches '{query}'. \
+                     On-screen apps: {}",
+                    names.join(", ")
+                )
+            }),
+        // No query → frontmost window (first entry, driver lists by z-index).
+        None => Ok(&entries[0]),
+    }
+}
+
 /// Resolve which window a capture targets. Explicit `window_id` wins (paired
 /// with the caller's optional `pid`). Otherwise enumerate `list_windows` and
 /// pick the frontmost window matching `target` (case-insensitive substring),
@@ -915,37 +952,8 @@ async fn resolve_capture_window(
     if let Some(window_id) = args.window_id {
         return Ok((args.pid, window_id, None));
     }
-    let resp = driver
-        .call("list_windows", json!({"on_screen_only": true}))
-        .await?;
-    let text = driver_text_only(resp);
-    let entries = parse_window_entries(&text);
-    if entries.is_empty() {
-        anyhow::bail!(
-            "computer_use.capture found no on-screen windows to target. Provide an explicit \
-             `window_id` (via action `list_windows`), or open a window first."
-        );
-    }
-    let chosen = match args
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        Some(query) => entries
-            .iter()
-            .find(|e| e.app.to_lowercase().contains(&query.to_lowercase()))
-            .ok_or_else(|| {
-                let names: Vec<&str> = entries.iter().map(|e| e.app.as_str()).collect();
-                anyhow::anyhow!(
-                    "computer_use.capture found no on-screen window whose app matches '{query}'. \
-                     On-screen apps: {}",
-                    names.join(", ")
-                )
-            })?,
-        // No target → frontmost window (first entry, driver lists by z-index).
-        None => &entries[0],
-    };
+    let entries = list_window_entries(driver).await?;
+    let chosen = pick_window(&entries, args.target.as_deref(), "capture")?;
     let note = format!(
         "(targeting {} — pid {}, window_id {})",
         chosen.app, chosen.pid, chosen.window_id
@@ -1473,6 +1481,14 @@ fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
 }
 
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
+    // `middle_click` has no dedicated driver tool; it maps to the `click` tool
+    // with `button: "middle"` (drivers that predate the button param degrade
+    // to a left-click, matching the reference's routing). Left/right/double
+    // use their own tools. `method` stays the logical name for the summary.
+    let (driver_method, button) = match method {
+        "middle_click" => ("click", Some("middle")),
+        other => (other, None),
+    };
     // Every click variant is posted to a target process, so `pid` is required
     // by the driver (`required: [pid]`). Fail early with an actionable message
     // rather than let the driver reject the call opaquely.
@@ -1482,6 +1498,9 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         )
     })?;
     let mut params = json!({"pid": pid});
+    if let Some(b) = button {
+        params["button"] = json!(b);
+    }
     let summary;
     let modifiers = driver_modifiers(args)?;
     if let Some(idx) = args.element_index {
@@ -1514,7 +1533,7 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
         let suffix = apply_modifiers(&mut params, &modifiers);
         summary = format!("{method} at ({x}, {y}){suffix}");
     }
-    let resp = driver.call(method, params).await?;
+    let resp = driver.call(driver_method, params).await?;
     Ok(merge_driver_text(summary, resp))
 }
 
@@ -1686,20 +1705,31 @@ async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     ))
 }
 
-/// `focus_app` has no cua-driver equivalent: the driver is AX-driven and
-/// operates on backgrounded windows *by design* — it never raises a window
-/// to the foreground (`launch_app` even launches hidden). So there is nothing
-/// to call. We surface an actionable error rather than dispatch a nonexistent
-/// tool. The security denylist for login/screen-lock targets still runs ahead
-/// of this in `check_denylist`, so a denied target reports the security
-/// refusal, not this generic message.
-async fn focus_app(_args: &ComputerUseArgs, _driver: &dyn Driver) -> Result<ToolOutput> {
-    Ok(ToolOutput::Text(
-        "Error: computer_use focus_app is not supported by cua-driver, which drives windows \
-         in the background without raising them. Target a specific window instead: use \
-         `list_windows` to get its `window_id`+`pid`, then pass those to capture/click/etc."
-            .into(),
-    ))
+/// `focus_app` is a window-selector, matching the reference: the cua-driver
+/// is background-automation, so "focus" doesn't raise a window (there is no
+/// activate tool, and `raise_window` is intentionally ignored — never
+/// stealing the user's focus is the whole point). It resolves the named app's
+/// frontmost on-screen window via `list_windows` and reports its `pid` +
+/// `window_id` so the model can drive that process on subsequent calls (borg
+/// is stateless across tool calls, so the ids are returned rather than stored).
+async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let app = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "computer_use.focus_app requires `app` (an app-name substring, e.g. \"Finder\")"
+            )
+        })?;
+    let entries = list_window_entries(driver).await?;
+    let chosen = pick_window(&entries, Some(app), "focus_app")?;
+    Ok(ToolOutput::Text(format!(
+        "Targeted {} (pid {}, window_id {}). The driver drives it in the background — no window \
+         raise. Pass this pid/window_id to click/type/etc.",
+        chosen.app, chosen.pid, chosen.window_id
+    )))
 }
 
 #[cfg(test)]
@@ -2646,44 +2676,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_app_is_unsupported_and_never_calls_driver() {
-        // cua-driver has no activation/raise tool — it drives windows in the
-        // background by design. focus_app must surface that as an actionable
-        // error (pointing at list_windows) and must NOT dispatch a
-        // nonexistent `focus_app` driver call.
-        let driver = FakeDriver::new(vec![ok_response()]);
+    async fn focus_app_resolves_app_via_list_windows_without_raising() {
+        // focus_app is a window *selector*: it enumerates list_windows,
+        // matches the app-name substring, and returns the pid/window_id for
+        // the model to reuse — it never raises or steals focus (the driver
+        // drives windows in the background).
+        let driver = FakeDriver::new(vec![windows_listing()]);
         let mut args = args_with_action(ComputerUseAction::FocusApp);
-        args.target = Some("com.google.Chrome".into());
+        args.target = Some("Finder".into());
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
-            other => panic!("expected text error, got {other:?}"),
+            other => panic!("expected text, got {other:?}"),
         };
+        assert!(text.contains("Targeted Finder"), "got: {text}");
+        assert!(text.contains("pid 863"), "got: {text}");
+        assert!(text.contains("window_id 2522"), "got: {text}");
+
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "focus_app should call list_windows once");
+        assert_eq!(calls[0].0, "list_windows");
+        // Selector must not raise/activate the window.
         assert!(
-            text.contains("not supported") && text.contains("list_windows"),
-            "focus_app should explain it's unsupported: {text}"
-        );
-        assert!(
-            driver.calls.lock().unwrap().is_empty(),
-            "focus_app must not reach the driver"
+            !text.to_lowercase().contains("raise") || text.to_lowercase().contains("no window"),
+            "focus_app must not claim to raise the window: {text}"
         );
     }
 
     #[tokio::test]
-    async fn middle_click_is_unsupported_and_never_calls_driver() {
-        // cua-driver exposes only left/right/double click. middle_click must
-        // surface a clear error rather than dispatch a call the driver rejects.
+    async fn focus_app_requires_app_before_driver() {
+        // Without `app`, focus_app can't select a window — it must fail early
+        // with an actionable message and never touch the driver.
+        let driver = FakeDriver::new(vec![windows_listing()]);
+        let args = args_with_action(ComputerUseAction::FocusApp);
+        let err = handle_with_driver(&args, &driver)
+            .await
+            .expect_err("focus_app without app must error");
+        assert!(err.to_string().contains("requires `app`"), "got: {err}");
+        assert!(
+            driver.calls.lock().unwrap().is_empty(),
+            "focus_app must not reach the driver when `app` is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_app_no_match_errors_with_available_apps() {
+        // A non-empty app query that matches nothing must error with the
+        // on-screen app names, not silently grab the frontmost window.
+        let driver = FakeDriver::new(vec![windows_listing()]);
+        let mut args = args_with_action(ComputerUseAction::FocusApp);
+        args.target = Some("Photoshop".into());
+        let err = handle_with_driver(&args, &driver)
+            .await
+            .expect_err("focus_app with no match must error");
+        let msg = err.to_string();
+        assert!(msg.contains("no on-screen window"), "got: {msg}");
+        assert!(msg.contains("Finder"), "should list available apps: {msg}");
+    }
+
+    #[tokio::test]
+    async fn focus_app_accepts_app_serde_alias() {
+        // The public schema names the param `app`; internally it deserializes
+        // into `target` via the serde alias. Parity check on the wire name.
+        let args: ComputerUseArgs =
+            serde_json::from_value(json!({"action": "focus_app", "app": "Finder"})).unwrap();
+        assert_eq!(args.target.as_deref(), Some("Finder"));
+    }
+
+    #[tokio::test]
+    async fn middle_click_routes_to_click_with_button_middle() {
+        // cua-driver has no dedicated middle-click tool; middle_click maps to
+        // the `click` tool with `button: "middle"`, carrying pid + coords.
         let driver = FakeDriver::new(vec![ok_response()]);
         let mut args = args_with_action(ComputerUseAction::MiddleClick);
         args.pid = Some(1234);
+        args.x = Some(10);
+        args.y = Some(20);
+        handle_with_driver(&args, &driver).await.unwrap();
+
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "middle_click should dispatch one call");
+        assert_eq!(calls[0].0, "click", "middle_click routes to the click tool");
+        let params = &calls[0].1;
+        assert_eq!(params["button"], "middle");
+        assert_eq!(params["pid"], 1234);
+        assert_eq!(params["x"], 10);
+        assert_eq!(params["y"], 20);
+    }
+
+    #[tokio::test]
+    async fn middle_click_requires_pid_before_driver() {
+        // Like every click variant, middle_click needs a target pid; without
+        // it, fail early rather than let the driver reject opaquely.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::MiddleClick);
         args.x = Some(1);
         args.y = Some(2);
-        let out = handle_with_driver(&args, &driver).await.unwrap();
-        let text = match out {
-            ToolOutput::Text(t) => t,
-            other => panic!("expected text error, got {other:?}"),
-        };
-        assert!(text.contains("not supported"), "got: {text}");
+        let err = handle_with_driver(&args, &driver)
+            .await
+            .expect_err("middle_click without pid must error");
+        assert!(err.to_string().contains("requires `pid`"), "got: {err}");
         assert!(driver.calls.lock().unwrap().is_empty());
     }
 
@@ -3826,6 +3918,47 @@ mod live {
             ToolOutput::Text(t) => assert!(!t.is_empty(), "ax capture returned empty tree"),
             other => panic!("ax capture must be text-only, got {other:?}"),
         }
+    }
+
+    /// focus_app against the live driver must resolve a real on-screen app by
+    /// name (via `list_windows`) and echo back that window's exact pid +
+    /// window_id, without raising the window. Proves the selector wires
+    /// through the production handler end to end.
+    #[tokio::test]
+    async fn live_focus_app_resolves_a_real_app() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+        let listing = match handle(&args(json!({"action": "list_windows"})), &config, &cancel).await
+        {
+            Ok(ToolOutput::Text(t)) => t,
+            other => panic!("list_windows failed: {other:?}"),
+        };
+        let first = parse_window_entries(&listing)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no window parsed from: {listing}"));
+        // Feed the real app name back into focus_app and expect its ids.
+        let out = handle(
+            &args(json!({"action": "focus_app", "app": first.app})),
+            &config,
+            &cancel,
+        )
+        .await
+        .expect("focus_app call");
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("focus_app must return Text, got {other:?}"),
+        };
+        assert!(
+            text.contains(&format!("pid {}", first.pid))
+                && text.contains(&format!("window_id {}", first.window_id)),
+            "focus_app should echo the resolved ids ({}, {}): {text}",
+            first.pid,
+            first.window_id
+        );
     }
 
     /// An out-of-range `element_index` against a real window must surface the
