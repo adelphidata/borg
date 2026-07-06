@@ -162,8 +162,17 @@ impl Database {
     pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = crate::constants::GATEWAY_BUSY_TIMEOUT_MS;
 
     /// Open (or create) the database at `~/.borg/borg.db` with default busy
-    /// timeout. Opens **unencrypted**; production callers must explicitly use
-    /// [`open_encrypted`](Self::open_encrypted).
+    /// timeout.
+    ///
+    /// Opens **unencrypted**, and this is the path *every* production caller
+    /// currently uses (daemon, heartbeat, scheduler, CLI, session). The
+    /// SQLCipher lane in [`open_encrypted`](Self::open_encrypted) exists but is
+    /// dormant — see its docs — so `borg.db` is presently **cleartext on
+    /// disk**. At-rest confidentiality for the DB therefore rests on
+    /// filesystem permissions (the `~/.borg` tree is 0700 and the DB deny-read
+    /// in the tool sandbox), *not* on encryption. Material that must be
+    /// encrypted at rest (the KEK, CA/device private keys) lives separately
+    /// under `~/.borg/secrets/`, not in this DB.
     #[instrument(skip_all)]
     pub async fn open() -> Result<Self> {
         Self::open_with_timeout(Self::DEFAULT_BUSY_TIMEOUT_MS).await
@@ -189,6 +198,14 @@ impl Database {
     /// `key` must be exactly 32 bytes — produced by
     /// [`encryption::derive_db_key_bytes`]. libsql uses SQLCipher framing
     /// (AES-256-CBC) for at-rest encryption.
+    ///
+    /// **Dormant:** no production path calls this today — every caller uses
+    /// [`open`](Self::open) (unencrypted). Enabling it is not a drop-in flip: an
+    /// existing plaintext `borg.db` cannot be read back through the SQLCipher
+    /// key, so turning this on requires a migration (or is fresh-install only).
+    /// Kept wired end-to-end (key derivation + open path + tests) so that
+    /// migration is a config change, not a rewrite. Until then, do not document
+    /// the DB as encrypted at rest — see [`open`](Self::open).
     #[instrument(skip_all)]
     pub async fn open_encrypted(key: &[u8]) -> Result<Self> {
         let path = Self::db_path()?;
