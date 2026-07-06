@@ -6,15 +6,17 @@
 //! - `https://` only unless `allow_plaintext_http` is explicitly set.
 //! - Loopback / RFC1918 / link-local destinations refused unless
 //!   `allow_local_network` is set.
-//! - Cloud-metadata FQDNs refused unconditionally — `allow_local_network`
-//!   must never unlock SSRF to IMDS.
+//! - Cloud-metadata FQDNs *and IPs* (169.254.169.254, Azure wireserver,
+//!   Alibaba, AWS IPv6) refused unconditionally — `allow_local_network`
+//!   must never unlock SSRF to IMDS, whether the host is written as a name,
+//!   an IP literal, or an encoded/mapped form.
 //! - DNS hostnames are resolved at check time, every resolved IP is checked,
 //!   and the addresses are returned for pinning into the connector so a
 //!   hostile authoritative DNS server cannot rebind the host between the
 //!   check and the connect.
 
 use crate::errors::{McpError, Result, UrlRefusalReason};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use url::Url;
 
 /// Policy knobs that the transport enforces on every outbound request.
@@ -37,7 +39,11 @@ const LOOPBACK_HOSTNAMES: &[&str] = &["localhost", "ip6-localhost", "ip6-loopbac
 /// `allow_local_network=true` must NOT silently unlock SSRF to cloud
 /// metadata endpoints. These FQDNs have no legitimate intranet use case
 /// for borg.
-const ALWAYS_FORBIDDEN_HOSTNAMES: &[&str] = &["metadata.google.internal", "metadata.goog"];
+const ALWAYS_FORBIDDEN_HOSTNAMES: &[&str] = &[
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata.digitalocean.com",
+];
 
 /// Parse `url` and check the scheme + literal host against the policy.
 ///
@@ -70,6 +76,18 @@ pub fn check_url_syntactic(url: &str, policy: &HttpPolicy) -> Result<Url> {
                 url: url.to_string(),
                 reason: UrlRefusalReason::LocalNetworkBlocked,
             });
+        }
+        // Cloud-metadata IP literals are refused UNCONDITIONALLY, even with
+        // `allow_local_network=true`. Previously the IMDS IP was caught only by
+        // the local-literal check below, so flipping the local-network knob for
+        // a legitimate subnet server also unlocked SSRF to 169.254.169.254.
+        if let Some(ip) = host_ip_literal(&host) {
+            if ip_is_always_blocked(ip) {
+                return Err(McpError::UrlRefused {
+                    url: url.to_string(),
+                    reason: UrlRefusalReason::LocalNetworkBlocked,
+                });
+            }
         }
         if !policy.allow_local_network && host_is_local_literal(&host) {
             return Err(McpError::UrlRefused {
@@ -153,6 +171,15 @@ pub async fn resolve_endpoint(url: &str, policy: &HttpPolicy) -> Result<Resolved
     .map_err(|e| McpError::Connect(format!("dns task panicked: {e}")))?
     .map_err(|e| McpError::Connect(format!("dns lookup failed for {name}: {e}")))?;
 
+    // Cloud-metadata IPs are refused unconditionally — a hostile authoritative
+    // DNS server resolving to 169.254.169.254 must not slip through just because
+    // `allow_local_network` is on for a real intranet.
+    if resolved.iter().any(|sa| ip_is_always_blocked(sa.ip())) {
+        return Err(McpError::UrlRefused {
+            url: url.to_string(),
+            reason: UrlRefusalReason::LocalNetworkBlocked,
+        });
+    }
     if !policy.allow_local_network && resolved.iter().any(|sa| ip_is_local(sa.ip())) {
         return Err(McpError::UrlRefused {
             url: url.to_string(),
@@ -178,6 +205,65 @@ fn host_is_local_literal(host: &url::Host<&str>) -> bool {
         url::Host::Ipv4(ip) => ip_is_local(IpAddr::V4(*ip)),
         url::Host::Ipv6(ip) => ip_is_local(IpAddr::V6(*ip)),
     }
+}
+
+/// Extract the IP address from an IP-literal host, if the host is written as a
+/// literal rather than a domain name.
+fn host_ip_literal(host: &url::Host<&str>) -> Option<IpAddr> {
+    match host {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// Cloud-metadata / instance-identity IPs refused UNCONDITIONALLY — even with
+/// `allow_local_network=true`. Mirrors the cortex-side `ssrf::is_always_blocked_ip`
+/// (duplicated because `mcp` must not depend on `cortex`). Flipping the
+/// local-network knob for a legitimate subnet server must never unlock SSRF to
+/// these endpoints.
+fn ip_is_always_blocked(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // Entire 169.254.0.0/16 link-local range — AWS/GCP/Azure/Oracle/DO
+            // metadata (169.254.169.254), Azure IMDS wireserver (.169.253), and
+            // AWS ECS task metadata (.170.2) all live here.
+            (o[0] == 169 && o[1] == 254)
+                // Alibaba Cloud metadata (routable, outside link-local).
+                || o == [100, 100, 100, 200]
+                // Azure WireServer / host-internal IMDS (routable).
+                || o == [168, 63, 129, 16]
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6_mapped_v4(v6) {
+                return ip_is_always_blocked(IpAddr::V4(v4));
+            }
+            // AWS IPv6 metadata endpoint fd00:ec2::254.
+            v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254]
+        }
+    }
+}
+
+/// Extract an equivalent IPv4 address from an IPv6 mapped/compat/6to4 form so
+/// the v4 metadata checks apply to `::ffff:169.254.169.254` and friends.
+fn v6_mapped_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segs = v6.segments();
+    if segs[0..6].iter().all(|&s| s == 0) {
+        if let Some(v4) = v6.to_ipv4() {
+            if !v4.is_loopback() && !v4.is_unspecified() {
+                return Some(v4);
+            }
+        }
+    }
+    if segs[0] == 0x2002 {
+        let b = (u32::from(segs[1]) << 16) | u32::from(segs[2]);
+        return Some(Ipv4Addr::from(b));
+    }
+    None
 }
 
 fn ip_is_local(ip: IpAddr) -> bool {
@@ -395,22 +481,64 @@ mod tests {
     }
 
     #[test]
-    fn imds_ip_literal_admitted_by_syntactic_layer_when_local_network_allowed() {
-        // Spec pin (syntactic layer only): the IMDS IP literal
-        // 169.254.169.254 sits in link-local space, which `allow_local_network`
-        // legitimately unlocks for operators talking to their own subnet.
-        // Domain hosts in the cloud-metadata FQDN list stay refused
-        // unconditionally (see `always_forbidden_hostnames_…`), but the
-        // matching IP literal does NOT. This asymmetry is intentional —
-        // operators must use the kill switch / URL allowlist (not the
-        // local-network policy) to keep IMDS out — and it deserves a
-        // tracking note in the user-facing settings docs. This test pins
-        // the syntactic gate's behavior only; deeper layers may still
-        // refuse and that would not break this assertion.
+    fn imds_ip_literal_refused_unconditionally_even_when_local_network_allowed() {
+        // Regression (M6): the IMDS IP literal must be refused UNCONDITIONALLY.
+        // Previously `allow_local_network=true` (a legitimate knob for talking
+        // to a real subnet) also admitted 169.254.169.254 — an SSRF-to-IMDS
+        // escape. The cloud-metadata IPs are now blocked regardless of the flag.
         let permissive = HttpPolicy {
-            allow_plaintext_http: false,
+            allow_plaintext_http: true,
             allow_local_network: true,
         };
-        check_url_syntactic("https://169.254.169.254/", &permissive).unwrap();
+        for url in [
+            "https://169.254.169.254/latest/meta-data/",
+            "http://169.254.169.254/",
+            "https://[::ffff:169.254.169.254]/",
+            "https://168.63.129.16/",       // Azure wireserver
+            "https://100.100.100.200/",     // Alibaba metadata
+        ] {
+            let err = check_url_syntactic(url, &permissive).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    McpError::UrlRefused {
+                        reason: UrlRefusalReason::LocalNetworkBlocked,
+                        ..
+                    }
+                ),
+                "IMDS/metadata IP {url} must be refused unconditionally, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_is_always_blocked_covers_metadata_and_spares_public() {
+        for ip in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "168.63.129.16",
+            "100.100.100.200",
+        ] {
+            assert!(
+                ip_is_always_blocked(ip.parse().unwrap()),
+                "{ip} must be always-blocked"
+            );
+        }
+        for ip in ["8.8.8.8", "93.184.216.34", "1.1.1.1"] {
+            assert!(
+                !ip_is_always_blocked(ip.parse().unwrap()),
+                "{ip} is public and must not be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_encoded_imds_literal_refused() {
+        // 2852039166 == 169.254.169.254; the url crate normalizes it.
+        let permissive = HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        };
+        assert!(check_url_syntactic("http://2852039166/", &permissive).is_err());
     }
 }
