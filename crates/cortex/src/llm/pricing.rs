@@ -20,6 +20,26 @@ struct AnthropicModelRate {
     output_per_mtok: &'static str,
 }
 
+impl AnthropicModelRate {
+    /// Build a rate row from its five per-Mtok decimal strings, in the order
+    /// input, cache-read, cache-write-5m, cache-write-1h, output.
+    const fn new(
+        input_per_mtok: &'static str,
+        cache_read_per_mtok: &'static str,
+        cache_write_5m_per_mtok: &'static str,
+        cache_write_1h_per_mtok: &'static str,
+        output_per_mtok: &'static str,
+    ) -> Self {
+        Self {
+            input_per_mtok,
+            cache_read_per_mtok,
+            cache_write_5m_per_mtok,
+            cache_write_1h_per_mtok,
+            output_per_mtok,
+        }
+    }
+}
+
 // Sources captured on 2026-05-02:
 // OpenAI official pricing/model docs:
 // - https://openai.com/api/pricing/
@@ -330,11 +350,50 @@ static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = La
                 output_per_mtok: "5.00",
             },
         ),
+        // Claude 3.x families offered on AWS Bedrock (incl. GovCloud). The
+        // `anthropic.*` Bedrock ids normalize onto these keys and are billed at
+        // the same Anthropic public rates as the direct API.
+        (
+            "claude-3-7-sonnet",
+            AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00"),
+        ),
+        (
+            "claude-3-7-sonnet-20250219",
+            AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00"),
+        ),
+        (
+            "claude-3-5-sonnet",
+            AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00"),
+        ),
+        (
+            "claude-3-5-sonnet-20241022",
+            AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00"),
+        ),
+        (
+            "claude-3-5-sonnet-20240620",
+            AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00"),
+        ),
+        (
+            "claude-3-5-haiku",
+            AnthropicModelRate::new("0.80", "0.08", "1.00", "1.60", "4.00"),
+        ),
+        (
+            "claude-3-5-haiku-20241022",
+            AnthropicModelRate::new("0.80", "0.08", "1.00", "1.60", "4.00"),
+        ),
+        (
+            "claude-3-opus",
+            AnthropicModelRate::new("15.00", "1.50", "18.75", "30.00", "75.00"),
+        ),
+        (
+            "claude-3-opus-20240229",
+            AnthropicModelRate::new("15.00", "1.50", "18.75", "30.00", "75.00"),
+        ),
     ])
 });
 
 fn normalize_model_id(model: &str) -> &str {
-    model
+    let slash_stripped = model
         .strip_prefix("openai/")
         .or_else(|| model.strip_prefix("anthropic/"))
         .or_else(|| model.strip_prefix("google/"))
@@ -343,7 +402,9 @@ fn normalize_model_id(model: &str) -> &str {
         .or_else(|| model.strip_prefix("x-ai/"))
         .or_else(|| model.strip_prefix("x.ai/"))
         .or_else(|| model.strip_prefix("grok/"))
-        .unwrap_or(model)
+        .unwrap_or(model);
+    // Also fold AWS Bedrock `anthropic.*` ids onto their Anthropic keys.
+    crate::pricing::strip_bedrock_model_shape(slash_stripped)
 }
 
 fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelRate>> {
@@ -442,6 +503,20 @@ pub fn shipped_openai_models() -> &'static [&'static str] {
 #[cfg(test)]
 pub fn shipped_anthropic_models() -> &'static [&'static str] {
     &["claude-sonnet-4", "claude-haiku-4-5"]
+}
+
+/// Shipped AWS Bedrock model ids (with region prefix + `-vN:M` suffix) that
+/// must keep resolving to an Anthropic rate.
+#[cfg(test)]
+pub fn shipped_bedrock_models() -> &'static [&'static str] {
+    &[
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+        "us.anthropic.claude-opus-4-20250514-v1:0",
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "eu.anthropic.claude-3-opus-20240229-v1:0",
+    ]
 }
 
 #[cfg(test)]
@@ -560,5 +635,110 @@ mod tests {
         // wrong rate. Returning None signals the daemon to skip cost
         // emission rather than emit incorrect dollars.
         assert!(estimate_cost_usd(Provider::XAi, "grok-vapor-99", 100, 100).is_none());
+    }
+
+    #[test]
+    fn bedrock_anthropic_id_prices_like_direct_anthropic() {
+        // `anthropic.claude-sonnet-4-20250514-v1:0` must bill exactly like the
+        // direct `claude-sonnet-4` API model: 1_000 in × 3/Mtok = 0.003,
+        // 500 out × 15/Mtok = 0.0075, total 0.0105.
+        let bedrock = estimate_anthropic_cost_usd(
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            1_000,
+            500,
+            0,
+            0,
+            CacheTtl::FiveMin,
+        )
+        .unwrap();
+        let direct =
+            estimate_anthropic_cost_usd("claude-sonnet-4", 1_000, 500, 0, 0, CacheTtl::FiveMin)
+                .unwrap();
+        assert_eq!(bedrock, "0.0105");
+        assert_eq!(bedrock, direct);
+    }
+
+    #[test]
+    fn bedrock_cross_region_prefix_and_version_are_stripped() {
+        // Cross-region inference profile ids carry a geo prefix (`us.`, `eu.`)
+        // and a `-vN:M` version tag; both must be normalized away.
+        for id in [
+            "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "eu.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        ] {
+            let cost =
+                estimate_anthropic_cost_usd(id, 1_000, 500, 0, 0, CacheTtl::FiveMin).unwrap();
+            assert_eq!(cost, "0.0105", "{id} did not price at the 3.7 Sonnet rate");
+        }
+    }
+
+    #[test]
+    fn bedrock_haiku_35_uses_haiku_rate_and_cache_tiers() {
+        // claude-3-5-haiku = $0.80 in / $4.00 out; cache read 0.08, write5m 1.00.
+        // 1_000 in × 0.80/Mtok = 0.0008; 500 out × 4/Mtok = 0.002 → 0.0028.
+        let cost = estimate_anthropic_cost_usd(
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            1_000,
+            500,
+            0,
+            0,
+            CacheTtl::FiveMin,
+        )
+        .unwrap();
+        assert_eq!(cost, "0.0028");
+        // With 1_000 cache-read + 1_000 cache-write-5m tokens:
+        // +1_000 × 0.08/Mtok = 0.00008, +1_000 × 1.00/Mtok = 0.001 → 0.00388.
+        let cached = estimate_anthropic_cost_usd(
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            1_000,
+            500,
+            1_000,
+            1_000,
+            CacheTtl::FiveMin,
+        )
+        .unwrap();
+        assert_eq!(cached, "0.00388");
+    }
+
+    #[test]
+    fn non_anthropic_bedrock_model_returns_none() {
+        // Bedrock also hosts Titan/Llama; those are not Anthropic-priced and
+        // must return None so the daemon emits "unknown" rather than wrong dollars.
+        assert!(estimate_anthropic_cost_usd(
+            "amazon.titan-text-express-v1",
+            1_000,
+            500,
+            0,
+            0,
+            CacheTtl::FiveMin
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn shipped_bedrock_models_resolve_to_anthropic_rates() {
+        for model in shipped_bedrock_models() {
+            assert!(
+                anthropic_rates_for(model).is_some(),
+                "Bedrock model {model} lost its Anthropic rate mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_model_id_strips_bedrock_shape_only_when_valid() {
+        // A well-formed Bedrock id folds to the bare Anthropic key.
+        assert_eq!(
+            normalize_model_id("us.anthropic.claude-opus-4-20250514-v1:0"),
+            "claude-opus-4-20250514"
+        );
+        // A `-v…` fragment that is not a `major:minor` version stays intact.
+        assert_eq!(
+            normalize_model_id("anthropic.claude-vision-preview"),
+            "claude-vision-preview"
+        );
+        // Native Anthropic ids are untouched.
+        assert_eq!(normalize_model_id("claude-sonnet-4"), "claude-sonnet-4");
     }
 }

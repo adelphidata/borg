@@ -11,7 +11,9 @@ struct ModelPricing {
 
 /// Normalize a model identifier by stripping the `provider/` prefix so that
 /// both `"anthropic/claude-sonnet-4"` and `"claude-sonnet-4"` resolve to the
-/// same pricing entry.
+/// same pricing entry. Also reduces AWS Bedrock model ids to their underlying
+/// Anthropic key so `anthropic.claude-sonnet-4-20250514-v1:0` prices the same
+/// as `claude-sonnet-4-20250514`.
 fn normalize_model(model: &str) -> &str {
     // Known provider prefixes used by OpenRouter
     const PREFIXES: &[&str] = &[
@@ -27,7 +29,46 @@ fn normalize_model(model: &str) -> &str {
             return rest;
         }
     }
-    model
+    strip_bedrock_model_shape(model)
+}
+
+/// Reduce an AWS Bedrock model id to the underlying vendor model key by
+/// stripping the cross-region inference geo prefix (`us.`, `eu.`, `apac.`,
+/// `us-gov.`), the `anthropic.` vendor segment, and the trailing `-vN:M`
+/// Bedrock version tag. Ids that are not Bedrock-shaped are returned unchanged,
+/// so this is a safe no-op on native Anthropic / OpenAI / Gemini ids.
+pub(crate) fn strip_bedrock_model_shape(model: &str) -> &str {
+    let geo_stripped = model
+        .strip_prefix("us-gov.")
+        .or_else(|| model.strip_prefix("us."))
+        .or_else(|| model.strip_prefix("eu."))
+        .or_else(|| model.strip_prefix("apac."));
+    // Only commit to the geo strip when the anthropic vendor segment follows,
+    // so a stray `us.`-prefixed non-Bedrock id is never mangled.
+    match geo_stripped.unwrap_or(model).strip_prefix("anthropic.") {
+        Some(rest) => strip_bedrock_version_suffix(rest),
+        None => model,
+    }
+}
+
+/// Drop a trailing `-v<major>:<minor>` Bedrock version tag (e.g. `-v1:0`),
+/// leaving other `-v…` fragments intact.
+fn strip_bedrock_version_suffix(model: &str) -> &str {
+    let Some(idx) = model.rfind("-v") else {
+        return model;
+    };
+    let Some((major, minor)) = model[idx + 2..].split_once(':') else {
+        return model;
+    };
+    if !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && minor.bytes().all(|b| b.is_ascii_digit())
+    {
+        &model[..idx]
+    } else {
+        model
+    }
 }
 
 static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(|| {
@@ -42,6 +83,17 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
         ("claude-sonnet-4", 3.0, 15.0),
         ("claude-haiku-4-5-20251001", 0.80, 4.0),
         ("claude-haiku-4-5", 0.80, 4.0),
+        // Claude 3.x (available on AWS Bedrock incl. GovCloud, mapped via the
+        // `anthropic.*` Bedrock ids to these Anthropic public rates)
+        ("claude-3-7-sonnet", 3.0, 15.0),
+        ("claude-3-7-sonnet-20250219", 3.0, 15.0),
+        ("claude-3-5-sonnet", 3.0, 15.0),
+        ("claude-3-5-sonnet-20241022", 3.0, 15.0),
+        ("claude-3-5-sonnet-20240620", 3.0, 15.0),
+        ("claude-3-5-haiku", 0.80, 4.0),
+        ("claude-3-5-haiku-20241022", 0.80, 4.0),
+        ("claude-3-opus", 15.0, 75.0),
+        ("claude-3-opus-20240229", 15.0, 75.0),
         // GPT-5 family
         ("gpt-5", 1.25, 10.0),
         ("gpt-5-mini", 0.25, 2.0),
@@ -315,5 +367,38 @@ mod tests {
         // 1000 * 0.55/1M + 1000 * 2.19/1M = 0.00055 + 0.00219 = 0.00274
         let c = estimate_cost("deepseek/deepseek-r1", 1000, 1000).expect("known model");
         assert!((c - 0.00274).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bedrock_anthropic_model_prices_like_direct() {
+        // `anthropic.claude-sonnet-4-20250514-v1:0` folds to `claude-sonnet-4`
+        // (3/15 $/Mtok): 1000*3/1M + 500*15/1M = 0.0105.
+        let c = estimate_cost("anthropic.claude-sonnet-4-20250514-v1:0", 1000, 500)
+            .expect("bedrock model priced");
+        assert!((c - 0.0105).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bedrock_cross_region_and_version_normalized() {
+        // Geo prefix + `-v2:0` version must both be stripped to the 3.5 Sonnet key.
+        let c = estimate_cost("us.anthropic.claude-3-5-sonnet-20241022-v2:0", 1_000_000, 0)
+            .expect("bedrock model priced");
+        assert!((c - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn strip_bedrock_shape_leaves_non_bedrock_untouched() {
+        assert_eq!(
+            strip_bedrock_model_shape("us.anthropic.claude-opus-4-20250514-v1:0"),
+            "claude-opus-4-20250514"
+        );
+        // No anthropic vendor segment → returned verbatim (geo strip not applied).
+        assert_eq!(strip_bedrock_model_shape("us-west-2-model"), "us-west-2-model");
+        assert_eq!(strip_bedrock_model_shape("claude-sonnet-4"), "claude-sonnet-4");
+        // Trailing `-v` without a `major:minor` tag is preserved.
+        assert_eq!(
+            strip_bedrock_model_shape("anthropic.claude-vision"),
+            "claude-vision"
+        );
     }
 }

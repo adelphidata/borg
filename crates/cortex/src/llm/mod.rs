@@ -1325,6 +1325,21 @@ impl LlmClient {
                 Some(cost) => (Some(cost), true, "table_gemini".to_string()),
                 None => (None, false, "unknown".to_string()),
             },
+            // Bedrock's first-class models are the `anthropic.*` Converse
+            // models, which normalize onto the Anthropic rate table (including
+            // prompt-cache tiers). Non-Anthropic Bedrock models return None and
+            // fall through to "unknown".
+            Provider::Bedrock => match pricing::estimate_anthropic_cost_usd(
+                &model,
+                u64::from(prompt_tokens),
+                u64::from(completion_tokens),
+                usage.map(|u| u.cached_input_tokens).unwrap_or(0),
+                usage.map(|u| u.cache_creation_tokens).unwrap_or(0),
+                self.llm_config.cache.ttl,
+            ) {
+                Some(cost) => (Some(cost), true, "table_bedrock_anthropic".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
             _ => (None, false, "unknown".to_string()),
         };
 
