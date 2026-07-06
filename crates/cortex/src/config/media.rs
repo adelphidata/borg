@@ -83,12 +83,131 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Where the browser session actually runs.
+///
+/// `Local` launches a headless Chromium-family browser that borg owns.
+/// `CdpAttach` attaches to an already-running browser via `browser.cdp_url`.
+/// The remaining variants create a session on a remote provider and drive it
+/// over the CDP endpoint the provider returns — no extra local driver, the
+/// existing `BrowserSession::connect` path handles the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBackend {
+    /// Launch and drive a local headless browser (default).
+    #[default]
+    Local,
+    /// Create a remote session on the Browserbase cloud and drive it over CDP.
+    Browserbase,
+    /// Create a remote session on the Browser Use cloud and drive it over CDP.
+    BrowserUse,
+    /// Create a remote session on the Firecrawl cloud and drive it over CDP.
+    Firecrawl,
+    /// Attach to an operator-managed browser exposing a CDP endpoint
+    /// (`browser.cdp_url`). Equivalent to setting `cdp_url` directly; provided
+    /// so the backend picker can express "attach" explicitly.
+    CdpAttach,
+}
+
+impl BrowserBackend {
+    /// Whether this backend creates a session on a remote HTTP provider.
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::Browserbase | Self::BrowserUse | Self::Firecrawl)
+    }
+}
+
+impl FromStr for BrowserBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "browserbase" => Ok(Self::Browserbase),
+            "browser_use" => Ok(Self::BrowserUse),
+            "firecrawl" => Ok(Self::Firecrawl),
+            "cdp_attach" => Ok(Self::CdpAttach),
+            other => anyhow::bail!(
+                "Unknown browser backend '{other}'. Valid: local, browserbase, browser_use, firecrawl, cdp_attach"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for BrowserBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Local => "local",
+            Self::Browserbase => "browserbase",
+            Self::BrowserUse => "browser_use",
+            Self::Firecrawl => "firecrawl",
+            Self::CdpAttach => "cdp_attach",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Which Chromium-family browser the `Local` backend launches. All variants
+/// speak CDP, so `chromiumoxide` drives any of them; the choice only changes
+/// which executable is resolved. `Custom` uses `browser.executable` verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserEngine {
+    /// Google Chrome (default).
+    #[default]
+    Chrome,
+    /// Brave Browser.
+    Brave,
+    /// Microsoft Edge.
+    Edge,
+    /// Chromium.
+    Chromium,
+    /// Lightpanda headless browser.
+    Lightpanda,
+    /// Use `browser.executable` verbatim (no engine-specific discovery).
+    Custom,
+}
+
+impl FromStr for BrowserEngine {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "chrome" => Ok(Self::Chrome),
+            "brave" => Ok(Self::Brave),
+            "edge" => Ok(Self::Edge),
+            "chromium" => Ok(Self::Chromium),
+            "lightpanda" => Ok(Self::Lightpanda),
+            "custom" => Ok(Self::Custom),
+            other => anyhow::bail!(
+                "Unknown browser engine '{other}'. Valid: chrome, brave, edge, chromium, lightpanda, custom"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for BrowserEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Chrome => "chrome",
+            Self::Brave => "brave",
+            Self::Edge => "edge",
+            Self::Chromium => "chromium",
+            Self::Lightpanda => "lightpanda",
+            Self::Custom => "custom",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Configuration for the headless Chrome browser automation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Whether browser automation is enabled.
     pub enabled: bool,
+    /// Where the browser session runs (local / remote provider / CDP attach).
+    pub backend: BrowserBackend,
+    /// Which Chromium-family browser the `Local` backend launches.
+    pub engine: BrowserEngine,
     /// Run Chrome in headless mode (no visible window).
     pub headless: bool,
     /// Optional path to the Chrome executable.
@@ -119,12 +238,48 @@ pub struct BrowserConfig {
     /// agent shares the user's already-running Chromium profile/cookies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_url: Option<String>,
+
+    // ── Browserbase remote backend ──
+    /// Browserbase API key (`X-BB-API-Key`). Required when `backend =
+    /// browserbase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browserbase_api_key: Option<SecretRef>,
+    /// Browserbase project ID. Required when `backend = browserbase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browserbase_project_id: Option<String>,
+    /// Request Browserbase residential proxies for the remote session.
+    pub browserbase_proxies: bool,
+    /// Override the Browserbase API base URL (self-host / staging).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browserbase_base_url: Option<String>,
+
+    // ── Browser Use remote backend ──
+    /// Browser Use API key (`Authorization: Bearer`). Required when `backend =
+    /// browser_use`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_use_api_key: Option<SecretRef>,
+    /// Override the Browser Use API base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_use_base_url: Option<String>,
+
+    // ── Firecrawl remote backend ──
+    /// Firecrawl API key (`Authorization: Bearer`). Required when `backend =
+    /// firecrawl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecrawl_api_key: Option<SecretRef>,
+    /// Override the Firecrawl API base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecrawl_base_url: Option<String>,
+    /// Lifetime (seconds) requested for the Firecrawl remote session.
+    pub firecrawl_browser_ttl_secs: u64,
 }
 
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            backend: BrowserBackend::default(),
+            engine: BrowserEngine::default(),
             headless: true,
             executable: None,
             cdp_port: constants::BROWSER_DEFAULT_CDP_PORT,
@@ -137,6 +292,15 @@ impl Default for BrowserConfig {
             js_eval_timeout_ms: constants::BROWSER_JS_EVAL_TIMEOUT_MS,
             snapshot_max_elements: constants::BROWSER_SNAPSHOT_MAX_ELEMENTS,
             cdp_url: None,
+            browserbase_api_key: None,
+            browserbase_project_id: None,
+            browserbase_proxies: true,
+            browserbase_base_url: None,
+            browser_use_api_key: None,
+            browser_use_base_url: None,
+            firecrawl_api_key: None,
+            firecrawl_base_url: None,
+            firecrawl_browser_ttl_secs: constants::BROWSER_FIRECRAWL_TTL_SECS,
         }
     }
 }
@@ -1153,6 +1317,66 @@ impl Default for HooksConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_backend_roundtrips_via_fromstr_and_display() {
+        // The wire strings here are load-bearing: the settings registry, the
+        // TUI Select choices, and serde all depend on these exact tokens.
+        for backend in [
+            BrowserBackend::Local,
+            BrowserBackend::Browserbase,
+            BrowserBackend::BrowserUse,
+            BrowserBackend::Firecrawl,
+            BrowserBackend::CdpAttach,
+        ] {
+            let s = backend.to_string();
+            let parsed: BrowserBackend = s.parse().expect("Display output must re-parse");
+            assert_eq!(parsed, backend, "round-trip failed for {s}");
+        }
+        assert_eq!(
+            "browser_use".parse::<BrowserBackend>().unwrap(),
+            BrowserBackend::BrowserUse
+        );
+        assert!("nope".parse::<BrowserBackend>().is_err());
+    }
+
+    #[test]
+    fn browser_backend_is_remote_only_for_cloud() {
+        assert!(BrowserBackend::Browserbase.is_remote());
+        assert!(BrowserBackend::BrowserUse.is_remote());
+        assert!(BrowserBackend::Firecrawl.is_remote());
+        assert!(!BrowserBackend::Local.is_remote());
+        assert!(!BrowserBackend::CdpAttach.is_remote());
+    }
+
+    #[test]
+    fn browser_engine_roundtrips_via_fromstr_and_display() {
+        for engine in [
+            BrowserEngine::Chrome,
+            BrowserEngine::Brave,
+            BrowserEngine::Edge,
+            BrowserEngine::Chromium,
+            BrowserEngine::Lightpanda,
+            BrowserEngine::Custom,
+        ] {
+            let s = engine.to_string();
+            let parsed: BrowserEngine = s.parse().expect("Display output must re-parse");
+            assert_eq!(parsed, engine, "round-trip failed for {s}");
+        }
+        assert!("firefox".parse::<BrowserEngine>().is_err());
+    }
+
+    #[test]
+    fn browser_config_defaults_to_local_chrome() {
+        let cfg = BrowserConfig::default();
+        assert_eq!(cfg.backend, BrowserBackend::Local);
+        assert_eq!(cfg.engine, BrowserEngine::Chrome);
+        assert!(cfg.browserbase_proxies);
+        assert_eq!(
+            cfg.firecrawl_browser_ttl_secs,
+            constants::BROWSER_FIRECRAWL_TTL_SECS
+        );
+    }
 
     #[test]
     fn skill_entry_config_default_allowed_env_empty() {

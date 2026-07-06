@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod backends;
 pub mod cdp_attach;
 pub mod console;
 pub mod detection;
@@ -51,6 +52,11 @@ pub struct BrowserSession {
     /// `config.browser.cdp_url` on every tool call so changes to the
     /// `/browser connect|disconnect` setting take effect on the next call.
     connected_url: Option<String>,
+    /// The remote provider session backing this browser, when the active
+    /// backend is a cloud provider. Held so `close()` can release it on the
+    /// provider (and not leak a paid keep-alive session). `None` for local
+    /// launches and operator-managed CDP attaches.
+    remote: Option<backends::RemoteSession>,
 }
 
 impl BrowserSession {
@@ -70,10 +76,15 @@ impl BrowserSession {
         registry: Option<&crate::process_registry::ProcessRegistry>,
         session_id: Option<String>,
     ) -> Result<Self> {
-        let detection = detection::find_chrome(config.executable.as_deref());
-        let chrome_path = detection.executable.context(
-            "No Chrome/Chromium found. Install Chrome or set browser.executable in config.",
-        )?;
+        let chrome_path =
+            detection::resolve_engine_executable(config.engine, config.executable.as_deref())
+                .with_context(|| {
+                    format!(
+                        "No browser found for engine '{}'. Install a Chromium-family browser \
+                         or set browser.executable in config.",
+                        config.engine
+                    )
+                })?;
 
         let mut builder = BrowserConfig::builder();
         builder = builder.chrome_executable(chrome_path);
@@ -140,6 +151,7 @@ impl BrowserSession {
             _registry_guard: registry_guard,
             snapshot_refs: HashMap::new(),
             connected_url: None,
+            remote: None,
         })
     }
 
@@ -196,6 +208,7 @@ impl BrowserSession {
             _registry_guard: None,
             snapshot_refs: HashMap::new(),
             connected_url: Some(cdp_url.to_string()),
+            remote: None,
         })
     }
 
@@ -203,6 +216,18 @@ impl BrowserSession {
     /// the Chrome process itself.
     pub fn connection_url(&self) -> Option<&str> {
         self.connected_url.as_deref()
+    }
+
+    /// Record the remote provider session backing this browser so `close()`
+    /// releases it. Called by the handler after connecting to a cloud
+    /// backend's CDP endpoint.
+    pub fn attach_remote(&mut self, remote: backends::RemoteSession) {
+        self.remote = Some(remote);
+    }
+
+    /// The remote provider session backing this browser, if any.
+    pub fn remote_session(&self) -> Option<&backends::RemoteSession> {
+        self.remote.as_ref()
     }
 
     // -- Health & Recovery --
@@ -846,6 +871,14 @@ impl BrowserSession {
     /// Close the browser gracefully: CDP close → await handler → abort.
     #[instrument(skip_all, fields(browser.action = "close"))]
     pub async fn close(self) -> Result<()> {
+        // Release the remote provider session first (best-effort, logs on
+        // failure) so a paid keep-alive session isn't left dangling. Done
+        // before dropping the CDP channel — the provider release is an
+        // independent HTTP call, but ordering keeps the intent clear.
+        if let Some(remote) = &self.remote {
+            backends::close_remote_session(&self.config, remote).await;
+        }
+
         // Abort event listener tasks
         for h in &self.event_listener_handles {
             h.abort();
@@ -1266,8 +1299,14 @@ mod tests {
             let start = SRC
                 .find(&needle)
                 .unwrap_or_else(|| panic!("method `{method}` not found"));
-            // Look at the next ~2KB of source after the signature.
-            let window = &SRC[start..start.saturating_add(2048).min(SRC.len())];
+            // Look at the next ~2KB of source after the signature. Walk the
+            // end back to a UTF-8 char boundary so a multibyte char (em dash
+            // in a doc comment) landing on the 2KB mark can't panic the slice.
+            let mut end = start.saturating_add(2048).min(SRC.len());
+            while end > start && !SRC.is_char_boundary(end) {
+                end -= 1;
+            }
+            let window = &SRC[start..end];
             assert!(
                 window.contains("snapshot_refs.clear()"),
                 "method `{method}` must clear snapshot_refs (stale refs would leak across tabs)"
@@ -1363,21 +1402,33 @@ mod tests {
     #[ignore] // Requires Chrome installed
     async fn browser_session_launch_fails_without_chrome() {
         let config = BorgBrowserConfig {
-            enabled: true,
-            headless: true,
             executable: Some("/nonexistent/chrome".to_string()),
+            engine: crate::config::BrowserEngine::Custom,
             cdp_port: 0,
-            no_sandbox: false,
-            timeout_ms: 5000,
-            startup_timeout_ms: 5000,
-            console_buffer_size: 500,
-            error_buffer_size: 200,
-            network_buffer_size: 500,
-            js_eval_timeout_ms: 10000,
-            snapshot_max_elements: 100,
-            cdp_url: None,
+            ..Default::default()
         };
         let result = BrowserSession::launch(&config).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a real Chromium-family browser; run with --ignored.
+    async fn engine_chrome_launches_and_closes() {
+        // Smoke: the engine-resolution path feeds `launch`, which must spawn a
+        // real browser and close it cleanly. Guards against the new
+        // `resolve_engine_executable` step breaking local launches.
+        let config = BorgBrowserConfig {
+            engine: crate::config::BrowserEngine::Chrome,
+            headless: true,
+            ..Default::default()
+        };
+        let session = BrowserSession::launch(&config)
+            .await
+            .expect("engine=chrome must launch a local browser");
+        session
+            .health_check()
+            .await
+            .expect("session must be healthy");
+        session.close().await.expect("close must succeed");
     }
 }

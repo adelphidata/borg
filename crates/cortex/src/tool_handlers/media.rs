@@ -149,7 +149,13 @@ pub async fn handle_browser(
     // Drop any active session whose attach mode no longer matches the live
     // setting — `/browser connect` and `/browser disconnect` take effect on
     // the very next tool call without needing an explicit signal.
-    if let Some(s) = session.as_ref() {
+    //
+    // Remote (cloud) sessions are exempt: their `connection_url` is the
+    // provider's CDP endpoint, which never equals the (unset) `cdp_url`
+    // setting, so `should_reconnect` would fire every call and recreate a
+    // paid session each time. Their lifecycle is keyed by `browser.backend`,
+    // not `cdp_url`.
+    if let Some(s) = session.as_ref().filter(|s| s.remote_session().is_none()) {
         let live = config.browser.cdp_url.as_deref();
         if crate::browser::cdp_attach::should_reconnect(s.connection_url(), live) {
             tracing::info!(
@@ -168,14 +174,39 @@ pub async fn handle_browser(
         }
     }
 
-    // Lazy-launch (or connect to) a browser session.
+    // Lazy-launch (or connect to) a browser session. Backend precedence:
+    //   1. An explicit CDP attach URL wins (operator ran `/browser connect`).
+    //   2. A remote cloud backend (browserbase / browser_use / firecrawl)
+    //      creates a session and hands us its CDP endpoint to connect to.
+    //   3. Otherwise launch a local browser for the configured engine.
     if session.is_none() {
-        let result = match config.browser.cdp_url.as_deref() {
-            Some(url) => BrowserSession::connect(&config.browser, url).await,
-            None => BrowserSession::launch(&config.browser).await,
+        let outcome = if let Some(url) = config.browser.cdp_url.as_deref() {
+            BrowserSession::connect(&config.browser, url)
+                .await
+                .map(|s| (s, None))
+        } else {
+            match crate::browser::backends::create_remote_session(
+                &config.browser,
+                &config.security.url_policy,
+            )
+            .await
+            {
+                Ok(Some(remote)) => BrowserSession::connect(&config.browser, &remote.cdp_url)
+                    .await
+                    .map(|s| (s, Some(remote))),
+                Ok(None) => BrowserSession::launch(&config.browser)
+                    .await
+                    .map(|s| (s, None)),
+                Err(e) => Err(e),
+            }
         };
-        match result {
-            Ok(s) => *session = Some(s),
+        match outcome {
+            Ok((mut s, remote)) => {
+                if let Some(remote) = remote {
+                    s.attach_remote(remote);
+                }
+                *session = Some(s);
+            }
             Err(e) => {
                 let hint = if let Some(url) = config.browser.cdp_url.as_deref() {
                     format!(
@@ -183,6 +214,14 @@ pub async fn handle_browser(
                          Hint: the configured browser may have exited or stopped serving CDP. \
                          Run `/browser disconnect` to revert to headless, or relaunch the browser \
                          with --remote-debugging-port and retry `/browser connect`."
+                    )
+                } else if config.browser.backend.is_remote() {
+                    format!(
+                        "Error opening remote browser session via '{backend}': {e}\n\
+                         Hint: verify browser.{backend}_api_key (and, for browserbase, \
+                         browser.browserbase_project_id) are set correctly, or switch \
+                         browser.backend back to 'local'.",
+                        backend = config.browser.backend
                     )
                 } else {
                     format!("Error launching browser: {e}")
@@ -783,6 +822,35 @@ mod tests {
         // chain falls back to the synthesizer default.
         assert_eq!(AudioFormat::from_str_lossy("xyz"), None);
         assert_eq!(AudioFormat::from_str_lossy(""), None);
+    }
+
+    #[tokio::test]
+    async fn handle_browser_remote_backend_without_credentials_surfaces_hint() {
+        // End-to-end routing smoke: with a cloud backend selected but no API
+        // key configured, the lazy-launch path must reach the remote-session
+        // resolver, fail with a precise error, and surface an actionable hint
+        // that names the missing setting — never silently fall back to a local
+        // launch or panic. Uses `snapshot` (no required args, no URL preflight)
+        // so we never touch the network or spawn Chrome.
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.backend = crate::config::BrowserBackend::Browserbase;
+        // No browserbase_api_key set.
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(&json!({"action": "snapshot"}), &config, &mut session)
+            .await
+            .expect("handler returns Ok with an error message, not Err");
+        let ToolOutput::Text(msg) = out else {
+            panic!("expected text output");
+        };
+        assert!(
+            msg.contains("browser.browserbase_api_key"),
+            "hint must name the missing credential setting, got: {msg}"
+        );
+        assert!(
+            session.is_none(),
+            "no session should be established when the remote backend fails"
+        );
     }
 
     #[tokio::test]

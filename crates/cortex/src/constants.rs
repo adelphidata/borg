@@ -601,6 +601,19 @@ pub const BROWSER_DEFAULT_CDP_PORT: u16 = 9222;
 /// otherwise blow LLM context.
 pub const BROWSER_SNAPSHOT_MAX_ELEMENTS: usize = 100;
 
+/// Default REST API base for the Browserbase remote-browser backend.
+pub const BROWSER_BROWSERBASE_BASE_URL: &str = "https://api.browserbase.com";
+
+/// Default REST API base for the Browser Use remote-browser backend.
+pub const BROWSER_BROWSER_USE_BASE_URL: &str = "https://api.browser-use.com";
+
+/// Default REST API base for the Firecrawl remote-browser backend.
+pub const BROWSER_FIRECRAWL_BASE_URL: &str = "https://api.firecrawl.dev";
+
+/// Default remote-session lifetime (seconds) requested from a cloud
+/// browser backend that accepts a TTL (Firecrawl).
+pub const BROWSER_FIRECRAWL_TTL_SECS: u64 = 300;
+
 // ── Gateway defaults ──────────────────────────────────────────────
 
 /// Per-sender error notification cooldown (ms). Default: 4 hours.
