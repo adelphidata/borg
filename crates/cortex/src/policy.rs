@@ -239,7 +239,7 @@ fn deobfuscate(command: &str) -> String {
 /// token position (`env rm -rf /`, `timeout 5 rm -rf /`, `nice -n1 rm -rf /`).
 const LEADING_WRAPPERS: &[&str] = &[
     "sudo", "doas", "env", "nice", "nohup", "setsid", "stdbuf", "ionice", "command", "timeout",
-    "chrt", "eatmydata", "nocache",
+    "chrt", "eatmydata", "nocache", "busybox",
 ];
 
 /// Normalize a command for more robust pattern matching:
@@ -265,7 +265,7 @@ fn normalize_command(command: &str) -> String {
 /// Remove leading [`LEADING_WRAPPERS`] and the argument tokens they consume
 /// (option flags, `VAR=value` assignments, and numeric/duration args), so the
 /// wrapped command surfaces as the first token.
-fn strip_leading_wrappers(tokens: &mut Vec<String>) {
+pub(crate) fn strip_leading_wrappers(tokens: &mut Vec<String>) {
     loop {
         let Some(first) = tokens.first() else { return };
         if !LEADING_WRAPPERS.contains(&strip_path_prefix(first)) {
@@ -608,7 +608,7 @@ fn is_download_piped_to_interpreter(fragment: &str) -> bool {
 
 /// True if a pipeline stage runs a code interpreter as its command, after
 /// stripping leading privilege/no-op wrappers and their args.
-fn stage_runs_interpreter(stage: &str) -> bool {
+pub(crate) fn stage_runs_interpreter(stage: &str) -> bool {
     let mut tokens: Vec<String> = stage.split_whitespace().map(str::to_string).collect();
     strip_leading_wrappers(&mut tokens);
     let Some(first) = tokens.first() else {

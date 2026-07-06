@@ -330,18 +330,108 @@ static CONTROL_PLANE_NEEDLES: std::sync::LazyLock<Vec<String>> = std::sync::Lazy
     needles
 });
 
+/// Bare leaf names that identify a control-plane file *by final path component
+/// alone*. Only consulted once the command has `cd`'d into a control-plane
+/// directory (see [`command_cwd_is_control_plane`]); matched by exact
+/// final-component equality (not substring) so an unrelated token like
+/// `my-secrets.txt` isn't swept up.
+const CONTROL_PLANE_BARE_LEAVES: &[&str] = &[
+    "hooks.json",
+    "borg.db",
+    "borg.db-wal",
+    "borg.db-shm",
+    "kek.enc",
+    "secrets",
+    "borgd.sock",
+    "borgd-pair.sock",
+    "borgd.pid",
+    "scheduler.tick.lock",
+];
+
+/// Substrings that identify a control-plane *directory* — the resolved
+/// `$BORG_HOME`, its `secrets/` subtree, and the conventional `.borg` /
+/// `.borg/secrets` relative forms. Used to detect a `cd` into control-plane
+/// territory so a subsequent bare-leaf write (`cd ~/.borg && … > hooks.json`)
+/// is still caught.
+static CONTROL_PLANE_DIR_NEEDLES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        let mut needles = Vec::new();
+        if let Ok(home) = crate::paths::resolve_borg_home_readonly(None) {
+            let home = home.canonicalize().unwrap_or(home);
+            needles.push(home.to_string_lossy().into_owned());
+            needles.push(home.join("secrets").to_string_lossy().into_owned());
+        }
+        needles.push(".borg/secrets".to_string());
+        needles.push(".borg".to_string());
+        needles
+    });
+
 /// True if `token`, after tilde expansion, references a control-plane file.
 /// Expansion (and its allocation) is skipped for the common case of a token
-/// without a leading `~`, where `expand_tilde` is a no-op.
-fn token_targets_control_plane(token: &str) -> bool {
+/// without a leading `~`, where `expand_tilde` is a no-op. When
+/// `include_bare_leaves` is set (the caller has established the command runs
+/// with a control-plane cwd) a token whose *final path component* is a
+/// control-plane leaf also matches.
+fn token_targets_control_plane_ext(token: &str, include_bare_leaves: bool) -> bool {
     let expanded = if token.starts_with('~') {
         std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(token))
     } else {
         std::borrow::Cow::Borrowed(token)
     };
-    CONTROL_PLANE_NEEDLES
+    if CONTROL_PLANE_NEEDLES
         .iter()
         .any(|n| expanded.contains(n.as_str()))
+    {
+        return true;
+    }
+    if include_bare_leaves {
+        // Strip a trailing slash (`secrets/`) then compare the final component.
+        let trimmed = expanded.trim_end_matches('/');
+        let final_component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        if CONTROL_PLANE_BARE_LEAVES.contains(&final_component) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if any `cd <dir>` fragment in the command changes into a control-plane
+/// directory, so subsequent bare-leaf writes (`> hooks.json`) must be treated
+/// as control-plane targets. Coarse by design — a single `cd` anywhere flips
+/// the whole command into bare-leaf mode; over-approximation here only ever
+/// denies *writes* to files that share a control-plane leaf name, never reads.
+fn command_cwd_is_control_plane(command: &str) -> bool {
+    crate::policy::command_fragments(command)
+        .into_iter()
+        .any(|frag| {
+            frag.split('|').any(|stage| {
+                let toks: Vec<&str> = stage.split_whitespace().collect();
+                let mut idx = 0;
+                // Skip leading `VAR=value` assignments (`FOO=bar cd …`).
+                while toks.get(idx).is_some_and(|t| {
+                    t.split_once('=')
+                        .is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))
+                }) {
+                    idx += 1;
+                }
+                let Some(&verb) = toks.get(idx) else {
+                    return false;
+                };
+                if command_basename(verb) != "cd" {
+                    return false;
+                }
+                toks.get(idx + 1).is_some_and(|target| {
+                    let expanded = if target.starts_with('~') {
+                        std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(target))
+                    } else {
+                        std::borrow::Cow::Borrowed(*target)
+                    };
+                    CONTROL_PLANE_DIR_NEEDLES
+                        .iter()
+                        .any(|n| expanded.contains(n.as_str()))
+                })
+            })
+        })
 }
 
 /// Basename of a command word, stripping any directory prefix (`/usr/bin/borg`
@@ -368,44 +458,76 @@ fn command_basename(word: &str) -> &str {
 /// [`crate::policy::command_fragments`] (pipelines stay whole so `… | tee <cp>`
 /// is seen).
 pub fn shell_command_targets_control_plane(command: &str) -> bool {
+    // A `cd` into `~/.borg` (or its `secrets/` subtree) means a subsequent bare
+    // leaf (`> hooks.json`, `: > kek.enc`) still lands on a control-plane file,
+    // so the whole command switches to final-component leaf matching.
+    let bare_leaves = command_cwd_is_control_plane(command);
     crate::policy::command_fragments(command)
         .into_iter()
-        .any(fragment_mutates_control_plane)
+        .any(|frag| fragment_mutates_control_plane(&frag, bare_leaves))
 }
 
-fn fragment_mutates_control_plane(frag: &str) -> bool {
+fn fragment_mutates_control_plane(frag: &str, bare_leaves: bool) -> bool {
     // Redirect: a control-plane path on the *write* side of `>` / `>>`. Reading
     // a control-plane file into a redirect elsewhere (`cat <cp> > /tmp/x`) is
     // not flagged because the needle sits before the operator. Checked on the
     // whole fragment since the operator binds within a pipeline stage anyway.
-    if redirect_target_is_control_plane(frag) {
+    if redirect_target_is_control_plane(frag, bare_leaves) {
         return true;
     }
 
     // Inspect each pipeline stage on its own, so the writing command can sit
     // anywhere in `echo x | tee <cp>` or `cat x | dd of=<cp>`.
-    frag.split('|').any(stage_verb_mutates_control_plane)
+    frag.split('|')
+        .any(|stage| stage_verb_mutates_control_plane(stage, bare_leaves))
 }
 
 /// Per-pipeline-stage verb analysis: `borg settings set/unset`, `sqlite3` on
 /// the DB, and the in-place / destination-mutating file verbs.
-fn stage_verb_mutates_control_plane(stage: &str) -> bool {
-    let toks: Vec<&str> = stage.split_whitespace().collect();
-    if toks.is_empty() {
+fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
+    let raw: Vec<&str> = stage.split_whitespace().collect();
+    if raw.is_empty() {
         return false;
     }
 
     // `borg settings set|unset …` — mutating the security config via the CLI.
-    // `borg settings get|list` stay allowed.
-    for w in toks.windows(3) {
+    // `borg settings get|list` stay allowed. Checked on the raw tokens (before
+    // wrapper stripping) so `borg` at any position is seen.
+    for w in raw.windows(3) {
         if command_basename(w[0]) == "borg" && w[1] == "settings" && matches!(w[2], "set" | "unset")
         {
             return true;
         }
     }
 
-    let any_ref = || toks.iter().any(|t| token_targets_control_plane(t));
-    match command_basename(toks[0]) {
+    // An interpreter (`python -c 'open("…/.borg/hooks.json","w")…'`, `perl -e`,
+    // `bash -c`) can open any referenced control-plane file for writing, and we
+    // can't parse its intent from the outside. Treat any control-plane
+    // reference from an interpreter stage as a denial — reads via `cat` stay
+    // available, so the false-positive cost is a redirect the agent can phrase
+    // differently.
+    if crate::policy::stage_runs_interpreter(stage)
+        && raw
+            .iter()
+            .any(|t| token_targets_control_plane_ext(t, bare_leaves))
+    {
+        return true;
+    }
+
+    // Strip leading privilege/no-op wrappers (`sudo`, `env`, `busybox`, …) so
+    // `busybox tee <cp>` / `env dd of=<cp>` surface their real write verb.
+    let mut owned: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
+    crate::policy::strip_leading_wrappers(&mut owned);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let Some(&first) = toks.first() else {
+        return false;
+    };
+
+    let any_ref = || {
+        toks.iter()
+            .any(|t| token_targets_control_plane_ext(t, bare_leaves))
+    };
+    match command_basename(first) {
         // `sqlite3 <control-plane db>` — the encrypted DB has no legitimate
         // agent use and sqlite3 opens read-write by default.
         "sqlite3" => any_ref(),
@@ -421,12 +543,14 @@ fn stage_verb_mutates_control_plane(stage: &str) -> bool {
         }
         "dd" => toks.iter().any(|t| {
             t.strip_prefix("of=")
-                .is_some_and(token_targets_control_plane)
+                .is_some_and(|p| token_targets_control_plane_ext(p, bare_leaves))
         }),
         // `cp`/`mv`/`install` overwrite their *final* argument (the
         // destination), so a control-plane *source* (`cp <cp> /tmp`) is not
         // flagged.
-        "cp" | "mv" | "install" => toks.last().is_some_and(|d| token_targets_control_plane(d)),
+        "cp" | "mv" | "install" => toks
+            .last()
+            .is_some_and(|d| token_targets_control_plane_ext(d, bare_leaves)),
         _ => false,
     }
 }
@@ -436,11 +560,11 @@ fn stage_verb_mutates_control_plane(stage: &str) -> bool {
 /// operator at the head of the following segment; a control-plane path *before*
 /// a redirect (`cat <cp> > /tmp/x`) is a read and stays in the prior segment, so
 /// it is not flagged. `>&` fd-dup targets (`&1`) never match a path needle.
-fn redirect_target_is_control_plane(frag: &str) -> bool {
+fn redirect_target_is_control_plane(frag: &str, bare_leaves: bool) -> bool {
     frag.split('>').skip(1).any(|seg| {
         seg.split_whitespace()
             .next()
-            .is_some_and(token_targets_control_plane)
+            .is_some_and(|t| token_targets_control_plane_ext(t, bare_leaves))
     })
 }
 
@@ -710,6 +834,61 @@ mod tests {
             assert!(
                 shell_command_targets_control_plane(cmd),
                 "expected control-plane guard to fire for: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_guard_denies_cwd_relative_and_wrapped_and_interpreter_bypasses() {
+        // Regression (H3): the control-plane guard must not be dodged by (a)
+        // `cd`-ing into ~/.borg then writing a bare leaf, (b) prefixing the write
+        // verb with a wrapper binary, or (c) driving the write through an
+        // interpreter. All rely on the home-independent `.borg` relative needles.
+        for cmd in [
+            // (a) cwd-relative bare leaf after a cd into the control-plane dir.
+            "cd ~/.borg && printf '{}' > hooks.json",
+            "cd ~/.borg && echo x >> hooks.json",
+            "cd ~/.borg/secrets && : > kek.enc",
+            "cd ~/.borg && tee hooks.json",
+            "cd ~/.borg/secrets && truncate -s0 kek.enc",
+            // (b) wrapper binaries in front of the write verb.
+            "busybox tee ~/.borg/hooks.json",
+            "sudo tee ~/.borg/hooks.json",
+            "env dd of=~/.borg/borg.db",
+            "busybox dd of=~/.borg/secrets/kek.enc",
+            // (c) interpreter opening a control-plane file for writing.
+            "python3 -c 'open(\"~/.borg/hooks.json\",\"w\").write(x)'",
+            "perl -e 'open(F,\">\",\"~/.borg/hooks.json\")'",
+            "bash -c 'echo x > ~/.borg/hooks.json'",
+        ] {
+            assert!(
+                shell_command_targets_control_plane(cmd),
+                "expected control-plane guard to fire for bypass attempt: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_guard_cwd_relative_does_not_overblock() {
+        // The cwd-into-control-plane heuristic must only catch *writes* to
+        // control-plane leaf names — a read there, or a same-named file written
+        // outside ~/.borg, stays allowed.
+        for cmd in [
+            // Read inside ~/.borg is fine (no write verb / redirect).
+            "cd ~/.borg && cat hooks.json",
+            // A file literally named hooks.json written outside the control
+            // plane must not be swept up.
+            "cd /tmp && echo x > hooks.json",
+            // Unrelated write inside ~/.borg (leaf name is not control-plane).
+            "cd ~/.borg && echo x > notes.md",
+            // Interpreter with no control-plane reference stays allowed.
+            "python3 -c 'print(1)'",
+            // A token that merely contains 'secrets' is not a bare leaf.
+            "cd ~/.borg && echo x > my-secrets.txt",
+        ] {
+            assert!(
+                !shell_command_targets_control_plane(cmd),
+                "control-plane guard should NOT fire for benign command: {cmd:?}"
             );
         }
     }
