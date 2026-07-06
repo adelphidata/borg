@@ -718,7 +718,12 @@ impl Transport for BedrockTransport {
         let region =
             crate::llm::bedrock::resolve_region(request.llm_config.bedrock_region.as_deref())
                 .unwrap_or_else(|| "region-unresolved".to_string());
-        Ok(url_for_model(&region, request.model, stream))
+        let base = crate::llm::bedrock::resolve_endpoint_base(
+            &region,
+            request.llm_config.bedrock_endpoint_url.as_deref(),
+            request.llm_config.bedrock_use_fips,
+        )?;
+        Ok(url_for_model(&base, request.model, stream))
     }
 
     fn build_streaming_request(
@@ -1544,6 +1549,54 @@ mod tests {
         assert!(
             unary_url.ends_with("/converse"),
             "stream=false must select converse: {unary_url}"
+        );
+    }
+
+    #[test]
+    fn bedrock_transport_endpoint_honors_fips_and_custom_override() {
+        use crate::config::LlmConfig;
+        // FIPS toggle selects the -fips host for a GovCloud region.
+        let mut fips_cfg = LlmConfig::default();
+        fips_cfg.bedrock_region = Some("us-gov-west-1".to_string());
+        fips_cfg.bedrock_use_fips = true;
+        let fips_box: &'static LlmConfig = Box::leak(Box::new(fips_cfg));
+        let fips_req = TransportRequest {
+            provider: Provider::Bedrock,
+            model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages: &[],
+            tools: None,
+            llm_config: fips_box,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let fips_url = BedrockTransport.endpoint(&fips_req, false).expect("endpoint");
+        assert_eq!(
+            fips_url,
+            "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse",
+            "FIPS toggle must select the -fips host"
+        );
+
+        // An explicit PrivateLink endpoint wins over FIPS derivation.
+        let mut vpce_cfg = LlmConfig::default();
+        vpce_cfg.bedrock_region = Some("us-gov-west-1".to_string());
+        vpce_cfg.bedrock_use_fips = true;
+        vpce_cfg.bedrock_endpoint_url =
+            Some("vpce-0abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com".to_string());
+        let vpce_box: &'static LlmConfig = Box::leak(Box::new(vpce_cfg));
+        let vpce_req = TransportRequest {
+            provider: Provider::Bedrock,
+            model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages: &[],
+            tools: None,
+            llm_config: vpce_box,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let vpce_url = BedrockTransport.endpoint(&vpce_req, true).expect("endpoint");
+        assert_eq!(
+            vpce_url,
+            "https://vpce-0abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream",
+            "explicit endpoint override must win over FIPS derivation"
         );
     }
 

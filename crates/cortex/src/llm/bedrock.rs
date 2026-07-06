@@ -19,13 +19,180 @@ pub(crate) struct AwsCredentials {
     pub(crate) session_token: Option<String>,
 }
 
-pub(crate) fn url_for_model(region: &str, model: &str, stream: bool) -> String {
+/// Compose the full Converse / ConverseStream URL for a model against a
+/// resolved base endpoint (scheme + host, no trailing slash needed).
+pub(crate) fn url_for_model(base: &str, model: &str, stream: bool) -> String {
     let suffix = if stream {
         "converse-stream"
     } else {
         "converse"
     };
-    format!("https://bedrock-runtime.{region}.amazonaws.com/model/{model}/{suffix}")
+    let base = base.trim_end_matches('/');
+    format!("{base}/model/{model}/{suffix}")
+}
+
+/// Rebuild a Bedrock request URL by swapping only the origin (scheme, host,
+/// port) of the `endpoint()` hint with the freshly-resolved `base`, preserving
+/// the request path.
+///
+/// The path already carries any operator base-path from the override (the hint
+/// was built with `url_for_model(base_with_path, …)`), so rebuilding as
+/// `base + path` would double the base-path prefix (e.g. `/bedrock/bedrock/…`)
+/// and 404 every PrivateLink / gateway request. Swapping the origin also lets
+/// the async credential chain correct a placeholder region in the derived host
+/// before signing.
+pub(crate) fn rebuild_request_url(request_url: &str, base: &str) -> Result<String> {
+    let mut parsed = Url::parse(request_url).context("parse Bedrock URL hint")?;
+    let base = Url::parse(base).context("parse resolved Bedrock endpoint base")?;
+    parsed
+        .set_scheme(base.scheme())
+        .map_err(|_| anyhow::anyhow!("invalid scheme in resolved Bedrock endpoint"))?;
+    parsed
+        .set_host(base.host_str())
+        .context("apply resolved Bedrock host")?;
+    parsed
+        .set_port(base.port())
+        .map_err(|_| anyhow::anyhow!("invalid port in resolved Bedrock endpoint"))?;
+    Ok(parsed.to_string())
+}
+
+/// Normalize an operator-supplied Bedrock endpoint override into a
+/// `scheme://host[/base-path]` URL with no trailing slash. A bare host (no
+/// scheme) defaults to `https://`. Returns `None` for blank input.
+pub(crate) fn normalize_endpoint_override(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("https://{trimmed}"))
+    }
+}
+
+/// AWS regions for which AWS publishes a `bedrock-runtime-fips` endpoint.
+/// Toggling FIPS for any other region derives a host that does not resolve, so
+/// we warn rather than fail silently at connect time.
+fn region_has_fips_endpoint(region: &str) -> bool {
+    matches!(
+        region,
+        "us-east-1"
+            | "us-east-2"
+            | "us-west-1"
+            | "us-west-2"
+            | "us-gov-east-1"
+            | "us-gov-west-1"
+            | "ca-central-1"
+    )
+}
+
+/// Whether a host is a cloud instance-metadata endpoint. Bedrock requests are
+/// SigV4-signed with live AWS credentials (including the session token), so an
+/// endpoint override pointing at IMDS / ECS-credential / other-cloud metadata
+/// services would let a poisoned setting exfiltrate those credentials. This
+/// blocks the entire link-local range (covers 169.254.169.254 IMDS and
+/// 169.254.170.2 ECS credentials) plus the known metadata FQDNs, while leaving
+/// RFC1918 addresses alone so PrivateLink / VPC-endpoint hosts still work.
+fn is_cloud_metadata_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                // fe80::/10 link-local, or the AWS IMDS IPv6 address.
+                (seg[0] & 0xffc0) == 0xfe80
+                    || seg == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            }
+        };
+    }
+    matches!(
+        h.to_ascii_lowercase().as_str(),
+        "metadata.google.internal" | "metadata.goog" | "metadata"
+    )
+}
+
+/// Validate and normalize an operator-supplied endpoint override into a base URL.
+///
+/// Rejects non-`https` schemes (Bedrock requests carry SigV4 credentials and
+/// must never travel in cleartext) and cloud instance-metadata hosts (an
+/// attacker-controlled override would otherwise sign requests with live AWS
+/// credentials straight to IMDS / ECS metadata).
+fn validate_endpoint_override(raw: &str, source: &str) -> Result<String> {
+    let normalized = normalize_endpoint_override(raw)
+        .ok_or_else(|| anyhow::anyhow!("{source} endpoint override is blank"))?;
+    let url = Url::parse(&normalized)
+        .with_context(|| format!("{source} endpoint override is not a valid URL: {normalized}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!(
+            "{source} endpoint override must use https (got {}://); Bedrock requests carry SigV4 \
+             credentials and must not travel in cleartext",
+            url.scheme()
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{source} endpoint override has no host: {normalized}"))?;
+    if is_cloud_metadata_host(host) {
+        anyhow::bail!(
+            "{source} endpoint override host {host} is a cloud instance-metadata endpoint; \
+             refusing to sign Bedrock requests with live AWS credentials to it"
+        );
+    }
+    Ok(normalized)
+}
+
+/// Validate an operator endpoint override (https-only, non cloud-metadata
+/// host) and return the normalized base URL. Exposed for the air-gap gate,
+/// which must apply the same guard before treating an override as a private
+/// PrivateLink path.
+pub(crate) fn validated_endpoint_override(raw: &str) -> Result<String> {
+    validate_endpoint_override(raw, "llm.bedrock_endpoint_url")
+}
+
+/// Resolve the base Bedrock runtime endpoint (scheme + host, no path).
+///
+/// Precedence: explicit `endpoint_override` (from `llm.bedrock_endpoint_url`) →
+/// the `AWS_ENDPOINT_URL_BEDROCK` environment variable → the derived
+/// `bedrock-runtime[-fips].{region}.amazonaws.com` host.
+///
+/// GovCloud regions (`us-gov-west-1`, `us-gov-east-1`) live in the same
+/// `.amazonaws.com` DNS suffix as the commercial partition, so the derived host
+/// is correct for them without special-casing. `use_fips` selects the
+/// FIPS 140-2 validated `-fips` host required by many US-government compliance
+/// regimes. An explicit endpoint override always wins over the FIPS toggle —
+/// airgapped / PrivateLink (VPC interface endpoint) deployments point Borg at a
+/// private hostname that already terminates at the operator's chosen endpoint.
+///
+/// Overrides are validated: https-only and never a cloud-metadata host, so a
+/// poisoned setting cannot redirect SigV4-signed, credential-bearing requests.
+pub(crate) fn resolve_endpoint_base(
+    region: &str,
+    endpoint_override: Option<&str>,
+    use_fips: bool,
+) -> Result<String> {
+    if let Some(raw) = endpoint_override.filter(|s| !s.trim().is_empty()) {
+        return validate_endpoint_override(raw, "llm.bedrock_endpoint_url");
+    }
+    if let Ok(env) = std::env::var("AWS_ENDPOINT_URL_BEDROCK") {
+        if !env.trim().is_empty() {
+            return validate_endpoint_override(&env, "AWS_ENDPOINT_URL_BEDROCK");
+        }
+    }
+    if use_fips && !region_has_fips_endpoint(region) {
+        tracing::warn!(
+            region,
+            "llm.bedrock_use_fips is set but AWS publishes no Bedrock FIPS endpoint for this \
+             region; the derived bedrock-runtime-fips host will not resolve"
+        );
+    }
+    let host = if use_fips {
+        format!("bedrock-runtime-fips.{region}.amazonaws.com")
+    } else {
+        format!("bedrock-runtime.{region}.amazonaws.com")
+    };
+    Ok(format!("https://{host}"))
 }
 
 pub(crate) fn resolve_region(explicit_region: Option<&str>) -> Option<String> {
@@ -409,17 +576,14 @@ mod tests {
 
     #[test]
     fn url_for_model_distinguishes_stream_and_unary() {
-        let unary = url_for_model(
-            "us-east-1",
-            "anthropic.claude-3-7-sonnet-20250219-v1:0",
-            false,
-        );
+        let base = "https://bedrock-runtime.us-east-1.amazonaws.com";
+        let unary = url_for_model(base, "anthropic.claude-3-7-sonnet-20250219-v1:0", false);
         assert_eq!(
             unary,
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
         );
         let stream = url_for_model(
-            "eu-west-2",
+            "https://bedrock-runtime.eu-west-2.amazonaws.com",
             "anthropic.claude-3-5-haiku-20241022-v1:0",
             true,
         );
@@ -427,6 +591,240 @@ mod tests {
             stream,
             "https://bedrock-runtime.eu-west-2.amazonaws.com/model/anthropic.claude-3-5-haiku-20241022-v1:0/converse-stream"
         );
+    }
+
+    #[test]
+    fn url_for_model_trims_trailing_slash_on_base() {
+        // A PrivateLink override may arrive with a trailing slash; the joined
+        // path must not double up separators.
+        let url = url_for_model(
+            "https://vpce-abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com/",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            false,
+        );
+        assert_eq!(
+            url,
+            "https://vpce-abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
+        );
+    }
+
+    #[test]
+    fn rebuild_request_url_swaps_region_host_without_base_path() {
+        // Derived (no base-path) case: the async chain corrects the region in
+        // the host while preserving the model path.
+        let hint = url_for_model(
+            "https://bedrock-runtime.region-unresolved.amazonaws.com",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            false,
+        );
+        let out = rebuild_request_url(
+            &hint,
+            "https://bedrock-runtime.us-gov-west-1.amazonaws.com",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "https://bedrock-runtime.us-gov-west-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
+        );
+    }
+
+    #[test]
+    fn rebuild_request_url_preserves_operator_base_path_without_doubling() {
+        // Regression: a gateway/PrivateLink base-path override must not be
+        // duplicated into `/bedrock/bedrock/...` (which 404s every request).
+        let base = "https://ai-gateway.corp/bedrock";
+        let hint = url_for_model(
+            base,
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            true,
+        );
+        // The hint already carries the base-path once.
+        assert_eq!(
+            hint,
+            "https://ai-gateway.corp/bedrock/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream"
+        );
+        let out = rebuild_request_url(&hint, base).unwrap();
+        assert_eq!(
+            out,
+            "https://ai-gateway.corp/bedrock/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream",
+            "base-path must appear exactly once"
+        );
+        assert!(!out.contains("/bedrock/bedrock/"), "base-path was doubled: {out}");
+    }
+
+    #[test]
+    fn rebuild_request_url_preserves_custom_port() {
+        let hint = url_for_model(
+            "https://10.20.30.40:8443",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            false,
+        );
+        let out = rebuild_request_url(&hint, "https://10.20.30.40:8443").unwrap();
+        assert_eq!(
+            out,
+            "https://10.20.30.40:8443/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_override_adds_scheme_and_trims() {
+        assert_eq!(
+            normalize_endpoint_override("bedrock.internal.example"),
+            Some("https://bedrock.internal.example".to_string())
+        );
+        assert_eq!(
+            normalize_endpoint_override("http://10.0.0.5:8443/"),
+            Some("http://10.0.0.5:8443".to_string())
+        );
+        assert_eq!(
+            normalize_endpoint_override("https://host/base/"),
+            Some("https://host/base".to_string())
+        );
+        assert_eq!(normalize_endpoint_override("   "), None);
+        assert_eq!(normalize_endpoint_override(""), None);
+    }
+
+    #[test]
+    fn resolve_endpoint_base_derives_standard_host() {
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert_eq!(
+            resolve_endpoint_base("us-east-1", None, false).unwrap(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_govcloud_region_uses_amazonaws_com() {
+        // GovCloud regions share the commercial .amazonaws.com suffix; no
+        // partition special-casing needed.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert_eq!(
+            resolve_endpoint_base("us-gov-west-1", None, false).unwrap(),
+            "https://bedrock-runtime.us-gov-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_fips_selects_fips_host() {
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert_eq!(
+            resolve_endpoint_base("us-gov-west-1", None, true).unwrap(),
+            "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_explicit_override_beats_fips_and_env() {
+        // Airgapped / PrivateLink: an explicit endpoint always wins, even with
+        // FIPS requested and a differing env var set.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::set("AWS_ENDPOINT_URL_BEDROCK", "https://env-endpoint.example");
+        assert_eq!(
+            resolve_endpoint_base(
+                "us-gov-west-1",
+                Some("vpce-0abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com"),
+                true,
+            )
+            .unwrap(),
+            "https://vpce-0abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_env_var_used_when_no_explicit_override() {
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::set("AWS_ENDPOINT_URL_BEDROCK", "https://env-endpoint.internal/");
+        assert_eq!(
+            resolve_endpoint_base("us-east-1", None, false).unwrap(),
+            "https://env-endpoint.internal"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_rejects_http_override() {
+        // http:// would send SigV4 credentials in cleartext; must be refused.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        let err = resolve_endpoint_base("us-east-1", Some("http://10.0.0.5:8443"), false)
+            .expect_err("http override must be rejected");
+        assert!(
+            err.to_string().contains("https"),
+            "error should mention https requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_rejects_imds_metadata_override() {
+        // The classic SSRF-to-credential-exfil target must be refused even
+        // though it is https.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        let err =
+            resolve_endpoint_base("us-east-1", Some("https://169.254.169.254/latest"), false)
+                .expect_err("IMDS override must be rejected");
+        assert!(
+            err.to_string().contains("metadata"),
+            "error should mention metadata endpoint: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_rejects_ecs_credentials_metadata_override() {
+        // 169.254.170.2 is the ECS task-credentials endpoint — also link-local.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert!(
+            resolve_endpoint_base("us-east-1", Some("https://169.254.170.2/creds"), false)
+                .is_err(),
+            "ECS credential metadata host must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_rejects_gcp_metadata_fqdn_override() {
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert!(
+            resolve_endpoint_base("us-east-1", Some("https://metadata.google.internal"), false)
+                .is_err(),
+            "GCP metadata FQDN must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_rejects_metadata_host_from_env_var() {
+        // The guard must apply to the env-var source too, not just the setting.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::set("AWS_ENDPOINT_URL_BEDROCK", "https://169.254.169.254");
+        assert!(
+            resolve_endpoint_base("us-east-1", None, false).is_err(),
+            "metadata host via AWS_ENDPOINT_URL_BEDROCK must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_allows_rfc1918_privatelink_host() {
+        // PrivateLink / VPC-endpoint hosts resolve to RFC1918 addresses and
+        // MUST remain reachable — the metadata guard is link-local only.
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert_eq!(
+            resolve_endpoint_base("us-gov-west-1", Some("https://10.20.30.40:8443"), false)
+                .unwrap(),
+            "https://10.20.30.40:8443"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_base_fips_supported_region_ok() {
+        let _lock = super::env_test_lock();
+        let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
+        assert!(region_has_fips_endpoint("us-gov-west-1"));
+        assert!(region_has_fips_endpoint("us-east-1"));
+        assert!(!region_has_fips_endpoint("eu-west-2"));
     }
 
     #[test]
@@ -438,7 +836,7 @@ mod tests {
         };
         let client = Client::new();
         let url = url_for_model(
-            "us-east-1",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
             "anthropic.claude-3-7-sonnet-20250219-v1:0",
             false,
         );

@@ -109,7 +109,9 @@ fn visible_entries(config: &Config) -> Vec<&'static SettingEntry> {
         .iter()
         .filter(|e| match e.key {
             "llm.api_key" | "llm.api_key_env" => provider_uses_api_key,
-            "llm.bedrock_region" => provider_is_bedrock,
+            "llm.bedrock_region" | "llm.bedrock_endpoint_url" | "llm.bedrock_use_fips" => {
+                provider_is_bedrock
+            }
             "llm.azure_resource" | "llm.azure_deployment" | "llm.azure_api_version" => {
                 provider_is_azure_openai
             }

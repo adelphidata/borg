@@ -175,6 +175,8 @@ fn bedrock_visibility_hides_api_key_rows_and_shows_region() {
     cfg.llm.provider = Some("bedrock".to_string());
     let entries = visible_entries(&cfg);
     assert!(entries.iter().any(|e| e.key == "llm.bedrock_region"));
+    assert!(entries.iter().any(|e| e.key == "llm.bedrock_endpoint_url"));
+    assert!(entries.iter().any(|e| e.key == "llm.bedrock_use_fips"));
     assert!(!entries.iter().any(|e| e.key == "llm.api_key"));
     assert!(!entries.iter().any(|e| e.key == "llm.api_key_env"));
 }
@@ -184,7 +186,11 @@ fn api_key_providers_hide_bedrock_region_row() {
     let mut cfg = Config::default();
     cfg.llm.provider = Some("openrouter".to_string());
     let entries = visible_entries(&cfg);
+    // All Bedrock-only rows — region, endpoint URL, FIPS toggle — must hide
+    // under a non-Bedrock provider, not just the region row.
     assert!(!entries.iter().any(|e| e.key == "llm.bedrock_region"));
+    assert!(!entries.iter().any(|e| e.key == "llm.bedrock_endpoint_url"));
+    assert!(!entries.iter().any(|e| e.key == "llm.bedrock_use_fips"));
     assert!(entries.iter().any(|e| e.key == "llm.api_key"));
     assert!(entries.iter().any(|e| e.key == "llm.api_key_env"));
 }

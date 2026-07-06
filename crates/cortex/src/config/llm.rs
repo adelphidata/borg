@@ -129,6 +129,25 @@ pub struct LlmConfig {
     /// standard AWS region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, profile).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bedrock_region: Option<String>,
+    /// Full base endpoint URL for the Bedrock runtime, overriding the derived
+    /// `bedrock-runtime.{region}.amazonaws.com` host. Required for airgapped /
+    /// GovCloud deployments that reach Bedrock through a VPC interface endpoint
+    /// (PrivateLink), e.g.
+    /// `https://vpce-0abc-xyz.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com`.
+    /// Also honored via the `AWS_ENDPOINT_URL_BEDROCK` environment variable when
+    /// unset. Scheme is optional (defaults to `https`); trailing slash trimmed.
+    /// Must be `https` and must not point at a cloud instance-metadata host —
+    /// requests carry live SigV4 credentials. Under air-gap mode
+    /// (`providers.outbound_allowed = false`) Bedrock is admitted only when this
+    /// override resolves to a private/loopback address; otherwise it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_endpoint_url: Option<String>,
+    /// Use FIPS 140-2 validated Bedrock endpoints
+    /// (`bedrock-runtime-fips.{region}.amazonaws.com`). Required by many US
+    /// government / GovCloud compliance regimes. Ignored when
+    /// `bedrock_endpoint_url` is set (an explicit endpoint wins).
+    #[serde(default)]
+    pub bedrock_use_fips: bool,
     /// Azure OpenAI resource name — e.g. `"my-resource"` →
     /// `https://my-resource.openai.azure.com`. Required when `provider =
     /// azure-openai` unless `llm.base_url` is set directly.
@@ -384,6 +403,8 @@ impl Default for LlmConfig {
             stream_chunk_timeout_secs: DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
             base_url: None,
             bedrock_region: None,
+            bedrock_endpoint_url: None,
+            bedrock_use_fips: false,
             azure_resource: None,
             azure_deployment: None,
             azure_api_version: None,

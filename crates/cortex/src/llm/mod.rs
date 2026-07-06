@@ -595,6 +595,50 @@ pub(crate) fn compose_azure_openai_url(cfg: &crate::config::LlmConfig) -> anyhow
     ))
 }
 
+/// Whether a configured Bedrock endpoint override provably targets a private
+/// or loopback address — the only case where Bedrock is permitted under
+/// air-gap mode (`providers.outbound_allowed = false`).
+///
+/// Fail-closed: a missing override, an https-invalid or cloud-metadata host, a
+/// host that does not resolve, or *any* resolved address that is publicly
+/// routable all return `false`, so the caller falls back to the standard
+/// air-gap refusal. Requiring every resolved address to be private prevents a
+/// split-horizon / dual-homed name from smuggling a public route past the gate.
+async fn bedrock_endpoint_is_private(endpoint_override: Option<&str>) -> bool {
+    let Some(raw) = endpoint_override.filter(|s| !s.trim().is_empty()) else {
+        return false;
+    };
+    // Same guard the request path applies: https-only, non cloud-metadata.
+    let Ok(base) = crate::llm::bedrock::validated_endpoint_override(raw) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(&base) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    // VPC / split-horizon DNS resolves the endpoint to its private address
+    // locally, so this lookup does not itself breach the air-gap.
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                tracing::warn!(
+                    host = host.as_str(),
+                    error = %e,
+                    "Bedrock endpoint override did not resolve; refusing under air-gap policy"
+                );
+                return false;
+            }
+        };
+    !addrs.is_empty()
+        && addrs
+            .iter()
+            .all(|a| crate::url_policy::is_private_class(&a.ip()))
+}
+
 impl LlmClient {
     /// Effective API URL: config override → provider default, with provider-
     /// specific normalization (e.g. Gemini base-URL suffix correction).
@@ -637,11 +681,23 @@ impl LlmClient {
         // Air-gap policy: when `providers.outbound_allowed = false` we refuse
         // any non-Local provider before constructing the client so no HTTP
         // socket is opened against a public endpoint.
-        crate::providers::ProviderRegistry::check_builtin_air_gap(
-            provider,
-            config.providers.outbound_allowed,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        //
+        // Bedrock is the one documented exception: an airgapped GovCloud
+        // deployment reaches Bedrock over a PrivateLink / VPC interface endpoint
+        // whose host resolves to a private address. When `bedrock_endpoint_url`
+        // provably resolves to a private/loopback address we permit it; every
+        // other case (no override, public host, unresolvable host) fails closed
+        // through the standard refusal.
+        let bedrock_privatelink_ok = provider == Provider::Bedrock
+            && !config.providers.outbound_allowed
+            && bedrock_endpoint_is_private(config.llm.bedrock_endpoint_url.as_deref()).await;
+        if !bedrock_privatelink_ok {
+            crate::providers::ProviderRegistry::check_builtin_air_gap(
+                provider,
+                config.providers.outbound_allowed,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
 
         // Compose the Azure OpenAI URL from settings at construction time so
         // misconfiguration surfaces as "borg refuses to start" rather than a
@@ -1642,14 +1698,29 @@ impl LlmClient {
         let fut = if self.provider == Provider::Bedrock {
             let client = self.client.clone();
             let region_hint = self.llm_config.bedrock_region.clone();
+            let endpoint_override = self.llm_config.bedrock_endpoint_url.clone();
+            let use_fips = self.llm_config.bedrock_use_fips;
             async move {
                 let (region, credentials) =
                     crate::llm::bedrock::load_region_and_credentials(region_hint.as_deref())
                         .await
                         .map_err(|e| anyhow::anyhow!("resolve AWS credentials for Bedrock: {e}"))?;
-                let parsed_url = url::Url::parse(&request_url).context("parse Bedrock URL hint")?;
-                let path = parsed_url.path().to_string();
-                let final_url = format!("https://bedrock-runtime.{region}.amazonaws.com{path}");
+                // Rebuild the URL against the *resolved* region/endpoint so the
+                // SigV4 credential scope and host match — the endpoint() hint may
+                // have been built with a placeholder region before the async
+                // chain resolved the real one. Honors a custom endpoint override
+                // (PrivateLink / VPC) and the FIPS toggle rather than pinning the
+                // commercial public host.
+                let base = crate::llm::bedrock::resolve_endpoint_base(
+                    &region,
+                    endpoint_override.as_deref(),
+                    use_fips,
+                )?;
+                let final_url = crate::llm::bedrock::rebuild_request_url(&request_url, &base)?;
+                let path = url::Url::parse(&final_url)
+                    .context("parse rebuilt Bedrock URL")?
+                    .path()
+                    .to_string();
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
                     reqwest::header::CONTENT_TYPE,
@@ -2113,6 +2184,51 @@ impl LlmClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bedrock_air_gap_tests {
+    use super::bedrock_endpoint_is_private;
+
+    // IP-literal endpoints resolve without touching the network, so these
+    // exercise the classification logic hermetically.
+
+    #[tokio::test]
+    async fn private_when_override_is_loopback() {
+        assert!(bedrock_endpoint_is_private(Some("https://127.0.0.1:8443")).await);
+    }
+
+    #[tokio::test]
+    async fn private_when_override_is_rfc1918() {
+        // The airgapped GovCloud PrivateLink case: a private VPC-endpoint IP.
+        assert!(bedrock_endpoint_is_private(Some("https://10.20.30.40:8443")).await);
+    }
+
+    #[tokio::test]
+    async fn not_private_when_override_absent() {
+        // Fail-closed: no override → not an airgapped path, refuse.
+        assert!(!bedrock_endpoint_is_private(None).await);
+        assert!(!bedrock_endpoint_is_private(Some("   ")).await);
+    }
+
+    #[tokio::test]
+    async fn not_private_when_override_is_public_ip() {
+        // A publicly-routable literal must fail the gate even though it is a
+        // valid https endpoint.
+        assert!(!bedrock_endpoint_is_private(Some("https://52.94.1.1")).await);
+    }
+
+    #[tokio::test]
+    async fn not_private_when_override_is_http() {
+        // http:// is rejected by the shared validation before resolution.
+        assert!(!bedrock_endpoint_is_private(Some("http://10.20.30.40:8443")).await);
+    }
+
+    #[tokio::test]
+    async fn not_private_when_override_is_metadata_host() {
+        // IMDS must never be treated as a legitimate private endpoint.
+        assert!(!bedrock_endpoint_is_private(Some("https://169.254.169.254")).await);
+    }
+}
 
 #[cfg(test)]
 mod ollama_url_tests {
