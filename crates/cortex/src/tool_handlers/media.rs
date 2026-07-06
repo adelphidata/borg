@@ -146,30 +146,20 @@ pub async fn handle_browser(
         }
     }
 
-    // Drop any active session whose attach mode no longer matches the live
-    // setting — `/browser connect` and `/browser disconnect` take effect on
-    // the very next tool call without needing an explicit signal.
-    //
-    // Remote (cloud) sessions are exempt: their `connection_url` is the
-    // provider's CDP endpoint, which never equals the (unset) `cdp_url`
-    // setting, so `should_reconnect` would fire every call and recreate a
-    // paid session each time. Their lifecycle is keyed by `browser.backend`,
-    // not `cdp_url`.
-    if let Some(s) = session.as_ref().filter(|s| s.remote_session().is_none()) {
-        let live = config.browser.cdp_url.as_deref();
-        if crate::browser::cdp_attach::should_reconnect(s.connection_url(), live) {
-            tracing::info!(
-                prev = ?s.connection_url(),
-                next = ?live,
-                "browser CDP setting drifted — closing prior session",
-            );
-            if let Some(prev) = session.take() {
-                // Close failures are non-fatal (CDP channel may already be
-                // dead) but must be logged — without this, a broken
-                // disconnect path is invisible.
-                if let Err(e) = prev.close().await {
-                    tracing::warn!(error = %e, "failed to close prior browser session before reattach");
-                }
+    // Drop any active session whose backend/engine/attach settings drifted since
+    // it was created — `/browser connect|disconnect`, a backend switch (local ↔
+    // cloud, or one cloud provider to another), and an engine change all take
+    // effect on the very next tool call without needing an explicit signal.
+    // `is_stale` compares the session's actual attach mode against the live
+    // config; a stale cloud session is released on the provider by `close()`, so
+    // switching away never leaks (or keeps billing) the old keep-alive session.
+    if session.as_ref().is_some_and(|s| s.is_stale(&config.browser)) {
+        if let Some(prev) = session.take() {
+            tracing::info!("browser backend/engine setting drifted — closing prior session");
+            // Close failures are non-fatal (CDP channel may already be dead) but
+            // must be logged — without this a broken disconnect path is invisible.
+            if let Err(e) = prev.close().await {
+                tracing::warn!(error = %e, "failed to close prior browser session before reattach");
             }
         }
     }
@@ -184,6 +174,16 @@ pub async fn handle_browser(
             BrowserSession::connect(&config.browser, url)
                 .await
                 .map(|s| (s, None))
+        } else if config.browser.backend == crate::config::BrowserBackend::CdpAttach {
+            // backend=cdp_attach means "attach to an operator-managed browser",
+            // but no browser.cdp_url is set to attach to. Silently launching a
+            // fresh local Chrome would ignore the operator's intent (a different
+            // profile with no cookies), so surface the misconfiguration.
+            Err(anyhow::anyhow!(
+                "browser.backend is 'cdp_attach' but browser.cdp_url is not set. \
+                 Set browser.cdp_url (or run `/browser connect <url>`), or switch \
+                 browser.backend to 'local' to launch a managed browser."
+            ))
         } else {
             match crate::browser::backends::create_remote_session(
                 &config.browser,
@@ -191,9 +191,22 @@ pub async fn handle_browser(
             )
             .await
             {
-                Ok(Some(remote)) => BrowserSession::connect(&config.browser, &remote.cdp_url)
-                    .await
-                    .map(|s| (s, Some(remote))),
+                Ok(Some(remote)) => {
+                    match BrowserSession::connect(&config.browser, &remote.cdp_url).await {
+                        Ok(s) => Ok((s, Some(remote))),
+                        Err(e) => {
+                            // The provider already created (and is billing) the
+                            // session; release it before surfacing the connect
+                            // error so we don't leak a keep-alive session.
+                            crate::browser::backends::close_remote_session(
+                                &config.browser,
+                                &remote,
+                            )
+                            .await;
+                            Err(e)
+                        }
+                    }
+                }
                 Ok(None) => BrowserSession::launch(&config.browser)
                     .await
                     .map(|s| (s, None)),
@@ -850,6 +863,33 @@ mod tests {
         assert!(
             session.is_none(),
             "no session should be established when the remote backend fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_browser_cdp_attach_without_url_errors_not_local_launch() {
+        // backend=cdp_attach with no cdp_url must surface a misconfig error, not
+        // silently launch a fresh local Chrome (which would ignore the operator's
+        // intent to attach to their running browser). `snapshot` avoids the URL
+        // preflight so we exercise the launch-routing branch directly.
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.backend = crate::config::BrowserBackend::CdpAttach;
+        // No browser.cdp_url set.
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(&json!({"action": "snapshot"}), &config, &mut session)
+            .await
+            .expect("handler returns Ok with an error message, not Err");
+        let ToolOutput::Text(msg) = out else {
+            panic!("expected text output");
+        };
+        assert!(
+            msg.contains("cdp_attach") && msg.contains("cdp_url"),
+            "error must explain the missing cdp_url for cdp_attach, got: {msg}"
+        );
+        assert!(
+            session.is_none(),
+            "no local session should be launched for a misconfigured cdp_attach"
         );
     }
 

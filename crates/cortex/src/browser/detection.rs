@@ -99,7 +99,16 @@ pub fn resolve_engine_executable(engine: BrowserEngine, explicit: Option<&str>) 
     }
 
     // Nothing engine-specific — fall back to generic Chrome discovery so that,
-    // e.g., "brave" on a machine with only Chrome still gets a working browser.
+    // e.g., "brave" on a machine with only Chrome still gets a working browser
+    // (the agent should always be able to boot *a* browser). Launching a
+    // different browser than the operator selected is surprising, though, so
+    // warn loudly rather than switch silently.
+    if engine != BrowserEngine::Chrome {
+        tracing::warn!(
+            engine = %engine,
+            "configured browser engine not found; falling back to generic Chrome/Chromium discovery"
+        );
+    }
     find_chrome(explicit)
         .executable
         .map(|p| p.to_string_lossy().into_owned())

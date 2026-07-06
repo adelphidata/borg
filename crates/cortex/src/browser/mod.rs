@@ -59,6 +59,34 @@ pub struct BrowserSession {
     remote: Option<backends::RemoteSession>,
 }
 
+/// Pure drift decision backing [`BrowserSession::is_stale`], split out so it can
+/// be unit-tested without constructing a live browser. `remote_provider` is the
+/// cloud provider backing the session (if any), `connected_url` the operator
+/// CDP attach URL (if any), and `launched_engine` the engine a local session was
+/// launched with; `live` is the current config.
+fn attach_drifted(
+    remote_provider: Option<crate::config::BrowserBackend>,
+    connected_url: Option<&str>,
+    launched_engine: crate::config::BrowserEngine,
+    live: &BorgBrowserConfig,
+) -> bool {
+    // A cloud session is valid only while the config still selects that exact
+    // provider and hasn't been overridden by an explicit `cdp_url` attach.
+    if let Some(provider) = remote_provider {
+        return live.cdp_url.is_some() || live.backend != provider;
+    }
+    // An operator CDP attach is valid only while `cdp_url` still points here.
+    if let Some(url) = connected_url {
+        return live.cdp_url.as_deref() != Some(url);
+    }
+    // A local launch is valid only while the config still wants a local browser
+    // (no `cdp_url`, non-remote backend) of the same engine.
+    if live.cdp_url.is_some() || live.backend.is_remote() {
+        return true;
+    }
+    launched_engine != live.engine
+}
+
 impl BrowserSession {
     /// Launch Chrome and open a default page.
     #[instrument(skip_all, fields(browser.action = "launch"))]
@@ -228,6 +256,24 @@ impl BrowserSession {
     /// The remote provider session backing this browser, if any.
     pub fn remote_session(&self) -> Option<&backends::RemoteSession> {
         self.remote.as_ref()
+    }
+
+    /// Should this live session be torn down because the browser
+    /// backend/engine/attach settings drifted since it was created?
+    ///
+    /// Compares the session's *actual* attach mode against the current config so
+    /// `/browser connect|disconnect`, a backend switch (local ↔ cloud, or one
+    /// cloud provider to another), and an engine change all take effect on the
+    /// very next tool call. A stale cloud session is released on the provider by
+    /// the caller's `close()`, so switching away never leaks (or keeps billing)
+    /// the old keep-alive session.
+    pub fn is_stale(&self, live: &BorgBrowserConfig) -> bool {
+        attach_drifted(
+            self.remote.as_ref().map(|r| r.provider),
+            self.connected_url.as_deref(),
+            self.config.engine,
+            live,
+        )
     }
 
     // -- Health & Recovery --
@@ -1430,5 +1476,87 @@ mod tests {
             .await
             .expect("session must be healthy");
         session.close().await.expect("close must succeed");
+    }
+
+    #[test]
+    fn attach_drifted_covers_backend_engine_and_cdp_transitions() {
+        use crate::config::{BrowserBackend, BrowserEngine};
+
+        struct Case {
+            name: &'static str,
+            provider: Option<BrowserBackend>,
+            connected_url: Option<&'static str>,
+            launched_engine: BrowserEngine,
+            live: BorgBrowserConfig,
+            want_stale: bool,
+        }
+
+        // Build a live config for the given backend/engine/cdp_url.
+        fn live(
+            backend: BrowserBackend,
+            engine: BrowserEngine,
+            cdp: Option<&str>,
+        ) -> BorgBrowserConfig {
+            BorgBrowserConfig {
+                backend,
+                engine,
+                cdp_url: cdp.map(str::to_string),
+                ..Default::default()
+            }
+        }
+
+        let case = |name, provider, connected_url, launched_engine, live, want_stale| Case {
+            name,
+            provider,
+            connected_url,
+            launched_engine,
+            live,
+            want_stale,
+        };
+
+        let cases = [
+            // Local session, config unchanged → keep.
+            case("local stable", None, None, BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None), false),
+            // Local session, engine switched → reconnect.
+            case("local engine change", None, None, BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Brave, None), true),
+            // Local session, switched to a cloud backend → reconnect.
+            case("local → cloud", None, None, BrowserEngine::Chrome,
+                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None), true),
+            // Local session, cdp_url now set → reconnect (attach wins).
+            case("local → cdp attach", None, None, BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, Some("ws://h:9222")), true),
+            // Cloud session, same provider → keep (does NOT recreate each call).
+            case("cloud stable", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
+                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None), false),
+            // Cloud session, switched provider → reconnect (release old, stop billing).
+            case("cloud provider swap", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
+                live(BrowserBackend::Firecrawl, BrowserEngine::Chrome, None), true),
+            // Cloud session, switched back to local → reconnect (release cloud).
+            case("cloud → local", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None), true),
+            // Cloud session, explicit cdp_url set → reconnect (attach overrides).
+            case("cloud → cdp attach", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
+                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, Some("ws://h:9222")), true),
+            // Operator CDP attach, same url → keep.
+            case("cdp stable", None, Some("ws://h:9222"), BrowserEngine::Chrome,
+                live(BrowserBackend::CdpAttach, BrowserEngine::Chrome, Some("ws://h:9222")), false),
+            // Operator CDP attach, url changed → reconnect.
+            case("cdp url change", None, Some("ws://h:9222"), BrowserEngine::Chrome,
+                live(BrowserBackend::CdpAttach, BrowserEngine::Chrome, Some("ws://other:9222")), true),
+            // Operator CDP attach, disconnected (cdp_url cleared) → reconnect.
+            case("cdp disconnect", None, Some("ws://h:9222"), BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None), true),
+        ];
+
+        for c in &cases {
+            assert_eq!(
+                attach_drifted(c.provider, c.connected_url, c.launched_engine, &c.live),
+                c.want_stale,
+                "case `{}` drift mismatch",
+                c.name
+            );
+        }
     }
 }

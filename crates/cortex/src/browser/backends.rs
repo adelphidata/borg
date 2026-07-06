@@ -41,7 +41,7 @@ pub async fn create_remote_session(
     cfg: &BrowserConfig,
     url_policy: &UrlPolicyConfig,
 ) -> Result<Option<RemoteSession>> {
-    let session = match cfg.backend {
+    let mut session = match cfg.backend {
         BrowserBackend::Local | BrowserBackend::CdpAttach => return Ok(None),
         BrowserBackend::Browserbase => create_browserbase(cfg).await?,
         BrowserBackend::BrowserUse => create_browser_use(cfg).await?,
@@ -49,9 +49,21 @@ pub async fn create_remote_session(
     };
 
     // SSRF gate: never connect to a provider-supplied endpoint that resolves to
-    // a metadata service or (unless explicitly allowed) a private address.
-    guard_remote_cdp_url(&session.cdp_url, url_policy).await?;
-    Ok(Some(session))
+    // a metadata service or (unless explicitly allowed) a private address. The
+    // provider has already created (and is billing) the session at this point,
+    // so a rejection must release it — otherwise a keep-alive session leaks.
+    match guard_remote_cdp_url(&session.cdp_url, url_policy).await {
+        Ok(guarded_url) => {
+            // Honor the classifier's `effective_url` (a transform rule may have
+            // rewritten the host); connect to that, not the raw provider URL.
+            session.cdp_url = guarded_url;
+            Ok(Some(session))
+        }
+        Err(e) => {
+            close_remote_session(cfg, &session).await;
+            Err(e)
+        }
+    }
 }
 
 /// Best-effort release of a remote session. Failures are logged, never
@@ -98,8 +110,9 @@ async fn create_browserbase(cfg: &BrowserConfig) -> Result<RemoteSession> {
         "keepAlive": true,
     });
 
-    let resp = http_client(cfg)?
+    let resp = http_client()?
         .post(format!("{base}/v1/sessions"))
+        .timeout(req_timeout(cfg))
         .header("X-BB-API-Key", key)
         .json(&body)
         .send()
@@ -126,8 +139,9 @@ async fn close_browserbase(cfg: &BrowserConfig, id: &str) -> Result<()> {
         "projectId": cfg.browserbase_project_id.clone().unwrap_or_default(),
         "status": "REQUEST_RELEASE",
     });
-    http_client(cfg)?
+    http_client()?
         .post(format!("{base}/v1/sessions/{id}"))
+        .timeout(req_timeout(cfg))
         .header("X-BB-API-Key", key)
         .json(&body)
         .send()
@@ -147,8 +161,9 @@ async fn create_browser_use(cfg: &BrowserConfig) -> Result<RemoteSession> {
         constants::BROWSER_BROWSER_USE_BASE_URL,
     );
 
-    let resp = http_client(cfg)?
+    let resp = http_client()?
         .post(format!("{base}/api/v3/browsers"))
+        .timeout(req_timeout(cfg))
         .bearer_auth(key)
         .json(&serde_json::json!({}))
         .send()
@@ -171,8 +186,9 @@ async fn close_browser_use(cfg: &BrowserConfig, id: &str) -> Result<()> {
         &cfg.browser_use_base_url,
         constants::BROWSER_BROWSER_USE_BASE_URL,
     );
-    http_client(cfg)?
+    http_client()?
         .delete(format!("{base}/api/v3/browsers/{id}"))
+        .timeout(req_timeout(cfg))
         .bearer_auth(key)
         .send()
         .await
@@ -191,8 +207,9 @@ async fn create_firecrawl(cfg: &BrowserConfig) -> Result<RemoteSession> {
         constants::BROWSER_FIRECRAWL_BASE_URL,
     );
 
-    let resp = http_client(cfg)?
+    let resp = http_client()?
         .post(format!("{base}/v2/browser"))
+        .timeout(req_timeout(cfg))
         .bearer_auth(key)
         .json(&serde_json::json!({ "ttl": cfg.firecrawl_browser_ttl_secs }))
         .send()
@@ -215,8 +232,9 @@ async fn close_firecrawl(cfg: &BrowserConfig, id: &str) -> Result<()> {
         &cfg.firecrawl_base_url,
         constants::BROWSER_FIRECRAWL_BASE_URL,
     );
-    http_client(cfg)?
+    http_client()?
         .delete(format!("{base}/v2/browser/{id}"))
+        .timeout(req_timeout(cfg))
         .bearer_auth(key)
         .send()
         .await
@@ -228,11 +246,26 @@ async fn close_firecrawl(cfg: &BrowserConfig, id: &str) -> Result<()> {
 
 // ── Shared helpers ───────────────────────────────────────────────────────
 
-fn http_client(cfg: &BrowserConfig) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_millis(cfg.startup_timeout_ms))
+/// Shared HTTP client for remote-backend control-plane calls. Built once and
+/// reused so we don't pay TLS + connection-pool setup on every create/close.
+/// Per-call timeouts are applied on the request builder (see [`req_timeout`]),
+/// not baked into the client, so each call still honors `startup_timeout_ms`.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    // Build outside `get_or_init` so a (rare) construction failure surfaces as
+    // an error instead of poisoning the slot with a panic.
+    let client = reqwest::Client::builder()
         .build()
-        .context("failed to build HTTP client for remote browser backend")
+        .context("failed to build HTTP client for remote browser backend")?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Per-request timeout for a remote-backend control-plane call.
+fn req_timeout(cfg: &BrowserConfig) -> Duration {
+    Duration::from_millis(cfg.startup_timeout_ms)
 }
 
 /// Resolve an optional credential, mapping "unset" to a precise, actionable
@@ -309,27 +342,63 @@ fn find_string(json: &serde_json::Value, keys: &[&str]) -> Option<String> {
 }
 
 /// Run a provider-supplied CDP endpoint through the shared URL-policy
-/// classifier. The classifier only understands http/https, so a `ws(s)://`
-/// endpoint is rewritten to `http(s)://` for the check — only the host is
-/// inspected (SSRF blocklist, metadata endpoints, DNS→private-IP), which is
-/// exactly what we need to gate before connecting.
-async fn guard_remote_cdp_url(cdp_url: &str, policy: &UrlPolicyConfig) -> Result<()> {
-    let probe = if let Some(rest) = cdp_url.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = cdp_url.strip_prefix("ws://") {
-        format!("http://{rest}")
+/// classifier and return the endpoint to actually connect to.
+///
+/// The classifier only understands http/https, so a `ws(s)://` endpoint is
+/// rewritten to `http(s)://` for the check (scheme match is case-insensitive —
+/// a provider or proxy may return `WSS://`). Only the host is inspected (SSRF
+/// blocklist, metadata endpoints, denylist, DNS→private-IP), which is exactly
+/// what we need to gate before connecting.
+///
+/// The user's `url_policy.allowlist` is intentionally cleared for this check:
+/// it is a `web_fetch`/`web_search` restriction, and a cloud provider's CDP
+/// host legitimately won't be on it — applying it would silently disable every
+/// cloud browser backend. Every other control (SSRF, denylist, private-IP)
+/// still applies.
+///
+/// On success the classifier's `effective_url` is returned (a transform rule
+/// may have rewritten the host), with the `ws(s)://` scheme restored so the
+/// CDP client connects over the right transport.
+async fn guard_remote_cdp_url(cdp_url: &str, policy: &UrlPolicyConfig) -> Result<String> {
+    let lower = cdp_url.to_ascii_lowercase();
+    let (probe, ws_scheme) = if lower.starts_with("wss://") {
+        (format!("https://{}", &cdp_url["wss://".len()..]), Some("wss"))
+    } else if lower.starts_with("ws://") {
+        (format!("http://{}", &cdp_url["ws://".len()..]), Some("ws"))
     } else {
-        cdp_url.to_string()
+        (cdp_url.to_string(), None)
     };
 
-    match url_policy::classify_no_throttle(&probe, policy).await {
-        ClassifyOutcome::Allow { .. } => Ok(()),
+    let ssrf_policy = UrlPolicyConfig {
+        allowlist: Vec::new(),
+        ..policy.clone()
+    };
+
+    match url_policy::classify_no_throttle(&probe, &ssrf_policy).await {
+        ClassifyOutcome::Allow { effective_url } => Ok(restore_ws_scheme(&effective_url, ws_scheme)),
         ClassifyOutcome::Throttle { host, .. } => {
             bail!("remote browser CDP endpoint is throttled: {host}")
         }
         ClassifyOutcome::Block { reason, rule } => {
             bail!("remote browser CDP endpoint rejected by URL policy [{rule}]: {reason}")
         }
+    }
+}
+
+/// Map a classifier-approved `http(s)://` URL back to the `ws(s)://` scheme the
+/// provider handed us, so the CDP client dials the correct transport. A URL
+/// that wasn't rewritten (already `http(s)://`) is returned unchanged.
+fn restore_ws_scheme(url: &str, ws_scheme: Option<&str>) -> String {
+    match ws_scheme {
+        Some("wss") => url
+            .strip_prefix("https://")
+            .map(|rest| format!("wss://{rest}"))
+            .unwrap_or_else(|| url.to_string()),
+        Some("ws") => url
+            .strip_prefix("http://")
+            .map(|rest| format!("ws://{rest}"))
+            .unwrap_or_else(|| url.to_string()),
+        _ => url.to_string(),
     }
 }
 
@@ -440,13 +509,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssrf_gate_allows_public_wss_endpoint() {
+    async fn ssrf_gate_allows_public_endpoint_and_restores_ws_scheme() {
         let policy = UrlPolicyConfig::default();
         // A normal public provider endpoint passes the gate (rewritten to https
-        // for the host check).
-        guard_remote_cdp_url("wss://connect.browserbase.com/session", &policy)
+        // for the host check) and comes back with its ws scheme restored. A
+        // literal public IP keeps the test hermetic — `resolve_host` short-
+        // circuits IP literals, so no DNS/network under a default `cargo test`.
+        let guarded = guard_remote_cdp_url("wss://1.1.1.1:9222/session", &policy)
             .await
             .expect("public provider endpoint should pass the SSRF gate");
+        assert_eq!(guarded, "wss://1.1.1.1:9222/session");
+    }
+
+    #[tokio::test]
+    async fn ssrf_gate_accepts_uppercase_ws_scheme() {
+        let policy = UrlPolicyConfig::default();
+        // A provider/proxy may return a mixed-case scheme; the rewrite must be
+        // case-insensitive so a legitimate endpoint isn't wrongly blocked.
+        let guarded = guard_remote_cdp_url("WSS://1.1.1.1:9222/session", &policy)
+            .await
+            .expect("uppercase scheme must still pass the gate");
+        assert_eq!(guarded, "wss://1.1.1.1:9222/session");
+    }
+
+    #[tokio::test]
+    async fn ssrf_gate_ignores_web_fetch_allowlist() {
+        // A user's web_fetch/web_search allowlist must NOT disable cloud browser
+        // backends: the provider's CDP host won't be on that list, but selecting
+        // the backend implies authorization. Every other SSRF control still runs.
+        let policy = UrlPolicyConfig {
+            allowlist: vec!["example.com".into()],
+            ..UrlPolicyConfig::default()
+        };
+        let guarded = guard_remote_cdp_url("wss://1.1.1.1:9222/session", &policy)
+            .await
+            .expect("allowlist must not gate the remote CDP host");
+        assert_eq!(guarded, "wss://1.1.1.1:9222/session");
+    }
+
+    #[tokio::test]
+    async fn ssrf_gate_still_blocks_metadata_even_with_allowlist_set() {
+        // Clearing the allowlist must not weaken the metadata/SSRF block.
+        let policy = UrlPolicyConfig {
+            allowlist: vec!["example.com".into()],
+            ..UrlPolicyConfig::default()
+        };
+        let err = guard_remote_cdp_url("wss://169.254.169.254/cdp", &policy)
+            .await
+            .expect_err("cloud-metadata IP must stay blocked");
+        assert!(
+            err.to_string().contains("URL policy"),
+            "expected a policy rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn restore_ws_scheme_maps_back_and_passes_through() {
+        assert_eq!(
+            restore_ws_scheme("https://h/p", Some("wss")),
+            "wss://h/p"
+        );
+        assert_eq!(restore_ws_scheme("http://h/p", Some("ws")), "ws://h/p");
+        // No original ws scheme → returned unchanged (discovery http(s) URL).
+        assert_eq!(
+            restore_ws_scheme("https://h/p", None),
+            "https://h/p"
+        );
     }
 
     #[tokio::test]
