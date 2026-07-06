@@ -46,7 +46,9 @@ impl AwsCredentials {
     fn is_fresh(&self) -> bool {
         match self.expires_at {
             None => true,
-            Some(expiry) => Utc::now() + chrono::Duration::seconds(CREDENTIAL_CACHE_SKEW_SECS) < expiry,
+            Some(expiry) => {
+                Utc::now() + chrono::Duration::seconds(CREDENTIAL_CACHE_SKEW_SECS) < expiry
+            }
         }
     }
 }
@@ -134,8 +136,7 @@ fn is_cloud_metadata_host(host: &str) -> bool {
             std::net::IpAddr::V6(v6) => {
                 let seg = v6.segments();
                 // fe80::/10 link-local, or the AWS IMDS IPv6 address.
-                (seg[0] & 0xffc0) == 0xfe80
-                    || seg == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+                (seg[0] & 0xffc0) == 0xfe80 || seg == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
             }
         };
     }
@@ -341,14 +342,20 @@ struct AwsJsonCredentials {
     expiration: Option<String>,
 }
 
-async fn parse_aws_json_credentials(resp: reqwest::Response, label: &str) -> Result<AwsCredentials> {
+async fn parse_aws_json_credentials(
+    resp: reqwest::Response,
+    label: &str,
+) -> Result<AwsCredentials> {
     let status = resp.status();
     let body = resp
         .text()
         .await
         .with_context(|| format!("read {label} response body"))?;
     if !status.is_success() {
-        bail!("{label} request returned HTTP {status}: {}", truncate(&body));
+        bail!(
+            "{label} request returned HTTP {status}: {}",
+            truncate(&body)
+        );
     }
     let parsed: AwsJsonCredentials =
         serde_json::from_str(&body).with_context(|| format!("parse {label} response"))?;
@@ -414,17 +421,29 @@ async fn resolve_container_credentials(client: &Client) -> Result<Option<AwsCred
 fn validate_container_full_uri(raw: &str) -> Result<()> {
     let url = Url::parse(raw)
         .with_context(|| format!("parse AWS_CONTAINER_CREDENTIALS_FULL_URI {raw:?}"))?;
+    let host = url
+        .host_str()
+        .context("AWS_CONTAINER_CREDENTIALS_FULL_URI missing host")?;
+    let loopback_or_link_local = host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback() || is_link_local_ip(&ip))
+        .unwrap_or(false)
+        || host.eq_ignore_ascii_case("localhost");
     match url.scheme() {
-        "https" => Ok(()),
+        "https" => {
+            if !loopback_or_link_local {
+                // Standard AWS SDK allows https anywhere, but a poisoned env var
+                // could still exfiltrate the container auth token over TLS to an
+                // attacker host — surface it rather than sending silently.
+                tracing::warn!(
+                    host,
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI targets a non-loopback host; \
+                     the container credential auth token will be sent to it"
+                );
+            }
+            Ok(())
+        }
         "http" => {
-            let host = url
-                .host_str()
-                .context("AWS_CONTAINER_CREDENTIALS_FULL_URI missing host")?;
-            let loopback_or_link_local = host
-                .parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback() || is_link_local_ip(&ip))
-                .unwrap_or(false)
-                || host.eq_ignore_ascii_case("localhost");
             if loopback_or_link_local {
                 Ok(())
             } else {
@@ -460,8 +479,8 @@ fn container_auth_token() -> Result<Option<String>> {
 /// or IMDS is disabled) so the chain ends with a clear "no credentials" error
 /// rather than a confusing metadata failure.
 async fn resolve_imds_credentials(client: &Client) -> Result<Option<AwsCredentials>> {
-    let base = env_nonempty("BORG_AWS_IMDS_ENDPOINT")
-        .unwrap_or_else(|| IMDS_DEFAULT_BASE.to_string());
+    let base =
+        env_nonempty("BORG_AWS_IMDS_ENDPOINT").unwrap_or_else(|| IMDS_DEFAULT_BASE.to_string());
     let base = base.trim_end_matches('/');
 
     let token = match client
@@ -936,11 +955,8 @@ mod tests {
             "anthropic.claude-3-5-sonnet-20241022-v2:0",
             false,
         );
-        let out = rebuild_request_url(
-            &hint,
-            "https://bedrock-runtime.us-gov-west-1.amazonaws.com",
-        )
-        .unwrap();
+        let out = rebuild_request_url(&hint, "https://bedrock-runtime.us-gov-west-1.amazonaws.com")
+            .unwrap();
         assert_eq!(
             out,
             "https://bedrock-runtime.us-gov-west-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
@@ -952,11 +968,7 @@ mod tests {
         // Regression: a gateway/PrivateLink base-path override must not be
         // duplicated into `/bedrock/bedrock/...` (which 404s every request).
         let base = "https://ai-gateway.corp/bedrock";
-        let hint = url_for_model(
-            base,
-            "anthropic.claude-3-5-sonnet-20241022-v2:0",
-            true,
-        );
+        let hint = url_for_model(base, "anthropic.claude-3-5-sonnet-20241022-v2:0", true);
         // The hint already carries the base-path once.
         assert_eq!(
             hint,
@@ -968,7 +980,10 @@ mod tests {
             "https://ai-gateway.corp/bedrock/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream",
             "base-path must appear exactly once"
         );
-        assert!(!out.contains("/bedrock/bedrock/"), "base-path was doubled: {out}");
+        assert!(
+            !out.contains("/bedrock/bedrock/"),
+            "base-path was doubled: {out}"
+        );
     }
 
     #[test]
@@ -1081,9 +1096,8 @@ mod tests {
         // though it is https.
         let _lock = super::env_test_lock();
         let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
-        let err =
-            resolve_endpoint_base("us-east-1", Some("https://169.254.169.254/latest"), false)
-                .expect_err("IMDS override must be rejected");
+        let err = resolve_endpoint_base("us-east-1", Some("https://169.254.169.254/latest"), false)
+            .expect_err("IMDS override must be rejected");
         assert!(
             err.to_string().contains("metadata"),
             "error should mention metadata endpoint: {err}"
@@ -1096,8 +1110,7 @@ mod tests {
         let _lock = super::env_test_lock();
         let _env = EnvGuard::remove("AWS_ENDPOINT_URL_BEDROCK");
         assert!(
-            resolve_endpoint_base("us-east-1", Some("https://169.254.170.2/creds"), false)
-                .is_err(),
+            resolve_endpoint_base("us-east-1", Some("https://169.254.170.2/creds"), false).is_err(),
             "ECS credential metadata host must be rejected"
         );
     }
@@ -1291,7 +1304,9 @@ mod tests {
         };
         store_dynamic_credentials(fresh);
         assert_eq!(
-            cached_dynamic_credentials().expect("fresh cached").access_key_id,
+            cached_dynamic_credentials()
+                .expect("fresh cached")
+                .access_key_id,
             "ASIAFRESH"
         );
 
@@ -1347,7 +1362,10 @@ mod tests {
             .await;
 
         let _full = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_FULL_URI");
-        let _rel = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/abc");
+        let _rel = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/abc",
+        );
         let _base = EnvGuard::set("BORG_AWS_ECS_CREDENTIALS_BASE", &server.uri());
         let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
         let _auth = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN");
@@ -1358,7 +1376,10 @@ mod tests {
             .expect("credentials present");
         assert_eq!(creds.access_key_id, "ASIADYNAMIC");
         assert_eq!(creds.secret_access_key, "dynamic-secret");
-        assert_eq!(creds.session_token.as_deref(), Some("dynamic-session-token"));
+        assert_eq!(
+            creds.session_token.as_deref(),
+            Some("dynamic-session-token")
+        );
         assert_eq!(
             creds.expires_at,
             Some(
@@ -1454,7 +1475,10 @@ mod tests {
             .expect("imds request ok")
             .expect("credentials present");
         assert_eq!(creds.access_key_id, "ASIADYNAMIC");
-        assert_eq!(creds.session_token.as_deref(), Some("dynamic-session-token"));
+        assert_eq!(
+            creds.session_token.as_deref(),
+            Some("dynamic-session-token")
+        );
     }
 
     #[tokio::test]
@@ -1503,6 +1527,79 @@ mod tests {
         assert_eq!(region, "us-gov-west-1");
         assert_eq!(creds.access_key_id, "AKIASTATIC");
         assert_eq!(creds.expires_at, None);
+        clear_dynamic_credential_cache_for_tests();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_endpoint_failure_is_a_hard_error() {
+        let _lock = super::env_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/creds"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let _rel = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let _auth = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN");
+        let _full = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            &format!("{}/creds", server.uri()),
+        );
+        // A configured-but-failing container endpoint must surface as an error,
+        // not silently fall through to IMDS (matches the AWS SDK).
+        let err = resolve_container_credentials(&Client::new())
+            .await
+            .expect_err("5xx from the container endpoint must be a hard error");
+        assert!(
+            err.to_string().contains("HTTP 500"),
+            "error should carry the HTTP status: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_credentials_walks_to_container_and_caches_result() {
+        let _lock = super::env_test_lock();
+        clear_dynamic_credential_cache_for_tests();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/creds"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(creds_json("2999-01-01T00:00:00Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Neutralize static sources: no env keys, and an empty HOME so the
+        // shared-profile file lookup finds nothing.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = EnvGuard::set("HOME", temp.path().to_str().expect("home path"));
+        let _access = EnvGuard::remove("AWS_ACCESS_KEY_ID");
+        let _secret = EnvGuard::remove("AWS_SECRET_ACCESS_KEY");
+        let _sess = EnvGuard::remove("AWS_SESSION_TOKEN");
+        let _profile = EnvGuard::remove("AWS_PROFILE");
+        let _region = EnvGuard::set("AWS_REGION", "us-east-1");
+        let _rel = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let _auth = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN");
+        let _full = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            &format!("{}/creds", server.uri()),
+        );
+
+        let (region, creds) = load_region_and_credentials(&Client::new(), None)
+            .await
+            .expect("chain resolves via container metadata");
+        assert_eq!(region, "us-east-1");
+        assert_eq!(creds.access_key_id, "ASIADYNAMIC");
+        // The dynamic result must now be cached (the mock is mounted `.expect(1)`,
+        // so a second network hit would fail verification on drop).
+        let cached = cached_dynamic_credentials().expect("dynamic creds cached");
+        assert_eq!(cached.access_key_id, "ASIADYNAMIC");
         clear_dynamic_credential_cache_for_tests();
     }
 }

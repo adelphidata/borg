@@ -1569,7 +1569,9 @@ mod tests {
             prompt_cache_key: None,
             cost_events_enabled: false,
         };
-        let fips_url = BedrockTransport.endpoint(&fips_req, false).expect("endpoint");
+        let fips_url = BedrockTransport
+            .endpoint(&fips_req, false)
+            .expect("endpoint");
         assert_eq!(
             fips_url,
             "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse",
@@ -1592,7 +1594,9 @@ mod tests {
             prompt_cache_key: None,
             cost_events_enabled: false,
         };
-        let vpce_url = BedrockTransport.endpoint(&vpce_req, true).expect("endpoint");
+        let vpce_url = BedrockTransport
+            .endpoint(&vpce_req, true)
+            .expect("endpoint");
         assert_eq!(
             vpce_url,
             "https://vpce-0abc.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream",

@@ -393,8 +393,14 @@ mod tests {
             "claude-opus-4-20250514"
         );
         // No anthropic vendor segment → returned verbatim (geo strip not applied).
-        assert_eq!(strip_bedrock_model_shape("us-west-2-model"), "us-west-2-model");
-        assert_eq!(strip_bedrock_model_shape("claude-sonnet-4"), "claude-sonnet-4");
+        assert_eq!(
+            strip_bedrock_model_shape("us-west-2-model"),
+            "us-west-2-model"
+        );
+        assert_eq!(
+            strip_bedrock_model_shape("claude-sonnet-4"),
+            "claude-sonnet-4"
+        );
         // Trailing `-v` without a `major:minor` tag is preserved.
         assert_eq!(
             strip_bedrock_model_shape("anthropic.claude-vision"),

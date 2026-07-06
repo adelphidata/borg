@@ -599,23 +599,52 @@ pub(crate) fn compose_azure_openai_url(cfg: &crate::config::LlmConfig) -> anyhow
 /// or loopback address — the only case where Bedrock is permitted under
 /// air-gap mode (`providers.outbound_allowed = false`).
 ///
+/// The effective override is the explicit `llm.bedrock_endpoint_url` or, when
+/// that is unset, the `AWS_ENDPOINT_URL_BEDROCK` env var — the same precedence
+/// the request path applies, so an env-var-configured PrivateLink host is
+/// admitted rather than silently refused.
+///
 /// Fail-closed: a missing override, an https-invalid or cloud-metadata host, a
 /// host that does not resolve, or *any* resolved address that is publicly
 /// routable all return `false`, so the caller falls back to the standard
 /// air-gap refusal. Requiring every resolved address to be private prevents a
 /// split-horizon / dual-homed name from smuggling a public route past the gate.
+///
+/// Residual risk: the name is resolved here and re-resolved independently by
+/// reqwest at send time, so a DNS-rebinding operator endpoint that answers
+/// private now and public later is not fully closed off. Exploiting it needs
+/// DNS control over the configured endpoint plus a real public route, which a
+/// true air-gap does not provide; connect-to-pinned-IP would close it if that
+/// threat model ever applies.
 async fn bedrock_endpoint_is_private(endpoint_override: Option<&str>) -> bool {
-    let Some(raw) = endpoint_override.filter(|s| !s.trim().is_empty()) else {
+    let raw = endpoint_override
+        .map(str::to_owned)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AWS_ENDPOINT_URL_BEDROCK")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let Some(raw) = raw else {
         return false;
     };
     // Same guard the request path applies: https-only, non cloud-metadata.
-    let Ok(base) = crate::llm::bedrock::validated_endpoint_override(raw) else {
-        return false;
+    let base = match crate::llm::bedrock::validated_endpoint_override(&raw) {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Bedrock endpoint override rejected by validation; refusing under air-gap policy"
+            );
+            return false;
+        }
     };
     let Ok(url) = url::Url::parse(&base) else {
+        tracing::warn!(%base, "Bedrock endpoint override did not parse; refusing under air-gap policy");
         return false;
     };
     let Some(host) = url.host_str().map(str::to_owned) else {
+        tracing::warn!(%base, "Bedrock endpoint override has no host; refusing under air-gap policy");
         return false;
     };
     let port = url.port_or_known_default().unwrap_or(443);
@@ -633,6 +662,13 @@ async fn bedrock_endpoint_is_private(endpoint_override: Option<&str>) -> bool {
                 return false;
             }
         };
+    all_addrs_private(&addrs)
+}
+
+/// True only when `addrs` is non-empty and *every* address is private/loopback.
+/// Split out so the "all private, not just the first" guarantee is unit-testable
+/// without a live resolver.
+fn all_addrs_private(addrs: &[std::net::SocketAddr]) -> bool {
     !addrs.is_empty()
         && addrs
             .iter()
@@ -1716,10 +1752,12 @@ impl LlmClient {
             let endpoint_override = self.llm_config.bedrock_endpoint_url.clone();
             let use_fips = self.llm_config.bedrock_use_fips;
             async move {
-                let (region, credentials) =
-                    crate::llm::bedrock::load_region_and_credentials(&client, region_hint.as_deref())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("resolve AWS credentials for Bedrock: {e}"))?;
+                let (region, credentials) = crate::llm::bedrock::load_region_and_credentials(
+                    &client,
+                    region_hint.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("resolve AWS credentials for Bedrock: {e}"))?;
                 // Rebuild the URL against the *resolved* region/endpoint so the
                 // SigV4 credential scope and host match — the endpoint() hint may
                 // have been built with a placeholder region before the async
@@ -2202,7 +2240,12 @@ mod tests;
 
 #[cfg(test)]
 mod bedrock_air_gap_tests {
-    use super::bedrock_endpoint_is_private;
+    use super::{all_addrs_private, bedrock_endpoint_is_private};
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("socket addr")
+    }
 
     // IP-literal endpoints resolve without touching the network, so these
     // exercise the classification logic hermetically.
@@ -2219,10 +2262,38 @@ mod bedrock_air_gap_tests {
     }
 
     #[tokio::test]
+    // Holds the env lock across the resolve await so AWS_ENDPOINT_URL_BEDROCK
+    // stays cleared for the whole gate call.
+    #[allow(clippy::await_holding_lock)]
     async fn not_private_when_override_absent() {
-        // Fail-closed: no override → not an airgapped path, refuse.
+        let _lock = crate::llm::bedrock::env_test_lock();
+        let saved = std::env::var("AWS_ENDPOINT_URL_BEDROCK").ok();
+        std::env::remove_var("AWS_ENDPOINT_URL_BEDROCK");
+        // Fail-closed: no override and no env fallback → refuse.
         assert!(!bedrock_endpoint_is_private(None).await);
         assert!(!bedrock_endpoint_is_private(Some("   ")).await);
+        if let Some(v) = saved {
+            std::env::set_var("AWS_ENDPOINT_URL_BEDROCK", v);
+        }
+    }
+
+    #[tokio::test]
+    // Env var is read inside the gate; hold the lock across the await.
+    #[allow(clippy::await_holding_lock)]
+    async fn private_via_env_var_fallback_when_override_unset() {
+        let _lock = crate::llm::bedrock::env_test_lock();
+        let saved = std::env::var("AWS_ENDPOINT_URL_BEDROCK").ok();
+        // A PrivateLink endpoint configured purely via the AWS env var must be
+        // admitted under air-gap, matching the request path's precedence.
+        std::env::set_var("AWS_ENDPOINT_URL_BEDROCK", "https://10.20.30.40:8443");
+        assert!(bedrock_endpoint_is_private(None).await);
+        // A public env endpoint is still refused.
+        std::env::set_var("AWS_ENDPOINT_URL_BEDROCK", "https://52.94.1.1");
+        assert!(!bedrock_endpoint_is_private(None).await);
+        match saved {
+            Some(v) => std::env::set_var("AWS_ENDPOINT_URL_BEDROCK", v),
+            None => std::env::remove_var("AWS_ENDPOINT_URL_BEDROCK"),
+        }
     }
 
     #[tokio::test]
@@ -2242,6 +2313,23 @@ mod bedrock_air_gap_tests {
     async fn not_private_when_override_is_metadata_host() {
         // IMDS must never be treated as a legitimate private endpoint.
         assert!(!bedrock_endpoint_is_private(Some("https://169.254.169.254")).await);
+    }
+
+    #[test]
+    fn all_addrs_private_requires_every_address_private() {
+        // The whole point of the gate: a dual-homed name resolving to one public
+        // address must fail even if the others are private.
+        assert!(all_addrs_private(&[
+            addr("10.0.0.1:443"),
+            addr("192.168.1.9:443")
+        ]));
+        assert!(!all_addrs_private(&[
+            addr("10.0.0.1:443"),
+            addr("52.94.1.1:443")
+        ]));
+        assert!(!all_addrs_private(&[addr("52.94.1.1:443")]));
+        // Empty resolution is not "all private" — it must fail closed.
+        assert!(!all_addrs_private(&[]));
     }
 }
 
