@@ -172,8 +172,14 @@ fn load_or_provision_passphrase(borg_home: &Path) -> Result<String> {
         .with_context(|| format!("write {}", env_path.display()))?;
     tracing::warn!(
         "auto KEK fallback: provisioned new passphrase at {} (0600). \
-        Back up this file — losing it will invalidate the encrypted KEK \
-        and require re-pairing devices.",
+        SECURITY: this passphrase sits next to kek.enc in the same secrets/ \
+        directory, so at-rest encryption gives ~no protection against anyone \
+        who can read that directory (same-UID process, stolen backup) — this \
+        is the accepted trade-off for booting without an OS keychain. For real \
+        at-rest protection, install an OS keychain (gnome-keyring + dbus) or \
+        run `borg service install --secure` to move the passphrase into a \
+        root-only systemd EnvironmentFile. Back up this file — losing it \
+        invalidates the encrypted KEK and requires re-pairing devices.",
         env_path.display()
     );
     Ok(passphrase)

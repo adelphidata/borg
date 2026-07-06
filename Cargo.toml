@@ -114,6 +114,7 @@ spake2 = "0.4"
 blake3 = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 hkdf = "0.12"
+scrypt = { version = "0.11", default-features = false }
 chacha20poly1305 = "0.10"
 x509-parser = "0.16"
 qrcodegen = "1"

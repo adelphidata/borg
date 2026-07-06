@@ -114,18 +114,29 @@ impl KekStore for MemoryKekStore {
 
 // Passphrase-encrypted file backend for headless servers. The whole secret
 // map is encrypted as a single ChaCha20Poly1305 ciphertext keyed by
-// HKDF-SHA256(passphrase, salt). Salt is per-file (random at first put);
-// nonce is random per write.
+// scrypt(passphrase, salt) → HKDF (v2 envelope; v1 files derived with bare
+// HKDF still decrypt and upgrade on next write). Salt is per-file (random at
+// first put); nonce is random per write.
 //
-// Threat model: protects against casual disk reads (rsync of `~/.borg`,
-// stolen backups) when the passphrase is supplied via systemd
-// EnvironmentFile (root-readable only) rather than living next to the
-// ciphertext. Does NOT protect against an attacker who can read both
-// `~/.borg/secrets/kek.enc` AND the passphrase source. Posture surfaces
-// this as `Reduced` so the gameplay loop still nudges the user toward
-// `KeychainStore`.
+// Threat model — READ THIS BEFORE RELYING ON IT:
+//   * Protection is REAL only when the passphrase comes from a source the
+//     attacker can't read alongside the ciphertext — i.e. a root-only systemd
+//     `EnvironmentFile` (explicit `File` backend). Then a stolen backup /
+//     `rsync` of `~/.borg` yields only ciphertext, and scrypt makes an
+//     offline guess of an operator passphrase memory-hard.
+//   * In the DEFAULT `Auto` fallback the passphrase is auto-provisioned to
+//     `~/.borg/secrets/kek.env`, which sits NEXT TO `kek.enc`. Anyone who can
+//     read the ciphertext (same-UID process, stolen backup of the whole
+//     `secrets/` dir) reads the passphrase too — at-rest protection is then
+//     effectively nil. This is an accepted trade-off for the "always boots on
+//     a headless VPS" guarantee, NOT a claim of confidentiality. Posture
+//     surfaces it as `Reduced` and boot logs warn; the only real fix is the OS
+//     keychain (auto-preferred when present) or a root-only EnvironmentFile.
 
-const KEK_FILE_VERSION: u32 = 1;
+/// Current on-disk envelope version. v2 derives the encryption key with
+/// memory-hard scrypt; v1 (bare HKDF) is still *read* for backward compat but
+/// never *written* — a v1 file transparently upgrades to v2 on its next flush.
+const KEK_FILE_VERSION: u32 = 2;
 
 /// On-disk envelope. Stored as JSON; whole-map ciphertext authenticates
 /// every account at once so partial-tampering attacks fail decryption.
@@ -299,13 +310,60 @@ impl KekStore for FileKekStore {
     }
 }
 
-fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
+/// scrypt work parameters for v2 derivation. `log_n=15` → N=32768, r=8, p=1 is
+/// ~32 MiB / ~50 ms per guess on commodity hardware — run once at daemon boot,
+/// so the latency is invisible, but an offline attacker with `kek.enc` now pays
+/// a memory-hard cost per passphrase guess instead of a single HMAC. Bumping
+/// these is safe (only affects newly written files); existing v2 files stay
+/// decryptable because the salt+params are fixed by the version tag.
+const SCRYPT_LOG_N: u8 = 15;
+const SCRYPT_R: u32 = 8;
+const SCRYPT_P: u32 = 1;
+
+/// Legacy v1 derivation: bare HKDF-SHA256, no work factor. Retained only so
+/// pre-existing `kek.enc` files (written before the scrypt upgrade) still
+/// decrypt; the first flush after open rewrites them as v2. Never used for new
+/// files.
+fn derive_key_v1(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), passphrase);
     let mut okm = [0u8; 32];
     // Domain-separation info string; changing it makes existing kek.enc files undecryptable.
     hk.expand(b"borg-kek-v1", &mut okm)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: hkdf: {e}")))?;
     Ok(*Key::from_slice(&okm))
+}
+
+/// v2 derivation: run the passphrase through memory-hard scrypt first, then
+/// HKDF for domain separation. This is what closes the "offline brute-force at
+/// one-HMAC-per-guess" gap for operator-chosen `BORG_KEK_PASSPHRASE` values
+/// (the `Auto` path uses a 256-bit random passphrase that is brute-force-immune
+/// regardless, but paying the cost there too is harmless — a one-time boot
+/// cost).
+fn derive_key_v2(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
+    let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32)
+        .map_err(|e| PkiError::Keychain(format!("FileKekStore: scrypt params: {e}")))?;
+    let mut stretched = [0u8; 32];
+    scrypt::scrypt(passphrase, salt, &params, &mut stretched)
+        .map_err(|e| PkiError::Keychain(format!("FileKekStore: scrypt: {e}")))?;
+    // HKDF over the stretched key for domain separation from any other use of
+    // scrypt output; salt is reused (already high-entropy and per-file).
+    let hk = Hkdf::<Sha256>::new(Some(salt), &stretched);
+    let mut okm = [0u8; 32];
+    hk.expand(b"borg-kek-v2", &mut okm)
+        .map_err(|e| PkiError::Keychain(format!("FileKekStore: hkdf: {e}")))?;
+    Ok(*Key::from_slice(&okm))
+}
+
+/// Dispatch key derivation on the on-disk file version so legacy v1 blobs keep
+/// decrypting while all new writes use the memory-hard v2 path.
+fn derive_key(version: u32, passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
+    match version {
+        1 => derive_key_v1(passphrase, salt),
+        2 => derive_key_v2(passphrase, salt),
+        other => Err(PkiError::Keychain(format!(
+            "FileKekStore: unsupported file version {other}"
+        ))),
+    }
 }
 
 fn encrypt_map(map: &HashMap<String, Vec<u8>>, passphrase: &[u8]) -> Result<Vec<u8>, PkiError> {
@@ -315,7 +373,7 @@ fn encrypt_map(map: &HashMap<String, Vec<u8>>, passphrase: &[u8]) -> Result<Vec<
     rand::rng().fill_bytes(&mut salt);
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
-    let key = derive_key(passphrase, &salt)?;
+    let key = derive_key(KEK_FILE_VERSION, passphrase, &salt)?;
     let cipher = ChaCha20Poly1305::new(&key);
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
@@ -333,12 +391,9 @@ fn encrypt_map(map: &HashMap<String, Vec<u8>>, passphrase: &[u8]) -> Result<Vec<
 fn decrypt_map(blob: &[u8], passphrase: &[u8]) -> Result<HashMap<String, Vec<u8>>, PkiError> {
     let env: EncryptedKekFile = serde_json::from_slice(blob)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: parse envelope: {e}")))?;
-    if env.version != KEK_FILE_VERSION {
-        return Err(PkiError::Keychain(format!(
-            "FileKekStore: unsupported file version {}",
-            env.version
-        )));
-    }
+    // Accept both the legacy v1 (bare HKDF) and current v2 (scrypt) envelopes so
+    // an upgrade doesn't strand an existing kek.enc. `derive_key` rejects any
+    // other version. A v1 file re-encrypts as v2 on the next flush.
     let b64 = base64::engine::general_purpose::STANDARD;
     let salt = b64
         .decode(&env.salt_b64)
@@ -355,7 +410,7 @@ fn decrypt_map(blob: &[u8], passphrase: &[u8]) -> Result<HashMap<String, Vec<u8>
             nonce_bytes.len()
         )));
     }
-    let key = derive_key(passphrase, &salt)?;
+    let key = derive_key(env.version, passphrase, &salt)?;
     let cipher = ChaCha20Poly1305::new(&key);
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
@@ -447,6 +502,104 @@ mod tests {
                 assert!(!msg.contains("wrong"));
                 assert!(!msg.contains("correct"));
             }
+            other => panic!("expected Keychain, got {other:?}"),
+        }
+    }
+
+    /// Read the on-disk envelope version for a kek.enc.
+    fn envelope_version(path: &Path) -> u32 {
+        let bytes = std::fs::read(path).expect("read kek.enc");
+        let env: EncryptedKekFile = serde_json::from_slice(&bytes).expect("parse envelope");
+        env.version
+    }
+
+    #[test]
+    fn new_files_are_written_as_v2_scrypt() {
+        // Regression (M4): a freshly written kek.enc must use the memory-hard
+        // v2 envelope, not the legacy bare-HKDF v1.
+        let (_dir, path) = tmp_path();
+        let store = FileKekStore::open(&path, b"pw".to_vec()).expect("open");
+        store.put("k", b"v").expect("put");
+        assert_eq!(envelope_version(&path), 2, "new files must be v2 (scrypt)");
+    }
+
+    #[test]
+    fn scrypt_v2_derives_different_key_than_legacy_v1() {
+        // Sanity: the scrypt path actually changes the derived key, so a v2 file
+        // is not merely a relabelled v1 (which would mean scrypt was a no-op).
+        let salt = [7u8; 16];
+        let v1 = derive_key_v1(b"passphrase", &salt).expect("v1");
+        let v2 = derive_key_v2(b"passphrase", &salt).expect("v2");
+        assert_ne!(v1, v2, "v2 derivation must differ from bare-HKDF v1");
+    }
+
+    #[test]
+    fn legacy_v1_file_decrypts_and_upgrades_to_v2_on_write() {
+        // Regression (M4): an existing v1 kek.enc (written before the scrypt
+        // upgrade) must still open and decrypt, and the next write must
+        // transparently re-encrypt it as v2 — no operator action, no stranded
+        // KEK.
+        let (_dir, path) = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+
+        // Hand-craft a v1 envelope the way the old code would have.
+        let passphrase = b"operator-secret".to_vec();
+        let mut map = HashMap::new();
+        map.insert("ca-key".to_string(), b"PRIVATE-CA".to_vec());
+        let plaintext = serde_json::to_vec(&map).expect("serialize");
+        let salt = [3u8; 16];
+        let nonce = [4u8; 12];
+        let key = derive_key_v1(&passphrase, &salt).expect("v1 key");
+        let ciphertext = ChaCha20Poly1305::new(&key)
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .expect("encrypt");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let env = EncryptedKekFile {
+            version: 1,
+            salt_b64: b64.encode(salt),
+            nonce_b64: b64.encode(nonce),
+            ciphertext_b64: b64.encode(ciphertext),
+        };
+        std::fs::write(&path, serde_json::to_vec(&env).expect("envelope")).expect("write v1");
+        assert_eq!(envelope_version(&path), 1, "precondition: file is v1");
+
+        // Open with the correct passphrase: legacy decrypt must succeed.
+        let store = FileKekStore::open(&path, passphrase.clone()).expect("open v1");
+        assert_eq!(store.get("ca-key").expect("get"), b"PRIVATE-CA".to_vec());
+
+        // A write flushes the whole map — which re-encrypts under v2.
+        store.put("server-key", b"PRIVATE-SRV").expect("put");
+        assert_eq!(envelope_version(&path), 2, "write must upgrade v1 → v2");
+
+        // And the upgraded file reopens cleanly with both entries intact.
+        let reopened = FileKekStore::open(&path, passphrase).expect("reopen v2");
+        assert_eq!(reopened.get("ca-key").expect("get"), b"PRIVATE-CA".to_vec());
+        assert_eq!(
+            reopened.get("server-key").expect("get"),
+            b"PRIVATE-SRV".to_vec()
+        );
+    }
+
+    #[test]
+    fn unsupported_future_version_is_rejected() {
+        // A version the running binary doesn't understand must fail closed, not
+        // silently mis-derive.
+        let (_dir, path) = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let env = EncryptedKekFile {
+            version: 99,
+            salt_b64: b64.encode([0u8; 16]),
+            nonce_b64: b64.encode([0u8; 12]),
+            ciphertext_b64: b64.encode([0u8; 16]),
+        };
+        std::fs::write(&path, serde_json::to_vec(&env).expect("envelope")).expect("write");
+        let err = FileKekStore::open(&path, b"pw".to_vec()).expect_err("must reject");
+        match err {
+            PkiError::Keychain(msg) => assert!(
+                msg.contains("unsupported file version"),
+                "unexpected msg: {msg}"
+            ),
             other => panic!("expected Keychain, got {other:?}"),
         }
     }
