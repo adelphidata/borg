@@ -275,7 +275,7 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     },
                     "pid": {"type": "integer", "description": "Target process id (from list_apps/list_windows, or from a prior capture/focus_app resolved-target note). Required for every mutating action; for capture som/ax it is auto-resolved when you use `app`/no id. Optional filter for list_windows."},
                     "window_id": {"type": "integer", "description": "Target window id. Optional for capture (auto-resolved via `app`/frontmost when omitted); required for set_value and any element_index-addressed action."},
-                    "app": {"type": "string", "description": "capture + focus_app. App-name substring (case-insensitive, e.g. \"Finder\", \"chrome\") to resolve the frontmost matching window. For capture, used when `window_id` is omitted."},
+                    "app": {"type": "string", "description": "capture + focus_app. App-name substring (case-insensitive, e.g. \"Finder\", \"chrome\") to resolve the frontmost matching window. For capture, used when `window_id` is omitted. Pass \"screen\" (or \"desktop\") to target the OS desktop/shell surface (wallpaper, Dock) instead of an app window."},
                     "duration_ms": {"type": "integer", "description": "Wait only. Milliseconds to sleep (capped at 300000)."},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},

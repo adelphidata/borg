@@ -907,11 +907,33 @@ async fn list_window_entries(driver: &dyn Driver) -> Result<Vec<WindowEntry>> {
     Ok(parse_window_entries(&driver_text_only(resp)))
 }
 
+/// `app` values that mean "the OS desktop/shell surface" rather than a named
+/// application — capturing the wallpaper, clicking the Dock/menu bar. The
+/// driver is window-oriented and can't span monitors, but the shell surfaces
+/// are themselves real windows (Finder owns the macOS desktop), so we resolve
+/// the sentinel to that window instead of matching an app literally.
+const SCREEN_CAPTURE_SENTINELS: &[&str] =
+    &["screen", "desktop", "fullscreen", "full screen", "all"];
+
+/// App/title fragments that identify the desktop/shell window on each platform.
+/// macOS: Finder owns the desktop, the Dock is the shell.
+const DESKTOP_WINDOW_NAMES: &[&str] = &[
+    "finder",
+    "desktop",
+    "dock", // macOS desktop / shell
+    "progman",
+    "workerw",
+    "program manager", // Windows desktop
+    "shell_traywnd",
+    "taskbar", // Windows taskbar
+];
+
 /// Pick a window from a listing: the frontmost window matching `app_query`
 /// (case-insensitive substring), or the frontmost window overall when no
-/// query is given. A non-empty query that matches nothing errors with the
-/// available app names rather than silently grabbing the frontmost — that
-/// would hide real failures (e.g. a localized macOS app name).
+/// query is given. A `screen`/`desktop` sentinel resolves to the shell window.
+/// A non-empty query that matches nothing errors with the available app names
+/// rather than silently grabbing the frontmost — that would hide real
+/// failures (e.g. a localized macOS app name).
 fn pick_window<'a>(
     entries: &'a [WindowEntry],
     app_query: Option<&str>,
@@ -924,17 +946,41 @@ fn pick_window<'a>(
         );
     }
     match app_query.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(query) => entries
-            .iter()
-            .find(|e| e.app.to_lowercase().contains(&query.to_lowercase()))
-            .ok_or_else(|| {
-                let names: Vec<&str> = entries.iter().map(|e| e.app.as_str()).collect();
-                anyhow::anyhow!(
-                    "computer_use.{action} found no on-screen window whose app matches '{query}'. \
-                     On-screen apps: {}",
-                    names.join(", ")
-                )
-            }),
+        Some(query) => {
+            let query_lower = query.to_lowercase();
+            // `app='screen'` → resolve the desktop/shell window, not a literal
+            // app named "screen". Mirrors the reference's whole-screen capture.
+            if SCREEN_CAPTURE_SENTINELS.contains(&query_lower.as_str()) {
+                return entries
+                    .iter()
+                    .find(|e| {
+                        let app = e.app.to_lowercase();
+                        DESKTOP_WINDOW_NAMES.iter().any(|n| app.contains(n))
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "computer_use.{action} found no desktop/shell window to represent \
+                             '{query}'. On-screen apps: {}",
+                            entries
+                                .iter()
+                                .map(|e| e.app.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    });
+            }
+            entries
+                .iter()
+                .find(|e| e.app.to_lowercase().contains(&query_lower))
+                .ok_or_else(|| {
+                    let names: Vec<&str> = entries.iter().map(|e| e.app.as_str()).collect();
+                    anyhow::anyhow!(
+                        "computer_use.{action} found no on-screen window whose app matches \
+                         '{query}'. On-screen apps: {}",
+                        names.join(", ")
+                    )
+                })
+        }
         // No query → frontmost window (first entry, driver lists by z-index).
         None => Ok(&entries[0]),
     }
@@ -2041,6 +2087,45 @@ mod tests {
         );
         // Only the list_windows probe ran; no capture attempted.
         assert_eq!(driver.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_screen_sentinel_resolves_desktop_shell_window() {
+        // `app="screen"` (and "desktop") must target the OS shell surface —
+        // on macOS that's Finder, which owns the desktop — rather than error
+        // out looking for a literal app named "screen".
+        for sentinel in ["screen", "desktop"] {
+            let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
+            let mut args = args_with_action(ComputerUseAction::Capture);
+            args.mode = Some(CaptureMode::Vision);
+            args.target = Some(sentinel.into());
+            let _ = handle_with_driver(&args, &driver).await.unwrap();
+            let calls = driver.calls.lock().unwrap();
+            assert_eq!(calls[0].0, "list_windows");
+            assert_eq!(
+                calls[1].1["window_id"], 2522,
+                "sentinel '{sentinel}' must resolve Finder's desktop window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_screen_sentinel_errors_when_no_shell_window() {
+        // If the listing carries no desktop/shell window, the sentinel must
+        // error (not silently grab the frontmost app), so the model learns
+        // the shell surface wasn't enumerable.
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(
+                "✅ Found 1 window(s)\n- Code (pid 2446) \"SKILL.md\" [window_id: 1923]".into(),
+            )],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.target = Some("screen".into());
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no desktop/shell window"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -3972,6 +4057,41 @@ mod live {
             first.pid,
             first.window_id
         );
+    }
+
+    /// `app="screen"` must wire through the real resolver end to end: either
+    /// it resolves the live desktop/shell window (Finder) and returns a real
+    /// capture, or — if no shell window is enumerable right now — it surfaces
+    /// the actionable "no desktop/shell window" error. Never a panic.
+    #[tokio::test]
+    async fn live_capture_screen_sentinel_resolves_or_reports() {
+        if guard().is_none() {
+            return;
+        }
+        let config = live_config();
+        let cancel = CancellationToken::new();
+        let result = handle(
+            &args(json!({"action": "capture", "mode": "vision", "app": "screen"})),
+            &config,
+            &cancel,
+        )
+        .await;
+        match result {
+            Ok(ToolOutput::Multimodal { parts, .. }) => assert!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+                "screen capture resolved a window but returned no image"
+            ),
+            Ok(ToolOutput::Text(t)) => assert!(
+                t.contains("no desktop/shell window") || t.starts_with("Error:"),
+                "unexpected text for screen capture: {t}"
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("no desktop/shell window"),
+                "screen capture failed for an unexpected reason: {e}"
+            ),
+        }
     }
 
     /// An out-of-range `element_index` against a real window must surface the
