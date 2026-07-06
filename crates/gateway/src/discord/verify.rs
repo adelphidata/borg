@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::http::HeaderMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::verify_common::headers as hdr;
+
+const REPLAY_WINDOW_SECS: u64 = crate::constants::DISCORD_REPLAY_WINDOW_SECS;
 
 /// Verify a Discord interaction request using Ed25519 signature verification.
 ///
@@ -10,8 +12,10 @@ use crate::verify_common::headers as hdr;
 /// are provided in the `X-Signature-Ed25519` and `X-Signature-Timestamp` headers.
 /// The signed message is `timestamp + body`.
 ///
-/// Discord handles replay protection server-side via the signed timestamp,
-/// so no additional replay window check is needed here.
+/// After the signature verifies, the signed timestamp is checked against a
+/// freshness window: the signature proves the timestamp is authentic, but does
+/// not stop a captured, validly signed request from being replayed to our
+/// endpoint later. Rejecting stale timestamps closes that gap.
 pub fn verify_discord_signature(
     headers: &HeaderMap,
     body: &str,
@@ -50,6 +54,17 @@ pub fn verify_discord_signature(
         .verify(message.as_bytes(), &signature)
         .map_err(|_| anyhow::anyhow!("Discord signature verification failed"))?;
 
+    // Replay protection: the timestamp is now trusted (it was signed). Reject it
+    // if it falls outside the freshness window, so an old captured request can't
+    // be replayed.
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid X-Signature-Timestamp: not an integer"))?;
+    let now = chrono::Utc::now().timestamp();
+    if (now - ts).unsigned_abs() > REPLAY_WINDOW_SECS {
+        bail!("Discord request timestamp too old (replay protection)");
+    }
+
     Ok(())
 }
 
@@ -86,10 +101,28 @@ mod tests {
     fn valid_signature_passes() {
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let body = r#"{"type":1}"#;
-        let timestamp = "1234567890";
+        // Fresh timestamp — the freshness window rejects stale ones.
+        let timestamp = chrono::Utc::now().timestamp().to_string();
 
-        let (headers, public_key_hex) = make_signed_request(&signing_key, timestamp, body);
+        let (headers, public_key_hex) = make_signed_request(&signing_key, &timestamp, body);
         assert!(verify_discord_signature(&headers, body, &public_key_hex).is_ok());
+    }
+
+    #[test]
+    fn old_signed_timestamp_rejected() {
+        // A validly signed but stale request (captured and replayed) must be
+        // rejected by the freshness window even though the signature verifies.
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let body = r#"{"type":1}"#;
+        let old_ts = (chrono::Utc::now().timestamp() - 3600).to_string();
+
+        let (headers, public_key_hex) = make_signed_request(&signing_key, &old_ts, body);
+        let result = verify_discord_signature(&headers, body, &public_key_hex);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("too old"),
+            "expected replay-protection rejection"
+        );
     }
 
     #[test]

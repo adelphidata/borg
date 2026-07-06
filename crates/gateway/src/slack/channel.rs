@@ -46,6 +46,13 @@ impl NativeChannel for SlackChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
+        // Fail closed: refuse inbound traffic when no signing secret is
+        // configured, rather than silently accepting unauthenticated requests.
+        crate::verify_common::require_verification_secret(
+            "slack",
+            self.signing_secret.as_deref(),
+            "SLACK_SIGNING_SECRET",
+        )?;
         let webhook_result = super::handle_slack_webhook(
             headers,
             body,

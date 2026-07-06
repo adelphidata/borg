@@ -54,6 +54,14 @@ impl NativeChannel for TelegramChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
+        // Fail closed: refuse inbound updates when no webhook secret token is
+        // configured. Telegram's secret token is protocol-optional, but without
+        // it any host that learns the webhook URL can POST forged updates.
+        crate::verify_common::require_verification_secret(
+            "telegram",
+            self.secret.as_deref(),
+            "TELEGRAM_WEBHOOK_SECRET",
+        )?;
         // Verify and parse
         let parsed = match super::handle_telegram_webhook(
             headers,

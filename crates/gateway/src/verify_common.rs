@@ -24,6 +24,33 @@ pub mod headers {
     pub const AUTHORIZATION: &str = "authorization";
 }
 
+/// Gate inbound webhook processing on a configured verification secret.
+///
+/// Fail CLOSED. A native channel activates on its bot/API token, but inbound
+/// request authentication uses a SEPARATE signing secret (Slack signing secret,
+/// Discord public key, Telegram webhook secret). If that secret is absent — or
+/// blank — signature verification was being silently skipped, and because the
+/// sender identity in the payload is attacker-controlled JSON, an unauthenticated
+/// POST could drive the agent as the owner. When the credential is missing we
+/// must refuse the request rather than trust it. Mirrors the fail-closed posture
+/// Google Chat and Twilio already enforce.
+///
+/// `env_var` names the credential in the returned error so operators can fix the
+/// misconfiguration.
+pub fn require_verification_secret(
+    channel: &str,
+    secret: Option<&str>,
+    env_var: &str,
+) -> Result<()> {
+    if secret.map(str::trim).is_none_or(str::is_empty) {
+        bail!(
+            "{channel} inbound webhook refused: no verification secret configured. \
+             Set {env_var} to authenticate inbound requests (failing closed)."
+        );
+    }
+    Ok(())
+}
+
 /// Compute HMAC-SHA256 over `data` keyed by `key` and constant-time compare
 /// against the expected raw signature bytes. Used by Slack (hex-encoded
 /// expected) and Teams (base64-encoded expected); each caller decodes its
@@ -98,5 +125,27 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-test", HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap());
         assert!(required_header(&headers, "x-test", "X-Test").is_err());
+    }
+
+    #[test]
+    fn require_verification_secret_fails_closed_when_missing_or_blank() {
+        // The whole point: a channel that is live but has no verification
+        // secret must refuse inbound traffic, not silently accept it.
+        for absent in [None, Some(""), Some("   "), Some("\t\n")] {
+            let err = require_verification_secret("slack", absent, "SLACK_SIGNING_SECRET")
+                .expect_err("missing/blank secret must fail closed");
+            assert!(
+                err.to_string().contains("SLACK_SIGNING_SECRET"),
+                "error should name the missing credential: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_verification_secret_allows_configured_secret() {
+        assert!(
+            require_verification_secret("slack", Some("s3cr3t"), "SLACK_SIGNING_SECRET").is_ok(),
+            "a configured secret must be accepted"
+        );
     }
 }

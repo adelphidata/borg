@@ -102,6 +102,13 @@ pub const SLACK_API_BASE: &str = "https://slack.com/api";
 /// timestamp outside this window must be rejected as replays.
 pub const SLACK_REPLAY_WINDOW_SECS: u64 = 300;
 
+/// Discord interaction replay window in seconds.
+/// Why: Discord signs `timestamp + body` with Ed25519, so the timestamp is
+/// tamper-proof — but the signature alone does not stop a captured, validly
+/// signed request from being replayed to our endpoint. Rejecting requests whose
+/// signed timestamp is outside this window closes that replay gap.
+pub const DISCORD_REPLAY_WINDOW_SECS: u64 = 300;
+
 /// Slack typing indicator circuit breaker: trips after N consecutive failures.
 /// Why: typing indicators are cosmetic; bail fast (2 strikes) rather than
 /// burn rate-limit budget that real sends will need.

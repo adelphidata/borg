@@ -68,6 +68,13 @@ impl NativeChannel for DiscordChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
+        // Fail closed: refuse inbound interactions when no public key is
+        // configured, rather than silently accepting unsigned requests.
+        crate::verify_common::require_verification_secret(
+            "discord",
+            self.public_key.as_deref(),
+            "DISCORD_PUBLIC_KEY",
+        )?;
         let webhook_result = super::handle_discord_webhook(
             headers,
             body,

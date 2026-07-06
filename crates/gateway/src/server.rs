@@ -1411,10 +1411,25 @@ async fn slack_command_handler(
     let _timer = GatewayTimer::new(&state.metrics.gateway_duration);
     state.metrics.gateway_requests.add(1, &[]);
 
-    // Verify signature
-    if let Some(ref secret) = state.slack_signing_secret {
-        if let Err(e) = crate::slack::verify::verify_slack_signature(&headers, &body, secret) {
-            warn!("Slack command signature verification failed: {e}");
+    // Verify signature — fail closed. A slash command is an arbitrary agent
+    // prompt, so an unauthenticated request here is equivalent to full command
+    // injection. If no signing secret is configured we refuse rather than trust
+    // the request (matching the inbound webhook fail-closed posture).
+    match state.slack_signing_secret.as_deref() {
+        Some(secret) => {
+            if let Err(e) = crate::slack::verify::verify_slack_signature(&headers, &body, secret) {
+                warn!("Slack command signature verification failed: {e}");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({ "error": "Unauthorized" })),
+                );
+            }
+        }
+        None => {
+            warn!(
+                "Slack slash command refused: no signing secret configured \
+                 (set SLACK_SIGNING_SECRET to enable this endpoint)"
+            );
             return (
                 StatusCode::UNAUTHORIZED,
                 axum::Json(serde_json::json!({ "error": "Unauthorized" })),

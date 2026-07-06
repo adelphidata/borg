@@ -97,7 +97,8 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     fn make_signed_headers(signing_key: &SigningKey, body: &str) -> (HeaderMap, String) {
-        let timestamp = "1234567890";
+        // Fresh timestamp so the signed-timestamp replay window accepts it.
+        let timestamp = chrono::Utc::now().timestamp().to_string();
         let message = format!("{timestamp}{body}");
         let signature = signing_key.sign(message.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
@@ -109,7 +110,7 @@ mod tests {
         );
         headers.insert(
             "x-signature-timestamp",
-            HeaderValue::from_str(timestamp).unwrap(),
+            HeaderValue::from_str(&timestamp).unwrap(),
         );
 
         let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
