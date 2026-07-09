@@ -348,3 +348,258 @@ async fn on_goal_updated_via_tool_noop_when_status_still_active() {
         "Active row must not trigger forget — only an actual Complete row should"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Self-continuation ("stop hook") + accounting: the agent-loop wiring that
+// turns an `EndTurn` on an Active goal into a `NudgeAndContinue`. These drive
+// the real `maybe_inject_goal_continuation` / `account_goal_at_turn_end` /
+// `user_input_is_pending` code, not mocks.
+// ---------------------------------------------------------------------------
+
+/// Seed an Active goal row for the agent's session and adopt it into the
+/// runtime, mirroring what `sync_goal_runtime_for_turn` does at turn start.
+async fn seed_active_goal(agent: &Agent, objective: &str, budget: Option<i64>) -> String {
+    let session_id = agent.session.meta.id.clone();
+    let guard = agent.db_guard().await;
+    let db = guard.as_ref().expect("db");
+    db.insert_goal(&session_id, objective, GoalStatus::Active, budget)
+        .await
+        .expect("insert goal")
+        .expect("row returned")
+        .goal_id
+}
+
+/// Positive: an Active goal ending a turn injects the continuation prompt as a
+/// synthetic user message and reserves the turn so the loop re-enters.
+#[tokio::test]
+async fn continuation_injects_for_active_goal_and_reserves_turn() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "ship the feature", Some(5000)).await;
+
+    let before = agent.history.len();
+    let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+    assert!(injected, "Active goal must self-continue");
+    assert_eq!(
+        agent.history.len(),
+        before + 1,
+        "exactly one synthetic continuation message must be appended"
+    );
+    let last = agent.history.last().expect("history has the injected message");
+    assert_eq!(last.role, crate::types::Role::User);
+    assert!(
+        last.text_content()
+            .is_some_and(|t| t.contains("Continue working toward the active session goal")),
+        "injected message must be the continuation prompt"
+    );
+    // Reservation is now held for turn-1, so a re-entrant call for the same
+    // turn must NOT inject a second continuation (loop-safety guard).
+    let second = agent.maybe_inject_goal_continuation("turn-1").await;
+    assert!(!second, "same turn_id must not double-continue");
+    assert_eq!(
+        agent.history.len(),
+        before + 1,
+        "no additional message on the deduped call"
+    );
+}
+
+/// Negative: only an *Active* goal continues. Every other status ends the turn.
+#[tokio::test]
+async fn continuation_suppressed_for_non_active_statuses() {
+    for status in [
+        GoalStatus::Paused,
+        GoalStatus::BudgetLimited,
+        GoalStatus::UsageLimited,
+        GoalStatus::Blocked,
+        GoalStatus::Complete,
+    ] {
+        let db = Database::test_db().await;
+        let mut agent = agent_with_db(Some(db)).await;
+        let session_id = agent.session.meta.id.clone();
+        {
+            let guard = agent.db_guard().await;
+            let db = guard.as_ref().expect("db");
+            db.insert_goal(&session_id, "x", GoalStatus::Active, Some(5000))
+                .await
+                .expect("insert")
+                .expect("row");
+            db.update_goal(
+                &session_id,
+                crate::db::GoalUpdate {
+                    status: Some(status),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set status");
+        }
+        let before = agent.history.len();
+        let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+        assert!(!injected, "status={status:?} must not continue");
+        assert_eq!(
+            agent.history.len(),
+            before,
+            "status={status:?} must not inject a message"
+        );
+    }
+}
+
+/// Negative: no goal row → nothing to continue.
+#[tokio::test]
+async fn continuation_false_when_no_goal() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    assert!(!agent.maybe_inject_goal_continuation("turn-1").await);
+}
+
+/// Negative: goals disabled short-circuits before any DB read.
+#[tokio::test]
+async fn continuation_false_when_goals_disabled() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "x", None).await;
+    agent.config.goals.enabled = false;
+    assert!(
+        !agent.maybe_inject_goal_continuation("turn-1").await,
+        "disabled goals must never auto-continue"
+    );
+    assert!(agent.history.is_empty());
+}
+
+/// Negative: Plan mode is read-only; a Plan turn must not spawn a
+/// continuation even for an Active goal.
+#[tokio::test]
+async fn continuation_false_in_plan_mode() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "x", None).await;
+    agent.config.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
+    assert!(!agent.maybe_inject_goal_continuation("turn-1").await);
+    assert!(agent.history.is_empty());
+}
+
+/// Negative + regression for the `user_input_is_pending` fix: a queued user
+/// steer must suppress the continuation so the user's fresh input drives the
+/// next turn instead of a synthetic nudge.
+#[tokio::test]
+async fn continuation_suppressed_by_pending_user_steer() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "x", None).await;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tx.send("actually, do this instead".to_string())
+        .expect("queue a steer");
+    agent.steer_rx = Some(rx);
+
+    assert!(
+        agent.user_input_is_pending(),
+        "a buffered steer must read as pending input"
+    );
+    let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+    assert!(
+        !injected,
+        "pending user input must suppress auto-continuation"
+    );
+    assert!(
+        agent.history.is_empty(),
+        "no continuation message when the user is steering"
+    );
+}
+
+/// `user_input_is_pending` reflects the steer queue precisely: no channel and
+/// an empty channel are both "not pending"; a buffered message is "pending".
+#[tokio::test]
+async fn user_input_is_pending_tracks_steer_queue() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    assert!(!agent.user_input_is_pending(), "no channel => not pending");
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    agent.steer_rx = Some(rx);
+    assert!(
+        !agent.user_input_is_pending(),
+        "empty channel => not pending"
+    );
+
+    tx.send("steer".to_string()).expect("send");
+    assert!(
+        agent.user_input_is_pending(),
+        "buffered message => pending"
+    );
+}
+
+/// End-to-end accounting: after a turn baseline is captured, charging a token
+/// delta that crosses the budget flips the goal to BudgetLimited and queues the
+/// one-shot budget-limit steering message.
+#[tokio::test]
+async fn account_at_turn_end_flips_budget_and_queues_steering() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    // Tiny budget so any real token growth crosses it.
+    seed_active_goal(&agent, "ship it", Some(1)).await;
+
+    // Capture the baseline at (empty) turn start, exactly as the loop does.
+    let baseline = agent.sync_goal_runtime_for_turn().await;
+    assert!(baseline.is_some(), "sync must return the Active goal");
+
+    // Simulate the turn producing output: append a substantial message so
+    // `history_tokens` grows well past the 1-token budget.
+    agent
+        .log_and_persist(Message::assistant(&"work ".repeat(200)))
+        .await;
+
+    let after = agent
+        .account_goal_at_turn_end()
+        .await
+        .expect("accounting fired");
+    assert_eq!(
+        after.status,
+        GoalStatus::BudgetLimited,
+        "crossing the budget must flip status"
+    );
+    assert!(after.tokens_used >= 1, "tokens must have been charged");
+
+    let steering = agent
+        .goal_runtime
+        .take_pending_steering()
+        .expect("budget-limit steering queued");
+    assert_eq!(
+        steering.reason,
+        crate::goals::runtime::SteeringReason::BudgetLimited
+    );
+    assert!(steering.body.contains("budget_limited"));
+}
+
+/// Negative: Plan-mode turns must not charge the budget. The baseline is
+/// dropped so a later Execute turn cannot double-charge a Plan start.
+#[tokio::test]
+async fn account_at_turn_end_noop_in_plan_mode() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "x", Some(1000)).await;
+    // Arm a baseline while in Execute, then switch to Plan before charging.
+    agent.sync_goal_runtime_for_turn().await;
+    agent
+        .log_and_persist(Message::assistant(&"work ".repeat(200)))
+        .await;
+    agent.config.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
+
+    assert!(
+        agent.account_goal_at_turn_end().await.is_none(),
+        "Plan mode must not charge accounting"
+    );
+    let session_id = agent.session.meta.id.clone();
+    let goal = {
+        let guard = agent.db_guard().await;
+        guard
+            .as_ref()
+            .expect("db")
+            .get_goal(&session_id)
+            .await
+            .expect("query")
+            .expect("goal still present")
+    };
+    assert_eq!(goal.tokens_used, 0, "no tokens charged in Plan mode");
+    assert_eq!(goal.status, GoalStatus::Active);
+}

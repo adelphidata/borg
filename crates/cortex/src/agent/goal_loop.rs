@@ -89,27 +89,22 @@ impl Agent {
         Some(goal)
     }
 
-    /// True iff a user-initiated steer is queued for the current turn. Used
-    /// by [`should_continue`] to suppress auto-continuation when the user
-    /// has already given the agent a fresh nudge.
+    /// True iff a user-initiated steer is queued and not yet consumed. Used by
+    /// [`maybe_inject_goal_continuation`] to suppress auto-continuation when the
+    /// user is actively steering — mirroring the reference's "only continue
+    /// when the thread is idle" invariant.
+    ///
+    /// `steer_rx` is the mid-turn channel into the agent. `drain_steers` runs
+    /// at tool boundaries, but the end-of-turn path taken by a *text-only*
+    /// response (`tool_calls.is_empty()` → `EndTurn`) never hits that drain, so
+    /// a steer that landed after the last boundary is still buffered here. If we
+    /// injected a continuation nudge in that state, the user's fresh input would
+    /// be delayed behind a synthetic message it should have superseded. We peek
+    /// the queue non-destructively via `is_empty()` (tokio ≥1.30 exposes it on
+    /// the unbounded receiver) rather than `try_recv`, which would consume the
+    /// message and drop it.
     pub(super) fn user_input_is_pending(&self) -> bool {
-        // `steer_rx` is the mid-turn channel into the agent; when it carries
-        // unread items, the user is steering this turn explicitly. We can't
-        // peek a `tokio::sync::mpsc` cleanly without consuming, so the cheap
-        // check is "did `drain_steers` leave anything for next iteration?".
-        // It runs at tool boundaries and `EndTurn` is reached *after* that
-        // drain, so on the end-of-turn path the queue is empty whenever the
-        // user hasn't sent anything since the last boundary. Use the channel
-        // length proxy via `len()` (mpsc::Receiver does not expose it);
-        // approximate via `self.steer_rx.is_some()` plus a try_recv-and-
-        // requeue would be wrong (consumes the message). The cleanest
-        // available signal is the *next* call to `drain_steers` finding
-        // nothing — by the time we reach `should_continue`, the previous
-        // drain has run, so the cached list is empty. Default to `false`
-        // here: it produces the right behavior (auto-continue unless the
-        // user actively steered) and any pending steer will be drained at
-        // the *next* tool boundary anyway.
-        false
+        self.steer_rx.as_ref().is_some_and(|rx| !rx.is_empty())
     }
 
     /// Charge the per-turn accounting against the goal, queue a budget-limit
