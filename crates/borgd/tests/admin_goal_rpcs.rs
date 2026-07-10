@@ -455,6 +455,109 @@ async fn set_goal_budget_changes_in_place_and_preserves_accounting() {
     );
 }
 
+/// A budget change re-evaluates the budget-limit invariant so it can resume a
+/// BudgetLimited goal (the only way — SetStatus has no BudgetLimited->Active
+/// edge) or re-limit an Active goal pushed over its new cap. Covers: raise cap
+/// above usage → resume; lower cap below usage → re-limit; clear cap → resume.
+#[tokio::test]
+async fn set_goal_budget_reevaluates_limit_status() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    seed_session("sess-resume").await;
+    admin
+        .set_goal(GoalMutation {
+            session_id: "sess-resume".into(),
+            op: GoalOp::Create as i32,
+            objective: "grind".into(),
+            token_budget_present: true,
+            token_budget: 100,
+            status: String::new(),
+        })
+        .await
+        .expect("create");
+
+    // Exhaust the budget so the goal flips to BudgetLimited.
+    {
+        let db = Database::open().await.expect("open db");
+        db.account_goal_usage("sess-resume", 150, 1, None)
+            .await
+            .expect("charge past budget");
+    }
+    let limited = admin
+        .get_goal(GoalRef {
+            session_id: "sess-resume".into(),
+        })
+        .await
+        .expect("get")
+        .into_inner();
+    assert_eq!(
+        limited.status, "budget_limited",
+        "precondition: the goal is budget-limited after overspending"
+    );
+
+    // Raising the cap above usage must RESUME the goal (BudgetLimited->Active).
+    let resumed = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-resume".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: true,
+            token_budget: 5000,
+            status: String::new(),
+        })
+        .await
+        .expect("raise budget")
+        .into_inner();
+    assert_eq!(
+        resumed.status, "active",
+        "raising the cap above usage must resume, not silently leave it stuck"
+    );
+    assert_eq!(resumed.token_budget, 5000);
+    assert_eq!(resumed.tokens_used, 150, "usage preserved across resume");
+
+    // Lowering the cap below current usage on an Active goal must re-limit it.
+    let relimited = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-resume".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: true,
+            token_budget: 50,
+            status: String::new(),
+        })
+        .await
+        .expect("lower budget")
+        .into_inner();
+    assert_eq!(
+        relimited.status, "budget_limited",
+        "lowering the cap below usage must re-limit an Active goal"
+    );
+
+    // Clearing the cap (unbounded) must resume a budget-limited goal.
+    let unbounded = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-resume".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: false,
+            token_budget: 0,
+            status: String::new(),
+        })
+        .await
+        .expect("clear budget")
+        .into_inner();
+    assert_eq!(
+        unbounded.status, "active",
+        "clearing the cap (unbounded) must resume a budget-limited goal"
+    );
+    assert!(!unbounded.token_budget_present);
+}
+
 /// Negative: `set_goal{SetStatus}` rejects an illegal transition like
 /// Complete -> Active.
 /// Negative: BudgetLimited cannot be set via RPC at all (system-only).

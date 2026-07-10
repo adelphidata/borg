@@ -185,11 +185,26 @@ pub(super) async fn set_goal(
                     .ok_or_else(|| {
                         SetGoalError::Precondition("no goal set for this session".into())
                     })?;
+                // Re-evaluate the budget-limit invariant (limited iff the new
+                // budget is finite and already met) so a budget change resumes
+                // or limits the goal instead of silently leaving it stuck. Only
+                // the Active<->BudgetLimited pair is auto-flipped; Paused,
+                // Blocked, and Complete are user/agent states we never override
+                // here. Raising the cap on a BudgetLimited goal is the sole way
+                // to resume it — SetStatus has no BudgetLimited->Active edge.
+                use cortex::goals::GoalStatus as S;
+                let over_budget = budget.is_some_and(|b| current.tokens_used >= b);
+                let new_status = match current.status {
+                    S::Active if over_budget => Some(S::BudgetLimited),
+                    S::BudgetLimited if !over_budget => Some(S::Active),
+                    _ => None,
+                };
                 let updated = db
                     .update_goal(
                         &session_id,
                         cortex::db::GoalUpdate {
                             token_budget: Some(budget),
+                            status: new_status,
                             expected_goal_id: Some(current.goal_id),
                             ..Default::default()
                         },
