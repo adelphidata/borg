@@ -65,10 +65,18 @@ pub enum GoalStatus {
     Paused,
     /// Token budget reached; agent should wrap up.
     BudgetLimited,
-    /// LLM provider usage limit reached (rate-limit / quota / 429). Auto-
-    /// continuation stops until the operator resumes — distinct from
-    /// [`GoalStatus::BudgetLimited`] (per-goal token budget) so the operator
-    /// can tell "you spent the budget you set" from "the provider cut us off."
+    /// LLM provider usage limit reached (rate-limit / quota / 429) — distinct
+    /// from [`GoalStatus::BudgetLimited`] (per-goal token budget) so the
+    /// operator can tell "you spent the budget you set" from "the provider cut
+    /// us off." Fully honored on the read side (auto-continuation stops via
+    /// [`runtime::should_continue`], the heartbeat scheduler treats it as
+    /// terminal, and the TUI renders it), and the operator resumes it like any
+    /// other stop. Not auto-written today: borg's LLM resilience layer absorbs
+    /// provider 429s with per-key cooldowns and the `llm.fallback` chain, so a
+    /// transient cap doesn't reach the goal layer, and terminal exhaustion
+    /// surfaces only as a formatted stream-error string that is unsafe to
+    /// pattern-match into a status flip. Reserved for a future structured
+    /// exhaustion signal and for daemon/operator use.
     UsageLimited,
     /// Agent hit a repeated impasse (permission denial, missing external
     /// resource, persistent tool failure) and called `update_goal` with
