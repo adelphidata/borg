@@ -1256,6 +1256,30 @@ impl App<'_> {
                 self.push_system_message(GOAL_USAGE.to_string());
                 Ok(AppAction::Continue)
             }
+            GoalSubcommand::Budget { budget } => {
+                if let Some(b) = budget {
+                    if let Err(e) = cortex::goals::validate_budget(Some(b)) {
+                        self.push_system_message(format!("/goal: {e}"));
+                        return Ok(AppAction::Continue);
+                    }
+                }
+                // SetGoal{SetBudget} changes the budget in place — unlike
+                // `--budget N <text>`, it preserves the objective, goal_id,
+                // and accumulated accounting. Requires an existing goal.
+                let report = match self.rpc_set_goal_budget(budget) {
+                    Ok(detail) => {
+                        let shown = if detail.token_budget_present {
+                            detail.token_budget.to_string()
+                        } else {
+                            "unbounded".to_string()
+                        };
+                        format!("/goal: budget set to {shown}")
+                    }
+                    Err(e) => format!("/goal: budget change failed — {e}"),
+                };
+                self.push_system_message(report);
+                Ok(AppAction::Continue)
+            }
             GoalSubcommand::Set { objective, budget } => {
                 let trimmed = match cortex::goals::validate_objective(&objective) {
                     Ok(v) => v,
@@ -1356,6 +1380,16 @@ impl App<'_> {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
                 c.set_goal_status("", &status).await
+            })
+        })
+    }
+
+    fn rpc_set_goal_budget(&self, budget: Option<i64>) -> Result<protocols::admin::GoalDetail> {
+        let client = self.client.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.set_goal_budget("", budget).await
             })
         })
     }
@@ -1664,10 +1698,10 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
     let parsed = cortex::goals::GoalStatus::from_str(&detail.status);
     let hint = match parsed {
         Some(cortex::goals::GoalStatus::Active) => {
-            "Commands: /goal <new text>, /goal pause, /goal clear"
+            "Commands: /goal <new text>, /goal budget N, /goal pause, /goal clear"
         }
         Some(cortex::goals::GoalStatus::Paused) => {
-            "Commands: /goal <new text>, /goal resume, /goal clear"
+            "Commands: /goal <new text>, /goal budget N, /goal resume, /goal clear"
         }
         Some(cortex::goals::GoalStatus::Blocked)
         | Some(cortex::goals::GoalStatus::UsageLimited) => {
@@ -1685,6 +1719,7 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
 const GOAL_USAGE: &str = "Usage:\n  /goal                       Show current goal\n  \
      /goal <text>                Set or replace the session goal\n  \
      /goal --budget N <text>     Set with a token budget\n  \
+     /goal budget N|none         Change the budget in place\n  \
      /goal edit <text>           Replace the objective\n  \
      /goal pause|resume|clear    Manage goal status";
 
@@ -1707,6 +1742,14 @@ pub(super) enum GoalSubcommand {
     EmptyObjective,
     /// `/goal --budget` with no value — show usage.
     Usage,
+    /// `/goal budget N` / `/goal budget none` — change the token budget of the
+    /// existing goal in place (preserves `goal_id` + accounting). `None`
+    /// clears the budget (unbounded). Distinct from the `--budget N <text>`
+    /// prefix on [`GoalSubcommand::Set`], which replaces the objective.
+    Budget {
+        /// New budget; `None` means unbounded.
+        budget: Option<i64>,
+    },
     /// `/goal <text>` or `/goal edit <text>` or `/goal --budget N <text>`.
     Set {
         /// Raw objective text (unvalidated, to be passed to
@@ -1726,6 +1769,19 @@ pub(super) fn parse_goal_subcommand(args: &str) -> GoalSubcommand {
         "edit" => return GoalSubcommand::BareEdit,
         "--budget" => return GoalSubcommand::Usage,
         _ => {}
+    }
+    // `/goal budget N` / `/goal budget none` — in-place budget change. Only a
+    // bare integer or none/unbounded qualifies; any other trailing text (e.g.
+    // `budget report for Q3`) falls through and is treated as an objective, so
+    // this never hijacks a legitimate goal that happens to start with "budget".
+    if let Some(rest) = args.trim().strip_prefix("budget ") {
+        let rest = rest.trim();
+        if let Ok(n) = rest.parse::<i64>() {
+            return GoalSubcommand::Budget { budget: Some(n) };
+        }
+        if rest.eq_ignore_ascii_case("none") || rest.eq_ignore_ascii_case("unbounded") {
+            return GoalSubcommand::Budget { budget: None };
+        }
     }
     // A literal `--budget ` prefix is always an attempt at the flag — if the
     // value doesn't parse as an integer, treat that as Usage rather than
@@ -2070,6 +2126,66 @@ mod tests {
             GoalSubcommand::Usage
         );
         assert_eq!(parse_goal_subcommand("--budget abc"), GoalSubcommand::Usage);
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_subcommand_sets_numeric() {
+        // `/goal budget N` is the in-place budget change — distinct from the
+        // `--budget N <text>` prefix, it carries no objective.
+        assert_eq!(
+            parse_goal_subcommand("budget 5000"),
+            GoalSubcommand::Budget { budget: Some(5000) }
+        );
+        assert_eq!(
+            parse_goal_subcommand("budget   250  "),
+            GoalSubcommand::Budget { budget: Some(250) }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_none_clears() {
+        // `budget none` / `budget unbounded` clear the budget (case-insensitive).
+        for s in ["budget none", "budget NONE", "budget unbounded", "budget Unbounded"] {
+            assert_eq!(
+                parse_goal_subcommand(s),
+                GoalSubcommand::Budget { budget: None },
+                "input {s:?} must clear the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_negative_is_carried_for_validation() {
+        // A negative value parses as an integer here; the dispatcher rejects it
+        // via `validate_budget` so the operator sees "must be positive" rather
+        // than the parser silently dropping it.
+        assert_eq!(
+            parse_goal_subcommand("budget -5"),
+            GoalSubcommand::Budget { budget: Some(-5) }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_word_is_an_objective_not_a_subcommand() {
+        // Only a numeric or none/unbounded value triggers the budget
+        // subcommand. A goal that legitimately begins with "budget" must not be
+        // hijacked — `/goal budget report for Q3` is an objective.
+        assert_eq!(
+            parse_goal_subcommand("budget report for Q3"),
+            GoalSubcommand::Set {
+                objective: "budget report for Q3".to_string(),
+                budget: None,
+            }
+        );
+        // Bare `budget` (no value) is likewise just an objective, not a
+        // malformed subcommand.
+        assert_eq!(
+            parse_goal_subcommand("budget"),
+            GoalSubcommand::Set {
+                objective: "budget".to_string(),
+                budget: None,
+            }
+        );
     }
 
     #[test]

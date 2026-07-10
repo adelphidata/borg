@@ -344,6 +344,109 @@ async fn set_goal_replace_regenerates_goal_id() {
     assert_eq!(second.tokens_used, 0, "Replace must reset tokens_used to 0");
 }
 
+/// Positive: `set_goal{SetBudget}` changes the budget in place — the objective,
+/// goal_id, and accumulated accounting all survive (unlike Replace, which
+/// resets them). Also covers clearing the budget back to unbounded.
+/// Negative: SetBudget on a session with no goal is a precondition failure.
+#[tokio::test]
+async fn set_goal_budget_changes_in_place_and_preserves_accounting() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    seed_session("sess-budget").await;
+    let created = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-budget".into(),
+            op: GoalOp::Create as i32,
+            objective: "ship it".into(),
+            token_budget_present: true,
+            token_budget: 1000,
+            status: String::new(),
+        })
+        .await
+        .expect("create")
+        .into_inner();
+    let original_id = created.goal_id.clone();
+
+    // Charge some usage directly against the DB (same BORG_DATA_DIR the
+    // handler reopens) so we can prove SetBudget preserves it.
+    {
+        let db = Database::open().await.expect("open db");
+        db.account_goal_usage("sess-budget", 250, 5, None)
+            .await
+            .expect("charge usage");
+    }
+
+    // Raise the budget in place.
+    let updated = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-budget".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: true,
+            token_budget: 4096,
+            status: String::new(),
+        })
+        .await
+        .expect("set budget")
+        .into_inner();
+    assert_eq!(updated.token_budget, 4096, "budget must be updated");
+    assert!(updated.token_budget_present);
+    assert_eq!(
+        updated.goal_id, original_id,
+        "SetBudget must NOT regenerate goal_id (in-place, not a replace)"
+    );
+    assert_eq!(updated.objective, "ship it", "objective must survive");
+    assert_eq!(
+        updated.tokens_used, 250,
+        "accumulated accounting must survive a budget change"
+    );
+    assert_eq!(updated.status, "active");
+
+    // Clearing the budget (token_budget_present=false) makes it unbounded.
+    let cleared = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-budget".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: false,
+            token_budget: 0,
+            status: String::new(),
+        })
+        .await
+        .expect("clear budget")
+        .into_inner();
+    assert!(
+        !cleared.token_budget_present,
+        "cleared budget must report unbounded"
+    );
+    assert_eq!(cleared.tokens_used, 250, "clearing must not reset usage");
+
+    // Negative: SetBudget with no goal set is a precondition failure.
+    seed_session("sess-nobudget").await;
+    let err = admin
+        .set_goal(GoalMutation {
+            session_id: "sess-nobudget".into(),
+            op: GoalOp::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: true,
+            token_budget: 100,
+            status: String::new(),
+        })
+        .await
+        .expect_err("SetBudget without a goal must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "missing goal must be FailedPrecondition, got {:?}",
+        err.code()
+    );
+}
+
 /// Negative: `set_goal{SetStatus}` rejects an illegal transition like
 /// Complete -> Active.
 /// Negative: BudgetLimited cannot be set via RPC at all (system-only).

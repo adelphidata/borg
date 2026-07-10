@@ -645,6 +645,19 @@ rpc_wrappers! {
             status: status.to_string(),
         });
 
+    /// Change the token budget of the existing goal in place. Preserves the
+    /// objective, `goal_id`, and accumulated accounting (unlike Replace).
+    /// `None` clears the budget (unbounded). Fails if no goal is set.
+    admin fn set_goal_budget(session_id: &str, token_budget: Option<i64>) -> GoalDetail =
+        set_goal("Admin.SetGoal{SetBudget}", GoalMutation {
+            session_id: session_id.to_string(),
+            op: protocols::admin::goal_mutation::Op::SetBudget as i32,
+            objective: String::new(),
+            token_budget_present: token_budget.is_some(),
+            token_budget: token_budget.unwrap_or(0),
+            status: String::new(),
+        });
+
     /// Delete the goal row. No-op when none exists.
     admin fn clear_goal(session_id: &str) =
         clear_goal("Admin.ClearGoal", GoalRef {
