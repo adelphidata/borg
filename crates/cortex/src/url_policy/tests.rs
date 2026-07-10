@@ -56,6 +56,33 @@ fn rules_normalize_host_handles_case_and_trailing_dot() {
 }
 
 #[test]
+fn rules_normalize_host_strips_ipv6_brackets() {
+    // The bracketed IPv6 authority must reduce to the bare address so the
+    // private/loopback IP gate can `IpAddr::parse` it. Regression: `[::1]`
+    // left bracketed fails to parse and silently skips the SSRF check.
+    assert_eq!(rules::normalize_host("[::1]"), "::1");
+    assert_eq!(rules::normalize_host("[FE80::1]"), "fe80::1");
+    assert_eq!(rules::normalize_host("[2606:4700::1]"), "2606:4700::1");
+}
+
+#[test]
+fn classify_offline_blocks_bracketed_ipv6_loopback() {
+    // End-to-end at the offline classifier: `http://[::1]/` must be blocked
+    // as a private/loopback literal, not slip through as Allow.
+    let cfg = UrlPolicyConfig::default();
+    assert!(matches!(
+        classify_offline("http://[::1]:8080/admin", &cfg),
+        ClassifyOutcome::Block { .. }
+    ));
+    // `::` (unspecified) shares the IPv4-compatible block with `::1`; it must
+    // block too, proving the native-v6 check runs before the v4 unwrap.
+    assert!(matches!(
+        classify_offline("http://[::]/", &cfg),
+        ClassifyOutcome::Block { .. }
+    ));
+}
+
+#[test]
 fn rules_normalize_rule_handles_url_shaped_input() {
     // Real failure mode: users paste a full URL into the denylist; the
     // rule must collapse to just the host for the matcher to fire.

@@ -43,8 +43,20 @@ fn ssrf_filter_addrs(ips: Vec<IpAddr>, allow_private: bool) -> Vec<SocketAddr> {
 /// the connect-time lookup are no longer allowed to disagree, because the
 /// connection uses exactly the addresses this resolver validated.
 #[derive(Debug, Clone)]
-struct SsrfGuardResolver {
+pub struct SsrfGuardResolver {
     allow_private: bool,
+}
+
+/// Build the connect-time SSRF DNS guard that `web_fetch` pins into its client,
+/// exposed so other outbound-fetch paths (e.g. the gateway link-unfurl) enforce
+/// the same IP policy on the initial request AND every redirect hop instead of
+/// re-implementing a weaker offline (no-DNS) per-hop check. With
+/// `allow_private = false` the resolver refuses, at connect time, any host that
+/// resolves to private/loopback/link-local/CGNAT or cloud-metadata space —
+/// closing the redirect-to-internal and DNS-rebinding window that a name-fronted
+/// internal host on an intermediate hop would otherwise slip through.
+pub fn ssrf_guard_resolver(allow_private: bool) -> Arc<SsrfGuardResolver> {
+    Arc::new(SsrfGuardResolver { allow_private })
 }
 
 impl reqwest::dns::Resolve for SsrfGuardResolver {

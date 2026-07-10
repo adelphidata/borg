@@ -279,16 +279,25 @@ pub(crate) fn is_private_class(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(*v4),
         IpAddr::V6(v6) => {
-            if let Some(v4) = ssrf::ipv6_to_v4_for_private_check(*v6) {
-                return is_private_v4(v4);
-            }
-            v6.is_loopback()
+            // Native v6 special ranges MUST be tested before the v4-equivalent
+            // unwrap: `::1` (loopback) and `::` (unspecified) live inside the
+            // IPv4-compatible block `::0.0.0.0/96`, so unwrapping first would
+            // turn `::1` into `0.0.0.1` — not private — and let the loopback
+            // slip the gate.
+            if v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
                 // unique-local (fc00::/7)
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 // link-local (fe80::/10)
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+            {
+                return true;
+            }
+            if let Some(v4) = ssrf::ipv6_to_v4_for_private_check(*v6) {
+                return is_private_v4(v4);
+            }
+            false
         }
     }
 }

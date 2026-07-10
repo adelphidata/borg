@@ -38,16 +38,24 @@ struct Args {
     insecure_tcp: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // MCP stdio watchdog trampoline (Unix): a re-exec of this binary to
     // supervise a stdio MCP server and reap it if the daemon dies ungracefully
-    // (SIGKILL/crash). Handled before clap so the watchdog argv never reaches
-    // the CLI and the watchdog never boots the daemon.
+    // (SIGKILL/crash). Handled before clap AND before the tokio runtime is
+    // built so the watchdog argv never reaches the CLI, the watchdog never
+    // boots the daemon, and a watchdog re-exec doesn't pay to spin up a
+    // multi-thread worker pool it would only discard.
     if let Some(code) = mcp::watchdog::dispatch() {
         std::process::exit(code);
     }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     // Point config/DB resolution at the resolved home so telemetry settings

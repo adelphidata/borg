@@ -18,6 +18,13 @@
 /// case (`example.com` rule matches `www.example.com` host).
 pub fn normalize_host(host: &str) -> String {
     let mut h = host.trim().to_ascii_lowercase();
+    // Strip the brackets a URL authority wraps around an IPv6 literal
+    // (`[::1]` → `::1`) — they are URL syntax, not part of the host, and
+    // leaving them on makes the bare address fail `IpAddr::parse`, so the
+    // private/loopback IP gate would silently skip `http://[::1]/`.
+    if h.len() >= 2 && h.starts_with('[') && h.ends_with(']') {
+        h = h[1..h.len() - 1].to_string();
+    }
     while h.ends_with('.') {
         h.pop();
     }

@@ -13,6 +13,18 @@ use cortex::url_policy::{self, ClassifyOutcome};
 /// against the SSRF policy, so this only bounds redirect-chain length.
 const REDIRECT_LIMIT: usize = 3;
 
+/// Inbound link-unfurl acts on attacker-controlled URLs pulled from untrusted
+/// messages, so it must NEVER reach private/loopback/internal space — regardless
+/// of `allow_private_urls`, which is an operator convenience for the first-party
+/// `web_fetch` tool, not something an inbound message sender should be able to
+/// leverage. Force the flag off for every SSRF check on this path.
+fn inbound_policy(policy: &UrlPolicyConfig) -> UrlPolicyConfig {
+    UrlPolicyConfig {
+        allow_private_urls: false,
+        ..policy.clone()
+    }
+}
+
 /// Extract URLs from text, deduplicate, cap at `max_links`, and drop any that
 /// the offline SSRF pre-filter refuses.
 pub fn extract_urls(text: &str, max_links: usize, policy: &UrlPolicyConfig) -> Vec<String> {
@@ -21,12 +33,13 @@ pub fn extract_urls(text: &str, max_links: usize, policy: &UrlPolicyConfig) -> V
         return Vec::new();
     };
 
+    let policy = inbound_policy(policy);
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
     for m in re.find_iter(text) {
         let url = m.as_str().trim_end_matches(['.', ',']);
-        if seen.insert(url.to_string()) && is_admissible(url, policy) {
+        if seen.insert(url.to_string()) && is_admissible(url, &policy) {
             urls.push(url.to_string());
             if urls.len() >= max_links {
                 break;
@@ -61,21 +74,26 @@ fn is_admissible(url: &str, policy: &UrlPolicyConfig) -> bool {
 
 /// Fetch a URL and extract its text content, truncated to `max_chars`.
 ///
-/// SSRF is enforced in three layers, mirroring the `web_fetch` tool: a full
-/// DNS-resolving [`url_policy::classify`] pre-flight on the input URL, a
-/// per-redirect-hop offline re-check (so a public URL that 30x-redirects to
-/// `http://169.254.169.254/` cloud IMDS is refused mid-chain), and a
-/// post-fetch DNS re-check of the final landing host (defense-in-depth against
-/// a redirect that resolved to internal space).
+/// SSRF is enforced with the same layering as the `web_fetch` tool: a full
+/// DNS-resolving [`url_policy::classify`] pre-flight on the input URL; a
+/// connect-time DNS guard ([`cortex::web::ssrf_guard_resolver`]) pinned into
+/// the client so the addresses actually connected to — on the initial request
+/// AND every redirect hop — are re-validated against the IP policy (this is what
+/// catches a name-fronted internal host on an intermediate hop, which the
+/// no-DNS offline re-check cannot); a fast offline per-hop reject for metadata
+/// FQDNs / IP literals; and a post-fetch DNS re-check of the final landing host.
+/// `allow_private_urls` is forced off here — see [`inbound_policy`].
 pub async fn fetch_link_content(
     url: &str,
     max_chars: usize,
     timeout_ms: u64,
     policy: &UrlPolicyConfig,
 ) -> Result<String> {
+    let policy = inbound_policy(policy);
+
     // Pre-flight: full classifier (scheme + SSRF + DNS). Honor the returned
     // effective URL so any policy transforms (e.g. force-https) apply.
-    let effective_url = match url_policy::classify(url, policy).await {
+    let effective_url = match url_policy::classify(url, &policy).await {
         ClassifyOutcome::Allow { effective_url } => effective_url,
         other => {
             let msg = url_policy::describe_block_or_throttle(&other)
@@ -84,9 +102,9 @@ pub async fn fetch_link_content(
         }
     };
 
-    // Re-validate every redirect hop. `classify_offline` skips DNS (the
-    // post-fetch check below covers rebinding on the final host) but still
-    // blocks metadata FQDNs and internal IP literals reached via redirect.
+    // Fast offline reject per redirect hop (metadata FQDNs, internal IP
+    // literals). This is a cheap first line; the connect-time DNS guard below
+    // is the authoritative check that also catches name-fronted internal hosts.
     let redirect_cfg = policy.clone();
     let redirect = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= REDIRECT_LIMIT {
@@ -107,6 +125,11 @@ pub async fn fetch_link_content(
         .user_agent("Mozilla/5.0 (compatible; Borg/0.1)")
         .timeout(Duration::from_millis(timeout_ms))
         .redirect(redirect)
+        // Pin SSRF enforcement into the connector: every host (initial + each
+        // redirect hop) is resolved through this guard, and a resolve to
+        // private/internal/metadata space fails the connection. Inbound unfurl
+        // never permits private targets, so `allow_private = false`.
+        .dns_resolver(cortex::web::ssrf_guard_resolver(false))
         .build()?;
 
     let resp = client.get(&effective_url).send().await?;
@@ -118,7 +141,7 @@ pub async fn fetch_link_content(
     // redirect that resolved to internal space never returns a body.
     let final_url = resp.url().to_string();
     if !matches!(
-        url_policy::classify_no_throttle(&final_url, policy).await,
+        url_policy::classify_no_throttle(&final_url, &policy).await,
         ClassifyOutcome::Allow { .. }
     ) {
         anyhow::bail!("URL policy blocked final redirect target: {final_url}");
@@ -324,6 +347,31 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"https://example.com".to_string()));
         assert!(urls.contains(&"https://other.com".to_string()));
+    }
+
+    #[test]
+    fn extract_urls_rejects_bracketed_ipv6_loopback() {
+        // Regression: `[::1]` is the IPv6 loopback authority; the bracketed
+        // host must not survive the extraction pre-filter (normalize_host now
+        // strips the brackets so the literal parses and the private-IP gate
+        // fires).
+        let text = "http://[::1]:8080/admin http://[::1]/ https://example.com";
+        let urls = extract_urls(text, 10, &policy());
+        assert_eq!(urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn inbound_unfurl_ignores_allow_private_urls() {
+        // Regression: inbound link-unfurl handles attacker-controlled URLs and
+        // must block private/loopback space even when the operator enabled
+        // `allow_private_urls` for the first-party web_fetch tool.
+        let permissive = UrlPolicyConfig {
+            allow_private_urls: true,
+            ..UrlPolicyConfig::default()
+        };
+        let text = "http://192.168.1.1/secret http://127.0.0.1/admin https://example.com";
+        let urls = extract_urls(text, 10, &permissive);
+        assert_eq!(urls, vec!["https://example.com"]);
     }
 
     #[test]

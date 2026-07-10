@@ -321,11 +321,20 @@ impl Transport for StdioTransport {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
         if let Some(mut child) = self.child.lock().await.take() {
-            // Give the child 250ms to exit on its own after EOF; well-behaved
-            // MCP servers do. Then kill + wait so we don't return with a
-            // zombie.
-            const GRACEFUL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-            match tokio::time::timeout(GRACEFUL_WAIT, child.wait()).await {
+            // Grace before we SIGKILL `child`. For a direct spawn `child` is the
+            // server, and 250ms after EOF is plenty for a well-behaved server.
+            // For a watchdogged spawn `child` is the WATCHDOG, which itself
+            // needs time to notice our SIGTERM (≤100ms poll), SIGTERM the
+            // server group, wait out its own ~300ms grace, then SIGKILL — so a
+            // 250ms window here would SIGKILL the watchdog mid-reap and strand
+            // the very server it exists to clean up. Give it comfortably more
+            // than that whole budget.
+            let graceful_wait = if self.watchdog_pid.is_some() {
+                std::time::Duration::from_millis(800)
+            } else {
+                std::time::Duration::from_millis(250)
+            };
+            match tokio::time::timeout(graceful_wait, child.wait()).await {
                 Ok(Ok(_status)) => {}
                 Ok(Err(e)) => {
                     tracing::debug!(server = %self.server_name, error = %e, "mcp child wait failed");
@@ -342,6 +351,10 @@ impl Transport for StdioTransport {
                 }
             }
         }
+        // The watchdog has now been reaped, freeing its pid. Clear it so the
+        // Drop path can't re-`SIGTERM` a recycled pid (PID reuse would land the
+        // signal on an unrelated process during heavy spawn churn).
+        self.watchdog_pid = None;
         Ok(())
     }
 }
