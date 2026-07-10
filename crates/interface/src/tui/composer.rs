@@ -300,13 +300,17 @@ impl<'a> Composer<'a> {
     pub fn handle_paste(&mut self, text: &str) {
         self.history.reset();
         self.paste_burst.flush_immediate();
-        self.textarea.insert_str(text);
+        // Strip terminal control sequences so a pasted CSI can't corrupt the
+        // composer's live echo or, later, native scrollback.
+        self.textarea
+            .insert_str(&*super::history::sanitize_user_text(text));
     }
 
     /// Called on each tick to flush any paste-burst buffer.
     pub fn tick(&mut self) {
         if let Some(text) = self.paste_burst.flush_if_due(Instant::now()) {
-            self.textarea.insert_str(&text);
+            self.textarea
+                .insert_str(&*super::history::sanitize_user_text(&text));
         }
     }
 

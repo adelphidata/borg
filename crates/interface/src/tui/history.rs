@@ -57,6 +57,48 @@ pub(super) struct AssistantRenderCache {
     committed_byte_len: usize,
 }
 
+/// Strip terminal control sequences from user-authored text so a pasted or
+/// persisted CSI sequence can't repaint the terminal or corrupt native
+/// scrollback. Removes CSI sequences (`\x1b[` … final byte in `@..=~`) and any
+/// other non-whitespace control characters, while preserving `\n` and `\t`.
+///
+/// Returns a borrow when the text needs no changes (the common case — this runs
+/// on every render of a user message), allocating only when something is
+/// actually stripped.
+///
+/// Tool output is already guarded (see `parse_ansi_line`); this closes the same
+/// hole on the user-message path, which is otherwise rendered verbatim.
+pub(super) fn sanitize_user_text(text: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: nothing to strip → borrow without allocating. The predicate is
+    // exactly the set the loop below removes (ESC or a non-`\n`/`\t` control).
+    if !text
+        .chars()
+        .any(|c| c == '\x1b' || (c.is_control() && c != '\n' && c != '\t'))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // For a CSI (`ESC [`), consume only valid parameter/intermediate
+            // bytes (`0x20..=0x3f`) followed by a single final byte
+            // (`0x40..=0x7e`). Stop at the first non-CSI byte *without*
+            // consuming it, so a truncated or malformed sequence can't swallow
+            // the printable text that follows. Any other ESC form (a lone ESC)
+            // is simply dropped.
+            if chars.next_if_eq(&'[').is_some() {
+                while chars.next_if(|c| ('\u{20}'..='\u{3f}').contains(c)).is_some() {}
+                chars.next_if(|c| ('@'..='~').contains(c));
+            }
+        } else if matches!(ch, '\n' | '\t') || !ch.is_control() {
+            out.push(ch);
+        }
+        // Any other control char (lone ESC, `\r`, `\x08`, C1, …) is dropped.
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Parse a single line of tool output, honoring embedded ANSI escape
 /// sequences (colors / bold / etc.) so output from `cargo`, `git`,
 /// `pytest`, etc. retains its meaning. `fallback_style` is applied to
@@ -862,6 +904,10 @@ impl HistoryCell {
                 if w > 0 {
                     lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
                 }
+                // Sanitize at render so raw CSI sequences in pasted or
+                // replayed history never reach native scrollback. Done here
+                // (not on the stored value) so the transcript stays faithful.
+                let text = sanitize_user_text(text);
                 let mut first = true;
                 for line in text.lines() {
                     let wrapped = if line.is_empty() {

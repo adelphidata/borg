@@ -66,6 +66,7 @@ fn cfg(command: &str, args: &[&str], env: HashMap<String, String>) -> StdioConfi
         command: command.into(),
         args: args.iter().map(|s| (*s).to_string()).collect(),
         env,
+        max_line_bytes: 0,
     }
 }
 

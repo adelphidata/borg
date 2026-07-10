@@ -45,6 +45,10 @@ pub async fn open(
                 command: command.clone(),
                 args: args.clone(),
                 env: env.clone(),
+                // 0 → transport applies its own DEFAULT_MAX_LINE_BYTES. The
+                // cortex dispatch path overrides this with an operator-tuned
+                // ceiling; this generic builder keeps the safe default.
+                max_line_bytes: 0,
             };
             let sink: stdio::StderrSink = Arc::new(|srv: &str, line: &str| {
                 tracing::debug!(server = %srv, line = %line, "mcp stderr");

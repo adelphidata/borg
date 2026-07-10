@@ -1353,11 +1353,19 @@ async fn open_transport(
 ) -> Result<Box<dyn Transport>> {
     match &manifest.transport {
         mcp::manifest::Transport::Stdio { command, args, env } => {
+            // Same ceiling as the HTTP transport: a single stdout/stderr line
+            // larger than display-cap × headroom is a hostile/broken peer, and
+            // the bounded reader tears the transport down instead of buffering
+            // it unbounded (OOM).
+            let max_line_bytes = MAX_RESPONSE_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_mul(TRANSPORT_BODY_HEADROOM_FACTOR);
             let cfg = mcp::transport::stdio::StdioConfig {
                 server_name: manifest.name.clone(),
                 command: command.clone(),
                 args: args.clone(),
                 env: env.clone(),
+                max_line_bytes,
             };
             let stderr_sink: mcp::transport::stdio::StderrSink =
                 Arc::new(|srv: &str, line: &str| {

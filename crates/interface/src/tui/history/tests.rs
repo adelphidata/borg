@@ -1548,3 +1548,42 @@ fn style_system_line_handles_multibyte_at_log_heuristic_boundary() {
         log_line.spans[0].content
     );
 }
+
+/// A pasted/persisted user message carrying terminal control sequences must be
+/// stripped of them before rendering, or a raw CSI can repaint the terminal and
+/// corrupt native scrollback. Visible text plus `\n`/`\t` survive; CSI
+/// sequences, lone ESC, `\r`, and other C0 control chars are removed.
+#[test]
+fn sanitize_user_text_strips_control_sequences_but_keeps_text() {
+    // Clear-screen + cursor-home CSI, a backspace, a bare ESC, and a CR that
+    // could hide preceding output — all interleaved with real text.
+    let input = "\x1b[2J\x1b[Hhi\x08\ttab\r\nline2\x1bX";
+    let out = sanitize_user_text(input);
+    assert_eq!(
+        &*out, "hi\ttab\nline2X",
+        "CSI/control chars must be stripped while tabs and newlines survive"
+    );
+
+    // A CSI with a multi-byte parameter run is consumed up to and including its
+    // final byte, not just the ESC.
+    assert_eq!(&*sanitize_user_text("a\x1b[38;5;196mb"), "ab");
+
+    // A CSI truncated before its final byte (no `@..=~` terminator) must NOT
+    // swallow the printable text that follows: the parser stops at the first
+    // non-CSI byte instead of greedily hunting for a terminator. `\n` is such a
+    // byte, so it and everything after it survive.
+    assert_eq!(&*sanitize_user_text("\x1b[\nkeep"), "\nkeep");
+    // A C0 control mid-parameters also breaks the CSI: the parser stops (the
+    // control is dropped separately) rather than hunting past it for a final
+    // byte and eating the word behind it. Old greedy code yielded "eep".
+    assert_eq!(&*sanitize_user_text("\x1b[1\x08keep"), "keep");
+    // The classic greedy-bug shape: a bare `ESC[` immediately followed by prose
+    // whose first char is a valid final byte ends the sequence there, leaving
+    // the rest intact rather than consuming to the next terminator far away.
+    assert_eq!(&*sanitize_user_text("\x1b[Xrest"), "rest");
+
+    // Plain text is returned unchanged (fast-path borrows, no allocation).
+    let clean = sanitize_user_text("just words 123");
+    assert!(matches!(clean, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(&*clean, "just words 123");
+}
