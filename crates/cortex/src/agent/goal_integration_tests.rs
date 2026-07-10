@@ -385,7 +385,10 @@ async fn continuation_injects_for_active_goal_and_reserves_turn() {
         before + 1,
         "exactly one synthetic continuation message must be appended"
     );
-    let last = agent.history.last().expect("history has the injected message");
+    let last = agent
+        .history
+        .last()
+        .expect("history has the injected message");
     assert_eq!(last.role, crate::types::Role::User);
     assert!(
         last.text_content()
@@ -523,10 +526,7 @@ async fn user_input_is_pending_tracks_steer_queue() {
     );
 
     tx.send("steer".to_string()).expect("send");
-    assert!(
-        agent.user_input_is_pending(),
-        "buffered message => pending"
-    );
+    assert!(agent.user_input_is_pending(), "buffered message => pending");
 }
 
 /// End-to-end accounting: after a turn baseline is captured, charging a token

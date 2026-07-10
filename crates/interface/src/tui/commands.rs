@@ -2166,7 +2166,12 @@ mod tests {
     #[test]
     fn parse_goal_subcommand_budget_none_clears() {
         // `budget none` / `budget unbounded` clear the budget (case-insensitive).
-        for s in ["budget none", "budget NONE", "budget unbounded", "budget Unbounded"] {
+        for s in [
+            "budget none",
+            "budget NONE",
+            "budget unbounded",
+            "budget Unbounded",
+        ] {
             assert_eq!(
                 parse_goal_subcommand(s),
                 GoalSubcommand::Budget { budget: None },
