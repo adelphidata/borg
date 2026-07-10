@@ -1202,6 +1202,16 @@ impl Agent {
         // even if the goal stays Active forever.
         match outcome {
             IterationOutcome::EndTurn => {
+                // A user steer that arrived after the last tool boundary is
+                // still buffered — `drain_steers` only runs at tool boundaries,
+                // so a text-only final response would otherwise strand it until
+                // an unrelated future turn. Absorb it and re-enter the loop so
+                // the model acts on the redirect now. This also resolves the
+                // case where a pending steer suppressed the goal continuation
+                // below (the user's input supersedes the synthetic nudge).
+                if self.absorb_pending_steer_at_turn_end(event_tx).await {
+                    return IterationOutcome::NudgeAndContinue;
+                }
                 let turn_id = format!("{}:{}", self.session.meta.id, self.turn_count);
                 if self.maybe_inject_goal_continuation(&turn_id).await {
                     IterationOutcome::NudgeAndContinue

@@ -107,6 +107,26 @@ impl Agent {
         self.steer_rx.as_ref().is_some_and(|rx| !rx.is_empty())
     }
 
+    /// At the end of an otherwise-final turn, absorb a user steer that landed
+    /// after the last tool boundary. Because `drain_steers` only runs at tool
+    /// boundaries, a text-only `EndTurn` would otherwise strand the buffered
+    /// steer in `steer_rx` until an unrelated future turn injected it out of
+    /// context — the agent would simply halt and the user's redirect would be
+    /// lost. Draining it into history here and returning `true` lets the caller
+    /// re-enter the loop so the model responds to the redirect immediately;
+    /// this is the correct resolution when a pending steer suppresses the goal
+    /// continuation. Returns `false` (no-op) when nothing is buffered.
+    pub(super) async fn absorb_pending_steer_at_turn_end(
+        &mut self,
+        event_tx: &tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,
+    ) -> bool {
+        if !self.user_input_is_pending() {
+            return false;
+        }
+        self.drain_steers(event_tx).await;
+        true
+    }
+
     /// Charge the per-turn accounting against the goal, queue a budget-limit
     /// steering message if the row just flipped to BudgetLimited, and emit
     /// the vitals event for the transition.

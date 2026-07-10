@@ -529,6 +529,45 @@ async fn user_input_is_pending_tracks_steer_queue() {
     assert!(agent.user_input_is_pending(), "buffered message => pending");
 }
 
+/// Regression: a steer buffered at a text-only `EndTurn` must be *absorbed*
+/// (drained into history so the loop re-enters), not merely used to suppress
+/// the goal continuation. Suppressing without draining would strand the user's
+/// redirect in `steer_rx` and halt the agent — the bug this method prevents.
+#[tokio::test]
+async fn absorb_pending_steer_drains_into_history_and_signals_continue() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+
+    // No steer buffered → no-op: does not signal continue, does not touch history.
+    assert!(!agent.absorb_pending_steer_at_turn_end(&event_tx).await);
+    assert!(agent.history.is_empty());
+
+    // A steer that landed after the last tool boundary is buffered.
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    steer_tx
+        .send("actually, focus on the tests".to_string())
+        .expect("queue steer");
+    agent.steer_rx = Some(steer_rx);
+
+    assert!(
+        agent.absorb_pending_steer_at_turn_end(&event_tx).await,
+        "a buffered steer must be absorbed and signal the loop to continue"
+    );
+    // The steer is now a real user message in history — not stranded.
+    let last = agent.history.last().expect("steer drained into history");
+    assert_eq!(last.role, crate::types::Role::User);
+    assert!(
+        last.text_content()
+            .is_some_and(|t| t.contains("focus on the tests")),
+        "the drained message must be the user's steer text"
+    );
+    // The queue is now empty, so a repeat call is a no-op (no double-drain,
+    // no spurious continue).
+    assert!(!agent.absorb_pending_steer_at_turn_end(&event_tx).await);
+    assert_eq!(agent.history.len(), 1, "no duplicate steer injected");
+}
+
 /// End-to-end accounting: after a turn baseline is captured, charging a token
 /// delta that crosses the budget flips the goal to BudgetLimited and queues the
 /// one-shot budget-limit steering message.
