@@ -357,10 +357,8 @@ pub async fn generate_embedding_cached(
         }
     }
 
-    // API call
     let embedding = generate_embedding(client, provider, text).await?;
 
-    // Store in cache
     if let Some(ref db) = db {
         let bytes = embedding_to_bytes(&embedding);
         if let Err(e) = db

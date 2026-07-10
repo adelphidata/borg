@@ -306,7 +306,6 @@ impl SettingsResolver {
         Ok(result)
     }
 
-    /// Access the underlying database.
     pub fn database(&self) -> &Database {
         &self.db
     }

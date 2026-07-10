@@ -117,8 +117,8 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     // Best-effort silent cert renewal: if the daemon says we're inside the
     // 14-day window, rotate now. Failures here MUST NOT block the connect —
     // unauthenticated connections (bootstrap UDS, tests) intentionally fall
-    // through. Real failures are surfaced via tracing::warn! per the
-    // CLAUDE.md "log + continue" rule for fire-and-forget paths.
+    // through. Real failures are surfaced via tracing::warn! (log + continue
+    // for this fire-and-forget path).
     let kek = KeychainStore::new();
     match client.ensure_cert_fresh(&kek).await {
         Ok(true) => tracing::info!("client cert silently renewed"),

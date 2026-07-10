@@ -387,8 +387,6 @@ async fn manage_tasks_run_now(args: &serde_json::Value) -> Result<String> {
     .await
 }
 
-// ── Cron job management ──
-
 pub async fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> Result<String> {
     let action = require_str_param(args, "action")?.to_string();
     match action.as_str() {
@@ -633,10 +631,4 @@ pub async fn update_task_status(task_id: &str, status: &str, verb: &str) -> Resu
         }
     })
     .await
-}
-
-#[cfg(all(test, feature = "phase9-tests-disabled"))]
-mod tests {
-    use super::*;
-    use serde_json::json;
 }

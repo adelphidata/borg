@@ -144,8 +144,7 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
 
 pub(crate) async fn run_poke() -> Result<()> {
     // Prefer the gRPC daemon when its socket is present; fall back to the
-    // legacy HTTP gateway poke endpoint for installs where borgd hasn't
-    // taken over yet. Safe to drop once the HTTP gateway is fully retired.
+    // HTTP gateway poke endpoint for installs where borgd hasn't taken over yet.
     let socket = crate::daemon_client::default_socket_path();
     if socket.exists() {
         match crate::daemon_client::connect(Some(&socket)).await {

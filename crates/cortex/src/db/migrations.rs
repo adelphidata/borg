@@ -49,12 +49,8 @@ impl Database {
         Ok(())
     }
 
-    /// No-op on libsql. The turso fork briefly replaced the SQLite FTS5
-    /// virtual tables with a `USING fts` index method (turso-only syntax);
-    /// the backend swap back to libsql reverts to standard FTS5 virtual
-    /// tables, which are emitted directly in `SCHEMA_SQL`. Kept as a
-    /// placeholder so `CURRENT_VERSION` stays at 3 and existing
-    /// (fresh-install) DBs skip this migration cleanly.
+    /// No-op: FTS5 virtual tables are emitted directly in `SCHEMA_SQL`. Kept as
+    /// a placeholder so `CURRENT_VERSION` stays at 3 and fresh installs skip it.
     pub(super) async fn migrate_v2(&self) -> Result<()> {
         Ok(())
     }
@@ -1275,8 +1271,7 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_resolved
 -- latter of which carry `expires_at_ms` and (in memory only) a refresh token.
 -- `base_url` overrides the provider's default endpoint for OpenAI-compatible
 -- custom endpoints. `extra_json` is a per-provider blob (PKCE verifier, OAuth
--- client_id) reserved for the refresh flow. Pre-release: schema is edited in
--- place rather than chained — existing dev DBs blow away.
+-- client_id) reserved for the refresh flow.
 CREATE TABLE IF NOT EXISTS credential_pool (
     provider               TEXT NOT NULL,
     fingerprint            TEXT NOT NULL,

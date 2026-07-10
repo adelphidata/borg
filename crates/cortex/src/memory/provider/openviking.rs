@@ -39,7 +39,6 @@ pub struct OpenVikingProvider {
 }
 
 impl OpenVikingProvider {
-    /// Build from resolved settings.
     pub fn from_settings(settings: &OpenVikingSettings) -> Result<Self, MemoryError> {
         let endpoint = settings
             .endpoint

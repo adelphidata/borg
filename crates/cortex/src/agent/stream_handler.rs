@@ -182,8 +182,7 @@ impl Agent {
     /// Handle a text-only LLM response (no tool calls). Either terminates the
     /// turn (by finalizing or recording a stream-interrupted marker) or signals
     /// that the caller should nudge the model with a reminder message and loop
-    /// again. Centralizes the three exit branches that used to live inline in
-    /// `run_agent_loop`.
+    /// again.
     pub(super) async fn handle_text_only_response(
         &mut self,
         text_content: &str,

@@ -10,8 +10,7 @@ use super::HistoryMessage;
 
 /// Map a Borg tool name to the ACP `tool_call` category. ACP clients (Zed,
 /// etc.) render tool calls based on this `kind` field; without it they fall
-/// back to a generic icon and label. Plan §"Tool lifecycle" specifies the
-/// `run_shell → execute`, fs → `other` baseline; we extend it to the full
+/// back to a generic icon and label. We map to the full
 /// ACP `kind` enum (`read`, `edit`, `search`, `fetch`, `execute`, `other`)
 /// so that read-only inspection, mutation, and network access render
 /// distinctly. Unknown tools degrade to `"other"` rather than erroring.

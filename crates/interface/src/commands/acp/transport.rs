@@ -73,6 +73,7 @@ impl AcpFsClient for JsonRpcCallbackClient {
     }
 
     async fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
+        // fs/write returns an ack payload we don't consume; only the error matters.
         let _ = self
             .request(
                 "fs/write_text_file",
@@ -249,6 +250,7 @@ where
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    // Receiver may already be gone during teardown; drop is safe.
                     let _ = inbound_tx
                         .send(InboundTransportMessage::ParseError(e.to_string()))
                         .await;
@@ -350,6 +352,7 @@ where
                         pending.remove(&key)
                     };
                     if let Some(tx) = tx {
+                        // Waiting caller may have dropped the oneshot; nothing to do.
                         let _ = tx.send(match (response.result, response.error) {
                             (Some(result), None) => Ok(result),
                             (_, Some(error)) => Err(error.message),

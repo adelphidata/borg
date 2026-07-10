@@ -114,8 +114,6 @@ impl Database {
         Ok(out)
     }
 
-    // ── Message persistence ──
-
     /// Append a conversational message to the session event log. Thin wrapper
     /// over [`Database::append_session_event`] with no fine-grained event kind.
     #[instrument(skip_all)]
@@ -571,8 +569,6 @@ impl Database {
             .await?;
         Ok(count as usize)
     }
-
-    // ── Channel sessions ──
 
     /// Look up an existing channel session WITHOUT creating one. Returns
     /// `Ok(None)` when no row exists yet — used by read-only paths like

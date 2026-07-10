@@ -60,6 +60,8 @@ pub async fn advance_next_run_raw(
             .await?;
         }
         SCHEDULE_TYPE_CRON | SCHEDULE_TYPE_INTERVAL => {
+            // A bad schedule expr maps to NULL next_run (task goes dormant) rather
+            // than erroring the status update; heal_stalled_tasks handles the loud path.
             let next = calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone)
                 .unwrap_or(None);
             conn.execute(

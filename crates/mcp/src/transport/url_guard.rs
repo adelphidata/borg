@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn imds_ip_literal_refused_unconditionally_even_when_local_network_allowed() {
-        // Regression (M6): the IMDS IP literal must be refused UNCONDITIONALLY.
+        // The IMDS IP literal must be refused UNCONDITIONALLY.
         // Previously `allow_local_network=true` (a legitimate knob for talking
         // to a real subnet) also admitted 169.254.169.254 — an SSRF-to-IMDS
         // escape. The cloud-metadata IPs are now blocked regardless of the flag.

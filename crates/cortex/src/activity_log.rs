@@ -143,10 +143,6 @@ mod tests {
         assert!(formatted.contains("timeout after 30s"));
     }
 
-    // TODO: needs async DB harness
-    // Original asserted log_activity → query_activity behavior; the helpers
-    // are now async and Database::from_connection needs a libsql connection.
-
     #[test]
     fn test_level_priority() {
         assert!(level_priority("error") < level_priority("warn"));

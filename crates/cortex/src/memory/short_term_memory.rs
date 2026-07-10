@@ -93,7 +93,6 @@ impl ShortTermMemory {
         }
     }
 
-    /// Returns true if there are no facts.
     pub fn is_empty(&self) -> bool {
         self.facts.is_empty()
     }

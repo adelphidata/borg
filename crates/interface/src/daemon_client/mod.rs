@@ -471,6 +471,7 @@ impl DaemonClient {
                             .await
                             .is_err()
                         {
+                            // Renderer may already be gone as we tear down; drop is safe.
                             let _ = event_tx
                                 .send(cortex::agent::AgentEvent::Error(
                                     "ACP turn stream closed while sending fs response".into(),
@@ -750,7 +751,7 @@ rpc_wrappers! {
     admin fn get_session(id: &str) -> SessionDetail =
         get_session("Admin.GetSession", SessionRef { id: id.to_string() });
 
-    // ── Session-state RPCs (replace direct agent calls in TUI) ────────────
+    // ── Session-state RPCs ────────────
 
     /// Snapshot of agent state for the given session_id.
     session fn get_state(session_id: &str) -> SessionState =
@@ -820,7 +821,7 @@ rpc_wrappers! {
 
     /// Fork the active agent session at its last message. Daemon-side
     /// execution — the TUI must NOT open a SQLite writer to do this itself,
-    /// since `borgd` is the single writer (CLAUDE.md "DB writer split-brain").
+    /// since `borgd` is the single DB writer (avoids split-brain).
     session fn fork_session(session_id: &str) -> ForkResponse =
         fork("Session.Fork", ForkRequest {
             session_id: session_id.to_string(),

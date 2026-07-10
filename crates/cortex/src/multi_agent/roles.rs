@@ -23,7 +23,6 @@ pub const BUILTIN_ROLES: &[(&str, &str, f32, &[&str])] = &[
     ),
 ];
 
-/// Build an AgentRole from built-in defaults.
 pub fn builtin_role(name: &str) -> Option<AgentRole> {
     BUILTIN_ROLES
         .iter()

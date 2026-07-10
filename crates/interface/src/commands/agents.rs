@@ -160,8 +160,6 @@ async fn resume(id: String) -> Result<()> {
     Ok(())
 }
 
-// -- rendering --
-
 fn print_flat(agents: &[AgentEntry]) {
     println!(
         "{:<10}  {:<14}  {:<10}  {:<5}  {:<10}  {:<16}  METRICS",

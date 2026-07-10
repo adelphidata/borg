@@ -28,14 +28,8 @@ mod vitals;
 pub mod wal;
 pub mod web_search_cache;
 
-// Gated on `phase9-tests-disabled` because the split-out `db::tests::*`
-// submodules still call the pre-async rusqlite-style sync helper signatures
-// (`test_db()` without `.await`, `db.conn().execute(..., [], ...)`-style
-// rusqlite calls). The libsql migration unblocked the *backend* gripe (real
-// WAL, real `PRAGMA data_version`); the sync→async port is independent
-// follow-up work tracked behind the same flag. The shared async helper at
-// `db::tests::mod` is already libsql-shaped; only the per-topic test bodies
-// remain to port.
+// Gated off: the per-topic `db::tests::*` bodies still use pre-async sync
+// helper signatures and need porting to the libsql-shaped async harness.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 

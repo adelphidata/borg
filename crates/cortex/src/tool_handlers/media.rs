@@ -123,6 +123,7 @@ pub async fn handle_browser(
     // Handle close without needing a session
     if action == "close" {
         if let Some(s) = session.take() {
+            // Close is best-effort: the CDP channel may already be dead.
             s.close().await.ok();
             return Ok(ToolOutput::Text("Browser closed.".to_string()));
         }

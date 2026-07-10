@@ -262,7 +262,8 @@ async fn search_scope(
     // FTS search returns candidates with a stub `0.0` score because the FTS5
     // virtual table no longer exposes SQL `bm25()`. Re-rank the candidate set
     // in Rust using `bm25::score_candidates` so the BM25 component of the
-    // hybrid mix carries actual signal instead of zeroes.
+    // hybrid mix carries actual signal instead of zeroes. Over-fetch 4x so the
+    // Rust-side re-rank has a wide enough candidate pool to reorder within.
     let fts_rows = match db.fts_search(scope, query, max_results * 4).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -600,7 +601,6 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-/// Format search results for display.
 pub fn format_search_results(results: &[embeddings::SearchResult]) -> String {
     if results.is_empty() {
         return "No matching memories found.".to_string();

@@ -1217,6 +1217,8 @@ impl Default for MultiAgentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            // Depth 1: spawned children cannot themselves re-delegate unless an
+            // operator raises this, keeping fan-out bounded by default.
             max_spawn_depth: 1,
             max_children_per_agent: 5,
             max_concurrent: 3,

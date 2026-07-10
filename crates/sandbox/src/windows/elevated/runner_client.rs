@@ -229,6 +229,7 @@ fn forward_stdin(writer: &FrameWriter) {
             }
         }
     }
+    // Best-effort EOF signal; the peer may already be gone during shutdown.
     let _ = send_frame(writer, &Message::CloseStdin);
 }
 

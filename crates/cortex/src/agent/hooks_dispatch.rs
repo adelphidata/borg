@@ -11,7 +11,6 @@ use crate::hooks::{HookContext, HookData, HookPoint, HookRegistry};
 use super::Agent;
 
 impl Agent {
-    /// Build a HookContext for the current agent state.
     pub(super) fn hook_ctx(&self, point: HookPoint, data: HookData) -> HookContext {
         HookContext {
             point,

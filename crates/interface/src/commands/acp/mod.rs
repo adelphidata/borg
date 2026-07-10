@@ -237,7 +237,7 @@ struct AcpState<D: AcpDaemon> {
     /// Set when a turn observes the daemon event channel closing without
     /// emitting TurnComplete/Error. Causes `run_acp_stdio` to exit non-zero
     /// after the in-flight error frame is flushed, so the IDE sees the
-    /// agent as failed (per plan §"Daemon failures").
+    /// agent as failed.
     daemon_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Wakes the inbound loop so it stops reading stdin after a daemon
     /// disconnect — the error frame for the in-flight request is already
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(lines[2]["params"]["update"]["kind"], "agent_message_chunk");
         assert_eq!(lines[2]["params"]["update"]["text"], "ok  visible");
         assert_eq!(lines[3]["params"]["update"]["toolCallId"], "call_1");
-        // Plan §"Tool lifecycle": tool updates must carry an ACP toolKind so
+        // Tool updates must carry an ACP toolKind so
         // clients can render category-specific affordances. `read_file`
         // categorises as `read`.
         assert_eq!(lines[3]["params"]["update"]["toolKind"], "read");
@@ -715,7 +715,7 @@ mod tests {
         );
     }
 
-    /// Plan §"Tool lifecycle" — ACP toolKind mapping. Drives the
+    /// ACP toolKind mapping. Drives the
     /// IDE-side rendering of tool calls. A new tool added to the catalog
     /// will fall through to `other`, which is the safe default; promoting
     /// it (e.g. a future `git` tool → `execute`) is an explicit edit.
@@ -744,8 +744,7 @@ mod tests {
         }
     }
 
-    /// Plan §"Logging and Stdio Safety" + §"Text streaming" — `<internal>`
-    /// stripping is a translator-only concern. Other event consumers (TUI,
+    /// `<internal>` stripping is a translator-only concern. Other event consumers (TUI,
     /// daemon log) keep raw text. Regression guard: if upstream cortex
     /// starts stripping, this still passes; if the ACP translator stops
     /// stripping on `ToolOutputDelta`, this fails.
@@ -847,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_advertises_spec_agent_capabilities() {
-        // Plan §"Capability advertisement": the agent advertises
+        // The agent advertises
         // `agentCapabilities.{loadSession, promptCapabilities, mcpCapabilities}`.
         // It does NOT re-advertise client `fs.*` capabilities; those are read
         // from the request's `clientCapabilities` and stored on AcpState.
@@ -1381,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn relative_cwd_returns_invalid_params() {
-        // Regression for B1: previously a `bail!` from validate_workspace_cwd
+        // Regression: previously a `bail!` from validate_workspace_cwd
         // bubbled up to the dispatcher's silent log path, leaving the IDE
         // hanging. Must surface as a JSON-RPC -32602 error frame keyed to
         // the request id.
@@ -1408,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn onboarding_required_returns_structured_error() {
-        // Regression for B1+M5: onboarding gate failures must surface as a
+        // Regression: onboarding gate failures must surface as a
         // dedicated error code with a kind hint so IDEs can route to a
         // user-facing onboarding prompt.
         let mut daemon = fake_daemon();
@@ -1436,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_active_turn_yields_cancelled_stop_reason() {
-        // t1 regression: previously the cancel test seeded an
+        // Regression: previously the cancel test seeded an
         // `Error("cancelled")` event directly, which never exercised the
         // `cancel_requested` flag. Here we stream a real text delta, send a
         // `session/cancel` notification while the turn is still alive, then
@@ -1481,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_disconnect_mid_turn_yields_error_and_nonzero_exit() {
-        // Regression for M1: if the daemon's event channel closes before
+        // Regression: if the daemon's event channel closes before
         // emitting TurnComplete or Error, the IDE must see a -32603
         // daemon_disconnected frame and the process must exit non-zero.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1522,7 +1521,6 @@ mod tests {
         );
     }
 
-    // ───────────────────────────────────────────────────────────────────────
     // Source-level guard: the ACP transport's hard invariant is that
     // *nothing* writes to stdout/stderr except valid JSON-RPC frames going
     // through the `run_transport` writer. A stray `println!` / `eprintln!`

@@ -714,7 +714,6 @@ impl AgentControl {
         };
         let join_handle = tokio::spawn(run_sub_agent_task(spawn_ctx));
 
-        // Store handle
         let handle = SubAgentHandle {
             info,
             input_tx,
@@ -927,7 +926,6 @@ impl AgentControl {
         self.agents.values().map(|h| h.info.clone()).collect()
     }
 
-    /// Get status of a specific agent.
     pub fn get_status(&self, agent_id: &str) -> Option<&SubAgentInfo> {
         self.agents.get(agent_id).map(|h| &h.info)
     }

@@ -75,7 +75,6 @@ pub struct AccountingDelta {
 }
 
 impl GoalRuntimeState {
-    /// Construct a fresh runtime container.
     pub fn new() -> Self {
         Self::default()
     }

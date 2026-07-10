@@ -294,7 +294,7 @@ pub(crate) async fn test(args: IdArgs) -> Result<()> {
     }
     // Session does not yet expose a graceful shutdown; dropping the actor
     // closes the underlying transport. The `let _ = timeout(yield_now)` is
-    // a CLAUDE.md-blessed best-effort cleanup (analogous to terminal-Drop
+    // a best-effort cleanup (analogous to terminal-Drop
     // and temp-file removal) — capping the linger so an unresponsive peer
     // cannot hang the CLI.
     drop(session);

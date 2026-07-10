@@ -38,7 +38,6 @@ pub struct HonchoProvider {
 }
 
 impl HonchoProvider {
-    /// Build from resolved settings.
     pub fn from_settings(settings: &HonchoSettings) -> Result<Self, MemoryError> {
         let api_key = settings
             .api_key

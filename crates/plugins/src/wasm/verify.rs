@@ -307,6 +307,7 @@ fn restrict_install_dir_permissions(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
             .with_context(|| format!("failed to chmod {} to 0700", dir.display()))?;
     }
+    // The chmod above is unix-only; silence the unused binding elsewhere.
     let _ = dir;
     Ok(())
 }

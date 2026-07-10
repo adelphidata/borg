@@ -619,6 +619,7 @@ pub fn looks_like_negative_sentiment(msg: &str) -> bool {
 // ── Formatting ──
 
 fn bar(val: u8, width: usize) -> String {
+    // `+ 50` rounds the percentage-to-cells division to nearest (half-up).
     let filled = (val as usize * width + 50) / 100;
     let empty = width - filled;
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))

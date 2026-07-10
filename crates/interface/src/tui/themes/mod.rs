@@ -5,8 +5,7 @@
 //! render time so swaps via `/theme` are live without a restart.
 //!
 //! Layout:
-//! - `palette` — the flat semantic-color struct (one field per token that
-//!   used to be a hardcoded constant in `theme.rs`).
+//! - `palette` — the flat semantic-color struct (one field per color token).
 //! - `builtins` — ships `default`, `mono`, `slate`, `daylight` as `static`
 //!   `Theme`s. `default` reproduces today's exact look (regression-guarded
 //!   by `builtins::tests::default_matches_legacy_palette`).

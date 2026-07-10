@@ -168,7 +168,6 @@ impl PluginsPopup {
             });
         }
 
-        // Load skills
         let resolved_creds = config.resolve_credentials();
         if let Ok(skills) = cortex::skills::load_all_skills(&resolved_creds, &config.skills) {
             for skill in skills {
@@ -488,7 +487,6 @@ impl PluginsPopup {
                     if *current_def_idx >= action_queue.len() {
                         let mut final_actions: Vec<PluginAction> = Vec::new();
 
-                        // Add skill actions
                         for item in &self.items {
                             if matches!(item.kind, ItemKind::Skill)
                                 && item.toggled != item.original_enabled

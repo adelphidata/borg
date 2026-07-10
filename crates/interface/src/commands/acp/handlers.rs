@@ -160,8 +160,7 @@ pub(super) async fn handle_request<D: AcpDaemon>(
             let params: SessionNewParams = parse_params(req.params)?;
             let cwd = validate_workspace_cwd(&params.cwd)?;
             // `mcpServers` is structurally accepted but not honored —
-            // MCP-over-ACP bridging is explicitly out of scope for v1
-            // (plan §Non-Goals).
+            // MCP-over-ACP bridging is explicitly out of scope for v1.
             _ = params.mcp_servers;
             let (session_id, _) = state
                 .daemon
@@ -186,8 +185,8 @@ pub(super) async fn handle_request<D: AcpDaemon>(
         "session/prompt" => {
             require_onboarding(&state).await?;
             let params: SessionPromptParams = parse_params(req.params)?;
-            // Mention/path expansion is deferred to the IDE in ACP sessions
-            // (n6). Zed, Neovim's ACP client, and similar editors implement
+            // Mention/path expansion is deferred to the IDE in ACP sessions.
+            // Zed, Neovim's ACP client, and similar editors implement
             // their own `@mention` resolution before sending the prompt;
             // calling `cortex::mentions::expand_mentions` here would
             // (a) double-expand for clients that already resolved their
@@ -406,9 +405,8 @@ pub(super) const MAX_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// **Interleaving is not preserved.** Text fragments are concatenated in
 /// order with `\n` separators; images are pushed onto a separate list and
-/// reach the daemon as multimodal attachments after the text. This matches
-/// plan §"Prompt Content Handling" ("text blocks compose the user message
-/// text"). If a future ACP client relies on tight image-text interleaving,
+/// reach the daemon as multimodal attachments after the text.
+/// If a future ACP client relies on tight image-text interleaving,
 /// extend `AcpStartTurn` with an ordered `repeated PromptBlock` field and
 /// thread that through `Message::user_multimodal`.
 pub(super) fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput> {

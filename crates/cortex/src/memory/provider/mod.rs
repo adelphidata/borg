@@ -151,7 +151,6 @@ pub struct MemCtx<'a> {
 }
 
 impl<'a> MemCtx<'a> {
-    /// Construct a ctx from the active config.
     pub fn from_config(config: &'a Config) -> Self {
         Self { config }
     }

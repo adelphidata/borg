@@ -112,7 +112,6 @@ pub fn handle_read_file_with_context(
         .to_lowercase();
 
     if ext == "pdf" {
-        // Delegate to existing PDF handler
         let pdf_args =
             serde_json::json!({"file_path": canonical.to_string_lossy(), "max_chars": max_chars});
         return Ok(ToolOutput::Text(handle_read_pdf(&pdf_args)?));

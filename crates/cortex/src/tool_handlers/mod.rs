@@ -70,37 +70,20 @@ pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) ->
     args[name].as_f64().unwrap_or(default)
 }
 
-// Memory
 pub use memory::{
     format_search_results, handle_memory_search, handle_read_memory, handle_write_memory,
 };
 pub(crate) use memory::{handle_write_memory_batch, native_memory_search};
-
-// Filesystem
 pub use filesystem::{
     handle_apply_patch_unified, handle_apply_skill_patch, handle_create_channel, handle_list_dir,
     handle_read_file, handle_read_pdf, is_blocked_path,
 };
-
-// Shell
 pub use shell::{handle_run_shell, handle_run_shell_with_context};
-
-// Web
 pub use web::{handle_web_fetch, handle_web_search};
-
-// Schedule
 pub use schedule::{handle_manage_cron, handle_manage_tasks, handle_schedule, update_task_status};
-
-// Media
 pub use media::{handle_browser, handle_generate_image, handle_text_to_speech};
-
-// List
 pub use list::{handle_list, handle_list_channels, handle_list_skills};
-
-// Scripts
 pub use scripts::{handle_manage_scripts, handle_run_script, handle_security_audit};
-
-// User input
 pub use user_input::{handle_request_user_input, handle_update_plan};
 
 #[cfg(test)]

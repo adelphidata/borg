@@ -100,9 +100,8 @@ fn parse_markdown_blocks(text: &str) -> Vec<Block> {
             continue;
         }
 
-        // Check for heading
         if let Some(level) = heading_level(trimmed) {
-            // Flush current block
+            // A heading boundary flushes the accumulated block as its own chunk.
             if !current_lines.is_empty() {
                 let content = current_lines.join("\n");
                 if !content.trim().is_empty() {

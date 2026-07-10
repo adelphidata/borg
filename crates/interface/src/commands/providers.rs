@@ -46,8 +46,8 @@ pub(crate) enum ProvidersAction {
     /// release host. Opt-in only — never invoked from a timer.
     ///
     /// The signed-manifest verification key is not yet shipped, so this
-    /// command refuses to write any rows and exits non-zero. (Per
-    /// CLAUDE.md "no silent error swallowing".)
+    /// command refuses to write any rows and exits non-zero rather than
+    /// silently swallowing the missing-key error.
     RefreshRates {
         /// Override the manifest URL (default: Borg release host).
         #[arg(long)]

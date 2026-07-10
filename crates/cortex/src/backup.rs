@@ -114,6 +114,7 @@ pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> R
     //   body.tar      (the inner tar containing borg_home/...)
     let final_file = fs::File::create(&dest)
         .with_context(|| format!("create backup tarball at {}", dest.display()))?;
+    // Level 3 (zstd default): favors backup speed over ratio for local snapshots.
     let zstd_writer =
         zstd::Encoder::new(BufWriter::new(final_file), 3).context("init zstd encoder")?;
     let mut outer = tar::Builder::new(zstd_writer);
