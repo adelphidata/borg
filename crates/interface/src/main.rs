@@ -402,6 +402,14 @@ fn main() -> Result<()> {
         }
     }
 
+    // MCP stdio watchdog trampoline (Unix): a re-exec of this binary to
+    // supervise a stdio MCP server spawned by `borg mcp …` tooling and reap it
+    // if this process dies ungracefully. Handled before tokio/clap so the
+    // watchdog argv never reaches the CLI and never boots the agent.
+    if let Some(code) = mcp::watchdog::dispatch() {
+        std::process::exit(code);
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(RUNTIME_STACK_SIZE)

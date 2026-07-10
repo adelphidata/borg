@@ -85,7 +85,6 @@ pub async fn run_polling(
                 consecutive_errors = 0;
 
                 for update in updates {
-                    // Track offset
                     let next_offset = update.update_id + 1;
                     offset = Some(match offset {
                         Some(current) => current.max(next_offset),

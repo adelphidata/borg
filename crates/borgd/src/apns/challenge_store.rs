@@ -41,7 +41,7 @@ pub struct ChallengeStore {
 }
 
 impl ChallengeStore {
-    /// Construct an empty store.
+    /// Empty store; entries are inserted per outstanding App Attest challenge.
     pub fn new() -> Self {
         Self::default()
     }

@@ -1247,8 +1247,6 @@ impl Admin for AdminSvc {
         Ok(Response::new(resp))
     }
 
-    // -- Sub-agent control (`/agents`) --------------------------------------
-
     /// List sub-agents owned by `session_id`. Reads from `sub_agent_runs` so
     /// terminal agents (completed/errored/shutdown) and live agents both
     /// surface — the operator's view of "what did this turn spawn" needs

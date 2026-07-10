@@ -32,6 +32,7 @@ pub(crate) async fn prepare_message_text(
         let (augmented, fetched) = super::link_understanding::augment_with_links(
             &cleaned_text,
             &config.gateway.link_understanding,
+            &config.security.url_policy,
         )
         .await;
         if !fetched.is_empty() {

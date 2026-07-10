@@ -922,8 +922,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // -- /v1/embeddings --
-
     #[tokio::test]
     async fn embeddings_missing_bearer_returns_401() {
         // The embeddings route holds the same upstream provider key as

@@ -1580,8 +1580,6 @@ mod tests {
         assert_eq!(text, "@mybot");
     }
 
-    // -- InboundMessage::session_key --
-
     #[test]
     fn session_key_format() {
         let msg = InboundMessage {
@@ -1666,8 +1664,6 @@ mod tests {
             "Denial message must be returned to users, not silently dropped"
         );
     }
-
-    // -- Pairing integration tests --
 
     /// New sender with DmPolicy::Pairing receives a non-empty challenge message.
     #[tokio::test]

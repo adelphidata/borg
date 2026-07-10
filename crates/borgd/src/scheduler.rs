@@ -97,6 +97,8 @@ pub async fn run(
         tokio::spawn(async move {
             let mut wd_interval = tokio::time::interval(WATCHDOG_TICK_INTERVAL);
             loop {
+                // Biased so shutdown wins and the watchdog can't false-positive
+                // by racing a tick against the cancellation on the way down.
                 tokio::select! {
                     biased;
                     _ = wd_shutdown.cancelled() => return,

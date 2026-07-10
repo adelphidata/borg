@@ -48,6 +48,7 @@ pub mod registry;
 pub mod security;
 pub mod session;
 pub mod transport;
+pub mod watchdog;
 
 pub use errors::McpError;
 pub use manifest::{HttpAuth, ServerManifest, ToolFilter, Transport};

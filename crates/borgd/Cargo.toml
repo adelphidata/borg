@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 protocols = { path = "../protocols" }
 cortex = { path = "../cortex" }
+mcp = { path = "../mcp" }
 gateway = { path = "../gateway" }
 heartbeat = { path = "../heartbeat" }
 identity = { path = "../identity" }

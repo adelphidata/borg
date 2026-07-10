@@ -580,8 +580,6 @@ mod tests {
         assert_eq!(msg.attachments[0].filename.as_deref(), Some("test.pdf"));
     }
 
-    // --- file_share subtype regression tests ---
-
     fn slack_file(name: &str, mime: &str) -> super::super::types::SlackFile {
         super::super::types::SlackFile {
             id: "F123".to_string(),
@@ -629,8 +627,6 @@ mod tests {
         let cb = make_event(event);
         assert!(parse_event(&cb, None, None).await.is_none());
     }
-
-    // --- bot mention stripping tests ---
 
     #[test]
     fn strip_bot_mention_no_mention() {

@@ -58,7 +58,7 @@ pub struct CapabilityRouter {
 }
 
 impl CapabilityRouter {
-    /// New empty router.
+    /// Empty router with no registered capability clients yet.
     pub fn new() -> Self {
         Self {
             next_client_id: AtomicU64::new(1),

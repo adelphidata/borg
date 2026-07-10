@@ -40,6 +40,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // MCP stdio watchdog trampoline (Unix): a re-exec of this binary to
+    // supervise a stdio MCP server and reap it if the daemon dies ungracefully
+    // (SIGKILL/crash). Handled before clap so the watchdog argv never reaches
+    // the CLI and the watchdog never boots the daemon.
+    if let Some(code) = mcp::watchdog::dispatch() {
+        std::process::exit(code);
+    }
+
     let args = Args::parse();
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     // Point config/DB resolution at the resolved home so telemetry settings

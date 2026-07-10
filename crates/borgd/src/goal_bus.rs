@@ -49,7 +49,7 @@ impl Default for GoalEventBus {
 }
 
 impl GoalEventBus {
-    /// New bus with the default capacity.
+    /// Fresh bus; subscribers attach later via [`Self::subscribe`].
     pub fn new() -> Self {
         Self::default()
     }

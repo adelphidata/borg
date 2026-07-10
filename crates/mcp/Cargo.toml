@@ -22,6 +22,10 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 async-trait = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Watchdog reaper for orphaned stdio MCP servers: getppid/kill/killpg/signal.
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

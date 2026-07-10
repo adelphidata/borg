@@ -77,14 +77,12 @@ mod tests {
         // Initially available
         assert!(check_auto_reply(&state, &config).await.is_none());
 
-        // Set away
         *state.write().await = AutoReplyState::Away("gone fishing".into());
         assert_eq!(
             check_auto_reply(&state, &config).await,
             Some("gone fishing".to_string())
         );
 
-        // Set available again
         *state.write().await = AutoReplyState::Available;
         assert!(check_auto_reply(&state, &config).await.is_none());
     }

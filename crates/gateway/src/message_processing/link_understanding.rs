@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -7,10 +6,16 @@ use anyhow::Result;
 use regex::Regex;
 use tracing::debug;
 
-use cortex::config::LinkUnderstandingConfig;
+use cortex::config::{LinkUnderstandingConfig, UrlPolicyConfig};
+use cortex::url_policy::{self, ClassifyOutcome};
 
-/// Extract URLs from text, deduplicate, and cap at `max_links`.
-pub fn extract_urls(text: &str, max_links: usize) -> Vec<String> {
+/// Number of redirect hops to follow before giving up. Each hop is re-checked
+/// against the SSRF policy, so this only bounds redirect-chain length.
+const REDIRECT_LIMIT: usize = 3;
+
+/// Extract URLs from text, deduplicate, cap at `max_links`, and drop any that
+/// the offline SSRF pre-filter refuses.
+pub fn extract_urls(text: &str, max_links: usize, policy: &UrlPolicyConfig) -> Vec<String> {
     static URL_RE: OnceLock<Option<Regex>> = OnceLock::new();
     let Some(re) = URL_RE.get_or_init(|| Regex::new(r#"https?://[^\s<>\)\]"']+"#).ok()) else {
         return Vec::new();
@@ -21,7 +26,7 @@ pub fn extract_urls(text: &str, max_links: usize) -> Vec<String> {
 
     for m in re.find_iter(text) {
         let url = m.as_str().trim_end_matches(['.', ',']);
-        if seen.insert(url.to_string()) && !is_private_url(url) {
+        if seen.insert(url.to_string()) && is_admissible(url, policy) {
             urls.push(url.to_string());
             if urls.len() >= max_links {
                 break;
@@ -31,42 +36,92 @@ pub fn extract_urls(text: &str, max_links: usize) -> Vec<String> {
     urls
 }
 
-/// Reject URLs that point to localhost or private IP ranges (SSRF protection).
-fn is_private_url(url: &str) -> bool {
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            // Check for localhost variants
-            if host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "0.0.0.0" {
-                return true;
-            }
-            // Check for private IP addresses
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                return match ip {
-                    IpAddr::V4(v4) => {
-                        v4.is_loopback()
-                            || v4.is_private()
-                            || v4.is_link_local()
-                            || v4.is_unspecified()
-                    }
-                    IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-                };
-            }
-        }
+/// Offline SSRF pre-filter for the extraction stage. Runs cortex's no-DNS
+/// classifier (blocks cloud-metadata FQDNs, link-local/private/CGNAT IP
+/// literals, non-http(s) schemes, and allow/deny rules) and additionally
+/// rejects the loopback hostname aliases a name-based check can only catch
+/// with a resolver. Name-based internal targets that *resolve* to private
+/// space are still caught at fetch time by the DNS-resolving
+/// [`url_policy::classify`] in [`fetch_link_content`].
+fn is_admissible(url: &str, policy: &UrlPolicyConfig) -> bool {
+    if !matches!(
+        url_policy::classify_offline(url, policy),
+        ClassifyOutcome::Allow { .. }
+    ) {
+        return false;
     }
-    false
+    match url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    {
+        Some(host) => !matches!(host.as_str(), "localhost" | "ip6-localhost" | "ip6-loopback"),
+        None => false,
+    }
 }
 
 /// Fetch a URL and extract its text content, truncated to `max_chars`.
-pub async fn fetch_link_content(url: &str, max_chars: usize, timeout_ms: u64) -> Result<String> {
+///
+/// SSRF is enforced in three layers, mirroring the `web_fetch` tool: a full
+/// DNS-resolving [`url_policy::classify`] pre-flight on the input URL, a
+/// per-redirect-hop offline re-check (so a public URL that 30x-redirects to
+/// `http://169.254.169.254/` cloud IMDS is refused mid-chain), and a
+/// post-fetch DNS re-check of the final landing host (defense-in-depth against
+/// a redirect that resolved to internal space).
+pub async fn fetch_link_content(
+    url: &str,
+    max_chars: usize,
+    timeout_ms: u64,
+    policy: &UrlPolicyConfig,
+) -> Result<String> {
+    // Pre-flight: full classifier (scheme + SSRF + DNS). Honor the returned
+    // effective URL so any policy transforms (e.g. force-https) apply.
+    let effective_url = match url_policy::classify(url, policy).await {
+        ClassifyOutcome::Allow { effective_url } => effective_url,
+        other => {
+            let msg = url_policy::describe_block_or_throttle(&other)
+                .unwrap_or_else(|| "URL policy refused request".to_string());
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    // Re-validate every redirect hop. `classify_offline` skips DNS (the
+    // post-fetch check below covers rebinding on the final host) but still
+    // blocks metadata FQDNs and internal IP literals reached via redirect.
+    let redirect_cfg = policy.clone();
+    let redirect = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= REDIRECT_LIMIT {
+            return attempt.error("too many redirects");
+        }
+        let next = attempt.url().to_string();
+        match url_policy::classify_offline(&next, &redirect_cfg) {
+            ClassifyOutcome::Allow { .. } => attempt.follow(),
+            ClassifyOutcome::Block { reason, rule } => attempt.error(format!(
+                "URL policy blocked redirect to {next}: {reason} (rule: {rule})"
+            )),
+            // Throttle carries no meaning on a redirect hop — let it follow.
+            ClassifyOutcome::Throttle { .. } => attempt.follow(),
+        }
+    });
+
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; Borg/0.1)")
         .timeout(Duration::from_millis(timeout_ms))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(redirect)
         .build()?;
 
-    let resp = client.get(url).send().await?;
+    let resp = client.get(&effective_url).send().await?;
     if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} fetching {}", resp.status(), url);
+        anyhow::bail!("HTTP {} fetching {}", resp.status(), effective_url);
+    }
+
+    // Post-fetch: re-validate the final landing host with full DNS so a
+    // redirect that resolved to internal space never returns a body.
+    let final_url = resp.url().to_string();
+    if !matches!(
+        url_policy::classify_no_throttle(&final_url, policy).await,
+        ClassifyOutcome::Allow { .. }
+    ) {
+        anyhow::bail!("URL policy blocked final redirect target: {final_url}");
     }
 
     // Only process text content types
@@ -141,12 +196,13 @@ fn html_to_plain_text(html: &str) -> String {
 pub async fn augment_with_links(
     text: &str,
     config: &LinkUnderstandingConfig,
+    policy: &UrlPolicyConfig,
 ) -> (String, Vec<String>) {
     if !config.enabled {
         return (text.to_string(), Vec::new());
     }
 
-    let urls = extract_urls(text, config.max_links);
+    let urls = extract_urls(text, config.max_links, policy);
     if urls.is_empty() {
         return (text.to_string(), Vec::new());
     }
@@ -156,7 +212,7 @@ pub async fn augment_with_links(
 
     let futures: Vec<_> = urls
         .iter()
-        .map(|url| fetch_link_content(url, config.max_chars_per_link, config.timeout_ms))
+        .map(|url| fetch_link_content(url, config.max_chars_per_link, config.timeout_ms, policy))
         .collect();
 
     let results = futures::future::join_all(futures).await;
@@ -189,79 +245,103 @@ pub async fn augment_with_links(
 mod tests {
     use super::*;
 
+    /// Default policy has `enabled: true`, `allow_private_urls: false` — the
+    /// production posture, so the SSRF gate is actually exercised.
+    fn policy() -> UrlPolicyConfig {
+        UrlPolicyConfig::default()
+    }
+
     #[test]
     fn extract_urls_basic() {
         let text = "Check out https://example.com and https://foo.bar/page";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls, vec!["https://example.com", "https://foo.bar/page"]);
     }
 
     #[test]
     fn extract_urls_deduplicates() {
         let text = "Visit https://example.com and also https://example.com again";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls.len(), 1);
     }
 
     #[test]
     fn extract_urls_respects_max_links() {
         let text = "https://a.com https://b.com https://c.com https://d.com";
-        let urls = extract_urls(text, 2);
+        let urls = extract_urls(text, 2, &policy());
         assert_eq!(urls.len(), 2);
     }
 
     #[test]
     fn extract_urls_strips_trailing_punctuation() {
         let text = "See https://example.com. And https://foo.com, too";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls, vec!["https://example.com", "https://foo.com"]);
     }
 
     #[test]
     fn extract_urls_rejects_localhost() {
         let text = "http://localhost:8080/admin and https://example.com";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls, vec!["https://example.com"]);
     }
 
     #[test]
     fn extract_urls_rejects_private_ips() {
         let text = "http://192.168.1.1/admin http://10.0.0.1/secret https://example.com";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls, vec!["https://example.com"]);
     }
 
     #[test]
     fn extract_urls_rejects_loopback() {
         let text = "http://127.0.0.1:3000 http://0.0.0.0:8080 https://real.com";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls, vec!["https://real.com"]);
     }
 
     #[test]
+    fn extract_urls_rejects_cloud_metadata() {
+        // The upgrade over the old literal-host guard: cloud-metadata FQDNs,
+        // the IMDS link-local IP, and CGNAT space are all refused now.
+        let text = "http://metadata.google.internal/ \
+             http://169.254.169.254/latest/meta-data/ \
+             http://100.100.100.200/ https://example.com";
+        let urls = extract_urls(text, 10, &policy());
+        assert_eq!(urls, vec!["https://example.com"]);
+    }
+
+    #[test]
     fn extract_urls_empty_text() {
-        let urls = extract_urls("no urls here", 10);
+        let urls = extract_urls("no urls here", 10, &policy());
         assert!(urls.is_empty());
     }
 
     #[test]
     fn extract_urls_in_markdown() {
         let text = "Check [this link](https://example.com) and https://other.com";
-        let urls = extract_urls(text, 10);
+        let urls = extract_urls(text, 10, &policy());
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"https://example.com".to_string()));
         assert!(urls.contains(&"https://other.com".to_string()));
     }
 
     #[test]
-    fn is_private_url_checks() {
-        assert!(is_private_url("http://localhost:8080"));
-        assert!(is_private_url("http://127.0.0.1"));
-        assert!(is_private_url("http://192.168.1.1"));
-        assert!(is_private_url("http://10.0.0.1"));
-        assert!(is_private_url("http://0.0.0.0"));
-        assert!(!is_private_url("https://example.com"));
-        assert!(!is_private_url("https://8.8.8.8"));
+    fn is_admissible_checks() {
+        let p = policy();
+        // Loopback names + literals, private, link-local, CGNAT, metadata all refused.
+        assert!(!is_admissible("http://localhost:8080", &p));
+        assert!(!is_admissible("http://127.0.0.1", &p));
+        assert!(!is_admissible("http://192.168.1.1", &p));
+        assert!(!is_admissible("http://10.0.0.1", &p));
+        assert!(!is_admissible("http://0.0.0.0", &p));
+        assert!(!is_admissible("http://169.254.169.254/", &p));
+        assert!(!is_admissible("http://metadata.google.internal/", &p));
+        // Non-http(s) schemes rejected by the classifier.
+        assert!(!is_admissible("ftp://example.com", &p));
+        // Public hosts admitted.
+        assert!(is_admissible("https://example.com", &p));
+        assert!(is_admissible("https://8.8.8.8", &p));
     }
 
     #[test]
@@ -282,7 +362,8 @@ mod tests {
     #[tokio::test]
     async fn augment_disabled_is_noop() {
         let config = LinkUnderstandingConfig::default(); // enabled: false
-        let (result, urls) = augment_with_links("https://example.com", &config).await;
+        let (result, urls) =
+            augment_with_links("https://example.com", &config, &policy()).await;
         assert_eq!(result, "https://example.com");
         assert!(urls.is_empty());
     }
@@ -293,7 +374,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let (result, urls) = augment_with_links("no links here", &config).await;
+        let (result, urls) = augment_with_links("no links here", &config, &policy()).await;
         assert_eq!(result, "no links here");
         assert!(urls.is_empty());
     }

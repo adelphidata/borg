@@ -566,8 +566,6 @@ async fn save_last_rowid(state_path: &std::path::Path, rowid: i64) {
 mod tests {
     use super::*;
 
-    // -- load_last_rowid / save_last_rowid --
-
     #[tokio::test]
     async fn load_last_rowid_missing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -607,8 +605,6 @@ mod tests {
         save_last_rowid(&path, 20).await;
         assert_eq!(load_last_rowid(&path).await, 20);
     }
-
-    // -- evaluate_message --
 
     fn make_payload(
         rowid: i64,
@@ -763,8 +759,6 @@ mod tests {
         assert!(self_chat.is_self_echo("my message", "chat1"));
     }
 
-    // -- group allowlist gate (Gate 0) --
-
     #[test]
     fn allowlist_blocks_unlisted_group() {
         let mut payload = make_payload(1, Some("hi"), Some("+1234"), false, Some("chat1"));
@@ -846,8 +840,6 @@ mod tests {
             InboundDecision::Dispatch { .. } => panic!("expected Drop"),
         }
     }
-
-    // -- reply quoting --
 
     #[test]
     fn reply_context_prefixed_to_dispatched_text() {
@@ -932,8 +924,6 @@ mod tests {
             InboundDecision::Drop { reason } => panic!("expected Dispatch, got Drop: {reason}"),
         }
     }
-
-    // -- SQL fixture tests --
 
     /// Build a minimal chat.db schema sufficient to exercise poll_new_messages.
     /// Mirrors the columns Borg actually reads — not a full chat.db replica.
@@ -1231,8 +1221,6 @@ mod tests {
         assert!(msgs[0].is_group);
         assert_eq!(msgs[0].chat_guid.as_deref(), Some("group-guid-1"));
     }
-
-    // -- load_attachments --
 
     #[test]
     fn load_attachments_skips_missing_files() {

@@ -379,6 +379,8 @@ impl HeartbeatScheduler {
         ticker: &mut tokio::time::Interval,
         liveness_ticker: &mut tokio::time::Interval,
     ) -> LoopControl {
+        // Biased so cancellation wins over a coincident tick and shutdown
+        // drains within one interval rather than firing one final heartbeat.
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -450,6 +452,8 @@ impl HeartbeatScheduler {
             let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);
             let mut upcoming = schedule.upcoming(chrono::Utc);
             if let (Some(t1), Some(t2)) = (upcoming.next(), upcoming.next()) {
+                // A non-positive delta (clock skew / DST fold) collapses to ZERO,
+                // which is < min_secs and correctly trips the fallback below.
                 let interval = (t2 - t1).to_std().unwrap_or_default();
                 if interval < std::time::Duration::from_secs(min_secs) {
                     warn!(
