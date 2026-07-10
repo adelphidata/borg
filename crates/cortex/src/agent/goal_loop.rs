@@ -91,8 +91,8 @@ impl Agent {
 
     /// True iff a user-initiated steer is queued and not yet consumed. Used by
     /// [`maybe_inject_goal_continuation`] to suppress auto-continuation when the
-    /// user is actively steering — mirroring the reference's "only continue
-    /// when the thread is idle" invariant.
+    /// user is actively steering, so a queued user turn drives the next
+    /// iteration instead of a synthetic continuation nudge.
     ///
     /// `steer_rx` is the mid-turn channel into the agent. `drain_steers` runs
     /// at tool boundaries, but the end-of-turn path taken by a *text-only*
