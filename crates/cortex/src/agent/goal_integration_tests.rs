@@ -546,7 +546,7 @@ async fn account_at_turn_end_flips_budget_and_queues_steering() {
     // Simulate the turn producing output: append a substantial message so
     // `history_tokens` grows well past the 1-token budget.
     agent
-        .log_and_persist(Message::assistant(&"work ".repeat(200)))
+        .log_and_persist(Message::assistant("work ".repeat(200)))
         .await;
 
     let after = agent
@@ -581,7 +581,7 @@ async fn account_at_turn_end_noop_in_plan_mode() {
     // Arm a baseline while in Execute, then switch to Plan before charging.
     agent.sync_goal_runtime_for_turn().await;
     agent
-        .log_and_persist(Message::assistant(&"work ".repeat(200)))
+        .log_and_persist(Message::assistant("work ".repeat(200)))
         .await;
     agent.config.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
 
