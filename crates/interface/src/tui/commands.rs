@@ -1771,16 +1771,37 @@ pub(super) fn parse_goal_subcommand(args: &str) -> GoalSubcommand {
         _ => {}
     }
     // `/goal budget N` / `/goal budget none` — in-place budget change. Only a
-    // bare integer or none/unbounded qualifies; any other trailing text (e.g.
+    // lone integer or none/unbounded qualifies. A word-valued first token (e.g.
     // `budget report for Q3`) falls through and is treated as an objective, so
     // this never hijacks a legitimate goal that happens to start with "budget".
+    // But a numeric-looking value — with trailing junk (`budget 5000 tokens`)
+    // or a malformed number (`budget 5,000`) — routes to Usage rather than
+    // silently becoming an objective *replace* that resets accounting: the
+    // operator clearly meant a budget change, so tell them the correct form.
     if let Some(rest) = args.trim().strip_prefix("budget ") {
         let rest = rest.trim();
-        if let Ok(n) = rest.parse::<i64>() {
-            return GoalSubcommand::Budget { budget: Some(n) };
-        }
-        if rest.eq_ignore_ascii_case("none") || rest.eq_ignore_ascii_case("unbounded") {
-            return GoalSubcommand::Budget { budget: None };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let first = parts.next().unwrap_or("");
+        let has_trailing = parts.next().is_some_and(|t| !t.trim().is_empty());
+        let is_clear_kw =
+            first.eq_ignore_ascii_case("none") || first.eq_ignore_ascii_case("unbounded");
+        let looks_numeric = first
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == '-');
+        if is_clear_kw || looks_numeric {
+            if has_trailing {
+                return GoalSubcommand::Usage;
+            }
+            if is_clear_kw {
+                return GoalSubcommand::Budget { budget: None };
+            }
+            return match first.parse::<i64>() {
+                Ok(n) => GoalSubcommand::Budget { budget: Some(n) },
+                // Numeric-looking but unparseable (`5,000`, `5000x`) — surface
+                // usage instead of an accidental objective replace.
+                Err(_) => GoalSubcommand::Usage,
+            };
         }
     }
     // A literal `--budget ` prefix is always an attempt at the flag — if the
@@ -2162,6 +2183,27 @@ mod tests {
         assert_eq!(
             parse_goal_subcommand("budget -5"),
             GoalSubcommand::Budget { budget: Some(-5) }
+        );
+    }
+
+    #[test]
+    fn parse_goal_subcommand_budget_numeric_with_trailing_junk_is_usage() {
+        // Regression for the footgun: a numeric budget value followed by
+        // trailing text must NOT silently fall through to an objective
+        // *replace* (which resets accounting). The operator clearly meant a
+        // budget change, so route to Usage.
+        assert_eq!(
+            parse_goal_subcommand("budget 5000 tokens"),
+            GoalSubcommand::Usage
+        );
+        // Malformed number (thousands separator, stray suffix) — same intent,
+        // same protection.
+        assert_eq!(parse_goal_subcommand("budget 5,000"), GoalSubcommand::Usage);
+        assert_eq!(parse_goal_subcommand("budget 5000x"), GoalSubcommand::Usage);
+        // A clear-keyword with trailing junk is likewise malformed.
+        assert_eq!(
+            parse_goal_subcommand("budget none now"),
+            GoalSubcommand::Usage
         );
     }
 

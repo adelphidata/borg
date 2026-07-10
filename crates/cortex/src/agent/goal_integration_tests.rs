@@ -602,4 +602,29 @@ async fn account_at_turn_end_noop_in_plan_mode() {
     };
     assert_eq!(goal.tokens_used, 0, "no tokens charged in Plan mode");
     assert_eq!(goal.status, GoalStatus::Active);
+
+    // Prove the Plan-mode path actually *dropped* the baseline rather than
+    // leaving it dangling: switch back to Execute and account again WITHOUT
+    // re-arming via `sync_goal_runtime_for_turn`. With no live baseline the
+    // charge must be a no-op — a leaked Plan-start baseline would otherwise
+    // double-charge the accumulated tokens onto the first real Execute turn.
+    agent.config.conversation.collaboration_mode = crate::config::CollaborationMode::Execute;
+    assert!(
+        agent.account_goal_at_turn_end().await.is_none(),
+        "no baseline survives Plan mode, so the next Execute account is a no-op"
+    );
+    let after_plan = {
+        let guard = agent.db_guard().await;
+        guard
+            .as_ref()
+            .expect("db")
+            .get_goal(&session_id)
+            .await
+            .expect("query")
+            .expect("goal present")
+    };
+    assert_eq!(
+        after_plan.tokens_used, 0,
+        "a dropped Plan baseline must not double-charge the next Execute turn"
+    );
 }

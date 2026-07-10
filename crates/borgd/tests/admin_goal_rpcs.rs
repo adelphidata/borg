@@ -425,6 +425,14 @@ async fn set_goal_budget_changes_in_place_and_preserves_accounting() {
         "cleared budget must report unbounded"
     );
     assert_eq!(cleared.tokens_used, 250, "clearing must not reset usage");
+    assert_eq!(
+        cleared.goal_id, original_id,
+        "clearing the budget must stay in place (no goal_id regen)"
+    );
+    assert_eq!(
+        cleared.objective, "ship it",
+        "clearing the budget must preserve the objective"
+    );
 
     // Negative: SetBudget with no goal set is a precondition failure.
     seed_session("sess-nobudget").await;
