@@ -1516,38 +1516,120 @@ mod tests {
 
         let cases = [
             // Local session, config unchanged → keep.
-            case("local stable", None, None, BrowserEngine::Chrome,
-                live(BrowserBackend::Local, BrowserEngine::Chrome, None), false),
+            case(
+                "local stable",
+                None,
+                None,
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None),
+                false,
+            ),
             // Local session, engine switched → reconnect.
-            case("local engine change", None, None, BrowserEngine::Chrome,
-                live(BrowserBackend::Local, BrowserEngine::Brave, None), true),
+            case(
+                "local engine change",
+                None,
+                None,
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Brave, None),
+                true,
+            ),
             // Local session, switched to a cloud backend → reconnect.
-            case("local → cloud", None, None, BrowserEngine::Chrome,
-                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None), true),
+            case(
+                "local → cloud",
+                None,
+                None,
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None),
+                true,
+            ),
             // Local session, cdp_url now set → reconnect (attach wins).
-            case("local → cdp attach", None, None, BrowserEngine::Chrome,
-                live(BrowserBackend::Local, BrowserEngine::Chrome, Some("ws://h:9222")), true),
+            case(
+                "local → cdp attach",
+                None,
+                None,
+                BrowserEngine::Chrome,
+                live(
+                    BrowserBackend::Local,
+                    BrowserEngine::Chrome,
+                    Some("ws://h:9222"),
+                ),
+                true,
+            ),
             // Cloud session, same provider → keep (does NOT recreate each call).
-            case("cloud stable", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
-                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None), false),
+            case(
+                "cloud stable",
+                Some(BrowserBackend::Browserbase),
+                Some("wss://p/x"),
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, None),
+                false,
+            ),
             // Cloud session, switched provider → reconnect (release old, stop billing).
-            case("cloud provider swap", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
-                live(BrowserBackend::Firecrawl, BrowserEngine::Chrome, None), true),
+            case(
+                "cloud provider swap",
+                Some(BrowserBackend::Browserbase),
+                Some("wss://p/x"),
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Firecrawl, BrowserEngine::Chrome, None),
+                true,
+            ),
             // Cloud session, switched back to local → reconnect (release cloud).
-            case("cloud → local", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
-                live(BrowserBackend::Local, BrowserEngine::Chrome, None), true),
+            case(
+                "cloud → local",
+                Some(BrowserBackend::Browserbase),
+                Some("wss://p/x"),
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None),
+                true,
+            ),
             // Cloud session, explicit cdp_url set → reconnect (attach overrides).
-            case("cloud → cdp attach", Some(BrowserBackend::Browserbase), Some("wss://p/x"), BrowserEngine::Chrome,
-                live(BrowserBackend::Browserbase, BrowserEngine::Chrome, Some("ws://h:9222")), true),
+            case(
+                "cloud → cdp attach",
+                Some(BrowserBackend::Browserbase),
+                Some("wss://p/x"),
+                BrowserEngine::Chrome,
+                live(
+                    BrowserBackend::Browserbase,
+                    BrowserEngine::Chrome,
+                    Some("ws://h:9222"),
+                ),
+                true,
+            ),
             // Operator CDP attach, same url → keep.
-            case("cdp stable", None, Some("ws://h:9222"), BrowserEngine::Chrome,
-                live(BrowserBackend::CdpAttach, BrowserEngine::Chrome, Some("ws://h:9222")), false),
+            case(
+                "cdp stable",
+                None,
+                Some("ws://h:9222"),
+                BrowserEngine::Chrome,
+                live(
+                    BrowserBackend::CdpAttach,
+                    BrowserEngine::Chrome,
+                    Some("ws://h:9222"),
+                ),
+                false,
+            ),
             // Operator CDP attach, url changed → reconnect.
-            case("cdp url change", None, Some("ws://h:9222"), BrowserEngine::Chrome,
-                live(BrowserBackend::CdpAttach, BrowserEngine::Chrome, Some("ws://other:9222")), true),
+            case(
+                "cdp url change",
+                None,
+                Some("ws://h:9222"),
+                BrowserEngine::Chrome,
+                live(
+                    BrowserBackend::CdpAttach,
+                    BrowserEngine::Chrome,
+                    Some("ws://other:9222"),
+                ),
+                true,
+            ),
             // Operator CDP attach, disconnected (cdp_url cleared) → reconnect.
-            case("cdp disconnect", None, Some("ws://h:9222"), BrowserEngine::Chrome,
-                live(BrowserBackend::Local, BrowserEngine::Chrome, None), true),
+            case(
+                "cdp disconnect",
+                None,
+                Some("ws://h:9222"),
+                BrowserEngine::Chrome,
+                live(BrowserBackend::Local, BrowserEngine::Chrome, None),
+                true,
+            ),
         ];
 
         for c in &cases {

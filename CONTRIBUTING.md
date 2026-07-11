@@ -14,7 +14,7 @@ Thanks for your interest in contributing! This guide will help you get set up an
    ```sh
    cp .env.example .env
    ```
-4. Add at least one LLM provider API key to `.env` — requires one of: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, or a running [Ollama](https://ollama.ai) instance (see [docs/configuration.md](docs/configuration.md) for details)
+4. Add at least one LLM provider API key to `.env` — see `.env.example` for the full list of supported providers, or run a local [Ollama](https://ollama.ai) instance
 5. Build the project:
    ```sh
    cargo build --release
@@ -43,22 +43,7 @@ cargo watch -x 'build --bin borg' -x 'build --bin borgd'
 
 ## Project Structure
 
-Borg is a Cargo workspace:
-
-| Crate | Purpose |
-|-------|---------|
-| `crates/interface` | Binary (`borg`): REPL, clap args, TUI, onboarding — gRPC client to `borgd` |
-| `crates/borgd` | Binary (`borgd`): long-running gRPC daemon owning the agent loop, scheduler, ingress |
-| `crates/cortex` | Library: agent loop, LLM client, memory, config |
-| `crates/protocols` | Library: tonic gRPC schema for the daemon and its clients |
-| `crates/identity` | Library: internal CA, cert lifecycle, OS keychain wrapping (PKI) |
-| `crates/heartbeat` | Library: proactive scheduler with quiet hours |
-| `crates/sandbox` | Library: macOS Seatbelt + Linux Bubblewrap policies |
-| `crates/coding` | Library: patch DSL parser + filesystem applicator |
-| `crates/gateway` | Library: webhook gateway for messaging channels (migrating into `borgd`) |
-| `crates/plugins` | Library: marketplace catalog, plugin installer |
-
-See [docs/architecture.md](docs/architecture.md) for a deeper overview.
+Borg is a Cargo workspace. See the Architecture table in [CLAUDE.md](CLAUDE.md#architecture) for the crate list and what each one owns.
 
 ## Running Tests
 

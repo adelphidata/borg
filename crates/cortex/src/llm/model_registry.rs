@@ -748,14 +748,8 @@ mod tests {
         // window for the open-weight flagships surfaced in onboarding.
         assert_eq!(lookup("z-ai/glm-5.1").unwrap().slug, "glm-5.1");
         assert_eq!(lookup("z-ai/glm-4.7").unwrap().slug, "glm-4.7");
-        assert_eq!(
-            lookup("minimax/minimax-m2.7").unwrap().slug,
-            "minimax-m2.7"
-        );
-        assert_eq!(
-            lookup("moonshotai/kimi-k2.5").unwrap().slug,
-            "kimi-k2.5"
-        );
+        assert_eq!(lookup("minimax/minimax-m2.7").unwrap().slug, "minimax-m2.7");
+        assert_eq!(lookup("moonshotai/kimi-k2.5").unwrap().slug, "kimi-k2.5");
         assert_eq!(
             lookup("moonshotai/kimi-k2-thinking").unwrap().slug,
             "kimi-k2-thinking"
@@ -767,10 +761,7 @@ mod tests {
                 .supports_thinking
         );
         // Qwen3 coder/max resolve above the generic `qwen3` (131K) entry.
-        assert_eq!(
-            lookup("qwen/qwen3-coder-next").unwrap().slug,
-            "qwen3-coder"
-        );
+        assert_eq!(lookup("qwen/qwen3-coder-next").unwrap().slug, "qwen3-coder");
         assert_eq!(context_window_for("qwen/qwen3.6-max-preview"), 256_000);
         // `mistral-large` must win over the 32K `mistral` family entry, and
         // `devstral` must resolve at all (no `mistral` prefix to catch it).
@@ -785,17 +776,17 @@ mod tests {
             lookup("google/gemini-3.1-pro-preview").unwrap().slug,
             "gemini-3.1-pro"
         );
-        assert_eq!(context_window_for("google/gemini-3.1-pro-preview"), 2_000_000);
+        assert_eq!(
+            context_window_for("google/gemini-3.1-pro-preview"),
+            2_000_000
+        );
         assert_eq!(
             lookup("google/gemini-3.1-flash-lite-preview").unwrap().slug,
             "gemini-3.1-flash-lite"
         );
         // `grok-4.1-fast` (dot, not dash) must not fall through to the 256K
         // bare `grok-4` — it carries the fast family's 2M window.
-        assert_eq!(
-            lookup("x-ai/grok-4.1-fast").unwrap().slug,
-            "grok-4.1-fast"
-        );
+        assert_eq!(lookup("x-ai/grok-4.1-fast").unwrap().slug, "grok-4.1-fast");
         assert_eq!(context_window_for("x-ai/grok-4.1-fast"), 2_000_000);
     }
 

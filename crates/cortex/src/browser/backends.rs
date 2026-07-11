@@ -362,7 +362,10 @@ fn find_string(json: &serde_json::Value, keys: &[&str]) -> Option<String> {
 async fn guard_remote_cdp_url(cdp_url: &str, policy: &UrlPolicyConfig) -> Result<String> {
     let lower = cdp_url.to_ascii_lowercase();
     let (probe, ws_scheme) = if lower.starts_with("wss://") {
-        (format!("https://{}", &cdp_url["wss://".len()..]), Some("wss"))
+        (
+            format!("https://{}", &cdp_url["wss://".len()..]),
+            Some("wss"),
+        )
     } else if lower.starts_with("ws://") {
         (format!("http://{}", &cdp_url["ws://".len()..]), Some("ws"))
     } else {
@@ -375,7 +378,9 @@ async fn guard_remote_cdp_url(cdp_url: &str, policy: &UrlPolicyConfig) -> Result
     };
 
     match url_policy::classify_no_throttle(&probe, &ssrf_policy).await {
-        ClassifyOutcome::Allow { effective_url } => Ok(restore_ws_scheme(&effective_url, ws_scheme)),
+        ClassifyOutcome::Allow { effective_url } => {
+            Ok(restore_ws_scheme(&effective_url, ws_scheme))
+        }
         ClassifyOutcome::Throttle { host, .. } => {
             bail!("remote browser CDP endpoint is throttled: {host}")
         }
@@ -565,16 +570,10 @@ mod tests {
 
     #[test]
     fn restore_ws_scheme_maps_back_and_passes_through() {
-        assert_eq!(
-            restore_ws_scheme("https://h/p", Some("wss")),
-            "wss://h/p"
-        );
+        assert_eq!(restore_ws_scheme("https://h/p", Some("wss")), "wss://h/p");
         assert_eq!(restore_ws_scheme("http://h/p", Some("ws")), "ws://h/p");
         // No original ws scheme → returned unchanged (discovery http(s) URL).
-        assert_eq!(
-            restore_ws_scheme("https://h/p", None),
-            "https://h/p"
-        );
+        assert_eq!(restore_ws_scheme("https://h/p", None), "https://h/p");
     }
 
     #[tokio::test]

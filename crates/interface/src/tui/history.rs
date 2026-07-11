@@ -88,7 +88,10 @@ pub(super) fn sanitize_user_text(text: &str) -> std::borrow::Cow<'_, str> {
             // the printable text that follows. Any other ESC form (a lone ESC)
             // is simply dropped.
             if chars.next_if_eq(&'[').is_some() {
-                while chars.next_if(|c| ('\u{20}'..='\u{3f}').contains(c)).is_some() {}
+                while chars
+                    .next_if(|c| ('\u{20}'..='\u{3f}').contains(c))
+                    .is_some()
+                {}
                 chars.next_if(|c| ('@'..='~').contains(c));
             }
         } else if matches!(ch, '\n' | '\t') || !ch.is_control() {

@@ -149,7 +149,10 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
         let mut buf: Vec<u8> = Vec::new();
         loop {
             match read_capped_line(&mut reader, &mut buf, max_line_bytes).await {
-                Ok(true) => stderr(&server_name, &String::from_utf8_lossy(trim_trailing_cr(&buf))),
+                Ok(true) => stderr(
+                    &server_name,
+                    &String::from_utf8_lossy(trim_trailing_cr(&buf)),
+                ),
                 Ok(false) => break,
                 Err(e) => {
                     tracing::warn!(server = %server_name, error = %e, "mcp stderr read failed");
@@ -221,10 +224,7 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
 
 /// Strip any trailing `\r` bytes (CRLF framing) without allocating.
 fn trim_trailing_cr(buf: &[u8]) -> &[u8] {
-    let end = buf
-        .iter()
-        .rposition(|&b| b != b'\r')
-        .map_or(0, |i| i + 1);
+    let end = buf.iter().rposition(|&b| b != b'\r').map_or(0, |i| i + 1);
     &buf[..end]
 }
 

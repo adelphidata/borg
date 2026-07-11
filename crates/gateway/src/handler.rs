@@ -1262,7 +1262,10 @@ mod tests {
             !out.contains("Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZg"),
             "KEK passphrase must not survive delivery redaction: {out}"
         );
-        assert!(out.contains("[REDACTED"), "expected redaction markers: {out}");
+        assert!(
+            out.contains("[REDACTED"),
+            "expected redaction markers: {out}"
+        );
     }
 
     #[test]
@@ -1271,7 +1274,10 @@ mod tests {
         // corrupt already-redacted text.
         let once = redact_channel_output("slack", "U1", Some("C1"), "k=AKIAIOSFODNN7EXAMPLE");
         let twice = redact_channel_output("slack", "U1", Some("C1"), &once);
-        assert_eq!(once, twice, "redaction must be idempotent: {once} != {twice}");
+        assert_eq!(
+            once, twice,
+            "redaction must be idempotent: {once} != {twice}"
+        );
     }
 
     #[test]

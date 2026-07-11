@@ -47,7 +47,7 @@ Out of scope:
 
 Borg includes multiple layers of security by design:
 
-- **File permissions** — the database file is restricted to owner-only access (mode 0600)
+- **File permissions** — the database file is restricted to owner-only access (mode 0600); note the database itself is cleartext at rest — confidentiality rests on filesystem permissions and sandbox deny-read, not encryption
 - **Sandboxed tool execution** — macOS Seatbelt and Linux Bubblewrap isolate user tools
 - **Blocked path enforcement** — sensitive directories (`.ssh`, `.aws`, `.gnupg`, etc.) are filtered from tool access
 - **Secret redaction** — API keys and tokens are automatically redacted from tool outputs

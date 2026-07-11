@@ -96,7 +96,11 @@ pub fn wrapped_command(_command: &str, _args: &[String]) -> Option<(String, Vec<
 /// [`wrapped_command`], separated so it can be unit-tested directly.
 #[cfg(unix)]
 fn build_wrapped(command: &str, args: &[String]) -> Option<(String, Vec<String>)> {
-    let exe = std::env::current_exe().ok()?.into_os_string().into_string().ok()?;
+    let exe = std::env::current_exe()
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
     let mut wrapped = Vec::with_capacity(args.len() + 4);
     wrapped.push(WATCHDOG_MARKER.to_string());
     wrapped.push(std::process::id().to_string());
@@ -112,8 +116,8 @@ mod wrap_tests {
 
     #[test]
     fn build_wrapped_has_marker_pid_sep_then_command() {
-        let (exe, args) =
-            build_wrapped("mcp-server-foo", &["--port".into(), "8080".into()]).expect("current_exe");
+        let (exe, args) = build_wrapped("mcp-server-foo", &["--port".into(), "8080".into()])
+            .expect("current_exe");
         assert!(!exe.is_empty());
         assert_eq!(args[0], WATCHDOG_MARKER);
         assert_eq!(args[1], std::process::id().to_string());

@@ -34,7 +34,7 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 80% via `cargo llvm-cov --fail-under-lines 80`.
 
-**Live-LLM lane (opt-in).** `web_fetch` / `web_search` / `browser` real-network tests in `crates/cortex/tests/live_network_integration.rs`, gated by `live-llm` feature + `BORG_ALLOW_LIVE_TESTS=1`. **Live-MCP lane (opt-in).** Real stdio MCP servers (today: `uvx mcp-server-time`) in `crates/mcp/tests/live_mcp.rs`, gated by `live-mcp` feature + `BORG_ALLOW_LIVE_TESTS=1`. Default `cargo test` stays hermetic.
+**Live-LLM/live-MCP lanes (real network) are opt-in** — see `crates/cortex/tests/live_network_integration.rs` and `crates/mcp/tests/live_mcp.rs`. Default `cargo test` stays hermetic.
 
 LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude Code CLI.
 
@@ -81,22 +81,7 @@ Every behavior-changing commit/PR includes tests. Bug fixes need a regression te
 
 ### Patch DSL
 
-`+` added, ` ` (space) context, `-` removed. Omitting the prefix is a common mistake.
-
-```
-*** Begin Patch
-*** Add File: path/to/new.py
-+import sys
-*** Update File: path/to/file.py
-@@
- context
--old
-+new
-*** Delete File: path/to/old.py
-*** End Patch
-```
-
-Anchor ambiguous hunks with `@@ method_name` (or `@@ class Foo`). Stack anchors for nested scopes.
+`+` added, ` ` (space) context, `-` removed. Omitting the prefix is a common mistake. Anchor ambiguous hunks with `@@ method_name` (or `@@ class Foo`); stack anchors for nested scopes. Full grammar/examples: `docs/patch-dsl.md`.
 
 ### mTLS — TCP Listener
 
@@ -137,9 +122,9 @@ Server cert SAN is `localhost` — exposing beyond loopback needs operator's hos
 | Collaboration Modes | `crates/cortex/templates/collaboration_mode/` | Execute (default) + Plan (read-only); "Default" mode removed — `"default"` is a `FromStr` legacy alias only |
 | Agent Loop | `crates/cortex/src/agent/` | `<internal>` tags stripped real-time; loop safety: `ToolCallRepeatTracker` (Allow→Backoff→Block, cap `loop_guard.identical_call_max=3`), `UnknownToolTracker` (soft error then terminal at `unknown_tool_max_per_name=2`) |
 | Heartbeat | `crates/heartbeat/` + `crates/borgd/src/heartbeat.rs` | Two schedulers: `heartbeat::scheduler` is tick generator only, `borgd::scheduler` is the dispatcher — don't merge. `heartbeat.min_interval_secs=60` in production. Skips cleanly when `llm.provider` unset (`SkipReason::NoLlmProvider`) |
-| Database | `crates/cortex/src/db/` | libsql (NOT rusqlite/turso) at `~/.borg/borg.db`. **Cleartext at rest today** — every production caller uses `Database::open()`; the SQLCipher AES-256-CBC lane (`open_encrypted`, key HKDF-derived from KEK) is wired but **dormant** (enabling it needs a migration — plaintext DBs can't be read back through the key). DB confidentiality currently rests on `~/.borg` 0700 perms + sandbox deny-read, not encryption; KEK/CA/device keys are encrypted separately under `secrets/`. Don't describe the DB as encrypted at rest until `open_encrypted` is on the boot path |
+| Database | `crates/cortex/src/db/` | libsql (NOT rusqlite/turso) at `~/.borg/borg.db`. **Cleartext at rest today** — SQLCipher lane (`open_encrypted`) exists but is **dormant** (needs a migration). Confidentiality rests on `~/.borg` 0700 perms + sandbox deny-read, not encryption. Don't describe as encrypted until `open_encrypted` ships |
 | Sandboxing | `crates/sandbox/` | macOS `sandbox-exec` Seatbelt (deny-all default); Linux `bwrap` namespace |
-| MCP Client | `crates/mcp/` + `crates/cortex/src/mcp_clients.rs` | Borg consumes external MCP, does NOT expose itself. Stdio children get only `ENV_ALLOWLIST` — every API_KEY/passphrase/OAuth stripped before spawn; credentials via `${SECRET:NAME}` only. HTTPS-only by default. Cloud-metadata FQDNs (`metadata.google.internal`, `metadata.goog`) stay refused even when `mcp.allow_local_network=true` — flipping that knob must not unlock SSRF to IMDS. Streamable-HTTP captures + echoes `Mcp-Session-Id`, drops on 404 and tears down the session (re-init = daemon restart today). Server-initiated requests (sampling/createMessage, roots, …) refused with JSON-RPC `-32601`. Per-call output capped at `mcp.max_response_bytes` (default 1 MiB; 0 → falls back to default, not unbounded). Plan-mode default-blocks MCP tools; only `tools.read_only` allowlist admitted (server `readOnlyHint` is NOT trusted for this). Mutating verbs CLI-only so trust gauntlet runs in one path. Audit events: `mcp_server_started/failed`, `mcp_tool_registered`, `mcp_schema_rejected`, `mcp_tool_executed`, `mcp_rate_limited`, `mcp_response_truncated`, `mcp_sampling_refused`. OTEL events under `borg.mcp` target |
+| MCP Client | `crates/mcp/` + `crates/cortex/src/mcp_clients.rs` | Borg consumes external MCP, does NOT expose itself. Stdio children get `ENV_ALLOWLIST` only, credentials via `${SECRET:NAME}`. HTTPS-only. Plan-mode default-blocks MCP tools (server `readOnlyHint` NOT trusted). See `docs/mcp.md` for session/audit/limits detail |
 | WASM Plugins | `crates/plugins/src/wasm.rs` | Tool-only (channels/hooks/onboarding stay native). Install gauntlet: manifest → SHA-256 pin → Ed25519 sig → static walk → HMAC seal. Runtime `wasmtime` with fuel/memory/output/wall-clock caps. No WASI/sockets/subprocesses/FS. Auto-reseals legacy-framing installs |
 | Vitals & Posture | `crates/cortex/src/vitals/` | 5 stats from HMAC-verified events; Posture v2: Reduced ×0.85, Default ×1.00, Boosted ×1.10; replay reads chain only |
 | Lifecycle Hooks | `crates/cortex/src/hooks.rs` | 9 `HookPoint` variants; compiled: Vitals/Activity/Bond/Evolution/Budget |

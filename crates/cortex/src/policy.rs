@@ -379,8 +379,20 @@ fn deobfuscate(command: &str) -> String {
 /// wrappers that an obfuscator uses to keep the dangerous verb out of the first
 /// token position (`env rm -rf /`, `timeout 5 rm -rf /`, `nice -n1 rm -rf /`).
 const LEADING_WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "nice", "nohup", "setsid", "stdbuf", "ionice", "command", "timeout",
-    "chrt", "eatmydata", "nocache", "busybox",
+    "sudo",
+    "doas",
+    "env",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "ionice",
+    "command",
+    "timeout",
+    "chrt",
+    "eatmydata",
+    "nocache",
+    "busybox",
 ];
 
 /// Normalize a command for more robust pattern matching:
@@ -422,9 +434,9 @@ pub(crate) fn strip_leading_wrappers(tokens: &mut Vec<String>) {
         // `nice -n 1` leaves `1` as a bare arg). Stop at the wrapped verb.
         while let Some(tok) = tokens.first() {
             let is_option = tok.starts_with('-');
-            let is_assignment = tok
-                .split_once('=')
-                .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+            let is_assignment = tok.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
             let is_numeric = tok.chars().next().is_some_and(|c| c.is_ascii_digit());
             if is_option || is_assignment || is_numeric {
                 tokens.remove(0);
@@ -788,7 +800,15 @@ pub(crate) fn stage_runs_interpreter(stage: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         interp.as_str(),
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "python" | "perl" | "ruby" | "node"
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+            | "python"
+            | "perl"
+            | "ruby"
+            | "node"
             | "php"
     )
 }
@@ -1159,10 +1179,7 @@ mod tests {
         // A genuine multi-line benign command (no dangerous verb re-forms) stays
         // allowed even though it uses a line continuation.
         for ok in ["echo hello \\\n  world", "git commit \\\n  -m msg"] {
-            assert!(
-                !is_catastrophic_command(ok),
-                "{ok:?} must pass"
-            );
+            assert!(!is_catastrophic_command(ok), "{ok:?} must pass");
         }
     }
 
@@ -1490,7 +1507,10 @@ mod tests {
         assert_decisions(&[
             // The exact command that fixed this — a PR title as data.
             (r#"git commit -m "rm -rf /""#, PolicyDecision::AutoApprove),
-            (r#"echo "run rm -rf ${HOME} to reset""#, PolicyDecision::AutoApprove),
+            (
+                r#"echo "run rm -rf ${HOME} to reset""#,
+                PolicyDecision::AutoApprove,
+            ),
             (r#"grep -r "rm -rf" ."#, PolicyDecision::AutoApprove),
             // Quoted relative paths are not root deletes.
             (r#"rm -rf "./build""#, PolicyDecision::AutoApprove),

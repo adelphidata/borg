@@ -2449,7 +2449,9 @@ mod redirect_policy_tests {
         let victim = MockServer::start().await;
         let redirect_to = attacker.uri();
         Mock::given(any())
-            .respond_with(ResponseTemplate::new(302).insert_header("location", redirect_to.as_str()))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", redirect_to.as_str()),
+            )
             .mount(&victim)
             .await;
 
@@ -2463,7 +2465,11 @@ mod redirect_policy_tests {
             .expect("send");
 
         // Redirect stopped: we get the 302 back, not the attacker's 200 body.
-        assert_eq!(resp.status().as_u16(), 302, "cross-origin redirect must not be followed");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "cross-origin redirect must not be followed"
+        );
     }
 
     #[tokio::test]
@@ -2492,7 +2498,11 @@ mod redirect_policy_tests {
             .await
             .expect("send");
 
-        assert_eq!(resp.status().as_u16(), 200, "same-origin redirect must be followed");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "same-origin redirect must be followed"
+        );
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 }

@@ -506,8 +506,14 @@ mod tests {
         // L5: coverage for credential shapes that were previously missed.
         let cases = [
             ("ASIAIOSFODNN7EXAMPLE", "AWS temporary key"),
-            ("github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123", "GitHub fine-grained PAT"),
-            ("AIzaSyA1234567890abcdefghijklmnopqrstuvwx", "Google API key"),
+            (
+                "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
+                "GitHub fine-grained PAT",
+            ),
+            (
+                "AIzaSyA1234567890abcdefghijklmnopqrstuvwx",
+                "Google API key",
+            ),
             ("sk_live_0123456789abcdefABCDEFghijkl", "Stripe live key"),
             ("xapp-1-A012345678BCDEFGHIJ", "Slack app token"),
         ];

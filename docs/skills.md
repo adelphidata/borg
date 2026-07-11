@@ -12,7 +12,7 @@ Skills are instruction bundles that teach the agent how to use external CLI tool
 
 ## Built-in skills
 
-Nineteen skills are embedded in the binary:
+Twenty-seven skills are embedded in the binary:
 
 | Skill | Requirements | Description |
 |-------|-------------|-------------|
@@ -35,6 +35,14 @@ Nineteen skills are embedded in the binary:
 | `linear` | `curl`, `jq`, `LINEAR_API_KEY` | Manage Linear issues, projects, and cycles via the GraphQL API |
 | `pdf` | `pdftotext` | Read, extract, split, and merge PDF files |
 | `reminders` | `reminders` (CLI) | Manage native macOS Reminders via reminders-cli |
+| `borg-cli` | -- | Drive the borg CLI to self-configure and diagnose: settings, skills, memory, tasks, channels, status |
+| `code-simplify` | `git` | Review code for safe simplifications, AI-slop, and silently-swallowed errors; apply by risk tier |
+| `healthcheck` | -- | Audit host security posture — SSH config, firewall, listening ports, package updates, cron |
+| `notion` | `curl`, `jq`, `NOTION_API_KEY` | Read and write Notion pages, databases, and blocks via the REST API |
+| `obsidian` | -- | Work with Borg's markdown knowledge files as an Obsidian-friendly workspace |
+| `stripe-link` | `link-cli` | Fetch one-time payment credentials from a Stripe Link wallet to complete purchases on the user's behalf |
+| `subagent-driven-development` | -- | Implement a plan via parallel sub-agents with a two-stage review per task |
+| `video-frames` | `ffmpeg`, `ffprobe` | Extract frames, thumbnails, contact sheets, GIFs, and short clips from videos |
 
 ## User skills
 

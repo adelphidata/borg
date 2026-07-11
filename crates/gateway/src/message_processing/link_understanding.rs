@@ -67,7 +67,10 @@ fn is_admissible(url: &str, policy: &UrlPolicyConfig) -> bool {
         .ok()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
     {
-        Some(host) => !matches!(host.as_str(), "localhost" | "ip6-localhost" | "ip6-loopback"),
+        Some(host) => !matches!(
+            host.as_str(),
+            "localhost" | "ip6-localhost" | "ip6-loopback"
+        ),
         None => false,
     }
 }
@@ -410,8 +413,7 @@ mod tests {
     #[tokio::test]
     async fn augment_disabled_is_noop() {
         let config = LinkUnderstandingConfig::default(); // enabled: false
-        let (result, urls) =
-            augment_with_links("https://example.com", &config, &policy()).await;
+        let (result, urls) = augment_with_links("https://example.com", &config, &policy()).await;
         assert_eq!(result, "https://example.com");
         assert!(urls.is_empty());
     }

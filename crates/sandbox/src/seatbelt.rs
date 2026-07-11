@@ -527,7 +527,9 @@ mod tests {
             .find(&format!("(deny file-read* (subpath \"{home}/.ssh\"))"))
             .expect("sensitive .ssh deny must be present");
         let deny_secrets = profile
-            .find(&format!("(deny file-read* (subpath \"{home}/.borg/secrets\"))"))
+            .find(&format!(
+                "(deny file-read* (subpath \"{home}/.borg/secrets\"))"
+            ))
             .expect("borg secrets deny must be present");
         assert!(
             allow_root < deny_ssh && allow_root < deny_secrets,

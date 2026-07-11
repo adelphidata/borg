@@ -586,7 +586,10 @@ mod tests {
             let out = ssrf_filter_addrs(vec![imds, azure_wire, public], allow_private);
             let ips: Vec<IpAddr> = out.iter().map(|s| s.ip()).collect();
             assert!(!ips.contains(&imds), "IMDS IP must be dropped");
-            assert!(!ips.contains(&azure_wire), "Azure wireserver must be dropped");
+            assert!(
+                !ips.contains(&azure_wire),
+                "Azure wireserver must be dropped"
+            );
             assert!(ips.contains(&public), "public IP must survive");
         }
     }
@@ -611,10 +614,7 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
                 let _ = sock.write_all(header.as_bytes()).await;
                 let _ = sock.write_all(&body).await;
                 let _ = sock.flush().await;

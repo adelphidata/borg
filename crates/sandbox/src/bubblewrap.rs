@@ -208,8 +208,7 @@ mod tests {
 
         let dir_s = dir.to_string_lossy().into_owned();
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--tmpfs" && w[1] == dir_s),
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == dir_s),
             "deny_read directory must be tmpfs-hidden: {args:?}"
         );
         let file_s = file.to_string_lossy().into_owned();
@@ -221,7 +220,10 @@ mod tests {
         // The overlay must come AFTER the broad read bind so it wins.
         let read_bind_idx = args.iter().position(|a| a == &tmp.path().to_string_lossy());
         let tmpfs_idx = args.iter().position(|a| a == &dir_s);
-        assert!(read_bind_idx < tmpfs_idx, "hide must be emitted after fs_read bind");
+        assert!(
+            read_bind_idx < tmpfs_idx,
+            "hide must be emitted after fs_read bind"
+        );
     }
 
     #[test]

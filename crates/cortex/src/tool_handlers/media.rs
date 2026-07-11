@@ -154,7 +154,10 @@ pub async fn handle_browser(
     // `is_stale` compares the session's actual attach mode against the live
     // config; a stale cloud session is released on the provider by `close()`, so
     // switching away never leaks (or keeps billing) the old keep-alive session.
-    if session.as_ref().is_some_and(|s| s.is_stale(&config.browser)) {
+    if session
+        .as_ref()
+        .is_some_and(|s| s.is_stale(&config.browser))
+    {
         if let Some(prev) = session.take() {
             tracing::info!("browser backend/engine setting drifted — closing prior session");
             // Close failures are non-fatal (CDP channel may already be dead) but

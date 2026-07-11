@@ -494,8 +494,8 @@ mod tests {
             "https://169.254.169.254/latest/meta-data/",
             "http://169.254.169.254/",
             "https://[::ffff:169.254.169.254]/",
-            "https://168.63.129.16/",       // Azure wireserver
-            "https://100.100.100.200/",     // Alibaba metadata
+            "https://168.63.129.16/",   // Azure wireserver
+            "https://100.100.100.200/", // Alibaba metadata
         ] {
             let err = check_url_syntactic(url, &permissive).unwrap_err();
             assert!(
