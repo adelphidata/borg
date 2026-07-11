@@ -503,7 +503,7 @@ impl Agent {
         tool_call_id: &str,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput> {
-        let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
+        let mut raw_args: serde_json::Value = match serde_json::from_str(args_json) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolOutput::Text(format!(
@@ -511,6 +511,12 @@ impl Agent {
                 )));
             }
         };
+        // Fail closed on valid-JSON-but-not-an-object arguments before any
+        // dispatch (including MCP and plugin paths) so a bare scalar/array
+        // can't be silently coerced to an empty arg set and executed.
+        if let Some(err) = reject_non_object_args(&mut raw_args) {
+            return Ok(ToolOutput::Text(err));
+        }
 
         // MCP tools live outside the typed `Tool` enum and use a reserved
         // `mcp_` prefix. Short-circuit before `Tool::parse` so the LLM
@@ -796,6 +802,32 @@ impl Agent {
 /// `ToolOutputDelta` requires extending this signature with `tool_call_id`
 /// first, otherwise the delta will land at the OpenAI compat layer with an
 /// empty id (see `agent_dispatcher::translate_events`).
+/// Fail closed on tool arguments that parsed as valid JSON but are not a JSON
+/// object. A tool invocation's `arguments` must be an object (`{...}`); a bare
+/// string, number, boolean, or array is a malformed call and must not be
+/// coerced into an empty arg set and executed — several tools accept a raw
+/// `serde_json::Value` (`#[serde(transparent)]`) and would otherwise silently
+/// default every field and walk into dispatch. `null` is the conventional
+/// "no arguments" form, so it is normalized to an empty object and accepted,
+/// keeping no-argument tools (`list_skills`, `list_channels`) working. Returns
+/// `Some(error_text)` to hand back to the model when the value must be rejected.
+fn reject_non_object_args(raw_args: &mut serde_json::Value) -> Option<String> {
+    match raw_args {
+        serde_json::Value::Object(_) => None,
+        serde_json::Value::Null => {
+            *raw_args = serde_json::Value::Object(serde_json::Map::new());
+            None
+        }
+        serde_json::Value::String(_) => Some("string"),
+        serde_json::Value::Number(_) => Some("number"),
+        serde_json::Value::Bool(_) => Some("boolean"),
+        serde_json::Value::Array(_) => Some("array"),
+    }
+    .map(|kind| {
+        format!("Error: Tool arguments must be a JSON object; got a {kind}. The tool was not executed.")
+    })
+}
+
 pub(super) async fn dispatch_parallel_safe_tool(
     name: &str,
     args_json: &str,
@@ -811,7 +843,7 @@ pub(super) async fn dispatch_parallel_safe_tool(
             "dispatch_parallel_safe_tool called with non-parallel-safe tool '{name}' — planner/dispatch mismatch"
         ));
     }
-    let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
+    let mut raw_args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => {
             return Ok(ToolOutput::Text(format!(
@@ -819,6 +851,11 @@ pub(super) async fn dispatch_parallel_safe_tool(
             )));
         }
     };
+    // Fail closed on valid-JSON-but-not-an-object arguments (see
+    // `reject_non_object_args`) before coercion/dispatch.
+    if let Some(err) = reject_non_object_args(&mut raw_args) {
+        return Ok(ToolOutput::Text(err));
+    }
     let tool = match crate::tool::coerce::parse_with_coercion(name, raw_args) {
         Ok(t) => t,
         Err(crate::tool::ToolParseError::UnknownTool(n)) => {

@@ -523,6 +523,44 @@ pub(crate) fn compose_ollama_url(host: &str) -> String {
     format!("{with_scheme}/v1/chat/completions")
 }
 
+/// Redirect policy for credential-bearing HTTP clients: follow same-host
+/// redirects (legitimate path-level 3xx) but refuse to follow a redirect whose
+/// host differs from the origin host we authenticated to.
+///
+/// Provider API keys travel as `x-api-key` (Anthropic), `x-goog-api-key`
+/// (Gemini), and `api-key` (Azure) headers, and OAuth refresh clients carry the
+/// `refresh_token` in the request *body*. reqwest's built-in cross-host
+/// stripping only removes `Authorization`/`Cookie`/`Proxy-Authorization` — it
+/// never touches those custom headers or the body — so following a cross-host
+/// 3xx (from a compromised/misconfigured endpoint or a poisoned, operator- or
+/// credential-supplied `base_url`) would forward the raw secret to the redirect
+/// target. reqwest's public redirect API can't mutate per-hop headers, so we
+/// fail closed instead: the cross-host request is simply never sent. The
+/// comparison is against the full *origin* (scheme + host + port) of the first
+/// URL in the chain, so a redirect to a different port or scheme on the same
+/// host is refused too.
+pub(crate) fn cross_host_safe_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        // Compare full origin (scheme + host + port) against the origin we
+        // authenticated to; empty history (shouldn't happen inside a redirect)
+        // fails closed.
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|origin| origin.origin() == attempt.url().origin());
+        if same_origin {
+            attempt.follow()
+        } else {
+            // Cross-origin (or unknown) redirect: stop here rather than re-send
+            // the credentialed request to a different origin.
+            attempt.stop()
+        }
+    })
+}
+
 pub(crate) fn compose_azure_openai_url(cfg: &crate::config::LlmConfig) -> anyhow::Result<String> {
     let resource = cfg
         .azure_resource
@@ -784,7 +822,12 @@ impl LlmClient {
         }
 
         let debug_logging = config.debug.llm_logging;
-        let client = Client::new();
+        // Credential-bearing client: refuse cross-host redirects so provider
+        // API-key headers / OAuth bodies can't leak to a redirect target.
+        let client = Client::builder()
+            .redirect(cross_host_safe_redirect_policy())
+            .build()
+            .context("build credentialed LLM http client")?;
         let mut keys_remaining = keys.clone();
         let api_key = keys_remaining.remove(0);
 
@@ -2373,5 +2416,83 @@ mod ollama_url_tests {
             compose_ollama_url("http://h:11434/"),
             "http://h:11434/v1/chat/completions"
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_policy_tests {
+    use super::cross_host_safe_redirect_policy;
+    use wiremock::matchers::{any, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn credentialed_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(cross_host_safe_redirect_policy())
+            .build()
+            .expect("build client")
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_is_stopped_and_key_never_forwarded() {
+        // The origin a redirect points to. Two wiremock servers share host
+        // 127.0.0.1 but bind different ports, so they are distinct origins —
+        // exactly the "same host, other service" case the port-aware compare
+        // must catch. If the redirect were followed, the credential header
+        // would land here.
+        let attacker = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("attacker"))
+            .expect(0) // verified on drop: must never be hit
+            .mount(&attacker)
+            .await;
+
+        let victim = MockServer::start().await;
+        let redirect_to = attacker.uri();
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(302).insert_header("location", redirect_to.as_str()))
+            .mount(&victim)
+            .await;
+
+        let resp = credentialed_client()
+            .get(victim.uri())
+            .header("x-api-key", "SECRET-ANTHROPIC-KEY")
+            .header("x-goog-api-key", "SECRET-GEMINI-KEY")
+            .header("api-key", "SECRET-AZURE-KEY")
+            .send()
+            .await
+            .expect("send");
+
+        // Redirect stopped: we get the 302 back, not the attacker's 200 body.
+        assert_eq!(resp.status().as_u16(), 302, "cross-origin redirect must not be followed");
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_is_followed_and_keeps_key_header() {
+        let server = MockServer::start().await;
+        // /first -> (same-origin, relative) /second
+        Mock::given(method("GET"))
+            .and(path("/first"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/second"))
+            .mount(&server)
+            .await;
+        // /second only answers 200 when the credential header survived the
+        // same-origin redirect; the header matcher is the assertion.
+        Mock::given(method("GET"))
+            .and(path("/second"))
+            .and(header("x-api-key", "SECRET-ANTHROPIC-KEY"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = credentialed_client()
+            .get(format!("{}/first", server.uri()))
+            .header("x-api-key", "SECRET-ANTHROPIC-KEY")
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status().as_u16(), 200, "same-origin redirect must be followed");
+        assert_eq!(resp.text().await.expect("body"), "ok");
     }
 }

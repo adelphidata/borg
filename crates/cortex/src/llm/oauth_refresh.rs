@@ -57,6 +57,7 @@ pub async fn refresh_anthropic_against(
     let client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .redirect(super::cross_host_safe_redirect_policy())
         .build()
         .context("build http client")?;
     let resp = client
@@ -107,6 +108,7 @@ pub async fn refresh_codex_against(refresh_token: &str, endpoint: &str) -> Resul
     let client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .redirect(super::cross_host_safe_redirect_policy())
         .build()
         .context("build http client")?;
     let resp = client

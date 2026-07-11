@@ -161,6 +161,39 @@ const HARDCODED_DENY: &[&str] = &[
     "find ~* -exec rm *",
 ];
 
+/// Deny patterns whose discrimination depends on ASCII case and must therefore
+/// be matched case-sensitively only. Every *other* `HARDCODED_DENY` pattern is
+/// additionally matched case-folded (see [`matches_hardcoded_deny`]) so a
+/// case-insensitive filesystem — default macOS APFS — cannot run `RM -RF /`
+/// past the floor. Folding these would instead cause false positives: the
+/// `*Socket*` pattern distinguishes the Perl reverse-shell `use Socket;` idiom
+/// from a benign `print "websocket"`, and a lowercase `*socket*` would deny the
+/// latter. Keeping it case-sensitive preserves that discrimination while the
+/// verb-based catastrophic patterns still gain case-insensitive coverage.
+const CASE_SENSITIVE_ONLY_DENY: &[&str] = &["perl -e *Socket*"];
+
+/// Match a normalized command against [`HARDCODED_DENY`]. Every pattern is
+/// checked case-sensitively (preserving exact prior behavior); additionally,
+/// all patterns except [`CASE_SENSITIVE_ONLY_DENY`] are checked case-folded so
+/// mixed-case spellings a case-insensitive filesystem still executes — `RM -RF
+/// /`, `DD if=… of=/dev/rdisk0`, `MKFS.ext4 …`, `Chmod -R 777 /` — hit the same
+/// floor as their lowercase forms. Fail-secure: folding only ever makes MORE
+/// commands match, never fewer.
+fn matches_hardcoded_deny(normalized: &str) -> bool {
+    let folded = normalized.to_ascii_lowercase();
+    for pattern in HARDCODED_DENY {
+        if glob_match(pattern, normalized) {
+            return true;
+        }
+        if !CASE_SENSITIVE_ONLY_DENY.contains(pattern)
+            && glob_match(&pattern.to_ascii_lowercase(), &folded)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Collapse shell `IFS` references to a single space. `$IFS`, `${IFS}`,
 /// and the bash substring form `${IFS:0:1}` all expand to whitespace in
 /// a live shell, so `rm${IFS}-rf${IFS}/` executes as `rm -rf /`; without
@@ -249,10 +282,26 @@ fn deobfuscate(command: &str) -> String {
             // `r\m`, and `\\rm` all as `rm` once parsed, so leaving any
             // of them in the output would let a determined caller
             // outrun us by stacking escapes. We never preserve the
-            // following character — `\n` is rare in this path (a real
-            // newline trips the explicit-newline check in `check()`)
-            // and `\` before a token boundary collapses cleanly.
-            '\\' => {}
+            // following character — `\` before a token boundary collapses
+            // cleanly.
+            //
+            // One exception: `\` immediately before a newline is a POSIX
+            // line continuation — the shell removes BOTH characters and
+            // *joins* the adjacent tokens, so `rm -r\<newline>f /` runs as
+            // `rm -rf /`. Dropping only the backslash would strand the
+            // newline as a token separator and the verb (`rm -rf`) would
+            // never re-form, so we swallow the newline half here too
+            // (including a `\r\n` pair). `\r` alone already denies upstream
+            // in `is_catastrophic_command`, so this only has to re-join the
+            // bare-`\n` continuation.
+            '\\' => {
+                if matches!(chars.peek(), Some('\n') | Some('\r')) {
+                    let nl = chars.next();
+                    if nl == Some('\r') && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+            }
             // Quotes are removed by the shell during word splitting, so
             // `rm -rf "/"` and `rm -rf '/'` execute as `rm -rf /`.
             // Dropping them lets quoted catastrophic paths reach the
@@ -620,10 +669,8 @@ pub(crate) fn is_catastrophic_command(command: &str) -> bool {
 
     for candidate in candidates {
         let normalized = normalize_command(candidate);
-        for pattern in HARDCODED_DENY {
-            if glob_match(pattern, &normalized) {
-                return true;
-            }
+        if matches_hardcoded_deny(&normalized) {
+            return true;
         }
         if writes_to_sensitive_path(&normalized) {
             return true;
@@ -636,10 +683,8 @@ pub(crate) fn is_catastrophic_command(command: &str) -> bool {
         let deobfuscated = deobfuscate(candidate);
         if deobfuscated != candidate {
             let deob_normalized = normalize_command(&deobfuscated);
-            for pattern in HARDCODED_DENY {
-                if glob_match(pattern, &deob_normalized) {
-                    return true;
-                }
+            if matches_hardcoded_deny(&deob_normalized) {
+                return true;
             }
             if writes_to_sensitive_path(&deob_normalized) {
                 return true;
@@ -997,6 +1042,73 @@ mod tests {
             "curl http://x | jq .",
         ] {
             assert!(!is_catastrophic_command(ok), "{ok} must pass");
+        }
+    }
+
+    #[test]
+    fn catastrophic_denylist_is_case_folded() {
+        // Default macOS APFS is case-insensitive: `RM`/`DD`/`MKFS`/`CHMOD`
+        // resolve and execute, so the hardcoded floor must match them regardless
+        // of case — a byte-exact denylist let `RM -RF /` wipe the host.
+        for bad in [
+            "RM -RF /",
+            "rm -RF /",
+            "Rm -rf /",
+            "RM -RF ~",
+            "DD if=/dev/zero of=/dev/rdisk0",
+            "MKFS /dev/sda",
+            "MkFs /dev/sda",
+            "Chmod -R 777 /",
+            "CHMOD 4755 /bin/sh",
+            "WIPEFS /dev/sda",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+        // Case-reliant patterns still discriminate: the Perl reverse-shell
+        // `use Socket` idiom is denied, but a benign `websocket` string literal
+        // must NOT be (the `*Socket*` pattern stays case-sensitive).
+        assert!(
+            is_catastrophic_command("perl -e 'use Socket; socket(S,PF_INET,...)'"),
+            "perl reverse shell must be flagged"
+        );
+        assert!(
+            !is_catastrophic_command("perl -e 'print \"websocket\"'"),
+            "benign websocket literal must pass"
+        );
+        // Folding must not over-block ordinary mixed-case commands / prose.
+        for ok in [
+            "RM report.txt",
+            "cat README.md",
+            "echo 'the rm command deletes files'",
+            "git commit -m 'DD notes and MKFS research'",
+        ] {
+            assert!(!is_catastrophic_command(ok), "{ok} must pass");
+        }
+    }
+
+    #[test]
+    fn catastrophic_line_continuation_is_rejoined() {
+        // A backslash immediately before a newline is a POSIX line continuation:
+        // the shell removes both and joins the tokens, so these all execute as
+        // `rm -rf /` and must hit the floor.
+        for bad in [
+            "rm -r\\\nf /",
+            "r\\\nm -rf /",
+            "rm -rf \\\n/",
+            "rm -rf \\\n~",
+        ] {
+            assert!(
+                is_catastrophic_command(bad),
+                "{bad:?} (line continuation) must be flagged"
+            );
+        }
+        // A genuine multi-line benign command (no dangerous verb re-forms) stays
+        // allowed even though it uses a line continuation.
+        for ok in ["echo hello \\\n  world", "git commit \\\n  -m msg"] {
+            assert!(
+                !is_catastrophic_command(ok),
+                "{ok:?} must pass"
+            );
         }
     }
 

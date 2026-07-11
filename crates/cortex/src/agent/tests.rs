@@ -524,6 +524,65 @@ async fn dispatch_parallel_safe_tool_invalid_json_returns_text() {
     };
     assert!(text.contains("Invalid JSON"), "got: {text}");
 }
+
+#[tokio::test]
+async fn dispatch_parallel_safe_tool_rejects_non_object_args() {
+    // Valid JSON that is not an object (bare string / number / array / bool)
+    // must fail closed with a structured error and NOT execute the tool —
+    // otherwise a `#[serde(transparent)]`-over-`Value` handler would coerce it
+    // to an empty arg set and walk into dispatch.
+    let config = Config::default();
+    let (tx, _rx) = mpsc::channel(8);
+    for bad in ["\"/etc/passwd\"", "42", "[1,2,3]", "true"] {
+        let out = dispatch_parallel_safe_tool("read_file", bad, &config, &tx, None)
+            .await
+            .unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            _ => panic!("expected text output for {bad}"),
+        };
+        assert!(
+            text.contains("must be a JSON object") && text.contains("was not executed"),
+            "arg {bad:?} must be rejected as non-object, got: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dispatch_parallel_safe_tool_null_args_normalize_to_empty_object() {
+    // `null` is the conventional "no arguments" form: it is normalized to `{}`
+    // and reaches arg parsing, so a no-argument tool still runs and an
+    // argument-requiring tool fails at *parsing*, not with the non-object
+    // rejection.
+    let config = Config::default();
+    let (tx, _rx) = mpsc::channel(8);
+
+    // list_skills takes no args → null-as-{} must not be rejected as non-object.
+    let out = dispatch_parallel_safe_tool("list_skills", "null", &config, &tx, None)
+        .await
+        .unwrap();
+    let text = match out {
+        ToolOutput::Text(t) => t,
+        ToolOutput::Multimodal { text, .. } => text,
+    };
+    assert!(
+        !text.contains("must be a JSON object"),
+        "null args to a no-arg tool must not be rejected as non-object: {text}"
+    );
+
+    // read_file requires `path` → null-as-{} reaches parse and fails there.
+    let out = dispatch_parallel_safe_tool("read_file", "null", &config, &tx, None)
+        .await
+        .unwrap();
+    let text = match out {
+        ToolOutput::Text(t) => t,
+        _ => panic!("expected text output"),
+    };
+    assert!(
+        text.contains("Invalid arguments") && !text.contains("must be a JSON object"),
+        "null to read_file should fail at arg parsing, not non-object reject: {text}"
+    );
+}
 //
 // The two `setup_template_*` template-rendering tests live alongside
 // `SETUP_TEMPLATE` in `agent::system_prompt`. The lifecycle tests below
