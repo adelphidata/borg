@@ -232,6 +232,22 @@ pub struct SecurityConfig {
     /// and persists the resolved choice (`OsKeychain` or `File`).
     #[serde(default)]
     pub kek_backend: KekBackend,
+    /// Per-stream byte cap on single-shot / PTY `run_shell` output retained for
+    /// the model. A runaway command (`yes`, `cat` of a huge file, a chatty
+    /// build) is otherwise collected into an unbounded buffer that can exhaust
+    /// daemon memory and blow the model's context window. When output exceeds
+    /// the cap the head and tail are kept and the middle is replaced by a
+    /// `... N bytes omitted ...` marker; live streaming deltas are unaffected.
+    /// `0` falls back to the 1 MiB default (never unbounded), matching
+    /// `mcp.max_response_bytes`.
+    ///
+    /// The bound is *per stream*: a non-PTY command flooding both stdout and
+    /// stderr can retain up to `2 ×` this value in the combined result. Set the
+    /// cap with that headroom in mind. Persistent sessions (`action=start` /
+    /// `poll`) drain through a separate offset-based buffer and are not governed
+    /// by this knob.
+    #[serde(default = "default_max_shell_output_bytes")]
+    pub max_shell_output_bytes: usize,
     /// Pre-flight gate for outbound URLs (`web_fetch`, `browser.navigate`).
     #[serde(default)]
     pub url_policy: UrlPolicyConfig,
@@ -274,6 +290,12 @@ fn default_startup_audit() -> bool {
     true
 }
 
+/// Default per-stream `run_shell` output cap: 1 MiB, matching
+/// `mcp.max_response_bytes` and the WASM sandbox `max_output_bytes`.
+pub(crate) fn default_max_shell_output_bytes() -> usize {
+    1024 * 1024
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -305,6 +327,7 @@ impl Default for SecurityConfig {
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
             verifier: VerifierKind::Tofu,
             kek_backend: KekBackend::Auto,
+            max_shell_output_bytes: default_max_shell_output_bytes(),
             url_policy: UrlPolicyConfig::default(),
             trusted_publisher_keys: Vec::new(),
             deprecated_publisher_keys: Vec::new(),

@@ -266,10 +266,33 @@ impl ScriptHook {
             return HookAction::Continue;
         }
         let payload = self.build_payload(ctx);
-        match run_subprocess(&self.command, &payload, self.timeout) {
-            Ok(0) => HookAction::Continue,
+        let started = Instant::now();
+        let result = run_subprocess(&self.command, &payload, self.timeout);
+        let duration_ms = started.elapsed().as_millis();
+        // Completion trace on *every* arm, success included — a slow-but-OK hook
+        // is otherwise invisible (only failures used to log). Low-cardinality
+        // metadata only; command text, payload, stdout, and stderr are
+        // deliberately excluded because they can carry secrets/PII.
+        match result {
+            Ok(0) => {
+                tracing::debug!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "ok",
+                    duration_ms,
+                    "hook completed"
+                );
+                HookAction::Continue
+            }
             Ok(code) => {
-                tracing::warn!("hook {} exited with code {code}", self.name);
+                tracing::warn!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "nonzero_exit",
+                    exit_code = code,
+                    duration_ms,
+                    "hook exited nonzero"
+                );
                 if self.is_pre_tool() {
                     HookAction::Skip
                 } else {
@@ -278,11 +301,24 @@ impl ScriptHook {
             }
             Err(SubprocessError::Spawn(e)) => {
                 // Fail-open even on PreToolUse: a broken hook must not block every tool.
-                tracing::warn!("hook {} spawn failed: {e}", self.name);
+                tracing::warn!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "spawn_failed",
+                    duration_ms,
+                    "hook spawn failed: {e}"
+                );
                 HookAction::Continue
             }
             Err(SubprocessError::Timeout) => {
-                tracing::warn!("hook {} timed out after {:?}", self.name, self.timeout);
+                tracing::warn!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "timeout",
+                    duration_ms,
+                    "hook timed out after {:?}",
+                    self.timeout
+                );
                 if self.is_pre_tool() {
                     HookAction::Skip
                 } else {
@@ -290,7 +326,13 @@ impl ScriptHook {
                 }
             }
             Err(SubprocessError::Io(e)) => {
-                tracing::warn!("hook {} io error: {e}", self.name);
+                tracing::warn!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "io_error",
+                    duration_ms,
+                    "hook io error: {e}"
+                );
                 HookAction::Continue
             }
         }
@@ -471,6 +513,77 @@ mod tests {
             command: command.to_string(),
             timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Captures each tracing event's fields as one `field=value …` string.
+    struct EventRecorder(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventRecorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Grab(Vec<String>);
+            impl tracing::field::Visit for Grab {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push(format!("{}={:?}", field.name(), value));
+                }
+            }
+            let mut grab = Grab(Vec::new());
+            event.record(&mut grab);
+            self.0.lock().unwrap().push(grab.0.join(" "));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_hook_emits_completion_trace_with_duration() {
+        // A hook that exits 0 used to be completely silent. It must now emit a
+        // completion event carrying the outcome and a duration so slow-but-OK
+        // hooks are observable — the whole point of this change.
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventRecorder(events.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let hook = make_hook("exit 0", HookPoint::AfterToolCall);
+        let ctx = make_tool_ctx(HookPoint::AfterToolCall, "run_shell");
+        assert!(matches!(hook.execute_inner(&ctx), HookAction::Continue));
+
+        let recorded = events.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e.contains("outcome=") && e.contains("ok") && e.contains("duration_ms=")),
+            "expected success completion event with duration, got: {recorded:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nonzero_hook_completion_trace_records_outcome_and_duration() {
+        // The failure path already logged; assert it now also carries the
+        // structured outcome + duration and still returns Skip on a pre-tool
+        // hook (behavior unchanged).
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventRecorder(events.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let hook = make_hook("exit 3", HookPoint::BeforeToolCall);
+        let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
+        assert!(matches!(hook.execute_inner(&ctx), HookAction::Skip));
+
+        let recorded = events.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e.contains("nonzero_exit") && e.contains("duration_ms=")),
+            "expected nonzero completion event with duration, got: {recorded:?}"
+        );
     }
 
     // ── config parsing ──

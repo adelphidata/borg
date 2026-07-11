@@ -156,6 +156,13 @@ struct WasmGuardState {
     enabled: bool,
     disabled_plugin_ids: Vec<String>,
     disabled_publisher_keys: Vec<String>,
+    /// Snapshot of `security.trusted_publisher_keys`. `None` means the config
+    /// was unreadable; the allowlist gate then fails *closed* (no publisher can
+    /// be attested, so nothing runs) — unlike the additive denylists below,
+    /// which fail open. `Some(list)` enforces: a publisher absent from the list
+    /// is refused at dispatch — even an empty list, which means "no publisher is
+    /// trusted" (mirroring the install-time empty-list rejection).
+    trusted_publisher_keys: Option<Vec<String>>,
     rate_limit_per_minute: u32,
     rate_limit_burst: u32,
 }
@@ -166,6 +173,7 @@ impl WasmGuardState {
             enabled: cfg.plugins.wasm.enabled,
             disabled_plugin_ids: cfg.plugins.wasm.disabled_plugin_ids.clone(),
             disabled_publisher_keys: cfg.plugins.wasm.disabled_publisher_keys.clone(),
+            trusted_publisher_keys: Some(cfg.security.trusted_publisher_keys.clone()),
             rate_limit_per_minute: cfg.plugins.wasm.rate_limit_per_minute,
             rate_limit_burst: cfg.plugins.wasm.rate_limit_burst,
         }
@@ -179,6 +187,67 @@ impl WasmGuardState {
         self.disabled_publisher_keys
             .iter()
             .any(|d| d == publisher_key)
+    }
+
+    /// Whether `publisher_key` is currently trusted. `None` (config unreadable)
+    /// fails *closed* — if we can't read the trust anchor we can't attest a
+    /// publisher, and executing unverifiable-trust plugin code is the unsafe
+    /// direction. This only bites already-installed plugins during a genuine
+    /// config-read failure: the default `trusted_publisher_keys` is empty, and
+    /// install itself requires a populated list, so a healthy default has no
+    /// plugins to refuse.
+    fn is_publisher_trusted(&self, publisher_key: &str) -> bool {
+        match &self.trusted_publisher_keys {
+            None => false,
+            Some(keys) => keys.iter().any(|k| k == publisher_key),
+        }
+    }
+}
+
+#[cfg(test)]
+mod trust_gate_tests {
+    use super::WasmGuardState;
+
+    fn guard(trusted: Option<Vec<&str>>) -> WasmGuardState {
+        WasmGuardState {
+            enabled: true,
+            trusted_publisher_keys: trusted.map(|v| v.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_listed_publisher_is_trusted() {
+        // The core of the runtime re-check: a publisher present in the allowlist
+        // is trusted; one that was removed (or never listed) is not. This is the
+        // gap the change closes — a plugin whose publisher is dropped from
+        // `security.trusted_publisher_keys` must stop being trusted at dispatch.
+        let g = guard(Some(vec!["GOOD"]));
+        assert!(g.is_publisher_trusted("GOOD"));
+        assert!(!g.is_publisher_trusted("REMOVED"));
+        // Exact match only — no substring/case leniency.
+        assert!(!g.is_publisher_trusted("GOO"));
+        assert!(!g.is_publisher_trusted("good"));
+    }
+
+    #[test]
+    fn empty_allowlist_trusts_nobody() {
+        // An empty allowlist means "no publisher is trusted" — fail-closed,
+        // mirroring the install-time empty-list rejection. A cleared trust
+        // anchor must deactivate every installed plugin, not open the gate.
+        let g = guard(Some(vec![]));
+        assert!(!g.is_publisher_trusted("GOOD"));
+        assert!(!g.is_publisher_trusted(""));
+    }
+
+    #[test]
+    fn none_snapshot_fails_closed() {
+        // `None` = config was unreadable. Trust can't be attested, so the gate
+        // fails closed: a revoked publisher must not slip through during a
+        // transient config-read failure (the security-critical direction).
+        let g = guard(None);
+        assert!(!g.is_publisher_trusted("anything"));
+        assert!(!g.is_publisher_trusted(""));
     }
 }
 
@@ -195,6 +264,12 @@ async fn guard_state() -> WasmGuardState {
                 enabled: true,
                 disabled_plugin_ids: Vec::new(),
                 disabled_publisher_keys: Vec::new(),
+                // Config unreadable → `None` fails the trusted-publisher gate
+                // *closed* (see `is_publisher_trusted`): we can't attest any
+                // publisher, so no plugin executes until config reads recover.
+                // A healthy default has an empty allowlist and thus no installed
+                // plugins, so this only bites a genuinely-degraded daemon.
+                trusted_publisher_keys: None,
                 rate_limit_per_minute: 60,
                 rate_limit_burst: 10,
             }
@@ -282,6 +357,12 @@ pub async fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
                 if guard.is_publisher_disabled(pk) {
                     continue;
                 }
+                // Hide tools whose publisher is no longer trusted, so a plugin
+                // stripped of trust after install stops being advertised to the
+                // model — mirrors the dispatch-time refusal in `try_execute_tool`.
+                if !guard.is_publisher_trusted(pk) {
+                    continue;
+                }
             }
         }
         let schema = match serde_json::from_str::<serde_json::Value>(&row.input_schema_json) {
@@ -341,6 +422,29 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
     if let Some(p) = plugin_row.as_ref() {
         if guard.is_publisher_disabled(&p.publisher_key) {
             anyhow::bail!("WASM plugin '{}' publisher key is disabled", row.plugin_id);
+        }
+        // Runtime re-check of the install-time trust anchor. `install_from_dir`
+        // enforces `security.trusted_publisher_keys` at install, but that
+        // admission is never re-evaluated afterward: an operator who *removes* a
+        // publisher from the allowlist (without also adding it to
+        // `disabled_publisher_keys`) would otherwise still have its already
+        // installed plugins load and execute. Refuse here so revoking trust
+        // deactivates them — pre-IO, like the sibling kill-switch checks.
+        if !guard.is_publisher_trusted(&p.publisher_key) {
+            crate::db::try_emit_global(
+                crate::db::audit_events::WASM_PLUGIN_UNTRUSTED,
+                &row.plugin_id,
+                &serde_json::json!({
+                    "plugin_id": &row.plugin_id,
+                    "tool_name": &row.tool_name,
+                    "reason": "publisher_not_in_trusted_publisher_keys",
+                }),
+            )
+            .await;
+            anyhow::bail!(
+                "WASM plugin '{}' publisher key is no longer in security.trusted_publisher_keys",
+                row.plugin_id
+            );
         }
     }
 
@@ -686,6 +790,7 @@ mod tests {
             enabled: true,
             disabled_plugin_ids: vec!["dev/bad".to_string(), "vendor/x".to_string()],
             disabled_publisher_keys: vec!["AAAA_pubkey_base64".to_string()],
+            trusted_publisher_keys: Some(vec!["GOOD_pubkey_base64".to_string()]),
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
         };
@@ -699,6 +804,19 @@ mod tests {
         assert!(guard.is_publisher_disabled("AAAA_pubkey_base64"));
         assert!(!guard.is_publisher_disabled("AAAA_pubkey_base6"));
         assert!(!guard.is_publisher_disabled("aaaa_pubkey_base64"));
+
+        // Trusted allowlist: only the listed key is trusted; a removed/unknown
+        // key (including the disabled one) is not.
+        assert!(guard.is_publisher_trusted("GOOD_pubkey_base64"));
+        assert!(!guard.is_publisher_trusted("AAAA_pubkey_base64"));
+        assert!(!guard.is_publisher_trusted("unknown_key"));
+        // `None` snapshot (config unreadable) fails closed — trust can't be
+        // attested, so nothing is trusted.
+        let unenforced = WasmGuardState {
+            trusted_publisher_keys: None,
+            ..guard.clone()
+        };
+        assert!(!unenforced.is_publisher_trusted("anything_at_all"));
     }
 
     /// LRU eviction regression: insert MAX_ENTRIES+1 distinct modules,

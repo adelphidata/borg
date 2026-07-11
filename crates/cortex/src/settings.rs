@@ -761,6 +761,10 @@ mod tests {
         resolver.set("agents.enabled", "false").await.unwrap();
         resolver.set("debug.llm_logging", "true").await.unwrap();
         resolver.set("web.enabled", "false").await.unwrap();
+        resolver
+            .set("security.max_shell_output_bytes", "4096")
+            .await
+            .unwrap();
 
         let config = resolver.resolve().await.unwrap();
         assert_eq!(config.llm.max_retries, 5);
@@ -768,6 +772,7 @@ mod tests {
         assert!(!config.agents.enabled);
         assert!(config.debug.llm_logging);
         assert!(!config.web.enabled);
+        assert_eq!(config.security.max_shell_output_bytes, 4096);
     }
 
     // ── DB-as-source-of-truth tests ──

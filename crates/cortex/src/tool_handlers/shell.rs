@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
@@ -10,6 +10,117 @@ use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 use crate::policy::ExecutionPolicy;
 
+/// Bounded accumulator for a single output stream: retains the first half of
+/// the byte budget from the head and the last half from the tail, eliding the
+/// middle. A runaway command (`yes`, `cat` of a huge file, a chatty build) is
+/// otherwise collected into an unbounded `String` that can exhaust daemon
+/// memory and blow the model's context window. The elision is surfaced with a
+/// `... N bytes omitted ...` marker (errors-never-swallowed) rather than
+/// silently truncated. Live `ToolOutputDelta` streaming is unaffected — this
+/// only bounds the buffer handed back to the model.
+struct HeadTailBuffer {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    head_budget: usize,
+    tail_budget: usize,
+    /// Every byte ever pushed, so the omitted count is exact.
+    total: usize,
+}
+
+impl HeadTailBuffer {
+    /// `cap` is the total retained byte budget for this stream. `0` is treated
+    /// as `1` (never unbounded); callers resolve the configured default first.
+    fn new(cap: usize) -> Self {
+        let cap = cap.max(1);
+        let head_budget = cap / 2;
+        let tail_budget = cap - head_budget; // always >= 1
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            head_budget,
+            tail_budget,
+            total: 0,
+        }
+    }
+
+    /// Convenience wrapper used by the unit tests, which express fixtures as
+    /// string literals. The streaming paths push raw bytes via `push_bytes`.
+    #[cfg(test)]
+    fn push_str(&mut self, s: &str) {
+        self.push_bytes(s.as_bytes());
+    }
+
+    /// Feed raw bytes. Callers on the streaming paths push fixed-size chunks
+    /// straight from the read buffer (never a whole unbounded line), so a flood
+    /// with no newlines can't accumulate before the cap engages.
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        self.total += rest.len();
+        // Fill the head first.
+        if self.head.len() < self.head_budget {
+            let take = (self.head_budget - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() {
+            return;
+        }
+        // Remainder feeds the tail ring, keeping only its most recent bytes.
+        if rest.len() >= self.tail_budget {
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - self.tail_budget..]);
+        } else {
+            while self.tail.len() + rest.len() > self.tail_budget {
+                self.tail.pop_front();
+            }
+            self.tail.extend(rest);
+        }
+    }
+
+    /// Number of bytes dropped from the middle (0 when nothing was elided).
+    fn omitted(&self) -> usize {
+        self.total - self.head.len() - self.tail.len()
+    }
+
+    /// Render the retained output. When nothing was elided this is the exact
+    /// stream; otherwise it is `head` + marker + `tail`. Byte slices are decoded
+    /// lossily — a cap boundary can land mid-UTF-8, and lossy decoding of
+    /// already-truncated diagnostic output is the pragmatic choice.
+    fn into_output(self) -> String {
+        let omitted = self.omitted();
+        if omitted == 0 {
+            let mut all = self.head;
+            all.extend(self.tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        let mut out = String::from_utf8_lossy(&self.head).into_owned();
+        out.push_str(&format!("\n... {omitted} bytes omitted ...\n"));
+        out.push_str(&String::from_utf8_lossy(&tail));
+        out
+    }
+}
+
+/// Resolve the per-stream `run_shell` output cap: the configured value, or the
+/// 1 MiB default when unset (`0`). Never unbounded — mirrors
+/// `mcp.max_response_bytes`.
+fn resolved_shell_output_cap(config: &Config) -> usize {
+    let configured = config.security.max_shell_output_bytes;
+    if configured == 0 {
+        let default = crate::config::security::default_max_shell_output_bytes();
+        // Surface the misconfiguration rather than silently ignoring the
+        // operator's value — mirrors `mcp_clients::resolve_max_response_bytes`,
+        // whose 0-fallback also warns.
+        tracing::warn!(
+            "security.max_shell_output_bytes=0 is invalid (would disable the cap); \
+             falling back to default {default}",
+        );
+        default
+    } else {
+        configured
+    }
+}
+
 /// Read stdout/stderr from a child process line-by-line, emitting `ToolOutputDelta` events.
 async fn stream_child_output(
     child: &mut tokio::process::Child,
@@ -17,59 +128,77 @@ async fn stream_child_output(
     event_tx: &mpsc::Sender<AgentEvent>,
     tool_call_id: &str,
     tool_name: &str,
+    max_output_bytes: usize,
 ) -> Result<(String, String, Option<i32>)> {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let mut stdout_buf = String::new();
-    let mut stderr_buf = String::new();
+    // Each stream is bounded independently so a flood on one can't crowd out the
+    // other, and neither can grow without limit.
+    let mut stdout_buf = HeadTailBuffer::new(max_output_bytes);
+    let mut stderr_buf = HeadTailBuffer::new(max_output_bytes);
 
     let streaming_future = async {
-        let mut stdout_lines = stdout_pipe.map(|p| BufReader::new(p).lines());
-        let mut stderr_lines = stderr_pipe.map(|p| BufReader::new(p).lines());
-        let mut stdout_done = stdout_lines.is_none();
-        let mut stderr_done = stderr_lines.is_none();
+        let mut stdout_pipe = stdout_pipe;
+        let mut stderr_pipe = stderr_pipe;
+        let mut stdout_done = stdout_pipe.is_none();
+        let mut stderr_done = stderr_pipe.is_none();
+        // Fixed-size reads (not `lines()`) so a single flood with few/no
+        // newlines can't accumulate an unbounded line in memory before the
+        // HeadTailBuffer cap ever sees it — that would defeat the whole cap.
+        // The PTY path reads in chunks for the same reason.
+        let mut stdout_chunk = [0u8; 8192];
+        let mut stderr_chunk = [0u8; 8192];
 
         while !stdout_done || !stderr_done {
             tokio::select! {
-                line = async {
-                    match stdout_lines.as_mut() {
-                        Some(reader) => reader.next_line().await,
+                res = async {
+                    match stdout_pipe.as_mut() {
+                        Some(p) => p.read(&mut stdout_chunk).await,
                         None => std::future::pending().await,
                     }
                 }, if !stdout_done => {
-                    match line {
-                        Ok(Some(l)) => {
+                    match res {
+                        Ok(0) => stdout_done = true,
+                        Ok(n) => {
                             let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
                                 tool_call_id: tool_call_id.to_string(),
                                 name: tool_name.to_string(),
-                                delta: l.clone(),
+                                delta: String::from_utf8_lossy(&stdout_chunk[..n]).into_owned(),
                                 is_stderr: false,
                             });
-                            stdout_buf.push_str(&l);
-                            stdout_buf.push('\n');
+                            stdout_buf.push_bytes(&stdout_chunk[..n]);
                         }
-                        _ => { stdout_done = true; }
+                        Err(e) => {
+                            // A pipe read error is not clean EOF — surface it
+                            // rather than presenting partial output as complete
+                            // (no-silent-swallow), then stop this stream.
+                            tracing::warn!(error = %e, "run_shell stdout read failed");
+                            stdout_done = true;
+                        }
                     }
                 }
-                line = async {
-                    match stderr_lines.as_mut() {
-                        Some(reader) => reader.next_line().await,
+                res = async {
+                    match stderr_pipe.as_mut() {
+                        Some(p) => p.read(&mut stderr_chunk).await,
                         None => std::future::pending().await,
                     }
                 }, if !stderr_done => {
-                    match line {
-                        Ok(Some(l)) => {
+                    match res {
+                        Ok(0) => stderr_done = true,
+                        Ok(n) => {
                             let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
                                 tool_call_id: tool_call_id.to_string(),
                                 name: tool_name.to_string(),
-                                delta: l.clone(),
+                                delta: String::from_utf8_lossy(&stderr_chunk[..n]).into_owned(),
                                 is_stderr: true,
                             });
-                            stderr_buf.push_str(&l);
-                            stderr_buf.push('\n');
+                            stderr_buf.push_bytes(&stderr_chunk[..n]);
                         }
-                        _ => { stderr_done = true; }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "run_shell stderr read failed");
+                            stderr_done = true;
+                        }
                     }
                 }
             }
@@ -83,7 +212,11 @@ async fn stream_child_output(
         .map_err(|_| anyhow::anyhow!("command timed out after {}ms", timeout.as_millis()))?
         .context("Failed to wait for shell process")?;
 
-    Ok((stdout_buf, stderr_buf, status.code()))
+    Ok((
+        stdout_buf.into_output(),
+        stderr_buf.into_output(),
+        status.code(),
+    ))
 }
 
 #[instrument(skip_all, fields(tool.name = "run_shell"))]
@@ -250,6 +383,7 @@ pub async fn handle_run_shell_with_context(
             event_tx,
             tool_call_id,
             ctx,
+            resolved_shell_output_cap(config),
         )
         .await;
     }
@@ -291,7 +425,16 @@ pub async fn handle_run_shell_with_context(
         })
     });
 
-    match stream_child_output(&mut child, timeout_dur, event_tx, tool_call_id, "run_shell").await {
+    match stream_child_output(
+        &mut child,
+        timeout_dur,
+        event_tx,
+        tool_call_id,
+        "run_shell",
+        resolved_shell_output_cap(config),
+    )
+    .await
+    {
         Ok((stdout, stderr, code)) => {
             if let Some(g) = _guard {
                 g.complete(code);
@@ -497,6 +640,7 @@ async fn run_in_pty(
     event_tx: &mpsc::Sender<AgentEvent>,
     tool_call_id: &str,
     ctx: &ExecutionContext,
+    max_output_bytes: usize,
 ) -> Result<String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -555,25 +699,29 @@ async fn run_in_pty(
     let tool_call_id = tool_call_id.to_string();
     let reader_task = tokio::task::spawn_blocking(move || {
         use std::io::Read;
-        let mut combined = String::new();
+        // A PTY merges stdout+stderr onto one fd, so the whole session shares a
+        // single bounded buffer.
+        let mut combined = HeadTailBuffer::new(max_output_bytes);
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                     let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
                         tool_call_id: tool_call_id.clone(),
                         name: "run_shell".to_string(),
-                        delta: chunk.clone(),
+                        delta: String::from_utf8_lossy(&buf[..n]).into_owned(),
                         is_stderr: false,
                     });
-                    combined.push_str(&chunk);
+                    combined.push_bytes(&buf[..n]);
                 }
+                // A PTY master read after the slave closes surfaces as an error
+                // (EIO on Linux), which is the *normal* end-of-session signal
+                // here — not a truncation. Treat it as EOF like `Ok(0)`.
                 Err(_) => break,
             }
         }
-        combined
+        combined.into_output()
     });
 
     let wait_task = tokio::task::spawn_blocking(move || child.wait());
@@ -653,11 +801,82 @@ fn redact_command_for_audit(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_run_shell, redact_command_for_audit};
+    use super::{handle_run_shell, redact_command_for_audit, HeadTailBuffer};
     use crate::agent::AgentEvent;
     use crate::config::Config;
     use crate::policy::{ExecutionPolicy, PolicyDecision};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn head_tail_buffer_under_cap_is_verbatim() {
+        // Output within the budget must pass through byte-for-byte with no
+        // marker — the cap is invisible for well-behaved commands.
+        let mut buf = HeadTailBuffer::new(64);
+        buf.push_str("hello ");
+        buf.push_str("world\n");
+        assert_eq!(buf.omitted(), 0);
+        assert_eq!(buf.into_output(), "hello world\n");
+    }
+
+    #[test]
+    fn head_tail_buffer_at_exact_cap_is_verbatim() {
+        // Boundary: total == cap must not trigger elision.
+        let mut buf = HeadTailBuffer::new(10);
+        buf.push_str("0123456789"); // exactly 10 bytes
+        assert_eq!(buf.omitted(), 0);
+        assert_eq!(buf.into_output(), "0123456789");
+    }
+
+    #[test]
+    fn head_tail_buffer_over_cap_keeps_head_and_tail_with_marker() {
+        // cap 10 → 5-byte head + 5-byte tail. 20 bytes in ⇒ 10 omitted, and the
+        // marker must report the exact dropped count while head+tail survive.
+        let mut buf = HeadTailBuffer::new(10);
+        buf.push_str("AAAAA"); // head fills: AAAAA
+        buf.push_str("MMMMMMMMMM"); // middle, elided
+        buf.push_str("ZZZZZ"); // tail keeps the last 5: ZZZZZ
+        assert_eq!(buf.omitted(), 10);
+        assert_eq!(buf.into_output(), "AAAAA\n... 10 bytes omitted ...\nZZZZZ");
+    }
+
+    #[test]
+    fn head_tail_buffer_tail_tracks_most_recent_bytes() {
+        // The tail is a ring: only the newest bytes are retained as more arrive.
+        let mut buf = HeadTailBuffer::new(6); // 3 head + 3 tail
+        for _ in 0..100 {
+            buf.push_str("abc");
+        }
+        let out = buf.into_output();
+        assert!(out.starts_with("abc\n... "), "head preserved: {out:?}");
+        assert!(
+            out.ends_with("\nabc"),
+            "tail is the most recent bytes: {out:?}"
+        );
+        assert_eq!(buf_omitted_from(&out), 300 - 6);
+    }
+
+    #[test]
+    fn head_tail_buffer_zero_cap_falls_back_not_unbounded() {
+        // cap 0 must behave as a tiny bound (never unbounded) — resolution to
+        // the real default happens in `resolved_shell_output_cap`, but the
+        // buffer itself must never retain everything.
+        let mut buf = HeadTailBuffer::new(0);
+        buf.push_str(&"x".repeat(1000));
+        assert!(buf.omitted() >= 999);
+    }
+
+    /// Parse the `... N bytes omitted ...` marker back out for assertions.
+    fn buf_omitted_from(rendered: &str) -> usize {
+        let marker = rendered
+            .lines()
+            .find(|l| l.contains("bytes omitted"))
+            .expect("marker present");
+        marker
+            .trim_start_matches("... ")
+            .trim_end_matches(" bytes omitted ...")
+            .parse()
+            .expect("numeric omitted count")
+    }
 
     #[test]
     fn redact_truncates_long_commands_and_marks_them() {
@@ -726,6 +945,92 @@ mod tests {
                 "run_shell must not emit shell confirmations"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_output_is_bounded_by_cap() {
+        // A command that floods stdout must come back head/tail-capped with an
+        // omission marker, not as an unbounded buffer — otherwise a runaway
+        // command blows the model's context window.
+        let mut config = Config::default();
+        config.security.max_shell_output_bytes = 256;
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(1024);
+        // ~9 KiB of stdout, well over the 256-byte cap.
+        let args = serde_json::json!({
+            "command": "for i in $(seq 1 1000); do echo AAAAAAAA; done",
+        });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-cap", None)
+            .await
+            .expect("shell command should run");
+
+        assert!(result.contains("Exit code: 0"), "got: {result}");
+        assert!(
+            result.contains("bytes omitted"),
+            "expected elision marker, got: {result}"
+        );
+        // The retained stdout is bounded near the cap (plus framing + marker),
+        // far below the ~9 KiB the command actually produced.
+        assert!(
+            result.len() < 1024,
+            "output not bounded: {} bytes",
+            result.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_bounds_output_with_no_newlines() {
+        // The cap must engage even when the flood has no newlines. Line-based
+        // reading would buffer the whole single line unbounded before the cap
+        // saw a byte; chunked reads keep memory bounded regardless of framing.
+        let mut config = Config::default();
+        config.security.max_shell_output_bytes = 256;
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(1024);
+        // ~512 KiB on a single line (no `\n`) — the pathological case for a
+        // line reader.
+        let args = serde_json::json!({
+            "command": "head -c 524288 /dev/zero | tr '\\0' A",
+        });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-noln", None)
+            .await
+            .expect("shell command should run");
+
+        assert!(result.contains("Exit code: 0"), "got exit: {result:.120}");
+        assert!(
+            result.contains("bytes omitted"),
+            "no-newline flood must still be elided"
+        );
+        assert!(
+            result.len() < 1024,
+            "no-newline output not bounded: {} bytes",
+            result.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_small_output_has_no_marker() {
+        // The cap must be invisible for well-behaved commands: no marker, no
+        // truncation.
+        let mut config = Config::default();
+        config.security.max_shell_output_bytes = 256;
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "printf 'hello\\n'" });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-small", None)
+            .await
+            .expect("shell command should run");
+        assert!(result.contains("hello"), "got: {result}");
+        assert!(
+            !result.contains("bytes omitted"),
+            "unexpected marker: {result}"
+        );
     }
 
     #[cfg(unix)]
