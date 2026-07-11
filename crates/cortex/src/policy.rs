@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
 /// Execution policy for shell commands — controls allow/deny behavior.
@@ -172,26 +174,41 @@ const HARDCODED_DENY: &[&str] = &[
 /// verb-based catastrophic patterns still gain case-insensitive coverage.
 const CASE_SENSITIVE_ONLY_DENY: &[&str] = &["perl -e *Socket*"];
 
+/// Case-folded copies of every [`HARDCODED_DENY`] pattern except the
+/// [`CASE_SENSITIVE_ONLY_DENY`] ones, computed once. The folded set is constant,
+/// so building it lazily avoids re-allocating ~40 lowercased pattern strings on
+/// every command check — [`is_catastrophic_command`] runs for every shell
+/// command the agent executes, up to twice per candidate fragment.
+static FOLDED_DENY: LazyLock<Vec<String>> = LazyLock::new(|| {
+    HARDCODED_DENY
+        .iter()
+        .filter(|pattern| !CASE_SENSITIVE_ONLY_DENY.contains(*pattern))
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .collect()
+});
+
 /// Match a normalized command against [`HARDCODED_DENY`]. Every pattern is
 /// checked case-sensitively (preserving exact prior behavior); additionally,
-/// all patterns except [`CASE_SENSITIVE_ONLY_DENY`] are checked case-folded so
-/// mixed-case spellings a case-insensitive filesystem still executes — `RM -RF
-/// /`, `DD if=… of=/dev/rdisk0`, `MKFS.ext4 …`, `Chmod -R 777 /` — hit the same
-/// floor as their lowercase forms. Fail-secure: folding only ever makes MORE
-/// commands match, never fewer.
+/// all patterns except [`CASE_SENSITIVE_ONLY_DENY`] are checked case-folded
+/// (against the precomputed [`FOLDED_DENY`]) so mixed-case spellings a
+/// case-insensitive filesystem still executes — `RM -RF /`, `DD if=… of=…`,
+/// `MKFS.ext4 …`, `Chmod -R 777 /` — hit the same floor as their lowercase
+/// forms. Fail-secure: folding only ever makes MORE commands match, never fewer.
+///
+/// Case-folding here is only half the story: [`normalize_command`] must also
+/// recognize mixed-case leading wrappers and `rm` verbs (it does, via
+/// case-insensitive comparisons) or a form needing normalization — `SUDO rm -rf
+/// /`, `RM -R -F /` — would never reach a matching pattern.
 fn matches_hardcoded_deny(normalized: &str) -> bool {
-    let folded = normalized.to_ascii_lowercase();
     for pattern in HARDCODED_DENY {
         if glob_match(pattern, normalized) {
             return true;
         }
-        if !CASE_SENSITIVE_ONLY_DENY.contains(pattern)
-            && glob_match(&pattern.to_ascii_lowercase(), &folded)
-        {
-            return true;
-        }
     }
-    false
+    let folded = normalized.to_ascii_lowercase();
+    FOLDED_DENY
+        .iter()
+        .any(|pattern| glob_match(pattern, &folded))
 }
 
 /// Collapse shell `IFS` references to a single space. `$IFS`, `${IFS}`,
@@ -392,7 +409,11 @@ fn normalize_command(command: &str) -> String {
 pub(crate) fn strip_leading_wrappers(tokens: &mut Vec<String>) {
     loop {
         let Some(first) = tokens.first() else { return };
-        if !LEADING_WRAPPERS.contains(&strip_path_prefix(first)) {
+        // Case-insensitive: default macOS APFS runs `SUDO`/`Env` as the same
+        // binary as `sudo`/`env`, so a mixed-case wrapper must be stripped too —
+        // otherwise the wrapped catastrophic verb never reaches the first token.
+        let verb = strip_path_prefix(first).to_ascii_lowercase();
+        if !LEADING_WRAPPERS.contains(&verb.as_str()) {
             return;
         }
         tokens.remove(0);
@@ -421,7 +442,10 @@ pub(crate) fn strip_leading_wrappers(tokens: &mut Vec<String>) {
 /// (`rm -fr /`, `rm -r -f /`, `rm --recursive --force /`, `rm -Rf /`).
 fn canonicalize_rm_flags(tokens: &mut Vec<String>) {
     let Some(first) = tokens.first() else { return };
-    if strip_path_prefix(first) != "rm" {
+    // Case-insensitive verb match: on a case-insensitive filesystem `RM`/`Rm`
+    // invoke `rm`, so their flags must be canonicalized too (`RM -R -F /` →
+    // `rm -rf /`) or the reordered/separated flags never re-form `-rf`.
+    if !strip_path_prefix(first).eq_ignore_ascii_case("rm") {
         return;
     }
     let mut recursive = false;
@@ -440,10 +464,13 @@ fn canonicalize_rm_flags(tokens: &mut Vec<String>) {
             if short.chars().all(|c| c.is_ascii_alphabetic()) {
                 let mut leftover = String::from("-");
                 for c in short.chars() {
-                    match c {
-                        'r' | 'R' => recursive = true,
+                    // Fold the flag char so uppercase `-R`/`-F` (valid on a
+                    // case-insensitive filesystem, and `-R` is a real rm flag)
+                    // are recognized as recursive/force, not shunted to leftover.
+                    match c.to_ascii_lowercase() {
+                        'r' => recursive = true,
                         'f' => force = true,
-                        other => leftover.push(other),
+                        _ => leftover.push(c),
                     }
                 }
                 if leftover.len() > 1 {
@@ -663,9 +690,22 @@ pub(crate) fn is_catastrophic_command(command: &str) -> bool {
         }
     }
 
-    let mut candidates = Vec::with_capacity(command_fragments(command).len() + 1);
+    // `command_fragments` splits on `.lines()` first, so a `\<newline>` line
+    // continuation inside a non-leading statement (`cd x && rm -r\<newline>f /`)
+    // is torn apart before the catastrophic verb re-forms — and the raw whole
+    // command stays start-anchored on the harmless leading verb (`cd`), so it
+    // never matches either. Deobfuscating the whole command first rejoins the
+    // continuation (and strips quoting/escapes); fragmenting *that* recovers the
+    // dangerous statement as its own candidate. Deobfuscation is fail-secure
+    // (only ever strips), so the extra candidates can only add matches.
+    let deob_whole = deobfuscate(command);
+    let mut candidates = Vec::with_capacity(command_fragments(command).len() + 2);
     candidates.push(command.trim());
     candidates.extend(command_fragments(command));
+    if deob_whole != command {
+        candidates.push(deob_whole.trim());
+        candidates.extend(command_fragments(&deob_whole));
+    }
 
     for candidate in candidates {
         let normalized = normalize_command(candidate);
@@ -1061,6 +1101,15 @@ mod tests {
             "Chmod -R 777 /",
             "CHMOD 4755 /bin/sh",
             "WIPEFS /dev/sda",
+            // Forms that reach a match only after case-insensitive
+            // normalization: a mixed-case leading wrapper must still be
+            // stripped, and mixed-case / separated `rm` flags must still
+            // canonicalize to `-rf`.
+            "SUDO rm -rf /",
+            "Sudo RM -rf /",
+            "RM -R -F /",
+            "Rm -Fr /",
+            "RM -R --force /",
         ] {
             assert!(is_catastrophic_command(bad), "{bad} must be flagged");
         }
@@ -1096,6 +1145,11 @@ mod tests {
             "r\\\nm -rf /",
             "rm -rf \\\n/",
             "rm -rf \\\n~",
+            // Continuation inside a *non-leading* statement: `command_fragments`
+            // splits on `.lines()` first, so this only re-forms `rm -rf /` once
+            // the deobfuscated whole command is itself re-fragmented.
+            "cd /tmp && rm -r\\\nf /",
+            "echo hi; rm -r\\\nf /",
         ] {
             assert!(
                 is_catastrophic_command(bad),

@@ -809,23 +809,41 @@ impl Agent {
 /// `serde_json::Value` (`#[serde(transparent)]`) and would otherwise silently
 /// default every field and walk into dispatch. `null` is the conventional
 /// "no arguments" form, so it is normalized to an empty object and accepted,
-/// keeping no-argument tools (`list_skills`, `list_channels`) working. Returns
-/// `Some(error_text)` to hand back to the model when the value must be rejected.
+/// keeping no-argument tools (`list_skills`, `list_channels`) working. A string
+/// that is *itself* a JSON object is the double-encoded-arguments failure mode
+/// (common from open-weight models) that the coercion layer recovers downstream;
+/// since this guard runs *before* coercion, it unwraps that case in place rather
+/// than rejecting it. Returns `Some(error_text)` to hand back to the model when
+/// the value must be rejected.
 fn reject_non_object_args(raw_args: &mut serde_json::Value) -> Option<String> {
-    match raw_args {
-        serde_json::Value::Object(_) => None,
+    let kind = match raw_args {
+        serde_json::Value::Object(_) => return None,
         serde_json::Value::Null => {
             *raw_args = serde_json::Value::Object(serde_json::Map::new());
-            None
+            return None;
         }
-        serde_json::Value::String(_) => Some("string"),
-        serde_json::Value::Number(_) => Some("number"),
-        serde_json::Value::Bool(_) => Some("boolean"),
-        serde_json::Value::Array(_) => Some("array"),
-    }
-    .map(|kind| {
-        format!("Error: Tool arguments must be a JSON object; got a {kind}. The tool was not executed.")
-    })
+        serde_json::Value::String(s) => {
+            // Whole-arguments object double-encoded as a JSON string, e.g.
+            // `args_json = "\"{\\\"path\\\":\\\"/etc/hosts\\\"}\""`. The coerce
+            // layer (`tool::coerce::coerce_in_place`) would normally re-parse
+            // this, but it runs after this guard — so unwrap an encoded object
+            // here and accept it. A bare string that is not an encoded object
+            // is a genuinely malformed call and is rejected below.
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(obj @ serde_json::Value::Object(_)) => {
+                    *raw_args = obj;
+                    return None;
+                }
+                _ => "string",
+            }
+        }
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Array(_) => "array",
+    };
+    Some(format!(
+        "Error: Tool arguments must be a JSON object; got a {kind}. The tool was not executed."
+    ))
 }
 
 pub(super) async fn dispatch_parallel_safe_tool(

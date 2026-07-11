@@ -15,18 +15,31 @@ use super::{check_enabled, require_str_param};
 // Both the clean and injection-warning wrappers emit that marker, so the flush
 // filter still fires when output is flagged.
 
-/// Scan externally-controlled web tool output for prompt-injection patterns and
-/// wrap it in the trust boundary, mirroring the MCP tool-output path
-/// (`mcp_clients`): `Clean` output gets the ordinary `wrap_untrusted` envelope;
-/// `Flagged`/`HighRisk` output is logged and wrapped with an explicit injection
-/// warning so the model treats it strictly as data. Advisory only — content is
-/// never blocked or redacted, and the raw scanned text is not retained.
+/// Redact leaked secrets from externally-controlled web tool output, scan it for
+/// prompt-injection patterns, and wrap it in the trust boundary — mirroring the
+/// MCP tool-output path (`mcp_clients`). Order matches MCP: redact first so the
+/// injection scan and the wrapper both see scrubbed text (a credential echoed in
+/// a fetched page or a redirected URL must not reach the LLM). `Clean` output
+/// gets the ordinary `wrap_untrusted` envelope; `Flagged`/`HighRisk` output is
+/// logged and wrapped with an explicit injection warning so the model treats it
+/// strictly as data. Injection handling is advisory (never blocks), but secret
+/// redaction does rewrite the text before it is returned.
 fn scan_and_wrap(label: &str, content: &str) -> String {
     use crate::security::sanitize::{
         scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
     };
-    match scan_for_injection(content) {
-        ThreatLevel::Clean => wrap_untrusted(label, content),
+    let redacted = crate::security::secrets::redact_with_audit(content);
+    if !redacted.hits.is_empty() {
+        tracing::warn!(
+            target: "borg.web",
+            tool = label,
+            hits = redacted.hits.len(),
+            "web tool output contained leaked secrets — redacted before LLM",
+        );
+    }
+    let text = redacted.text.as_str();
+    match scan_for_injection(text) {
+        ThreatLevel::Clean => wrap_untrusted(label, text),
         ThreatLevel::Flagged { score, patterns } => {
             tracing::warn!(
                 target: "borg.web",
@@ -35,7 +48,7 @@ fn scan_and_wrap(label: &str, content: &str) -> String {
                 patterns = ?patterns,
                 "web tool output flagged for potential prompt injection",
             );
-            wrap_with_injection_warning(label, content)
+            wrap_with_injection_warning(label, text)
         }
         ThreatLevel::HighRisk { score, patterns } => {
             tracing::warn!(
@@ -45,7 +58,7 @@ fn scan_and_wrap(label: &str, content: &str) -> String {
                 patterns = ?patterns,
                 "web tool output classified high-risk for prompt injection",
             );
-            wrap_with_injection_warning(label, content)
+            wrap_with_injection_warning(label, text)
         }
     }
 }
@@ -273,6 +286,26 @@ mod tests {
         assert!(
             hostile.contains("<untrusted_content"),
             "flagged output must still carry the untrusted marker: {hostile}"
+        );
+    }
+
+    #[test]
+    fn scan_and_wrap_redacts_leaked_secrets() {
+        // A credential-shaped string echoed in fetched content must be scrubbed
+        // before reaching the LLM — parity with the MCP tool-output path, which
+        // redacts via `redact_with_audit` first. The raw key must not survive.
+        let key = "AKIAIOSFODNN7EXAMPLE";
+        let wrapped = scan_and_wrap(
+            "web_fetch",
+            &format!("Here is the access key {key} embedded in the page."),
+        );
+        assert!(
+            !wrapped.contains(key),
+            "leaked AWS key must be redacted out of web output: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("[REDACTED"),
+            "redaction placeholder must be present: {wrapped}"
         );
     }
 

@@ -549,6 +549,30 @@ async fn dispatch_parallel_safe_tool_rejects_non_object_args() {
 }
 
 #[tokio::test]
+async fn dispatch_parallel_safe_tool_recovers_double_encoded_object_args() {
+    // A whole-arguments object double-encoded as a JSON string is a known
+    // open-weight-model failure mode. The non-object guard must NOT reject it:
+    // it unwraps the encoded object so the call still runs (the coercion layer
+    // relies on this recovery). Regression guard — an over-eager guard here
+    // silently drops otherwise-valid tool calls.
+    let config = Config::default();
+    let (tx, _rx) = mpsc::channel(8);
+    // args_json is a JSON *string* whose contents are the real argument object.
+    let double_encoded = serde_json::to_string(&r#"{"path":"/etc/hostname"}"#).unwrap();
+    let out = dispatch_parallel_safe_tool("read_file", &double_encoded, &config, &tx, None)
+        .await
+        .unwrap();
+    let text = match out {
+        ToolOutput::Text(t) => t,
+        _ => panic!("expected text output"),
+    };
+    assert!(
+        !text.contains("must be a JSON object"),
+        "double-encoded object args must be recovered, not rejected: {text}"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_parallel_safe_tool_null_args_normalize_to_empty_object() {
     // `null` is the conventional "no arguments" form: it is normalized to `{}`
     // and reaches arg parsing, so a no-argument tool still runs and an
