@@ -4,7 +4,7 @@
     Borg Installer for Windows
 .DESCRIPTION
     Downloads and installs the borg AI personal assistant binary.
-    Usage: irm https://raw.githubusercontent.com/borganization/borg/main/scripts/install.ps1 | iex
+    Usage: irm https://raw.githubusercontent.com/adelphidata/borg/main/scripts/install.ps1 | iex
 .PARAMETER Version
     Install a specific version tag (default: latest)
 .PARAMETER InstallDir
@@ -23,7 +23,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$Repo = "borganization/borg"
+$Repo = "adelphidata/borg"
 $BinaryName = "borg.exe"
 $DataDir = "$env:USERPROFILE\.borg"
 $GithubApi = "https://api.github.com/repos/$Repo"

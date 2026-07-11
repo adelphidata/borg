@@ -2,8 +2,8 @@
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/borganization/borg"
-homepage = "https://github.com/borganization/borg"
+repository = "https://github.com/adelphidata/borg"
+homepage = "https://github.com/adelphidata/borg"
 readme = "README.md"
 authors = ["Borg Contributors"]
 rust-version = "1.88"

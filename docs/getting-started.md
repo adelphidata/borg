@@ -13,7 +13,7 @@ Borg is an AI personal assistant agent built in Rust. The agent writes its own t
 ### Quick install (recommended)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/borganization/borg/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/adelphidata/borg/main/scripts/install.sh | bash
 ```
 
 The installer detects OS/arch, downloads a pre-built binary from GitHub Releases, verifies checksums, installs to `~/.local/bin/`, and runs `borg init` for first-time setup.
@@ -23,7 +23,7 @@ The installer detects OS/arch, downloads a pre-built binary from GitHub Releases
 Requires the [Rust toolchain](https://rustup.rs/):
 
 ```sh
-git clone https://github.com/borganization/borg.git
+git clone https://github.com/adelphidata/borg.git
 cd borg
 cargo build --release
 ```

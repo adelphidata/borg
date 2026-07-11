@@ -1,8 +1,8 @@
 # Borg
 
-[![CI](https://github.com/borganization/borg/actions/workflows/ci.yml/badge.svg)](https://github.com/borganization/borg/actions/workflows/ci.yml)
-[![Release](https://github.com/borganization/borg/actions/workflows/release.yml/badge.svg)](https://github.com/borganization/borg/releases)
-[![Coverage](https://codecov.io/gh/borganization/borg/branch/main/graph/badge.svg)](https://codecov.io/gh/borganization/borg)
+[![CI](https://github.com/adelphidata/borg/actions/workflows/ci.yml/badge.svg)](https://github.com/adelphidata/borg/actions/workflows/ci.yml)
+[![Release](https://github.com/adelphidata/borg/actions/workflows/release.yml/badge.svg)](https://github.com/adelphidata/borg/releases)
+[![Coverage](https://codecov.io/gh/adelphidata/borg/branch/main/graph/badge.svg)](https://codecov.io/gh/adelphidata/borg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Borg is your personal assistant, employee, developer, analyst, and sidekick. Security-first by default.**
@@ -10,13 +10,13 @@
 ## Quick Start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/borganization/borg/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/adelphidata/borg/main/scripts/install.sh | bash
 borg
 ```
 
 The installer detects your OS, downloads the right binary, and walks you through setup. Then run `borg` to start an interactive conversation.
 
-Or download manually from [Releases](https://github.com/borganization/borg/releases), or [build from source](CONTRIBUTING.md#development-setup).
+Or download manually from [Releases](https://github.com/adelphidata/borg/releases), or [build from source](CONTRIBUTING.md#development-setup).
 
 ## Commands
 

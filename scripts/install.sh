@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Borg Installer ──────────────────────────────────────────────────────────
-# Usage: curl -fsSL https://raw.githubusercontent.com/borganization/borg/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/adelphidata/borg/main/scripts/install.sh | bash
 # Or:    bash install.sh [OPTIONS]
 #
 # Options:
@@ -13,7 +13,7 @@ set -euo pipefail
 #   --dry-run             Show what would be done without making changes
 #   --help                Show this help message
 
-REPO="borganization/borg"
+REPO="adelphidata/borg"
 BINARY_NAME="borg"
 DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.borg"
@@ -206,7 +206,7 @@ Options:
   --help                Show this help message
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/borganization/borg/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/adelphidata/borg/main/scripts/install.sh | bash
   bash install.sh --version v0.2.0
   bash install.sh --uninstall
 

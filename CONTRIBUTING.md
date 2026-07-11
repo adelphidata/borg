@@ -7,7 +7,7 @@ Thanks for your interest in contributing! This guide will help you get set up an
 1. Install [Rust 1.87+](https://rustup.rs/)
 2. Clone the repository:
    ```sh
-   git clone https://github.com/borganization/borg.git
+   git clone https://github.com/adelphidata/borg.git
    cd borg
    ```
 3. Copy the environment template:
@@ -103,10 +103,10 @@ Example: `feat: add Discord native integration`
 
 ## Reporting Issues
 
-- **Bugs:** Use the [bug report template](https://github.com/borganization/borg/issues/new?template=bug_report.md)
-- **Features:** Use the [feature request template](https://github.com/borganization/borg/issues/new?template=feature_request.md)
+- **Bugs:** Use the [bug report template](https://github.com/adelphidata/borg/issues/new?template=bug_report.md)
+- **Features:** Use the [feature request template](https://github.com/adelphidata/borg/issues/new?template=feature_request.md)
 - **Security:** See [SECURITY.md](SECURITY.md) — do not open public issues for vulnerabilities
 
 ## Questions?
 
-Open a [discussion](https://github.com/borganization/borg/discussions).
+Open a [discussion](https://github.com/adelphidata/borg/discussions).

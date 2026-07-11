@@ -14,7 +14,7 @@ Only the latest release receives security updates. We recommend always running t
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do not** open a public issue
-2. Use [GitHub private vulnerability reporting](https://github.com/borganization/borg/security/advisories/new) or email the maintainers directly
+2. Use [GitHub private vulnerability reporting](https://github.com/adelphidata/borg/security/advisories/new) or email the maintainers directly
 3. Include:
     - Steps to reproduce
     - Potential impact

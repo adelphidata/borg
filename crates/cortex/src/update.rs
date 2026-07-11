@@ -6,11 +6,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-const GITHUB_API: &str = "https://api.github.com/repos/borganization/borg";
+const GITHUB_API: &str = "https://api.github.com/repos/adelphidata/borg";
 
 /// Public URL for human-readable release notes, surfaced in the TUI-open
 /// update prompt.
-pub const RELEASE_NOTES_URL: &str = "https://github.com/borganization/borg/releases/latest";
+pub const RELEASE_NOTES_URL: &str = "https://github.com/adelphidata/borg/releases/latest";
 
 /// How a future "Update now" action would install. Only `Tarball` is wired up
 /// today — `Homebrew` is a stub for an upcoming `brew install borg` formula.
