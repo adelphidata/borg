@@ -123,10 +123,10 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
     }
 
     // The last entry component is filename-like; all preceding ones must match
-    // exactly. `split_last` is safe — emptiness was checked above.
-    let (entry_last, entry_head) = entry_components
-        .split_last()
-        .expect("entry_components checked non-empty");
+    // exactly.
+    let Some((entry_last, entry_head)) = entry_components.split_last() else {
+        return false;
+    };
 
     // Sliding window match. Preceding components match exactly; the final
     // (filename-like) component also matches a "family" suffix so a blocked
@@ -136,7 +136,9 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
     // unrelated files like `.environment` or `foo.ssh.txt` are not over-blocked.
     for start in 0..=path_components.len() - entry_components.len() {
         let window = &path_components[start..start + entry_components.len()];
-        let (win_last, win_head) = window.split_last().expect("window has entry len");
+        let Some((win_last, win_head)) = window.split_last() else {
+            continue;
+        };
         if win_head == entry_head && component_matches_family(win_last, entry_last) {
             return true;
         }
@@ -464,7 +466,7 @@ pub fn shell_command_targets_control_plane(command: &str) -> bool {
     let bare_leaves = command_cwd_is_control_plane(command);
     crate::policy::command_fragments(command)
         .into_iter()
-        .any(|frag| fragment_mutates_control_plane(&frag, bare_leaves))
+        .any(|frag| fragment_mutates_control_plane(frag, bare_leaves))
 }
 
 fn fragment_mutates_control_plane(frag: &str, bare_leaves: bool) -> bool {
@@ -516,7 +518,7 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
 
     // Strip leading privilege/no-op wrappers (`sudo`, `env`, `busybox`, …) so
     // `busybox tee <cp>` / `env dd of=<cp>` surface their real write verb.
-    let mut owned: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
+    let mut owned: Vec<String> = raw.iter().map(ToString::to_string).collect();
     crate::policy::strip_leading_wrappers(&mut owned);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     let Some(&first) = toks.first() else {

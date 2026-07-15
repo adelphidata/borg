@@ -1,4 +1,4 @@
-//! `borg export <session_id> [--format json|csv|txt] [--output PATH]`
+//! `borg export <session_id> [--format json|csv|txt|md] [--output PATH] [--no-redact]`
 //!
 //! Thin wrapper over `Admin.ExportSession` (daemon-side) which in turn calls
 //! `cortex::export::export_session`. Routing through the daemon keeps the
@@ -16,7 +16,13 @@ use cortex::export::ExportFormat;
 use crate::daemon_client::connect_or_spawn;
 
 /// Run `borg export`. With `output=None`, writes to stdout (pipeable).
-pub(crate) fn run_export(session_id: &str, format: &str, output: Option<PathBuf>) -> Result<()> {
+/// `no_redact` opts out of the default fail-closed secret redaction.
+pub(crate) fn run_export(
+    session_id: &str,
+    format: &str,
+    output: Option<PathBuf>,
+    no_redact: bool,
+) -> Result<()> {
     // Validate locally before the round-trip. The daemon validates again, but
     // pre-validation keeps a typo on `--format` from showing up as an opaque
     // tonic error and lets the format-rejection unit test stay synchronous.
@@ -24,7 +30,7 @@ pub(crate) fn run_export(session_id: &str, format: &str, output: Option<PathBuf>
 
     let resp = tokio::runtime::Handle::current().block_on(async {
         let mut client = connect_or_spawn().await?;
-        client.export_session(session_id, format).await
+        client.export_session(session_id, format, no_redact).await
     })?;
 
     match output {
@@ -82,7 +88,7 @@ mod tests {
             .expect("rt");
         let err = rt
             .block_on(async {
-                tokio::task::spawn_blocking(|| run_export("any-id", "yaml", None)).await
+                tokio::task::spawn_blocking(|| run_export("any-id", "yaml", None, false)).await
             })
             .expect("spawn_blocking")
             .unwrap_err();

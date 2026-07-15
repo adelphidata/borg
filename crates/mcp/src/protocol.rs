@@ -6,8 +6,10 @@
 //! borg's security posture prefers auditable bytes over transitive deps.
 //!
 //! The MCP spec (2025-06-18) wraps tool results in a list of `content`
-//! blocks; we model only the text and json subset since that's the
-//! agent-loop-relevant surface.
+//! blocks; we model the text-bearing subset (text, json, embedded text
+//! resources, resource links) since that's the agent-loop-relevant
+//! surface. Binary payloads (blobs, audio, images) are never
+//! materialized — they render as typed placeholders.
 
 use crate::errors::{McpError, Result};
 use serde::{Deserialize, Serialize};
@@ -264,7 +266,9 @@ pub struct ToolAnnotations {
 /// `tools/call` response, normalized to the agent-loop-relevant fields.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCallResult {
-    /// Ordered content blocks. We surface `text` and `json` to the LLM.
+    /// Ordered content blocks. Text-bearing blocks (text, json, embedded
+    /// text resources, resource links) are surfaced to the LLM; binary
+    /// blocks render as typed placeholders.
     #[serde(default)]
     pub content: Vec<ContentBlock>,
     /// Server-reported error flag. When true, the call "succeeded" at the
@@ -275,8 +279,13 @@ pub struct ToolCallResult {
 }
 
 /// One content block in a `tools/call` response.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+///
+/// Deserialization is hand-rolled rather than `#[serde(tag = "type")]` for
+/// two reasons: (1) unknown block types must carry their wire `type` string
+/// so the placeholder can name what was elided instead of being vague, and
+/// (2) a malformed known-type block must degrade to a placeholder rather
+/// than failing decode of the entire `tools/call` response.
+#[derive(Debug, Clone)]
 pub enum ContentBlock {
     /// Text content. The common case.
     Text {
@@ -288,20 +297,156 @@ pub enum ContentBlock {
         /// JSON body.
         json: Value,
     },
-    /// Anything else: image, audio, resource link — surfaced to the agent as
-    /// a placeholder ("[unsupported content block: <kind>]").
-    #[serde(other)]
-    Other,
+    /// Embedded resource (`type: "resource"`). Text contents are inlined
+    /// for the LLM, framed with the resource's uri/mimeType; binary (`blob`)
+    /// contents render as a typed placeholder — borg never materializes
+    /// binary payloads.
+    Resource {
+        /// The nested `resource` object (uri/mimeType + text or blob).
+        resource: ResourceContents,
+    },
+    /// Resource link (`type: "resource_link"`): a pointer to a server-side
+    /// resource whose contents were NOT included in the result. Rendered as
+    /// a pointer line so the model knows it can ask the server for the
+    /// contents rather than assuming the call returned nothing.
+    ResourceLink {
+        /// Server-assigned resource name.
+        name: Option<String>,
+        /// Resource URI on the server.
+        uri: Option<String>,
+        /// Human-readable description, if provided.
+        description: Option<String>,
+    },
+    /// Anything else (image, audio, future block types) — surfaced to the
+    /// agent as a typed placeholder, never silently dropped.
+    Other {
+        /// The wire `type` string, when present, so the placeholder can
+        /// name what was elided.
+        kind: Option<String>,
+    },
+}
+
+/// Contents of an embedded resource block (the MCP `resource` object).
+///
+/// Per spec, `text` and `blob` are mutually exclusive; all fields are
+/// optional here so a sloppy server degrades to a placeholder instead of
+/// failing the whole response decode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourceContents {
+    /// Resource URI as reported by the server.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// Declared MIME type, if any.
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    /// Inline text contents. Present ⇒ inlined for the LLM.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Base64 binary contents. Present (without `text`) ⇒ typed
+    /// placeholder; the base64 payload is never inlined into LLM context.
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = Value::deserialize(deserializer)?;
+        Ok(Self::from_value(&v))
+    }
 }
 
 impl ContentBlock {
+    /// Classify a decoded content-block value. Total: malformed or unknown
+    /// blocks land in [`ContentBlock::Other`] (typed placeholder) rather
+    /// than erroring — one bad block must not lose the rest of the result.
+    fn from_value(v: &Value) -> Self {
+        let kind = v.get("type").and_then(Value::as_str).map(str::to_owned);
+        match kind.as_deref() {
+            Some("text") => {
+                if let Some(text) = v.get("text").and_then(Value::as_str) {
+                    return Self::Text {
+                        text: text.to_owned(),
+                    };
+                }
+            }
+            Some("json") => {
+                if let Some(json) = v.get("json") {
+                    return Self::Json { json: json.clone() };
+                }
+            }
+            Some("resource") => {
+                if let Some(res) = v.get("resource") {
+                    if let Ok(resource) = serde_json::from_value::<ResourceContents>(res.clone()) {
+                        return Self::Resource { resource };
+                    }
+                }
+            }
+            Some("resource_link") => {
+                let as_str = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+                return Self::ResourceLink {
+                    name: as_str("name"),
+                    uri: as_str("uri"),
+                    description: as_str("description"),
+                };
+            }
+            _ => {}
+        }
+        Self::Other { kind }
+    }
+
     /// Render this block to a single string the LLM can consume. Distinct
     /// from `Display` because we may want to redact / wrap upstream.
     pub fn render_text(&self) -> String {
         match self {
             Self::Text { text } => text.clone(),
             Self::Json { json } => serde_json::to_string(json).unwrap_or_default(),
-            Self::Other => "[unsupported mcp content block]".to_string(),
+            Self::Resource { resource } => resource.render_text(),
+            Self::ResourceLink {
+                name,
+                uri,
+                description,
+            } => {
+                let mut out = String::from("[mcp resource link]");
+                if let Some(name) = name {
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push(':');
+                }
+                out.push(' ');
+                out.push_str(uri.as_deref().unwrap_or("<no uri>"));
+                if let Some(desc) = description {
+                    out.push_str(" — ");
+                    out.push_str(desc);
+                }
+                out.push_str(
+                    " (contents not included; fetch this uri via the MCP \
+                     server's resource-read capability if it exposes one)",
+                );
+                out
+            }
+            Self::Other { kind } => match kind {
+                Some(kind) => format!("[unsupported mcp content block: {kind}]"),
+                None => "[unsupported mcp content block]".to_string(),
+            },
+        }
+    }
+}
+
+impl ResourceContents {
+    /// Render embedded-resource contents: inline text framed with its
+    /// uri/mimeType, or a typed placeholder for binary payloads.
+    fn render_text(&self) -> String {
+        let uri = self.uri.as_deref().unwrap_or("<no uri>");
+        match &self.text {
+            Some(text) => match self.mime_type.as_deref() {
+                Some(mime) => format!("[embedded resource {uri} ({mime})]\n{text}"),
+                None => format!("[embedded resource {uri}]\n{text}"),
+            },
+            // blob (or neither): binary is never inlined into LLM context.
+            None => format!("[unsupported mcp content block: resource (binary) {uri}]"),
         }
     }
 }
@@ -331,6 +476,8 @@ pub mod methods {
     pub const TOOLS_CALL: &str = "tools/call";
     /// `notifications/tools/list_changed` (server → client).
     pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+    /// `notifications/message` (server → client log notification).
+    pub const LOGGING_MESSAGE: &str = "notifications/message";
 }
 
 /// Decode a single inbound JSON line into a [`Message`]. Returns a typed
@@ -519,7 +666,7 @@ mod tests {
                 ContentBlock::Text {
                     text: "before".into(),
                 },
-                ContentBlock::Other,
+                ContentBlock::Other { kind: None },
                 ContentBlock::Text {
                     text: "after".into(),
                 },
@@ -541,9 +688,10 @@ mod tests {
 
     #[test]
     fn other_variant_decodes_from_unknown_block_type() {
-        // Real-world failure: a future MCP spec block type (e.g. "video")
+        // Real-world failure: a block type we don't inline (e.g. "image")
         // must NOT fail decode of the whole response — it should land in
-        // `Other` so we degrade gracefully. Encode the spec.
+        // `Other`, carrying the wire type name so the placeholder isn't
+        // vague. Encode the spec.
         let resp = br#"{
             "content":[
                 {"type":"image","data":"..."},
@@ -553,11 +701,171 @@ mod tests {
         }"#;
         let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
         assert_eq!(result.content.len(), 2);
-        assert!(matches!(result.content[0], ContentBlock::Other));
+        match &result.content[0] {
+            ContentBlock::Other { kind } => assert_eq!(kind.as_deref(), Some("image")),
+            other => panic!("expected Other, got {other:?}"),
+        }
         match &result.content[1] {
             ContentBlock::Text { text } => assert_eq!(text, "caption"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_block_placeholder_names_the_wire_type() {
+        // Spec: audio / image / future block types keep placeholder-only
+        // behavior (no binary materialization) but the placeholder must
+        // NAME the elided type so nothing is silently vague. A typeless
+        // block falls back to the generic placeholder.
+        for (wire, expected) in [
+            (
+                r#"{"content":[{"type":"audio","data":"...","mimeType":"audio/wav"}]}"#,
+                "[unsupported mcp content block: audio]",
+            ),
+            (
+                r#"{"content":[{"type":"video","data":"..."}]}"#,
+                "[unsupported mcp content block: video]",
+            ),
+            (
+                r#"{"content":[{"data":"..."}]}"#,
+                "[unsupported mcp content block]",
+            ),
+        ] {
+            let r: ToolCallResult = serde_json::from_str(wire).expect("decode");
+            assert_eq!(render_call_result(&r), expected, "wire: {wire}");
+        }
+    }
+
+    #[test]
+    fn malformed_known_type_block_degrades_to_placeholder_not_decode_failure() {
+        // A `text` block missing its `text` field (hostile or buggy server)
+        // must not error the whole tools/call decode — the surrounding
+        // blocks still matter. It degrades to a typed placeholder.
+        let resp = br#"{
+            "content":[
+                {"type":"text"},
+                {"type":"text","text":"still here"}
+            ]
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        let out = render_call_result(&result);
+        assert!(
+            out.contains("[unsupported mcp content block: text]"),
+            "got: {out}"
+        );
+        assert!(out.contains("still here"), "got: {out}");
+    }
+
+    #[test]
+    fn embedded_text_resource_inlines_content_framed_with_uri_and_mime() {
+        // Spec: an embedded resource whose contents are text must be
+        // inlined for the LLM — dropping it as "[unsupported]" silently
+        // loses real tool output (config files, query results, docs). The
+        // frame carries uri + mimeType so the model knows the provenance.
+        let resp = br#"{
+            "content":[{
+                "type":"resource",
+                "resource":{
+                    "uri":"file:///etc/motd",
+                    "mimeType":"text/plain",
+                    "text":"welcome to the server"
+                }
+            }],
+            "isError":false
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        let out = render_call_result(&result);
+        assert!(out.contains("welcome to the server"), "got: {out}");
+        assert!(out.contains("file:///etc/motd"), "got: {out}");
+        assert!(out.contains("text/plain"), "got: {out}");
+        assert!(
+            !out.contains("[unsupported"),
+            "text resource must not render as unsupported: {out}"
+        );
+    }
+
+    #[test]
+    fn resource_link_renders_pointer_with_name_uri_description() {
+        // Spec: a resource_link carries no contents — the render must be a
+        // pointer line preserving name/uri/description and telling the
+        // model the contents are fetchable through the server, not a vague
+        // placeholder the model reads as "the call returned nothing".
+        let resp = br#"{
+            "content":[{
+                "type":"resource_link",
+                "name":"quarterly-report",
+                "uri":"reports://2026/q2",
+                "description":"Q2 revenue summary"
+            }]
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        let out = render_call_result(&result);
+        assert!(out.contains("quarterly-report"), "got: {out}");
+        assert!(out.contains("reports://2026/q2"), "got: {out}");
+        assert!(out.contains("Q2 revenue summary"), "got: {out}");
+        assert!(
+            out.contains("resource-read"),
+            "pointer must tell the model the uri is fetchable via the \
+             server's resource-read capability: {out}"
+        );
+        assert!(!out.contains("[unsupported"), "got: {out}");
+    }
+
+    #[test]
+    fn blob_resource_keeps_typed_placeholder_and_never_inlines_base64() {
+        // Spec: binary resource contents are NOT materialized — the
+        // placeholder names the block type (so nothing is silently vague)
+        // and the base64 payload must never leak into LLM context.
+        let resp = br#"{
+            "content":[{
+                "type":"resource",
+                "resource":{
+                    "uri":"file:///a.pdf",
+                    "mimeType":"application/pdf",
+                    "blob":"QkFTRTY0UEFZTE9BRA=="
+                }
+            }]
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        let out = render_call_result(&result);
+        assert!(
+            out.contains("[unsupported mcp content block: resource (binary)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("file:///a.pdf"),
+            "placeholder keeps uri: {out}"
+        );
+        assert!(
+            !out.contains("QkFTRTY0UEFZTE9BRA"),
+            "base64 payload must never be inlined: {out}"
+        );
+    }
+
+    #[test]
+    fn is_error_result_still_surfaces_embedded_resource_text() {
+        // Spec: servers commonly carry the real failure detail in an
+        // embedded resource on the isError path. Rendering must surface
+        // that text — collapsing it to a placeholder leaves the model with
+        // a bare "error" and nothing actionable.
+        let resp = br#"{
+            "content":[
+                {"type":"text","text":"tool failed"},
+                {"type":"resource","resource":{
+                    "uri":"error://detail",
+                    "text":"stack: widget exploded at line 42"
+                }}
+            ],
+            "isError":true
+        }"#;
+        let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
+        assert!(result.is_error, "isError flag must decode");
+        let out = render_call_result(&result);
+        assert!(out.contains("tool failed"), "got: {out}");
+        assert!(
+            out.contains("stack: widget exploded at line 42"),
+            "error-path embedded resource text must be surfaced: {out}"
+        );
     }
 
     #[test]

@@ -395,7 +395,7 @@ mod tests {
         // the first line is delivered and the second read trips the cap — the
         // real "valid message then hostile long line" shape.
         let mut data = b"valid\n".to_vec();
-        data.extend(std::iter::repeat(b'x').take(200));
+        data.extend(std::iter::repeat_n(b'x', 200));
         let mut reader = BufReader::new(&data[..]);
         let mut buf = Vec::new();
 
@@ -412,7 +412,7 @@ mod tests {
     async fn capped_line_trips_across_chunk_boundaries() {
         // 40 bytes, no newline, fed 4 bytes per fill_buf so the cap must be
         // enforced across many reads rather than in a single buffer.
-        let data = vec![b'x'; 40];
+        let data = [b'x'; 40];
         let mut reader = BufReader::with_capacity(4, &data[..]);
         let mut buf = Vec::new();
 

@@ -100,6 +100,24 @@ pub struct RecoveryNotice {
     pub new_path: PathBuf,
 }
 
+/// Per-OS `PRAGMA synchronous` level applied to every connection.
+///
+/// macOS gets `FULL`: a plain `fsync()` there does not guarantee writes
+/// reach stable storage or stay ordered, so under `synchronous=NORMAL` a
+/// crash or power loss racing a WAL checkpoint can leave half-written
+/// btree pages in the main DB file (btree-level corruption on the next
+/// open). `FULL` adds the sync before the WAL-to-DB transfer commits,
+/// and pairs with the `checkpoint_fullfsync=ON` barrier set below.
+///
+/// Everywhere else stays `NORMAL`: Linux honors the fsync barrier WAL
+/// durability assumes, and the headless-VPS deployment cares about the
+/// per-commit latency `FULL` would add.
+pub(crate) const SYNCHRONOUS_PRAGMA: &str = if cfg!(target_os = "macos") {
+    "PRAGMA synchronous=FULL;"
+} else {
+    "PRAGMA synchronous=NORMAL;"
+};
+
 /// Process-global record of the most recent automatic DB recovery. Lets the
 /// boot path and `doctor` surface the event to the user without threading a
 /// return value through the ~40 `Database::open()` call sites. One-shot:
@@ -524,9 +542,9 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .await
             .context("set journal_mode=WAL")?;
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")
+        conn.execute_batch(SYNCHRONOUS_PRAGMA)
             .await
-            .context("set synchronous=NORMAL")?;
+            .with_context(|| format!("set {SYNCHRONOUS_PRAGMA}"))?;
         // Durability barrier at WAL checkpoints on macOS. A plain `fsync()`
         // there does NOT guarantee writes reach stable storage or stay
         // ordered — Apple documents `F_FULLFSYNC` as the only call that does.
@@ -961,6 +979,37 @@ mod macos_durability_tests {
             row.get::<i64>(0).expect("int"),
             1,
             "checkpoint_fullfsync must be ON for the F_FULLFSYNC barrier"
+        );
+    }
+}
+
+/// Durability-pragma tests that assert the *live* connection state, not the
+/// SQL string — they fail if the pragma is dropped, mistyped, or applied
+/// after the connection is handed out.
+#[cfg(test)]
+mod synchronous_pragma_tests {
+    use super::*;
+
+    /// SQLite reports `PRAGMA synchronous` as 0=OFF / 1=NORMAL / 2=FULL /
+    /// 3=EXTRA. macOS must run at FULL (crash/power-loss during a WAL
+    /// checkpoint corrupts the btree at NORMAL there); everywhere else must
+    /// stay at NORMAL (headless-VPS write latency).
+    #[tokio::test]
+    async fn synchronous_level_matches_platform_contract() {
+        let db = Database::test_db().await;
+        let mut rows = db
+            .conn()
+            .query("PRAGMA synchronous", ())
+            .await
+            .expect("query synchronous");
+        let row = rows.next().await.expect("row").expect("one row");
+        let level = row.get::<i64>(0).expect("int");
+        #[cfg(target_os = "macos")]
+        assert_eq!(level, 2, "macOS connections must run synchronous=FULL");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            level, 1,
+            "non-macOS connections must stay at synchronous=NORMAL"
         );
     }
 }

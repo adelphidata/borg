@@ -109,6 +109,12 @@ const TIMEOUT_NEEDLES: &[&str] = &[
     "timeout_error",
     "request timed out",
     "deadline exceeded",
+    // Stall-detector kills: the SSE watchdog aborts with "No data received
+    // for {N}s" and the Bedrock loop with "No Bedrock stream data received
+    // for {N}s". These must classify as Timeout or the stale-stream circuit
+    // breaker (and transient-retry paths) never see the wedged-stream case.
+    "no data received",
+    "stream data received",
     "connection reset",
     "connection refused",
     "broken pipe",

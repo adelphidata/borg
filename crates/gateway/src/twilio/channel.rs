@@ -73,8 +73,9 @@ impl NativeChannel for TwilioChannel {
         // path (gateway/src/telegram/mod.rs:72-115). When the message
         // carries an audio attachment AND the STT pipeline is
         // configured, download via Twilio's Basic auth + transcribe +
-        // inject as `[Voice transcript]:` text. Failure is logged and
-        // the user sees `[Media message]` rather than dropping the turn.
+        // inject as `[Voice transcript]:` text. Download failure is logged
+        // and surfaced as a `[… could not be downloaded]` placeholder line
+        // rather than dropping the turn.
         if let (Some(audio_url), Some(audio_mime)) =
             (parsed.audio_url.clone(), parsed.audio_mime.clone())
         {
@@ -102,6 +103,10 @@ impl NativeChannel for TwilioChannel {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "twilio: media download failed");
+                        crate::message_processing::media_failure::append_download_failure(
+                            &mut parsed.message.text,
+                            crate::message_processing::media_failure::kind_for_mime(&audio_mime),
+                        );
                     }
                 }
             }

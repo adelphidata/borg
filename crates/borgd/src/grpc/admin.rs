@@ -438,12 +438,15 @@ impl Admin for AdminSvc {
             req.format
         };
         let session_id = req.session_id;
+        // Redaction defaults ON; `no_redact` is the wire-level opt-out
+        // (unset/false on old clients keeps them on the safe path).
+        let redact = !req.no_redact;
         let (rendered, suggested) = async {
             use cortex::export::{export_session, ExportFormat, ExportOptions};
             use std::str::FromStr;
             let format = ExportFormat::from_str(&format_str)?;
             let db = Database::open().await?;
-            export_session(&db, &session_id, ExportOptions { format }).await
+            export_session(&db, &session_id, ExportOptions { format, redact }).await
         }
         .await
         .map_err(|e: anyhow::Error| {

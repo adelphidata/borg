@@ -53,6 +53,7 @@ impl NativeChannel for GoogleChatChannel {
             cortex::media::understanding::AudioTranscriber::from_config(&self.config)
         {
             let mut transcripts: Vec<String> = Vec::new();
+            let mut failed_kinds: Vec<&'static str> = Vec::new();
             for att in &inbound.attachments {
                 if !att.mime_type.starts_with("audio/") {
                     continue;
@@ -74,8 +75,19 @@ impl NativeChannel for GoogleChatChannel {
                             .await,
                         );
                     }
-                    Err(e) => tracing::warn!(error = %e, "google_chat: attachment download failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "google_chat: attachment download failed");
+                        failed_kinds.push(crate::message_processing::media_failure::kind_for_mime(
+                            &att.mime_type,
+                        ));
+                    }
                 }
+            }
+            for kind in failed_kinds {
+                crate::message_processing::media_failure::append_download_failure(
+                    &mut inbound.text,
+                    kind,
+                );
             }
             voice::append_voice_transcripts(&mut inbound.text, &transcripts);
         }

@@ -519,30 +519,67 @@ impl Database {
     /// when the task has no explicit timeout). Used by the daemon loop
     /// to recover wedged executions without waiting for a restart.
     /// Returns the number of rows updated.
-    pub async fn recover_wedged_runs(&self, now: i64, default_grace_secs: i64) -> Result<u64> {
+    ///
+    /// `live_run_ids` is the liveness escape hatch: candidates in that set
+    /// are still executing in this process (see
+    /// [`crate::tasks::LiveRunGuard`]), so they are deferred with a warning
+    /// instead of being falsified into `failed` — a slow LLM call is not a
+    /// wedge, and its future will finalize the row itself. Genuinely dead
+    /// runs (in the DB, absent from the live set) behave exactly as before.
+    pub async fn recover_wedged_runs(
+        &self,
+        now: i64,
+        default_grace_secs: i64,
+        live_run_ids: &std::collections::HashSet<i64>,
+    ) -> Result<u64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT tr.id FROM task_runs tr \
+                 LEFT JOIN scheduled_tasks st ON st.id = tr.task_id \
+                 WHERE tr.status = ?1 \
+                   AND tr.started_at < ?2 - COALESCE(st.timeout_ms / 1000, ?3)",
+                params!(crate::tasks::RUN_STATUS_RUNNING, now, default_grace_secs),
+            )
+            .await?;
+        let mut wedged: Vec<i64> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            wedged.push(row.get::<i64>(0)?);
+        }
+        if wedged.is_empty() {
+            return Ok(0);
+        }
+
         let error_msg = format!(
             "self-healing: task_run wedged in 'running' past timeout (grace {default_grace_secs}s)"
         );
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE task_runs \
-             SET status = ?1, error = ?2 \
-             WHERE id IN ( \
-                 SELECT tr.id FROM task_runs tr \
-                 LEFT JOIN scheduled_tasks st ON st.id = tr.task_id \
-                 WHERE tr.status = ?3 \
-                   AND tr.started_at < ?4 - COALESCE(st.timeout_ms / 1000, ?5) \
-             )",
-                params!(
-                    crate::tasks::RUN_STATUS_FAILED,
-                    error_msg,
-                    crate::tasks::RUN_STATUS_RUNNING,
-                    now,
-                    default_grace_secs,
-                ),
-            )
-            .await?;
+        let mut updated = 0u64;
+        for run_id in wedged {
+            if live_run_ids.contains(&run_id) {
+                tracing::warn!(
+                    run_id,
+                    "wedged-run sweep: run is past its timeout but still \
+                     executing in-process — deferring recovery"
+                );
+                continue;
+            }
+            // Re-check status in the UPDATE: the run may have finished
+            // between the candidate SELECT and now, and a completed row
+            // must not be clobbered back to failed.
+            updated += self
+                .conn
+                .execute(
+                    "UPDATE task_runs SET status = ?1, error = ?2 \
+                     WHERE id = ?3 AND status = ?4",
+                    params!(
+                        crate::tasks::RUN_STATUS_FAILED,
+                        error_msg.as_str(),
+                        run_id,
+                        crate::tasks::RUN_STATUS_RUNNING,
+                    ),
+                )
+                .await?;
+        }
         Ok(updated)
     }
 

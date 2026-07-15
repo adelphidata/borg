@@ -24,6 +24,7 @@ use crate::process_registry::{compile_never_kill_patterns, AutoReapPolicy, Proce
 mod budget;
 mod embeddings;
 mod fs_setup;
+mod fts;
 mod gateway_recovery;
 mod issues;
 mod log_prune;
@@ -535,6 +536,15 @@ pub async fn run_daily_maintenance_with_registry(
     report.wal_checkpoint_pages_reclaimed = wv.wal_checkpoint_pages_reclaimed;
     report.vacuum_ran = wv.vacuum_ran;
     report.vacuum_bytes_reclaimed = wv.vacuum_bytes_reclaimed;
+
+    // 5a-bis. Bounded FTS5 segment merge on `messages_fts`. Same class of
+    //     SQLite housekeeping as the checkpoint above: not counted against
+    //     the heal action budget, warn-and-continue on failure (retried
+    //     next sweep). Without this, per-insert segments accumulate without
+    //     bound and every MATCH / insert pays for the fragmentation.
+    if let Err(e) = fts::merge_messages_fts_segments(db).await {
+        tracing::warn!("maintenance: messages_fts segment merge failed: {e}");
+    }
 
     // 5b. Gateway recovery probe. The orchestrator's respawn supervisor
     //     gives up after `GATEWAY_MAX_CRASH_RESPAWNS` and writes

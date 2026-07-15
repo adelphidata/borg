@@ -9,7 +9,7 @@
 //! path on each worker; its closed-set `match` keeps the planner and dispatcher
 //! in sync at compile time.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -30,6 +30,95 @@ use super::{Agent, AgentEvent};
 
 const GOALS_DISABLED_ERROR: &str = r#"{"error":"goals are disabled"}"#;
 const DATABASE_UNAVAILABLE_ERROR: &str = r#"{"error":"database unavailable"}"#;
+
+/// Wall-clock deadline applied to a single builtin tool handler future.
+///
+/// Cancellation between calls already exists (the `CancellationToken` checks
+/// in `run_tool_calls`), but nothing bounded a single handler: a wedged
+/// network fetch or hung subprocess wait could stall the turn forever. 300s
+/// comfortably clears the slowest legitimate bounded builtins (web fetch,
+/// browser navigation, media transcription) while still guaranteeing the
+/// turn eventually makes progress.
+const BUILTIN_TOOL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Tools exempt from [`BUILTIN_TOOL_DEADLINE`], by name:
+///
+/// - `run_shell` — self-bounds via `timeout_ms` / `tools.default_timeout_ms`,
+///   and a caller may legitimately request a budget above 300s (long builds).
+/// - `request_user_input` — waits on a human; unbounded by design.
+/// - `spawn_agent` / `wait_for_agent` — delegation can legitimately run a
+///   full sub-agent turn; `wait_for_agent` carries its own caller-chosen
+///   `timeout_secs` budget.
+///
+/// `mcp_`-prefixed tools are also exempt (checked by prefix in
+/// [`builtin_tool_deadline`]): the MCP client layer owns its own per-request
+/// watchdog and configured timeouts, which may exceed this deadline.
+const DEADLINE_EXEMPT_TOOLS: &[&str] = &[
+    crate::tool::names::RUN_SHELL,
+    crate::tool::names::REQUEST_USER_INPUT,
+    crate::tool::names::SPAWN_AGENT,
+    crate::tool::names::WAIT_FOR_AGENT,
+];
+
+/// Deadline for one handler invocation of tool `name`; `None` means the tool
+/// is exempt and runs unbounded (it either self-bounds or is legitimately
+/// long-running — see [`DEADLINE_EXEMPT_TOOLS`]).
+fn builtin_tool_deadline(name: &str) -> Option<Duration> {
+    if name.starts_with("mcp_") || DEADLINE_EXEMPT_TOOLS.contains(&name) {
+        None
+    } else {
+        Some(BUILTIN_TOOL_DEADLINE)
+    }
+}
+
+/// Synthetic tool result handed to the model when a handler blows its
+/// wall-clock deadline. Mirrors the `Error:`-prefixed shape the validation
+/// layer uses for its synthetic results so the model can address the failure
+/// and the turn continues.
+fn tool_deadline_exceeded_message(name: &str, deadline: Duration) -> String {
+    format!(
+        "Error: tool '{name}' timed out after {deadline:?} (wall-clock deadline) and the \
+         in-flight operation was abandoned — its future was dropped, so the work \
+         did not complete but any partial side effects may persist. Retry with a \
+         smaller input, or use a different approach."
+    )
+}
+
+/// Drive a builtin tool handler future under an optional wall-clock deadline.
+///
+/// On timeout the handler future is dropped (we do not detach it — nothing
+/// silently keeps holding its resources in the background) and a synthetic
+/// addressable error result is returned as `Ok(ToolOutput::Text(...))` so the
+/// turn continues with a tool_result the model can react to. Handler errors
+/// pass through untouched. `deadline` is a parameter (rather than reading the
+/// constant inline) so tests can inject a short deadline instead of sleeping
+/// 300s.
+async fn run_with_deadline<F>(
+    name: &str,
+    deadline: Option<Duration>,
+    handler: F,
+) -> Result<ToolOutput>
+where
+    F: std::future::Future<Output = Result<ToolOutput>>,
+{
+    match deadline {
+        None => handler.await,
+        Some(limit) => match tokio::time::timeout(limit, handler).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    tool.name = %name,
+                    deadline_secs = limit.as_secs(),
+                    "builtin tool exceeded wall-clock deadline; abandoning handler future \
+                     and returning synthetic timeout result"
+                );
+                Ok(ToolOutput::Text(tool_deadline_exceeded_message(
+                    name, limit,
+                )))
+            }
+        },
+    }
+}
 
 impl Agent {
     /// Persist the assistant message with tool calls, partition and execute them,
@@ -230,15 +319,18 @@ impl Agent {
                 .await;
 
             let tool_start = Instant::now();
-            let tool_output = self
-                .execute_tool(name, args, event_tx, &tool_call.id, cancel)
-                .instrument(info_span!("tool.execute", tool.name = %name))
-                .await
-                .unwrap_or_else(|e| {
-                    ToolOutput::Text(crate::security::sanitize::sanitize_tool_error(
-                        &e.to_string(),
-                    ))
-                });
+            let tool_output = run_with_deadline(
+                name,
+                builtin_tool_deadline(name),
+                self.execute_tool(name, args, event_tx, &tool_call.id, cancel)
+                    .instrument(info_span!("tool.execute", tool.name = %name)),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                ToolOutput::Text(crate::security::sanitize::sanitize_tool_error(
+                    &e.to_string(),
+                ))
+            });
             let tool_elapsed = tool_start.elapsed().as_secs_f64();
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(tool_elapsed, &[]);
@@ -422,12 +514,16 @@ impl Agent {
                 join_set.spawn(async move {
                     let _permit = permits.acquire_owned().await.ok();
                     let start = Instant::now();
-                    let result = dispatch_parallel_safe_tool(
+                    let result = run_with_deadline(
                         &name_clone,
-                        &args_clone,
-                        config.as_ref(),
-                        &tx,
-                        Some(&execution_context),
+                        builtin_tool_deadline(&name_clone),
+                        dispatch_parallel_safe_tool(
+                            &name_clone,
+                            &args_clone,
+                            config.as_ref(),
+                            &tx,
+                            Some(&execution_context),
+                        ),
                     )
                     .await;
                     (idx, name_clone, start, result)
@@ -937,5 +1033,113 @@ pub(super) async fn dispatch_parallel_safe_tool(
             "dispatch_parallel_safe_tool: variant '{}' is parallel_safe() but lacks a handler arm",
             other.name()
         )),
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// A handler that blows past an injected short deadline must yield the
+    /// synthetic addressable timeout result (Ok, not Err — the turn continues
+    /// and the model sees a tool_result it can react to). The deadline is
+    /// injected (30ms) so the test doesn't sleep out the production 300s.
+    #[tokio::test]
+    async fn slow_handler_yields_timeout_error_result() {
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(ToolOutput::Text("finished".into()))
+        };
+        let out = run_with_deadline("web_fetch", Some(Duration::from_millis(30)), slow)
+            .await
+            .expect("timeout must synthesize Ok result, not Err");
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(
+                    t.starts_with("Error: tool 'web_fetch' timed out after 30ms"),
+                    "unexpected timeout text: {t}"
+                );
+                assert!(
+                    t.contains("abandoned"),
+                    "timeout text must state the operation was abandoned: {t}"
+                );
+            }
+            other => panic!("expected Text output, got {other:?}"),
+        }
+    }
+
+    /// A handler finishing inside the deadline passes its output through
+    /// untouched — the wrapper must be invisible on the happy path.
+    #[tokio::test]
+    async fn fast_handler_passes_through() {
+        let fast = async { Ok(ToolOutput::Text("payload".into())) };
+        let out = run_with_deadline("read_file", Some(Duration::from_millis(30)), fast)
+            .await
+            .unwrap();
+        assert!(matches!(out, ToolOutput::Text(t) if t == "payload"));
+    }
+
+    /// Handler errors are not swallowed or reshaped by the deadline wrapper.
+    #[tokio::test]
+    async fn handler_error_propagates_through_deadline() {
+        let failing = async { Err(anyhow::anyhow!("disk on fire")) };
+        let err = run_with_deadline("read_file", Some(Duration::from_millis(30)), failing)
+            .await
+            .expect_err("handler Err must propagate");
+        assert!(err.to_string().contains("disk on fire"));
+    }
+
+    /// A `None` deadline applies no timeout at all: the same sleep that
+    /// trips a 30ms bound completes under `None`. Pairs with
+    /// `deadline_exemptions_honored` to encode "exempt tools run unbounded".
+    #[tokio::test]
+    async fn none_deadline_applies_no_bound() {
+        let mk = || async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(ToolOutput::Text("subagent done".into()))
+        };
+        let bounded = run_with_deadline("wait_for_agent", Some(Duration::from_millis(30)), mk())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&bounded, ToolOutput::Text(t) if t.contains("timed out")),
+            "control: 30ms bound must trip on an 80ms handler"
+        );
+        let unbounded = run_with_deadline("wait_for_agent", None, mk())
+            .await
+            .unwrap();
+        assert!(matches!(unbounded, ToolOutput::Text(t) if t == "subagent done"));
+    }
+
+    /// Exemption policy: self-bounding / legitimately-long tools and MCP
+    /// tools run unbounded; everything else gets the 300s deadline.
+    #[test]
+    fn deadline_exemptions_honored() {
+        for exempt in [
+            "run_shell",
+            "request_user_input",
+            "spawn_agent",
+            "wait_for_agent",
+            "mcp_github_search",
+        ] {
+            assert_eq!(
+                builtin_tool_deadline(exempt),
+                None,
+                "'{exempt}' must be exempt from the wall-clock deadline"
+            );
+        }
+        for bounded in [
+            "web_fetch",
+            "web_search",
+            "read_file",
+            "browser",
+            "computer_use",
+        ] {
+            assert_eq!(
+                builtin_tool_deadline(bounded),
+                Some(BUILTIN_TOOL_DEADLINE),
+                "'{bounded}' must be bounded by the wall-clock deadline"
+            );
+        }
     }
 }

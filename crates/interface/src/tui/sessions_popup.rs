@@ -18,14 +18,29 @@ use super::theme;
 
 #[derive(Debug)]
 pub enum SessionAction {
-    Load { id: String },
-    Export { id: String },
+    Load {
+        id: String,
+    },
+    Export {
+        id: String,
+        format: cortex::export::ExportFormat,
+    },
 }
+
+/// Export formats offered by the popup, in `f`-key cycle order.
+const EXPORT_FORMATS: &[cortex::export::ExportFormat] = &[
+    cortex::export::ExportFormat::Json,
+    cortex::export::ExportFormat::Csv,
+    cortex::export::ExportFormat::Txt,
+    cortex::export::ExportFormat::Markdown,
+];
 
 pub struct SessionsPopup {
     visible: bool,
     sessions: Vec<SessionSummary>,
     cursor: usize,
+    /// Index into [`EXPORT_FORMATS`] selecting the `e`-key export format.
+    format_idx: usize,
 }
 
 impl SessionsPopup {
@@ -34,7 +49,13 @@ impl SessionsPopup {
             visible: false,
             sessions: Vec::new(),
             cursor: 0,
+            format_idx: 0,
         }
+    }
+
+    /// Export format currently selected via the `f` key (default JSON).
+    fn selected_format(&self) -> cortex::export::ExportFormat {
+        EXPORT_FORMATS[self.format_idx]
     }
 
     pub fn is_visible(&self) -> bool {
@@ -102,11 +123,16 @@ impl SessionsPopup {
             KeyCode::Char('e') => {
                 if let Some(session) = self.sessions.get(self.cursor) {
                     let id = session.id.clone();
+                    let format = self.selected_format();
                     self.dismiss();
-                    Some(SessionAction::Export { id })
+                    Some(SessionAction::Export { id, format })
                 } else {
                     None
                 }
+            }
+            KeyCode::Char('f') => {
+                self.format_idx = (self.format_idx + 1) % EXPORT_FORMATS.len();
+                None
             }
             _ => None,
         }
@@ -159,7 +185,11 @@ impl SessionsPopup {
         let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
-        popup_utils::render_footer(frame, inner, " Enter: load  e: export (JSON)  Esc: close");
+        let footer = format!(
+            " Enter: load  e: export ({})  f: format  Esc: close",
+            self.selected_format().as_str()
+        );
+        popup_utils::render_footer(frame, inner, &footer);
     }
 }
 
@@ -175,10 +205,9 @@ impl PopupHandler for SessionsPopup {
     ) -> Result<Option<AppAction>> {
         match self.handle_key(key) {
             Some(SessionAction::Load { id }) => Ok(Some(AppAction::LoadSession { id })),
-            Some(SessionAction::Export { id }) => Ok(Some(AppAction::ExportSession {
-                id,
-                format: cortex::export::ExportFormat::Json,
-            })),
+            Some(SessionAction::Export { id, format }) => {
+                Ok(Some(AppAction::ExportSession { id, format }))
+            }
             None => Ok(None),
         }
     }

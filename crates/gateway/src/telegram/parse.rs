@@ -94,7 +94,7 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
         .map(|u| u.id.to_string())
         .unwrap_or_else(|| msg.chat.id.to_string());
 
-    let thread_id = msg.message_thread_id.map(|t| t.to_string());
+    let thread_id = effective_thread_id(msg).map(|t| t.to_string());
     let message_id = Some(msg.message_id.to_string());
     let peer_kind = peer_kind_for_chat(&msg.chat.chat_type);
 
@@ -115,6 +115,24 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
         photo: photo_ref,
         input_kind,
     })
+}
+
+/// Derive the session-relevant thread id for a Telegram message.
+///
+/// Telegram overloads `message_thread_id`: in forum supergroups it is the
+/// topic id (a real thread, flagged by `is_topic_message`), but on an
+/// ordinary reply it is a reply-UI anchor equal to the replied-to message id.
+/// Keying sessions on the raw value forks a fresh session for every reply in
+/// a plain group. Only explicit forum-topic messages keep their thread id;
+/// everything else — plain-group reply anchors, forum General-topic messages
+/// and their replies (which carry an anchor but no `is_topic_message`), DMs —
+/// normalizes to `None`, i.e. the chat-level session.
+fn effective_thread_id(msg: &TelegramMessage) -> Option<i64> {
+    if msg.is_topic_message {
+        msg.message_thread_id
+    } else {
+        None
+    }
 }
 
 /// Derive display text (and any audio ref needed for transcription) from a
@@ -189,7 +207,7 @@ fn parse_callback(cb: &CallbackQuery) -> Option<TelegramParsed> {
     let thread_id = cb
         .message
         .as_ref()
-        .and_then(|m| m.message_thread_id)
+        .and_then(effective_thread_id)
         .map(|t| t.to_string());
     let message_id = cb.message.as_ref().map(|m| m.message_id.to_string());
 
@@ -466,16 +484,17 @@ mod tests {
     }
 
     #[test]
-    fn message_thread_id_extracted() {
+    fn forum_topic_message_keeps_topic_thread_id() {
         let update: Update = serde_json::from_str(
             r#"{
                 "update_id": 10,
                 "message": {
                     "message_id": 50,
                     "from": { "id": 42, "first_name": "Alice", "is_bot": false },
-                    "chat": { "id": -100123, "type": "supergroup" },
+                    "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
                     "date": 1700000000,
                     "message_thread_id": 99,
+                    "is_topic_message": true,
                     "text": "forum message"
                 }
             }"#,
@@ -485,6 +504,101 @@ mod tests {
         let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.thread_id.as_deref(), Some("99"));
         assert_eq!(msg.text, "forum message");
+    }
+
+    #[test]
+    fn plain_group_reply_anchor_is_not_a_thread() {
+        // In a non-forum group, a reply carries message_thread_id equal to the
+        // replied-to message id (a reply-UI anchor). Treating it as a thread
+        // would fork a new session for every reply in the group.
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 11,
+                "message": {
+                    "message_id": 51,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": -100123, "type": "supergroup" },
+                    "date": 1700000000,
+                    "message_thread_id": 40,
+                    "reply_to_message": {
+                        "message_id": 40,
+                        "chat": { "id": -100123, "type": "supergroup" },
+                        "date": 1699999000,
+                        "text": "original"
+                    },
+                    "text": "replying in plain group"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(
+            msg.thread_id, None,
+            "reply anchor must not become a thread id"
+        );
+        // Session key must stay the group-level session, not fork per reply.
+        assert_eq!(
+            msg.session_key("telegram", msg.thread_id.as_deref().unwrap_or("")),
+            "telegram:42:"
+        );
+    }
+
+    #[test]
+    fn forum_general_topic_reply_anchor_dropped() {
+        // Replies in a forum's General topic carry a reply anchor but no
+        // is_topic_message flag — they must land in the same (thread-less)
+        // session as non-reply General messages.
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 12,
+                "message": {
+                    "message_id": 52,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
+                    "date": 1700000000,
+                    "message_thread_id": 45,
+                    "reply_to_message": {
+                        "message_id": 45,
+                        "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
+                        "date": 1699999000,
+                        "text": "general topic original"
+                    },
+                    "text": "reply in General"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.thread_id, None);
+    }
+
+    #[test]
+    fn dm_reply_has_no_thread_id() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 13,
+                "message": {
+                    "message_id": 53,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "reply_to_message": {
+                        "message_id": 30,
+                        "chat": { "id": 42, "type": "private" },
+                        "date": 1699999000,
+                        "text": "earlier"
+                    },
+                    "text": "dm reply"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.thread_id, None);
+        assert_eq!(msg.session_key("telegram", ""), "telegram:42:");
     }
 
     #[test]

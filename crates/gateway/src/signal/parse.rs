@@ -183,8 +183,10 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
 /// Enrich an `InboundMessage` by downloading attachment data from the signal-cli daemon.
 ///
 /// For each attachment with a valid `id`, attempts to download the binary content
-/// and populate `msg.attachments`. On failure, logs a warning and keeps the existing
-/// text placeholder.
+/// and populate `msg.attachments`. On failure, logs a warning and appends a
+/// `[<kind> could not be downloaded]` line to the message text (in addition to
+/// the `[Attachment: …]` placeholder set at parse time) so the agent sees the
+/// failure rather than assuming the attachment arrived.
 pub async fn enrich_attachments(
     msg: &mut InboundMessage,
     raw_attachments: &[Attachment],
@@ -214,6 +216,12 @@ pub async fn enrich_attachments(
                     attachment_id = id,
                     error = %e,
                     "Failed to download Signal attachment; keeping text placeholder"
+                );
+                crate::message_processing::media_failure::append_download_failure(
+                    &mut msg.text,
+                    crate::message_processing::media_failure::kind_for_mime(
+                        att.content_type.as_deref().unwrap_or(""),
+                    ),
                 );
             }
         }
@@ -853,6 +861,13 @@ mod tests {
                 "Failed download should not produce attachment"
             );
             assert!(msg.text.contains("[Attachment: photo.jpg]"));
+            // The failure must be visible to the agent, not silently dropped:
+            // a failed image fetch appends a placeholder line to the body.
+            assert!(
+                msg.text.contains("[image could not be downloaded]"),
+                "download failure must surface in message text: {}",
+                msg.text
+            );
         });
     }
 }

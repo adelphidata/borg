@@ -1,32 +1,39 @@
 /// Tag names whose contents are stripped from assistant text before it is
-/// emitted to the UI or persisted. Both prevent chain-of-thought from
-/// re-entering context on replay.
-const STRIPPED_TAGS: &[&str] = &["internal", "thinking"];
+/// emitted to the UI or persisted. All prevent chain-of-thought from
+/// re-entering context on replay. Matching is ASCII case-insensitive
+/// (`<Thinking>`, `<THINK>`, … are stripped too) — names here must be
+/// lowercase.
+const STRIPPED_TAGS: &[&str] = &["internal", "thinking", "think", "reasoning"];
 
-/// Strip `<internal>...</internal>` and `<thinking>...</thinking>` blocks from
-/// text to prevent chain-of-thought leakage into the UI or persisted history.
+/// Strip `<internal>`, `<thinking>`, `<think>` and `<reasoning>` blocks
+/// (tag names matched ASCII case-insensitively) from text to prevent
+/// chain-of-thought leakage into the UI or persisted history.
 pub fn strip_internal_tags(text: &str) -> String {
+    // ASCII lowercasing is length- and boundary-preserving, so positions
+    // found in `lower` index directly into `text`.
+    let lower = text.to_ascii_lowercase();
     let mut result = String::with_capacity(text.len());
-    let mut remaining = text;
+    let mut cursor = 0usize;
     loop {
         // Find the earliest opening tag among the set.
+        let rem = &lower[cursor..];
         let mut earliest: Option<(usize, &'static str)> = None;
         for tag in STRIPPED_TAGS {
             let open = format!("<{tag}>");
-            if let Some(pos) = remaining.find(&open) {
+            if let Some(pos) = rem.find(&open) {
                 if earliest.is_none_or(|(p, _)| pos < p) {
                     earliest = Some((pos, tag));
                 }
             }
         }
         let Some((start, tag)) = earliest else {
-            result.push_str(remaining);
+            result.push_str(&text[cursor..]);
             return result;
         };
-        result.push_str(&remaining[..start]);
+        result.push_str(&text[cursor..cursor + start]);
         let close = format!("</{tag}>");
-        if let Some(end) = remaining[start..].find(&close) {
-            remaining = &remaining[start + end + close.len()..];
+        if let Some(end) = lower[cursor + start..].find(&close) {
+            cursor = cursor + start + end + close.len();
         } else {
             // Unclosed tag — strip everything from the opening tag onward.
             return result;
@@ -34,8 +41,9 @@ pub fn strip_internal_tags(text: &str) -> String {
     }
 }
 
-/// Streaming filter that buffers text to strip `<internal>` and `<thinking>`
-/// blocks in real-time.
+/// Streaming filter that buffers text to strip `STRIPPED_TAGS` blocks
+/// (`<internal>`, `<thinking>`, `<think>`, `<reasoning>`, any ASCII case)
+/// in real-time.
 #[derive(Default)]
 pub struct InternalTagFilter {
     raw: String,
@@ -51,6 +59,8 @@ impl InternalTagFilter {
     pub fn push(&mut self, delta: &str) -> Option<String> {
         self.raw.push_str(delta);
         let cleaned = strip_internal_tags(&self.raw);
+        // Case-insensitive search mirror; positions index directly into `raw`.
+        let lower = self.raw.to_ascii_lowercase();
 
         // If there's an unclosed opening tag somewhere in `raw`, only emit up
         // to that opening position (in cleaned coordinates).
@@ -58,8 +68,8 @@ impl InternalTagFilter {
         for tag in STRIPPED_TAGS {
             let open = format!("<{tag}>");
             let close = format!("</{tag}>");
-            if let Some(pos) = self.raw.rfind(&open) {
-                if !self.raw[pos..].contains(&close) {
+            if let Some(pos) = lower.rfind(&open) {
+                if !lower[pos..].contains(&close) {
                     unclosed_open = Some(match unclosed_open {
                         Some(prev) => prev.min(pos),
                         None => pos,
@@ -103,9 +113,10 @@ impl InternalTagFilter {
     }
 }
 
-/// Longest suffix of `text` that is a non-empty prefix of any stripped open
-/// tag (e.g. `<int`, `<thinking`). Used to hold back streaming output when a
-/// chunk boundary might be splitting an opening tag.
+/// Longest suffix of `text` that is a non-empty prefix (ASCII
+/// case-insensitive) of any stripped open tag (e.g. `<int`, `<Thinking`).
+/// Used to hold back streaming output when a chunk boundary might be
+/// splitting an opening tag.
 pub fn partial_tag_overlap(text: &str) -> usize {
     let text_bytes = text.as_bytes();
     let mut best = 0;
@@ -114,7 +125,7 @@ pub fn partial_tag_overlap(text: &str) -> usize {
         let tag_bytes = open.as_bytes();
         for len in (1..tag_bytes.len()).rev() {
             if text_bytes.len() >= len
-                && text_bytes[text_bytes.len() - len..] == tag_bytes[..len]
+                && text_bytes[text_bytes.len() - len..].eq_ignore_ascii_case(&tag_bytes[..len])
                 && len > best
             {
                 best = len;
@@ -273,10 +284,61 @@ mod tests {
 
     #[test]
     fn strip_preserves_lookalike_tags() {
-        // `<think>` (not in the set), `<thinkingaloud>`, `<thinky>` must pass
-        // through. Spec: scope is limited to `<thinking>` per ROADMAP item.
-        let input = "<think>x</think> <thinkingaloud>y</thinkingaloud> <thinky>z</thinky>";
+        // Tag matching is exact on the name (up to ASCII case): longer
+        // lookalikes like `<thinkingaloud>`, `<thinky>`, `<reason>` and
+        // `<reasoned>` must pass through untouched.
+        let input = "<thinkingaloud>y</thinkingaloud> <thinky>z</thinky> <reason>w</reason> <reasoned>v</reasoned>";
         assert_eq!(strip_internal_tags(input), input);
+    }
+
+    #[test]
+    fn strip_think_and_reasoning_tags() {
+        let input = "A <think>short form</think> B <reasoning>cot</reasoning> C";
+        assert_eq!(strip_internal_tags(input), "A  B  C");
+    }
+
+    #[test]
+    fn strip_tags_ascii_case_insensitive() {
+        // Models emit tag names with arbitrary casing; open and close casing
+        // need not even agree. Kept text must preserve its original case.
+        let cases: &[(&str, &str)] = &[
+            ("Hello <Thinking>secret</Thinking> World", "Hello  World"),
+            ("Hello <THINK>secret</think> World", "Hello  World"),
+            ("Hello <INTERNAL>secret</Internal> World", "Hello  World"),
+            ("Hello <Reasoning>secret</REASONING> World", "Hello  World"),
+            // Unclosed mixed-case open tag strips to the end.
+            ("Hello <ThInKiNg>never closed", "Hello "),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_internal_tags(input), *expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn filter_streaming_mixed_case_split_open_tag() {
+        // `<THINK>` split across stream chunks, closed with different casing.
+        let mut filter = InternalTagFilter::new();
+        let r1 = filter.push("prefix<TH");
+        assert_eq!(r1.as_deref(), Some("prefix"));
+        let r2 = filter.push("INK>secret</Think> world");
+        assert_eq!(r2.as_deref(), Some(" world"));
+        assert_eq!(filter.full_clean(), "prefix world");
+    }
+
+    #[test]
+    fn filter_streaming_reasoning_tag() {
+        let mut filter = InternalTagFilter::new();
+        let r1 = filter.push("a<reasoning>co");
+        assert_eq!(r1.as_deref(), Some("a"));
+        let r2 = filter.push("t</reasoning>b");
+        assert_eq!(r2.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn partial_tag_overlap_case_insensitive() {
+        assert_eq!(partial_tag_overlap("text<THIN"), 5);
+        assert_eq!(partial_tag_overlap("text<Reasoning"), 10);
+        assert_eq!(partial_tag_overlap("text<InT"), 4);
     }
 
     #[test]

@@ -86,6 +86,7 @@ impl NativeChannel for SlackChannel {
         let transcriber = cortex::media::understanding::AudioTranscriber::from_config(&self.config);
         let mut resolved_attachments = Vec::new();
         let mut voice_transcripts: Vec<String> = Vec::new();
+        let mut failed_kinds: Vec<&'static str> = Vec::new();
         for att in &inbound.attachments {
             if att.data.starts_with("https://") {
                 match self.client.download_file(&att.data).await {
@@ -120,6 +121,9 @@ impl NativeChannel for SlackChannel {
                             "Failed to download Slack file {}: {e}",
                             att.filename.as_deref().unwrap_or("unknown")
                         );
+                        failed_kinds.push(crate::message_processing::media_failure::kind_for_mime(
+                            &att.mime_type,
+                        ));
                     }
                 }
             } else {
@@ -127,6 +131,14 @@ impl NativeChannel for SlackChannel {
             }
         }
         inbound.attachments = resolved_attachments;
+        // Surface failed downloads to the agent instead of silently dropping
+        // the attachment from the message.
+        for kind in failed_kinds {
+            crate::message_processing::media_failure::append_download_failure(
+                &mut inbound.text,
+                kind,
+            );
+        }
         voice::append_voice_transcripts(&mut inbound.text, &voice_transcripts);
 
         // Only inject channel history for top-level @mentions: a threaded reply

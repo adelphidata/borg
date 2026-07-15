@@ -154,7 +154,9 @@ impl App<'_> {
                     return Some(Ok(AppAction::ExportCurrentSession { format }));
                 }
                 Err(e) => {
-                    self.push_system_message(format!("Error: {e}\nUsage: /export [json|csv|txt]"));
+                    self.push_system_message(format!(
+                        "Error: {e}\nUsage: /export [json|csv|txt|md]"
+                    ));
                     return Some(Ok(AppAction::Continue));
                 }
             }
@@ -395,7 +397,7 @@ impl App<'_> {
              /new       - Start new session\n  \
              /fork      - Branch the current session into a new one (preserves history up to now)\n  \
              /resume <id> - Resume a saved session by id (prefix ok)\n  \
-             /export [fmt] - Export current session (fmt: json|csv|txt, default json)\n\
+             /export [fmt] - Export current session (fmt: json|csv|txt|md, default json)\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
              /skills    - Manage skills (alias of /plugins)\n  \

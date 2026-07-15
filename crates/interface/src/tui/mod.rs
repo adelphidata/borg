@@ -667,12 +667,10 @@ async fn handle_export(
     session_id: &str,
     format: cortex::export::ExportFormat,
 ) {
-    let format_str = match format {
-        cortex::export::ExportFormat::Json => "json",
-        cortex::export::ExportFormat::Csv => "csv",
-        cortex::export::ExportFormat::Txt => "txt",
-    };
-    let resp = match client.export_session(session_id, format_str).await {
+    let format_str = format.as_str();
+    // TUI exports always redact (fail-closed default); the raw-output escape
+    // hatch is the CLI's `borg export --no-redact`.
+    let resp = match client.export_session(session_id, format_str, false).await {
         Ok(r) => r,
         Err(e) => {
             app.push_system_message(format!("Export failed: {e}"));

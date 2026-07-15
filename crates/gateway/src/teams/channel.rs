@@ -84,6 +84,7 @@ impl NativeChannel for TeamsChannel {
                 cortex::media::understanding::AudioTranscriber::from_config(&self.config)
             {
                 let mut transcripts: Vec<String> = Vec::new();
+                let mut failed_kinds: Vec<&'static str> = Vec::new();
                 for att in atts {
                     if !att.content_type.starts_with("audio/") {
                         continue;
@@ -108,15 +109,32 @@ impl NativeChannel for TeamsChannel {
                                 .await,
                             );
                         }
-                        Err(e) => tracing::warn!(error = %e, "teams: attachment download failed"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "teams: attachment download failed");
+                            failed_kinds.push(
+                                crate::message_processing::media_failure::kind_for_mime(
+                                    &att.content_type,
+                                ),
+                            );
+                        }
                     }
+                }
+                // A failed download surfaces as a placeholder line so the
+                // voice-only empty-text guard below doesn't drop the turn and
+                // the agent learns media existed.
+                for kind in failed_kinds {
+                    crate::message_processing::media_failure::append_download_failure(
+                        &mut inbound.text,
+                        kind,
+                    );
                 }
                 voice::append_voice_transcripts(&mut inbound.text, &transcripts);
             }
         }
 
         // A voice-only message whose transcript never materialized (STT
-        // unconfigured, download failed, or transcription errored) would
+        // unconfigured or transcription errored; download failures surface a
+        // placeholder above instead of landing here) would
         // otherwise emit an empty agent turn. Only the audio path can reach
         // here with empty text — text/invoke/reaction empties were already
         // filtered by `parse_activity`.

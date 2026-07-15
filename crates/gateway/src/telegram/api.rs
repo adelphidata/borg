@@ -55,6 +55,23 @@ impl TelegramClient {
         format!("{TELEGRAM_API_BASE}/file/bot{}/{file_path}", self.token)
     }
 
+    /// Scrub the bot token out of arbitrary error text.
+    fn scrub(&self, text: &str) -> String {
+        redact_bot_token(text, &self.token)
+    }
+
+    /// Flatten a transport error into a token-scrubbed `anyhow` error.
+    ///
+    /// `reqwest` error Displays embed the request URL, which contains the bot
+    /// token (`…/bot<token>/<method>`). The error is flattened to a plain
+    /// redacted string — deliberately dropping the source chain — so no
+    /// downstream consumer (`tracing`, the channel-health registry, `{:#}`
+    /// chain formatting) can ever surface the raw token.
+    fn scrub_err(&self, e: reqwest::Error, action: &str) -> anyhow::Error {
+        let chain = format!("{:#}", anyhow::Error::from(e));
+        anyhow::anyhow!("{action}: {}", self.scrub(&chain))
+    }
+
     /// Validate the bot token by calling getMe.
     pub async fn get_me(&self) -> Result<User> {
         let resp: ApiResponse<User> = self
@@ -62,10 +79,10 @@ impl TelegramClient {
             .get(self.api_url("getMe"))
             .send()
             .await
-            .context("Failed to call getMe")?
+            .map_err(|e| self.scrub_err(e, "Failed to call getMe"))?
             .json()
             .await
-            .context("Failed to parse getMe response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse getMe response"))?;
 
         match resp.result {
             Some(user) if resp.ok => Ok(user),
@@ -133,15 +150,18 @@ impl TelegramClient {
                 Err(e) => {
                     if is_safe_to_retry(&e) {
                         attempts += 1;
+                        let scrubbed = self.scrub(&e.to_string());
                         if attempts > MAX_SEND_RETRIES {
-                            bail!("sendMessage failed after {MAX_SEND_RETRIES} retries: {e}");
+                            bail!(
+                                "sendMessage failed after {MAX_SEND_RETRIES} retries: {scrubbed}"
+                            );
                         }
                         let backoff = Duration::from_millis(500 * 2u64.pow(attempts - 1));
-                        warn!("sendMessage connection error, retrying in {backoff:?} (attempt {attempts}/{MAX_SEND_RETRIES}): {e}");
+                        warn!("sendMessage connection error, retrying in {backoff:?} (attempt {attempts}/{MAX_SEND_RETRIES}): {scrubbed}");
                         tokio::time::sleep(backoff).await;
                         continue;
                     }
-                    return Err(e).context("Failed to send message");
+                    return Err(self.scrub_err(e, "Failed to send message"));
                 }
             };
 
@@ -149,7 +169,7 @@ impl TelegramClient {
             let resp_body: ApiResponse<serde_json::Value> = resp
                 .json()
                 .await
-                .context("Failed to parse sendMessage response")?;
+                .map_err(|e| self.scrub_err(e, "Failed to parse sendMessage response"))?;
 
             if resp_body.ok {
                 self.circuit_breaker.record_success();
@@ -258,12 +278,12 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .context("Failed to send voice message")?;
+            .map_err(|e| self.scrub_err(e, "Failed to send voice message"))?;
 
         let resp_body: ApiResponse<serde_json::Value> = resp
             .json()
             .await
-            .context("Failed to parse sendVoice response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse sendVoice response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -305,10 +325,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to call editMessageText")?
+            .map_err(|e| self.scrub_err(e, "Failed to call editMessageText"))?
             .json()
             .await
-            .context("Failed to parse editMessageText response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse editMessageText response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -340,10 +360,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to call deleteMessage")?
+            .map_err(|e| self.scrub_err(e, "Failed to call deleteMessage"))?
             .json()
             .await
-            .context("Failed to parse deleteMessage response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse deleteMessage response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -415,12 +435,12 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .with_context(|| format!("Failed to call {method}"))?;
+            .map_err(|e| self.scrub_err(e, &format!("Failed to call {method}")))?;
 
         let resp_body: ApiResponse<serde_json::Value> = resp
             .json()
             .await
-            .with_context(|| format!("Failed to parse {method} response"))?;
+            .map_err(|e| self.scrub_err(e, &format!("Failed to parse {method} response")))?;
 
         if !resp_body.ok {
             bail!(
@@ -545,10 +565,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to call setWebhook")?
+            .map_err(|e| self.scrub_err(e, "Failed to call setWebhook"))?
             .json()
             .await
-            .context("Failed to parse setWebhook response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse setWebhook response"))?;
 
         if !resp.ok {
             bail!(
@@ -566,10 +586,10 @@ impl TelegramClient {
             .post(self.api_url("deleteWebhook"))
             .send()
             .await
-            .context("Failed to call deleteWebhook")?
+            .map_err(|e| self.scrub_err(e, "Failed to call deleteWebhook"))?
             .json()
             .await
-            .context("Failed to parse deleteWebhook response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse deleteWebhook response"))?;
 
         if !resp.ok {
             bail!(
@@ -589,10 +609,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to call getFile")?
+            .map_err(|e| self.scrub_err(e, "Failed to call getFile"))?
             .json()
             .await
-            .context("Failed to parse getFile response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse getFile response"))?;
 
         match resp.result {
             Some(info) if resp.ok => Ok(info),
@@ -611,7 +631,7 @@ impl TelegramClient {
             .get(self.file_url(file_path))
             .send()
             .await
-            .context("Failed to download file")?;
+            .map_err(|e| self.scrub_err(e, "Failed to download file"))?;
 
         if let Some(len) = resp.content_length() {
             if len > TELEGRAM_MAX_FILE_SIZE_BYTES {
@@ -619,7 +639,10 @@ impl TelegramClient {
             }
         }
 
-        let bytes = resp.bytes().await.context("Failed to read file bytes")?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| self.scrub_err(e, "Failed to read file bytes"))?;
 
         if bytes.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
             bail!(
@@ -656,12 +679,12 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to send message with keyboard")?;
+            .map_err(|e| self.scrub_err(e, "Failed to send message with keyboard"))?;
 
         let resp_body: ApiResponse<serde_json::Value> = resp
             .json()
             .await
-            .context("Failed to parse sendMessage response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse sendMessage response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -698,12 +721,12 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to send silent message")?;
+            .map_err(|e| self.scrub_err(e, "Failed to send silent message"))?;
 
         let resp_body: ApiResponse<serde_json::Value> = resp
             .json()
             .await
-            .context("Failed to parse sendMessage response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse sendMessage response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -743,12 +766,12 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to send poll")?;
+            .map_err(|e| self.scrub_err(e, "Failed to send poll"))?;
 
         let resp_body: ApiResponse<serde_json::Value> = resp
             .json()
             .await
-            .context("Failed to parse sendPoll response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse sendPoll response"))?;
 
         if !resp_body.ok {
             bail!(
@@ -783,10 +806,9 @@ impl TelegramClient {
 
         match result {
             Ok(resp) => {
-                let resp_body: ApiResponse<serde_json::Value> = resp
-                    .json()
-                    .await
-                    .context("Failed to parse setMessageReaction response")?;
+                let resp_body: ApiResponse<serde_json::Value> = resp.json().await.map_err(|e| {
+                    self.scrub_err(e, "Failed to parse setMessageReaction response")
+                })?;
 
                 if !resp_body.ok {
                     warn!(
@@ -798,7 +820,10 @@ impl TelegramClient {
                 }
             }
             Err(e) => {
-                warn!("setMessageReaction network error: {e}");
+                warn!(
+                    "setMessageReaction network error: {}",
+                    self.scrub(&e.to_string())
+                );
             }
         }
 
@@ -822,10 +847,10 @@ impl TelegramClient {
             .timeout(Duration::from_secs(timeout + 10))
             .send()
             .await
-            .context("Failed to call getUpdates")?
+            .map_err(|e| self.scrub_err(e, "Failed to call getUpdates"))?
             .json()
             .await
-            .context("Failed to parse getUpdates response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse getUpdates response"))?;
 
         match resp.result {
             Some(updates) if resp.ok => Ok(updates),
@@ -854,10 +879,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to call setMyCommands")?
+            .map_err(|e| self.scrub_err(e, "Failed to call setMyCommands"))?
             .json()
             .await
-            .context("Failed to parse setMyCommands response")?;
+            .map_err(|e| self.scrub_err(e, "Failed to parse setMyCommands response"))?;
 
         if !resp.ok {
             bail!(
@@ -886,6 +911,39 @@ impl NativeCommandRegistration for TelegramClient {
 /// Determine if a network error is safe to retry (no data was sent/received).
 fn is_safe_to_retry(err: &reqwest::Error) -> bool {
     err.is_connect() || (err.is_timeout() && err.status().is_none())
+}
+
+/// Replace the bot token in error/log text with `[REDACTED]`.
+///
+/// Two passes: exact occurrences of the stored token, plus any
+/// `/bot<segment>/`-shaped URL path (belt-and-braces for encodings where the
+/// token is not byte-identical). Idempotent — already-redacted text passes
+/// through unchanged.
+fn redact_bot_token(text: &str, token: &str) -> String {
+    let exact = if token.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(token, "[REDACTED]")
+    };
+
+    let mut out = String::with_capacity(exact.len());
+    let mut rest = exact.as_str();
+    while let Some(idx) = rest.find("/bot") {
+        let (head, tail) = rest.split_at(idx + "/bot".len());
+        out.push_str(head);
+        // The token segment runs to the next path separator or delimiter.
+        let end = tail
+            .find(|c: char| c == '/' || c == ')' || c == '"' || c == '\'' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        if end == 0 || tail[..end] == *"[REDACTED]" {
+            out.push_str(&tail[..end]);
+        } else {
+            out.push_str("[REDACTED]");
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -921,6 +979,59 @@ mod tests {
             client.file_url("photos/file_1.jpg"),
             "https://api.telegram.org/file/bot123:ABC/photos/file_1.jpg"
         );
+    }
+
+    /// Regression: transport-error strings embed the request URL, whose path
+    /// contains the bot token. Anything reaching `tracing::warn!` or
+    /// `health.record_error` via the api boundary must come out scrubbed.
+    #[test]
+    fn error_text_containing_token_is_redacted() {
+        let token = "123456789:AAF-secret_tokenXYZ";
+        let cases = [
+            // reqwest-style Display with the URL embedded
+            format!(
+                "error sending request for url (https://api.telegram.org/bot{token}/sendMessage): connection refused"
+            ),
+            // file download URL variant
+            format!("https://api.telegram.org/file/bot{token}/photos/file_1.jpg: timed out"),
+            // bare token outside a URL
+            format!("unexpected token {token} in response"),
+        ];
+        for input in cases {
+            let out = redact_bot_token(&input, token);
+            assert!(
+                !out.contains(token),
+                "token must not survive redaction: {out}"
+            );
+            assert!(out.contains("[REDACTED]"), "expected marker in: {out}");
+        }
+    }
+
+    /// The `/bot<segment>/` URL shape is masked even when the embedded token
+    /// differs from the stored one (e.g. encoding drift), and redaction is
+    /// idempotent.
+    #[test]
+    fn bot_url_shape_redacted_without_exact_token_match() {
+        let input = "GET https://api.telegram.org/bot999:OTHER-token/getMe failed";
+        let once = redact_bot_token(input, "123:ABC");
+        assert!(!once.contains("999:OTHER-token"), "shape miss: {once}");
+        assert_eq!(redact_bot_token(&once, "123:ABC"), once, "not idempotent");
+        // Non-URL text without token material passes through untouched.
+        assert_eq!(
+            redact_bot_token("plain connection reset", "123:ABC"),
+            "plain connection reset"
+        );
+    }
+
+    #[test]
+    fn scrub_err_flattens_and_redacts() {
+        let client = TelegramClient::new("123:ABC").unwrap();
+        // scrub() is the same path scrub_err feeds through; assert the client
+        // wiring uses its own stored token.
+        let scrubbed =
+            client.scrub("request to https://api.telegram.org/bot123:ABC/sendMessage failed");
+        assert!(!scrubbed.contains("123:ABC"), "leak: {scrubbed}");
+        assert!(scrubbed.contains("/bot[REDACTED]/"), "marker: {scrubbed}");
     }
 
     #[test]

@@ -2,8 +2,14 @@
 //! `e` key in the TUI sessions popup. All three surfaces call `export_session`
 //! so the serialization stays consistent.
 //!
-//! JSON is the default format (round-trippable via `Session` serde). CSV and
-//! TXT are lossy, human-oriented flattenings for spreadsheets / grepping.
+//! JSON is the default format (round-trippable via `Session` serde). CSV,
+//! TXT, and Markdown are lossy, human-oriented flattenings for spreadsheets /
+//! grepping / reading.
+//!
+//! Every format runs through secret redaction by default, fail-closed: if
+//! the redaction step itself fails, the export ABORTS rather than writing
+//! unredacted output. Callers opt out explicitly via
+//! [`ExportOptions::redact`] (`--no-redact` on the CLI).
 
 use anyhow::{anyhow, Context, Result};
 use std::str::FromStr;
@@ -21,6 +27,9 @@ pub enum ExportFormat {
     Csv,
     /// Plain text, human-readable.
     Txt,
+    /// Markdown transcript: role-headed sections, code fences preserved,
+    /// tool calls/results summarized compactly.
+    Markdown,
 }
 
 impl ExportFormat {
@@ -30,6 +39,17 @@ impl ExportFormat {
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
             ExportFormat::Txt => "txt",
+            ExportFormat::Markdown => "md",
+        }
+    }
+
+    /// Canonical wire/CLI name for this format (inverse of `FromStr`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExportFormat::Json => "json",
+            ExportFormat::Csv => "csv",
+            ExportFormat::Txt => "txt",
+            ExportFormat::Markdown => "md",
         }
     }
 }
@@ -42,8 +62,9 @@ impl FromStr for ExportFormat {
             "json" => Ok(ExportFormat::Json),
             "csv" => Ok(ExportFormat::Csv),
             "txt" | "text" => Ok(ExportFormat::Txt),
+            "md" | "markdown" => Ok(ExportFormat::Markdown),
             other => Err(anyhow!(
-                "unsupported export format '{other}' (expected: json, csv, txt)"
+                "unsupported export format '{other}' (expected: json, csv, txt, md)"
             )),
         }
     }
@@ -54,12 +75,17 @@ impl FromStr for ExportFormat {
 pub struct ExportOptions {
     /// Output format.
     pub format: ExportFormat,
+    /// Run the rendered export through secret redaction (default `true`).
+    /// Redaction is fail-closed: a redaction failure aborts the export.
+    /// `false` is the explicit `--no-redact` opt-out for raw output.
+    pub redact: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             format: ExportFormat::Json,
+            redact: true,
         }
     }
 }
@@ -78,9 +104,48 @@ pub async fn export_session(
         ExportFormat::Json => render_json(&session)?,
         ExportFormat::Csv => render_csv(&session),
         ExportFormat::Txt => render_txt(&session),
+        ExportFormat::Markdown => render_markdown(&session),
+    };
+    let rendered = if opts.redact {
+        apply_export_redaction(rendered, default_export_redactor)?
+    } else {
+        rendered
     };
     let filename = suggested_filename(&session.meta, opts.format);
     Ok((rendered, filename))
+}
+
+/// Fail-closed redaction gate for exports.
+///
+/// Runs the fully rendered export through `redactor` and returns the redacted
+/// text. If the redactor fails for ANY reason the export is aborted with an
+/// error — the unredacted `rendered` string is dropped, never returned. The
+/// redactor is a parameter so tests can inject a failing one to exercise the
+/// abort path.
+fn apply_export_redaction(
+    rendered: String,
+    redactor: impl FnOnce(&str) -> Result<String>,
+) -> Result<String> {
+    redactor(&rendered).map_err(|e| {
+        anyhow!(e).context(
+            "secret redaction failed — aborting export (fail-closed: refusing to \
+             write unredacted output; pass --no-redact to export raw)",
+        )
+    })
+}
+
+/// Production redactor: the same secret-pattern machinery guarding channel /
+/// TUI / log sinks (see [`crate::security::secrets::redact_secrets`]).
+///
+/// The pattern engine is infallible by signature, so the only real-world
+/// failure mode is a panic inside the regex machinery (e.g. a bad pattern
+/// added later). `catch_unwind` converts that panic into an `Err` so the
+/// fail-closed gate above aborts the export instead of the panic either
+/// killing the daemon task or — worse — some caller swallowing it and
+/// writing raw output.
+fn default_export_redactor(text: &str) -> Result<String> {
+    std::panic::catch_unwind(|| crate::security::secrets::redact_secrets(text))
+        .map_err(|_| anyhow!("secret redaction panicked"))
 }
 
 /// Reconstruct a full `Session` from the DB. Fails loudly if the session
@@ -227,6 +292,113 @@ fn render_txt(session: &Session) -> String {
     out
 }
 
+/// Compact-summary budget for tool-call arguments in Markdown exports (chars).
+const MD_TOOL_ARGS_MAX_CHARS: usize = 200;
+/// Compact-summary budget for tool-result output in Markdown exports (chars).
+const MD_TOOL_OUTPUT_MAX_CHARS: usize = 1000;
+
+/// Truncate `s` to at most `max` characters (not bytes — never splits a
+/// multibyte char), appending a marker with the elided count.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}… [+{} chars truncated]", total - max)
+}
+
+/// Longest run of consecutive backticks in `s`.
+fn longest_backtick_run(s: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+/// A code fence long enough that `content` can never close it early: one
+/// backtick more than the longest backtick run inside, minimum three.
+fn safe_fence(content: &str) -> String {
+    "`".repeat((longest_backtick_run(content) + 1).max(3))
+}
+
+/// A CommonMark inline code span that renders `s` literally: delimiter one
+/// backtick longer than any run inside, space-padded when `s` begins or ends
+/// with a backtick.
+fn inline_code(s: &str) -> String {
+    let delim = "`".repeat(longest_backtick_run(s) + 1);
+    if s.starts_with('`') || s.ends_with('`') {
+        format!("{delim} {s} {delim}")
+    } else {
+        format!("{delim}{s}{delim}")
+    }
+}
+
+/// Readable Markdown transcript. Role-headed sections; user/assistant text is
+/// emitted verbatim (so fenced code blocks inside messages survive intact);
+/// tool calls and tool results are summarized compactly — tool name plus
+/// truncated args/output — rather than dumped in full.
+fn render_markdown(session: &Session) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", session.meta.title));
+    out.push_str(&format!(
+        "- **Session:** `{}`\n- **Messages:** {}\n\n",
+        session.meta.id, session.meta.message_count
+    ));
+    for msg in &session.messages {
+        let role = match msg.role {
+            Role::System => "System",
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool",
+        };
+        let ts = msg.timestamp.as_deref().unwrap_or("-");
+        out.push_str(&format!("## {role} — {ts}\n\n"));
+        let body = flatten_content(msg.content.as_ref());
+        match msg.role {
+            // Tool results: compact fenced summary, truncated. The fence is
+            // sized past any backtick run in the output so embedded ``` can't
+            // break the document structure.
+            Role::Tool => {
+                if !body.is_empty() {
+                    let summary = truncate_chars(&body, MD_TOOL_OUTPUT_MAX_CHARS);
+                    let fence = safe_fence(&summary);
+                    out.push_str(&format!("{fence}\n{summary}\n{fence}\n\n"));
+                }
+            }
+            // Human/model prose is emitted verbatim so authored code fences
+            // render as the author wrote them.
+            _ => {
+                if !body.is_empty() {
+                    out.push_str(&body);
+                    if !body.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        if let Some(tcs) = &msg.tool_calls {
+            for tc in tcs {
+                let args = truncate_chars(&tc.function.arguments, MD_TOOL_ARGS_MAX_CHARS);
+                out.push_str(&format!(
+                    "**Tool call:** `{}` — {}\n\n",
+                    tc.function.name,
+                    inline_code(&args)
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Flatten `MessageContent` into a single text blob, with bracketed placeholders
 /// for non-text parts so CSV/TXT readers still see *something* for image/audio.
 fn flatten_content(content: Option<&MessageContent>) -> String {
@@ -358,6 +530,9 @@ mod tests {
             ("  csv  ", ExportFormat::Csv),
             ("txt", ExportFormat::Txt),
             ("text", ExportFormat::Txt),
+            ("md", ExportFormat::Markdown),
+            ("markdown", ExportFormat::Markdown),
+            ("Markdown", ExportFormat::Markdown),
         ] {
             assert_eq!(ExportFormat::from_str(input).unwrap(), *expected);
         }
@@ -395,6 +570,7 @@ mod tests {
         seed_session(&db, "sess-csv").await;
         let opts = ExportOptions {
             format: ExportFormat::Csv,
+            ..Default::default()
         };
         let (out, filename) = export_session(&db, "sess-csv", opts).await.unwrap();
 
@@ -436,6 +612,7 @@ mod tests {
         .unwrap();
         let opts = ExportOptions {
             format: ExportFormat::Csv,
+            ..Default::default()
         };
         let (out, _) = export_session(&db, "sess-esc", opts).await.unwrap();
         // Doubled quote + wrapped in quotes because of `,` / `"` / `\n`.
@@ -448,6 +625,7 @@ mod tests {
         seed_session(&db, "sess-txt").await;
         let opts = ExportOptions {
             format: ExportFormat::Txt,
+            ..Default::default()
         };
         let (out, filename) = export_session(&db, "sess-txt", opts).await.unwrap();
 
@@ -531,6 +709,7 @@ mod tests {
             "sess-inj",
             ExportOptions {
                 format: ExportFormat::Csv,
+                ..Default::default()
             },
         )
         .await
@@ -566,5 +745,220 @@ mod tests {
         let name = suggested_filename(&meta, ExportFormat::Json);
         assert!(name.starts_with("borg-session-café-ses"), "got {name}");
         assert!(name.ends_with(".json"));
+    }
+
+    // ── Markdown format ──
+
+    #[tokio::test]
+    async fn export_markdown_renders_transcript_structure() {
+        let db = Database::test_db().await;
+        seed_session(&db, "sess-md").await;
+        // Add an assistant message containing a fenced code block — it must
+        // survive verbatim in the Markdown output.
+        db.insert_message(
+            "sess-md",
+            "assistant",
+            Some("here you go:\n```rust\nfn main() {}\n```\ndone"),
+            None,
+            None,
+            Some("2024-01-01T00:00:03Z"),
+            None,
+        )
+        .await
+        .unwrap();
+        let opts = ExportOptions {
+            format: ExportFormat::Markdown,
+            ..Default::default()
+        };
+        let (out, filename) = export_session(&db, "sess-md", opts).await.unwrap();
+
+        assert!(filename.ends_with(".md"));
+        // Title + role-headed sections.
+        assert!(out.starts_with("# Demo chat\n"));
+        assert!(out.contains("## User — 2024-01-01T00:00:00Z"));
+        assert!(out.contains("## Assistant — 2024-01-01T00:00:01Z"));
+        assert!(out.contains("## Tool — 2024-01-01T00:00:02Z"));
+        assert!(out.contains("hello, agent"));
+        // Authored code fence preserved verbatim.
+        assert!(out.contains("```rust\nfn main() {}\n```"));
+        // Tool call summarized compactly: name + args.
+        assert!(out.contains("**Tool call:** `run_shell`"));
+        assert!(out.contains(r#"{\"cmd\":\"ls\"}"#) || out.contains(r#"{"cmd":"ls"}"#));
+        // Tool result fenced.
+        assert!(out.contains("file1.txt\nfile2.txt"));
+    }
+
+    #[test]
+    fn markdown_truncates_long_tool_output_and_args() {
+        use crate::types::{FunctionCall, Message, ToolCall};
+        let long_output = "x".repeat(MD_TOOL_OUTPUT_MAX_CHARS + 500);
+        let long_args = format!(
+            "{{\"data\":\"{}\"}}",
+            "y".repeat(MD_TOOL_ARGS_MAX_CHARS + 300)
+        );
+        let session = Session {
+            meta: SessionMeta {
+                id: "s".into(),
+                title: "T".into(),
+                created_at: "x".into(),
+                updated_at: "x".into(),
+                message_count: 2,
+            },
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "tc1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "web_fetch".into(),
+                            arguments: long_args,
+                        },
+                    }]),
+                    tool_call_id: None,
+                    timestamp: None,
+                    seq: None,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: Some(MessageContent::Text(long_output)),
+                    tool_calls: None,
+                    tool_call_id: Some("tc1".into()),
+                    timestamp: None,
+                    seq: None,
+                },
+            ],
+        };
+        let out = render_markdown(&session);
+        assert!(
+            out.contains("chars truncated]"),
+            "truncation marker missing"
+        );
+        // Full payloads must not be dumped.
+        assert!(!out.contains(&"x".repeat(MD_TOOL_OUTPUT_MAX_CHARS + 500)));
+        assert!(!out.contains(&"y".repeat(MD_TOOL_ARGS_MAX_CHARS + 300)));
+    }
+
+    #[test]
+    fn markdown_tool_output_fence_survives_embedded_backticks() {
+        // Tool output containing ``` must not close the summary fence early:
+        // the fence is sized one backtick past the longest run inside.
+        let session = Session {
+            meta: SessionMeta {
+                id: "s".into(),
+                title: "T".into(),
+                created_at: "x".into(),
+                updated_at: "x".into(),
+                message_count: 1,
+            },
+            messages: vec![crate::types::Message {
+                role: Role::Tool,
+                content: Some(MessageContent::Text(
+                    "before\n```\ninner fence\n```\nafter".into(),
+                )),
+                tool_calls: None,
+                tool_call_id: Some("tc1".into()),
+                timestamp: None,
+                seq: None,
+            }],
+        };
+        let out = render_markdown(&session);
+        assert!(
+            out.contains("````\nbefore\n```\ninner fence\n```\nafter\n````"),
+            "expected 4-backtick fence around output containing ```: {out}"
+        );
+    }
+
+    // ── Redaction (fail-closed, on by default) ──
+
+    /// 48 alnum chars after `sk-` — matches the generic "API Key" secret
+    /// pattern. Fixture value, not a real credential.
+    const FAKE_SK_KEY: &str = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    async fn seed_secret_session(db: &Database, id: &str) {
+        db.upsert_session(id, 1, 2, 0, "m", "Secret chat")
+            .await
+            .unwrap();
+        db.insert_message(
+            id,
+            "assistant",
+            Some(&format!("your key is {FAKE_SK_KEY} — keep it safe")),
+            None,
+            None,
+            Some("2024-01-01T00:00:00Z"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn redaction_is_on_by_default_for_every_format() {
+        let db = Database::test_db().await;
+        seed_secret_session(&db, "sess-red").await;
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Csv,
+            ExportFormat::Txt,
+            ExportFormat::Markdown,
+        ] {
+            let (out, _) = export_session(
+                &db,
+                "sess-red",
+                ExportOptions {
+                    format,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                !out.contains(FAKE_SK_KEY),
+                "raw key leaked in {format:?} export"
+            );
+            assert!(
+                out.contains("[REDACTED"),
+                "redaction marker missing in {format:?} export"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_redact_opt_out_emits_raw_output() {
+        let db = Database::test_db().await;
+        seed_secret_session(&db, "sess-raw").await;
+        let (out, _) = export_session(
+            &db,
+            "sess-raw",
+            ExportOptions {
+                format: ExportFormat::Txt,
+                redact: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.contains(FAKE_SK_KEY), "opt-out must emit raw output");
+        assert!(!out.contains("[REDACTED"));
+    }
+
+    /// Fail-closed contract: if the redaction step errors, the export aborts
+    /// — no unredacted text escapes. The redactor is injectable precisely so
+    /// this path is testable without breaking the real pattern engine.
+    #[test]
+    fn redaction_failure_aborts_export_fail_closed() {
+        let rendered = format!("leaky {FAKE_SK_KEY}");
+        let err = apply_export_redaction(rendered, |_| Err(anyhow!("regex engine exploded")))
+            .expect_err("failing redactor must abort the export");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("aborting export"), "got: {msg}");
+        assert!(msg.contains("regex engine exploded"), "got: {msg}");
+    }
+
+    #[test]
+    fn default_redactor_strips_secrets_and_reports_ok() {
+        let out = default_export_redactor(&format!("k={FAKE_SK_KEY}")).unwrap();
+        assert!(!out.contains(FAKE_SK_KEY));
+        assert!(out.contains("[REDACTED"));
     }
 }

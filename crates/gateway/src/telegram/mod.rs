@@ -65,6 +65,12 @@ pub async fn enrich_parsed_message(
             }
             Err(e) => {
                 tracing::warn!("Telegram photo download failed: {e}");
+                // Surface the failure to the agent instead of silently
+                // presenting a caption-only (or bare "[Photo]") message.
+                crate::message_processing::media_failure::append_download_failure(
+                    &mut parsed.inbound.text,
+                    "image",
+                );
             }
         }
     }

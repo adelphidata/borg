@@ -6,7 +6,7 @@ use tracing::{debug, instrument, warn};
 use crate::constants;
 use crate::constants::COMPACTION_MARKER_TOKENS;
 use crate::llm::LlmClient;
-use crate::types::{Message, Role};
+use crate::types::{ContentPart, Message, MessageContent, Role};
 
 use super::summarize::{summarize_with_llm, summarize_with_llm_v2};
 use super::tokens::{history_tokens, message_tokens};
@@ -94,6 +94,49 @@ pub fn effective_head_protection(protect_first_n: usize, has_prior_summary: bool
     } else {
         protect_first_n
     }
+}
+
+/// Strip reasoning-trace spans (`<think>`, `<thinking>`, `<reasoning>`,
+/// `<internal>`, any ASCII case) from text bound for — or produced by — the
+/// compaction summarizer. A summary that quotes a reasoning trace gets
+/// folded into the next iterative summary, so traces compound across
+/// compactions and bloat every future context window. Thin domain alias for
+/// the crate-wide [`crate::internal_tag_filter::strip_internal_tags`], which
+/// owns the stripped-tag set and the unclosed-tag drop semantics.
+fn strip_reasoning_traces(text: &str) -> String {
+    crate::internal_tag_filter::strip_internal_tags(text)
+}
+
+/// Copy `messages` for the summarizer with reasoning-trace spans removed
+/// from assistant text. Non-assistant messages pass through untouched — a
+/// user quoting a `<think>` tag is content, not a trace.
+fn sanitize_for_summarizer(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.role != Role::Assistant {
+                return m.clone();
+            }
+            let mut cleaned = m.clone();
+            match &m.content {
+                Some(MessageContent::Text(t)) => {
+                    cleaned.content = Some(MessageContent::Text(strip_reasoning_traces(t)));
+                }
+                Some(MessageContent::Parts(parts)) => {
+                    let stripped = parts
+                        .iter()
+                        .map(|p| match p {
+                            ContentPart::Text(t) => ContentPart::Text(strip_reasoning_traces(t)),
+                            other => other.clone(),
+                        })
+                        .collect();
+                    cleaned.content = Some(MessageContent::Parts(stripped));
+                }
+                None => {}
+            }
+            cleaned
+        })
+        .collect()
 }
 
 /// Determine which messages need to be dropped for compaction.
@@ -245,10 +288,19 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
     // dropping the range for a degraded placeholder would irrecoverably lose
     // context, whereas leaving history intact lets the next turn retry once the
     // provider recovers. Mirrors the v2 path's empty-summary bail-out.
-    let Some(summary) = summarize_with_llm(&history[..dropped], llm).await else {
+    //
+    // Assistant reasoning traces are stripped from the summarizer's input and
+    // its output so chain-of-thought can't compound into iterative summaries.
+    let sanitized = sanitize_for_summarizer(&history[..dropped]);
+    let Some(summary) = summarize_with_llm(&sanitized, llm).await else {
         warn!("compaction summary unavailable, leaving history untouched");
         return;
     };
+    let summary = strip_reasoning_traces(&summary);
+    if summary.trim().is_empty() {
+        warn!("compaction summary was reasoning-only, leaving history untouched");
+        return;
+    }
 
     let marker = Message::user(summary);
 
@@ -289,16 +341,24 @@ pub async fn compact_history_v2(
         history.len() - plan.tail_start
     );
 
-    let middle = &history[plan.head_end..plan.tail_start];
+    // Strip assistant reasoning traces before the middle reaches the
+    // summarizer, and again from the summary before it is stored, so
+    // chain-of-thought can't compound across iterative summaries.
+    let middle = sanitize_for_summarizer(&history[plan.head_end..plan.tail_start]);
 
     // Bail out without mutating history if the summarizer gave us nothing
     // usable — better to let the next turn try again than to drop the
     // middle with no context at all. Shares the v1 path's let-else abort.
-    let Some(summary_body) = summarize_with_llm_v2(middle, previous_summary.as_deref(), llm).await
+    let Some(summary_body) = summarize_with_llm_v2(&middle, previous_summary.as_deref(), llm).await
     else {
         warn!("compact_history_v2: no usable summary, leaving history untouched");
         return 0;
     };
+    let summary_body = strip_reasoning_traces(&summary_body);
+    if summary_body.trim().is_empty() {
+        warn!("compact_history_v2: summary was reasoning-only, leaving history untouched");
+        return 0;
+    }
 
     // Sanitize the summary body to strip any XML tag boundaries the LLM may
     // have injected (e.g. a stray `</compaction_summary>` inside a code
@@ -838,6 +898,75 @@ mod tests {
             plan_compaction(&history, tight_budget).is_some(),
             "should compact at ~90% usage (above 85% margin)"
         );
+    }
+
+    // -- summarizer reasoning-trace hygiene --
+
+    #[test]
+    fn strip_reasoning_traces_removes_all_tag_families_case_insensitively() {
+        let input = "keep A<think>hidden 1</think> keep B<THINKING>hidden 2</THINKING>\
+                     <Reasoning>hidden 3</Reasoning> keep C<internal>hidden 4</internal> keep D";
+        let out = strip_reasoning_traces(input);
+        for kept in ["keep A", "keep B", "keep C", "keep D"] {
+            assert!(
+                out.contains(kept),
+                "visible text {kept:?} must survive: {out:?}"
+            );
+        }
+        for hidden in ["hidden 1", "hidden 2", "hidden 3", "hidden 4"] {
+            assert!(
+                !out.contains(hidden),
+                "reasoning span {hidden:?} must be stripped: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_reasoning_traces_drops_unclosed_trace_remainder() {
+        // A stream cut off mid-trace leaves an unclosed tag; the half-emitted
+        // trace must not leak into the summarizer.
+        let out = strip_reasoning_traces("visible <think>never closed and secret");
+        assert_eq!(out.trim(), "visible");
+    }
+
+    #[test]
+    fn summarizer_input_strips_assistant_traces_but_not_user_text() {
+        let history = vec![
+            Message::user("what does <think> mean in HTML? padding padding"),
+            Message::assistant(
+                "<think>I should check the docs first, secret plan here</think>It is not a real tag.",
+            ),
+            Message {
+                role: Role::Assistant,
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart::Text("<REASONING>multi part trace</REASONING>Answer: 42".into()),
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+                seq: None,
+            },
+        ];
+        let sanitized = sanitize_for_summarizer(&history);
+        assert_eq!(sanitized.len(), history.len(), "no messages may be dropped");
+        // User text is content, not a trace — byte-identical.
+        assert_eq!(
+            sanitized[0].text_content(),
+            history[0].text_content(),
+            "user messages must pass through untouched"
+        );
+        let a1 = sanitized[1].text_content().unwrap();
+        assert!(
+            !a1.contains("secret plan"),
+            "trace must be stripped: {a1:?}"
+        );
+        assert!(a1.contains("It is not a real tag."), "answer must survive");
+        let a2 = sanitized[2].text_content().unwrap();
+        assert!(
+            !a2.contains("multi part trace"),
+            "trace in Parts must be stripped"
+        );
+        assert!(a2.contains("Answer: 42"), "Parts answer must survive");
     }
 
     /// A summarizer that fails — here a provider whose endpoint refuses the

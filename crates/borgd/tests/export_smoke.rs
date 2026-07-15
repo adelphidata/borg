@@ -122,6 +122,7 @@ async fn export_session_round_trips_messages() {
         .export_session(ExportSessionRequest {
             session_id: session_id.into(),
             format: "json".into(),
+            no_redact: false,
         })
         .await
         .expect("export rpc")
@@ -151,6 +152,7 @@ async fn export_session_round_trips_messages() {
         .export_session(ExportSessionRequest {
             session_id: session_id.into(),
             format: "yaml".into(),
+            no_redact: false,
         })
         .await
         .expect_err("yaml must be rejected");

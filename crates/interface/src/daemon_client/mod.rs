@@ -886,11 +886,13 @@ rpc_wrappers! {
             id: id.to_string(),
         });
 
-    /// Render a session via the daemon's export pipeline.
-    admin fn export_session(session_id: &str, format: &str) -> ExportSessionResponse =
+    /// Render a session via the daemon's export pipeline. `no_redact` opts
+    /// out of the default fail-closed secret redaction.
+    admin fn export_session(session_id: &str, format: &str, no_redact: bool) -> ExportSessionResponse =
         export_session("Admin.ExportSession", ExportSessionRequest {
             session_id: session_id.to_string(),
             format: format.to_string(),
+            no_redact,
         });
 
     // ── Pairing ───────────────────────────────────────────────────────────

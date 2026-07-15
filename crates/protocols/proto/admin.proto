@@ -554,8 +554,10 @@ message ScheduledTaskDetail {
 
 message ExportSessionRequest {
   string session_id = 1;
-  // "json" | "csv" | "txt"
+  // "json" | "csv" | "txt" | "md"
   string format = 2;
+  // Opt OUT of secret redaction (redaction is on by default, fail-closed).
+  bool no_redact = 3;
 }
 message ExportSessionResponse {
   bytes content = 1;

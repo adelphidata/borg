@@ -84,6 +84,12 @@ pub async fn spawn_task_execution(
     let pre_run_timeout_ms = task.pre_run_timeout_ms;
 
     tokio::spawn(async move {
+        // Liveness registration for the wedged-run recovery sweep: while
+        // this future is alive (queued on the semaphore or executing), the
+        // sweep must defer this run instead of falsifying it to `failed`.
+        // RAII — the id deregisters when this task ends, including via
+        // panic unwind or tokio's task-boundary panic catch.
+        let _live_guard = cortex::tasks::LiveRunGuard::register(run_id);
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
@@ -174,6 +180,62 @@ pub async fn spawn_task_execution(
             }
         }
     });
+}
+
+/// `task_runs.result` marker recorded when a pre_run wake gate suppressed
+/// the run. The row is truthful — the run *completed*, doing exactly what
+/// the gate asked: nothing.
+pub(crate) const WAKE_GATE_SKIP_RESULT: &str = "skipped by wake gate (pre_run wakeAgent=false)";
+
+/// Decision extracted from the last line of a `pre_run_command`'s stdout.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WakeGate {
+    /// Last line is exactly `{"wakeAgent": false}` (sole key, whitespace
+    /// tolerated) — skip the LLM turn and delivery for this run.
+    Skip,
+    /// Last line is a JSON object with `"wakeAgent": true` (extra keys
+    /// allowed) — proceed, with the gate line stripped from the stdout
+    /// injected as context.
+    Wake { stripped_stdout: String },
+    /// No gate line (absent, malformed JSON, non-bool value, or a
+    /// `false` object carrying extra keys) — proceed with stdout
+    /// unchanged. The gate must never fail a run.
+    Absent,
+}
+
+/// Inspect the last line of pre_run stdout for the wake-gate contract.
+///
+/// A scheduled task's pre-run script can decide the agent shouldn't wake
+/// at all this run (nothing changed, nothing to reason about) by printing
+/// `{"wakeAgent": false}` as its final stdout line — saving the LLM turn
+/// entirely instead of paying for it and suppressing delivery afterwards
+/// via `[SILENT]`. Parsing is lenient on whitespace but strict on shape:
+/// anything that isn't the documented contract is treated as ordinary
+/// output ([`WakeGate::Absent`]), never an error.
+pub(crate) fn evaluate_wake_gate(stdout: &str) -> WakeGate {
+    let trimmed = stdout.trim_end();
+    let (head, last) = match trimmed.rsplit_once('\n') {
+        Some((head, last)) => (head, last),
+        None => ("", trimmed),
+    };
+    let candidate = last.trim();
+    if !candidate.starts_with('{') {
+        return WakeGate::Absent;
+    }
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(candidate) else {
+        return WakeGate::Absent;
+    };
+    match obj.get("wakeAgent").and_then(serde_json::Value::as_bool) {
+        // Any trailing JSON object asserting wakeAgent=true is a gate line:
+        // proceed, but strip it — it's control metadata, not context.
+        Some(true) => WakeGate::Wake {
+            stripped_stdout: head.to_string(),
+        },
+        // Skip is the destructive direction (the turn never happens), so it
+        // requires the exact documented object with no extra keys.
+        Some(false) if obj.len() == 1 => WakeGate::Skip,
+        _ => WakeGate::Absent,
+    }
 }
 
 /// Captured outcome of a `pre_run_command` invocation.
@@ -674,7 +736,51 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     // user prompt so the model reasons over deterministic data instead of
     // attempting to fetch/parse it itself.
     let user_msg = if let Some(cmd) = pre_run_command.as_deref() {
-        let outcome = run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms).await;
+        let mut outcome =
+            run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms).await;
+        // Wake gate: a *successful* preamble may end its stdout with a
+        // `{"wakeAgent": ...}` control line. A failed/timed-out preamble
+        // never gates — the model must get its turn to surface the problem.
+        if outcome.success {
+            match evaluate_wake_gate(&outcome.stdout) {
+                WakeGate::Skip => {
+                    tracing::debug!(
+                        task = %task_name,
+                        run_id,
+                        "pre_run wake gate returned wakeAgent=false — skipping LLM turn and delivery"
+                    );
+                    let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+                    match cortex::db::Database::open().await {
+                        Ok(db) => {
+                            if let Err(e) = db
+                                .complete_task_run(
+                                    *run_id,
+                                    duration_ms,
+                                    Some(WAKE_GATE_SKIP_RESULT),
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Task '{task_name}': failed to record wake-gate skip: {e}"
+                                );
+                            }
+                            if let Err(e) = db.clear_task_retry(task_id).await {
+                                tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Task '{task_name}': DB open failed at wake-gate skip: {e}"
+                            )
+                        }
+                    }
+                    return;
+                }
+                WakeGate::Wake { stripped_stdout } => outcome.stdout = stripped_stdout,
+                WakeGate::Absent => {}
+            }
+        }
         format!("{}{task_prompt}", render_pre_run_block(&outcome))
     } else {
         task_prompt.clone()
@@ -1455,6 +1561,87 @@ mod pre_run_tests {
         // dedup-empty path handles it). The sentinel matcher must not claim it.
         assert!(!is_silent_response(""));
         assert!(!is_silent_response("   \n\n  "));
+    }
+
+    // ── pre_run wake gate ──
+
+    #[test]
+    fn wake_gate_false_last_line_skips() {
+        // The documented skip contract: exact single-key object as the last
+        // stdout line, lenient on surrounding whitespace and blank tails.
+        for s in [
+            "{\"wakeAgent\": false}",
+            "data line one\ndata line two\n{\"wakeAgent\": false}",
+            "output\n  {\"wakeAgent\":false}  \n\n",
+            "output\n{ \"wakeAgent\" : false }",
+        ] {
+            assert_eq!(
+                evaluate_wake_gate(s),
+                WakeGate::Skip,
+                "{s:?} must skip the LLM turn"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_gate_true_proceeds_with_line_stripped() {
+        // wakeAgent=true means "wake as usual" — the gate line is control
+        // metadata and must not leak into <preprocessed_context>.
+        match evaluate_wake_gate("useful context\n{\"wakeAgent\": true}") {
+            WakeGate::Wake { stripped_stdout } => assert_eq!(stripped_stdout, "useful context"),
+            other => panic!("expected Wake, got {other:?}"),
+        }
+        // Extra keys are allowed on the true side (a script may attach
+        // metadata alongside its decision).
+        match evaluate_wake_gate("ctx\n{\"wakeAgent\": true, \"reason\": \"new items\"}") {
+            WakeGate::Wake { stripped_stdout } => assert_eq!(stripped_stdout, "ctx"),
+            other => panic!("expected Wake with extra keys, got {other:?}"),
+        }
+        // Gate line as the entire stdout → empty context, still wake.
+        match evaluate_wake_gate("{\"wakeAgent\": true}") {
+            WakeGate::Wake { stripped_stdout } => assert_eq!(stripped_stdout, ""),
+            other => panic!("expected Wake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wake_gate_absent_when_no_gate_line() {
+        // Ordinary output must pass through untouched — including output
+        // that merely *mentions* the key somewhere other than a trailing
+        // JSON object line.
+        for s in [
+            "plain output",
+            "",
+            "{\"wakeAgent\": false}\ntrailing real output",
+            "the script may print wakeAgent: false in prose",
+        ] {
+            assert_eq!(
+                evaluate_wake_gate(s),
+                WakeGate::Absent,
+                "{s:?} must proceed unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_gate_malformed_last_line_never_gates() {
+        // The gate must never fail or suppress a run on bad input: broken
+        // JSON, wrong value type, non-object JSON, or a false object
+        // smuggling extra keys all fall through to Absent.
+        for s in [
+            "output\n{\"wakeAgent\": false",            // unterminated JSON
+            "output\n{\"wakeAgent\": \"false\"}",       // string, not bool
+            "output\n{\"wakeAgent\": 0}",               // number, not bool
+            "output\n{\"wake_agent\": false}",          // wrong key
+            "output\nfalse",                            // bare JSON scalar
+            "output\n{\"wakeAgent\": false, \"x\": 1}", // skip requires sole key
+        ] {
+            assert_eq!(
+                evaluate_wake_gate(s),
+                WakeGate::Absent,
+                "{s:?} must proceed unchanged, not skip or error"
+            );
+        }
     }
 
     // ── origin_session_key (proactive-delivery session mirror) ──

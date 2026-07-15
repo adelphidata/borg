@@ -544,6 +544,19 @@ mod tests {
         assert_eq!(msg.peer_kind.as_deref(), Some("direct"));
     }
 
+    /// Multi-party IMs are shared surfaces: they must classify as `group` so
+    /// the activation gate requires an @mention (like channels), never as
+    /// `direct` (which auto-replies to every message like a 1:1 DM).
+    #[tokio::test]
+    async fn channel_type_mpim_is_group_peer_kind_not_dm() {
+        let mut event = make_slack_event("message");
+        event.channel_type = Some("mpim".to_string());
+        let cb = make_event(event);
+        let msg = parse_event(&cb, None, None).await.unwrap();
+        assert_eq!(msg.peer_kind.as_deref(), Some("group"));
+        assert_ne!(msg.peer_kind.as_deref(), Some("direct"));
+    }
+
     #[tokio::test]
     async fn app_mention_stores_event_type_metadata() {
         let cb = make_event(make_slack_event("app_mention"));

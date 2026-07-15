@@ -49,6 +49,72 @@ pub struct DiscoveredTools {
 /// `tracing::warn!` per session per overflow window.
 pub(crate) const NOTIFICATION_BUFFER_CAP: usize = 256;
 
+/// Cap on `notifications/message` server-log lines forwarded to `tracing`
+/// per session. Same posture as [`NOTIFICATION_BUFFER_CAP`]: a chatty or
+/// hostile server must not flood the operator's logs. Past the cap we emit
+/// one "further server logs suppressed" warning and drop the rest.
+pub(crate) const SERVER_LOG_CAP: usize = 256;
+
+/// Byte cap applied to each server-log body (and, defensively, the level /
+/// logger fields) before it reaches `tracing`. Server logs bypass the
+/// cortex per-call response cap, so they need their own bound.
+pub(crate) const SERVER_LOG_MAX_BYTES: usize = 2048;
+
+/// Coarse `tracing` severity for a server-supplied RFC-5424 level string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogSeverity {
+    /// debug / info / notice — and any unknown level.
+    Info,
+    /// warning.
+    Warn,
+    /// error / critical / alert / emergency.
+    Error,
+}
+
+/// Map an MCP `notifications/message` level (RFC-5424 names) onto the
+/// severity we emit at. Unknown levels map to `Info`: the message still
+/// surfaces, and an untrusted peer can't force error-level noise by
+/// inventing level names.
+pub(crate) fn map_log_level(level: &str) -> LogSeverity {
+    match level.to_ascii_lowercase().as_str() {
+        "warning" => LogSeverity::Warn,
+        "error" | "critical" | "alert" | "emergency" => LogSeverity::Error,
+        // debug / info / notice, plus anything unrecognized.
+        _ => LogSeverity::Info,
+    }
+}
+
+/// Truncate `s` to at most `max` bytes on a char boundary. Server-supplied
+/// log fields are unbounded on the wire; the operator's log is not.
+fn bounded(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Neutralize control characters in a server-supplied log field.
+///
+/// Server log content is untrusted: embedded newlines forge additional
+/// operator-looking log lines and ANSI/CSI escapes can rewrite the terminal
+/// that renders `daemon.err`. Every control char except `\t` becomes a
+/// space; borrows unchanged input to keep the clean path allocation-free.
+fn neutralize_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(|c| c.is_control() && c != '\t') {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// One open MCP session against a single server.
 ///
 /// Methods are `async` but not internally locked — the supervisor uses an
@@ -66,6 +132,12 @@ pub struct SessionActor {
     /// True iff we've already logged a notification-overflow warning this
     /// session. Avoids log spam from a sustained flood.
     notification_overflow_logged: bool,
+    /// Count of `notifications/message` server-log lines forwarded to
+    /// `tracing` this session. Bounded by [`SERVER_LOG_CAP`].
+    server_logs_emitted: usize,
+    /// True once the one-shot "further server logs suppressed" warning has
+    /// been emitted for this session.
+    server_logs_suppressed: bool,
     /// Server-initiated requests refused this session, keyed by method.
     /// Populated by the request-loop's "not found" path; the supervisor
     /// reads + drains this so it can emit one audit row per (server, method)
@@ -85,6 +157,8 @@ impl SessionActor {
             call_timeout: manifest.call_timeout,
             pending_notifications: std::collections::VecDeque::new(),
             notification_overflow_logged: false,
+            server_logs_emitted: 0,
+            server_logs_suppressed: false,
             refused_server_requests: Vec::new(),
         }
     }
@@ -176,6 +250,61 @@ impl SessionActor {
             }
         }
         self.pending_notifications.push_back(msg);
+    }
+
+    /// Forward one `notifications/message` server log line to `tracing`.
+    ///
+    /// Total: malformed params (missing, non-object, wrong-typed fields)
+    /// degrade to defaults and still surface — they can never error the
+    /// session. Bounded by [`SERVER_LOG_CAP`] with a one-shot suppression
+    /// warning so a chatty server can't flood the operator's logs.
+    fn handle_server_log(&mut self, params: Option<&Value>) {
+        if self.server_logs_emitted >= SERVER_LOG_CAP {
+            if !self.server_logs_suppressed {
+                tracing::warn!(
+                    server = %self.server_name,
+                    cap = SERVER_LOG_CAP,
+                    "mcp server log cap reached; further server logs suppressed this session"
+                );
+                self.server_logs_suppressed = true;
+            }
+            return;
+        }
+        self.server_logs_emitted += 1;
+
+        let field = |key: &str| params.and_then(|p| p.get(key));
+        let level_raw = field("level").and_then(Value::as_str).unwrap_or("");
+        let logger = field("logger").and_then(Value::as_str).unwrap_or("-");
+        // `data` may be any JSON value: strings pass through, everything
+        // else is compact-serialized so structured payloads stay readable.
+        let body = match field("data") {
+            None => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+        };
+        let level = neutralize_control_chars(bounded(level_raw, 32));
+        let logger = neutralize_control_chars(bounded(logger, 128));
+        let body = neutralize_control_chars(bounded(&body, SERVER_LOG_MAX_BYTES));
+        let (level, logger, body) = (level.as_ref(), logger.as_ref(), body.as_ref());
+
+        // `tracing` macros need a const level, so dispatch per severity.
+        match map_log_level(level) {
+            LogSeverity::Info => tracing::info!(
+                server = %self.server_name,
+                level, logger,
+                "mcp server log: {body}"
+            ),
+            LogSeverity::Warn => tracing::warn!(
+                server = %self.server_name,
+                level, logger,
+                "mcp server log: {body}"
+            ),
+            LogSeverity::Error => tracing::error!(
+                server = %self.server_name,
+                level, logger,
+                "mcp server log: {body}"
+            ),
+        }
     }
 
     /// Close the transport. Idempotent.
@@ -300,7 +429,14 @@ impl SessionActor {
                     );
                 }
                 None => {
-                    // Notification — stash for the supervisor (bounded).
+                    // Server-log notifications are routed to `tracing`
+                    // immediately (bounded) — they never enter the buffer,
+                    // so a chatty logger can't crowd out `tools/list_changed`.
+                    if msg.method.as_deref() == Some(methods::LOGGING_MESSAGE) {
+                        self.handle_server_log(msg.params.as_ref());
+                        continue;
+                    }
+                    // Other notifications — stash for the supervisor (bounded).
                     if let Some(method) = msg.method.as_deref() {
                         tracing::debug!(
                             server = %self.server_name,
@@ -592,5 +728,163 @@ mod tests {
             drained.len(),
             NOTIFICATION_BUFFER_CAP,
         );
+    }
+
+    #[test]
+    fn server_log_level_mapping_follows_rfc5424_severity() {
+        // Spec: debug/info/notice → info; warning → warn; error and above
+        // (error/critical/alert/emergency) → error. Unknown or hostile
+        // level strings must NOT escalate — they map to info, case-
+        // insensitively. A wrong mapping either hides server errors from
+        // the operator or lets a hostile peer spam error-level noise.
+        for (level, expected) in [
+            ("debug", LogSeverity::Info),
+            ("info", LogSeverity::Info),
+            ("notice", LogSeverity::Info),
+            ("warning", LogSeverity::Warn),
+            ("error", LogSeverity::Error),
+            ("critical", LogSeverity::Error),
+            ("alert", LogSeverity::Error),
+            ("emergency", LogSeverity::Error),
+            ("WARNING", LogSeverity::Warn),
+            ("Error", LogSeverity::Error),
+            ("", LogSeverity::Info),
+            ("verbose-custom", LogSeverity::Info),
+            ("<script>alert(1)</script>", LogSeverity::Info),
+        ] {
+            assert_eq!(
+                map_log_level(level),
+                expected,
+                "level {level:?} mapped wrong"
+            );
+        }
+    }
+
+    fn log_notification(params: Option<Value>) -> Message {
+        Message {
+            jsonrpc: Some("2.0".into()),
+            id: None,
+            method: Some(crate::protocol::methods::LOGGING_MESSAGE.into()),
+            result: None,
+            error: None,
+            params,
+        }
+    }
+
+    fn initialize_response() -> Message {
+        Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            })),
+            error: None,
+            params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_server_log_notification_never_errors_the_session() {
+        // Spec: a broken (or hostile) logger on the peer can't take down
+        // tool calls. Missing params, non-object params, and wrong-typed
+        // fields must all be swallowed gracefully — the in-flight request
+        // still completes, and the junk is not buffered for the supervisor.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            q.push_back(log_notification(None));
+            q.push_back(log_notification(Some(json!("not an object"))));
+            q.push_back(log_notification(Some(json!({
+                "level": 42, "logger": {"nested": true}, "data": [1, 2, 3]
+            }))));
+            q.push_back(initialize_response());
+        }
+
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session
+            .handshake()
+            .await
+            .expect("malformed server logs must not break the handshake");
+
+        assert_eq!(
+            session.server_logs_emitted, 3,
+            "all three log lines are forwarded (with defaults), not dropped"
+        );
+        assert!(
+            session.drain_notifications().is_empty(),
+            "server logs are routed to tracing, never buffered for the supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_log_flood_is_suppressed_past_cap() {
+        // Spec: a chatty server gets at most SERVER_LOG_CAP forwarded log
+        // lines per session, then a one-shot suppression notice. Without
+        // the cap, a hostile peer could flood the operator's logs through
+        // a single long-running tool call.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            for i in 0..(SERVER_LOG_CAP + 25) {
+                q.push_back(log_notification(Some(json!({
+                    "level": "info",
+                    "logger": "spammy",
+                    "data": format!("line {i}"),
+                }))));
+            }
+            q.push_back(initialize_response());
+        }
+
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        assert_eq!(
+            session.server_logs_emitted, SERVER_LOG_CAP,
+            "forwarding must stop exactly at the cap"
+        );
+        assert!(
+            session.server_logs_suppressed,
+            "one-shot suppression notice must have fired past the cap"
+        );
+    }
+
+    #[test]
+    fn server_log_control_chars_are_neutralized() {
+        // A hostile server must not forge operator-looking log lines (`\n`)
+        // or emit terminal escapes (ESC/CSI) through forwarded log fields.
+        let forged = "ok\ninfo borgd: fake line\x1b[2Jend\r";
+        let clean = neutralize_control_chars(forged);
+        assert!(!clean.contains('\n') && !clean.contains('\x1b') && !clean.contains('\r'));
+        assert_eq!(clean, "ok info borgd: fake line [2Jend ");
+        // Tabs survive and clean input stays borrowed (no allocation).
+        assert!(matches!(
+            neutralize_control_chars("a\tb"),
+            std::borrow::Cow::Borrowed("a\tb")
+        ));
+    }
+
+    #[test]
+    fn bounded_truncates_on_char_boundary() {
+        // Server-supplied log fields are unbounded on the wire; the bound
+        // must never split a multi-byte char (that would panic at the
+        // slice). Multi-byte input truncated mid-char walks back safely.
+        let s = "héllo wörld";
+        for max in 0..=s.len() {
+            let t = bounded(s, max);
+            assert!(t.len() <= max, "len {} > max {max}", t.len());
+            assert!(s.starts_with(t));
+        }
+        assert_eq!(bounded("short", 2048), "short");
     }
 }

@@ -330,8 +330,69 @@ pub async fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Res
 /// executions don't sit forever — the daemon-startup-only
 /// [`Database::recover_stale_runs`] is not enough when the daemon
 /// stays alive but a single task wedges.
+///
+/// Runs registered as live in this process (see [`LiveRunGuard`]) are
+/// skipped: a slow-but-alive execution (long LLM call) past its timeout is
+/// deferred, not falsified into a `failed` row while its future may still
+/// complete and overwrite the status.
 pub async fn recover_wedged_runs(db: &Database, now: i64, default_grace_secs: i64) -> Result<u64> {
-    db.recover_wedged_runs(now, default_grace_secs).await
+    db.recover_wedged_runs(now, default_grace_secs, &live_run_ids())
+        .await
+}
+
+// ── In-process run liveness registry ──
+//
+// The wedged-run sweep above judges liveness purely from `started_at` in
+// the DB, which cannot distinguish "executor died mid-run" from "run is
+// slow but its future is still polling". This registry is the in-memory
+// side channel: the execution path holds a guard for the run's lifetime,
+// and the sweep defers any run id it finds here. Process-global because
+// execution (borgd's task runner) and recovery (this crate's maintenance
+// sweep and borgd's stalled scan) live in different crates but the same
+// process — and a run registered here by a *previous* process can't exist,
+// since the set dies with the process (exactly when DB-only recovery
+// becomes correct again).
+
+static LIVE_TASK_RUNS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn live_runs_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<i64>> {
+    // A poisoned lock only means another thread panicked mid-insert/remove;
+    // the set itself is still a valid HashSet, so recover rather than
+    // propagate the panic into recovery/execution paths.
+    LIVE_TASK_RUNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII registration of a currently-executing `task_runs` row.
+///
+/// Hold this for the entire execution of a run; the run id stays in the
+/// live set until the guard drops — including drop-during-unwind, so a
+/// panicking run still deregisters and a genuinely dead run is never
+/// shielded from recovery.
+#[derive(Debug)]
+pub struct LiveRunGuard {
+    run_id: i64,
+}
+
+impl LiveRunGuard {
+    /// Mark `run_id` as live in this process until the guard is dropped.
+    pub fn register(run_id: i64) -> Self {
+        live_runs_lock().insert(run_id);
+        Self { run_id }
+    }
+}
+
+impl Drop for LiveRunGuard {
+    fn drop(&mut self) {
+        live_runs_lock().remove(&self.run_id);
+    }
+}
+
+/// Snapshot of the run ids currently executing in this process.
+pub fn live_run_ids() -> std::collections::HashSet<i64> {
+    live_runs_lock().clone()
 }
 
 /// Format a task row for display.
@@ -793,6 +854,126 @@ mod tests {
         assert!(
             !is_transient_error("prompt is too long: 205k > 200k"),
             "context overflow must not be transient — needs compaction, not retry",
+        );
+    }
+
+    // ── Wedged-run recovery + in-process liveness registry ──
+    //
+    // The live-run set is process-global, and in-memory test DBs all start
+    // rowids at 1 — so every test here inserts task_runs with explicit,
+    // test-unique ids to keep parallel tests from shielding each other's
+    // rows via the shared registry.
+
+    async fn seed_wedged_fixture(db: &Database, task_id: &str, run_id: i64, started_at: i64) {
+        db.create_task(&crate::db::NewTask {
+            id: task_id,
+            name: task_id,
+            prompt: "p",
+            schedule_type: "cron",
+            schedule_expr: "0 0 * * * *",
+            timezone: "UTC",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create task");
+        db.conn()
+            .execute(
+                "INSERT INTO task_runs (id, task_id, started_at, duration_ms, status)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                libsql::params![run_id, task_id, started_at, RUN_STATUS_RUNNING],
+            )
+            .await
+            .expect("insert running run");
+    }
+
+    async fn run_status(db: &Database, run_id: i64) -> String {
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT status FROM task_runs WHERE id = ?1",
+                libsql::params![run_id],
+            )
+            .await
+            .expect("query status");
+        rows.next()
+            .await
+            .expect("row")
+            .expect("run row exists")
+            .get::<String>(0)
+            .expect("status column")
+    }
+
+    /// A run past its timeout but registered live in-process must be
+    /// deferred, while a genuinely dead run in the same sweep is still
+    /// reclaimed — the escape hatch must not blunt real recovery.
+    #[tokio::test]
+    async fn wedged_sweep_defers_live_run_but_reclaims_dead_one() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_wedged_fixture(&db, "live-task", 910_001, now - 3_600).await;
+        seed_wedged_fixture(&db, "dead-task", 910_002, now - 3_600).await;
+
+        let _guard = LiveRunGuard::register(910_001);
+        let n = recover_wedged_runs(&db, now, 3_600).await.expect("sweep");
+
+        assert_eq!(n, 1, "only the dead run may be reclaimed");
+        assert_eq!(
+            run_status(&db, 910_001).await,
+            RUN_STATUS_RUNNING,
+            "live in-process run must not be falsified to failed"
+        );
+        assert_eq!(
+            run_status(&db, 910_002).await,
+            RUN_STATUS_FAILED,
+            "dead run must still be recovered exactly as before"
+        );
+    }
+
+    /// Dropping the guard ends liveness protection: the same run that was
+    /// deferred while the guard was held is reclaimed by the next sweep.
+    /// Guard-during-unwind is exercised too — a panicking holder must
+    /// deregister, or a crashed run would be shielded forever.
+    #[tokio::test]
+    async fn wedged_sweep_reclaims_after_guard_drop() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_wedged_fixture(&db, "guarded-task", 920_001, now - 3_600).await;
+
+        let guard = LiveRunGuard::register(920_001);
+        let n = recover_wedged_runs(&db, now, 3_600).await.expect("sweep");
+        assert_eq!(n, 0, "guarded run deferred while guard is held");
+
+        drop(guard);
+        assert!(
+            !live_run_ids().contains(&920_001),
+            "drop must deregister the run id"
+        );
+        let n = recover_wedged_runs(&db, now, 3_600)
+            .await
+            .expect("second sweep");
+        assert_eq!(n, 1, "post-drop the run is an ordinary dead wedge");
+        assert_eq!(run_status(&db, 920_001).await, RUN_STATUS_FAILED);
+
+        // RAII under panic: unwinding through a held guard still removes
+        // the id from the live set.
+        let unwind = std::panic::catch_unwind(|| {
+            let _g = LiveRunGuard::register(920_002);
+            panic!("simulated run panic");
+        });
+        assert!(unwind.is_err());
+        assert!(
+            !live_run_ids().contains(&920_002),
+            "guard must deregister during unwind"
         );
     }
 }

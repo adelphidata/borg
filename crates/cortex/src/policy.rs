@@ -253,7 +253,9 @@ fn expand_ifs(command: &str) -> String {
                 rest = after;
             }
         } else {
-            let ch = rest.chars().next().unwrap();
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
             out.push(ch);
             rest = &rest[ch.len_utf8()..];
         }

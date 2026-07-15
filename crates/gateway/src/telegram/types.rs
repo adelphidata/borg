@@ -30,8 +30,14 @@ pub struct TelegramMessage {
     pub edit_date: Option<i64>,
     /// Identifier for a group of related media messages.
     pub media_group_id: Option<String>,
-    /// Forum topic thread identifier.
+    /// Thread identifier. Only a real forum-topic id when
+    /// [`is_topic_message`](Self::is_topic_message) is set; on ordinary
+    /// replies Telegram populates it with a reply-UI anchor (the replied-to
+    /// message id) that must not be treated as a topic.
     pub message_thread_id: Option<i64>,
+    /// True if the message was sent to a forum topic.
+    #[serde(default)]
+    pub is_topic_message: bool,
     /// Available sizes of an attached photo.
     pub photo: Option<Vec<PhotoSize>>,
     /// Caption for media messages.
@@ -62,6 +68,9 @@ pub struct Chat {
     /// Type of chat (e.g. "private", "group", "supergroup", "channel").
     #[serde(rename = "type")]
     pub chat_type: String,
+    /// True if the supergroup is a forum (has topics enabled).
+    #[serde(default)]
+    pub is_forum: bool,
 }
 
 /// A Telegram user.
@@ -539,9 +548,10 @@ mod tests {
             "message": {
                 "message_id": 50,
                 "from": { "id": 42, "first_name": "Alice", "is_bot": false },
-                "chat": { "id": -100123, "type": "supergroup" },
+                "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
                 "date": 1700000000,
                 "message_thread_id": 99,
+                "is_topic_message": true,
                 "text": "Forum topic message"
             }
         }"#;
@@ -549,7 +559,27 @@ mod tests {
         let update: Update = serde_json::from_str(json).unwrap();
         let msg = update.message.unwrap();
         assert_eq!(msg.message_thread_id, Some(99));
+        assert!(msg.is_topic_message);
+        assert!(msg.chat.is_forum);
         assert_eq!(msg.text.as_deref(), Some("Forum topic message"));
+
+        // Absent flags must default to false (non-forum payloads omit them).
+        let bare: Update = serde_json::from_str(
+            r#"{
+                "update_id": 103,
+                "message": {
+                    "message_id": 51,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": -100123, "type": "supergroup" },
+                    "date": 1700000000,
+                    "text": "plain"
+                }
+            }"#,
+        )
+        .unwrap();
+        let bare_msg = bare.message.unwrap();
+        assert!(!bare_msg.is_topic_message);
+        assert!(!bare_msg.chat.is_forum);
     }
 
     #[test]

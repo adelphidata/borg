@@ -691,7 +691,7 @@ async fn letta_overwrite_deletes_prior_passage_then_inserts_with_marker() {
     let received = server.received_requests().await.unwrap();
     let post = received
         .iter()
-        .find(|r| r.method.to_string() == "POST")
+        .find(|r| r.method == "POST")
         .expect("insert POST must fire");
     let body: serde_json::Value = serde_json::from_slice(&post.body).expect("json body");
     let text = body["text"].as_str().expect("text field");
@@ -723,7 +723,7 @@ async fn letta_core_scope_write_patches_block_not_archival() {
     let received = server.received_requests().await.unwrap();
     let patch = received
         .iter()
-        .find(|r| r.method.to_string() == "PATCH")
+        .find(|r| r.method == "PATCH")
         .expect("core block PATCH must fire");
     let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("json body");
     assert_eq!(body["value"].as_str(), Some("I am Borg"));
@@ -1067,7 +1067,7 @@ async fn letta_append_concatenates_existing_passage_then_replaces() {
     let received = server.received_requests().await.unwrap();
     let post = received
         .iter()
-        .find(|r| r.method.to_string() == "POST")
+        .find(|r| r.method == "POST")
         .expect("insert POST must fire");
     let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
     let text = body["text"].as_str().unwrap();
@@ -1121,7 +1121,7 @@ async fn letta_core_scope_delete_clears_block_value() {
     let received = server.received_requests().await.unwrap();
     let patch = received
         .iter()
-        .find(|r| r.method.to_string() == "PATCH")
+        .find(|r| r.method == "PATCH")
         .expect("clear PATCH must fire");
     let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
     assert_eq!(body["value"].as_str(), Some(""), "delete clears the value");

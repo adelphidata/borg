@@ -215,6 +215,15 @@ pub(crate) fn classify_status(
             retry_after,
             reason: FailoverReason::RateLimit,
         },
+        // 408 Request Timeout is a transient timing failure the server itself
+        // flags as safe to retry (RFC 9110 §15.5.9) — commonly a reverse proxy
+        // in front of a slow backend closing its request-read window. Without
+        // this arm it fell through to Fatal{Unknown} and aborted the turn.
+        408 => LlmError::Retryable {
+            source: anyhow::anyhow!("{provider} returned 408 (request timeout): {safe}"),
+            retry_after: None,
+            reason: FailoverReason::Timeout,
+        },
         500 | 502 | 504 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             retry_after: None,
@@ -446,6 +455,28 @@ mod tests {
         );
         assert!(err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::Overloaded);
+    }
+
+    #[test]
+    fn classify_408_is_retryable_timeout() {
+        // A proxy-side request timeout must be retried, not surfaced as an
+        // unknown fatal error that aborts the turn.
+        let err = classify_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            "request timed out",
+            Provider::OpenAi,
+        );
+        assert!(err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::Timeout);
+    }
+
+    #[test]
+    fn classify_409_still_falls_through_unknown() {
+        // Boundary guard for the 408 arm: neighboring 4xx statuses keep the
+        // fatal catch-all classification.
+        let err = classify_status(reqwest::StatusCode::CONFLICT, "conflict", Provider::OpenAi);
+        assert!(!err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::Unknown);
     }
 
     #[test]
@@ -991,6 +1022,14 @@ mod tests {
         ("connection reset by peer", FailoverReason::Timeout),
         ("request timed out after 30000ms", FailoverReason::Timeout),
         ("deadline exceeded", FailoverReason::Timeout),
+        // Stall-detector kill texts (SSE watchdog + Bedrock loop) — the
+        // stale-stream circuit breaker keys its strikes off this
+        // classification, so these rows pin its primary trigger.
+        ("No data received for 90s", FailoverReason::Timeout),
+        (
+            "No Bedrock stream data received for 120s",
+            FailoverReason::Timeout,
+        ),
         (
             "DNS lookup failed for api.openai.com",
             FailoverReason::Timeout,

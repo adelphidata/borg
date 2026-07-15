@@ -298,6 +298,17 @@ pub struct Agent {
     /// served it rather than the configured primary during an outage.
     /// In-memory only — never persisted.
     pub(super) active_failover_identity: Option<(String, String)>,
+    /// Anti-thrash guard for proactive LLM compaction: counts consecutive
+    /// passes that failed to bring the prompt under threshold and suspends
+    /// further proactive attempts once the cap is hit. The reactive
+    /// (provider context-overflow) path is never gated. See
+    /// [`prompt_assembly::CompactionStrikes`].
+    pub(super) compaction_strikes: prompt_assembly::CompactionStrikes,
+    /// Cross-turn stale-stream circuit breaker: counts consecutive streams
+    /// killed as stale/timed out with nothing usable received, and
+    /// short-circuits turns once tripped. See
+    /// [`stream_handler::StreamHealth`].
+    pub(super) stream_health: stream_handler::StreamHealth,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -437,6 +448,8 @@ impl Agent {
             goal_event_sink: None,
             auto_title_spawned: false,
             active_failover_identity: None,
+            compaction_strikes: prompt_assembly::CompactionStrikes::new(),
+            stream_health: stream_handler::StreamHealth::new(),
         }
     }
 
@@ -557,6 +570,15 @@ impl Agent {
 
     /// Replace config, re-derive dependent state (policy, rate limits).
     fn reload_config(&mut self, new_config: Config) {
+        // A model/provider switch is the operator's escape hatch for a
+        // wedged session — give the new target a clean slate on the
+        // stale-stream circuit breaker instead of inheriting the old
+        // target's streak.
+        if new_config.llm.provider != self.config.llm.provider
+            || new_config.llm.model != self.config.llm.model
+        {
+            self.stream_health.record_provider_switch();
+        }
         self.policy = new_config.policy.clone();
         self.rate_guard
             .update_limits(new_config.security.action_limits.clone());
@@ -710,7 +732,11 @@ impl Agent {
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
-        let llm = match self.make_llm_client_from_config(&self.config).await {
+        // Use the compaction-tuned client (operator overrides + a summary
+        // output-cap floor) so a manual /compact can't truncate the summary
+        // mid-section any more than the automatic paths can.
+        let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
+        let llm = match self.make_llm_client_from_config(&compaction_config).await {
             Ok(l) => l,
             Err(_) => return (before, before),
         };
@@ -934,6 +960,20 @@ impl Agent {
         self.tool_call_repeat.reset();
         self.unknown_tool_tracker.reset();
 
+        // Cross-turn stale-stream circuit breaker: a session whose streams
+        // keep dying as stale would otherwise burn the full stall timeout
+        // (× the client's internal retries) on every turn with nothing to
+        // show. Short-circuit with an actionable error instead; alternating
+        // turns are let through as a single probe so a recovered provider
+        // can re-prove itself (see `StreamHealth`).
+        if self.stream_health.should_abort_turn() {
+            let msg = stream_handler::wedged_session_error(self.stream_health.streak());
+            warn!("{msg}");
+            let _ = event_tx.send(AgentEvent::Error(msg)).await;
+            let _ = event_tx.send(AgentEvent::TurnComplete).await;
+            return Ok(());
+        }
+
         self.prepare_loop().await;
 
         loop {
@@ -1110,6 +1150,31 @@ impl Agent {
             self.metrics
                 .llm_duration
                 .record(llm_start.elapsed().as_secs_f64(), &[]);
+
+            // Stream-health accounting for the cross-turn stale-stream
+            // breaker. A stream killed as stale/timed out with nothing
+            // usable received counts one strike; demonstrated responsiveness
+            // — a completed stream, or a usable partial (chunks arrived) —
+            // clears the streak. Definite provider errors (auth, rate limit,
+            // overflow) are neutral: not stale, but not proof of health.
+            match &stream_error {
+                Some(err) if classify_error_text(err) == Some(FailoverReason::Timeout) => {
+                    let usable_partial =
+                        !tag_filter.full_clean().trim().is_empty() || !tool_calls.is_empty();
+                    if usable_partial {
+                        self.stream_health.record_responsive();
+                    } else {
+                        let streak = self.stream_health.record_stale_kill();
+                        warn!(
+                            consecutive_stale = streak,
+                            "LLM stream killed as stale with no usable output"
+                        );
+                    }
+                }
+                Some(_) => {}
+                None if received_terminal => self.stream_health.record_responsive(),
+                None => {}
+            }
 
             // Reactive compaction: provider rejected the request because it
             // exceeded the context window. Compact once and retry this
@@ -1561,7 +1626,7 @@ impl Agent {
         // pressure and about to run LLM-based compaction.
         self.metrics.record_memory_pressure("reactive");
 
-        let compaction_config = self.config.with_compaction_overrides();
+        let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
         let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         // Whether this pass updates a prior summary (UX hint only).
         let iterative =
@@ -1570,6 +1635,9 @@ impl Agent {
         let dropped = self.run_llm_compaction(target, &compaction_llm).await;
 
         if dropped > 0 {
+            // A reactive compaction that actually dropped messages is a
+            // demonstrated success — clear the proactive anti-thrash streak.
+            self.compaction_strikes.reset();
             let _ = event_tx
                 .send(AgentEvent::HistoryCompacted {
                     dropped,

@@ -83,10 +83,43 @@ fn e_key_exports_highlighted_session_and_dismisses() {
     popup.handle_key(key(KeyCode::Down)); // cursor -> 1
     let result = popup.handle_key(key(KeyCode::Char('e')));
     match result {
-        Some(SessionAction::Export { id }) => assert_eq!(id, "session-1"),
+        Some(SessionAction::Export { id, format }) => {
+            assert_eq!(id, "session-1");
+            assert_eq!(
+                format,
+                cortex::export::ExportFormat::Json,
+                "default export format must be JSON"
+            );
+        }
         other => panic!("expected Export, got {other:?}"),
     }
     assert!(!popup.is_visible(), "pressing 'e' should dismiss the popup");
+}
+
+/// `f` cycles through every offered format and wraps back to JSON; the
+/// selected format is carried into the Export action.
+#[test]
+fn f_key_cycles_export_formats_and_export_uses_selection() {
+    use cortex::export::ExportFormat;
+    let mut popup = make_popup_with_sessions(1);
+    // json -> csv -> txt -> md
+    for expected in [ExportFormat::Csv, ExportFormat::Txt, ExportFormat::Markdown] {
+        assert!(popup.handle_key(key(KeyCode::Char('f'))).is_none());
+        assert_eq!(popup.selected_format(), expected);
+    }
+    // Export in the currently selected (Markdown) format.
+    match popup.handle_key(key(KeyCode::Char('e'))) {
+        Some(SessionAction::Export { format, .. }) => {
+            assert_eq!(format, ExportFormat::Markdown);
+        }
+        other => panic!("expected Export, got {other:?}"),
+    }
+    // Wrap-around: one more 'f' from md returns to json.
+    let mut popup = make_popup_with_sessions(1);
+    for _ in 0..EXPORT_FORMATS.len() {
+        popup.handle_key(key(KeyCode::Char('f')));
+    }
+    assert_eq!(popup.selected_format(), ExportFormat::Json);
 }
 
 #[test]

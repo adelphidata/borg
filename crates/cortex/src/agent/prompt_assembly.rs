@@ -44,6 +44,157 @@ use crate::types::{Message, ToolDefinition};
 
 use super::{spawn_logged, Agent, AgentEvent};
 
+/// Consecutive ineffective proactive compaction passes tolerated before the
+/// per-session anti-thrash guard suspends further proactive LLM compaction.
+pub(crate) const MAX_INEFFECTIVE_COMPACTIONS: u32 = 3;
+
+/// Minimum output-token allowance for compaction summarizer calls. A small
+/// `llm.max_tokens` (or `compaction.max_tokens` override) truncates the
+/// summary mid-section — reasoning models burn the cap on hidden thinking
+/// first — and a truncated summary fails to shrink anything, re-firing
+/// compaction every turn. Raise-only: a larger configured cap is kept.
+pub(crate) const SUMMARY_OUTPUT_TOKENS_FLOOR: u32 = 16_384;
+
+/// Decision from [`CompactionStrikes::gate`] for a proactive compaction
+/// attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionGate {
+    /// Proactive LLM compaction may run.
+    Proceed,
+    /// The strike cap was just reached — the caller warns once, then skips.
+    SkipEngaged,
+    /// The guard is already engaged — skip silently.
+    Skipping,
+}
+
+/// Anti-thrash guard for proactive LLM compaction.
+///
+/// When the incompressible floor of the prompt (system prompt, tool schemas,
+/// and the protected tail) alone exceeds the trigger threshold, every compaction
+/// pass shrinks messages by a healthy margin yet leaves the prompt over the
+/// line, so the next turn compacts again — an unbounded loop of futile
+/// summarizer calls. This tracker counts consecutive ineffective passes and,
+/// at [`MAX_INEFFECTIVE_COMPACTIONS`], suspends proactive compaction for the
+/// session until history actually shrinks or a compaction succeeds.
+///
+/// Effectiveness is judged like-for-like:
+/// - the local post-pass estimate is compared against the same history
+///   budget the trigger gate uses — still over means one strike, now;
+/// - an estimate that dips *under* the budget proves nothing (tokenizer skew
+///   between the rough estimator and the provider can hide a still-over
+///   prompt), so it must NOT reset the strike. It arms a pending verdict
+///   that only the provider's next *real* prompt-token report settles.
+#[derive(Debug, Default)]
+pub(crate) struct CompactionStrikes {
+    strikes: u32,
+    /// Real-prompt budget (context window minus output reservation) that the
+    /// provider's next reported prompt count is verified against. Armed by
+    /// [`Self::record_pass`] when the local estimate dipped under the trigger
+    /// threshold; consumed by [`Self::observe_real_prompt_tokens`].
+    pending_real_check: Option<usize>,
+    /// History-token estimate at the moment the guard engaged. History
+    /// shrinking below this (user rewind, reactive compaction, tool-result
+    /// trimming, new session) re-opens the gate.
+    skip_baseline: Option<usize>,
+}
+
+impl CompactionStrikes {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn strikes(&self) -> u32 {
+        self.strikes
+    }
+
+    /// Record the outcome of a proactive compaction pass.
+    ///
+    /// `post_estimate` is the local history-token estimate after the pass,
+    /// `trigger_threshold` the history budget the pass tried to get under
+    /// (the same measure the trigger gate fires on), and `real_prompt_limit`
+    /// the usable input budget in provider tokens that a deferred verdict is
+    /// checked against.
+    pub(crate) fn record_pass(
+        &mut self,
+        post_estimate: usize,
+        trigger_threshold: usize,
+        real_prompt_limit: usize,
+    ) {
+        if post_estimate > trigger_threshold {
+            // Same measure as the trigger gate: still over → futile pass.
+            self.strikes += 1;
+            self.pending_real_check = None;
+        } else {
+            // The rough estimate dipped under the threshold. That must NOT
+            // reset the strike — only the provider's real prompt count can
+            // prove the pass effective. Defer the verdict.
+            self.pending_real_check = Some(real_prompt_limit);
+        }
+    }
+
+    /// Settle a pending verdict with the provider-reported real prompt size
+    /// (0 = provider did not report; the verdict is consumed either way so a
+    /// usage-less response can't leave it armed for an unrelated reading).
+    pub(crate) fn observe_real_prompt_tokens(&mut self, real_prompt_tokens: u64) {
+        let Some(limit) = self.pending_real_check.take() else {
+            return;
+        };
+        if real_prompt_tokens == 0 {
+            return;
+        }
+        if (real_prompt_tokens as usize) < limit {
+            // Real-vs-real: the full prompt genuinely fits. Effective pass.
+            self.reset();
+        } else {
+            self.strikes += 1;
+        }
+    }
+
+    /// Gate a proactive compaction attempt given the current history-token
+    /// estimate. Handles skip engagement (warn-once signal) and shrink-based
+    /// recovery.
+    pub(crate) fn gate(&mut self, current_history_tokens: usize) -> CompactionGate {
+        if self.strikes < MAX_INEFFECTIVE_COMPACTIONS {
+            return CompactionGate::Proceed;
+        }
+        match self.skip_baseline {
+            None => {
+                self.skip_baseline = Some(current_history_tokens);
+                CompactionGate::SkipEngaged
+            }
+            Some(baseline) if current_history_tokens < baseline => {
+                // History actually shrank — re-open with a clean slate.
+                self.reset();
+                CompactionGate::Proceed
+            }
+            Some(_) => CompactionGate::Skipping,
+        }
+    }
+
+    /// A compaction demonstrably succeeded (e.g. a reactive pass dropped
+    /// messages) — clear all strike state.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// LLM config for compaction summarizer calls: the operator's compaction
+/// overrides, with the output cap floored at [`SUMMARY_OUTPUT_TOKENS_FLOOR`]
+/// so a small default `max_tokens` can't truncate summaries mid-section.
+///
+/// An explicit `compaction.max_tokens` override is respected verbatim: the
+/// operator may be targeting a model whose output limit is below the floor,
+/// and a request above that limit is a hard 400 — flooring it would make
+/// every summarizer call fail.
+pub(crate) fn compaction_llm_config(base: &crate::config::Config) -> crate::config::Config {
+    let mut cfg = base.with_compaction_overrides();
+    if base.compaction.max_tokens.is_none() {
+        cfg.llm.max_tokens = cfg.llm.max_tokens.max(SUMMARY_OUTPUT_TOKENS_FLOOR);
+    }
+    cfg
+}
+
 impl Agent {
     /// Load long-term memory under the given `strategy`, reusing the agent's
     /// owned DB handle when available so a per-turn `Database::open()` (and
@@ -379,6 +530,31 @@ Rules:
 
         // Only run LLM-based compaction when history still exceeds the token budget
         if history_tokens(&self.history) > max_hist {
+            // Anti-thrash guard: when consecutive passes have failed to bring
+            // the prompt under threshold, further proactive attempts are
+            // futile LLM spend — the incompressible floor (system prompt +
+            // tool schemas + protected tail) likely exceeds the budget.
+            // Skipped until history actually shrinks or a compaction
+            // succeeds. The reactive (provider context-overflow) path is
+            // deliberately not gated.
+            let current_tokens = history_tokens(&self.history);
+            match self.compaction_strikes.gate(current_tokens) {
+                CompactionGate::SkipEngaged => {
+                    warn!(
+                        strikes = MAX_INEFFECTIVE_COMPACTIONS,
+                        history_tokens = current_tokens,
+                        threshold = max_hist,
+                        "Suspending proactive compaction: {MAX_INEFFECTIVE_COMPACTIONS} \
+                         consecutive passes failed to bring the prompt under threshold — \
+                         the incompressible prompt floor (system prompt + tool schemas + \
+                         protected tail) may exceed it, in which case shrinking messages \
+                         cannot help. Skipping until history shrinks or a compaction succeeds."
+                    );
+                    return Ok(());
+                }
+                CompactionGate::Skipping => return Ok(()),
+                CompactionGate::Proceed => {}
+            }
             self.metrics.record_memory_pressure("proactive");
             let before_tokens = history_tokens(&self.history);
 
@@ -405,12 +581,22 @@ Rules:
                 }
             }
 
-            let compaction_config = self.config.with_compaction_overrides();
+            let compaction_config = compaction_llm_config(&self.config);
             let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
             let dropped_count = self.run_llm_compaction(max_hist, &compaction_llm).await;
+
+            // Score the pass for the anti-thrash guard. Still over the
+            // trigger threshold → strike now; dipped under → defer the
+            // verdict to the provider's next real prompt-token report
+            // (see `CompactionStrikes::record_pass`).
+            self.compaction_strikes.record_pass(
+                history_tokens(&self.history),
+                max_hist,
+                self.usable_real_prompt_budget(),
+            );
 
             if dropped_count > 0 {
                 let after_tokens = history_tokens(&self.history);
@@ -591,6 +777,20 @@ Rules:
         )
     }
 
+    /// Usable *real* prompt budget: the context window minus the output
+    /// reservation, in provider tokens. This is what the provider-reported
+    /// prompt count (system prompt + tools + history) must stay under for a
+    /// compaction pass to count as effective. Passing an unbounded configured
+    /// budget through [`crate::conversation::reserve_output_budget`] yields
+    /// exactly the usable-window clamp, keeping the formula single-sourced.
+    pub(super) fn usable_real_prompt_budget(&self) -> usize {
+        crate::conversation::reserve_output_budget(
+            usize::MAX,
+            self.active_context_window() as usize,
+            self.config.llm.max_tokens as usize,
+        )
+    }
+
     /// Emit a per-session toast/log warning when the skill budget had to drop
     /// or downgrade skills. Re-warns only when the dropped-set actually changes
     /// so a stable budget doesn't spam users every turn.
@@ -750,7 +950,10 @@ fn contains_untrusted_marker(content: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_flush_transcript, contains_untrusted_marker};
+    use super::{
+        build_flush_transcript, compaction_llm_config, contains_untrusted_marker, CompactionGate,
+        CompactionStrikes, MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
+    };
     use crate::types::Message;
 
     const AGENT_RS_SRC: &str = include_str!("prompt_assembly.rs");
@@ -832,6 +1035,158 @@ mod tests {
             "<active_memory trust=\"retrieved\">x</active_memory>"
         ));
         assert!(!contains_untrusted_marker("a normal assistant reply"));
+    }
+
+    // -- compaction anti-thrash guard --
+
+    const THRESHOLD: usize = 10_000;
+    const REAL_LIMIT: usize = 30_000;
+
+    /// Drive one futile pass: the post-pass estimate is still over the
+    /// trigger threshold, which must strike immediately (same measure as the
+    /// gate — no usage report needed).
+    fn futile_pass(s: &mut CompactionStrikes) {
+        s.record_pass(THRESHOLD + 500, THRESHOLD, REAL_LIMIT);
+    }
+
+    #[test]
+    fn estimate_still_over_threshold_strikes_without_usage() {
+        let mut s = CompactionStrikes::new();
+        futile_pass(&mut s);
+        futile_pass(&mut s);
+        assert_eq!(s.strikes(), 2);
+        assert_eq!(
+            s.gate(THRESHOLD + 500),
+            CompactionGate::Proceed,
+            "below the cap the gate stays open"
+        );
+    }
+
+    #[test]
+    fn low_local_estimate_does_not_reset_strikes() {
+        // Spec: a rough estimate dipping under the threshold proves nothing
+        // (tokenizer skew) and must NOT reset the strike; only the provider's
+        // real prompt count settles the verdict.
+        let mut s = CompactionStrikes::new();
+        futile_pass(&mut s);
+        futile_pass(&mut s);
+        s.record_pass(THRESHOLD - 100, THRESHOLD, REAL_LIMIT);
+        assert_eq!(
+            s.strikes(),
+            2,
+            "sub-threshold local estimate must leave the strike count untouched"
+        );
+        // The provider then reports a real prompt still over the usable
+        // budget: the deferred verdict lands as the third strike.
+        s.observe_real_prompt_tokens(REAL_LIMIT as u64 + 1);
+        assert_eq!(s.strikes(), MAX_INEFFECTIVE_COMPACTIONS);
+        assert_eq!(s.gate(THRESHOLD + 500), CompactionGate::SkipEngaged);
+    }
+
+    #[test]
+    fn real_usage_under_limit_resets_strikes() {
+        let mut s = CompactionStrikes::new();
+        futile_pass(&mut s);
+        futile_pass(&mut s);
+        s.record_pass(THRESHOLD - 100, THRESHOLD, REAL_LIMIT);
+        s.observe_real_prompt_tokens(REAL_LIMIT as u64 - 1);
+        assert_eq!(
+            s.strikes(),
+            0,
+            "a genuinely effective pass resets the streak"
+        );
+        assert_eq!(s.gate(THRESHOLD + 500), CompactionGate::Proceed);
+    }
+
+    #[test]
+    fn usage_without_pending_verdict_is_ignored() {
+        // A random low usage reading (e.g. after a user rewind, or a
+        // usage-less turn later re-reporting) with no compaction pass armed
+        // must neither reset nor strike.
+        let mut s = CompactionStrikes::new();
+        futile_pass(&mut s);
+        futile_pass(&mut s);
+        s.observe_real_prompt_tokens(1);
+        assert_eq!(s.strikes(), 2, "unarmed usage reading must be a no-op");
+    }
+
+    #[test]
+    fn unreported_usage_consumes_the_verdict_without_scoring() {
+        // prompt_tokens == 0 means "not reported": the armed verdict is
+        // consumed (so it can't latch onto an unrelated later reading) but
+        // neither resets nor strikes.
+        let mut s = CompactionStrikes::new();
+        futile_pass(&mut s);
+        s.record_pass(THRESHOLD - 100, THRESHOLD, REAL_LIMIT);
+        s.observe_real_prompt_tokens(0);
+        assert_eq!(s.strikes(), 1);
+        // A later low reading must not reset via the stale verdict.
+        s.observe_real_prompt_tokens(1);
+        assert_eq!(s.strikes(), 1);
+    }
+
+    #[test]
+    fn gate_warns_once_then_skips_silently() {
+        let mut s = CompactionStrikes::new();
+        for _ in 0..MAX_INEFFECTIVE_COMPACTIONS {
+            futile_pass(&mut s);
+        }
+        assert_eq!(
+            s.gate(20_000),
+            CompactionGate::SkipEngaged,
+            "first gated attempt after the cap signals the warn-once entry"
+        );
+        assert_eq!(s.gate(20_000), CompactionGate::Skipping);
+        assert_eq!(s.gate(20_001), CompactionGate::Skipping);
+    }
+
+    #[test]
+    fn history_shrink_reopens_the_gate() {
+        let mut s = CompactionStrikes::new();
+        for _ in 0..MAX_INEFFECTIVE_COMPACTIONS {
+            futile_pass(&mut s);
+        }
+        assert_eq!(s.gate(20_000), CompactionGate::SkipEngaged);
+        assert_eq!(s.gate(20_000), CompactionGate::Skipping);
+        // History actually shrank (rewind / reactive compaction / trimming):
+        // the guard re-opens with a clean slate.
+        assert_eq!(s.gate(15_000), CompactionGate::Proceed);
+        assert_eq!(s.strikes(), 0);
+    }
+
+    // -- summarizer output-cap floor --
+
+    #[test]
+    fn compaction_llm_config_floors_small_output_caps() {
+        // A small primary cap truncates summaries mid-section on reasoning
+        // models — the summarizer client must get a generous floor.
+        let mut cfg = crate::config::Config::default();
+        cfg.llm.max_tokens = 1_024;
+        assert_eq!(
+            compaction_llm_config(&cfg).llm.max_tokens,
+            SUMMARY_OUTPUT_TOKENS_FLOOR
+        );
+
+        // An explicit compaction.max_tokens override is the operator saying
+        // "this is what the summarizer model can take" — flooring past a
+        // model's real output limit turns every summarizer call into a 400.
+        cfg.compaction.max_tokens = Some(512);
+        assert_eq!(
+            compaction_llm_config(&cfg).llm.max_tokens,
+            512,
+            "an explicit compaction.max_tokens override is respected verbatim"
+        );
+    }
+
+    #[test]
+    fn compaction_llm_config_keeps_generous_caps() {
+        let mut cfg = crate::config::Config::default();
+        cfg.llm.max_tokens = SUMMARY_OUTPUT_TOKENS_FLOOR * 2;
+        assert_eq!(
+            compaction_llm_config(&cfg).llm.max_tokens,
+            SUMMARY_OUTPUT_TOKENS_FLOOR * 2,
+            "the floor is raise-only"
+        );
     }
 
     #[test]

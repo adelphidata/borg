@@ -307,6 +307,8 @@ fn minimal_test_agent(config: Config) -> Agent {
         goal_event_sink: None,
         auto_title_spawned: false,
         active_failover_identity: None,
+        compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
+        stream_health: super::stream_handler::StreamHealth::new(),
     }
 }
 

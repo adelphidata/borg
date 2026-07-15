@@ -300,18 +300,22 @@ enum Commands {
         #[command(subcommand)]
         action: BackupCmd,
     },
-    /// Export a session to JSON (default), CSV, or TXT.
+    /// Export a session to JSON (default), CSV, TXT, or Markdown.
     ///
     /// With no `--output`, writes to stdout (pipeable into `jq`, files, etc.).
+    /// Secrets are redacted by default (fail-closed); `--no-redact` opts out.
     Export {
         /// Session ID (full UUID — use `/sessions` in the TUI to find one).
         session_id: String,
-        /// Output format: json (default), csv, txt.
+        /// Output format: json (default), csv, txt, md.
         #[arg(long, short, default_value = "json")]
         format: String,
         /// Write to a file instead of stdout.
         #[arg(long, short)]
         output: Option<std::path::PathBuf>,
+        /// Skip secret redaction and emit raw session content.
+        #[arg(long)]
+        no_redact: bool,
     },
 }
 
@@ -691,7 +695,8 @@ async fn async_main() -> Result<()> {
             session_id,
             format,
             output,
-        }) => commands::export::run_export(&session_id, &format, output)?,
+            no_redact,
+        }) => commands::export::run_export(&session_id, &format, output, no_redact)?,
         Some(Commands::Pair { action }) => match action {
             PairCmd::Show => commands::device_pair::run_show().await?,
             PairCmd::Complete {
@@ -1390,10 +1395,12 @@ mod tests {
                 session_id,
                 format,
                 output,
+                no_redact,
             }) => {
                 assert_eq!(session_id, "sess-abc");
                 assert_eq!(format, "json");
                 assert!(output.is_none());
+                assert!(!no_redact, "redaction must default ON");
             }
             _ => panic!("Expected Export"),
         }
@@ -1416,6 +1423,7 @@ mod tests {
                 session_id,
                 format,
                 output,
+                ..
             }) => {
                 assert_eq!(session_id, "sess-abc");
                 assert_eq!(format, "csv");
@@ -1441,6 +1449,21 @@ mod tests {
     #[test]
     fn test_parse_export_requires_session_id() {
         assert!(Cli::try_parse_from(["borg", "export"]).is_err());
+    }
+
+    #[test]
+    fn test_parse_export_markdown_with_no_redact() {
+        let cli =
+            Cli::try_parse_from(["borg", "export", "sess-md", "-f", "md", "--no-redact"]).unwrap();
+        match cli.command {
+            Some(Commands::Export {
+                format, no_redact, ..
+            }) => {
+                assert_eq!(format, "md");
+                assert!(no_redact);
+            }
+            _ => panic!("Expected Export"),
+        }
     }
 
     // ── Skills CLI parse tests ──
