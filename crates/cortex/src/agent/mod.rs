@@ -309,6 +309,11 @@ pub struct Agent {
     /// short-circuits turns once tripped. See
     /// [`stream_handler::StreamHealth`].
     pub(super) stream_health: stream_handler::StreamHealth,
+    /// When set (tool-spawned sub-agents), used as the OpenAI-family
+    /// `prompt_cache_key` instead of this agent's own session ID, so the
+    /// parent and its spawns — which share most of their prompt prefix —
+    /// route to the same provider cache shard.
+    pub(super) prompt_cache_scope: Option<String>,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -450,7 +455,28 @@ impl Agent {
             active_failover_identity: None,
             compaction_strikes: prompt_assembly::CompactionStrikes::new(),
             stream_health: stream_handler::StreamHealth::new(),
+            prompt_cache_scope: None,
         }
+    }
+
+    /// Route this agent's LLM requests to the given prompt-cache scope
+    /// (the spawning tree's root session) instead of its own session ID.
+    /// Also re-scopes this agent's own controller so any grandchildren it
+    /// spawns inherit the same scope rather than starting a new one.
+    pub fn set_prompt_cache_scope(&mut self, scope: String) {
+        if let Some(ref mut control) = self.agent_control {
+            control.set_prompt_cache_scope(scope.clone());
+        }
+        self.prompt_cache_scope = Some(scope);
+    }
+
+    /// OpenAI-family `prompt_cache_key` for this agent's requests: the
+    /// spawn-time scope when present (sub-agents share the parent session's
+    /// key), otherwise this agent's own session ID.
+    pub(super) fn prompt_cache_key(&self) -> String {
+        self.prompt_cache_scope
+            .clone()
+            .unwrap_or_else(|| self.session.meta.id.clone())
     }
 
     pub async fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
@@ -1057,7 +1083,7 @@ impl Agent {
                     .make_llm_client_from_config(&self.config)
                     .await
                     .context("Failed to initialize LLM client")?
-                    .with_prompt_cache_key(self.session.meta.id.clone());
+                    .with_prompt_cache_key(self.prompt_cache_key());
                 tokio::spawn(async move {
                     if let Err(e) = llm_client
                         .stream_chat_with_cancel(

@@ -224,6 +224,15 @@ impl SessionActor {
         Ok((text, raw))
     }
 
+    /// Issue an MCP `ping` as a liveness probe. The spec requires receivers
+    /// to respond promptly, so this is cheap. Callers should treat only
+    /// [`McpError::Timeout`] / [`McpError::TransportClosed`] as death — an
+    /// error *reply* (e.g. from a server that skipped implementing `ping`)
+    /// still proves the peer is alive and reading its stdin.
+    pub async fn ping(&mut self) -> Result<()> {
+        self.request(methods::PING, None).await.map(|_| ())
+    }
+
     /// Drain any notifications received while we were waiting on the last
     /// response. The supervisor calls this between requests so it can react
     /// to `tools/list_changed` without racing the next call.
@@ -679,6 +688,74 @@ mod tests {
         );
         assert_eq!(drained[0].0, SAMPLING_CREATE_MESSAGE);
         assert_eq!(drained[0].1, 9001);
+    }
+
+    #[tokio::test]
+    async fn ping_distinguishes_alive_error_reply_from_silence() {
+        // Liveness contract: a peer that RESPONDS to ping — even with a
+        // JSON-RPC error because it never implemented the method — is alive
+        // and must surface as a non-timeout error. A peer that stays silent
+        // must surface as Timeout so the supervisor can tear it down.
+
+        // Case 1: empty-result reply → Ok.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({})),
+            error: None,
+            params: None,
+        });
+        let mut session = SessionActor::new(
+            &manifest(),
+            Box::new(ScriptedTransport::new(
+                Arc::new(Mutex::new(Vec::new())),
+                inbound,
+            )),
+        );
+        session.ping().await.expect("empty-result reply is a pong");
+
+        // Case 2: method-not-found reply → Protocol error, NOT Timeout.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: None,
+            error: Some(crate::protocol::RpcError {
+                code: JSONRPC_METHOD_NOT_FOUND,
+                message: "ping not implemented".into(),
+                data: None,
+            }),
+            params: None,
+        });
+        let mut session = SessionActor::new(
+            &manifest(),
+            Box::new(ScriptedTransport::new(
+                Arc::new(Mutex::new(Vec::new())),
+                inbound,
+            )),
+        );
+        let err = session.ping().await.unwrap_err();
+        assert!(
+            matches!(err, McpError::Protocol(_)),
+            "an error reply proves the peer is alive; got {err:?}"
+        );
+
+        // Case 3: silent peer → Timeout (the supervisor's death signal).
+        let mut session = SessionActor::new(
+            &manifest(),
+            Box::new(ScriptedTransport::new(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(VecDeque::new())),
+            )),
+        );
+        let err = session.ping().await.unwrap_err();
+        assert!(
+            matches!(err, McpError::Timeout { .. }),
+            "silence must surface as Timeout; got {err:?}"
+        );
     }
 
     #[tokio::test]

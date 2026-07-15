@@ -119,6 +119,11 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
                         "type": "string",
                         "description": "Override the model for this agent"
                     },
+                    "thinking": {
+                        "type": "string",
+                        "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"],
+                        "description": "Override the thinking/reasoning effort for this agent (default: inherit). Use low for mechanical subtasks, high+ for hard analysis."
+                    },
                     "fork_context": {
                         "type": "boolean",
                         "description": "If true, copies current conversation history to the sub-agent"
@@ -142,7 +147,8 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
                                 "role": {"type": "string"},
                                 "role_kind": {"type": "string", "enum": ["leaf", "orchestrator"]},
                                 "toolsets": {"type": "array", "items": {"type": "string"}},
-                                "model": {"type": "string"}
+                                "model": {"type": "string"},
+                                "thinking": {"type": "string", "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"]}
                             },
                             "required": ["goal"]
                         }
@@ -278,6 +284,7 @@ pub async fn handle_spawn_agent(
     let context_top = args["context"].as_str();
     let nickname = args["nickname"].as_str();
     let model_override = args["model"].as_str();
+    let thinking_override = parse_thinking_arg(args.get("thinking"))?;
     let fork_context = args["fork_context"].as_bool().unwrap_or(false);
     let blocking = args["blocking"].as_bool().unwrap_or(false);
     let timeout_secs = args["timeout_secs"]
@@ -322,6 +329,8 @@ pub async fn handle_spawn_agent(
                 role_kind: per_task_kind,
                 toolsets: parse_string_array(t.get("toolsets")).or_else(|| toolsets_top.clone()),
                 model_override: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
+                thinking_override: parse_thinking_arg(t.get("thinking"))?
+                    .or_else(|| thinking_override.clone()),
             });
         }
 
@@ -380,6 +389,7 @@ pub async fn handle_spawn_agent(
                 toolsets_top.as_deref(),
                 nickname,
                 model_override,
+                thinking_override,
                 parent_config,
                 fork,
                 Some(&blocklist),
@@ -411,6 +421,7 @@ pub async fn handle_spawn_agent(
             toolsets_top.as_deref(),
             nickname,
             model_override,
+            thinking_override,
             parent_config,
             fork,
             Some(&blocklist),
@@ -424,6 +435,24 @@ pub async fn handle_spawn_agent(
         "status": "spawned"
     })
     .to_string())
+}
+
+/// Parse an optional `thinking` arg into a [`ThinkingLevel`]. Absent/null
+/// means "inherit from parent". An unknown level is a hard error — silently
+/// mapping a typo to Off would run the child at the wrong effort with no
+/// signal to the caller.
+fn parse_thinking_arg(
+    v: Option<&serde_json::Value>,
+) -> Result<Option<crate::config::ThinkingLevel>> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    serde_json::from_value(v.clone()).map(Some).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid 'thinking' value {v}: expected one of off, minimal, low, medium, \
+             high, xhigh, adaptive, max"
+        )
+    })
 }
 
 /// Parse a JSON array of strings out of a tool-call argument value.
@@ -701,6 +730,30 @@ mod tests {
         }
         // `manage_roles` is depth-independent (metadata, not delegation).
         assert!(names.contains(&"manage_roles"));
+    }
+
+    /// `thinking` arg contract: absent/null inherits (None), valid levels
+    /// parse, and a typo is a hard error — NOT a silent downgrade to Off,
+    /// which would run the child at the wrong effort with no signal.
+    #[test]
+    fn parse_thinking_arg_inherits_parses_and_rejects() {
+        use crate::config::ThinkingLevel;
+        assert_eq!(parse_thinking_arg(None).unwrap(), None);
+        assert_eq!(
+            parse_thinking_arg(Some(&serde_json::Value::Null)).unwrap(),
+            None,
+            "JSON null must mean inherit, not error"
+        );
+        assert_eq!(
+            parse_thinking_arg(Some(&serde_json::json!("minimal"))).unwrap(),
+            Some(ThinkingLevel::Minimal)
+        );
+        let err = parse_thinking_arg(Some(&serde_json::json!("ultra")))
+            .expect_err("unknown level must be a hard error");
+        assert!(
+            err.to_string().contains("minimal"),
+            "error must list the valid levels so the model can self-correct: {err}"
+        );
     }
 
     /// `parse_string_array` distinguishes Absent (None) from Empty

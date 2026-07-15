@@ -78,6 +78,28 @@ pub fn load_skills_context(
     // Exclude disabled skills from context injection entirely
     let skills: Vec<Skill> = skills.into_iter().filter(|s| !s.disabled).collect();
 
+    // Shadow-mode lexical selection: record what a relevance-gated selector
+    // WOULD have injected this turn versus the full catalog we inject today.
+    // Metrics only — behavior is unchanged until accumulated real-usage data
+    // shows selection wouldn't starve turns of skills they actually needed.
+    // Gated on the log level: it re-formats and re-scores every skill, work
+    // the budget loop below already does, so it must not run when nobody
+    // will read the result.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let shadow = shadow_selection_stats(&skills, user_request);
+        debug!(
+            total = shadow.total,
+            relevant = shadow.relevant,
+            all_tokens = shadow.all_tokens,
+            relevant_tokens = shadow.relevant_tokens,
+            "skill shadow-selection: lexical selector would inject {}/{} skills (~{}/{} metadata tokens)",
+            shadow.relevant,
+            shadow.total,
+            shadow.relevant_tokens,
+            shadow.all_tokens,
+        );
+    }
+
     // Sort metadata so relevant available skills consume the budget first.
     let mut sorted_skills = skills;
     sorted_skills.sort_by(|a, b| {
@@ -192,6 +214,42 @@ fn normalized_skill_terms(skill: &Skill) -> Vec<String> {
     ];
     terms.extend(skill.manifest.triggers.iter().map(|t| t.to_lowercase()));
     terms
+}
+
+/// What a lexical skill selector WOULD have injected this turn, versus what
+/// injecting the full catalog costs. Shadow-only: computed and logged from
+/// `load_skills_context`, never used to gate injection — that decision needs
+/// evidence from real conversations first.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShadowSelectionStats {
+    /// Enabled skills considered this turn.
+    pub total: usize,
+    /// Skills a lexical selector would keep (relevance score > 0).
+    pub relevant: usize,
+    /// Estimated metadata tokens for the relevant subset.
+    pub relevant_tokens: usize,
+    /// Estimated metadata tokens for full injection (what we pay today).
+    pub all_tokens: usize,
+}
+
+/// Compute [`ShadowSelectionStats`] for this turn's request over the enabled
+/// skill set, using the same `skill_relevance_score` that already orders
+/// budget consumption — so the shadow numbers reflect the selector we would
+/// actually ship.
+pub(crate) fn shadow_selection_stats(skills: &[Skill], user_request: &str) -> ShadowSelectionStats {
+    let mut stats = ShadowSelectionStats {
+        total: skills.len(),
+        ..Default::default()
+    };
+    for skill in skills {
+        let tokens = estimate_tokens(&skill.format_at_level(SkillLoadLevel::Metadata));
+        stats.all_tokens += tokens;
+        if skill_relevance_score(skill, user_request) > 0 {
+            stats.relevant += 1;
+            stats.relevant_tokens += tokens;
+        }
+    }
+    stats
 }
 
 pub(super) fn skill_relevance_score(skill: &Skill, user_request: &str) -> u32 {

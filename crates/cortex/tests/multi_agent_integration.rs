@@ -84,6 +84,7 @@ async fn context_and_goal_reach_llm_as_structured_preamble() {
             None, // toolsets
             None, // nickname
             None, // model_override
+            None, // thinking_override
             &parent_cfg,
             None, // fork_context
             None, // tools_blocklist
@@ -171,6 +172,7 @@ async fn heartbeat_events_fire_while_child_runs() {
             None,
             None,
             None,
+            None,
             &parent_cfg,
             None,
             None,
@@ -238,6 +240,7 @@ async fn stalled_event_fires_after_threshold_idle_cycles() {
             None,
             None,
             None,
+            None,
             &parent_cfg,
             None,
             None,
@@ -291,6 +294,7 @@ async fn model_override_takes_precedence_over_parent_model() {
             None,
             None,
             Some("override-model-name"),
+            None,
             &parent_cfg,
             None,
             None,
@@ -350,6 +354,7 @@ async fn orchestrator_role_gets_spawn_agent_tool() {
             None,
             None,
             AgentRoleKind::Orchestrator,
+            None,
             None,
             None,
             None,
@@ -430,6 +435,7 @@ async fn leaf_role_never_gets_spawn_agent_even_with_kill_switch_on() {
             None,
             None,
             None,
+            None,
             &parent_cfg,
             None,
             Some(&blocklist_refs),
@@ -489,6 +495,7 @@ async fn heartbeat_interval_zero_disables_events() {
             None,
             None,
             AgentRoleKind::Leaf,
+            None,
             None,
             None,
             None,

@@ -1983,3 +1983,57 @@ fn bundled_vs_user_skill_returns_none_without_local_copy() {
     // A non-bundled name → None regardless of disk state.
     assert!(bundled_vs_user_skill("no-such-bundled-skill", tmp.path()).is_none());
 }
+
+/// Shadow-selection contract: the stats must reflect what a lexical selector
+/// would actually keep — trigger-matched skills counted with their metadata
+/// token cost, unmatched skills counted only toward the full-injection total,
+/// and an empty request selecting nothing. These numbers drive the future
+/// decision to gate skill injection on relevance; if they drift from the
+/// real scorer's behavior the accumulated evidence is worthless.
+#[test]
+fn shadow_selection_stats_reflect_lexical_relevance() {
+    let mk = |name: &str, triggers: &[&str]| Skill {
+        manifest: SkillManifest {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            triggers: triggers.iter().map(|t| t.to_string()).collect(),
+            requires: SkillRequires::default(),
+            os: vec![],
+            install: std::collections::HashMap::new(),
+            category: None,
+            ..Default::default()
+        },
+        body: "body".to_string(),
+        source: SkillSource::BuiltIn,
+        available: true,
+        disabled: false,
+        references: Vec::new(),
+        scripts: Vec::new(),
+    };
+    let skills = vec![
+        mk("deployer", &["deploy the app"]),
+        mk("forecaster", &["weather forecast"]),
+    ];
+
+    let stats = super::context::shadow_selection_stats(&skills, "please deploy the app now");
+    assert_eq!(stats.total, 2);
+    assert_eq!(stats.relevant, 1, "only the trigger-matched skill is kept");
+    assert!(
+        stats.relevant_tokens > 0 && stats.relevant_tokens < stats.all_tokens,
+        "kept subset must cost less than full injection \
+         ({} vs {} tokens)",
+        stats.relevant_tokens,
+        stats.all_tokens
+    );
+
+    let empty = super::context::shadow_selection_stats(&skills, "   ");
+    assert_eq!(
+        (empty.relevant, empty.relevant_tokens),
+        (0, 0),
+        "an empty request must select nothing"
+    );
+    assert_eq!(
+        empty.all_tokens, stats.all_tokens,
+        "full-injection cost is independent of the request"
+    );
+}

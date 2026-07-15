@@ -478,6 +478,8 @@ pub mod methods {
     pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
     /// `notifications/message` (server → client log notification).
     pub const LOGGING_MESSAGE: &str = "notifications/message";
+    /// `ping` request (either direction; receiver must respond promptly).
+    pub const PING: &str = "ping";
 }
 
 /// Decode a single inbound JSON line into a [`Message`]. Returns a typed

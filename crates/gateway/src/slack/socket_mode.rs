@@ -48,6 +48,11 @@ const MIN_BACKOFF: Duration = Duration::from_millis(500);
 /// Max backoff cap. Slack docs suggest capping reconnect at ~30s; we cap
 /// lower so an outage doesn't leave the agent silent for half a minute.
 const MAX_BACKOFF: Duration = Duration::from_secs(20);
+/// Reconnect if no frame (of any kind) arrives within this window. Slack
+/// pings every few seconds, so a healthy socket never comes close; a
+/// half-open TCP connection would otherwise hang until the OS timeout
+/// (minutes) with the channel silently dead.
+const IDLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// One Socket Mode envelope as delivered by the Slack WebSocket.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -206,7 +211,7 @@ where
             }
         };
 
-        match run_session(&url, &mut handler, &mut shutdown).await {
+        match run_session(&url, &mut handler, &mut shutdown, IDLE_DEADLINE).await {
             Ok(SessionEnd::Shutdown) => return Ok(()),
             Ok(SessionEnd::Reconnect) => {
                 attempt = 0; // successful session resets backoff
@@ -234,6 +239,7 @@ async fn run_session<F>(
     url: &str,
     handler: &mut F,
     shutdown: &mut mpsc::Receiver<()>,
+    idle_deadline: Duration,
 ) -> Result<SessionEnd>
 where
     F: FnMut(SocketEnvelope) -> Dispatch + Send,
@@ -243,10 +249,22 @@ where
         .context("WebSocket connect failed")?;
     let (mut sink, mut stream) = ws.split();
 
+    // Liveness: `stream.next()` on a half-open connection pends forever —
+    // Slack's server pings never stop on a healthy socket, so silence means
+    // the peer is gone even though the OS hasn't noticed yet.
+    let idle = tokio::time::sleep(idle_deadline);
+    tokio::pin!(idle);
+
     loop {
         tokio::select! {
+            // `biased` so a ready frame always beats an elapsed idle timer.
+            // Under random selection, a handler or ack send that stalls past
+            // the deadline could let the idle branch win with live traffic
+            // already buffered — a spurious reconnect on a healthy socket.
+            biased;
             _ = shutdown.recv() => return Ok(SessionEnd::Shutdown),
             msg = stream.next() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 let Some(msg) = msg else { return Ok(SessionEnd::Reconnect) };
                 let msg = msg.context("WebSocket read failed")?;
                 let text = match msg {
@@ -307,6 +325,12 @@ where
                         debug!("Slack Socket Mode: handler dropped envelope {envelope_id}");
                     }
                 }
+            }
+            _ = idle.as_mut() => {
+                warn!(
+                    "Slack Socket Mode: no frame in {idle_deadline:?}; assuming half-open socket, reconnecting"
+                );
+                return Ok(SessionEnd::Reconnect);
             }
         }
     }
@@ -459,6 +483,101 @@ mod tests {
         assert_eq!(env.envelope_type, "hello");
         assert!(env.envelope_id.is_none());
         assert!(env.reason.is_none());
+    }
+
+    // ─── Integration tests: run_session against a stub WebSocket server ───
+
+    /// Spawn a stub WebSocket server; the provided closure drives one
+    /// accepted connection. Returns the `ws://` URL to connect to.
+    async fn stub_ws_server<Fut>(
+        drive: impl FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+    ) -> String
+    where
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            drive(ws).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn silent_socket_reconnects_at_idle_deadline() {
+        // Server sends hello then goes silent WITHOUT closing — the
+        // half-open-connection failure mode. The session must give up at the
+        // idle deadline instead of pending on the read forever.
+        let url = stub_ws_server(|mut ws| async move {
+            ws.send(Message::Text(r#"{"type":"hello"}"#.into()))
+                .await
+                .unwrap();
+            // Hold the socket open, silent, longer than the deadline.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+
+        let (_tx, mut shutdown) = mpsc::channel::<()>(1);
+        let mut handler = |_env: SocketEnvelope| Dispatch::Ack;
+        let end = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_session(
+                &url,
+                &mut handler,
+                &mut shutdown,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("session must end at the idle deadline, not hang")
+        .unwrap();
+        assert!(matches!(end, SessionEnd::Reconnect));
+    }
+
+    #[tokio::test]
+    async fn inbound_frames_reset_the_idle_deadline() {
+        // Server sends a frame every 50ms for 250ms, then goes silent. The
+        // 400ms deadline is 8× the send gap, so surviving it reflects a real
+        // timer reset rather than CI scheduling slack.
+        let url = stub_ws_server(|mut ws| async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                ws.send(Message::Text(r#"{"type":"hello"}"#.into()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+
+        let (_tx, mut shutdown) = mpsc::channel::<()>(1);
+        let mut handler = |_env: SocketEnvelope| Dispatch::Ack;
+        let started = std::time::Instant::now();
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                &url,
+                &mut handler,
+                &mut shutdown,
+                Duration::from_millis(400),
+            ),
+        )
+        .await
+        .expect("session must end after traffic stops")
+        .unwrap();
+        assert!(matches!(end, SessionEnd::Reconnect));
+        // Without the reset the session would end ~400ms after connect. The
+        // last frame lands at ~250ms, so surviving past 500ms means the timer
+        // restarted on inbound traffic.
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "session ended at {:?} — idle deadline was not reset by traffic",
+            started.elapsed()
+        );
     }
 
     // ─── Integration test: open_connection_url against a stub HTTP server ───

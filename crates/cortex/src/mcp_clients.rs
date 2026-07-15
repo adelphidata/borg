@@ -69,6 +69,22 @@ static MAX_RESPONSE_BYTES: std::sync::atomic::AtomicUsize =
 /// fail-closed-on-zero convention at [`try_consume_rate_token`].
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Idle gap after which the session actor probes the server with an MCP
+/// `ping`. A hung-but-alive server (process running, event loop wedged)
+/// otherwise sits undetected until the next tool call burns a full
+/// `call_timeout` in the user's critical path. Atomic (not const) so tests
+/// can shrink it; production never mutates it.
+///
+/// A call enqueued while a ping is in flight waits behind it, so a
+/// slow-but-alive ping (up to `call_timeout`) plus the call's own
+/// `call_timeout` can exceed the dispatcher's outer `call_timeout + 5s`
+/// watchdog and surface as a spurious "did not reply". The window is narrow
+/// (it needs a server that is slow enough to nearly time out a ping yet
+/// still answer) and the failure is a clear per-call error, not corruption —
+/// bump the outer deadline if it ever shows up in practice.
+static IDLE_PING_INTERVAL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(60_000);
+
 /// Headroom multiple applied to the display cap to derive the *transport*
 /// buffer ceiling. The display cap (`MAX_RESPONSE_BYTES`) bounds how much of a
 /// parsed response we hand the LLM; the transport must still buffer the whole
@@ -1480,6 +1496,109 @@ async fn audit_registrations(server_name: &str, outcomes: &[ToolRegistrationOutc
     }
 }
 
+/// Tear down a dead session: emit the audit row, drop the sender from the
+/// global map so future dispatches fail fast with an operator-readable
+/// error, and unregister the server's tools. Re-init requires the operator
+/// to `borg settings set` or restart the daemon; auto-reconnect lives in a
+/// follow-up.
+async fn teardown_dead_session(
+    server_name: &str,
+    registry: &McpRegistry,
+    reason: &str,
+    error_kind: &str,
+) {
+    tracing::warn!(
+        server = %server_name,
+        reason,
+        "MCP session dead; tearing down (re-init requires daemon restart)",
+    );
+    crate::db::try_emit_global(
+        crate::db::audit_events::MCP_SERVER_FAILED,
+        server_name,
+        &serde_json::json!({
+            "server": server_name,
+            "phase": "runtime",
+            "reason": reason,
+            // Matches `McpError::kind()` — a stable audit string contract.
+            // Keeps `error_kind` present across all failure rows.
+            "error_kind": error_kind,
+            "reauth_required": false,
+        }),
+    )
+    .await;
+    if let Ok(mut map) = session_map().lock() {
+        map.remove(server_name);
+    }
+    registry.drop_server(server_name);
+}
+
+/// Drain everything the peer pushed at us during the last round-trip:
+/// refused server-initiated requests (audited) and notifications (a
+/// `tools/list_changed` triggers a re-list).
+///
+/// Called after *every* round-trip — tool calls and idle liveness pings
+/// alike. Draining only after calls would delay sampling-refusal audit rows
+/// indefinitely on an idle session (and lose them entirely if it were later
+/// torn down while idle), and would let a chatty peer evict a
+/// `tools/list_changed` from the capped notification buffer before we ever
+/// acted on it.
+async fn drain_peer_side_traffic(
+    session: &mut SessionActor,
+    server_name: &str,
+    registry: &McpRegistry,
+    filter: &mcp::manifest::ToolFilter,
+    builtin: &[String],
+) {
+    // The protocol layer already replied with -32601; we emit one audit row
+    // per refusal so an operator can SEE that a server tried to drive the
+    // borg LLM. Silence here would hide a determined hostile peer.
+    for (method, _id) in session.drain_refused_server_requests() {
+        crate::db::try_emit_global(
+            crate::db::audit_events::MCP_SAMPLING_REFUSED,
+            server_name,
+            &serde_json::json!({
+                "server": server_name,
+                "method": method,
+            }),
+        )
+        .await;
+    }
+
+    let needs_relist = session
+        .drain_notifications()
+        .iter()
+        .any(|n| n.method.as_deref() == Some(mcp::protocol::methods::TOOLS_LIST_CHANGED));
+    if !needs_relist {
+        return;
+    }
+    // A `tools/list_changed` re-lists so newly advertised tools become
+    // callable without a reconnect.
+    match session.list_tools().await {
+        Ok(discovered) => {
+            let builtin_refs: Vec<&str> = builtin.iter().map(String::as_str).collect();
+            let outcomes = registry.replace_server_tools(
+                server_name,
+                &discovered.tools,
+                filter,
+                &builtin_refs,
+            );
+            audit_registrations(server_name, &outcomes).await;
+            tracing::debug!(
+                server = %server_name,
+                count = discovered.tools.len(),
+                "MCP server tool list refreshed after list_changed",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                server = %server_name,
+                error = %e,
+                "MCP tools/list refresh failed after list_changed",
+            );
+        }
+    }
+}
+
 async fn run_session_task(
     mut session: SessionActor,
     server_name: String,
@@ -1488,7 +1607,48 @@ async fn run_session_task(
     filter: mcp::manifest::ToolFilter,
     builtin: Vec<String>,
 ) {
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let idle =
+            Duration::from_millis(IDLE_PING_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed));
+        let cmd = match tokio::time::timeout(idle, rx.recv()).await {
+            Ok(Some(cmd)) => cmd,
+            // All senders dropped: clean shutdown.
+            Ok(None) => break,
+            // No traffic for a full idle window: probe liveness. Any reply —
+            // even an error from a server that never implemented `ping` —
+            // proves the peer is alive; only silence (timeout) or a closed
+            // transport is death.
+            Err(_idle_elapsed) => {
+                match session.ping().await {
+                    Ok(()) => {}
+                    Err(
+                        e @ (mcp::errors::McpError::Timeout { .. }
+                        | mcp::errors::McpError::TransportClosed(_)),
+                    ) => {
+                        teardown_dead_session(
+                            &server_name,
+                            &registry,
+                            "idle liveness ping went unanswered",
+                            e.kind(),
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            server = %server_name,
+                            error = %e,
+                            "MCP liveness ping got an error reply (peer alive)",
+                        );
+                    }
+                }
+                // The ping is a full round-trip, so the peer may have pushed
+                // notifications or server-initiated requests at us during it.
+                drain_peer_side_traffic(&mut session, &server_name, &registry, &filter, &builtin)
+                    .await;
+                continue;
+            }
+        };
         match cmd {
             SessionCmd::Call {
                 original_name,
@@ -1527,60 +1687,8 @@ async fn run_session_task(
                     );
                 }
 
-                // Drain refused server-initiated requests (sampling, roots,
-                // …). The protocol layer already replied with -32601; we
-                // emit one audit row per refusal so an operator can SEE that
-                // a server tried to drive the borg LLM. Silence here would
-                // hide a determined hostile peer.
-                for (method, _id) in session.drain_refused_server_requests() {
-                    crate::db::try_emit_global(
-                        crate::db::audit_events::MCP_SAMPLING_REFUSED,
-                        &server_name,
-                        &serde_json::json!({
-                            "server": &server_name,
-                            "method": method,
-                        }),
-                    )
+                drain_peer_side_traffic(&mut session, &server_name, &registry, &filter, &builtin)
                     .await;
-                }
-
-                // Drain notifications that arrived during the call. A
-                // `tools/list_changed` triggers a re-list so newly
-                // advertised tools become callable without a reconnect.
-                let pending = session.drain_notifications();
-                let mut needs_relist = false;
-                for n in pending {
-                    if n.method.as_deref() == Some(mcp::protocol::methods::TOOLS_LIST_CHANGED) {
-                        needs_relist = true;
-                    }
-                }
-                if needs_relist {
-                    match session.list_tools().await {
-                        Ok(discovered) => {
-                            let builtin_refs: Vec<&str> =
-                                builtin.iter().map(String::as_str).collect();
-                            let outcomes = registry.replace_server_tools(
-                                &server_name,
-                                &discovered.tools,
-                                &filter,
-                                &builtin_refs,
-                            );
-                            audit_registrations(&server_name, &outcomes).await;
-                            tracing::debug!(
-                                server = %server_name,
-                                count = discovered.tools.len(),
-                                "MCP server tool list refreshed after list_changed",
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                server = %server_name,
-                                error = %e,
-                                "MCP tools/list refresh failed after list_changed",
-                            );
-                        }
-                    }
-                }
 
                 // Transport-level failure (e.g. streamable-HTTP 404 on a
                 // stale session id). Tear down: remove our sender from the
@@ -1590,31 +1698,16 @@ async fn run_session_task(
                 // Re-init requires the operator to `borg settings set` or
                 // restart the daemon; auto-reconnect lives in a follow-up.
                 if transport_dead {
-                    tracing::warn!(
-                        server = %server_name,
-                        "MCP transport closed; tearing down session (re-init requires daemon restart)",
-                    );
-                    crate::db::try_emit_global(
-                        crate::db::audit_events::MCP_SERVER_FAILED,
+                    // This branch is entered only on a transport-level
+                    // teardown, so the kind is fixed to match
+                    // `McpError::TransportClosed.kind()`.
+                    teardown_dead_session(
                         &server_name,
-                        &serde_json::json!({
-                            "server": &server_name,
-                            "phase": "runtime",
-                            "reason": "transport closed mid-session",
-                            // This branch is entered only on a transport-level
-                            // teardown, so the kind is fixed. Matches
-                            // `McpError::TransportClosed.kind()` — a stable audit
-                            // string contract. Keeps `error_kind` present across
-                            // all three failure rows.
-                            "error_kind": "transport_closed",
-                            "reauth_required": false,
-                        }),
+                        &registry,
+                        "transport closed mid-session",
+                        "transport_closed",
                     )
                     .await;
-                    if let Ok(mut map) = session_map().lock() {
-                        map.remove(&server_name);
-                    }
-                    registry.drop_server(&server_name);
                     break;
                 }
             }
@@ -1636,11 +1729,19 @@ pub mod testing {
 
     use super::*;
 
+    /// Override the idle liveness-ping interval. Tests shrink this so a
+    /// hung-server teardown can be observed in milliseconds instead of a
+    /// minute. `reset_all` restores the production default.
+    pub fn set_idle_ping_interval_ms(ms: u64) {
+        IDLE_PING_INTERVAL_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Clear every piece of process-global MCP state between tests. The
     /// `OnceLock`s themselves can't be reset, but their *interiors* can:
     /// drop every server's tools from the registry, drop every mpsc
     /// sender so the actor tasks exit, and empty the rate-limit buckets.
     pub fn reset_all() {
+        IDLE_PING_INTERVAL_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
         if let Some(reg) = REGISTRY.get() {
             let servers: Vec<String> = reg.status().servers.keys().cloned().collect();
             for s in servers {

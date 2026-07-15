@@ -309,7 +309,133 @@ fn minimal_test_agent(config: Config) -> Agent {
         active_failover_identity: None,
         compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
         stream_health: super::stream_handler::StreamHealth::new(),
+        prompt_cache_scope: None,
     }
+}
+
+/// A `[compaction]` override that stops working (retired model slug, dead
+/// key) must not wedge compaction forever. The summarizer bails without
+/// mutating history, so without a fallback every future turn stays over
+/// budget and repeats the failure. This drives the real path end-to-end:
+/// override client 404s → one retry with the primary client compacts.
+#[tokio::test]
+async fn compaction_retries_with_primary_model_when_override_fails() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // The `[compaction]` override model has been retired by the provider.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("dead-compaction-model"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    // The primary model still summarizes fine.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("live-primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "summary of earlier work"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    std::env::set_var("BORG_COMPACTION_FALLBACK_TEST_KEY", "test-key");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".into());
+    config.llm.model = "live-primary-model".into();
+    config.llm.base_url = Some(format!("{}/v1/chat/completions", server.uri()));
+    config.llm.api_key_env = "BORG_COMPACTION_FALLBACK_TEST_KEY".into();
+    config.llm.max_retries = 0;
+    config.compaction.model = Some("dead-compaction-model".into());
+    // Tiny budget so LLM compaction triggers on a small history; keep the
+    // pre-compaction memory flush out of the way (it would also hit the LLM).
+    config.conversation.max_history_tokens = 200;
+    config.memory.flush_before_compaction = false;
+
+    let mut agent = minimal_test_agent(config);
+    for i in 0..40 {
+        agent.history.push(crate::types::Message::user(format!(
+            "message {i}: {}",
+            "long filler text about ongoing work ".repeat(20)
+        )));
+    }
+    let before_len = agent.history.len();
+    let before_tokens = crate::conversation::history_tokens(&agent.history);
+    let budget = agent.effective_history_budget();
+    assert!(
+        before_tokens > budget,
+        "test setup: history ({before_tokens} tokens) must exceed budget ({budget})"
+    );
+
+    let (tx, _rx) = mpsc::channel(64);
+    agent
+        .compact_history_if_needed(&tx)
+        .await
+        .expect("compaction must not surface an error");
+
+    assert!(
+        agent.history.len() < before_len,
+        "override model failed, so the primary-model retry must have compacted \
+         history ({before_len} → {} messages)",
+        agent.history.len()
+    );
+}
+
+/// Sub-agents must reuse the spawning tree's prompt-cache key — parent and
+/// child share most of their prompt prefix, and OpenAI-family caches only hit
+/// when both `prompt_cache_key` and prefix match. A root agent (no scope)
+/// keys on its own session so unrelated sessions never share routing, and
+/// setting a scope must also re-scope the agent's controller — otherwise a
+/// depth-2 grandchild would be spawned under its immediate parent's session
+/// and silently land on a different cache shard than the rest of the tree.
+#[test]
+fn prompt_cache_scope_propagates_to_controller_for_grandchildren() {
+    let mut config = Config::default();
+    config.agents.enabled = true;
+    let mut agent = minimal_test_agent(config.clone());
+    let own_session = agent.session.meta.id.clone();
+    agent.agent_control = Some(crate::multi_agent::AgentControl::new(
+        &config.agents,
+        &own_session,
+        1,
+    ));
+
+    assert_eq!(
+        agent.prompt_cache_key(),
+        own_session,
+        "root agent must key the prompt cache on its own session"
+    );
+    assert_eq!(
+        agent
+            .agent_control
+            .as_ref()
+            .expect("control")
+            .prompt_cache_scope(),
+        own_session,
+        "unscoped controller hands children its own session"
+    );
+
+    agent.set_prompt_cache_scope("root-session-123".to_string());
+    assert_eq!(
+        agent.prompt_cache_key(),
+        "root-session-123",
+        "spawned agent must key the prompt cache on the tree's root session"
+    );
+    assert_eq!(
+        agent
+            .agent_control
+            .as_ref()
+            .expect("control")
+            .prompt_cache_scope(),
+        "root-session-123",
+        "controller must hand grandchildren the SAME root scope, not this \
+         agent's own session"
+    );
 }
 
 /// After a provider failover, the `<environment>` runtime line must report the

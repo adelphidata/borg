@@ -252,6 +252,8 @@ pub struct DelegatedTask {
     pub toolsets: Option<Vec<String>>,
     /// Optional model override for this specific child.
     pub model_override: Option<String>,
+    /// Optional thinking-level override for this specific child.
+    pub thinking_override: Option<crate::config::ThinkingLevel>,
 }
 
 /// Result delivered from a sub-agent to its parent.
@@ -376,6 +378,11 @@ pub struct AgentControl {
     _max_concurrent: u32,
     name_pool: names::NamePool,
     parent_session_id: String,
+    /// Prompt-cache scope to hand to children. Defaults to
+    /// `parent_session_id`; a sub-agent's own controller is re-scoped to the
+    /// value its agent was spawned under, so a whole tree — not just each
+    /// parent/child pair — shares one `prompt_cache_key`.
+    prompt_cache_scope: Option<String>,
     current_depth: u32,
     /// Optional broadcast bus. Lifecycle events publish here when set so the
     /// gRPC `SubscribeAgentTreeEvents` stream can fan them out to operators.
@@ -419,9 +426,25 @@ impl AgentControl {
             _max_concurrent: config.max_concurrent,
             name_pool: names::NamePool::new(),
             parent_session_id: parent_session_id.to_string(),
+            prompt_cache_scope: None,
             current_depth,
             bus: None,
         }
+    }
+
+    /// Re-scope the prompt cache for children spawned by this controller.
+    /// Called when the owning agent is itself a sub-agent, so grandchildren
+    /// inherit the root's scope rather than starting a new one at each level.
+    pub fn set_prompt_cache_scope(&mut self, scope: String) {
+        self.prompt_cache_scope = Some(scope);
+    }
+
+    /// The scope children of this controller should key their prompt cache
+    /// on: the inherited scope when set, else this controller's own session.
+    pub fn prompt_cache_scope(&self) -> &str {
+        self.prompt_cache_scope
+            .as_deref()
+            .unwrap_or(&self.parent_session_id)
     }
 
     /// Attach an event bus. Subsequent state mutations publish to it.
@@ -470,6 +493,7 @@ impl AgentControl {
         &self,
         role: Option<&AgentRole>,
         model_override: Option<&str>,
+        thinking_override: Option<crate::config::ThinkingLevel>,
         parent_config: &Config,
     ) -> Config {
         let mut child_config = parent_config.clone();
@@ -501,6 +525,14 @@ impl AgentControl {
         // Layer 1: explicit per-call override wins above all.
         if let Some(model) = model_override {
             child_config.llm.model = model.to_string();
+        }
+        if let Some(thinking) = thinking_override {
+            child_config.llm.thinking = thinking;
+            // Per-model `thinking_overrides` entries beat the global
+            // `thinking` field in `effective_thinking`, so an inherited map
+            // would silently defeat an explicit per-spawn override. Clearing
+            // it is what makes "explicit wins above all" true for thinking.
+            child_config.llm.thinking_overrides.clear();
         }
 
         // Sub-agent execution policy. The parent's deny list always carries
@@ -647,6 +679,7 @@ impl AgentControl {
         toolsets: Option<&[String]>,
         nickname: Option<&str>,
         model_override: Option<&str>,
+        thinking_override: Option<crate::config::ThinkingLevel>,
         parent_config: &Config,
         fork_context: Option<&[crate::types::Message]>,
         tools_blocklist: Option<&[&str]>,
@@ -663,8 +696,12 @@ impl AgentControl {
             .map_or("default", |r| r.name.as_str())
             .to_string();
 
-        let child_config =
-            self.build_sub_agent_config(role.as_ref(), model_override, parent_config);
+        let child_config = self.build_sub_agent_config(
+            role.as_ref(),
+            model_override,
+            thinking_override,
+            parent_config,
+        );
 
         let child_depth = self.current_depth + 1;
         let max_spawn_depth = self.max_spawn_depth;
@@ -709,6 +746,7 @@ impl AgentControl {
             tools_filter,
             bus: self.bus.clone(),
             info: info.clone(),
+            prompt_cache_scope: self.prompt_cache_scope().to_string(),
             semaphore: self.semaphore.clone(),
             completion_tx: self.completion_tx.clone(),
         };
@@ -1003,6 +1041,7 @@ impl AgentControl {
         toolsets: Option<&[String]>,
         nickname: Option<&str>,
         model_override: Option<&str>,
+        thinking_override: Option<crate::config::ThinkingLevel>,
         parent_config: &Config,
         fork_context: Option<&[crate::types::Message]>,
         tools_blocklist: Option<&[&str]>,
@@ -1017,6 +1056,7 @@ impl AgentControl {
                 toolsets,
                 nickname,
                 model_override,
+                thinking_override,
                 parent_config,
                 fork_context,
                 tools_blocklist,
@@ -1068,6 +1108,7 @@ impl AgentControl {
                     task.toolsets.as_deref(),
                     None,
                     task.model_override.as_deref(),
+                    task.thinking_override.clone(),
                     parent_config,
                     None,
                     Some(&per_task_refs),
@@ -1894,7 +1935,7 @@ mod sub_agent_surface_tests {
         };
 
         let ctrl = AgentControl::new(&cfg, "p", 0);
-        let child = ctrl.build_sub_agent_config(None, None, &parent);
+        let child = ctrl.build_sub_agent_config(None, None, None, &parent);
         assert_eq!(
             child.policy.auto_approve,
             vec!["*".to_string()],
@@ -1923,23 +1964,62 @@ mod sub_agent_surface_tests {
         let ctrl = AgentControl::new(&MultiAgentConfig::default(), "p", 0);
 
         // No role, no override → delegation_model takes over.
-        let c1 = ctrl.build_sub_agent_config(None, None, &parent);
+        let c1 = ctrl.build_sub_agent_config(None, None, None, &parent);
         assert_eq!(c1.llm.model, "delegation-default");
 
         // Role with model → role wins over delegation_model.
-        let c2 = ctrl.build_sub_agent_config(Some(&role_with_model), None, &parent);
+        let c2 = ctrl.build_sub_agent_config(Some(&role_with_model), None, None, &parent);
         assert_eq!(c2.llm.model, "role-model");
 
         // Explicit override → wins over both.
-        let c3 =
-            ctrl.build_sub_agent_config(Some(&role_with_model), Some("explicit-model"), &parent);
+        let c3 = ctrl.build_sub_agent_config(
+            Some(&role_with_model),
+            Some("explicit-model"),
+            None,
+            &parent,
+        );
         assert_eq!(c3.llm.model, "explicit-model");
 
         // No role, no override, no delegation_model → parent's model.
         let mut parent_no_delegation = parent.clone();
         parent_no_delegation.agents.delegation_model = None;
-        let c4 = ctrl.build_sub_agent_config(None, None, &parent_no_delegation);
+        let c4 = ctrl.build_sub_agent_config(None, None, None, &parent_no_delegation);
         assert_eq!(c4.llm.model, "parent-model");
+    }
+
+    /// The per-spawn thinking override must decide the child's *effective*
+    /// level — what the request builders actually resolve via
+    /// `effective_thinking` — not merely the raw `llm.thinking` field. An
+    /// inherited per-model `thinking_overrides` entry beats that field, so
+    /// asserting the field alone would pass while the child silently ran at
+    /// the operator's model-pinned effort instead of the caller's.
+    #[test]
+    fn build_sub_agent_config_thinking_override_beats_inherited_model_map() {
+        use crate::config::ThinkingLevel;
+        let mut parent = Config::default();
+        parent.llm.model = "gpt-5".into();
+        parent.llm.thinking = ThinkingLevel::Medium;
+        // Operator pins gpt-5 to High — this is what silently won before.
+        parent
+            .llm
+            .thinking_overrides
+            .insert("gpt-5".into(), ThinkingLevel::High);
+        let ctrl = AgentControl::new(&MultiAgentConfig::default(), "p", 0);
+
+        let inherited = ctrl.build_sub_agent_config(None, None, None, &parent);
+        assert_eq!(
+            inherited.llm.effective_thinking(&inherited.llm.model),
+            ThinkingLevel::High,
+            "no override → child inherits the operator's per-model pin"
+        );
+
+        let overridden =
+            ctrl.build_sub_agent_config(None, None, Some(ThinkingLevel::Minimal), &parent);
+        assert_eq!(
+            overridden.llm.effective_thinking(&overridden.llm.model),
+            ThinkingLevel::Minimal,
+            "explicit per-spawn override must win over the inherited per-model map"
+        );
     }
 
     /// `extract_apply_patch_paths` is what populates `files_written` from

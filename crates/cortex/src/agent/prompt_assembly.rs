@@ -586,7 +586,23 @@ Rules:
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
-            let dropped_count = self.run_llm_compaction(max_hist, &compaction_llm).await;
+            let mut dropped_count = self.run_llm_compaction(max_hist, &compaction_llm).await;
+
+            // A `[compaction]` override that stops working (retired model
+            // slug, dead key) would otherwise wedge compaction forever: the
+            // summarizer bails without mutating history, history stays over
+            // budget, and every future turn repeats the failure. Retry once
+            // with the primary client before giving up for this turn.
+            if dropped_count == 0
+                && self.config.compaction.has_overrides()
+                && history_tokens(&self.history) > max_hist
+            {
+                warn!(
+                    "compaction via [compaction] override made no progress; retrying with the primary model"
+                );
+                let primary_llm = self.make_llm_client_from_config(&self.config).await?;
+                dropped_count = self.run_llm_compaction(max_hist, &primary_llm).await;
+            }
 
             // Score the pass for the anti-thrash guard. Still over the
             // trigger threshold → strike now; dipped under → defer the

@@ -254,6 +254,9 @@ pub(super) struct SubAgentSpawn {
     pub(super) tools_filter: Option<Vec<String>>,
     pub(super) bus: Option<AgentTreeBus>,
     pub(super) info: SubAgentInfo,
+    /// Prompt-cache scope inherited from the spawning controller — the root
+    /// session of this agent tree, not necessarily the immediate parent.
+    pub(super) prompt_cache_scope: String,
     pub(super) semaphore: Arc<Semaphore>,
     pub(super) completion_tx: mpsc::Sender<SubAgentCompletion>,
 }
@@ -283,6 +286,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         tools_filter,
         bus,
         info,
+        prompt_cache_scope,
         semaphore,
         completion_tx,
     } = spawn;
@@ -330,6 +334,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         files_written.clone(),
         bus,
         info,
+        prompt_cache_scope,
     )
     .await;
 
@@ -394,6 +399,7 @@ fn run_sub_agent(
     files_written: Arc<std::sync::Mutex<Vec<String>>>,
     bus: Option<AgentTreeBus>,
     info: SubAgentInfo,
+    prompt_cache_scope: String,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         use crate::agent::{Agent, AgentEvent};
@@ -406,6 +412,13 @@ fn run_sub_agent(
             tools_filter,
         )
         .await?;
+
+        // Share the spawning tree's prompt-cache key: parent and child
+        // requests carry a near-identical prompt prefix, and OpenAI-family
+        // caches only hit when both key and prefix match. The scope comes
+        // from the controller, so a whole tree keys on the root session
+        // rather than re-scoping at every level.
+        agent.set_prompt_cache_scope(prompt_cache_scope);
 
         // Inject fork context if provided
         if let Some(context_msgs) = fork_context {

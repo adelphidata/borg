@@ -2251,3 +2251,53 @@ async fn server_initiated_request_refusal_does_not_break_subsequent_dispatch() {
         "tool result must still be wrapped in the trust envelope; got: {out}",
     );
 }
+
+#[tokio::test]
+async fn hung_server_is_torn_down_by_idle_liveness_ping() {
+    // Spec: a hung-but-alive server (process running, event loop wedged)
+    // must not sit registered forever, burning a full call_timeout in the
+    // user's critical path on the next dispatch. After an idle window the
+    // session actor pings; unanswered ping → teardown, tools dropped, and
+    // future dispatches fail fast. Without the watchdog this test hangs
+    // at "never torn down" — the actor only ever failed reactively.
+    let _g = begin_test();
+    mcp_clients::testing::set_idle_ping_interval_ms(50);
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| tools_list(&[("search", well_formed_schema())])),
+        );
+        // No `ping` handler: after install the server answers nothing —
+        // recv() blocks forever, modeling the wedged-event-loop peer.
+    }
+
+    let cfg = enabled_config();
+    // Short call timeout so the unanswered ping is classified quickly.
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 100, vec![], vec![]);
+    mcp_clients::testing::install_session("hung", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+    assert_eq!(
+        mcp_clients::tool_definitions().len(),
+        1,
+        "tool must be registered before the hang is detected"
+    );
+
+    // Idle ping fires at ~50ms and its timeout expires ~100ms later; the
+    // generous deadline absorbs CI scheduling noise, not design slack.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !mcp_clients::tool_definitions().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hung server was never torn down by the liveness ping"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
