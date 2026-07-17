@@ -140,6 +140,13 @@ pub struct McpServerConfig {
     /// Per-server tool include/exclude/read-only/max.
     #[serde(default)]
     pub tools: mcp::manifest::ToolFilter,
+    /// Cache this stdio server's advertised tool catalog so a restart can
+    /// present its tools while the process starts in the background. Default:
+    /// true. Set false for a server whose catalog is generated per-run and
+    /// would be misleading if shown from the previous run. Ignored for
+    /// HTTP/SSE, which have no spawn cost to amortize.
+    #[serde(default = "default_true")]
+    pub cache_tools: bool,
 }
 
 fn default_true() -> bool {
@@ -543,6 +550,7 @@ mod tests {
             rate_limit_per_minute: 120,
             rate_limit_burst: 20,
             tools: mcp::manifest::ToolFilter::default(),
+            cache_tools: true,
         };
         let m = server
             .resolve_to_manifest("alpha", &Config::default())
@@ -597,6 +605,7 @@ mod tests {
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
             tools: mcp::manifest::ToolFilter::default(),
+            cache_tools: true,
         };
         let m = server
             .resolve_to_manifest("mtls", &Config::default())
@@ -636,6 +645,7 @@ mod tests {
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
             tools: mcp::manifest::ToolFilter::default(),
+            cache_tools: true,
         };
         let err = server
             .resolve_to_manifest("bad", &Config::default())

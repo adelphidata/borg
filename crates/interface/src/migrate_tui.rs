@@ -401,6 +401,18 @@ fn render_source(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) {
             "    ~/.openclaw/  (OpenClaw)",
             theme::dim(),
         )));
+        lines.push(Line::from(Span::styled(
+            "    ~/.claude/  (Claude Code — memory)",
+            theme::dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "    ~/.cursor/rules  (Cursor — rules)",
+            theme::dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "    ~/.codex/AGENTS.md  (AGENTS.md CLI — instructions)",
+            theme::dim(),
+        )));
     } else {
         for (i, source) in state.available_sources.iter().enumerate() {
             let selected = i == state.selected_source;

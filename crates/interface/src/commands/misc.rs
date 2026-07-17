@@ -7,6 +7,12 @@ pub(crate) enum MigrateSubcommand {
     Hermes,
     /// Migrate from OpenClaw (~/.openclaw/)
     Claw,
+    /// Import memory from Claude Code (~/.claude/)
+    Claude,
+    /// Import rules from Cursor (~/.cursor/)
+    Cursor,
+    /// Import instructions from an AGENTS.md-based CLI (~/.codex/)
+    Agents,
 }
 
 #[derive(Subcommand)]
@@ -55,6 +61,15 @@ pub(crate) async fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Resul
         }
         Some(MigrateSubcommand::Claw) => {
             run_migrate_direct(cortex::migrate::MigrationSource::OpenClaw).await
+        }
+        Some(MigrateSubcommand::Claude) => {
+            run_migrate_direct(cortex::migrate::MigrationSource::ClaudeCode).await
+        }
+        Some(MigrateSubcommand::Cursor) => {
+            run_migrate_direct(cortex::migrate::MigrationSource::Cursor).await
+        }
+        Some(MigrateSubcommand::Agents) => {
+            run_migrate_direct(cortex::migrate::MigrationSource::AgentsMd).await
         }
     }
 }

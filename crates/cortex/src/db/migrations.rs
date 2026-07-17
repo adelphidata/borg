@@ -220,6 +220,26 @@ impl Database {
         Ok(())
     }
 
+    /// Cache of stdio MCP servers' advertised tool catalogs, so a restart can
+    /// present tools while the server process is still starting. See
+    /// `db::mcp_catalog_cache` for why the key is a keyed MAC.
+    pub(super) async fn migrate_v10(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mcp_catalog_cache (
+                    config_hash TEXT PRIMARY KEY,
+                    server_name TEXT NOT NULL,
+                    tools_json  TEXT NOT NULL,
+                    server_info TEXT,
+                    cached_at   INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_mcp_catalog_cache_server
+                    ON mcp_catalog_cache(server_name);",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn migrate_v8(&self) -> Result<()> {
         let mut rows = self.conn.query("PRAGMA table_info(messages)", ()).await?;
         let mut existing = std::collections::HashSet::new();
@@ -1201,6 +1221,21 @@ CREATE TABLE IF NOT EXISTS web_search_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched_at
     ON web_search_cache(fetched_at);
+
+-- MCP tool catalog cache ---------------------------------------------------
+-- Lets a restart advertise a stdio server's tools while its process is still
+-- starting. `config_hash` is a keyed MAC of the resolved config (see
+-- `db::mcp_catalog_cache`) — resolved env carries secrets, so only the MAC is
+-- stored, never the values.
+CREATE TABLE IF NOT EXISTS mcp_catalog_cache (
+    config_hash TEXT PRIMARY KEY,
+    server_name TEXT NOT NULL,
+    tools_json  TEXT NOT NULL,
+    server_info TEXT,
+    cached_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_catalog_cache_server
+    ON mcp_catalog_cache(server_name);
 
 -- Output redaction audit ---------------------------------------------------
 -- Records *that* a secret was redacted from agent output (channels / TUI /

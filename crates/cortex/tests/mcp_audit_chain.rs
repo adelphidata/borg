@@ -126,6 +126,7 @@ fn server_config() -> McpServerConfig {
             read_only: vec![],
             max: ToolFilter::DEFAULT_MAX,
         },
+        cache_tools: true,
     }
 }
 

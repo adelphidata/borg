@@ -3,6 +3,8 @@ mod environment;
 use environment::format_skill_info;
 pub use environment::{collect_required_env_vars, collect_skill_env, install_skill_deps};
 
+mod selectors;
+
 mod types;
 #[cfg(test)]
 use types::{check_os_requirements, check_requirements};

@@ -190,6 +190,7 @@ pub(crate) async fn add(args: AddArgs) -> Result<()> {
             max: args.max_tools,
             ..Default::default()
         },
+        cache_tools: true,
     };
     persist_server(&args.id, server, args.force).await?;
     println!("Added MCP server `{}`.", args.id);
@@ -582,6 +583,7 @@ fn preset_to_config(name: &str, fs_root: Option<&str>) -> Result<McpServerConfig
         rate_limit_per_minute: p.rate_limit_per_minute,
         rate_limit_burst: p.rate_limit_burst,
         tools: ToolFilter::default(),
+        cache_tools: true,
     })
 }
 

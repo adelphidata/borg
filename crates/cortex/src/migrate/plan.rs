@@ -93,14 +93,13 @@ fn build_credential_changes(data: &SourceData, borg_data_dir: &Path) -> Vec<Stri
         .collect()
 }
 
-fn build_memory_changes(
-    data: &SourceData,
-    borg_data_dir: &Path,
-) -> Vec<(std::path::PathBuf, String)> {
+/// Imports whose destination doesn't already exist. This is what makes a
+/// re-import a no-op instead of a duplicate.
+fn build_memory_changes(data: &SourceData, borg_data_dir: &Path) -> Vec<super::MemoryImport> {
     let memory_dir = borg_data_dir.join("memory");
     data.memory_files
         .iter()
-        .filter(|(_, dest)| !memory_dir.join(dest).exists())
+        .filter(|import| !memory_dir.join(&import.dest_rel).exists())
         .cloned()
         .collect()
 }
@@ -198,8 +197,16 @@ mod tests {
 
         let data = SourceData {
             memory_files: vec![
-                (dir.path().join("src.md"), "hermes-MEMORY.md".into()),
-                (dir.path().join("src2.md"), "hermes-USER.md".into()),
+                crate::migrate::MemoryImport::global(
+                    dir.path().join("src.md"),
+                    "hermes-MEMORY.md",
+                    "hermes",
+                ),
+                crate::migrate::MemoryImport::global(
+                    dir.path().join("src2.md"),
+                    "hermes-USER.md",
+                    "hermes",
+                ),
             ],
             ..Default::default()
         };
@@ -208,7 +215,54 @@ mod tests {
         let plan = build_plan(MigrationSource::Hermes, &data, &config, dir.path());
 
         assert_eq!(plan.memory_files.len(), 1);
-        assert_eq!(plan.memory_files[0].1, "hermes-USER.md");
+        assert_eq!(plan.memory_files[0].dest_rel, "hermes-USER.md");
+    }
+
+    /// Idempotency has to hold for scoped imports too — their dest is a
+    /// subpath, and an exists-check that only understood flat names would
+    /// re-import (and re-stamp) every project memory on every run.
+    #[test]
+    fn build_plan_skips_existing_scoped_memory() {
+        let dir = TempDir::new().unwrap();
+        let scope_dir = dir.path().join("memory/scopes/my-proj");
+        std::fs::create_dir_all(&scope_dir).unwrap();
+        std::fs::write(scope_dir.join("claude-fact.md"), "existing").unwrap();
+
+        let data = SourceData {
+            memory_files: vec![
+                crate::migrate::MemoryImport::scoped(
+                    dir.path().join("fact.md"),
+                    "my-proj",
+                    "claude-fact.md",
+                    "claude-code",
+                ),
+                crate::migrate::MemoryImport::scoped(
+                    dir.path().join("other.md"),
+                    "my-proj",
+                    "claude-other.md",
+                    "claude-code",
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let plan = build_plan(
+            MigrationSource::ClaudeCode,
+            &data,
+            &default_config(),
+            dir.path(),
+        );
+
+        assert_eq!(
+            plan.memory_files.len(),
+            1,
+            "the already-imported scoped file must be skipped: {:?}",
+            plan.memory_files
+        );
+        assert_eq!(
+            plan.memory_files[0].dest_rel,
+            "scopes/my-proj/claude-other.md"
+        );
     }
 
     #[test]

@@ -6,6 +6,9 @@ use crate::constants::MEMORY_INDEX_FILE;
 
 use super::{ConfigChange, MigrationCategories, MigrationSource, SourceData};
 
+/// Provenance label stamped into imported memory files.
+const ORIGIN: &str = "openclaw";
+
 // API key vars are handled by hermes::parse_env_content (shared .env parser).
 
 /// Parse OpenClaw data from its default location.
@@ -342,14 +345,20 @@ fn parse_memory(root: &Path, data: &mut SourceData) {
 
     let memory_md = workspace.join(MEMORY_INDEX_FILE);
     if memory_md.exists() {
-        data.memory_files
-            .push((memory_md, "openclaw-MEMORY.md".to_string()));
+        data.memory_files.push(super::MemoryImport::global(
+            memory_md,
+            "openclaw-MEMORY.md",
+            ORIGIN,
+        ));
     }
 
     let user_md = workspace.join("USER.md");
     if user_md.exists() {
-        data.memory_files
-            .push((user_md, "openclaw-USER.md".to_string()));
+        data.memory_files.push(super::MemoryImport::global(
+            user_md,
+            "openclaw-USER.md",
+            ORIGIN,
+        ));
     }
 
     // Also check workspace/memory/*.md
@@ -361,7 +370,8 @@ fn parse_memory(root: &Path, data: &mut SourceData) {
                 if path.extension().is_some_and(|e| e == "md") {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         let dest = format!("openclaw-{name}");
-                        data.memory_files.push((path, dest));
+                        data.memory_files
+                            .push(super::MemoryImport::global(path, dest, ORIGIN));
                     }
                 }
             }
@@ -603,15 +613,15 @@ mod tests {
         assert!(data
             .memory_files
             .iter()
-            .any(|(_, d)| d == "openclaw-MEMORY.md"));
+            .any(|i| i.dest_rel == "openclaw-MEMORY.md"));
         assert!(data
             .memory_files
             .iter()
-            .any(|(_, d)| d == "openclaw-USER.md"));
+            .any(|i| i.dest_rel == "openclaw-USER.md"));
         assert!(data
             .memory_files
             .iter()
-            .any(|(_, d)| d == "openclaw-daily.md"));
+            .any(|i| i.dest_rel == "openclaw-daily.md"));
     }
 
     #[test]

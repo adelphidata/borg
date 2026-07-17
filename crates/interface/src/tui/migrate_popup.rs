@@ -326,6 +326,18 @@ impl MigratePopup {
                 "   ~/.openclaw/  (OpenClaw)",
                 theme::dim(),
             )));
+            lines.push(Line::from(Span::styled(
+                "   ~/.claude/  (Claude Code — memory)",
+                theme::dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   ~/.cursor/rules  (Cursor — rules)",
+                theme::dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   ~/.codex/AGENTS.md  (AGENTS.md CLI — instructions)",
+                theme::dim(),
+            )));
         } else {
             for (i, source) in self.available_sources.iter().enumerate() {
                 let selected = i == self.source_cursor;

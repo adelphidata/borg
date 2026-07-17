@@ -6,6 +6,9 @@ use crate::constants::MEMORY_INDEX_FILE;
 
 use super::{ConfigChange, MigrationCategories, MigrationSource, SourceData};
 
+/// Provenance label stamped into imported memory files.
+const ORIGIN: &str = "hermes";
+
 /// Known API key env var names to look for in .env files.
 const API_KEY_VARS: &[&str] = &[
     "OPENROUTER_API_KEY",
@@ -225,22 +228,31 @@ fn parse_memory(root: &Path, data: &mut SourceData) {
     // MEMORY.md
     let memory_md = memories_dir.join(MEMORY_INDEX_FILE);
     if memory_md.exists() {
-        data.memory_files
-            .push((memory_md, "hermes-MEMORY.md".to_string()));
+        data.memory_files.push(super::MemoryImport::global(
+            memory_md,
+            "hermes-MEMORY.md",
+            ORIGIN,
+        ));
     }
 
     // USER.md
     let user_md = memories_dir.join("USER.md");
     if user_md.exists() {
-        data.memory_files
-            .push((user_md, "hermes-USER.md".to_string()));
+        data.memory_files.push(super::MemoryImport::global(
+            user_md,
+            "hermes-USER.md",
+            ORIGIN,
+        ));
     }
 
     // Also check root-level MEMORY.md (some installations)
     let root_memory = root.join(MEMORY_INDEX_FILE);
     if root_memory.exists() && !memories_dir.join(MEMORY_INDEX_FILE).exists() {
-        data.memory_files
-            .push((root_memory, "hermes-MEMORY.md".to_string()));
+        data.memory_files.push(super::MemoryImport::global(
+            root_memory,
+            "hermes-MEMORY.md",
+            ORIGIN,
+        ));
     }
 }
 
@@ -424,8 +436,11 @@ UNRELATED_KEY=should-be-ignored
         assert!(data
             .memory_files
             .iter()
-            .any(|(_, d)| d == "hermes-MEMORY.md"));
-        assert!(data.memory_files.iter().any(|(_, d)| d == "hermes-USER.md"));
+            .any(|i| i.dest_rel == "hermes-MEMORY.md"));
+        assert!(data
+            .memory_files
+            .iter()
+            .any(|i| i.dest_rel == "hermes-USER.md"));
     }
 
     #[test]

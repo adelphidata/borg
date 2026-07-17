@@ -52,6 +52,7 @@ async fn http_startup_retries_transient_503_up_to_the_configured_bound() {
         rate_limit_per_minute: 60,
         rate_limit_burst: 10,
         tools: ToolFilter::default(),
+        cache_tools: true,
     };
     cfg.mcp.servers.insert("flaky".into(), sc);
 

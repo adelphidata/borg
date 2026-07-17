@@ -9,6 +9,7 @@ mod goals;
 mod handoff;
 mod issue_state;
 mod maintenance;
+pub mod mcp_catalog_cache;
 mod memory;
 mod meta;
 mod migrations;
@@ -719,7 +720,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 9;
+    const CURRENT_VERSION: u32 = 10;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -808,8 +809,11 @@ impl Database {
         if current < 9 {
             self.migrate_v9().await?;
         }
+        if current < 10 {
+            self.migrate_v10().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 9,
+            Database::CURRENT_VERSION == 10,
             "add the new migrate_vN call above and bump this constant",
         );
 

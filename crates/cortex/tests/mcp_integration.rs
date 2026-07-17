@@ -201,6 +201,7 @@ fn server_config(read_only: Vec<&str>, per_min: u32, burst: u32) -> McpServerCon
             read_only: read_only.into_iter().map(String::from).collect(),
             max: ToolFilter::DEFAULT_MAX,
         },
+        cache_tools: true,
     }
 }
 
@@ -231,6 +232,7 @@ fn server_config_tuned(
             read_only: vec![],
             max: per_server_max,
         },
+        cache_tools: true,
     }
 }
 

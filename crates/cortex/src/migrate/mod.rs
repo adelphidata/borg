@@ -1,5 +1,11 @@
+/// Parser for `AGENTS.md`-based CLI data directories.
+pub mod agents_md;
 /// Apply a migration plan to the local Borg data directory.
 pub mod apply;
+/// Parser for Claude Code data directories.
+pub mod claude_code;
+/// Parser for Cursor rules directories.
+pub mod cursor;
 /// Parser for Hermes Agent data directories.
 pub mod hermes;
 /// Parser for OpenClaw data directories.
@@ -7,7 +13,7 @@ pub mod openclaw;
 /// Build a dry-run migration plan from parsed source data.
 pub mod plan;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which tool to migrate from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +22,22 @@ pub enum MigrationSource {
     Hermes,
     /// OpenClaw data directory (~/.openclaw).
     OpenClaw,
+    /// Claude Code data directory (~/.claude).
+    ClaudeCode,
+    /// Cursor data directory (~/.cursor).
+    Cursor,
+    /// A CLI that keeps its user-level instructions in an `AGENTS.md`.
+    AgentsMd,
 }
+
+/// Every source, in the order pickers present them.
+const ALL_SOURCES: [MigrationSource; 5] = [
+    MigrationSource::Hermes,
+    MigrationSource::OpenClaw,
+    MigrationSource::ClaudeCode,
+    MigrationSource::Cursor,
+    MigrationSource::AgentsMd,
+];
 
 impl MigrationSource {
     /// Human-readable display name for this source.
@@ -24,6 +45,9 @@ impl MigrationSource {
         match self {
             Self::Hermes => "Hermes Agent",
             Self::OpenClaw => "OpenClaw",
+            Self::ClaudeCode => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::AgentsMd => "AGENTS.md CLI",
         }
     }
 
@@ -33,21 +57,137 @@ impl MigrationSource {
         match self {
             Self::Hermes => home.join(".hermes"),
             Self::OpenClaw => home.join(".openclaw"),
+            Self::ClaudeCode => home.join(".claude"),
+            Self::Cursor => home.join(".cursor"),
+            Self::AgentsMd => home.join(".codex"),
         }
     }
 
-    /// Returns true if the source tool's data directory exists.
+    /// Returns true if this source has anything to migrate on this system.
+    ///
+    /// The memory-only sources probe for the specific files they import rather
+    /// than the directory: `~/.cursor` and `~/.claude` exist on plenty of
+    /// machines that have no rules or memories in them, and offering an import
+    /// that would copy nothing is just noise in the picker.
     pub fn is_installed(&self) -> bool {
-        self.data_dir().is_dir()
+        match self {
+            Self::Hermes | Self::OpenClaw => self.data_dir().is_dir(),
+            Self::ClaudeCode => claude_code::has_importable(&self.data_dir()),
+            Self::Cursor => cursor::has_importable(&self.data_dir()),
+            Self::AgentsMd => agents_md::has_importable(&self.data_dir()),
+        }
     }
 }
 
 /// Detect which migration sources are available on this system.
 pub fn detect_sources() -> Vec<MigrationSource> {
-    [MigrationSource::Hermes, MigrationSource::OpenClaw]
+    ALL_SOURCES
         .into_iter()
         .filter(MigrationSource::is_installed)
         .collect()
+}
+
+/// One memory/rules file to import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryImport {
+    /// File to read.
+    pub source: PathBuf,
+    /// Destination relative to `~/.borg/memory/`. May contain
+    /// `scopes/<scope>/` path segments.
+    pub dest_rel: String,
+    /// Project scope this belongs to; `None` for globally-loaded memory.
+    pub scope: Option<String>,
+    /// Where it came from, stamped into the imported file so its origin
+    /// survives the copy.
+    pub origin: &'static str,
+}
+
+impl MemoryImport {
+    /// A globally-scoped import.
+    pub fn global(source: PathBuf, dest_rel: impl Into<String>, origin: &'static str) -> Self {
+        Self {
+            source,
+            dest_rel: dest_rel.into(),
+            scope: None,
+            origin,
+        }
+    }
+
+    /// An import that only loads when `memory.memory_scope` matches `scope`.
+    pub fn scoped(
+        source: PathBuf,
+        scope: impl Into<String>,
+        file_name: &str,
+        origin: &'static str,
+    ) -> Self {
+        let scope = scope.into();
+        Self {
+            source,
+            dest_rel: format!("scopes/{scope}/{file_name}"),
+            scope: Some(scope),
+            origin,
+        }
+    }
+}
+
+/// Turn an external project key into a scope slug Borg can load.
+///
+/// External tools key projects by encoded absolute path
+/// (`-Users-me-src-proj`); Borg scopes are plain identifiers. Runs of
+/// non-alphanumerics collapse to a single `-` so the result stays readable
+/// and, more importantly, stable — two projects must not collide.
+pub fn scope_slug(project_key: &str) -> String {
+    let mut out = String::with_capacity(project_key.len());
+    let mut last_dash = true; // trims leading separators
+    for c in project_key.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Collect `*.md` files under `dir`, recursively, sorted for deterministic
+/// plans. Symlinks are skipped: an import should copy the tool's own files,
+/// not follow a link out of the directory it was pointed at.
+pub(crate) fn collect_markdown(dir: &Path, out: &mut Vec<(PathBuf, String)>, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let nested = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            collect_markdown(&path, out, &nested);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            let rel = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            out.push((path, rel));
+        }
+    }
 }
 
 /// What categories of data to migrate.
@@ -119,8 +259,8 @@ pub struct SourceData {
     pub config_changes: Vec<ConfigChange>,
     /// Env var credentials: (VAR_NAME, value).
     pub credentials: Vec<(String, String)>,
-    /// Memory files to copy: (source_path, dest_relative_path).
-    pub memory_files: Vec<(PathBuf, String)>,
+    /// Memory/rules files to import.
+    pub memory_files: Vec<MemoryImport>,
     /// Persona file source path (if found).
     pub persona_file: Option<PathBuf>,
     /// Skill directories to copy: (source_path, dest_name).
@@ -155,8 +295,8 @@ pub struct MigrationPlan {
     pub config_changes: Vec<PlanChange>,
     /// Credential env var names to add.
     pub credentials_to_add: Vec<String>,
-    /// Memory files to copy: (source_path, dest_relative_path).
-    pub memory_files: Vec<(PathBuf, String)>,
+    /// Memory/rules files to import.
+    pub memory_files: Vec<MemoryImport>,
     /// Persona/identity file source path, if found.
     pub persona_file: Option<PathBuf>,
     /// Skill directories to copy: (source_path, dest_name).
@@ -220,8 +360,14 @@ impl MigrationPlan {
 
         if !self.memory_files.is_empty() {
             lines.push("Memory files:".to_string());
-            for (_, dest) in &self.memory_files {
-                lines.push(format!("  {dest}"));
+            for import in &self.memory_files {
+                lines.push(format!("  {}", import.dest_rel));
+            }
+            if self.memory_files.iter().any(|i| i.scope.is_some()) {
+                lines.push(
+                    "  (scoped entries load when memory.memory_scope is set to that scope)"
+                        .to_string(),
+                );
             }
             lines.push(String::new());
         }
@@ -293,6 +439,9 @@ pub fn parse_source(
     match source {
         MigrationSource::Hermes => hermes::parse(categories),
         MigrationSource::OpenClaw => openclaw::parse(categories),
+        MigrationSource::ClaudeCode | MigrationSource::Cursor | MigrationSource::AgentsMd => {
+            parse_source_from(source, &source.data_dir(), categories)
+        }
     }
 }
 
@@ -305,6 +454,9 @@ pub fn parse_source_from(
     match source {
         MigrationSource::Hermes => hermes::parse_from(root, categories),
         MigrationSource::OpenClaw => openclaw::parse_from(root, categories),
+        MigrationSource::ClaudeCode => claude_code::parse_from(root, categories),
+        MigrationSource::Cursor => cursor::parse_from(root, categories),
+        MigrationSource::AgentsMd => agents_md::parse_from(root, categories),
     }
 }
 
@@ -316,6 +468,34 @@ mod tests {
     fn migration_source_labels() {
         assert_eq!(MigrationSource::Hermes.label(), "Hermes Agent");
         assert_eq!(MigrationSource::OpenClaw.label(), "OpenClaw");
+        assert_eq!(MigrationSource::ClaudeCode.label(), "Claude Code");
+        assert_eq!(MigrationSource::Cursor.label(), "Cursor");
+        assert_eq!(MigrationSource::AgentsMd.label(), "AGENTS.md CLI");
+    }
+
+    /// Slugs key Borg's scope directories, so two distinct projects must never
+    /// collapse onto one — that would merge unrelated projects' memories.
+    #[test]
+    fn scope_slug_normalizes_without_collapsing_distinct_projects() {
+        assert_eq!(scope_slug("-Users-me-src-Proj"), "users-me-src-proj");
+        assert_eq!(scope_slug("/Users/me/src/proj"), "users-me-src-proj");
+        // Leading/trailing/repeated separators are trimmed, not carried.
+        assert_eq!(scope_slug("--foo__bar--"), "foo-bar");
+        assert_ne!(scope_slug("-Users-me-a"), scope_slug("-Users-me-b"));
+        // Degenerate keys produce an empty slug, which parsers must skip.
+        assert_eq!(scope_slug("---"), "");
+    }
+
+    #[test]
+    fn memory_import_scoped_lands_under_its_scope_dir() {
+        let import = MemoryImport::scoped(
+            PathBuf::from("/src/fact.md"),
+            "my-proj",
+            "claude-fact.md",
+            "claude-code",
+        );
+        assert_eq!(import.dest_rel, "scopes/my-proj/claude-fact.md");
+        assert_eq!(import.scope.as_deref(), Some("my-proj"));
     }
 
     #[test]

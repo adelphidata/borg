@@ -10,6 +10,7 @@ use crate::config::SkillsConfig;
 use crate::memory::tokenizer::estimate_tokens;
 
 use super::loader::load_all_skills;
+use super::selectors::{lexical_relevance, SkillSelectionDoc, SHADOW_SELECTORS};
 use super::types::{Skill, SkillLoadLevel};
 
 /// Diagnostic report from `load_skills_context` describing what fit, what was
@@ -78,8 +79,8 @@ pub fn load_skills_context(
     // Exclude disabled skills from context injection entirely
     let skills: Vec<Skill> = skills.into_iter().filter(|s| !s.disabled).collect();
 
-    // Shadow-mode lexical selection: record what a relevance-gated selector
-    // WOULD have injected this turn versus the full catalog we inject today.
+    // Shadow-mode selection: record what each relevance-gated selector WOULD
+    // have injected this turn versus the full catalog we inject today.
     // Metrics only — behavior is unchanged until accumulated real-usage data
     // shows selection wouldn't starve turns of skills they actually needed.
     // Gated on the log level: it re-formats and re-scores every skill, work
@@ -87,17 +88,24 @@ pub fn load_skills_context(
     // will read the result.
     if tracing::enabled!(tracing::Level::DEBUG) {
         let shadow = shadow_selection_stats(&skills, user_request);
-        debug!(
-            total = shadow.total,
-            relevant = shadow.relevant,
-            all_tokens = shadow.all_tokens,
-            relevant_tokens = shadow.relevant_tokens,
-            "skill shadow-selection: lexical selector would inject {}/{} skills (~{}/{} metadata tokens)",
-            shadow.relevant,
-            shadow.total,
-            shadow.relevant_tokens,
-            shadow.all_tokens,
-        );
+        for method in &shadow.methods {
+            debug!(
+                method = method.method,
+                total = shadow.total,
+                selected = method.selected,
+                all_tokens = shadow.all_tokens,
+                selected_tokens = method.selected_tokens,
+                query_truncated = method.query_truncated,
+                candidate_set_truncated = method.candidate_set_truncated,
+                top = ?method.top,
+                "skill shadow-selection: {} would inject {}/{} skills (~{}/{} metadata tokens)",
+                method.method,
+                method.selected,
+                shadow.total,
+                method.selected_tokens,
+                shadow.all_tokens,
+            );
+        }
     }
 
     // Sort metadata so relevant available skills consume the budget first.
@@ -207,16 +215,7 @@ pub fn load_skills_context(
     Ok((rendered, report))
 }
 
-fn normalized_skill_terms(skill: &Skill) -> Vec<String> {
-    let mut terms = vec![
-        skill.manifest.name.to_lowercase(),
-        skill.manifest.description.to_lowercase(),
-    ];
-    terms.extend(skill.manifest.triggers.iter().map(|t| t.to_lowercase()));
-    terms
-}
-
-/// What a lexical skill selector WOULD have injected this turn, versus what
+/// What each shadow selection method WOULD have injected this turn, versus what
 /// injecting the full catalog costs. Shadow-only: computed and logged from
 /// `load_skills_context`, never used to gate injection — that decision needs
 /// evidence from real conversations first.
@@ -224,67 +223,92 @@ fn normalized_skill_terms(skill: &Skill) -> Vec<String> {
 pub(crate) struct ShadowSelectionStats {
     /// Enabled skills considered this turn.
     pub total: usize,
-    /// Skills a lexical selector would keep (relevance score > 0).
-    pub relevant: usize,
-    /// Estimated metadata tokens for the relevant subset.
-    pub relevant_tokens: usize,
     /// Estimated metadata tokens for full injection (what we pay today).
     pub all_tokens: usize,
+    /// One entry per method in [`SHADOW_SELECTORS`], in declaration order.
+    pub methods: Vec<MethodShadowStats>,
 }
 
+/// One selection method's shadow result for a turn.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MethodShadowStats {
+    /// Stable metrics identifier, e.g. `fielded_bm25_v1`.
+    pub method: &'static str,
+    /// Skills this method would keep.
+    pub selected: usize,
+    /// Estimated metadata tokens for the kept subset.
+    pub selected_tokens: usize,
+    /// The query hit a bound.
+    pub query_truncated: bool,
+    /// The catalog hit a bound.
+    pub candidate_set_truncated: bool,
+    /// Highest-ranked names, for eyeballing agreement between methods.
+    pub top: Vec<String>,
+}
+
+/// Names logged per method. Enough to compare methods at a glance without
+/// turning one turn's log line into a wall of text.
+const SHADOW_TOP_N: usize = 5;
+
 /// Compute [`ShadowSelectionStats`] for this turn's request over the enabled
-/// skill set, using the same `skill_relevance_score` that already orders
-/// budget consumption — so the shadow numbers reflect the selector we would
-/// actually ship.
+/// skill set. Every method sees the same docs and the same per-skill metadata
+/// cost, so their numbers are directly comparable.
 pub(crate) fn shadow_selection_stats(skills: &[Skill], user_request: &str) -> ShadowSelectionStats {
-    let mut stats = ShadowSelectionStats {
+    let docs: Vec<SkillSelectionDoc<'_>> = skills
+        .iter()
+        .enumerate()
+        .map(|(id, s)| SkillSelectionDoc {
+            id,
+            name: &s.manifest.name,
+            triggers: &s.manifest.triggers,
+            description: &s.manifest.description,
+        })
+        .collect();
+    // Metadata formatting is the expensive part; do it once and reuse it for
+    // every method's token total.
+    let token_costs: Vec<usize> = skills
+        .iter()
+        .map(|s| estimate_tokens(&s.format_at_level(SkillLoadLevel::Metadata)))
+        .collect();
+
+    let methods = SHADOW_SELECTORS
+        .iter()
+        .map(|selector| {
+            let outcome = selector.select(user_request, &docs, skills.len());
+            MethodShadowStats {
+                method: selector.method(),
+                selected: outcome.candidate_ids.len(),
+                selected_tokens: outcome
+                    .candidate_ids
+                    .iter()
+                    .map(|id| token_costs[*id])
+                    .sum(),
+                query_truncated: outcome.query_truncated,
+                candidate_set_truncated: outcome.candidate_set_truncated,
+                top: outcome
+                    .candidate_ids
+                    .iter()
+                    .take(SHADOW_TOP_N)
+                    .map(|id| skills[*id].manifest.name.clone())
+                    .collect(),
+            }
+        })
+        .collect();
+
+    ShadowSelectionStats {
         total: skills.len(),
-        ..Default::default()
-    };
-    for skill in skills {
-        let tokens = estimate_tokens(&skill.format_at_level(SkillLoadLevel::Metadata));
-        stats.all_tokens += tokens;
-        if skill_relevance_score(skill, user_request) > 0 {
-            stats.relevant += 1;
-            stats.relevant_tokens += tokens;
-        }
+        all_tokens: token_costs.iter().sum(),
+        methods,
     }
-    stats
 }
 
 pub(super) fn skill_relevance_score(skill: &Skill, user_request: &str) -> u32 {
-    if user_request.trim().is_empty() {
-        return 0;
-    }
-
-    let request = user_request.to_lowercase();
-    let mut score = 0;
-
-    for trigger in &skill.manifest.triggers {
-        let trigger = trigger.trim().to_lowercase();
-        if trigger.is_empty() {
-            continue;
-        }
-        if request.contains(&trigger) {
-            score += 10;
-        } else if trigger
-            .split_whitespace()
-            .all(|word| !word.is_empty() && request.contains(word))
-        {
-            score += 5;
-        }
-    }
-
-    for term in normalized_skill_terms(skill) {
-        if term.is_empty() {
-            continue;
-        }
-        if request.contains(&term) {
-            score += 3;
-        }
-    }
-
-    score
+    lexical_relevance(
+        &skill.manifest.name,
+        &skill.manifest.description,
+        &skill.manifest.triggers,
+        user_request,
+    )
 }
 
 // `collect_skill_env`, `collect_required_env_vars`, `install_skill_deps`,

@@ -13,8 +13,15 @@ use unicode_width::UnicodeWidthChar;
 use super::highlight;
 use super::theme;
 
-/// Tab stops are rendered as 4 columns wide.
-const TAB_WIDTH: usize = 4;
+/// Literal tabs are replaced with this at span construction, so no rendered
+/// buffer carries a `\t`. Emitting the tab instead would let the terminal
+/// expand it at its own tab stops (commonly 8), which no longer matches the
+/// width this module used to lay the row out — the gutter and every wrap point
+/// would drift.
+const TAB_REPLACEMENT: &str = "    ";
+/// Tab stops are rendered as 4 columns wide. Kept in sync with
+/// [`TAB_REPLACEMENT`] by construction.
+const TAB_WIDTH: usize = TAB_REPLACEMENT.len();
 /// Continuation rows from line wrapping are indented by this many spaces so
 /// the wrap visually belongs to the row above.
 const WRAP_CONTINUATION_INDENT: usize = 2;
@@ -274,7 +281,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
                     )));
                 }
                 lines.push(Line::from(Span::styled(
-                    raw.to_string(),
+                    expand_tabs(raw),
                     theme::diff_hunk_style(),
                 )));
                 hunks_in_file += 1;
@@ -294,7 +301,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
         // a leading space as "context" (would swallow arbitrary prose).
         if !in_file {
             flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
-            lines.push(Line::from(Span::styled(raw.to_string(), theme::dim())));
+            lines.push(Line::from(Span::styled(expand_tabs(raw), theme::dim())));
             continue;
         }
 
@@ -312,7 +319,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
                     DiffKind::Remove => (Some(old_lineno), None),
                     DiffKind::Context => (Some(old_lineno), Some(new_lineno)),
                 };
-                let body = raw.get(1..).unwrap_or("").to_string();
+                let body = expand_tabs(raw.get(1..).unwrap_or(""));
                 body_buf.push(BufferedBody {
                     kind: k,
                     body,
@@ -331,7 +338,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
             }
             None => {
                 flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
-                lines.push(Line::from(Span::styled(raw.to_string(), theme::dim())));
+                lines.push(Line::from(Span::styled(expand_tabs(raw), theme::dim())));
             }
         }
     }
@@ -357,7 +364,19 @@ pub fn render_patch_wrapped(patch: &str, width: usize) -> Vec<Line<'static>> {
     wrap_lines(render_patch(patch), width)
 }
 
+/// Replace literal tabs with [`TAB_REPLACEMENT`]. `render_patch` runs every
+/// piece of patch text through this before it becomes a span.
+fn expand_tabs(s: &str) -> String {
+    if s.contains('\t') {
+        s.replace('\t', TAB_REPLACEMENT)
+    } else {
+        s.to_string()
+    }
+}
+
 /// Width of `c` in terminal columns: tab counts as 4, control/zero-width as 0.
+/// `render_patch` output no longer contains tabs, but [`wrap_lines`] is public
+/// and may be handed lines built elsewhere.
 fn char_width(c: char) -> usize {
     if c == '\t' {
         TAB_WIDTH
@@ -468,6 +487,94 @@ mod tests {
 
     fn all_text(lines: &[Line<'_>]) -> String {
         lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Unhighlighted bodies (no syntax for the extension) still get tabs
+    /// expanded, so the terminal never re-expands them at its own tab stops.
+    #[test]
+    fn tabs_expand_to_spaces_in_body() {
+        let patch = "*** Begin Patch\n*** Add File: foo.txt\n+\tindented\n*** End Patch";
+        let lines = render_patch(patch);
+        let body = line_text(&lines[1]);
+        assert!(
+            body.contains("    indented"),
+            "tab should render as 4 spaces, got {body:?}"
+        );
+        assert!(!body.contains('\t'), "body kept a literal tab: {body:?}");
+    }
+
+    /// The expansion must happen before the highlighter runs, or the syntect
+    /// path would smuggle the literal tab back into the spans it emits.
+    #[test]
+    fn tabs_expand_in_highlighted_body() {
+        let patch = "*** Begin Patch\n*** Add File: foo.rs\n+\tlet x = 1;\n*** End Patch";
+        let lines = render_patch(patch);
+        let body = line_text(&lines[1]);
+        assert!(
+            body.contains("    let"),
+            "tab should render as 4 spaces on the highlighted path, got {body:?}"
+        );
+        assert!(!body.contains('\t'), "body kept a literal tab: {body:?}");
+    }
+
+    /// The invariant the fix rests on: no line `render_patch` emits — body,
+    /// hunk header, or unrecognized/dim fallback — may contain a raw tab.
+    #[test]
+    fn no_literal_tabs_in_any_rendered_line() {
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: foo.rs\n",
+            "@@ fn main() {\t\n",
+            " \tcontext line\n",
+            "-\tremoved line\n",
+            "+\tadded line\n",
+            "\tgarbage line with a tab\n",
+            "*** End Patch"
+        );
+        for line in render_patch(patch) {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\t'),
+                    "rendered span kept a literal tab: {:?}",
+                    span.content
+                );
+            }
+        }
+    }
+
+    /// With tabs expanded, the width this module models is the width the
+    /// terminal actually draws — so wrapped rows genuinely fit.
+    #[test]
+    fn tab_expansion_wraps_at_modeled_width() {
+        let patch = "*** Begin Patch\n*** Add File: foo.txt\n+\tabcdefghij\n*** End Patch";
+        let width = 20;
+        let wrapped = render_patch_wrapped(patch, width);
+        let body_rows: Vec<&Line<'_>> = wrapped
+            .iter()
+            .filter(|l| l.style.bg == Some(theme::diff_add_bg()))
+            .collect();
+        assert!(
+            body_rows.len() >= 2,
+            "expected the tab-expanded body to wrap at width {width}, got {} row(s)",
+            body_rows.len()
+        );
+        for row in &body_rows {
+            assert!(
+                line_display_width(row) <= width,
+                "wrapped row exceeds width {width}: {:?}",
+                line_text(row)
+            );
+            assert!(
+                !line_text(row).contains('\t'),
+                "wrapped row kept a literal tab: {:?}",
+                line_text(row)
+            );
+        }
+        assert!(
+            line_text(body_rows[0]).contains("    "),
+            "first body row should carry the expanded tab: {:?}",
+            line_text(body_rows[0])
+        );
     }
 
     #[test]

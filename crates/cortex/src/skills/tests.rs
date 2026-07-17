@@ -2017,23 +2017,290 @@ fn shadow_selection_stats_reflect_lexical_relevance() {
 
     let stats = super::context::shadow_selection_stats(&skills, "please deploy the app now");
     assert_eq!(stats.total, 2);
-    assert_eq!(stats.relevant, 1, "only the trigger-matched skill is kept");
+    assert_eq!(
+        stats.methods.len(),
+        3,
+        "every shadow method must report, or the comparison is one-sided"
+    );
+
+    let lexical = stats
+        .methods
+        .iter()
+        .find(|m| m.method == "weighted_lexical_v1")
+        .expect("weighted lexical method must report");
+    assert_eq!(
+        lexical.selected, 1,
+        "only the trigger-matched skill is kept"
+    );
+    assert_eq!(lexical.top, vec!["deployer".to_string()]);
     assert!(
-        stats.relevant_tokens > 0 && stats.relevant_tokens < stats.all_tokens,
-        "kept subset must cost less than full injection \
-         ({} vs {} tokens)",
-        stats.relevant_tokens,
+        lexical.selected_tokens > 0 && lexical.selected_tokens < stats.all_tokens,
+        "kept subset must cost less than full injection ({} vs {} tokens)",
+        lexical.selected_tokens,
         stats.all_tokens
     );
 
     let empty = super::context::shadow_selection_stats(&skills, "   ");
-    assert_eq!(
-        (empty.relevant, empty.relevant_tokens),
-        (0, 0),
-        "an empty request must select nothing"
-    );
+    for method in &empty.methods {
+        assert_eq!(
+            (method.selected, method.selected_tokens),
+            (0, 0),
+            "{} must select nothing for an empty request",
+            method.method
+        );
+    }
     assert_eq!(
         empty.all_tokens, stats.all_tokens,
         "full-injection cost is independent of the request"
     );
+}
+
+mod selectors {
+    use crate::skills::selectors::{
+        query_views, FieldedBm25Selector, MultiQueryLexicalSelector, ShadowSkillSelector,
+        SkillSelectionDoc, WeightedLexicalSelector, SHADOW_SELECTORS,
+    };
+
+    /// Owns the strings a `SkillSelectionDoc` borrows.
+    struct Doc {
+        name: String,
+        triggers: Vec<String>,
+        description: String,
+    }
+
+    fn doc(name: &str, triggers: &[&str], description: &str) -> Doc {
+        Doc {
+            name: name.to_string(),
+            triggers: triggers.iter().map(|t| t.to_string()).collect(),
+            description: description.to_string(),
+        }
+    }
+
+    fn docs(owned: &[Doc]) -> Vec<SkillSelectionDoc<'_>> {
+        owned
+            .iter()
+            .enumerate()
+            .map(|(id, d)| SkillSelectionDoc {
+                id,
+                name: &d.name,
+                triggers: &d.triggers,
+                description: &d.description,
+            })
+            .collect()
+    }
+
+    /// The whole point of field weighting: the same term is a stronger signal in
+    /// a skill's name than buried in its prose description.
+    #[test]
+    fn bm25_field_weighting_beats_body_match() {
+        let owned = [
+            doc("presentations", &[], "create and edit slides quickly"),
+            doc("slides", &[], "a tool for making things"),
+            doc("notes", &["take notes"], "capture slides from a talk"),
+        ];
+        let out = FieldedBm25Selector.select("slides", &docs(&owned), 10);
+        assert_eq!(
+            out.candidate_ids.first(),
+            Some(&1),
+            "name match must outrank description matches, got {:?}",
+            out.candidate_ids
+        );
+    }
+
+    /// IDF: a term almost every skill mentions says little about which one is
+    /// wanted; a rare term says a lot.
+    ///
+    /// Every doc here matches exactly one query term in the same field at the
+    /// same field length, so term count and length normalization are held
+    /// constant — only IDF can separate them.
+    #[test]
+    fn bm25_ranks_rare_terms_above_common() {
+        let owned = [
+            doc("alpha", &[], "deploy things"),
+            doc("beta", &[], "kubernetes things"),
+            doc("gamma", &[], "deploy things"),
+            doc("delta", &[], "deploy things"),
+        ];
+        // "deploy" is in three of four docs; "kubernetes" in one.
+        let out = FieldedBm25Selector.select("deploy kubernetes", &docs(&owned), 10);
+        assert_eq!(
+            out.candidate_ids.first(),
+            Some(&1),
+            "the doc matching the rare term must outrank the common-term docs, got {:?}",
+            out.candidate_ids
+        );
+    }
+
+    /// A query with nothing in common with the catalog must select nothing —
+    /// a selector that always returns something would gate nothing.
+    #[test]
+    fn selectors_select_nothing_for_unmatched_query() {
+        let owned = [
+            doc("deployer", &["deploy the app"], "ship code to production"),
+            doc("forecaster", &["weather forecast"], "predict the weather"),
+        ];
+        let d = docs(&owned);
+        for selector in SHADOW_SELECTORS {
+            let out = selector.select("photosynthesis chlorophyll", &d, 10);
+            assert!(
+                out.candidate_ids.is_empty(),
+                "{} selected {:?} for an unrelated query",
+                selector.method(),
+                out.candidate_ids
+            );
+        }
+    }
+
+    /// Bounds must be reported, not silently applied: a truncated query or
+    /// candidate set changes what the shadow numbers mean.
+    #[test]
+    fn bm25_flags_truncated_inputs() {
+        let owned: Vec<super::selectors::Doc> = (0..1_005)
+            .map(|i| doc(&format!("skill{i}"), &[], "deploy things"))
+            .collect();
+        let d = docs(&owned);
+
+        let long_query = "deploy ".repeat(2_000);
+        let out = FieldedBm25Selector.select(&long_query, &d, 10);
+        assert!(out.query_truncated, "an over-long query must be flagged");
+        assert!(
+            out.candidate_set_truncated,
+            "an over-large catalog must be flagged"
+        );
+        assert!(
+            out.candidate_ids.len() <= 10,
+            "limit must be honored, got {}",
+            out.candidate_ids.len()
+        );
+
+        let small = FieldedBm25Selector.select("deploy", &d[..2], 10);
+        assert!(!small.query_truncated && !small.candidate_set_truncated);
+    }
+
+    /// The reason to decompose: scoring one flat string lets skills answering
+    /// the *same* clause fill the whole budget, starving the other clause
+    /// entirely. Merging per-clause rankings promotes each clause's winner.
+    ///
+    /// All four skills score identically on the full query (each trigger is a
+    /// verbatim substring of it), so the flat ranking falls back to name order
+    /// and cuts `forecaster` at the limit — the only skill that answers the
+    /// second clause.
+    #[test]
+    fn multi_query_promotes_starved_clause_winner() {
+        let owned = [
+            doc("alpha", &["deploy the app"], "ship code"),
+            doc("bravo", &["deploy the app"], "ship code"),
+            doc("charlie", &["deploy the app"], "ship code"),
+            doc("forecaster", &["check the weather"], "predict weather"),
+        ];
+        let query = "deploy the app and then check the weather";
+        let limit = 3;
+
+        let flat = WeightedLexicalSelector.select(query, &docs(&owned), limit);
+        assert_eq!(
+            flat.candidate_ids,
+            vec![0, 1, 2],
+            "precondition: flat ranking starves the second clause"
+        );
+
+        let merged = MultiQueryLexicalSelector.select(query, &docs(&owned), limit);
+        assert!(
+            merged.candidate_ids.contains(&3),
+            "the second clause's only skill must survive the merge, got {:?}",
+            merged.candidate_ids
+        );
+        // best_rank pulls both clause winners to the front; the full-query rank
+        // then breaks their tie in favor of the one the flat ranking preferred.
+        assert_eq!(merged.candidate_ids, vec![0, 3, 1]);
+    }
+
+    /// Without a connector or sentence break there is only one view, so the
+    /// method must be exactly the lexical one — no accidental divergence.
+    #[test]
+    fn multi_query_single_clause_equals_weighted_lexical() {
+        let owned = [
+            doc("deployer", &["deploy the app"], "ship code"),
+            doc("forecaster", &["weather forecast"], "predict weather"),
+        ];
+        let d = docs(&owned);
+        let query = "deploy the app";
+        assert_eq!(
+            MultiQueryLexicalSelector.select(query, &d, 10),
+            WeightedLexicalSelector.select(query, &d, 10)
+        );
+    }
+
+    #[test]
+    fn query_views_split_sentences_and_connectors() {
+        // View 0 is always the full query; clauses follow in reading order.
+        assert_eq!(
+            query_views("deploy the app and then check the weather"),
+            vec![
+                "deploy the app and then check the weather",
+                "deploy the app",
+                "check the weather",
+            ]
+        );
+        assert_eq!(
+            query_views("fix the bug. run the tests"),
+            vec!["fix the bug. run the tests", "fix the bug", "run the tests"]
+        );
+        // A single clause yields only the full query.
+        assert_eq!(query_views("deploy the app"), vec!["deploy the app"]);
+        // Case-insensitive connectors, and a clause identical to the full query
+        // is not repeated.
+        assert_eq!(
+            query_views("build AND then ship"),
+            vec!["build AND then ship", "build", "ship"]
+        );
+
+        // Decomposition is bounded.
+        let many = (0..40)
+            .map(|i| format!("task{i}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        assert!(
+            query_views(&many).len() <= 8,
+            "query decomposition must stay bounded"
+        );
+    }
+
+    /// Ties must not depend on the order docs happened to be loaded in, or the
+    /// shadow metrics would be noise.
+    #[test]
+    fn selectors_are_deterministic_under_ties() {
+        let forward = [
+            doc("alpha", &["deploy the app"], "ship code"),
+            doc("bravo", &["deploy the app"], "ship code"),
+            doc("charlie", &["deploy the app"], "ship code"),
+        ];
+        let reversed = [
+            doc("charlie", &["deploy the app"], "ship code"),
+            doc("bravo", &["deploy the app"], "ship code"),
+            doc("alpha", &["deploy the app"], "ship code"),
+        ];
+        for selector in SHADOW_SELECTORS {
+            let names = |owned: &[super::selectors::Doc]| -> Vec<String> {
+                selector
+                    .select("deploy the app", &docs(owned), 10)
+                    .candidate_ids
+                    .into_iter()
+                    .map(|id| owned[id].name.clone())
+                    .collect()
+            };
+            let a = names(&forward);
+            assert_eq!(
+                a,
+                names(&forward),
+                "{} is not stable across runs",
+                selector.method()
+            );
+            assert_eq!(
+                a,
+                names(&reversed),
+                "{} ranks identical docs by input order",
+                selector.method()
+            );
+        }
+    }
 }

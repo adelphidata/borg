@@ -61,6 +61,7 @@ fn mcp_section_appears_when_servers_are_configured() {
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
             tools: Default::default(),
+            cache_tools: true,
         },
     );
 

@@ -118,6 +118,11 @@ pub struct ServerStatus {
 pub enum ServerHealth {
     /// Connected and operating normally.
     Healthy,
+    /// Tools are registered from a cached catalog while the live connection is
+    /// still being established. Tool *calls* are refused until the session is
+    /// live — the catalog is a hint about what will be available, not proof
+    /// that it currently is.
+    Starting,
     /// Connect failed or session dropped; supervisor is retrying.
     Reconnecting {
         /// Number of consecutive failures so far.
@@ -336,7 +341,12 @@ impl McpRegistry {
         entry.health = health;
         // When a server is no longer Healthy, drop its tools — keeping stale
         // schemas in the LLM tool list would invite confusing failures.
-        let drop_tools = !matches!(entry.health, ServerHealth::Healthy);
+        //
+        // `Starting` is the exception: its tools come from a cached catalog and
+        // are deliberately advertised before the session is live. Dropping them
+        // here would defeat the cache entirely — the caller registers the
+        // catalog and *then* marks the server starting.
+        let drop_tools = !matches!(entry.health, ServerHealth::Healthy | ServerHealth::Starting);
         if drop_tools {
             if let Some(names) = inner.by_server.remove(server) {
                 for n in names {
@@ -347,6 +357,14 @@ impl McpRegistry {
                 s.tool_count = 0;
             }
         }
+    }
+
+    /// A single server's health, or `None` if no session has touched it.
+    /// Cheaper than [`Self::status`] for the dispatch path, which asks about
+    /// one server and would otherwise clone every server's status.
+    pub fn health(&self, server: &str) -> Option<ServerHealth> {
+        let inner = read_recovering(&self.inner, "registry.inner");
+        inner.status.get(server).map(|s| s.health.clone())
     }
 
     /// Record server-info from a successful handshake.
@@ -625,6 +643,47 @@ mod tests {
             "required": ["query"]
         });
         validate_schema(&s).unwrap();
+    }
+
+    /// `Starting` means "tools known from cache, session not live yet". Health
+    /// changes drop a server's tools precisely so stale schemas can't linger —
+    /// but applying that to `Starting` would erase the catalog the cache just
+    /// registered, silently defeating it. Every other non-healthy state must
+    /// still drop.
+    #[test]
+    fn set_health_keeps_tools_only_for_healthy_and_starting() {
+        let tools = vec![McpToolSchema {
+            name: "read".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        }];
+
+        for (health, expect_kept) in [
+            (ServerHealth::Healthy, true),
+            (ServerHealth::Starting, true),
+            (ServerHealth::Reconnecting { attempts: 1 }, false),
+            (
+                ServerHealth::AuthFailed {
+                    message: "401".into(),
+                },
+                false,
+            ),
+            (ServerHealth::Degraded, false),
+        ] {
+            let reg = McpRegistry::new();
+            reg.replace_server_tools("files", &tools, &ToolFilter::default(), &[]);
+            assert!(!reg.tools().is_empty(), "precondition: tool registered");
+
+            reg.set_health("files", health.clone());
+
+            assert_eq!(
+                !reg.tools().is_empty(),
+                expect_kept,
+                "{health:?}: tools kept should be {expect_kept}"
+            );
+            assert_eq!(reg.health("files"), Some(health));
+        }
     }
 
     #[test]

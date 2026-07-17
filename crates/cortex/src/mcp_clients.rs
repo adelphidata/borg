@@ -165,6 +165,101 @@ fn limits_map() -> &'static Mutex<HashMap<String, ServerLimits>> {
     SERVER_LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Per-server teardown counter, bumped every time [`reload_from_config`] drops
+/// a server.
+///
+/// A cache-warmed start runs in the background, so a reload that removes its
+/// server cannot see it coming: the reload purges and drops, then the in-flight
+/// task registers the tools right back. The task captures this counter before
+/// spawning and re-checks it afterwards — a change means *this* server was torn
+/// down underneath it, so its registration must be undone. Keyed per server so a
+/// reload touching some other server never disturbs it.
+static SERVER_EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn server_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    SERVER_EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn server_epoch(server: &str) -> u64 {
+    lock_recover(server_epochs())
+        .get(server)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn bump_server_epoch(server: &str) {
+    *lock_recover(server_epochs())
+        .entry(server.to_string())
+        .or_insert(0) += 1;
+}
+
+/// How long a cached catalog may be served for a server that never manages to
+/// come back up. Any successful discovery rewrites the row, so in practice this
+/// only bounds staleness for a persistently broken server.
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Keyed fingerprint of a resolved stdio config, or `None` for other
+/// transports (HTTP/SSE pay no spawn cost worth caching around).
+///
+/// The MAC covers everything that can change what a server advertises: the
+/// command, its args, and the resolved environment. Env values are resolved
+/// secrets, so they are keyed into the MAC rather than stored — a changed
+/// secret misses the cache, and the DB never holds the value. Env is sorted so
+/// `HashMap` iteration order can't produce two keys for one config.
+fn catalog_cache_key(
+    server_name: &str,
+    manifest: &ServerManifest,
+    hmac_key: &[u8],
+) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mcp::manifest::Transport::Stdio { command, args, env } = &manifest.transport else {
+        return None;
+    };
+    let mut env: Vec<(&String, &String)> = env.iter().collect();
+    env.sort();
+    let canonical = serde_json::json!({
+        "server": server_name,
+        "command": command,
+        "args": args,
+        "env": env,
+    })
+    .to_string();
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key).ok()?;
+    mac.update(canonical.as_bytes());
+    Some(crate::util::hex::hex_encode(&mac.finalize().into_bytes()))
+}
+
+/// Register a cached catalog so the model can see a starting server's tools.
+///
+/// Deliberately does *not* install a `session_map` entry: dispatch resolves
+/// calls against live sessions only, so a cached tool is advertised but not
+/// callable until the real connection lands. `Starting` health is what makes
+/// that visible to the operator (and produces the "still initializing" error
+/// rather than a bare "no live session").
+fn register_cached_catalog(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    manifest: &ServerManifest,
+    row: &crate::db::mcp_catalog_cache::McpCatalogCacheRow,
+    reg: &McpRegistry,
+    builtin: &[&str],
+) -> Result<usize> {
+    let tools: Vec<mcp::protocol::McpToolSchema> = serde_json::from_str(&row.tools_json)?;
+    // Re-runs the same gauntlet and filter as a live registration, so a cached
+    // load and a live load converge on identical registry contents.
+    let outcomes = reg.replace_server_tools(server_name, &tools, &manifest.tools, builtin);
+    let registered = outcomes
+        .iter()
+        .filter(|o| matches!(o, ToolRegistrationOutcome::Registered { .. }))
+        .count();
+    record_limits(server_name, server_cfg);
+    reg.set_health(server_name, mcp::registry::ServerHealth::Starting);
+    Ok(registered)
+}
+
 fn record_limits(server: &str, cfg: &McpServerConfig) {
     let limits = ServerLimits {
         rate_limit_per_minute: cfg.rate_limit_per_minute,
@@ -425,6 +520,7 @@ impl McpServerSnapshot {
         }
         match self.health.as_ref() {
             Some(ServerHealth::Healthy) => "connected",
+            Some(ServerHealth::Starting) => "starting",
             Some(ServerHealth::Reconnecting { .. }) => "reconnecting",
             Some(ServerHealth::AuthFailed { .. }) => "auth-failed",
             Some(ServerHealth::Degraded) => "degraded",
@@ -575,10 +671,21 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         match map.get(&tool.server) {
             Some(s) => s.clone(),
             None => {
+                // The tool is registered but nothing can carry the call. When
+                // the catalog came from the cache, say so — "no live session"
+                // reads like a fault, but a starting server is expected to be
+                // callable in a moment.
+                if reg.health(&tool.server) == Some(mcp::registry::ServerHealth::Starting) {
+                    return Err(anyhow!(
+                        "MCP server '{server}' is still initializing; its tools were listed \
+                         from a cached catalog — retry shortly",
+                        server = tool.server
+                    ));
+                }
                 return Err(anyhow!(
                     "MCP server '{server}' has no live session",
                     server = tool.server
-                ))
+                ));
             }
         }
     };
@@ -859,51 +966,247 @@ pub async fn initialize(config: &Config) -> Result<()> {
             tracing::info!(server = %server_name, "MCP server disabled — skipping");
             continue;
         }
+
+        // Serve a fresh cached catalog while the server starts in the
+        // background, so a restart doesn't hide a stdio server's tools behind
+        // its spawn + handshake. On a miss we fall through to the original
+        // blocking start, which is also what populates the cache.
+        if serve_cached_catalog(server_name, server_cfg, config, reg, &builtin_refs).await {
+            continue;
+        }
+
         if let Err(e) = start_server(server_name, server_cfg, config, reg, &builtin_refs).await {
-            let (error_kind, reauth_required) = classify_startup_failure(&e);
-            // Alternate Display (`{:#}`) walks the anyhow cause chain, so the
-            // underlying McpError (e.g. "authentication failed: 401") is kept —
-            // plain `{e}` would show only the outermost context line, hiding the
-            // reason this commit exists to surface.
-            let detail = format!("{e:#}");
-            tracing::warn!(
-                server = %server_name,
-                error = %detail,
-                error_kind,
-                "MCP server failed to start — continuing without it",
-            );
-            // An auth failure needs operator action (fix/re-add credentials) and
-            // will not fix itself on retry, so mark the server AuthFailed. That
-            // renders "auth-failed" in `/mcp` and `/plugins` instead of the
-            // ambiguous "not-started", and set_health creates the status entry a
-            // never-started server otherwise lacks.
-            if reauth_required {
-                reg.set_health(
-                    server_name,
-                    mcp::registry::ServerHealth::AuthFailed {
-                        message: detail.clone(),
-                    },
-                );
-            }
-            // Surface unreachable / mis-credentialled servers in the audit
-            // chain so operators don't have to grep logs to see why their
-            // configured servers aren't contributing tools. `error_kind` carries
-            // the structured McpError class for aggregation.
-            crate::db::try_emit_global(
-                crate::db::audit_events::MCP_SERVER_FAILED,
-                server_name,
-                &serde_json::json!({
-                    "server": server_name,
-                    "phase": "initialize",
-                    "reason": format!("start_server failed: {detail}"),
-                    "error_kind": error_kind,
-                    "reauth_required": reauth_required,
-                }),
-            )
-            .await;
+            report_start_failure(server_name, &e, reg).await;
         }
     }
     Ok(())
+}
+
+/// Log + audit a server that failed to start, and mark it `AuthFailed` when the
+/// operator has to intervene. Shared by the inline and background start paths so
+/// a cache-warmed server's failure is as visible as any other.
+async fn report_start_failure(server_name: &str, e: &anyhow::Error, reg: &McpRegistry) {
+    let (error_kind, reauth_required) = classify_startup_failure(e);
+    // Alternate Display (`{:#}`) walks the anyhow cause chain, so the
+    // underlying McpError (e.g. "authentication failed: 401") is kept —
+    // plain `{e}` would show only the outermost context line, hiding the
+    // reason this commit exists to surface.
+    let detail = format!("{e:#}");
+    tracing::warn!(
+        server = %server_name,
+        error = %detail,
+        error_kind,
+        "MCP server failed to start — continuing without it",
+    );
+    // An auth failure needs operator action (fix/re-add credentials) and
+    // will not fix itself on retry, so mark the server AuthFailed. That
+    // renders "auth-failed" in `/mcp` and `/plugins` instead of the
+    // ambiguous "not-started", and set_health creates the status entry a
+    // never-started server otherwise lacks.
+    if reauth_required {
+        reg.set_health(
+            server_name,
+            mcp::registry::ServerHealth::AuthFailed {
+                message: detail.clone(),
+            },
+        );
+    }
+    // Surface unreachable / mis-credentialled servers in the audit
+    // chain so operators don't have to grep logs to see why their
+    // configured servers aren't contributing tools. `error_kind` carries
+    // the structured McpError class for aggregation.
+    crate::db::try_emit_global(
+        crate::db::audit_events::MCP_SERVER_FAILED,
+        server_name,
+        &serde_json::json!({
+            "server": server_name,
+            "phase": "initialize",
+            "reason": format!("start_server failed: {detail}"),
+            "error_kind": error_kind,
+            "reauth_required": reauth_required,
+        }),
+    )
+    .await;
+}
+
+/// Try to register `server_name`'s cached catalog and start it in the
+/// background. Returns true when the caller should skip the inline start.
+///
+/// Any doubt — non-stdio, opted out, no DB, stale row, unparseable row —
+/// returns false and takes the ordinary blocking path, which is also what
+/// repopulates the cache.
+async fn serve_cached_catalog(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    config: &Config,
+    reg: &McpRegistry,
+    builtin: &[&str],
+) -> bool {
+    // A resolution failure here is reported by the inline start path; don't
+    // duplicate the diagnostic.
+    let Ok(manifest) = server_cfg.resolve_to_manifest(server_name, config) else {
+        return false;
+    };
+    if !matches!(manifest.transport, mcp::manifest::Transport::Stdio { .. }) {
+        return false;
+    }
+
+    let db = match crate::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(
+                target: "borg.mcp",
+                event = "catalog_cache_unavailable",
+                server = %server_name,
+                error = %e,
+                "cannot reach the MCP catalog cache; starting server inline",
+            );
+            return false;
+        }
+    };
+
+    if !server_cfg.cache_tools {
+        // Opting out must also drop what a previous opted-in run stored, or the
+        // flag would only stop future writes.
+        if let Err(e) = db.mcp_catalog_cache_delete_server(server_name).await {
+            tracing::warn!(
+                target: "borg.mcp",
+                event = "catalog_cache_purge_failed",
+                server = %server_name,
+                error = %e,
+                "could not purge cached catalog for an opted-out server",
+            );
+        }
+        return false;
+    }
+
+    let hmac_key = match db.mcp_catalog_cache_hmac_key().await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(
+                target: "borg.mcp",
+                event = "catalog_cache_key_unavailable",
+                server = %server_name,
+                error = %e,
+                "cannot key the MCP catalog cache; starting server inline",
+            );
+            return false;
+        }
+    };
+    let Some(cache_key) = catalog_cache_key(server_name, &manifest, &hmac_key) else {
+        return false;
+    };
+
+    let row = match db.mcp_catalog_cache_get(&cache_key).await {
+        Ok(Some(row)) => row,
+        // A miss is the normal first-run state, not a problem.
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(
+                target: "borg.mcp",
+                event = "catalog_cache_read_failed",
+                server = %server_name,
+                error = %e,
+                "could not read cached catalog; starting server inline",
+            );
+            return false;
+        }
+    };
+
+    let age = crate::util::time::now_unix().saturating_sub(row.cached_at);
+    if age < 0 || age as u64 > CATALOG_CACHE_TTL.as_secs() {
+        return false;
+    }
+
+    let registered =
+        match register_cached_catalog(server_name, server_cfg, &manifest, &row, reg, builtin) {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(
+                    target: "borg.mcp",
+                    event = "catalog_cache_unusable",
+                    server = %server_name,
+                    error = %e,
+                    "cached catalog could not be registered; starting server inline",
+                );
+                return false;
+            }
+        };
+
+    tracing::info!(
+        target: "borg.mcp",
+        event = "catalog_cache_hit",
+        server = %server_name,
+        tools = registered,
+        age_secs = age,
+        "serving cached MCP catalog while the server starts",
+    );
+
+    let server_owned = server_name.to_string();
+    let cfg_owned = server_cfg.clone();
+    let config_owned = config.clone();
+    let reg_owned = reg.clone();
+    let builtin_owned: Vec<String> = builtin.iter().map(ToString::to_string).collect();
+    // Captured before spawning: if a reload tears this server down while the
+    // start is in flight, the epoch moves and the task undoes its registration.
+    let epoch = server_epoch(server_name);
+    let start = tokio::spawn({
+        let server_owned = server_owned.clone();
+        let reg_owned = reg_owned.clone();
+        async move {
+            let builtin_refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
+            if let Err(e) = start_server(
+                &server_owned,
+                &cfg_owned,
+                &config_owned,
+                &reg_owned,
+                &builtin_refs,
+            )
+            .await
+            {
+                // The cached tools were a promise this server would be callable
+                // shortly. It won't be, so withdraw them rather than leave the
+                // model calling into a server that will never answer.
+                reg_owned.drop_server(&server_owned);
+                report_start_failure(&server_owned, &e, &reg_owned).await;
+                return;
+            }
+            if server_epoch(&server_owned) != epoch {
+                // A reload removed this server while we were starting it, and
+                // `start_server` has just registered it again. Undo that — the
+                // operator's config is the authority, not our stale in-flight
+                // work.
+                if let Ok(mut map) = session_map().lock() {
+                    map.remove(&server_owned);
+                }
+                reg_owned.drop_server(&server_owned);
+                purge_cached_catalog(&server_owned).await;
+                tracing::info!(
+                    target: "borg.mcp",
+                    event = "catalog_cache_start_superseded",
+                    server = %server_owned,
+                    "MCP server was removed while starting; its registration was rolled back",
+                );
+            }
+        }
+    });
+    // A panic in the start task would otherwise vanish with the dropped
+    // `JoinHandle`, leaving the server advertising cached tools at `Starting`
+    // forever and telling the model to "retry shortly" on every call. Withdraw
+    // the promise on a panic exactly as the `Err` path does.
+    tokio::spawn(async move {
+        if let Err(join_err) = start.await {
+            reg_owned.drop_server(&server_owned);
+            tracing::error!(
+                target: "borg.mcp",
+                event = "catalog_cache_start_task_died",
+                server = %server_owned,
+                error = %join_err,
+                "MCP start task panicked or was cancelled; cached tools withdrawn",
+            );
+        }
+    });
+    true
 }
 
 /// Result of a [`reload_from_config`] pass. Designed for the operator-facing
@@ -984,6 +1287,12 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
         if let Ok(mut l) = limits_map().lock() {
             l.remove(name);
         }
+        // Tell any in-flight cache-warmed start that this server is gone, so it
+        // doesn't register its tools back after we've dropped them.
+        bump_server_epoch(name);
+        // A server removed from config must not come back as cached tools on
+        // the next restart.
+        purge_cached_catalog(name).await;
         tracing::info!(server = %name, "MCP server torn down via reload");
     }
 
@@ -1287,6 +1596,70 @@ async fn handshake_and_register(
     .await
 }
 
+/// Drop any cached catalog for a server that is going away.
+async fn purge_cached_catalog(server_name: &str) {
+    let purge = async {
+        crate::db::Database::open()
+            .await?
+            .mcp_catalog_cache_delete_server(server_name)
+            .await
+    };
+    if let Err(e) = purge.await {
+        tracing::warn!(
+            target: "borg.mcp",
+            event = "catalog_cache_purge_failed",
+            server = %server_name,
+            error = %e,
+            "could not purge cached catalog for a removed server",
+        );
+    }
+}
+
+/// Persist a freshly-discovered stdio catalog for the next restart.
+///
+/// Best-effort by design: a cache write failure must never take down a server
+/// that just started successfully. It is logged rather than swallowed so a
+/// permanently unwritable cache doesn't masquerade as a permanent cache miss.
+async fn store_catalog_in_cache(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    manifest: &ServerManifest,
+    discovered: &mcp::session::DiscoveredTools,
+) {
+    if !server_cfg.cache_tools
+        || !matches!(manifest.transport, mcp::manifest::Transport::Stdio { .. })
+    {
+        return;
+    }
+
+    let write = async {
+        let db = crate::db::Database::open().await?;
+        let hmac_key = db.mcp_catalog_cache_hmac_key().await?;
+        let Some(cache_key) = catalog_cache_key(server_name, manifest, &hmac_key) else {
+            return Ok(());
+        };
+        let tools_json = serde_json::to_string(&discovered.tools)?;
+        db.mcp_catalog_cache_put(
+            &cache_key,
+            server_name,
+            &tools_json,
+            discovered.server_info.as_deref(),
+            crate::util::time::now_unix(),
+        )
+        .await
+    };
+
+    if let Err(e) = write.await {
+        tracing::warn!(
+            target: "borg.mcp",
+            event = "catalog_cache_write_failed",
+            server = %server_name,
+            error = %e,
+            "could not cache tool catalog; next restart will start this server inline",
+        );
+    }
+}
+
 /// Register discovered tools, emit audit rows, and hand the live session to the
 /// background session task. Runs once per server after a successful
 /// [`discover_session`] — never on a retried or failed attempt.
@@ -1312,6 +1685,11 @@ async fn register_discovered(
     audit_registrations(server_name, &outcomes).await;
 
     record_limits(server_name, server_cfg);
+
+    // Write through so the next restart can advertise these tools immediately.
+    // The live catalog always wins: this replaces whatever was cached, so a
+    // tool the server has dropped stops being advertised next boot too.
+    store_catalog_in_cache(server_name, server_cfg, manifest, &discovered).await;
 
     // Operator-visible "this server is live" signal — paired with
     // `MCP_SERVER_FAILED` for terminal failures and with per-tool
@@ -1883,6 +2261,7 @@ mod tests {
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
             tools: Default::default(),
+            cache_tools: true,
         };
 
         let err = start_server("evil", &server_cfg, &cfg, &reg, &builtin_refs)
@@ -1894,6 +2273,160 @@ mod tests {
             "expected config-rejection error, got: {msg}"
         );
         assert!(msg.contains("network egress"), "got: {msg}");
+    }
+
+    /// Build a stdio server config for the catalog-cache tests.
+    fn stdio_cfg(command: &str, args: &[&str], env: &[(&str, &str)]) -> McpServerConfig {
+        use crate::config::TransportSpec;
+        McpServerConfig {
+            enabled: true,
+            transport: TransportSpec::Stdio {
+                command: command.to_string(),
+                args: args.iter().map(ToString::to_string).collect(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+            connect_timeout_ms: 60_000,
+            call_timeout_ms: 120_000,
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+            tools: Default::default(),
+            cache_tools: true,
+        }
+    }
+
+    fn key_for(cfg: &McpServerConfig, name: &str) -> Option<String> {
+        let manifest = cfg
+            .resolve_to_manifest(name, &crate::config::Config::default())
+            .expect("manifest resolves");
+        catalog_cache_key(name, &manifest, b"test-key-0123456789")
+    }
+
+    /// The key must be a pure function of the resolved config, or the cache
+    /// would miss at random across restarts.
+    #[test]
+    fn catalog_cache_key_is_stable_for_identical_config() {
+        let a = stdio_cfg("srv", &["--stdio"], &[("TOKEN", "abc"), ("MODE", "fast")]);
+        let b = stdio_cfg("srv", &["--stdio"], &[("MODE", "fast"), ("TOKEN", "abc")]);
+        let ka = key_for(&a, "files").expect("stdio config keys");
+        // Same pairs, different declaration order: `HashMap` iteration order
+        // must not leak into the key.
+        assert_eq!(ka, key_for(&b, "files").unwrap());
+        assert_eq!(ka, key_for(&a, "files").unwrap());
+    }
+
+    /// Anything that can change what a server advertises must change the key,
+    /// or a config edit would be served a stale catalog.
+    #[test]
+    fn catalog_cache_key_changes_with_config() {
+        let base = stdio_cfg("srv", &["--stdio"], &[("TOKEN", "abc")]);
+        let base_key = key_for(&base, "files").unwrap();
+
+        for (label, cfg) in [
+            (
+                "command",
+                stdio_cfg("other", &["--stdio"], &[("TOKEN", "abc")]),
+            ),
+            ("args", stdio_cfg("srv", &["--http"], &[("TOKEN", "abc")])),
+            // A rotated secret must invalidate: the old catalog may have been
+            // produced under different credentials.
+            (
+                "env value",
+                stdio_cfg("srv", &["--stdio"], &[("TOKEN", "xyz")]),
+            ),
+            (
+                "env key",
+                stdio_cfg("srv", &["--stdio"], &[("OTHER", "abc")]),
+            ),
+        ] {
+            assert_ne!(
+                base_key,
+                key_for(&cfg, "files").unwrap(),
+                "changing the {label} must change the cache key"
+            );
+        }
+        // Two servers sharing a command are still distinct entries.
+        assert_ne!(base_key, key_for(&base, "other-server").unwrap());
+    }
+
+    /// HTTP/SSE have no spawn to amortize, so they are never cached.
+    #[test]
+    fn catalog_cache_key_is_none_for_non_stdio() {
+        use crate::config::TransportSpec;
+        let cfg = McpServerConfig {
+            transport: TransportSpec::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: Default::default(),
+                auth: Default::default(),
+                client_cert: None,
+                client_key: None,
+            },
+            ..stdio_cfg("srv", &[], &[])
+        };
+        assert!(key_for(&cfg, "remote").is_none());
+    }
+
+    /// The cache's whole purpose: a cached catalog is visible to the model
+    /// before the session is live. `set_health` drops tools for every health
+    /// that isn't Healthy, so `Starting` must be exempt or the tools this
+    /// registers would vanish the instant they are marked.
+    #[test]
+    fn cached_catalog_registers_tools_and_marks_server_starting() {
+        use mcp::registry::ServerHealth;
+
+        let cfg = stdio_cfg("srv", &[], &[]);
+        let manifest = cfg
+            .resolve_to_manifest("files", &crate::config::Config::default())
+            .unwrap();
+        let row = crate::db::mcp_catalog_cache::McpCatalogCacheRow {
+            config_hash: "hash".to_string(),
+            server_name: "files".to_string(),
+            tools_json: serde_json::json!([{
+                "name": "read",
+                "description": "read a file",
+                "inputSchema": {"type": "object", "properties": {}},
+            }])
+            .to_string(),
+            server_info: None,
+            cached_at: 0,
+        };
+        let reg = McpRegistry::new();
+
+        let registered =
+            register_cached_catalog("files", &cfg, &manifest, &row, &reg, &[]).unwrap();
+
+        assert_eq!(registered, 1, "the cached tool must register");
+        assert_eq!(
+            reg.health("files"),
+            Some(ServerHealth::Starting),
+            "a cache-warmed server must not claim to be connected"
+        );
+        assert!(
+            reg.tools().iter().any(|t| t.full_name.contains("read")),
+            "cached tools must survive being marked Starting, got {:?}",
+            reg.tools().iter().map(|t| &t.full_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A corrupt row must degrade to a miss, not poison the registry.
+    #[test]
+    fn unusable_cached_catalog_is_rejected() {
+        let cfg = stdio_cfg("srv", &[], &[]);
+        let manifest = cfg
+            .resolve_to_manifest("files", &crate::config::Config::default())
+            .unwrap();
+        let row = crate::db::mcp_catalog_cache::McpCatalogCacheRow {
+            config_hash: "hash".to_string(),
+            server_name: "files".to_string(),
+            tools_json: "{not json".to_string(),
+            server_info: None,
+            cached_at: 0,
+        };
+        let reg = McpRegistry::new();
+        assert!(register_cached_catalog("files", &cfg, &manifest, &row, &reg, &[]).is_err());
+        assert!(reg.tools().is_empty());
     }
 
     #[test]
@@ -1961,6 +2494,7 @@ mod tests {
                 rate_limit_per_minute: 60,
                 rate_limit_burst: 10,
                 tools: Default::default(),
+                cache_tools: true,
             },
         );
         cfg.mcp.servers.insert(
@@ -1977,6 +2511,7 @@ mod tests {
                 rate_limit_per_minute: 60,
                 rate_limit_burst: 10,
                 tools: Default::default(),
+                cache_tools: true,
             },
         );
         cfg.mcp.servers.insert(
@@ -1995,6 +2530,7 @@ mod tests {
                 rate_limit_per_minute: 60,
                 rate_limit_burst: 10,
                 tools: Default::default(),
+                cache_tools: true,
             },
         );
 
