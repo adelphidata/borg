@@ -128,7 +128,7 @@ fn region_has_fips_endpoint(region: &str) -> bool {
 /// blocks the entire link-local range (covers 169.254.169.254 IMDS and
 /// 169.254.170.2 ECS credentials) plus the known metadata FQDNs, while leaving
 /// RFC1918 addresses alone so PrivateLink / VPC-endpoint hosts still work.
-fn is_cloud_metadata_host(host: &str) -> bool {
+pub(crate) fn is_cloud_metadata_host(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
         return match ip {

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -360,11 +360,23 @@ impl Provider {
                     HeaderValue::from_static("oauth-2025-04-20"),
                 );
             }
-            Provider::CodexOAuth | Provider::Custom => {
+            Provider::CodexOAuth => {
                 let bearer = format!("Bearer {api_key}");
                 let val = HeaderValue::from_str(&bearer)
                     .context("Access token contains invalid characters for HTTP headers")?;
                 headers.insert("Authorization", val);
+            }
+            Provider::Custom => {
+                // Custom endpoints are commonly keyless local servers
+                // (llama.cpp, LM Studio, vLLM). Skip the header entirely
+                // rather than sending a malformed `Bearer ` credential,
+                // which some servers reject with a 400/401.
+                if !api_key.is_empty() {
+                    let bearer = format!("Bearer {api_key}");
+                    let val = HeaderValue::from_str(&bearer)
+                        .context("Access token contains invalid characters for HTTP headers")?;
+                    headers.insert("Authorization", val);
+                }
             }
             Provider::CopilotOAuth => {
                 // GitHub Copilot's chat endpoint requires both the OAuth bearer
@@ -536,25 +548,128 @@ impl Provider {
     }
 
     /// Check if Ollama is reachable (sync, short timeout).
+    ///
+    /// Honors `OLLAMA_HOST` (host[:port], scheme/path optional). Callers that
+    /// know the configured `llm.base_url` should prefer
+    /// [`Provider::ollama_available_at`] so a remote endpoint configured only
+    /// via `base_url` isn't misreported as down.
     pub fn ollama_available() -> bool {
-        let default_addr: SocketAddr =
-            SocketAddr::from(([127, 0, 0, 1], crate::constants::OLLAMA_PORT_DEFAULT));
-        let addr: SocketAddr = std::env::var("OLLAMA_HOST")
-            .ok()
-            .and_then(|h| {
-                // OLLAMA_HOST can be a URL like "http://host:port" or just "host:port"
-                let stripped = h
-                    .strip_prefix("http://")
-                    .or_else(|| h.strip_prefix("https://"))
-                    .unwrap_or(&h);
-                let host_port = stripped.split('/').next().unwrap_or(stripped);
-                host_port.parse().ok()
-            })
-            .unwrap_or(default_addr);
-        // Probe runs on the onboarding/startup hot path; keep it short so an
-        // absent local Ollama doesn't stall boot.
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+        Self::ollama_available_at(None)
     }
+
+    /// Check if Ollama is reachable, preferring `base_url_override` (the
+    /// configured `llm.base_url`, full endpoint URL accepted) over
+    /// `OLLAMA_HOST`, falling back to `localhost:11434`.
+    pub fn ollama_available_at(base_url_override: Option<&str>) -> bool {
+        let (host, port) = ollama_probe_target(&ollama_origin(base_url_override));
+        // Hostname specs need DNS resolution — `SocketAddr::parse` only
+        // accepts IP literals, and silently probing localhost instead of the
+        // configured remote host produced false health signals. The lookup
+        // itself uses the OS resolver with no timeout of our own; localhost
+        // resolves from /etc/hosts instantly, and remote names are only
+        // consulted once per doctor/onboarding run.
+        let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+            return false;
+        };
+        // Probe runs on the onboarding/startup hot path; keep the connect
+        // short so an absent local Ollama doesn't stall boot.
+        addrs
+            .take(2)
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
+    }
+}
+
+/// Connect timeout for the Ollama reachability probe (per resolved address).
+const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Resolve the Ollama server origin (`scheme://host[:port]`, no path).
+///
+/// Precedence: explicit override (the configured `llm.base_url`; a full
+/// endpoint URL is accepted and reduced to its origin) → `OLLAMA_HOST`
+/// (ecosystem convention: `host[:port]`, scheme optional) → the localhost
+/// default.
+///
+/// A schemeless spec follows the Ollama client convention: `http` with the
+/// port defaulting to 11434, made explicit in the returned origin
+/// (`myhost` → `http://myhost:11434`) so requests and reachability probes
+/// can never disagree about the target. A spec with an explicit scheme is
+/// kept verbatim — `https://host` means the scheme's default port (443), as
+/// for any URL. Bare IPv6 hosts are bracketed to keep the origin a valid URL.
+pub fn ollama_origin(base_url_override: Option<&str>) -> String {
+    let spec = base_url_override
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("OLLAMA_HOST")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let Some(spec) = spec else {
+        return format!("http://localhost:{}", crate::constants::OLLAMA_PORT_DEFAULT);
+    };
+    let trimmed = spec.trim().trim_end_matches('/');
+    if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .map(|r| ("https", r))
+        .or_else(|| trimmed.strip_prefix("http://").map(|r| ("http", r)))
+    {
+        let (scheme, rest) = rest;
+        let host_port = rest.split('/').next().unwrap_or(rest);
+        return format!("{scheme}://{host_port}");
+    }
+    let host_port = trimmed.split('/').next().unwrap_or(trimmed);
+    let (host, port) = split_host_port(host_port);
+    let port = port.unwrap_or(crate::constants::OLLAMA_PORT_DEFAULT);
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+/// Split a `host[:port]` string, understanding bracketed (`[::1]:11434`) and
+/// bare (`::1`) IPv6 hosts. An unparseable port yields the whole input as
+/// host (garbage in, unresolvable host out).
+fn split_host_port(host_port: &str) -> (String, Option<u16>) {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            return (
+                host.to_string(),
+                after.strip_prefix(':').and_then(|p| p.parse().ok()),
+            );
+        }
+    }
+    match host_port.rsplit_once(':') {
+        // A single colon separates host from port; multiple colons mean a
+        // bare IPv6 address with no port syntax.
+        Some((host, port_str)) if !host.contains(':') => match port_str.parse() {
+            Ok(port) => (host.to_string(), Some(port)),
+            Err(_) => (host_port.to_string(), None),
+        },
+        _ => (host_port.to_string(), None),
+    }
+}
+
+/// Extract the `(host, port)` TCP probe target from an origin or
+/// `OLLAMA_HOST`-style spec.
+///
+/// The default port is scheme-aware so the probe target always matches where
+/// requests actually go: an explicit `http://`/`https://` spec without a
+/// port defaults to 80/443 (what reqwest will dial for the composed
+/// endpoint URL), while a schemeless `host[:port]` spec follows the Ollama
+/// client convention of 11434.
+fn ollama_probe_target(spec: &str) -> (String, u16) {
+    let s = spec.trim();
+    let (default_port, rest) = if let Some(rest) = s.strip_prefix("https://") {
+        (443, rest)
+    } else if let Some(rest) = s.strip_prefix("http://") {
+        (80, rest)
+    } else {
+        (crate::constants::OLLAMA_PORT_DEFAULT, s)
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = split_host_port(host_port);
+    (host, port.unwrap_or(default_port))
 }
 
 impl fmt::Display for Provider {
@@ -862,6 +977,78 @@ mod tests {
     }
 
     #[test]
+    fn ollama_origin_reduces_override_to_origin() {
+        // A configured `llm.base_url` is a full endpoint URL; the origin is
+        // what reachability probes and the /api/tags catalog need. Schemeless
+        // specs (the `OLLAMA_HOST` convention) canonicalize to an explicit
+        // http origin with the 11434 default port, so every consumer of the
+        // origin dials the same place.
+        let cases: &[(&str, &str)] = &[
+            (
+                "http://10.0.0.5:11434/v1/chat/completions",
+                "http://10.0.0.5:11434",
+            ),
+            // Explicit scheme without a port is a normal URL: the scheme's
+            // default port applies, so the origin must stay verbatim.
+            (
+                "https://ollama.tailnet.example/v1/chat/completions",
+                "https://ollama.tailnet.example",
+            ),
+            // OLLAMA_HOST-style host[:port] specs, scheme optional.
+            ("10.0.0.5:11434", "http://10.0.0.5:11434"),
+            ("myhost", "http://myhost:11434"),
+            ("myhost:1234", "http://myhost:1234"),
+            // Bare IPv6 must be bracketed to stay a valid URL.
+            ("::1", "http://[::1]:11434"),
+            ("[::1]:8080", "http://[::1]:8080"),
+            ("http://myhost:11434/", "http://myhost:11434"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(super::ollama_origin(Some(input)), *want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn ollama_probe_target_matches_request_target() {
+        // Spec: the TCP probe must dial exactly where HTTP requests to the
+        // same spec go — a probe that checks a different port reports false
+        // health signals (the pre-fix bug this locks out). Scheme present →
+        // scheme default port (80/443); schemeless → Ollama's 11434
+        // convention. Hostnames and IPv6 must parse (the old
+        // `SocketAddr::parse` silently fell back to localhost for them).
+        let cases: &[(&str, &str, u16)] = &[
+            ("http://localhost:11434", "localhost", 11434),
+            // HTTPS-fronted Ollama (Caddy/Tailscale Funnel): requests go to
+            // 443, so the probe must too.
+            (
+                "https://ollama.tailnet.example",
+                "ollama.tailnet.example",
+                443,
+            ),
+            ("http://myhost", "myhost", 80),
+            ("http://10.0.0.5:8080", "10.0.0.5", 8080),
+            ("myhost:1234", "myhost", 1234),
+            ("myhost", "myhost", 11434),
+            ("http://[::1]:11434", "::1", 11434),
+            ("[::1]", "::1", 11434),
+            ("::1", "::1", 11434),
+            ("http://h:11434/v1/chat/completions", "h", 11434),
+        ];
+        for (input, want_host, want_port) in cases {
+            let (host, port) = super::ollama_probe_target(input);
+            assert_eq!(
+                (host.as_str(), port),
+                (*want_host, *want_port),
+                "input: {input}"
+            );
+        }
+        // End-to-end consistency: probing through `ollama_origin` (what
+        // `ollama_available_at` does) preserves the schemeless convention.
+        let (host, port) = super::ollama_probe_target(&super::ollama_origin(Some("myhost")));
+        assert_eq!((host.as_str(), port), ("myhost", 11434));
+    }
+
+    #[test]
     fn requires_api_key_cloud_vs_local() {
         assert!(Provider::OpenRouter.requires_api_key());
         assert!(Provider::OpenAi.requires_api_key());
@@ -870,6 +1057,21 @@ mod tests {
         assert!(Provider::DeepSeek.requires_api_key());
         assert!(Provider::Groq.requires_api_key());
         assert!(!Provider::Ollama.requires_api_key());
+    }
+
+    #[test]
+    fn build_headers_custom_skips_auth_when_keyless() {
+        // Keyless local OpenAI-compatible servers (llama.cpp, LM Studio):
+        // no Authorization header at all — `Bearer ` (empty credential)
+        // makes some servers reject the request.
+        let headers = Provider::Custom.build_headers("").unwrap();
+        assert!(headers.get("Authorization").is_none());
+        // With a key configured, bearer auth is sent as before.
+        let headers = Provider::Custom.build_headers("sk-byo").unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer sk-byo"
+        );
     }
 
     #[test]

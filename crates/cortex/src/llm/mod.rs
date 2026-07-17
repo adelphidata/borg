@@ -510,12 +510,26 @@ fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap
 /// string (the ecosystem convention is `OLLAMA_HOST=http://10.0.0.5:11434`,
 /// scheme optional). Already-suffixed inputs are returned unchanged so an
 /// operator pasting the full URL from existing docs keeps working.
+///
+/// Pure `host[:port]` specs route through [`provider::ollama_origin`] so
+/// the endpoint follows the same schemeless conventions the reachability
+/// probe uses (default port 11434, bracketed IPv6) — requests and health
+/// checks must never dial different targets. Specs carrying an explicit
+/// scheme or path (reverse-proxy prefixes like `http://h/ollama`) are kept
+/// verbatim apart from the appended completions path.
 pub(crate) fn compose_ollama_url(host: &str) -> String {
     let trimmed = host.trim().trim_end_matches('/');
     if trimmed.contains("/v1/chat/completions") {
         return trimmed.to_string();
     }
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    if !has_scheme && !trimmed.contains('/') {
+        return format!(
+            "{}/v1/chat/completions",
+            provider::ollama_origin(Some(trimmed))
+        );
+    }
+    let with_scheme = if has_scheme {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
@@ -703,6 +717,97 @@ async fn bedrock_endpoint_is_private(endpoint_override: Option<&str>) -> bool {
     all_addrs_private(&addrs)
 }
 
+/// Whether a Custom-provider `llm.base_url` provably targets a private or
+/// loopback address — the only case where the Custom (BYO) provider is
+/// permitted under air-gap mode. This implements the address-based
+/// enforcement documented on [`crate::providers::ProviderCategory`]: a local
+/// llama.cpp / LM Studio / vLLM endpoint is exactly as air-gap-safe as
+/// Ollama, and the category alone can't prove that at compile time.
+///
+/// Fail-closed, mirroring [`bedrock_endpoint_is_private`]: a missing URL, a
+/// non-http(s) scheme, a cloud-metadata host (refused by name *and* by
+/// resolved link-local address — link-local counts as "private" in
+/// [`all_addrs_private`], so IMDS must be excluded explicitly), an
+/// unresolvable host, or *any* publicly-routable resolved address all return
+/// `false` and fall through to the standard air-gap refusal. Unlike Bedrock,
+/// plain `http` is permitted — the whole point is loopback/RFC1918 servers,
+/// where TLS is commonly absent (same trust model as Ollama's default
+/// `http://localhost:11434`).
+///
+/// Residual risk (same acceptance as the Bedrock gate): the name is resolved
+/// here and re-resolved by reqwest at send time, so a DNS-rebinding endpoint
+/// that answers private now and public later is not fully closed off.
+/// Exploiting it needs DNS control over the operator-configured endpoint
+/// plus a real public route, which a true air-gap does not provide.
+async fn custom_endpoint_is_private(base_url: Option<&str>) -> bool {
+    let Some(raw) = base_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(raw) else {
+        tracing::warn!(%raw, "custom base_url did not parse; refusing under air-gap policy");
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        tracing::warn!(
+            scheme = url.scheme(),
+            "custom base_url scheme not http(s); refusing under air-gap policy"
+        );
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        tracing::warn!(%raw, "custom base_url has no host; refusing under air-gap policy");
+        return false;
+    };
+    if crate::llm::bedrock::is_cloud_metadata_host(&host) {
+        tracing::warn!(
+            host = host.as_str(),
+            "custom base_url is a cloud metadata endpoint; refusing under air-gap policy"
+        );
+        return false;
+    }
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                tracing::warn!(
+                    host = host.as_str(),
+                    error = %e,
+                    "custom base_url did not resolve; refusing under air-gap policy"
+                );
+                return false;
+            }
+        };
+    // The by-name metadata guard above only catches IP literals and known
+    // FQDNs; a hostname RESOLVING to link-local (IMDS et al.) would still
+    // pass `all_addrs_private`. No legitimate local LLM server lives on a
+    // link-local address, so reject those outright.
+    if any_addr_link_local(&addrs) {
+        tracing::warn!(
+            host = host.as_str(),
+            "custom base_url resolves to a link-local (cloud-metadata range) address; refusing under air-gap policy"
+        );
+        return false;
+    }
+    all_addrs_private(&addrs)
+}
+
+/// True when any resolved address is link-local: v4 `169.254/16` (covers
+/// IMDS 169.254.169.254 and ECS 169.254.170.2), v6 `fe80::/10`, the AWS
+/// IMDS v6 literal, or a v4-mapped equivalent.
+fn any_addr_link_local(addrs: &[std::net::SocketAddr]) -> bool {
+    addrs.iter().any(|a| match a.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    })
+}
+
 /// True only when `addrs` is non-empty and *every* address is private/loopback.
 /// Split out so the "all private, not just the first" guarantee is unit-testable
 /// without a live resolver.
@@ -765,7 +870,13 @@ impl LlmClient {
         let bedrock_privatelink_ok = provider == Provider::Bedrock
             && !config.providers.outbound_allowed
             && bedrock_endpoint_is_private(config.llm.bedrock_endpoint_url.as_deref()).await;
-        if !bedrock_privatelink_ok {
+        // Custom (BYO) endpoints are statically refused under air-gap, but a
+        // base_url that provably resolves to loopback/RFC1918 (local
+        // llama.cpp, LM Studio, vLLM) is as air-gap-safe as Ollama.
+        let custom_private_ok = provider == Provider::Custom
+            && !config.providers.outbound_allowed
+            && custom_endpoint_is_private(config.llm.base_url.as_deref()).await;
+        if !(bedrock_privatelink_ok || custom_private_ok) {
             crate::providers::ProviderRegistry::check_builtin_air_gap(
                 provider,
                 config.providers.outbound_allowed,
@@ -1867,8 +1978,22 @@ impl LlmClient {
                 match result {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
+                        // A refused connection to a local Ollama almost always
+                        // means the server isn't running — say so instead of
+                        // leaving the operator to decode a transport error.
+                        let hint = if self.provider == Provider::Ollama
+                            && e.downcast_ref::<reqwest::Error>()
+                                .is_some_and(reqwest::Error::is_connect)
+                        {
+                            format!(
+                                " — is the Ollama server running at {}? Start it with `ollama serve`.",
+                                self.effective_base_url()
+                            )
+                        } else {
+                            String::new()
+                        };
                         return Err(classify_network_error(
-                            anyhow::anyhow!("Failed to connect to {}: {e}", self.provider)
+                            anyhow::anyhow!("Failed to connect to {}: {e}{hint}", self.provider)
                         ));
                     }
                     Err(_) => {
@@ -2283,7 +2408,7 @@ mod tests;
 
 #[cfg(test)]
 mod bedrock_air_gap_tests {
-    use super::{all_addrs_private, bedrock_endpoint_is_private};
+    use super::{all_addrs_private, any_addr_link_local, bedrock_endpoint_is_private};
     use std::net::SocketAddr;
 
     fn addr(s: &str) -> SocketAddr {
@@ -2374,6 +2499,27 @@ mod bedrock_air_gap_tests {
         // Empty resolution is not "all private" — it must fail closed.
         assert!(!all_addrs_private(&[]));
     }
+
+    #[test]
+    fn any_addr_link_local_rejects_metadata_ranges() {
+        // A hostname resolving to link-local (IMDS 169.254.169.254, ECS
+        // 169.254.170.2, fe80::/10) would pass `all_addrs_private` — the
+        // custom air-gap gate must catch it by address, not just by name.
+        assert!(any_addr_link_local(&[addr("169.254.169.254:80")]));
+        assert!(any_addr_link_local(&[addr("169.254.170.2:80")]));
+        assert!(any_addr_link_local(&[addr("[fe80::1]:80")]));
+        assert!(any_addr_link_local(&[addr("[fd00:ec2::254]:80")]));
+        // One link-local among private addrs still rejects.
+        assert!(any_addr_link_local(&[
+            addr("10.0.0.1:80"),
+            addr("169.254.169.254:80")
+        ]));
+        // Ordinary loopback/RFC1918 stays allowed.
+        assert!(!any_addr_link_local(&[
+            addr("127.0.0.1:8080"),
+            addr("10.0.0.5:8080")
+        ]));
+    }
 }
 
 #[cfg(test)]
@@ -2387,6 +2533,13 @@ mod ollama_url_tests {
         assert_eq!(
             compose_ollama_url("10.0.0.5:11434"),
             "http://10.0.0.5:11434/v1/chat/completions"
+        );
+        // A bare host without a port follows the Ollama client convention
+        // (11434), matching where the reachability probe dials — not the
+        // http default of 80.
+        assert_eq!(
+            compose_ollama_url("myhost"),
+            "http://myhost:11434/v1/chat/completions"
         );
     }
 

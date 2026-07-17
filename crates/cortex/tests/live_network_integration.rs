@@ -1,6 +1,6 @@
 //! Live-LLM test lane: exercises `web_fetch`, `web_search`, `browser`,
-//! `text_to_speech`, and the audio transcription chain against real
-//! network targets.
+//! `text_to_speech`, the audio transcription chain, and a local Ollama
+//! chat round-trip against real network targets.
 //!
 //! Run with:
 //!
@@ -351,8 +351,7 @@ async fn live_tts_openai_synthesizes_short_clip() {
         || (head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0);
     assert!(
         is_mp3,
-        "response does not start with MP3 magic (first bytes: {:?})",
-        head
+        "response does not start with MP3 magic (first bytes: {head:?})"
     );
     // Attempts log: exactly one entry, success, provider name "openai".
     assert_eq!(attempts.len(), 1);
@@ -449,4 +448,47 @@ async fn live_stt_groq_transcribes_synthesized_clip() {
         attempts[0].outcome,
         cortex::media::understanding::AttemptOutcome::Success
     ));
+}
+
+/// Live local-LLM lane: a real chat round-trip against a local Ollama server.
+///
+/// Requires `BORG_ALLOW_LIVE_TESTS=1` AND a reachable Ollama (honors
+/// `OLLAMA_HOST`; defaults to localhost:11434) — skipped otherwise so the
+/// live lane stays usable on hosts that only have cloud credentials.
+/// Override the model with `BORG_LIVE_OLLAMA_MODEL` (default `llama3.2`,
+/// which must be `ollama pull`ed).
+#[tokio::test]
+async fn live_ollama_chat_round_trip() {
+    require_live!("live_ollama_chat_round_trip");
+    if !cortex::llm::provider::Provider::ollama_available() {
+        eprintln!("skipping live_ollama_chat_round_trip: no Ollama server reachable");
+        return;
+    }
+
+    let model = std::env::var("BORG_LIVE_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+    let mut config = Config::default();
+    config.llm.provider = Some("ollama".to_string());
+    config.llm.model = model;
+
+    let client = cortex::llm::LlmClient::new(&config)
+        .await
+        .expect("ollama client builds keyless");
+    let reply = client
+        .chat(
+            &[cortex::types::Message::user(
+                "Reply with the single word: pong",
+            )],
+            None,
+        )
+        .await
+        .expect("local ollama chat should succeed");
+
+    let content = reply
+        .text_content()
+        .expect("reply should contain text")
+        .to_ascii_lowercase();
+    assert!(
+        content.contains("pong"),
+        "expected 'pong' in local-model reply, got: {content:?}"
+    );
 }

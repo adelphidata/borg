@@ -242,6 +242,17 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
 
     let config = Config::load_from_db().await?;
 
+    // Same treatment for the local Ollama catalog: the `/model` picker shows
+    // the models actually installed on this machine. The configured
+    // `llm.base_url` only applies when Ollama is the active provider.
+    let ollama_base_url = config
+        .llm
+        .provider
+        .as_deref()
+        .filter(|p| *p == "ollama")
+        .and_then(|_| config.llm.base_url.clone());
+    crate::ollama_catalog::spawn_prefetch(ollama_base_url);
+
     // Initialize the active theme from the persisted `ui.theme` setting.
     // Done before any TUI render so the very first frame already reflects
     // the user's choice (otherwise the welcome banner flashes default

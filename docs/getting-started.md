@@ -177,11 +177,30 @@ export OLLAMA_HOST=http://10.0.0.5:11434          # scheme optional
 borg settings set llm.base_url http://10.0.0.5:11434/v1/chat/completions
 
 # llama.cpp / vLLM / LM Studio — use the `custom` provider with the
-# OpenAI-compatible base_url published by the server.
+# OpenAI-compatible base_url published by the server. No API key needed;
+# add one (llm.api_key / llm.api_key_env) only if the endpoint requires it.
 borg settings set llm.provider custom
 borg settings set llm.base_url http://localhost:8080/v1/chat/completions
 borg settings set llm.model "gemma-3-4b-it"
 ```
+
+Local-server tuning worth knowing:
+
+- **Ollama context length.** The OpenAI-compatible endpoint uses the server's
+  default context window (commonly 4096), and Borg cannot raise it per-request
+  — long prompts get silently truncated by the server. Start the server with
+  `OLLAMA_CONTEXT_LENGTH=32768 ollama serve` (or bake `num_ctx` into a
+  Modelfile) to match the model's real window.
+- **Ollama keep-alive.** Ollama unloads a model after ~5 idle minutes, so
+  intermittent use pays the cold-load latency every time. Run the server with
+  `OLLAMA_KEEP_ALIVE=24h` to keep it resident.
+- **Slow models.** Large models on modest hardware can exceed Borg's default
+  120s request timeout during cold loads — raise it with
+  `borg settings set llm.request_timeout_ms 300000`.
+- `borg doctor` probes the Ollama endpoint you actually configured
+  (`llm.base_url` → `OLLAMA_HOST` → `localhost:11434`), and the onboarding /
+  `/model` pickers list the models installed on your server (`ollama pull`
+  results), falling back to a static list when the server is unreachable.
 
 **TTS (Piper / Edge / a `custom` shell template for Qwen3-TTS, XTTS, etc.).**
 

@@ -6,7 +6,7 @@ use crate::llm::provider::Provider;
 
 pub(in crate::doctor) fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     match config.resolve_provider() {
-        Ok((provider, _key)) => {
+        Ok((provider, key)) => {
             if provider == Provider::ClaudeCli {
                 if let Some(path) = crate::claude_cli::detect_cli_path() {
                     checks.push(DiagnosticCheck::pass(
@@ -32,18 +32,46 @@ pub(in crate::doctor) fn check_provider(config: &Config, checks: &mut Vec<Diagno
                         "not authenticated or expired — run `claude login`",
                     ));
                 }
+            } else if provider == Provider::Custom && key.is_empty() {
+                // Keyless custom endpoint (llama.cpp, LM Studio, vLLM) —
+                // resolution already required `llm.base_url` to be set.
+                checks.push(DiagnosticCheck::pass(
+                    "Provider",
+                    "Custom endpoint configured (keyless)",
+                ));
             } else if provider.requires_api_key() {
                 checks.push(DiagnosticCheck::pass("Provider", "API key set"));
-            } else if Provider::ollama_available() {
-                checks.push(DiagnosticCheck::pass("Provider", "Ollama server reachable"));
-            } else {
-                checks.push(DiagnosticCheck::warn(
+            } else if provider.uses_aws_credential_chain() {
+                // Region resolution already succeeded inside resolve_provider.
+                checks.push(DiagnosticCheck::pass(
                     "Provider",
-                    "Ollama server",
-                    format!(
-                        "not reachable at localhost:{} — run `ollama serve`",
-                        crate::constants::OLLAMA_PORT_DEFAULT
-                    ),
+                    "AWS credential chain configured",
+                ));
+            } else if provider == Provider::Ollama {
+                // Probe the endpoint actually in use: `llm.base_url` override
+                // → `OLLAMA_HOST` → localhost default. Probing localhost
+                // while the operator configured a remote host produced
+                // false "not reachable" warnings.
+                let base_url = config.llm.base_url.as_deref();
+                let origin = crate::llm::provider::ollama_origin(base_url);
+                if Provider::ollama_available_at(base_url) {
+                    checks.push(DiagnosticCheck::pass(
+                        "Provider",
+                        format!("Ollama server reachable at {origin}"),
+                    ));
+                } else {
+                    checks.push(DiagnosticCheck::warn(
+                        "Provider",
+                        "Ollama server",
+                        format!("not reachable at {origin} — run `ollama serve`"),
+                    ));
+                }
+            } else {
+                // Remaining keyless providers (e.g. Vertex AI cloud OAuth)
+                // resolve credentials at request time.
+                checks.push(DiagnosticCheck::pass(
+                    "Provider",
+                    format!("{provider} requires no static API key"),
                 ));
             }
             checks.push(DiagnosticCheck::pass(

@@ -258,7 +258,15 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
         "groq" => GROQ_MODELS,
         "xai" => XAI_MODELS,
         "azure-openai" => AZURE_OPENAI_MODELS,
-        "ollama" => OLLAMA_MODELS,
+        "ollama" => {
+            // Prefer the live installed-model list from `GET /api/tags` —
+            // what's actually pulled on this machine rarely matches the
+            // hardcoded suggestions.
+            if let Some(live) = crate::ollama_catalog::cached_models() {
+                return live;
+            }
+            OLLAMA_MODELS
+        }
         "claude-cli" => CLAUDE_CLI_MODELS,
         "openrouter" => {
             if let Some(live) = crate::openrouter_catalog::cached_models() {
@@ -276,6 +284,10 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
 
 /// Run the interactive onboarding wizard. Returns `None` if the user cancels.
 pub fn run_onboarding() -> Result<Option<OnboardingResult>> {
+    // Fire-and-forget: populate the installed-Ollama-model cache while the
+    // user is on the earlier tabs, so the model picker shows what `ollama
+    // pull` actually installed.
+    crate::ollama_catalog::prefetch_from_sync();
     crate::onboarding_tui::run()
 }
 

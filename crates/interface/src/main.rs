@@ -53,6 +53,7 @@ mod borgd_launcher;
 mod daemon_client;
 mod logo;
 mod migrate_tui;
+mod ollama_catalog;
 mod onboarding;
 mod onboarding_tui;
 mod openrouter_catalog;

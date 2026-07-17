@@ -271,6 +271,97 @@ fn resolve_api_keys_keeps_provider_when_key_prefix_is_ambiguous() {
 }
 
 #[test]
+fn resolve_api_keys_keyless_provider_ignores_stray_api_keys() {
+    // Strict provider resolution: an operator running Ollama with a leftover
+    // OpenRouter key in `llm.api_keys` must stay on Ollama —
+    // `correct_provider_from_key` silently flipping the provider would route
+    // local traffic to a public cloud.
+    let env = "BORG_TEST_STRAY_KEY_FOR_OLLAMA";
+    std::env::set_var(env, "sk-or-v1-leftover-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("ollama".to_string());
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env.to_string(),
+    }];
+    let (provider, keys) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::Ollama);
+    assert_eq!(keys, vec![String::new()]);
+    std::env::remove_var(env);
+}
+
+#[test]
+fn resolve_provider_custom_keyless_with_base_url() {
+    // The documented llama.cpp / LM Studio / vLLM flow: `llm.provider =
+    // "custom"` + `llm.base_url`, no API key. Must resolve with an empty key
+    // rather than bailing "No API key found".
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("custom".to_string());
+    cfg.llm.base_url = Some("http://localhost:8080/v1/chat/completions".to_string());
+    let (provider, key) = cfg.resolve_provider().expect("should resolve keyless");
+    assert_eq!(provider, Provider::Custom);
+    assert_eq!(key, "");
+}
+
+#[test]
+fn custom_provider_never_flipped_by_key_prefix() {
+    // A recognizable key prefix used as a custom endpoint's bearer credential
+    // must not reroute traffic away from the operator's explicit endpoint.
+    assert_eq!(
+        correct_provider_from_key(Provider::Custom, "sk-or-v1-endpoint-cred"),
+        Provider::Custom
+    );
+    // Sanity: the correction still applies to non-custom providers.
+    assert_eq!(
+        correct_provider_from_key(Provider::OpenAi, "sk-or-v1-endpoint-cred"),
+        Provider::OpenRouter
+    );
+}
+
+/// Serializes tests that mutate the process-global `OPENROUTER_API_KEY` env
+/// var (the built-in `api_key_env` default). Without this they race in the
+/// parallel test runner and observe each other's set/remove.
+fn openrouter_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[test]
+fn resolve_provider_custom_ignores_default_openrouter_env() {
+    // Regression: a host with OPENROUTER_API_KEY exported (the built-in
+    // `api_key_env` default) must not have that key resolved for a custom
+    // endpoint — it would be sent as a Bearer credential to a user-supplied
+    // URL and flip provider routing.
+    let _env = openrouter_env_lock();
+    let old = std::env::var("OPENROUTER_API_KEY").ok();
+    std::env::set_var("OPENROUTER_API_KEY", "sk-or-v1-host-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("custom".to_string());
+    cfg.llm.base_url = Some("http://localhost:8080/v1/chat/completions".to_string());
+    let (provider, key) = cfg.resolve_provider().expect("should resolve");
+    match old {
+        Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+        None => std::env::remove_var("OPENROUTER_API_KEY"),
+    }
+    assert_eq!(provider, Provider::Custom);
+    assert_eq!(
+        key, "",
+        "default env key must not attach to a custom endpoint"
+    );
+}
+
+#[test]
+fn resolve_provider_custom_without_base_url_errors_actionably() {
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("custom".to_string());
+    let err = cfg.resolve_provider().expect_err("must not resolve");
+    assert!(
+        err.to_string().contains("llm.base_url"),
+        "error must point at the missing base_url, got: {err}"
+    );
+}
+
+#[test]
 fn resolve_api_keys_multi() {
     let env1 = "BORG_TEST_MULTI_KEY_1";
     let env2 = "BORG_TEST_MULTI_KEY_2";
@@ -521,6 +612,7 @@ fn resolve_provider_bails_loud_when_key_missing_for_configured_provider() {
     // Incident regression: user onboarded OpenRouter but OPENROUTER_API_KEY
     // wasn't in the launch shell → runtime used to silently fall through to
     // Ollama. Must now fail loud pointing at the configured provider.
+    let _env = openrouter_env_lock();
     let env_name = "BORG_TEST_MISSING_KEY_OPENROUTER_DOES_NOT_EXIST";
     std::env::remove_var(env_name);
     std::env::remove_var("OPENROUTER_API_KEY");

@@ -340,9 +340,20 @@ impl OnboardingState {
         if provider.uses_aws_credential_chain() {
             return true;
         }
-        // Keyless local providers: check if server is reachable instead of API key
-        if !provider.requires_api_key() {
+        // Keyless local providers substitute their own readiness signal for
+        // an API key. Each gets its own check — probing Ollama's TCP port
+        // for Claude CLI reported nonsense.
+        if provider == Provider::Ollama {
             return Provider::ollama_available();
+        }
+        if provider == Provider::ClaudeCli {
+            return cortex::claude_cli::detect_cli_path().is_some()
+                && cortex::claude_cli::has_valid_auth();
+        }
+        if !provider.requires_api_key() {
+            // Other keyless providers (not currently onboardable) have no
+            // pre-existing local credential to detect.
+            return false;
         }
         let env_var_name = provider.default_env_var();
         let Ok(data_dir) = Config::data_dir() else {

@@ -113,6 +113,44 @@ async fn air_gap_allows_local_construction() {
 }
 
 #[tokio::test]
+async fn air_gap_custom_endpoint_policy_by_resolved_address() {
+    // Custom (BYO) is statically refused under air-gap, EXCEPT when the
+    // base_url provably resolves to a private/loopback address — a local
+    // llama.cpp/LM Studio server is as air-gap-safe as Ollama. IP literals
+    // keep this hermetic (no live DNS). The metadata case matters because
+    // link-local counts as "private" in all_addrs_private — it must be
+    // refused by the explicit metadata-host guard instead.
+    let cases: &[(&str, bool)] = &[
+        ("http://127.0.0.1:8080/v1/chat/completions", true),
+        ("http://10.0.0.5:8080/v1/chat/completions", true),
+        ("http://8.8.8.8/v1/chat/completions", false),
+        ("http://169.254.169.254/v1/chat/completions", false),
+        ("ftp://127.0.0.1/v1/chat/completions", false),
+    ];
+    for (base_url, allowed) in cases {
+        let mut config = Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "gemma-3-4b-it".to_string();
+        config.llm.base_url = Some((*base_url).to_string());
+        config.providers.outbound_allowed = false;
+        match LlmClient::new(&config).await {
+            Ok(_) => assert!(*allowed, "base_url {base_url}: expected air-gap refusal"),
+            Err(err) => {
+                assert!(
+                    !*allowed,
+                    "base_url {base_url}: expected allowed, got: {err}"
+                );
+                // Refusals must go through the standard air-gap message.
+                assert!(
+                    format!("{err}").contains("air-gap"),
+                    "expected air-gap rejection for {base_url}, got: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn air_gap_skips_public_cloud_fallback_slot() {
     // A primary Local provider with a PublicCloud fallback under air-gap
     // must construct, but the fallback slot must be dropped — otherwise
@@ -851,6 +889,53 @@ async fn effective_base_url_falls_back_to_provider_default() {
     assert_eq!(
         client.effective_base_url().as_ref(),
         "http://localhost:11434/v1/chat/completions"
+    );
+}
+
+#[tokio::test]
+async fn custom_provider_constructs_keyless_with_base_url() {
+    // The documented llama.cpp / LM Studio flow: custom provider + base_url,
+    // no API key anywhere. Client construction must succeed and target the
+    // configured endpoint.
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "gemma-3-4b-it".to_string();
+    config.llm.base_url = Some("http://localhost:8080/v1/chat/completions".to_string());
+    let client = LlmClient::new(&config)
+        .await
+        .expect("keyless custom must construct");
+    assert_eq!(
+        client.effective_base_url().as_ref(),
+        "http://localhost:8080/v1/chat/completions"
+    );
+}
+
+#[tokio::test]
+async fn ollama_connection_refused_error_says_ollama_serve() {
+    // Bind then drop a listener so the port is provably closed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+
+    let mut config = Config::default();
+    config.llm.provider = Some("ollama".to_string());
+    config.llm.model = "llama3.3".to_string();
+    config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
+    config.llm.max_retries = 0;
+    let client = LlmClient::new(&config).await.expect("client builds");
+
+    let err = client
+        .chat(&[Message::user("hi")], None)
+        .await
+        .expect_err("no server listening");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("ollama serve"),
+        "refused connection must tell the operator to start Ollama, got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("127.0.0.1:{port}")),
+        "error must name the endpoint it tried, got: {msg}"
     );
 }
 

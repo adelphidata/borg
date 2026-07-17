@@ -521,7 +521,25 @@ impl Config {
 
         if let Some(key) = self
             .try_resolve_api_key_secret_ref("api_key_env")
-            .or_else(|| try_resolve_env(&self.llm.api_key_env))
+            .or_else(|| {
+                // For a Custom endpoint, the built-in `api_key_env` default
+                // (`OPENROUTER_API_KEY`) must not apply: it would send an
+                // unrelated provider's key as a Bearer credential to a
+                // user-supplied URL. Only an explicitly configured env var
+                // counts. (`Provider::Custom.default_env_var()` is already
+                // empty, so the third source is a no-op.) An operator who
+                // genuinely wants that env var as the endpoint's bearer
+                // credential can still express it via `llm.api_key =
+                // { source = "env", var = "OPENROUTER_API_KEY" }` — we can't
+                // distinguish "explicitly set to the default" here.
+                if provider == Provider::Custom
+                    && self.llm.api_key_env == crate::constants::DEFAULT_LLM_API_KEY_ENV
+                {
+                    None
+                } else {
+                    try_resolve_env(&self.llm.api_key_env)
+                }
+            })
             .or_else(|| try_resolve_env(provider.default_env_var()))
         {
             return Ok((provider, key));
@@ -529,6 +547,24 @@ impl Config {
 
         if provider.supports_cloud_auth() {
             return Ok((provider, String::new()));
+        }
+
+        // Custom endpoints (llama.cpp server, LM Studio, vLLM, …) are
+        // commonly keyless local servers: with `llm.base_url` set, proceed
+        // without a key — an endpoint that does require auth will reject the
+        // request with its own message.
+        if provider == Provider::Custom {
+            if self
+                .llm
+                .base_url
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Ok((provider, String::new()));
+            }
+            anyhow::bail!(
+                "Provider `custom` needs `llm.base_url` pointing at an OpenAI-compatible endpoint (e.g. http://localhost:8080/v1/chat/completions for llama.cpp). Set it via `/settings` or `borg settings set llm.base_url <url>`; add an API key only if the endpoint requires one."
+            );
         }
 
         anyhow::bail!(
@@ -573,6 +609,21 @@ impl Config {
     /// Returns the provider and a list of resolved keys (for multi-key fallback).
     /// Falls back to a single key from `resolve_provider` if no `api_keys` are configured.
     pub fn resolve_api_keys(&self) -> Result<(Provider, Vec<String>)> {
+        // Keyless and AWS-chain providers never consult `llm.api_keys`: a
+        // stray key row must not flip the operator's explicit provider choice
+        // via `correct_provider_from_key` — provider resolution is strict.
+        if let Some(provider) = self
+            .llm
+            .provider
+            .as_deref()
+            .and_then(|s| Provider::from_str(s).ok())
+        {
+            if !provider.requires_api_key() {
+                let (provider, key) = self.resolve_provider()?;
+                return Ok((provider, vec![key]));
+            }
+        }
+
         // Try multi-key resolution first (avoids requiring a default API key env var)
         if !self.llm.api_keys.is_empty() {
             let mut keys = Vec::new();
@@ -590,10 +641,6 @@ impl Config {
                     );
                 };
                 let provider = Provider::from_str(provider_str)?;
-                if provider.uses_aws_credential_chain() {
-                    self.resolve_bedrock_region()?;
-                    return Ok((provider, vec![String::new()]));
-                }
                 let provider = correct_provider_from_key(provider, &keys[0]);
                 return Ok((provider, keys));
             }
@@ -789,6 +836,12 @@ fn read_credentials_file(service: &str, account: &str) -> Option<String> {
 /// Prevents the surprising "Authentication with OpenAI failed" flow when an
 /// OpenRouter key ends up stored under `provider = "openai"`.
 fn correct_provider_from_key(configured: Provider, key: &str) -> Provider {
+    // `custom` names an explicit operator endpoint; a recognizable key prefix
+    // (e.g. an OpenRouter key used as the endpoint's bearer credential) must
+    // not silently reroute traffic away from it.
+    if configured == Provider::Custom {
+        return configured;
+    }
     match Provider::from_api_key_prefix(key) {
         Some(detected) if detected != configured => {
             warn!(
