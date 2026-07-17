@@ -18,6 +18,9 @@ pub use patch::{
     handle_apply_patch, handle_apply_patch_unified, handle_apply_patch_unified_with_context,
     handle_apply_patch_with_context, handle_apply_skill_patch, handle_create_channel,
 };
+// Re-exported for the concurrency planner in `crate::tool::effects`, which must
+// reserve exactly the paths these markers cause this handler to write.
+pub(crate) use patch::PATCH_DSL_MARKERS;
 pub use read::{handle_read_file, handle_read_file_with_context, handle_read_pdf};
 
 /// Build a default `ExecutionContext` from the running process. Used by the

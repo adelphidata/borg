@@ -116,11 +116,16 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
         ("gemini-2.5-pro", 1.25, 10.0),
         ("gemini-2.5-flash", 0.30, 2.50),
         ("gemini-2.0-flash", 0.10, 0.40),
-        // DeepSeek (deepseek-chat is V3.2 alias)
-        ("deepseek-chat", 0.27, 1.10),
+        // DeepSeek — direct-API rates, 2026-07 snapshot of
+        // https://api-docs.deepseek.com/quick_start/pricing (cache-miss input).
+        // `deepseek-chat` / `deepseek-reasoner` retire 2026-07-24 and already
+        // alias V4 Flash's non-thinking / thinking modes, so they price as it.
+        ("deepseek-v4-flash", 0.14, 0.28),
+        ("deepseek-v4-pro", 0.435, 0.87),
+        ("deepseek-chat", 0.14, 0.28),
+        ("deepseek-reasoner", 0.14, 0.28),
         ("deepseek-v3.2", 0.27, 1.10),
         ("deepseek-chat-v3", 0.27, 1.10),
-        ("deepseek-reasoner", 0.55, 2.19),
         ("deepseek-r1", 0.55, 2.19),
     ];
 
@@ -283,18 +288,32 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
             prompt_per_mtok_usd: "0.30",
             completion_per_mtok_usd: "2.50",
         },
-        // DeepSeek
+        // DeepSeek — 2026-07 direct-API snapshot. The legacy `deepseek-chat` /
+        // `deepseek-reasoner` ids alias V4 Flash until they retire 2026-07-24,
+        // so all three carry its rate.
+        BundledRateCardEntry {
+            provider_id: "deepseek",
+            model: "deepseek-v4-flash",
+            prompt_per_mtok_usd: "0.14",
+            completion_per_mtok_usd: "0.28",
+        },
+        BundledRateCardEntry {
+            provider_id: "deepseek",
+            model: "deepseek-v4-pro",
+            prompt_per_mtok_usd: "0.435",
+            completion_per_mtok_usd: "0.87",
+        },
         BundledRateCardEntry {
             provider_id: "deepseek",
             model: "deepseek-chat",
-            prompt_per_mtok_usd: "0.27",
-            completion_per_mtok_usd: "1.10",
+            prompt_per_mtok_usd: "0.14",
+            completion_per_mtok_usd: "0.28",
         },
         BundledRateCardEntry {
             provider_id: "deepseek",
             model: "deepseek-reasoner",
-            prompt_per_mtok_usd: "0.55",
-            completion_per_mtok_usd: "2.19",
+            prompt_per_mtok_usd: "0.14",
+            completion_per_mtok_usd: "0.28",
         },
         // Local providers — zero rate card so the budget pipeline records $0
         // uniformly without special-casing (per task spec).
@@ -327,6 +346,41 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rates from the 2026-07 direct-API snapshot. Stale rates here don't fail
+    /// loudly — they silently mis-bill every turn and skew the budget guard, so
+    /// pin the arithmetic.
+    #[test]
+    fn deepseek_v4_costs_match_the_published_rates() {
+        // 1M input × $0.14/M + 500K output × $0.28/M = 0.14 + 0.14 = 0.28
+        let flash = estimate_cost("deepseek-v4-flash", 1_000_000, 500_000).unwrap();
+        assert!((flash - 0.28).abs() < 1e-9, "got {flash}");
+
+        // 1M input × $0.435/M + 500K output × $0.87/M = 0.435 + 0.435 = 0.87
+        let pro = estimate_cost("deepseek-v4-pro", 1_000_000, 500_000).unwrap();
+        assert!((pro - 0.87).abs() < 1e-9, "got {pro}");
+
+        assert!(
+            pro > flash,
+            "the Pro tier must never price below Flash: {pro} vs {flash}"
+        );
+    }
+
+    /// Invariant: `deepseek-chat` / `deepseek-reasoner` are aliases of V4
+    /// Flash's non-thinking / thinking modes until they retire on 2026-07-24,
+    /// so they must bill at exactly its rate — not the retired V3-era rates.
+    #[test]
+    fn deepseek_legacy_aliases_price_as_v4_flash() {
+        let flash = estimate_cost("deepseek-v4-flash", 1_000_000, 500_000).unwrap();
+        for alias in ["deepseek-chat", "deepseek-reasoner"] {
+            let aliased = estimate_cost(alias, 1_000_000, 500_000)
+                .unwrap_or_else(|| panic!("{alias} must stay priced while it still resolves"));
+            assert!(
+                (aliased - flash).abs() < 1e-9,
+                "{alias} must bill as V4 Flash: {aliased} vs {flash}"
+            );
+        }
+    }
 
     #[test]
     fn known_model_returns_cost() {

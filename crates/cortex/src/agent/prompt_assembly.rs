@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::constants;
 use crate::conversation::{
     compact_history, compact_history_v2, compact_tool_results, compaction_checkpoint_range,
     enforce_tool_result_share_limit, extract_last_compaction_summary, history_tokens,
-    normalize_history,
+    normalize_history, SummarizeFailure,
 };
 use crate::hooks::{HookAction, HookData, HookPoint};
 use crate::llm::LlmClient;
@@ -54,6 +54,30 @@ pub(crate) const MAX_INEFFECTIVE_COMPACTIONS: u32 = 3;
 /// first — and a truncated summary fails to shrink anything, re-firing
 /// compaction every turn. Raise-only: a larger configured cap is kept.
 pub(crate) const SUMMARY_OUTPUT_TOKENS_FLOOR: u32 = 16_384;
+
+/// Turns a summarizer outage suppresses proactive compaction before one probe
+/// is let through. Long enough that a dead key isn't re-billed every turn,
+/// short enough that a restored key resumes compacting without a restart.
+pub(crate) const COMPACTION_OUTAGE_RETRY_TURNS: u32 = 10;
+
+/// A summarizer failure that retrying cannot fix, latched so the agent stops
+/// re-paying for it every turn.
+///
+/// Deliberately distinct from [`CompactionStrikes`]: strikes measure passes
+/// that ran and were *ineffective*, whereas this records a provider that
+/// refuses to run the pass at all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionOutage {
+    /// What the provider rejected us for — reported to the user once.
+    pub(crate) category: crate::error_format::ErrorCategory,
+    /// Turns left before a single probe is allowed through.
+    pub(crate) turns_until_retry: u32,
+    /// Whether the user has been shown the notice yet. Tracked separately from
+    /// the latch itself because a latch can be armed from a path with no event
+    /// channel (manual `/compact`); it then stays unannounced until a path that
+    /// *can* reach the user observes it, rather than being silently swallowed.
+    pub(crate) announced: bool,
+}
 
 /// Decision from [`CompactionStrikes::gate`] for a proactive compaction
 /// attempt.
@@ -537,6 +561,27 @@ Rules:
             // Skipped until history actually shrinks or a compaction
             // succeeds. The reactive (provider context-overflow) path is
             // deliberately not gated.
+            // A summarizer outage that retrying can't fix (bad key, exhausted
+            // quota) fails identically every turn, so stop paying for it —
+            // but never permanently: the cooldown lets one probe through
+            // every `COMPACTION_OUTAGE_RETRY_TURNS` so a restored credential
+            // resumes compaction on its own.
+            if let Some(outage) = self.compaction_outage.as_mut() {
+                if outage.turns_until_retry > 0 {
+                    outage.turns_until_retry -= 1;
+                    debug!(
+                        category = %outage.category,
+                        turns_until_retry = outage.turns_until_retry,
+                        "Skipping proactive compaction: summarizer is still failing"
+                    );
+                    return Ok(());
+                }
+                debug!(
+                    category = %outage.category,
+                    "Re-probing the summarizer after the outage cooldown"
+                );
+            }
+
             let current_tokens = history_tokens(&self.history);
             match self.compaction_strikes.gate(current_tokens) {
                 CompactionGate::SkipEngaged => {
@@ -586,7 +631,8 @@ Rules:
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
-            let mut dropped_count = self.run_llm_compaction(max_hist, &compaction_llm).await;
+            let (mut dropped_count, mut failure) =
+                self.run_llm_compaction(max_hist, &compaction_llm).await;
 
             // A `[compaction]` override that stops working (retired model
             // slug, dead key) would otherwise wedge compaction forever: the
@@ -601,8 +647,17 @@ Rules:
                     "compaction via [compaction] override made no progress; retrying with the primary model"
                 );
                 let primary_llm = self.make_llm_client_from_config(&self.config).await?;
-                dropped_count = self.run_llm_compaction(max_hist, &primary_llm).await;
+                // The primary's verdict replaces the override's: if the primary
+                // can summarize, there is no outage to report — and if it can't
+                // either, the outage is real rather than an override typo.
+                let (retry_dropped, retry_failure) =
+                    self.run_llm_compaction(max_hist, &primary_llm).await;
+                dropped_count = retry_dropped;
+                failure = retry_failure;
             }
+
+            self.record_compaction_outcome(dropped_count, failure, Some(event_tx))
+                .await;
 
             // Score the pass for the anti-thrash guard. Still over the
             // trigger threshold → strike now; dipped under → defer the
@@ -642,6 +697,71 @@ Rules:
         Ok(())
     }
 
+    /// Fold one compaction pass's outcome into the outage latch, announcing a
+    /// newly-detected outage exactly once.
+    ///
+    /// Every path that realizes an LLM compaction (proactive, reactive, manual
+    /// `/compact`) funnels its result through here so the latch can't be set by
+    /// one path and left stale by another.
+    ///
+    /// The clearing rule is deliberately narrow: only the summarizer actually
+    /// dropping messages proves it works. A healthy *main* stream proves
+    /// nothing, because `[compaction]` overrides can point the summarizer at a
+    /// different provider and key entirely.
+    pub(super) async fn record_compaction_outcome(
+        &mut self,
+        dropped: usize,
+        failure: Option<SummarizeFailure>,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    ) {
+        if dropped > 0 {
+            // Demonstrated success — whatever was wrong is over.
+            self.compaction_outage = None;
+            return;
+        }
+
+        let Some(SummarizeFailure::Persistent(category)) = failure else {
+            // Transient, or nothing to compact: keep normal retry semantics.
+            self.compaction_outage = None;
+            return;
+        };
+
+        if self.compaction_outage.is_none() {
+            warn!(
+                %category,
+                "Suspending proactive compaction: the summarizer's provider is rejecting \
+                 requests in a way retrying cannot fix. History will keep growing until \
+                 it is restored."
+            );
+        }
+        let outage = self.compaction_outage.get_or_insert(CompactionOutage {
+            category,
+            turns_until_retry: COMPACTION_OUTAGE_RETRY_TURNS,
+            announced: false,
+        });
+        // Re-arm: a fresh latch and a failed re-probe both get a full cooldown.
+        outage.category = category;
+        outage.turns_until_retry = COMPACTION_OUTAGE_RETRY_TURNS;
+
+        // Announce once, from whichever path first has a channel to the user.
+        let Some(event_tx) = event_tx else { return };
+        if outage.announced {
+            return;
+        }
+        outage.announced = true;
+        let _ = event_tx
+            .send(AgentEvent::SystemNotice {
+                category: "compaction".to_string(),
+                text: format!(
+                    "Context compaction is paused — the summarizer could not reach the model \
+                     provider ({category}). Older messages will stay in context, so this \
+                     conversation may hit the model's limit. Check your API key or billing; \
+                     compaction retries on its own."
+                ),
+            })
+            .await;
+    }
+
     /// Run one LLM-based compaction pass over the working history and record it
     /// as a durable [`crate::conversation::SessionEventKind::CompactionCheckpoint`].
     ///
@@ -656,7 +776,14 @@ Rules:
     /// (non-destructive).
     ///
     /// Returns the number of messages dropped from the working view (0 = no-op).
-    pub(super) async fn run_llm_compaction(&mut self, target: usize, llm: &LlmClient) -> usize {
+    /// Returns how many messages were dropped, plus the summarizer's failure
+    /// class when it produced nothing — the caller decides whether to keep
+    /// paying for retries.
+    pub(super) async fn run_llm_compaction(
+        &mut self,
+        target: usize,
+        llm: &LlmClient,
+    ) -> (usize, Option<SummarizeFailure>) {
         // Seed the iterative summary from the marker already in the working set
         // (itself a projection of the log) — no separate cached field to drift.
         let mut summary = extract_last_compaction_summary(&self.history);
@@ -679,8 +806,11 @@ Rules:
         // even when protection has *decayed* to 0 — so the iterative summary fold
         // and durable checkpoint keep chaining. Only a user who disabled head
         // protection entirely (configured 0) takes the legacy path.
+        // Remember why a pass produced nothing. A later pass that succeeds
+        // clears it — the summarizer demonstrably works.
+        let mut failure: Option<SummarizeFailure> = None;
         let head_protected_dropped = if self.config.conversation.protect_first_n > 0 {
-            compact_history_v2(
+            match compact_history_v2(
                 &mut self.history,
                 target,
                 effective_protect_first_n,
@@ -688,9 +818,18 @@ Rules:
                 llm,
             )
             .await
+            {
+                Ok(dropped) => dropped,
+                Err(f) => {
+                    failure = Some(f);
+                    0
+                }
+            }
         } else {
             let before = self.history.len();
-            compact_history(&mut self.history, target, llm).await;
+            if let Err(f) = compact_history(&mut self.history, target, llm).await {
+                failure = Some(f);
+            }
             before.saturating_sub(self.history.len())
         };
         let mut dropped = head_protected_dropped;
@@ -698,10 +837,23 @@ Rules:
         // Fallback: head-protected compaction made no progress (protected head
         // alone exceeds budget, or the head clamped out the middle) yet we are
         // still over budget — degrade to non-head-protected so we don't stall.
-        if dropped == 0 && history_tokens(&self.history) > target {
+        //
+        // Skipped when the pass above already failed persistently: the same
+        // credential is about to be rejected the same way, and the chunked path
+        // is up to five calls. Nothing to gain, real money to lose.
+        let persistent = matches!(failure, Some(SummarizeFailure::Persistent(_)));
+        if dropped == 0 && !persistent && history_tokens(&self.history) > target {
             let before = self.history.len();
-            compact_history(&mut self.history, target, llm).await;
+            let fallback = compact_history(&mut self.history, target, llm).await;
             dropped = before.saturating_sub(self.history.len());
+            // `Ok(())` here can mean "planned nothing", which is a no-op rather
+            // than proof the summarizer works — only dropped messages clear a
+            // recorded failure, or a persistent outage would vanish unreported.
+            failure = if dropped > 0 {
+                None
+            } else {
+                fallback.err().or(failure)
+            };
             if dropped > 0 {
                 warn!(
                     "v2 compaction yielded no progress; fell back to legacy compaction and dropped {dropped} messages"
@@ -723,7 +875,7 @@ Rules:
                     .await;
             }
         }
-        dropped
+        (dropped, failure)
     }
 
     /// Append a compaction checkpoint to the durable session log. Best-effort:

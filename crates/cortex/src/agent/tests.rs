@@ -308,6 +308,7 @@ fn minimal_test_agent(config: Config) -> Agent {
         auto_title_spawned: false,
         active_failover_identity: None,
         compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
+        compaction_outage: None,
         stream_health: super::stream_handler::StreamHealth::new(),
         prompt_cache_scope: None,
     }
@@ -470,6 +471,201 @@ async fn environment_section_reports_failover_model_identity() {
         !env.contains("model=claude-primary"),
         "must not still report the primary model after failover: {env}"
     );
+}
+
+/// Spec: once the summarizer's provider has rejected us in a way retrying
+/// cannot fix, proactive compaction must stop attempting it. Without the
+/// latch the agent re-pays for the identical rejection on every single turn,
+/// and re-announces it every time.
+#[tokio::test]
+async fn latched_compaction_outage_skips_proactive_compaction() {
+    let mut config = Config::default();
+    // Force the history over budget so the LLM-compaction block is reached.
+    config.conversation.max_history_tokens = 32;
+    let mut agent = minimal_test_agent(config);
+    agent.history = vec![
+        Message::user("a".repeat(2000)),
+        Message::assistant("b".repeat(2000)),
+        Message::user("c".repeat(2000)),
+    ];
+    agent.compaction_outage = Some(super::prompt_assembly::CompactionOutage {
+        category: crate::error_format::ErrorCategory::Auth,
+        turns_until_retry: super::prompt_assembly::COMPACTION_OUTAGE_RETRY_TURNS,
+        announced: true,
+    });
+
+    let before: Vec<Option<String>> = agent
+        .history
+        .iter()
+        .map(|m| m.text_content().map(str::to_string))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(16);
+
+    agent
+        .compact_history_if_needed(&tx)
+        .await
+        .expect("a latched outage is not an error — it just skips the pass");
+
+    let after: Vec<Option<String>> = agent
+        .history
+        .iter()
+        .map(|m| m.text_content().map(str::to_string))
+        .collect();
+    assert_eq!(
+        after, before,
+        "history must be left untouched while the summarizer is known-broken"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the outage was already announced once; it must not be re-announced every turn"
+    );
+    assert_eq!(
+        agent
+            .compaction_outage
+            .expect("latch must persist while cooling down")
+            .turns_until_retry,
+        super::prompt_assembly::COMPACTION_OUTAGE_RETRY_TURNS - 1,
+        "each skipped turn must burn down the cooldown, or the latch never re-probes"
+    );
+}
+
+/// Spec: the latch must never be permanent. After the cooldown burns down, one
+/// probe is let through — that is what lets a restored key resume compaction
+/// without restarting the session.
+#[tokio::test]
+async fn compaction_outage_cooldown_expires_and_allows_a_probe() {
+    let mut config = Config::default();
+    config.conversation.max_history_tokens = 32;
+    // No provider configured, so the probe fails at client construction —
+    // reaching that error is itself proof the gate let the attempt through.
+    config.llm.provider = None;
+    let mut agent = minimal_test_agent(config);
+    agent.history = vec![
+        Message::user("a".repeat(2000)),
+        Message::assistant("b".repeat(2000)),
+        Message::user("c".repeat(2000)),
+    ];
+    agent.compaction_outage = Some(super::prompt_assembly::CompactionOutage {
+        category: crate::error_format::ErrorCategory::Auth,
+        turns_until_retry: 0,
+        announced: true,
+    });
+
+    let (tx, _rx) = mpsc::channel(16);
+    let result = agent.compact_history_if_needed(&tx).await;
+
+    assert!(
+        result.is_err(),
+        "an expired cooldown must let a probe through to the summarizer, \
+         not return early like a live latch"
+    );
+}
+
+/// Spec: only the summarizer actually working clears the latch. A persistent
+/// failure announces exactly once, no matter how many probes fail after it.
+#[tokio::test]
+async fn compaction_outage_announces_once_and_clears_only_on_success() {
+    use crate::conversation::SummarizeFailure;
+    use crate::error_format::ErrorCategory;
+
+    let mut agent = minimal_test_agent(Config::default());
+    let (tx, mut rx) = mpsc::channel(16);
+
+    // First persistent failure: latch + tell the user.
+    agent
+        .record_compaction_outcome(
+            0,
+            Some(SummarizeFailure::Persistent(ErrorCategory::Auth)),
+            Some(&tx),
+        )
+        .await;
+    assert!(agent.compaction_outage.is_some(), "must latch");
+    let first = rx.try_recv().expect("the user must be told the first time");
+    match first {
+        AgentEvent::SystemNotice { ref category, .. } => assert_eq!(category, "compaction"),
+        _ => panic!("expected a SystemNotice"),
+    }
+
+    // A later probe fails the same way: re-arm silently, never re-announce.
+    agent
+        .record_compaction_outcome(
+            0,
+            Some(SummarizeFailure::Persistent(ErrorCategory::Auth)),
+            Some(&tx),
+        )
+        .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "a repeat failure must not re-announce — that is the spam the latch exists to stop"
+    );
+    assert_eq!(
+        agent
+            .compaction_outage
+            .expect("still latched")
+            .turns_until_retry,
+        super::prompt_assembly::COMPACTION_OUTAGE_RETRY_TURNS,
+        "a failed probe must re-arm the full cooldown"
+    );
+
+    // Only dropped messages prove the summarizer works.
+    agent.record_compaction_outcome(3, None, Some(&tx)).await;
+    assert!(
+        agent.compaction_outage.is_none(),
+        "a pass that actually compacted must clear the latch"
+    );
+}
+
+/// The notice must name the failure class. "Compaction is paused" alone sends
+/// the user hunting through context settings for a billing problem.
+#[tokio::test]
+async fn persistent_billing_outage_latches_and_names_the_cause() {
+    use crate::conversation::SummarizeFailure;
+    use crate::error_format::ErrorCategory;
+
+    let mut agent = minimal_test_agent(Config::default());
+    let (tx, mut rx) = mpsc::channel(16);
+
+    agent
+        .record_compaction_outcome(
+            0,
+            Some(SummarizeFailure::Persistent(ErrorCategory::Billing)),
+            Some(&tx),
+        )
+        .await;
+
+    let outage = agent
+        .compaction_outage
+        .expect("a billing outage must latch");
+    assert_eq!(outage.category, ErrorCategory::Billing);
+    assert!(outage.announced);
+    let notice = rx.try_recv().expect("must announce");
+    match notice {
+        AgentEvent::SystemNotice { text, .. } => assert!(
+            text.contains("billing"),
+            "the notice must name the cause so the user knows what to fix: {text}"
+        ),
+        _ => panic!("expected a SystemNotice"),
+    }
+}
+
+/// A transient failure must keep normal retry semantics — latching on a blip
+/// would stop compacting for ten turns over a single 503.
+#[tokio::test]
+async fn transient_compaction_failure_does_not_latch() {
+    use crate::conversation::SummarizeFailure;
+
+    let mut agent = minimal_test_agent(Config::default());
+    let (tx, mut rx) = mpsc::channel(16);
+
+    agent
+        .record_compaction_outcome(0, Some(SummarizeFailure::Transient), Some(&tx))
+        .await;
+
+    assert!(
+        agent.compaction_outage.is_none(),
+        "a transient failure must not suspend compaction"
+    );
+    assert!(rx.try_recv().is_err(), "and must not nag the user");
 }
 
 #[test]

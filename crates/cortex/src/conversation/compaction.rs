@@ -8,7 +8,7 @@ use crate::constants::COMPACTION_MARKER_TOKENS;
 use crate::llm::LlmClient;
 use crate::types::{ContentPart, Message, MessageContent, Role};
 
-use super::summarize::{summarize_with_llm, summarize_with_llm_v2};
+use super::summarize::{summarize_with_llm, summarize_with_llm_v2, SummarizeFailure};
 use super::tokens::{history_tokens, message_tokens};
 
 /// Opening fence of the XML-tagged compaction marker. The marker is wrapped
@@ -274,10 +274,18 @@ pub fn compaction_checkpoint_range(
 ///   LLM to generate a rich summary of what was discussed.
 /// - Tool result messages are only kept if their corresponding assistant
 ///   tool-call message is also kept (orphaned tool results confuse the API).
+///
+/// Returns `Err` only when the summarizer itself failed; the caller uses the
+/// [`SummarizeFailure`] class to decide whether retrying next turn is useful.
+/// Having nothing to compact is `Ok`.
 #[instrument(skip_all, fields(max_tokens = max_tokens))]
-pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm: &LlmClient) {
+pub async fn compact_history(
+    history: &mut Vec<Message>,
+    max_tokens: usize,
+    llm: &LlmClient,
+) -> Result<(), SummarizeFailure> {
     let Some(keep_from) = plan_compaction(history, max_tokens) else {
-        return;
+        return Ok(());
     };
 
     let dropped = keep_from;
@@ -292,14 +300,18 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
     // Assistant reasoning traces are stripped from the summarizer's input and
     // its output so chain-of-thought can't compound into iterative summaries.
     let sanitized = sanitize_for_summarizer(&history[..dropped]);
-    let Some(summary) = summarize_with_llm(&sanitized, llm).await else {
-        warn!("compaction summary unavailable, leaving history untouched");
-        return;
+    let summary = match summarize_with_llm(&sanitized, llm).await {
+        Ok(s) => s,
+        Err(failure) => {
+            warn!("compaction summary unavailable, leaving history untouched");
+            return Err(failure);
+        }
     };
     let summary = strip_reasoning_traces(&summary);
     if summary.trim().is_empty() {
         warn!("compaction summary was reasoning-only, leaving history untouched");
-        return;
+        // The provider answered — this is a bad response, not an outage.
+        return Err(SummarizeFailure::Transient);
     }
 
     let marker = Message::user(summary);
@@ -308,6 +320,7 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
     compacted.push(marker);
     compacted.extend(history.drain(dropped..));
     *history = compacted;
+    Ok(())
 }
 
 /// Compact history preserving a head region and iterating prior summaries.
@@ -322,6 +335,7 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
 ///
 /// Returns the number of dropped messages (0 when no compaction was
 /// necessary). Callers can use this to decide whether to emit a UX event.
+/// Returns `Err` only when the summarizer failed — see [`compact_history`].
 #[instrument(skip_all, fields(max_tokens = max_tokens, head = protect_first_n))]
 pub async fn compact_history_v2(
     history: &mut Vec<Message>,
@@ -329,9 +343,9 @@ pub async fn compact_history_v2(
     protect_first_n: usize,
     previous_summary: &mut Option<String>,
     llm: &LlmClient,
-) -> usize {
+) -> Result<usize, SummarizeFailure> {
     let Some(plan) = plan_compaction_v2(history, max_tokens, protect_first_n) else {
-        return 0;
+        return Ok(0);
     };
 
     let dropped = plan.tail_start - plan.head_end;
@@ -349,15 +363,19 @@ pub async fn compact_history_v2(
     // Bail out without mutating history if the summarizer gave us nothing
     // usable — better to let the next turn try again than to drop the
     // middle with no context at all. Shares the v1 path's let-else abort.
-    let Some(summary_body) = summarize_with_llm_v2(&middle, previous_summary.as_deref(), llm).await
-    else {
-        warn!("compact_history_v2: no usable summary, leaving history untouched");
-        return 0;
+    let summary_body = match summarize_with_llm_v2(&middle, previous_summary.as_deref(), llm).await
+    {
+        Ok(s) => s,
+        Err(failure) => {
+            warn!("compact_history_v2: no usable summary, leaving history untouched");
+            return Err(failure);
+        }
     };
     let summary_body = strip_reasoning_traces(&summary_body);
     if summary_body.trim().is_empty() {
         warn!("compact_history_v2: summary was reasoning-only, leaving history untouched");
-        return 0;
+        // The provider answered — a bad response, not an outage.
+        return Err(SummarizeFailure::Transient);
     }
 
     // Sanitize the summary body to strip any XML tag boundaries the LLM may
@@ -376,7 +394,7 @@ pub async fn compact_history_v2(
     *history = compacted;
 
     *previous_summary = Some(summary_body);
-    dropped
+    Ok(dropped)
 }
 
 /// Extract a previous-summary body from a compacted history, if any.
@@ -1011,7 +1029,13 @@ mod tests {
             .await
             .expect("offline ollama client builds");
 
-        compact_history(&mut history, tight_budget, &llm).await;
+        let outcome = compact_history(&mut history, tight_budget, &llm).await;
+        assert_eq!(
+            outcome,
+            Err(SummarizeFailure::Transient),
+            "an unreachable summarizer is a blip, not a credential problem — \
+             classifying it as persistent would stop compacting for the session"
+        );
 
         let after: Vec<Option<String>> = history
             .iter()

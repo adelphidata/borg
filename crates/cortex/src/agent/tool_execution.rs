@@ -194,7 +194,10 @@ impl Agent {
         let max_workers = concurrent_cfg.max_workers.max(1);
         let parallel_enabled = concurrent_cfg.enabled && max_workers > 1;
 
-        let groups = crate::tool::effects::plan_groups(tc);
+        // Resolve relative paths against the same cwd `dispatch_parallel_safe_tool`
+        // hands the executor below, so the planner reasons about the files the
+        // tools will actually write.
+        let groups = crate::tool::effects::plan_groups(tc, self.execution_context.workspace_cwd());
         for group in groups {
             if cancel.is_cancelled() {
                 // Emit cancellation markers for the remaining calls so the LLM

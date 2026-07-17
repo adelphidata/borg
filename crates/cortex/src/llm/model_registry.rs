@@ -344,7 +344,22 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 131_072,
         supports_thinking: false,
     },
-    // `deepseek-chat` is the stable alias — the underlying weights are V3.2 today.
+    // V4 is the current direct-API generation, at a 1M window. `deepseek-chat`
+    // and `deepseek-reasoner` are the legacy aliases the provider retires on
+    // 2026-07-24 — they now route to V4 Flash's non-thinking / thinking modes,
+    // so their rows below stay only to keep existing configs resolving.
+    ModelMetadata {
+        slug: "deepseek-v4-flash",
+        context_window: 1_048_576,
+        max_context_window: 1_048_576,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "deepseek-v4-pro",
+        context_window: 1_048_576,
+        max_context_window: 1_048_576,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "deepseek-reasoner",
         context_window: 128_000,
@@ -390,6 +405,12 @@ const REGISTRY: &[ModelMetadata] = &[
         slug: "minimax-m2.7",
         context_window: 200_000,
         max_context_window: 200_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "kimi-k3",
+        context_window: 1_048_576,
+        max_context_window: 1_048_576,
         supports_thinking: true,
     },
     ModelMetadata {
@@ -760,6 +781,11 @@ mod tests {
                 .unwrap()
                 .supports_thinking
         );
+        // K3 is the curated Kimi entry and must not shadow-match the K2 rows
+        // or fall to the 200K default — it is a 1M-window reasoning model.
+        assert_eq!(lookup("moonshotai/kimi-k3").unwrap().slug, "kimi-k3");
+        assert_eq!(context_window_for("moonshotai/kimi-k3"), 1_048_576);
+        assert!(lookup("moonshotai/kimi-k3").unwrap().supports_thinking);
         // Qwen3 coder/max resolve above the generic `qwen3` (131K) entry.
         assert_eq!(lookup("qwen/qwen3-coder-next").unwrap().slug, "qwen3-coder");
         assert_eq!(context_window_for("qwen/qwen3.6-max-preview"), 256_000);
@@ -883,6 +909,24 @@ mod tests {
         assert_eq!(context_window_for("gpt-5"), 272_000);
         assert_eq!(context_window_for("gemini-2.5-pro"), 2_000_000);
         assert_eq!(context_window_for("deepseek-chat"), 128_000);
+    }
+
+    /// The V4 generation is a 1M window — an order of magnitude past the
+    /// legacy aliases. Falling back to the 200K default here would silently
+    /// under-budget every DeepSeek turn.
+    #[test]
+    fn deepseek_v4_models_resolve_to_their_real_window() {
+        assert_eq!(
+            lookup("deepseek-v4-flash").unwrap().slug,
+            "deepseek-v4-flash"
+        );
+        assert_eq!(lookup("deepseek-v4-pro").unwrap().slug, "deepseek-v4-pro");
+        assert_eq!(context_window_for("deepseek-v4-flash"), 1_048_576);
+        assert_eq!(context_window_for("deepseek-v4-pro"), 1_048_576);
+        assert_eq!(context_window_for("deepseek/deepseek-v4-flash"), 1_048_576);
+        // Both V4 tiers expose thinking mode.
+        assert!(lookup("deepseek-v4-flash").unwrap().supports_thinking);
+        assert!(lookup("deepseek-v4-pro").unwrap().supports_thinking);
     }
 
     #[test]

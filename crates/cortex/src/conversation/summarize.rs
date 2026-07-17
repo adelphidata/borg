@@ -5,6 +5,7 @@ use tracing::{debug, warn};
 
 use crate::constants;
 use crate::constants::MAX_TRANSCRIPT_CHARS;
+use crate::error_format::{classify_error, ErrorCategory};
 use crate::llm::LlmClient;
 use crate::types::{ContentPart, Message, MessageContent, Role};
 
@@ -99,11 +100,40 @@ pub(super) fn is_trivial_tool_result(msg: &Message) -> bool {
     }
 }
 
+/// Why a summarizer call produced no usable output.
+///
+/// The distinction drives whether the caller keeps paying for a summarizer call
+/// on every subsequent turn: a bad key or an exhausted quota will fail
+/// identically until an operator intervenes, so retrying is pure spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarizeFailure {
+    /// The provider rejected the call in a way retrying cannot fix — a bad or
+    /// expired key (401/403), or exhausted billing quota (402).
+    Persistent(ErrorCategory),
+    /// Anything else — overload, timeout, an empty response. Retry next turn.
+    Transient,
+}
+
+/// Classify a failed summarizer call.
+///
+/// Delegates to the central error taxonomy so this can't drift from the
+/// failover layer's view of the same message.
+fn classify_summarize_failure(err: &anyhow::Error) -> SummarizeFailure {
+    let category = classify_error(&err.to_string());
+    match category {
+        ErrorCategory::Auth | ErrorCategory::Billing => SummarizeFailure::Persistent(category),
+        _ => SummarizeFailure::Transient,
+    }
+}
+
 /// Use the LLM to generate a concise summary of dropped conversation messages.
-/// Returns `None` when the summarizer produced nothing usable (e.g. a provider
+/// Returns `Err` when the summarizer produced nothing usable (e.g. a provider
 /// auth outage). The caller aborts compaction in that case rather than dropping
 /// the summarized range for a degraded placeholder.
-pub(super) async fn summarize_with_llm(messages: &[Message], llm: &LlmClient) -> Option<String> {
+pub(super) async fn summarize_with_llm(
+    messages: &[Message],
+    llm: &LlmClient,
+) -> Result<String, SummarizeFailure> {
     // Build a transcript of dropped messages for the LLM to summarize
     let mut transcript = String::new();
     for msg in messages {
@@ -157,7 +187,7 @@ pub(super) async fn summarize_with_llm(messages: &[Message], llm: &LlmClient) ->
         summarize_single_chunk(&transcript, llm).await
     }?;
 
-    Some(format!(
+    Ok(format!(
         "[Earlier conversation was summarized to fit context limits.]\n\n{summary_text}"
     ))
 }
@@ -171,7 +201,7 @@ pub(super) async fn summarize_with_llm_v2(
     messages: &[Message],
     previous_summary: Option<&str>,
     llm: &LlmClient,
-) -> Option<String> {
+) -> Result<String, SummarizeFailure> {
     // Build a transcript of the middle region. Reuses the same trivial-result
     // skipping and truncation as the legacy summarizer.
     let mut transcript = String::new();
@@ -236,19 +266,26 @@ pub(super) async fn summarize_with_llm_v2(
     match llm.chat(&request, None).await {
         Ok(response) => {
             let text = response.text_content().unwrap_or("").trim().to_string();
-            (!text.is_empty()).then_some(text)
+            if text.is_empty() {
+                Err(SummarizeFailure::Transient)
+            } else {
+                Ok(text)
+            }
         }
         Err(e) => {
             warn!("LLM summarization (v2) failed: {e}");
-            None
+            Err(classify_summarize_failure(&e))
         }
     }
 }
 
-/// Summarize a single chunk of transcript. Returns `None` when the LLM call
+/// Summarize a single chunk of transcript. Returns `Err` when the LLM call
 /// failed or produced nothing usable — the caller aborts compaction rather
 /// than dropping the middle for a degraded placeholder.
-async fn summarize_single_chunk(transcript: &str, llm: &LlmClient) -> Option<String> {
+async fn summarize_single_chunk(
+    transcript: &str,
+    llm: &LlmClient,
+) -> Result<String, SummarizeFailure> {
     let capped: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
 
     let messages = vec![
@@ -259,19 +296,23 @@ async fn summarize_single_chunk(transcript: &str, llm: &LlmClient) -> Option<Str
     match llm.chat(&messages, None).await {
         Ok(response) => {
             let text = response.text_content().unwrap_or("").trim().to_string();
-            (!text.is_empty()).then_some(text)
+            if text.is_empty() {
+                Err(SummarizeFailure::Transient)
+            } else {
+                Ok(text)
+            }
         }
         Err(e) => {
             warn!("LLM summarization failed: {e}");
-            None
+            Err(classify_summarize_failure(&e))
         }
     }
 }
 
 /// Split a long transcript into chunks, summarize each, then merge. Returns
-/// `None` when every chunk failed — the caller aborts compaction rather than
+/// `Err` when every chunk failed — the caller aborts compaction rather than
 /// substituting a degraded placeholder.
-async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> {
+async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Result<String, SummarizeFailure> {
     // Cap at 5 chunks to avoid runaway LLM calls on very long conversations
     const MAX_SUMMARY_CHUNKS: usize = 5;
     let chars: Vec<char> = transcript
@@ -288,8 +329,12 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> 
         chunks.len()
     );
 
-    // Summarize each chunk independently
+    // Summarize each chunk independently. Track why chunks failed so that an
+    // all-chunks-failed abort reports the real cause: if the provider is
+    // rejecting our credentials, every chunk fails that way, and the caller
+    // must hear "persistent" rather than retry the whole set next turn.
     let mut chunk_summaries = Vec::new();
+    let mut worst_failure: Option<SummarizeFailure> = None;
     for (i, chunk) in chunks.iter().enumerate() {
         let messages = vec![
             Message::system(SUMMARY_SYSTEM_PROMPT),
@@ -312,18 +357,24 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> 
             }
             Err(e) => {
                 warn!("Chunk {}/{} summarization failed: {e}", i + 1, chunks.len());
+                let failure = classify_summarize_failure(&e);
+                // Persistent outranks transient: one bad-key rejection is
+                // enough to know retrying the batch is futile.
+                if failure != SummarizeFailure::Transient || worst_failure.is_none() {
+                    worst_failure = Some(failure);
+                }
             }
         }
     }
 
     if chunk_summaries.is_empty() {
         warn!("Chunked summarization: every chunk failed, aborting compaction");
-        return None;
+        return Err(worst_failure.unwrap_or(SummarizeFailure::Transient));
     }
 
     // If only one chunk succeeded, use it directly
-    if chunk_summaries.len() == 1 {
-        return chunk_summaries.into_iter().next();
+    if let [only] = chunk_summaries.as_slice() {
+        return Ok(only.clone());
     }
 
     // Merge chunk summaries
@@ -347,7 +398,7 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> 
             let text = response.text_content().unwrap_or("").trim().to_string();
             // A successful merge that came back empty still has the per-chunk
             // summaries to fall back on — only a hard failure aborts.
-            Some(if text.is_empty() {
+            Ok(if text.is_empty() {
                 chunk_summaries.join("\n\n")
             } else {
                 text
@@ -355,8 +406,60 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Option<String> 
         }
         Err(e) => {
             warn!("Merge summarization failed, using concatenated chunks: {e}");
-            // Fallback: just concatenate the chunk summaries
-            Some(chunk_summaries.join("\n\n"))
+            // Fallback: just concatenate the chunk summaries. The per-chunk
+            // work already succeeded, so a failed merge is not an outage —
+            // there is real summary content to return.
+            Ok(chunk_summaries.join("\n\n"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::*;
+
+    /// Spec: only failures that will recur identically until a human
+    /// intervenes are `Persistent`. These are the ones worth latching on —
+    /// getting this wrong either burns tokens re-failing every turn, or
+    /// silently stops compacting during a blip the next turn would survive.
+    #[test]
+    fn auth_and_billing_rejections_are_persistent() {
+        let cases = [
+            ("HTTP 401 unauthorized", ErrorCategory::Auth),
+            ("invalid api key provided", ErrorCategory::Auth),
+            ("status 403 forbidden", ErrorCategory::Auth),
+            ("HTTP 402 payment required", ErrorCategory::Billing),
+            (
+                "insufficient_quota: exceeded your current quota",
+                ErrorCategory::Billing,
+            ),
+        ];
+        for (msg, expected) in cases {
+            let err = anyhow::anyhow!("{msg}");
+            assert_eq!(
+                classify_summarize_failure(&err),
+                SummarizeFailure::Persistent(expected),
+                "{msg} must latch compaction off"
+            );
+        }
+    }
+
+    /// Spec: anything that could succeed on the next turn must NOT latch.
+    #[test]
+    fn transient_provider_failures_do_not_latch() {
+        for msg in [
+            "HTTP 503 service unavailable",
+            "overloaded_error: server is overloaded",
+            "request timed out",
+            "connection refused",
+            "HTTP 429 rate limit exceeded",
+        ] {
+            let err = anyhow::anyhow!("{msg}");
+            assert_eq!(
+                classify_summarize_failure(&err),
+                SummarizeFailure::Transient,
+                "{msg} must stay retryable"
+            );
         }
     }
 }

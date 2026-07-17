@@ -29,6 +29,22 @@ pub struct DeprecatedModel {
 /// Static deprecation table. Extend per provider; keep entries sorted by
 /// `(provider, model)` for diff-friendliness.
 const DEPRECATIONS: &[DeprecatedModel] = &[
+    // DeepSeek — the legacy aliases retire 2026-07-24; both already route to
+    // V4 Flash (non-thinking / thinking), so the replacement is a rename.
+    DeprecatedModel {
+        provider: Provider::DeepSeek,
+        model: "deepseek-chat",
+        retires_on: "2026-07-24",
+        replacement: "deepseek-v4-flash",
+        advisory_url: "https://api-docs.deepseek.com/quick_start/pricing",
+    },
+    DeprecatedModel {
+        provider: Provider::DeepSeek,
+        model: "deepseek-reasoner",
+        retires_on: "2026-07-24",
+        replacement: "deepseek-v4-flash",
+        advisory_url: "https://api-docs.deepseek.com/quick_start/pricing",
+    },
     // xAI Grok — May 2026 retirement wave.
     DeprecatedModel {
         provider: Provider::XAi,

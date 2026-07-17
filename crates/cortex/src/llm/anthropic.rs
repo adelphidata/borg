@@ -375,6 +375,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
 /// - **Anthropic**: `cache_read_input_tokens`, `cache_creation_input_tokens`
 /// - **OpenAI / Responses API**: `prompt_tokens_details.cached_tokens`
 /// - **DeepSeek / Kimi / Moonshot**: top-level `cached_tokens`
+/// - **DeepSeek direct API**: top-level `prompt_cache_hit_tokens`
 /// - **Bedrock alt**: already covered by the Anthropic names
 ///
 /// Missing fields default to 0. Never panics.
@@ -384,6 +385,7 @@ pub(crate) fn normalize_cache_tokens(usage: &serde_json::Value) -> (u64, u64) {
         usage.get("cache_read_input_tokens"),
         usage.get("cached_input_tokens"),
         usage.get("cached_tokens"),
+        usage.get("prompt_cache_hit_tokens"),
         usage
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens")),

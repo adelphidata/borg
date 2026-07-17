@@ -63,6 +63,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         auto_title_spawned: false,
         active_failover_identity: None,
         compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
+        compaction_outage: None,
         stream_health: super::stream_handler::StreamHealth::new(),
         prompt_cache_scope: None,
     }

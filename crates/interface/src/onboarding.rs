@@ -79,11 +79,7 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
     ("z-ai/glm-5.1", "GLM 5.1 (recommended)"),
     ("z-ai/glm-4.7", "GLM 4.7"),
     ("minimax/minimax-m2.7", "MiniMax M2.7"),
-    ("moonshotai/kimi-k2.5", "Kimi K2.5"),
-    (
-        "moonshotai/kimi-k2-thinking",
-        "Kimi K2 Thinking (reasoning)",
-    ),
+    ("moonshotai/kimi-k3", "Kimi K3 (reasoning)"),
     ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
     ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
     (
@@ -160,9 +156,14 @@ pub(crate) const BEDROCK_MODELS: &[(&str, &str)] = &[
     ),
 ];
 
+// `deepseek-chat` / `deepseek-reasoner` are deliberately absent: the provider
+// retires those ids on 2026-07-24 (they alias V4 Flash's non-thinking /
+// thinking modes). Existing configs still resolve — the registry, pricing, and
+// deprecation tables keep the aliases — but the picker must not hand a new
+// operator an id that is about to stop answering.
 pub(crate) const DEEPSEEK_MODELS: &[(&str, &str)] = &[
-    ("deepseek-chat", "DeepSeek Chat — V3.2 (recommended)"),
-    ("deepseek-reasoner", "DeepSeek Reasoner — R1 (reasoning)"),
+    ("deepseek-v4-flash", "DeepSeek V4 Flash (recommended)"),
+    ("deepseek-v4-pro", "DeepSeek V4 Pro (reasoning)"),
 ];
 
 pub(crate) const GROQ_MODELS: &[(&str, &str)] = &[

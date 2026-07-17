@@ -2181,6 +2181,21 @@ fn normalize_cache_tokens_deepseek_bare_cached_tokens() {
 }
 
 #[test]
+fn normalize_cache_tokens_deepseek_native_cache_hit_field() {
+    // The direct DeepSeek API reports cache hits as top-level
+    // `prompt_cache_hit_tokens`, with no `cached_tokens` anywhere.
+    let usage = serde_json::json!({
+        "prompt_tokens": 1000,
+        "completion_tokens": 120,
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 360,
+    });
+    let (read, created) = normalize_cache_tokens(&usage);
+    assert_eq!(read, 640);
+    assert_eq!(created, 0);
+}
+
+#[test]
 fn normalize_cache_tokens_missing_fields_returns_zero() {
     let usage = serde_json::json!({ "prompt_tokens": 100 });
     let (read, created) = normalize_cache_tokens(&usage);

@@ -304,6 +304,18 @@ pub struct Agent {
     /// (provider context-overflow) path is never gated. See
     /// [`prompt_assembly::CompactionStrikes`].
     pub(super) compaction_strikes: prompt_assembly::CompactionStrikes,
+    /// Set when the summarizer hit a provider outage that retrying cannot fix
+    /// (bad key, exhausted quota). Suspends *proactive* compaction — which
+    /// would otherwise re-pay for the identical failure every turn — and
+    /// records that the user has already been told. Cleared only by a
+    /// compaction pass that actually drops messages (a healthy main stream
+    /// proves nothing: `[compaction]` overrides can point the summarizer at
+    /// its own provider and key), and re-probed on a cooldown so a restored
+    /// credential resumes compaction without a restart. See
+    /// [`prompt_assembly::CompactionOutage`]. The reactive (context-overflow)
+    /// path stays ungated, so a real overflow still surfaces a hard error
+    /// rather than silently stalling.
+    pub(super) compaction_outage: Option<prompt_assembly::CompactionOutage>,
     /// Cross-turn stale-stream circuit breaker: counts consecutive streams
     /// killed as stale/timed out with nothing usable received, and
     /// short-circuits turns once tripped. See
@@ -454,6 +466,7 @@ impl Agent {
             auto_title_spawned: false,
             active_failover_identity: None,
             compaction_strikes: prompt_assembly::CompactionStrikes::new(),
+            compaction_outage: None,
             stream_health: stream_handler::StreamHealth::new(),
             prompt_cache_scope: None,
         }
@@ -764,10 +777,18 @@ impl Agent {
         let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
         let llm = match self.make_llm_client_from_config(&compaction_config).await {
             Ok(l) => l,
-            Err(_) => return (before, before),
+            Err(e) => {
+                warn!("Manual compaction could not build a summarizer client: {e}");
+                return (before, before);
+            }
         };
         let max_hist = self.effective_history_budget();
-        self.run_llm_compaction(max_hist, &llm).await;
+        let (dropped, failure) = self.run_llm_compaction(max_hist, &llm).await;
+        // No event channel here — the caller renders the before/after counts.
+        // Still record the outcome so a persistent outage latches (and gets
+        // announced by the next path that can reach the user) instead of
+        // silently reporting "compacted 0".
+        self.record_compaction_outcome(dropped, failure, None).await;
         let after = history_tokens(&self.history);
         (before, after)
     }
@@ -1658,7 +1679,11 @@ impl Agent {
         let iterative =
             crate::conversation::extract_last_compaction_summary(&self.history).is_some();
 
-        let dropped = self.run_llm_compaction(target, &compaction_llm).await;
+        let (dropped, failure) = self.run_llm_compaction(target, &compaction_llm).await;
+        // Fold the outcome into the outage latch. This path reports its own
+        // context-overflow error below, so it suppresses the generic notice by
+        // passing no channel — the message here is strictly more specific.
+        self.record_compaction_outcome(dropped, failure, None).await;
 
         if dropped > 0 {
             // A reactive compaction that actually dropped messages is a
@@ -1683,13 +1708,31 @@ impl Agent {
             // follows.
             warn!("reactive_compact_history: nothing dropped, retry will likely re-fail");
             let after_tokens = history_tokens(&self.history);
-            let _ = event_tx
-                .send(AgentEvent::Error(format!(
+
+            // Name the real cause. When the summarizer's provider is rejecting
+            // us, "compaction freed nothing" would send the user hunting for a
+            // context-size problem they don't have. The latch itself was
+            // recorded above; this message is a strictly richer version of the
+            // generic notice, so mark the outage announced to suppress it.
+            let text = if let Some(crate::conversation::SummarizeFailure::Persistent(category)) =
+                failure
+            {
+                if let Some(outage) = self.compaction_outage.as_mut() {
+                    outage.announced = true;
+                }
+                format!(
+                    "Context overflow, and history compaction could not run — the summarizer \
+                     could not reach the model provider ({category}). Check your API key or \
+                     billing, then retry."
+                )
+            } else {
+                format!(
                     "Context overflow and history compaction freed nothing \
                      ({after_tokens} tokens, target {target}). \
                      Start a new session or raise `conversation.max_history_tokens`."
-                )))
-                .await;
+                )
+            };
+            let _ = event_tx.send(AgentEvent::Error(text)).await;
         }
 
         Ok(())

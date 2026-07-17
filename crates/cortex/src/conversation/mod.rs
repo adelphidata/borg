@@ -33,6 +33,7 @@ pub use event::{
     SESSION_HMAC_DOMAIN,
 };
 pub use history::{normalize_history, rewind_to_nth_user, undo_last_turn};
+pub use summarize::SummarizeFailure;
 pub use tokens::history_tokens;
 pub use truncation::{
     age_based_tool_result_degradation, compact_tool_results, enforce_tool_result_share_limit,

@@ -557,7 +557,12 @@ fn extract_patch_paths(patch_text: &str) -> Vec<String> {
 }
 
 /// Patch DSL marker prefixes (each ends with a single trailing space before the path).
-const PATCH_DSL_MARKERS: &[&str] = &[
+///
+/// Shared with [`crate::tool::effects`], whose concurrency planner must reserve
+/// exactly the paths this handler will write — a marker known here but not
+/// there reads as "touches no files" and lets a conflicting write run in
+/// parallel.
+pub(crate) const PATCH_DSL_MARKERS: &[&str] = &[
     "*** Add File: ",
     "*** Update File: ",
     "*** Delete File: ",
