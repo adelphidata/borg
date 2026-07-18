@@ -93,18 +93,33 @@ pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>
 /// filter, and a fmt layer. Centralizes the registry composition so each
 /// binary (`borg`, `borgd`) does not hand-roll it. The `EnvFilter` is a global
 /// filter, so it gates the OTel exporters and the fmt sink alike regardless of
-/// layer order. All inputs are boxed `Layer<Registry>`, so they attach
-/// directly to the registry as siblings.
+/// layer order.
+///
+/// The filter must wrap the layer stack via `with_filter`, NOT be pushed into
+/// the `Vec` as a sibling layer: `Vec<Layer>::register_callsite` keeps the
+/// *most* interested child, so an unfiltered fmt layer (`Interest::always`)
+/// overrides the filter's `never` and tracing then skips per-event `enabled()`
+/// checks entirely — TRACE/DEBUG spam reaches stdout regardless of `RUST_LOG`.
 pub fn install_subscriber(
-    mut layers: Vec<BoxedLayer>,
+    layers: Vec<BoxedLayer>,
     env_filter: tracing_subscriber::EnvFilter,
     fmt_layer: BoxedLayer,
 ) {
-    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    layers.push(Box::new(env_filter));
+    build_subscriber(layers, env_filter, fmt_layer).init();
+}
+
+/// Compose (but do not install) the subscriber `install_subscriber` uses.
+/// Split out so tests can install it as a scoped/global dispatcher and verify
+/// the env filter actually gates events end-to-end.
+pub fn build_subscriber(
+    mut layers: Vec<BoxedLayer>,
+    env_filter: tracing_subscriber::EnvFilter,
+    fmt_layer: BoxedLayer,
+) -> impl tracing::Subscriber + Send + Sync {
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt};
     layers.push(fmt_layer);
-    tracing_subscriber::registry().with(layers).init();
+    tracing_subscriber::registry().with(layers.with_filter(env_filter))
 }
 
 /// RAII guard that records a harness boot on construction and a graceful
