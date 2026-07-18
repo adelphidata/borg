@@ -212,8 +212,11 @@ impl CommandPopup {
     }
 
     pub fn update_filter(&mut self, text: &str) {
-        // Show popup only when text starts with '/' and has no spaces
-        if text.starts_with('/') && !text.contains(' ') {
+        // Show the popup only while the composer holds a single unterminated
+        // `/token`. Any whitespace ends it — a tab or newline finishes the token
+        // just as a space does, and matching only on `' '` left the popup open
+        // filtering on a query containing whitespace.
+        if text.starts_with('/') && !text.contains(char::is_whitespace) {
             self.filter = text[1..].to_string();
             self.visible = true;
             // Reset to top on every filter change so the best match is selected
@@ -383,6 +386,31 @@ mod tests {
         popup.update_filter("/");
         assert!(popup.is_visible());
         assert_eq!(popup.filtered().len(), BUILTIN_COMMANDS.len());
+    }
+
+    /// Any whitespace terminates the slash token. A tab or newline finishes
+    /// `/help` just as a space does; leaving the popup open would filter on a
+    /// query that can never match a command name.
+    #[test]
+    fn whitespace_after_slash_token_hides_popup() {
+        for text in [
+            "/help ",
+            "/help\tmore",
+            "/help\nmore",
+            "/ help",
+            "not /help",
+        ] {
+            let mut popup = CommandPopup::new();
+            popup.update_filter(text);
+            assert!(
+                !popup.is_visible(),
+                "{text:?} should not keep the command popup open"
+            );
+        }
+        // An unterminated token still shows the popup.
+        let mut popup = CommandPopup::new();
+        popup.update_filter("/hel");
+        assert!(popup.is_visible(), "/hel is still in progress");
     }
 
     #[test]

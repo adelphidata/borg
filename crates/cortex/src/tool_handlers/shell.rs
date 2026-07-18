@@ -523,7 +523,7 @@ async fn start_session(
         })
     });
 
-    let id = sessions.register(child, guard);
+    let id = sessions.register(child, guard, resolved_shell_output_cap(config));
     Ok(format!(
         "Started shell session {id}. Drive it with run_shell: action=write_stdin \
          (session_id={id}, stdin=…) to send input, action=poll (session_id={id}) to read new \

@@ -35,7 +35,11 @@ fn load_history() -> Vec<String> {
     let Some(path) = history_path() else {
         return Vec::new();
     };
-    let contents = match std::fs::read_to_string(&path) {
+    load_history_at(&path)
+}
+
+fn load_history_at(path: &std::path::Path) -> Vec<String> {
+    let contents = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
@@ -92,6 +96,24 @@ fn rewrite_history(entries: &[String]) {
 
 fn append_history(text: &str) {
     let Some(path) = history_path() else { return };
+    append_history_at(&path, text);
+}
+
+/// True if `file` ends mid-line (non-empty, last byte is not `\n`) — the shape
+/// a crash or a full disk leaves behind when a previous append was cut short.
+fn ends_unterminated(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+fn append_history_at(path: &std::path::Path, text: &str) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::warn!("failed to create history dir: {e}");
@@ -106,17 +128,59 @@ fn append_history(text: &str) {
         }
     };
     use std::io::Write;
-    match std::fs::OpenOptions::new()
+    // The tail check needs read access, but read is not required to *append*.
+    // If the file is write-only (restrictive umask, a hardened data dir), fall
+    // back to the plain append handle rather than losing history entirely —
+    // only the repair is skipped.
+    let opened = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{encoded}") {
-                tracing::warn!("failed to append history: {e}");
+        .open(path);
+    let (mut f, can_inspect) = match opened {
+        Ok(f) => (f, true),
+        Err(read_err) => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => {
+                tracing::warn!(
+                    "history not readable ({read_err}); appending without truncation repair"
+                );
+                (f, false)
+            }
+            Err(e) => {
+                tracing::warn!("failed to open history for append: {e}");
+                return;
+            }
+        },
+    };
+    // Terminate a truncated trailing line before appending. Without this the
+    // new entry fuses onto the partial one and `load_history` drops *both* as a
+    // single malformed line — one interrupted write would cost the next entry
+    // too. When the check itself fails we still write the separator: a spurious
+    // blank line is skipped at load, whereas skipping a needed one corrupts the
+    // entry we are about to write.
+    let terminate = if can_inspect {
+        match ends_unterminated(&mut f) {
+            Ok(unterminated) => unterminated,
+            Err(e) => {
+                tracing::warn!("failed to inspect history tail, assuming truncated: {e}");
+                true
             }
         }
-        Err(e) => tracing::warn!("failed to open history for append: {e}"),
+    } else {
+        false
+    };
+    if terminate {
+        if let Err(e) = writeln!(f) {
+            tracing::warn!("failed to terminate truncated history line: {e}");
+            return;
+        }
+    }
+    if let Err(e) = writeln!(f, "{encoded}") {
+        tracing::warn!("failed to append history: {e}");
     }
 }
 
@@ -764,6 +828,56 @@ impl<'a> Composer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash mid-append leaves a line with no trailing newline. The next
+    /// append must not fuse onto it — that would corrupt the new entry too,
+    /// costing the user a second entry for one interrupted write.
+    #[test]
+    fn append_after_truncated_line_preserves_the_new_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history.jsonl");
+        // Two good entries, then a write that was cut off mid-line.
+        std::fs::write(&path, "\"first\"\n\"second\"\n\"trunc").expect("seed history");
+
+        append_history_at(&path, "third");
+
+        let loaded = load_history_at(&path);
+        assert_eq!(
+            loaded,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ],
+            "the new entry must survive; only the truncated line is lost"
+        );
+    }
+
+    #[test]
+    fn append_to_well_terminated_history_does_not_add_blank_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history.jsonl");
+        std::fs::write(&path, "\"first\"\n").expect("seed history");
+
+        append_history_at(&path, "second");
+
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(raw, "\"first\"\n\"second\"\n");
+        assert_eq!(
+            load_history_at(&path),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn append_creates_missing_history_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("history.jsonl");
+
+        append_history_at(&path, "only");
+
+        assert_eq!(load_history_at(&path), vec!["only".to_string()]);
+    }
 
     #[test]
     fn test_history_push_and_up() {

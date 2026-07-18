@@ -2313,3 +2313,44 @@ fn voice_help_lists_command() {
         "/help must list /voice so users can find it: {sys}"
     );
 }
+
+// ========================================================================
+// extract_at_query — decides whether the composer is mid-`@file` mention.
+// ========================================================================
+
+/// Whitespace ends the mention token; punctuation must not, because paths
+/// legitimately contain `.`, `-` and `/`.
+#[test]
+fn at_query_terminates_on_any_whitespace_not_punctuation() {
+    // In progress: the query is everything after the `@`.
+    for (text, expected) in [
+        ("@", ""),
+        ("@src", "src"),
+        ("@src/main.rs", "src/main.rs"),
+        ("@foo.bar", "foo.bar"),
+        ("@my-file", "my-file"),
+        ("look at @Cargo.toml", "Cargo.toml"),
+    ] {
+        assert_eq!(
+            extract_at_query(text).as_deref(),
+            Some(expected),
+            "{text:?} should be an in-progress mention"
+        );
+    }
+
+    // Terminated or not a mention at all.
+    for text in [
+        "@foo bar",
+        "@foo\tbar",
+        "@foo\nbar",
+        "@foo ",
+        "email@example.com",
+        "no mention here",
+    ] {
+        assert_eq!(
+            extract_at_query(text),
+            None,
+            "{text:?} should not be an in-progress mention"
+        );
+    }
+}

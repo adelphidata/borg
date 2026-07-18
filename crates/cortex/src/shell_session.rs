@@ -24,6 +24,10 @@
 //! dies the session is simply dead and the next `poll`/`write_stdin` surfaces
 //! that. The existing `process_registry` auto-reap + the child's
 //! `kill_on_drop` are the safety net against leaks.
+//!
+//! That buffer is bounded ([`SessionOutput`]): a session the model never polls
+//! — or one whose child floods output faster than it is read — would otherwise
+//! accumulate until the session is killed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -57,6 +61,78 @@ pub fn global() -> Option<ShellSessionRegistry> {
     GLOBAL.get().cloned()
 }
 
+/// Bounded rolling buffer holding a session's output that `poll` has not yet
+/// returned. The one-shot `run_shell` path caps its collection the same way;
+/// without a cap here a long-lived session (a chatty REPL, a build loop, a
+/// `yes`) grows a `String` until the session is killed.
+///
+/// The newest bytes are the ones kept: for an interactive session the current
+/// prompt and the latest error are what the model needs. Dropped bytes are
+/// counted and surfaced by `poll` as an explicit marker rather than silently
+/// disappearing.
+struct SessionOutput {
+    text: String,
+    /// Bytes dropped from the front since the last `poll`.
+    dropped: usize,
+    cap: usize,
+}
+
+impl SessionOutput {
+    /// `cap` is the retained byte budget. `0` is treated as `1` (never
+    /// unbounded); callers resolve the configured default first.
+    fn new(cap: usize) -> Self {
+        Self {
+            text: String::new(),
+            dropped: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    fn push(&mut self, chunk: &str) {
+        self.text.push_str(chunk);
+        // Compact lazily: let the buffer reach twice the cap before trimming
+        // back down to it, so a flooding child pays one memmove per `cap` bytes
+        // written instead of one per 4 KiB chunk. This is a memory-residency
+        // optimization only — `take` trims to the exact cap, so what a `poll`
+        // returns never exceeds the configured budget.
+        if self.text.len() <= self.cap.saturating_mul(2) {
+            return;
+        }
+        self.trim_to_cap();
+    }
+
+    /// Drop the oldest bytes until at most `cap` remain, counting what went.
+    fn trim_to_cap(&mut self) {
+        if self.text.len() <= self.cap {
+            return;
+        }
+        let mut cut = self.text.len() - self.cap;
+        // Trim forward to a char boundary so the retained text stays valid
+        // UTF-8 even when the cut lands mid-codepoint. Walking forward (not
+        // back) keeps the result at or under the cap.
+        while cut < self.text.len() && !self.text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        self.text.drain(..cut);
+        self.dropped += cut;
+    }
+
+    /// Take everything retained, resetting the buffer so already-returned
+    /// output is not held (or re-emitted) afterwards. Trims first so a single
+    /// `poll` never returns more than the configured cap, matching the hard
+    /// bound the one-shot `run_shell` path applies.
+    fn take(&mut self) -> String {
+        self.trim_to_cap();
+        let dropped = std::mem::take(&mut self.dropped);
+        let text = std::mem::take(&mut self.text);
+        if dropped == 0 {
+            text
+        } else {
+            format!("... {dropped} bytes omitted ...\n{text}")
+        }
+    }
+}
+
 /// One live interactive session.
 struct Session {
     /// The child handle, kept for `kill`. `kill_on_drop` is set at spawn so a
@@ -70,11 +146,8 @@ struct Session {
     /// write without holding the registry's std mutex across an await point.
     /// `None` once stdin has been taken/closed.
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
-    /// Accumulated stdout+stderr. Appended by the drain task; sliced by `poll`.
-    output: Arc<Mutex<String>>,
-    /// Byte offset already returned by a previous `poll`. Only ever advances to
-    /// a prior `output` length, which is always a UTF-8 char boundary.
-    polled_offset: usize,
+    /// Unread stdout+stderr. Appended by the drain task; drained by `poll`.
+    output: Arc<Mutex<SessionOutput>>,
     /// Subprocess-registry guard. Marked `killed` on `kill`; its `Drop` marks
     /// the entry `Killed` if the session is torn down without an explicit kill.
     guard: Option<ProcessGuard>,
@@ -121,12 +194,21 @@ impl ShellSessionRegistry {
     /// via `killpg`, which is only safe — and only reaches descendants — when
     /// that holds. Without it, `kill` would signal an unrelated group, so it
     /// instead falls back to signaling just the direct child.
-    pub fn register(&self, mut child: Child, guard: Option<ProcessGuard>) -> String {
+    ///
+    /// `max_output_bytes` caps the unread output retained between polls; the
+    /// caller resolves it from `security.max_shell_output_bytes` so sessions and
+    /// one-shot commands share one budget.
+    pub fn register(
+        &self,
+        mut child: Child,
+        guard: Option<ProcessGuard>,
+        max_output_bytes: usize,
+    ) -> String {
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
-        let output = Arc::new(Mutex::new(String::new()));
+        let output = Arc::new(Mutex::new(SessionOutput::new(max_output_bytes)));
         let drain = spawn_drain(stdout, stderr, output.clone());
 
         let mut inner = self.lock();
@@ -146,7 +228,6 @@ impl ShellSessionRegistry {
                 pid,
                 stdin: Arc::new(AsyncMutex::new(stdin)),
                 output,
-                polled_offset: 0,
                 guard,
                 drain,
             },
@@ -181,23 +262,20 @@ impl ShellSessionRegistry {
         }
     }
 
-    /// Return output accumulated since the last `poll` for this session and
-    /// advance the read offset. Errors if the session is unknown.
+    /// Return output accumulated since the last `poll` for this session,
+    /// draining it so nothing is re-emitted or retained afterwards. Errors if
+    /// the session is unknown.
     pub fn poll(&self, id: &str) -> Result<String> {
-        let mut inner = self.lock();
+        let inner = self.lock();
         let session = inner
             .sessions
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
-        let (new, new_len) = {
-            let buf = session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (buf[session.polled_offset..].to_string(), buf.len())
-        };
-        session.polled_offset = new_len;
-        Ok(new)
+        let mut buf = session
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(buf.take())
     }
 
     /// Terminate a session: abort its drain task, kill the child's whole
@@ -272,7 +350,7 @@ fn signal_group(pgid: i32, sig: i32) {
 fn spawn_drain(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
-    output: Arc<Mutex<String>>,
+    output: Arc<Mutex<SessionOutput>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stdout = stdout;
@@ -310,12 +388,12 @@ fn spawn_drain(
     })
 }
 
-fn append(output: &Arc<Mutex<String>>, bytes: &[u8]) {
+fn append(output: &Arc<Mutex<SessionOutput>>, bytes: &[u8]) {
     let chunk = String::from_utf8_lossy(bytes);
     let mut buf = output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    buf.push_str(&chunk);
+    buf.push(&chunk);
 }
 
 #[cfg(test)]
@@ -324,6 +402,10 @@ mod tests {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::process::Command;
+
+    /// Output cap for tests that aren't exercising the cap itself: large enough
+    /// that no fixture trips it.
+    const TEST_CAP: usize = 64 * 1024;
 
     /// Spawn `cat` (echoes stdin to stdout line-by-line) as a session.
     /// Mirrors the production spawn contract documented on [`register`]:
@@ -337,7 +419,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn cat");
-        reg.register(child, None)
+        reg.register(child, None, TEST_CAP)
     }
 
     /// Poll until `needle` shows up or we give up — drain is async, so the
@@ -415,7 +497,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None);
+        let id = reg.register(child, None, TEST_CAP);
 
         // Move somewhere distinct from the spawn-time cwd, then ask where we are
         // on a *separate* command. A fresh-process-per-command shell would
@@ -429,6 +511,112 @@ mod tests {
         );
 
         reg.kill(&id).await.expect("kill");
+    }
+
+    #[test]
+    fn session_output_retention_is_bounded_and_keeps_newest() {
+        // A session that floods output must not grow without limit: retention
+        // stays within the lazy-compaction ceiling (2x cap) no matter how much
+        // is written, and what survives is the most recent output.
+        let cap = 1024;
+        let mut out = SessionOutput::new(cap);
+        for i in 0..1000 {
+            out.push(&format!("line {i}\n"));
+            assert!(
+                out.text.len() <= cap * 2,
+                "retention {} exceeded 2x cap after {i} pushes",
+                out.text.len()
+            );
+        }
+        let taken = out.take();
+        assert!(
+            taken.contains("line 999"),
+            "newest output must survive: {taken:?}"
+        );
+        assert!(
+            !taken.contains("line 0\n"),
+            "oldest output should have been dropped"
+        );
+    }
+
+    #[test]
+    fn dropped_session_output_is_reported_not_silently_truncated() {
+        let cap = 64;
+        let mut out = SessionOutput::new(cap);
+        let total = 4096;
+        out.push(&"x".repeat(total));
+        let retained = out.text.len();
+        let dropped = out.dropped;
+        assert_eq!(
+            dropped + retained,
+            total,
+            "every byte is either retained or counted as dropped"
+        );
+
+        let taken = out.take();
+        assert!(
+            taken.starts_with(&format!("... {dropped} bytes omitted ...\n")),
+            "elision must be surfaced with an exact count: {:?}",
+            &taken[..taken.len().min(64)]
+        );
+    }
+
+    #[test]
+    fn session_output_under_cap_round_trips_exactly() {
+        // The common case — a session that stays under budget — must be byte-
+        // for-byte intact with no marker.
+        let mut out = SessionOutput::new(1024);
+        out.push("hello ");
+        out.push("world\n");
+        assert_eq!(out.take(), "hello world\n");
+    }
+
+    #[test]
+    fn session_output_take_drains_so_output_is_not_re_emitted() {
+        let mut out = SessionOutput::new(1024);
+        out.push("first\n");
+        assert_eq!(out.take(), "first\n");
+        assert_eq!(out.take(), "", "drained buffer must not re-emit");
+        out.push("second\n");
+        assert_eq!(out.take(), "second\n");
+    }
+
+    #[test]
+    fn session_output_trim_preserves_utf8_boundaries() {
+        // A cut that lands mid-codepoint must advance FORWARD to the next
+        // boundary. Walking backward would keep more than `cap`; not walking at
+        // all would panic in `String::drain`. Sizes are chosen so the cut is
+        // never already aligned, making the boundary walk observable.
+        const CAP: usize = 10;
+        let mut out = SessionOutput::new(CAP);
+        // 8 x 4-byte codepoints = 32 bytes pushed, none of them cap-aligned.
+        for _ in 0..8 {
+            out.push("😀");
+        }
+        let taken = out.take();
+        // 24 dropped + 8 retained = the 32 bytes pushed: nothing is unaccounted
+        // for, and the retained tail is exactly two whole codepoints.
+        assert_eq!(taken, "... 24 bytes omitted ...\n😀😀");
+    }
+
+    #[test]
+    fn poll_never_returns_more_than_the_cap() {
+        // `push` compacts lazily at 2x cap for amortization, but that must not
+        // leak into what a caller receives: the operator sets
+        // `security.max_shell_output_bytes` to bound context cost, and the
+        // one-shot path treats it as a hard limit.
+        const CAP: usize = 1024;
+        let mut out = SessionOutput::new(CAP);
+        for _ in 0..64 {
+            out.push(&"x".repeat(30));
+        }
+        let taken = out.take();
+        let marker_end = taken.find('\n').expect("omission marker present") + 1;
+        assert_eq!(
+            taken.len() - marker_end,
+            CAP,
+            "retained payload must be exactly the cap, not 2x it"
+        );
     }
 
     #[tokio::test]
@@ -457,7 +645,7 @@ mod tests {
             .process_group(0) // mirror the production spawn: child leads its group
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None);
+        let id = reg.register(child, None, TEST_CAP);
 
         // The shell echoes the backgrounded grandchild's PID.
         let out = poll_until(&reg, &id, "\n").await;

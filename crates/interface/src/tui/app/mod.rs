@@ -1119,7 +1119,7 @@ impl<'a> App<'a> {
 }
 
 /// Extract the query portion after the last `@` in text, if it looks like a file
-/// mention in progress (preceded by whitespace or at position 0, and no space after it).
+/// mention in progress (preceded by whitespace or at position 0, and unterminated).
 fn extract_at_query(text: &str) -> Option<String> {
     let at_pos = text.rfind('@')?;
     // Must be at start or preceded by whitespace
@@ -1130,8 +1130,11 @@ fn extract_at_query(text: &str) -> Option<String> {
         }
     }
     let after = &text[at_pos + 1..];
-    // If there's a space, the mention is already completed
-    if after.contains(' ') {
+    // Any whitespace ends the mention, not just a space: a tab or newline after
+    // `@foo` means the token is finished, and treating it as still-in-progress
+    // leaves the file popup open filtering on a query with whitespace in it.
+    // Punctuation deliberately does not terminate — paths contain `.`, `-`, `/`.
+    if after.contains(char::is_whitespace) {
         return None;
     }
     Some(after.to_string())
