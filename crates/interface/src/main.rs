@@ -380,9 +380,11 @@ enum BackupCmd {
 /// Runtime worker thread stack size.
 ///
 /// Rust futures can grow large frames along the agent-loop → tool-handler → sub-agent
-/// call chain. The tokio default (2 MiB on Linux/macOS) has been sufficient so far but
-/// leaves little headroom, so Borg uses 4 MiB for all worker and blocking threads.
-const RUNTIME_STACK_SIZE: usize = 4 * 1024 * 1024;
+/// call chain, and the tokio default (2 MiB on Linux/macOS) overflows that chain (a
+/// stack overflow `abort()`s the process — see `borgd::runtime`). The in-process agent
+/// loop needs the same headroom the daemon does, so this reuses the daemon's single
+/// source of truth rather than keeping a second 4 MiB constant in sync by hand.
+const RUNTIME_STACK_SIZE: usize = borgd::runtime::WORKER_STACK_SIZE;
 
 fn main() -> Result<()> {
     // Windows sandbox trampoline. Intercepted before tokio + clap so a
