@@ -1760,12 +1760,11 @@ impl Agent {
         }
     }
 
-    /// Close the browser session if active.
-    #[instrument(skip_all)]
     /// Close the headless browser session if one is open.
+    #[instrument(skip_all)]
     pub async fn close_browser(&mut self) {
         if let Some(session) = self.browser_session.take() {
-            let _ = session.close().await;
+            let _ = session.close().await; // best-effort cleanup; nothing to recover from a close failure
         }
     }
 

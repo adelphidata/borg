@@ -64,7 +64,6 @@ pub async fn seed_builtin_roles(db: &Database) -> anyhow::Result<()> {
 
 /// Load a role from the database, falling back to built-in defaults.
 pub async fn load_role(name: &str) -> Option<AgentRole> {
-    // Try DB first
     if let Ok(db) = Database::open().await {
         if let Ok(Some(row)) = db.get_role(name).await {
             let tools_allowed = row

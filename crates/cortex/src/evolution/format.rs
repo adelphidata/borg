@@ -12,7 +12,7 @@ use super::{
     EvolutionState, FeedEntry, ReadinessReport, Stage, XpSummary,
 };
 
-// ── `borg status` / status-popup renderers (moved from evolution/mod.rs) ──
+// ── `borg status` / status-popup renderers ──
 
 /// Compact one-line status used by ambient headers and `/status`.
 pub fn format_compact(state: &EvolutionState) -> String {

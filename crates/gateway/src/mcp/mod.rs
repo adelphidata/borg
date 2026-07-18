@@ -17,7 +17,7 @@
 //! (`apply_patch`, `run_shell`, `write_memory`) are deliberately NOT
 //! exposed — MCP is a tool surface, not a chat surface, and giving
 //! third-party clients write authority over the agent's own state is
-//! the kind of expansion the task spec calls out as a risk to watch.
+//! an unreviewed privilege escalation.
 //!
 //! The exclusion is enforced by a `tools/list` test that fails if a
 //! mutating tool is ever added to the registry. Adding a mutator

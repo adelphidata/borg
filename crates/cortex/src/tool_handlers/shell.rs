@@ -161,6 +161,8 @@ async fn stream_child_output(
                     match res {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
+                            // Best-effort streaming delta: a full/closed channel just means no
+                            // live listener — the final buffered output is still returned below.
                             let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
                                 tool_call_id: tool_call_id.to_string(),
                                 name: tool_name.to_string(),
@@ -707,6 +709,7 @@ async fn run_in_pty(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Best-effort streaming delta; dropped sends don't affect `combined` below.
                     let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
                         tool_call_id: tool_call_id.clone(),
                         name: "run_shell".to_string(),

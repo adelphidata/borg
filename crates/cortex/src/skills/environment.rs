@@ -164,7 +164,6 @@ pub(super) fn format_skill_info(
         }
     }
 
-    // Body preview (first paragraph)
     if let Some(first_para) = skill.body.split("\n\n").find(|p| !p.trim().is_empty()) {
         out.push_str(&format!("\n{first_para}\n"));
     }

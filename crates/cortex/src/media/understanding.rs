@@ -3,36 +3,10 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::{bail, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config::{AudioModelConfig, Config};
 use crate::media::core::ensure_success;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaUnderstandingConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_concurrency() -> usize {
-    2
-}
-
-impl Default for MediaUnderstandingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            concurrency: 2,
-        }
-    }
-}
 
 // ── Audio Transcription ──
 

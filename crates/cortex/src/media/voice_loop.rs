@@ -213,10 +213,6 @@ impl VoiceLoop {
         self.state.lock().await.active
     }
 
-    pub fn status_sender(&self) -> mpsc::UnboundedSender<VoiceEvent> {
-        self.events_tx.clone()
-    }
-
     /// Current RMS reading from the live recording, scaled to int16
     /// amplitude (0..=32767). Returns 0 when the recorder is idle.
     /// Used by the TUI footer to render a live level meter while

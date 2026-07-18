@@ -205,11 +205,9 @@ fn validate_model_name(model: &str) -> Result<()> {
     if model.is_empty() {
         bail!("Model name is empty");
     }
-    // Reject path traversal
     if model.contains("..") {
         bail!("Invalid model name (path traversal): {model}");
     }
-    // Allow alphanumeric, hyphens, slashes, dots, underscores
     if model
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '/' || c == '.' || c == '_')
@@ -222,7 +220,6 @@ fn validate_model_name(model: &str) -> Result<()> {
 
 /// Validate that a URL is under the fal.run domain.
 fn is_fal_domain(url: &str) -> bool {
-    // Extract host from URL for domain validation
     url.starts_with("https://fal.run/")
         || url.starts_with("https://queue.fal.run/")
         || url.starts_with("https://storage.fal.run/")
@@ -241,7 +238,6 @@ async fn generate_fal(
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()?;
 
-    // Parse size to width/height
     let (width, height) = parse_size(size.unwrap_or(constants::IMAGE_GEN_DEFAULT_SIZE));
 
     let body = serde_json::json!({

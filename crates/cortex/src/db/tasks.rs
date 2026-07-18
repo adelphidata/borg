@@ -273,7 +273,6 @@ impl Database {
                     .await?;
             }
 
-            // Insert a 'running' task_run row
             self.conn
                 .execute(
                     "INSERT INTO task_runs (task_id, started_at, duration_ms, status)

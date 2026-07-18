@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use super::format_ts;
+use crate::async_bridge::block_on;
 use crate::daemon_client::connect_or_spawn;
 
 #[derive(Subcommand)]
@@ -28,12 +29,6 @@ pub(crate) enum PairingAction {
         /// Filter by channel name
         channel: Option<String>,
     },
-}
-
-/// Block on a future from a sync context. Reuses the ambient tokio runtime
-/// (`main()` builds one in `crates/cli/src/main.rs`).
-fn block_on<F: std::future::Future<Output = R>, R>(fut: F) -> R {
-    tokio::runtime::Handle::current().block_on(fut)
 }
 
 /// Dispatch for `borg pairing ...`.

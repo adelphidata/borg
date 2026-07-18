@@ -573,7 +573,6 @@ impl AgentControl {
             metrics: SubAgentMetrics::default(),
         };
 
-        // Record in DB
         match crate::db::Database::open().await {
             Ok(db) => {
                 if let Err(e) = db
@@ -719,7 +718,6 @@ impl AgentControl {
             .await;
         self.publish(AgentTreeEventKind::Spawned, &info);
 
-        // Spawn tokio task
         let (input_tx, input_rx) = mpsc::channel::<String>(16);
         let cancel = CancellationToken::new();
         let is_paused = Arc::new(AtomicBool::new(false));

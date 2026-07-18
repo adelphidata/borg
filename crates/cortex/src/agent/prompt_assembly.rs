@@ -1,7 +1,6 @@
 //! Per-turn prompt-assembly helpers and adjacent caches.
 //!
-//! Pulled out of `agent/mod.rs` as part of the structural split. The methods
-//! here cluster around `prepare_llm_request`: ranking memory + knowledge for
+//! These methods cluster around `prepare_llm_request`: ranking memory + knowledge for
 //! injection, building the tool-definition list, warming the skills cache,
 //! firing the pre-LLM hooks, compacting history before assembly, and the
 //! pre-compaction memory flush. `build_system_prompt` itself stays in

@@ -76,7 +76,6 @@ pub struct InMemoryKeyStore {
 }
 
 impl InMemoryKeyStore {
-    /// Create a fresh empty in-memory store.
     pub fn new() -> Self {
         Self::default()
     }

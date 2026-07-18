@@ -1,6 +1,6 @@
 //! Session and message-history lifecycle for `Agent`.
 //!
-//! Extracted from `agent/mod.rs` to keep session boundaries
+//! Keeps session boundaries
 //! (`load_session` / `new_session` / `end_session`), message persistence
 //! (`persist_message`, `log_and_persist`, `append_assistant_message`,
 //! `skip_tool_call`), and the secret-redaction helpers that wrap tool

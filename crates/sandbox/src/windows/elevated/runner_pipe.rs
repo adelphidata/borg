@@ -299,6 +299,7 @@ pub fn serve(pipe_name: &str) -> io::Result<u32> {
     let code = child
         .wait_for_exit()
         .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
+    // Drain threads return (); only a panic makes join() Err, and the exit code above already stands.
     let _ = out_thread.join();
     let _ = err_thread.join();
     send_frame(&writer, &Message::Exit { code })?;

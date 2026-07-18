@@ -774,7 +774,6 @@ pub struct EvolutionHook {
 }
 
 impl EvolutionHook {
-    /// Create a new evolution hook, opening a database connection.
     pub async fn new() -> anyhow::Result<Self> {
         let enabled = crate::config::Config::load_from_db()
             .await

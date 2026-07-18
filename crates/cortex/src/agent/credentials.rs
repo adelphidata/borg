@@ -1,8 +1,7 @@
 //! Credential cache and skill-runtime refresh helpers for `Agent`.
 //!
-//! Extracted from `agent/mod.rs` so credential resolution, the skill env
-//! allowlist, and the "did a tool just write to ~/.borg/skills?" gate live
-//! together in one focused module. All entry points are methods on `Agent`;
+//! Groups credential resolution, the skill env allowlist, and the "did a
+//! tool just write to ~/.borg/skills?" gate in one focused module. All entry points are methods on `Agent`;
 //! the trait-like surface is preserved through an additional `impl Agent`
 //! block.
 

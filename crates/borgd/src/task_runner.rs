@@ -1036,7 +1036,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             (text, followup)
         }
         _ => {
-            // Cheap tool-less check-in (legacy path).
+            // Cheap tool-less check-in — the steady-state path for quiet ticks.
             let identity = cortex::identity::load_identity().unwrap_or_default();
             let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
                 .await

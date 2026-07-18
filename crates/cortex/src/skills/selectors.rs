@@ -52,6 +52,8 @@ pub(super) const SHADOW_SELECTORS: &[&dyn ShadowSkillSelector] = &[
     &MultiQueryLexicalSelector,
 ];
 
+// Shadow selectors run alongside the live selector every turn, so these bound
+// worst-case per-turn cost rather than reflecting any real query/doc size.
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_QUERY_TERMS: usize = 64;
 const MAX_DOC_BYTES: usize = 4 * 1024;

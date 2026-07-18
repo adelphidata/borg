@@ -10,7 +10,7 @@
 //! native click+drag text selection in the terminal. Mouse-wheel scrolling
 //! still works through xterm Alternate Scroll Mode (`?1007h`) which the
 //! terminal translates into Up/Down arrow keys (handled here as scroll input).
-//! See `crates/cli/src/tui/mod.rs` for the source-level guard tests.
+//! See `crates/interface/src/tui/mod.rs` for the source-level guard tests.
 
 use super::custom_terminal::Frame;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

@@ -3,6 +3,7 @@ use clap::Subcommand;
 use protocols::admin::ScheduledTaskCreate;
 
 use super::{format_ts, short_id, truncate_str, TS_FMT};
+use crate::async_bridge::block_on;
 use crate::daemon_client::connect_or_spawn;
 
 #[derive(Subcommand)]
@@ -127,12 +128,6 @@ pub(crate) enum CronAction {
         #[arg(long, short, default_value_t = 10)]
         count: usize,
     },
-}
-
-/// Block on a future from a sync context. Reuses the ambient tokio runtime
-/// (`main()` builds one in `crates/cli/src/main.rs`).
-fn block_on<F: std::future::Future<Output = R>, R>(fut: F) -> R {
-    tokio::runtime::Handle::current().block_on(fut)
 }
 
 /// Dispatch for `borg tasks ...`.

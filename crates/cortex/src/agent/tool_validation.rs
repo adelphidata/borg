@@ -1,7 +1,6 @@
 //! Free types and helpers for tool-call validation.
 //!
-//! Pulled out of `agent/mod.rs` as part of the structural split. None of these
-//! are methods on `Agent` — they are standalone validators / partitioners
+//! None of these are methods on `Agent` — they are standalone validators / partitioners
 //! consumed by the agent loop.
 
 use std::collections::HashMap;
@@ -156,6 +155,7 @@ impl UnknownToolTracker {
     pub(crate) fn new(cfg: &LoopGuardConfig) -> Self {
         Self {
             seen: HashMap::new(),
+            // Floor at 1: 0 would refuse on the very first unknown-name call, same failure mode as identical_call_max=1 above.
             max_per_name: cfg.unknown_tool_max_per_name.max(1),
         }
     }

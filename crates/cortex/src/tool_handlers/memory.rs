@@ -86,7 +86,7 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
     let mut state: std::collections::HashMap<(String, String), Option<String>> =
         std::collections::HashMap::new();
 
-    // ── Phase 1: validate by simulating the exact apply sequence (no writes) ──
+    // Phase 1: validate by simulating the exact apply sequence (no writes).
     for (i, op) in ops.iter().enumerate() {
         let name = op.filename.strip_suffix(".md").unwrap_or(&op.filename);
         if name.is_empty() {
@@ -128,7 +128,7 @@ pub(crate) async fn handle_write_memory_batch(ops: &[MemoryOp], config: &Config)
         }
     }
 
-    // ── Phase 2: apply in order ──
+    // Phase 2: apply in order.
     let mut writes = 0usize;
     let mut removals = 0usize;
     for op in ops {

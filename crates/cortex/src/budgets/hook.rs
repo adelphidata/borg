@@ -2,7 +2,7 @@
 //! point.
 //!
 //! The hook keeps a private [`Database`] handle (mirroring the
-//! `VitalsHook` pattern at `crates/core/src/vitals.rs:716`). On every
+//! `VitalsHook` pattern in `crates/cortex/src/vitals.rs`). On every
 //! before-call dispatch:
 //!
 //! 1. Read the daemon's active provider/model from settings.

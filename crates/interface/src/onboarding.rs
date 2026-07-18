@@ -8,31 +8,11 @@ use cortex::llm::provider::Provider;
 use cortex::security::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
 
+use crate::async_bridge::block_on;
 use crate::daemon_client;
 
 /// Standard subdirectories created under the Borg data directory.
 pub(crate) const BORG_SUBDIRS: &[&str] = &["memory", "tools", "skills", "logs", "cache"];
-
-/// Run `fut` to completion regardless of whether we're already inside a
-/// tokio runtime. Mirrors the helper in `api_key_store.rs` — `apply_onboarding`
-/// is a sync entry point reachable from `init_data_dir` (sync) which is
-/// itself called from `#[tokio::main]`. `block_in_place` releases the worker
-/// thread so the inner `block_on` can drive the gRPC connector.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) => tokio::task::block_in_place(|| h.block_on(fut)),
-        Err(_) => {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => panic!("onboarding: failed to spin a tokio runtime: {e}"),
-            };
-            rt.block_on(fut)
-        }
-    }
-}
 
 /// Provider choices with display labels.
 pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
@@ -292,8 +272,7 @@ pub fn run_onboarding() -> Result<Option<OnboardingResult>> {
     crate::onboarding_tui::run()
 }
 
-/// Template for the initial IDENTITY.md scaffold.
-/// Edit `crates/cli/templates/IDENTITY.md` to change the content.
+/// Edit `crates/interface/templates/IDENTITY.md` to change the content.
 const IDENTITY_TEMPLATE: &str = include_str!("../templates/IDENTITY.md");
 
 /// Generate IDENTITY.md content from onboarding choices.
@@ -306,8 +285,7 @@ pub fn generate_identity(name: &str, owner_name: &str) -> String {
         .replace("{owner_name}", owner_name)
 }
 
-/// Template for the first-conversation SETUP.md.
-/// Edit `crates/cli/templates/SETUP.md` to change the content.
+/// Edit `crates/interface/templates/SETUP.md` to change the content.
 const SETUP_TEMPLATE: &str = include_str!("../templates/SETUP.md");
 
 /// Generate SETUP.md content for the agent's first conversation.
@@ -599,7 +577,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             client.set_setting("user.timezone", &tz).await?;
         }
         // Sentinel that gates re-running the onboarding wizard on subsequent
-        // launches. See `is_onboarded` in `crates/cli/src/main.rs`.
+        // launches. See `is_onboarded` in `crates/interface/src/main.rs`.
         client.set_onboarding_complete().await?;
 
         if use_keychain {

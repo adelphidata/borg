@@ -4,7 +4,7 @@ use anyhow::Result;
 use base64::Engine;
 use tracing::warn;
 
-use crate::types::{ContentPart, MediaData};
+use crate::types::MediaData;
 
 /// Max side length steps to try, descending.
 const DIMENSION_STEPS: &[u32] = &[2048, 1536, 1280, 1024, 800];
@@ -64,7 +64,6 @@ pub fn compress_image(
 ) -> Result<(String, String)> {
     let engine = base64::engine::general_purpose::STANDARD;
 
-    // Validate and decode base64
     let validated =
         validate_base64(base64_data).ok_or_else(|| anyhow::anyhow!("invalid base64 data"))?;
     let raw_bytes = engine.decode(&validated)?;
@@ -119,26 +118,6 @@ pub fn compress_image(
         .map_err(|e| anyhow::anyhow!("JPEG encode failed: {e}"))?;
     let b64 = engine.encode(buf.into_inner());
     Ok((b64, "image/jpeg".to_string()))
-}
-
-/// Compress all ImageBase64 parts in-place. Logs warnings on failure, keeps originals.
-pub fn compress_content_parts(parts: &mut [ContentPart], max_bytes: usize) {
-    for part in parts.iter_mut() {
-        if let ContentPart::ImageBase64 { media } = part {
-            if !is_compressible_image(&media.mime_type) {
-                continue;
-            }
-            match compress_image(&media.data, &media.mime_type, max_bytes) {
-                Ok((new_data, new_mime)) => {
-                    media.data = new_data;
-                    media.mime_type = new_mime;
-                }
-                Err(e) => {
-                    warn!("Image compression failed, keeping original: {e}");
-                }
-            }
-        }
-    }
 }
 
 /// True when `mime_type` names a video container Gemini accepts via inline_data.

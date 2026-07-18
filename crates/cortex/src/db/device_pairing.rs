@@ -4,6 +4,7 @@ use libsql::params;
 use sha2::{Digest, Sha256};
 
 use super::Database;
+use crate::util::hex::hex_encode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeOutcome {
@@ -17,14 +18,7 @@ pub enum ConsumeOutcome {
 const MAX_ATTEMPTS_PER_CODE: i64 = 5;
 
 pub fn hash_pairing_code(code: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(code.as_bytes());
-    let digest = hasher.finalize();
-    digest.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(&mut acc, "{b:02x}");
-        acc
-    })
+    hex_encode(&Sha256::digest(code.as_bytes()))
 }
 
 impl Database {

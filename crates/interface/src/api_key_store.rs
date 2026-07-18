@@ -20,6 +20,7 @@ use cortex::llm::provider::Provider;
 use cortex::security::secrets_resolve::provider_api_key_secret_ref;
 use protocols::admin::{api_key_value::Body as ApiKeyBody, ApiKeyValue, KeychainRef};
 
+use crate::async_bridge::block_on;
 use crate::daemon_client;
 
 #[cfg(test)]
@@ -40,31 +41,6 @@ pub enum ApiKeySaveOutcome {
 /// Keychain service name convention for a provider.
 pub fn keychain_service_name(provider_id: &str) -> String {
     format!("borg-{provider_id}")
-}
-
-/// Run `fut` to completion regardless of whether we're already inside a
-/// tokio runtime. `block_in_place` releases the worker thread so the inner
-/// `block_on` can drive other tasks (e.g. the gRPC connector). When called
-/// from a non-runtime thread we fall back to spinning a small current-thread
-/// runtime — necessary for sync test contexts and the rare CLI subcommand
-/// that calls this without `#[tokio::main]`.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) => tokio::task::block_in_place(|| h.block_on(fut)),
-        Err(_) => {
-            // No ambient runtime — build a single-threaded one for this call.
-            // If runtime init fails the host is in such a degraded state that
-            // panicking surfaces the real fault faster than swallowing it.
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => panic!("api_key_store: failed to spin a tokio runtime: {e}"),
-            };
-            rt.block_on(fut)
-        }
-    }
 }
 
 /// Save `raw_key` for `provider_id`. The keychain write happens locally;

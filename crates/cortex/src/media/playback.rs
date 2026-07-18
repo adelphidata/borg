@@ -200,8 +200,8 @@ pub fn stop_playback() {
 }
 
 // Beep cues: 880 Hz single beep on record start, 660 Hz double beep on record stop.
-// The reference implementation synthesizes these inline; we cache to `$TMPDIR/borg_voice/` once
-// per process so playback is a cheap `afplay`/`ffplay`/`aplay` invocation.
+// Synthesized once per process and cached to `$TMPDIR/borg_voice/` so playback
+// is a cheap `afplay`/`ffplay`/`aplay` invocation.
 //
 // Beeps run on a detached `tokio::spawn` so the voice loop never blocks
 // on the speaker — a 100 ms beep behind a sluggish `afplay` spawn must

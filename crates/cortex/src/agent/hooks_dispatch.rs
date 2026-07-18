@@ -1,6 +1,5 @@
 //! Hook context construction and `AfterToolCall` dispatch.
 //!
-//! Pulled out of `agent/mod.rs` as part of the structural split. The
 //! `Agent::hook_ctx` helper builds a [`HookContext`] from the agent's session
 //! state; `Agent::fire_after_tool_hook` dispatches the post-tool hook with the
 //! tool name and (already redacted) result. Both stay on `impl Agent` so they

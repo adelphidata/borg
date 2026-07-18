@@ -187,7 +187,8 @@ impl McpServer {
     /// MCP in v1. The tools/list guard test asserts none of these
     /// appear in the registry — adding any to the surface requires
     /// also updating that test, which is a deliberate friction
-    /// point per the task spec's risks-to-watch.
+    /// point: third-party MCP clients must never gain write authority
+    /// over the agent's own state.
     pub const MUTATING_TOOLS: &'static [&'static str] = &[
         "apply_patch",
         "run_shell",
@@ -277,10 +278,10 @@ mod tests {
         McpServer::new(tools, "0.1.0-test")
     }
 
-    /// **Hard regression guard.** Per the task spec's risks-to-watch:
-    /// "Tempting to expose `apply_patch` or `run_shell` over MCP;
-    /// **don't** in v1 (that's the entire agent loop's authority over
-    /// a fragile boundary). Read-only tools only."
+    /// **Hard regression guard.** It's tempting to expose `apply_patch`
+    /// or `run_shell` over MCP; don't — that would hand third-party MCP
+    /// clients the entire agent loop's authority over a fragile trust
+    /// boundary. Read-only tools only.
     ///
     /// Adding any of the names in `McpServer::MUTATING_TOOLS` to the
     /// MCP registry breaks this test. Doing so should be a deliberate

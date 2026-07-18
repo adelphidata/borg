@@ -156,17 +156,17 @@ fn parse_anthropic(headers: &HeaderMap, now_ms: i64) -> (Option<Bucket>, Option<
     let combined = header_str(headers, "anthropic-ratelimit-tokens-limit").and_then(|lim| {
         let rem = header_str(headers, "anthropic-ratelimit-tokens-remaining")?;
         let rst = header_str(headers, "anthropic-ratelimit-tokens-reset")?;
-        build_bucket_owned(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
+        build_bucket(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
     });
     let input = header_str(headers, "anthropic-ratelimit-input-tokens-limit").and_then(|lim| {
         let rem = header_str(headers, "anthropic-ratelimit-input-tokens-remaining")?;
         let rst = header_str(headers, "anthropic-ratelimit-input-tokens-reset")?;
-        build_bucket_owned(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
+        build_bucket(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
     });
     let output = header_str(headers, "anthropic-ratelimit-output-tokens-limit").and_then(|lim| {
         let rem = header_str(headers, "anthropic-ratelimit-output-tokens-remaining")?;
         let rst = header_str(headers, "anthropic-ratelimit-output-tokens-reset")?;
-        build_bucket_owned(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
+        build_bucket(Some(lim), Some(rem), Some(rst), now_ms, parse_rfc3339_reset)
     });
 
     let tokens = [combined, input, output]
@@ -197,19 +197,6 @@ fn min_remaining_bucket(a: Bucket, b: Bucket) -> Bucket {
 }
 
 fn build_bucket<F>(
-    limit: Option<&str>,
-    remaining: Option<&str>,
-    reset: Option<&str>,
-    now_ms: i64,
-    parse_reset: F,
-) -> Option<Bucket>
-where
-    F: Fn(&str, i64) -> Option<i64>,
-{
-    build_bucket_owned(limit, remaining, reset, now_ms, parse_reset)
-}
-
-fn build_bucket_owned<F>(
     limit: Option<&str>,
     remaining: Option<&str>,
     reset: Option<&str>,

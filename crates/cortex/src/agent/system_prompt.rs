@@ -1,10 +1,8 @@
 //! System-prompt section builders and the top-level `build_system_prompt`
 //! orchestrator.
 //!
-//! Extracted from `agent/mod.rs` so the per-section logic lives next to the
-//! orchestrator that stitches them together — interleaving with
-//! session-management, tool-execution, and loop state made `mod.rs`
-//! unnavigable.
+//! Per-section logic lives next to the orchestrator that stitches it together, kept
+//! separate from `mod.rs`'s session-management, tool-execution, and loop state.
 //!
 //! All section builders and `build_system_prompt` itself are methods on
 //! `Agent`; the trait-like surface is kept intact through additional

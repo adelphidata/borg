@@ -22,19 +22,10 @@ pub async fn apply_plan(
         warnings: Vec::new(),
     };
 
-    // Apply config changes to DB
     apply_config_changes(plan, &mut result).await?;
-
-    // Apply credentials to DB
     apply_credentials(plan, data, &mut result).await?;
-
-    // Copy memory files
     apply_memory_files(plan, borg_data_dir, &mut result)?;
-
-    // Copy persona
     apply_persona(plan, borg_data_dir, &mut result)?;
-
-    // Copy skills
     apply_skills(plan, borg_data_dir, &mut result)?;
 
     Ok(result)
@@ -79,7 +70,6 @@ async fn apply_credentials(
         .await
         .context("Failed to open database for credential migration")?;
 
-    // Load existing credentials from DB
     let existing_json = db.get_setting("credentials").await.ok().flatten();
     let mut creds: std::collections::HashMap<String, crate::config::CredentialValue> =
         existing_json

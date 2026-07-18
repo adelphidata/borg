@@ -173,7 +173,59 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
     out
 }
 
-// ── Anthropic message conversion helpers ──
+/// Convert one message's `Parts` content into Anthropic content blocks.
+/// Shared by the user-turn and tool-result paths below, which differ only in
+/// whether an empty text part is worth keeping (`skip_empty_text`).
+fn content_parts_to_anthropic_blocks(
+    parts: &[crate::types::ContentPart],
+    skip_empty_text: bool,
+) -> Vec<serde_json::Value> {
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    for part in parts {
+        match part {
+            crate::types::ContentPart::Text(t) => {
+                if !skip_empty_text || !t.is_empty() {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": t,
+                    }));
+                }
+            }
+            crate::types::ContentPart::ImageBase64 { media } => {
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media.mime_type,
+                        "data": media.data,
+                    },
+                }));
+            }
+            crate::types::ContentPart::ImageUrl { url } => {
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": url,
+                    },
+                }));
+            }
+            crate::types::ContentPart::AudioBase64 { media } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
+                }));
+            }
+            crate::types::ContentPart::VideoBase64 { media } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video")),
+                }));
+            }
+        }
+    }
+    blocks
+}
 
 /// Convert internal Messages to Anthropic format.
 pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -187,48 +239,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
         match msg.role {
             Role::User => match &msg.content {
                 Some(crate::types::MessageContent::Parts(parts)) => {
-                    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
-                    for part in parts {
-                        match part {
-                            crate::types::ContentPart::Text(t) => {
-                                content_blocks.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": t,
-                                }));
-                            }
-                            crate::types::ContentPart::ImageBase64 { media } => {
-                                content_blocks.push(serde_json::json!({
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media.mime_type,
-                                        "data": media.data,
-                                    },
-                                }));
-                            }
-                            crate::types::ContentPart::ImageUrl { url } => {
-                                content_blocks.push(serde_json::json!({
-                                    "type": "image",
-                                    "source": {
-                                        "type": "url",
-                                        "url": url,
-                                    },
-                                }));
-                            }
-                            crate::types::ContentPart::AudioBase64 { media } => {
-                                content_blocks.push(serde_json::json!({
-                                        "type": "text",
-                                        "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
-                                    }));
-                            }
-                            crate::types::ContentPart::VideoBase64 { media } => {
-                                content_blocks.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video")),
-                                }));
-                            }
-                        }
-                    }
+                    let content_blocks = content_parts_to_anthropic_blocks(parts, false);
                     result.push(serde_json::json!({
                         "role": "user",
                         "content": content_blocks,
@@ -285,50 +296,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                 // reach the model instead of being flattened.
                 let content_value = match &msg.content {
                     Some(crate::types::MessageContent::Parts(parts)) => {
-                        let mut blocks: Vec<serde_json::Value> = Vec::new();
-                        for part in parts {
-                            match part {
-                                crate::types::ContentPart::Text(t) => {
-                                    if !t.is_empty() {
-                                        blocks.push(serde_json::json!({
-                                            "type": "text",
-                                            "text": t,
-                                        }));
-                                    }
-                                }
-                                crate::types::ContentPart::ImageBase64 { media } => {
-                                    blocks.push(serde_json::json!({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": media.mime_type,
-                                            "data": media.data,
-                                        },
-                                    }));
-                                }
-                                crate::types::ContentPart::ImageUrl { url } => {
-                                    blocks.push(serde_json::json!({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "url",
-                                            "url": url,
-                                        },
-                                    }));
-                                }
-                                crate::types::ContentPart::AudioBase64 { media } => {
-                                    blocks.push(serde_json::json!({
-                                        "type": "text",
-                                        "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
-                                    }));
-                                }
-                                crate::types::ContentPart::VideoBase64 { media } => {
-                                    blocks.push(serde_json::json!({
-                                        "type": "text",
-                                        "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video")),
-                                    }));
-                                }
-                            }
-                        }
+                        let blocks = content_parts_to_anthropic_blocks(parts, true);
                         if blocks.is_empty() {
                             serde_json::json!("")
                         } else {

@@ -192,8 +192,8 @@ fn build_gemini_request(request: &TransportRequest<'_>) -> Value {
 
 /// Split Borg messages into a Gemini `contents` array and a single optional
 /// `systemInstruction` string. All `Role::System` messages are concatenated
-/// (Gemini accepts only one); the rest map per the role table in the M2
-/// spec doc.
+/// (Gemini accepts only one); `Role::User`/`Assistant` map to `user`/`model`
+/// turns and `Role::Tool` results fold into a `functionResponse` user turn.
 fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String>) {
     let mut system_chunks: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
@@ -569,7 +569,7 @@ fn parse_gemini_response(
 }
 
 /// Synthesize a stable id for a Gemini function call so subsequent tool
-/// results can be matched back to it. M3's streaming path uses the same
+/// results can be matched back to it. The streaming path uses the same
 /// scheme to stay consistent across streaming/non-streaming.
 fn synth_call_id(name: &str, idx: usize) -> String {
     format!("gem_call_{name}_{idx}")
@@ -629,7 +629,6 @@ pub(crate) fn parse_gemini_sse_line(
     let mut events: Vec<StreamEvent> = Vec::new();
     let mut done_after = false;
 
-    // ── candidates[0].content.parts → text / thought / functionCall ──
     if let Some(parts) = value
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
@@ -687,7 +686,6 @@ pub(crate) fn parse_gemini_sse_line(
         }
     }
 
-    // ── finishReason (candidate-level) ──
     if let Some(reason) = value
         .pointer("/candidates/0/finishReason")
         .and_then(Value::as_str)
@@ -715,7 +713,6 @@ pub(crate) fn parse_gemini_sse_line(
         }
     }
 
-    // ── usageMetadata (last event) ──
     if let Some(u) = value.get("usageMetadata") {
         let pick = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
         let usage = UsageData {

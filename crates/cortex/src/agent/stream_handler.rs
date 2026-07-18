@@ -1,7 +1,6 @@
 //! Stream-event handling and text-only response finalization.
 //!
-//! Pulled out of `agent/mod.rs` as part of the structural split. The methods
-//! here process the per-iteration LLM stream into history mutations and TUI
+//! These methods process the per-iteration LLM stream into history mutations and TUI
 //! events:
 //!
 //! - [`Agent::handle_stream_event`] consumes one [`StreamEvent`] and updates
@@ -155,6 +154,7 @@ impl Agent {
             StreamEvent::TextDelta(delta) => {
                 if let Some(filtered) = tag_filter.push(&delta) {
                     let redacted = self.maybe_redact(filtered);
+                    // Send errors mean the TUI receiver dropped (e.g. UI torn down mid-turn); the loop keeps running regardless.
                     let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
                 }
             }

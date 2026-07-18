@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Only fields backed by a live consumer in the runtime are surfaced as
 /// settings. Continuation / budget-limit steering knobs are intentionally
 /// not exposed yet — the steering-prompt injection sites land in a later
-/// change, and shipping a dead knob silently lies to operators (CLAUDE.md
-/// "Don't add features ... beyond what the task requires").
+/// change, and shipping a dead knob would silently lie to operators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GoalsConfig {

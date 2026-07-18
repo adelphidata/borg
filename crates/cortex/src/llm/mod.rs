@@ -1375,6 +1375,7 @@ impl LlmClient {
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => {
+                    // Best-effort: a closed receiver just means the turn was torn down first.
                     let _ = tx.send(StreamEvent::Done).await;
                     return Ok(());
                 }
@@ -1588,7 +1589,6 @@ impl LlmClient {
     /// Supports multi-key fallback: on 401/429 errors, rotates to the next available key.
     /// On exhausted retries, attempts failover to the next provider in the fallback chain.
     #[instrument(skip_all, fields(llm.provider = %self.provider, llm.model = %self.llm_config.model))]
-    /// Stream a chat completion with cancellation support.
     pub async fn stream_chat_with_cancel(
         &mut self,
         messages: &[Message],
@@ -2400,8 +2400,6 @@ impl LlmClient {
         transport::build_anthropic_request(&request, stream)
     }
 }
-
-// ── OpenAI message sanitization ──
 
 #[cfg(test)]
 mod tests;

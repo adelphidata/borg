@@ -151,7 +151,7 @@ impl TeamsClient {
         let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
 
         for chunk in &chunks {
-            let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+            let url = activities_url(&base, conversation_id, Some(activity_id));
             let reply = ReplyActivity::message(chunk.as_str());
             self.send_with_retry(&url, &reply).await?;
         }
@@ -173,7 +173,7 @@ impl TeamsClient {
         let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
 
         for chunk in &chunks {
-            let url = format!("{base}v3/conversations/{conversation_id}/activities");
+            let url = activities_url(&base, conversation_id, None);
             let reply = ReplyActivity::message(chunk.as_str());
             self.send_with_retry(&url, &reply).await?;
         }
@@ -203,7 +203,7 @@ impl TeamsClient {
         let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+            let url = activities_url(&base, conversation_id, Some(activity_id));
             let activity = if i == 0 {
                 ReplyActivity::message_with_mentions(chunk.as_str(), mentions)
             } else {
@@ -219,7 +219,7 @@ impl TeamsClient {
     pub async fn send_typing(&self, service_url: &str, conversation_id: &str) -> Result<()> {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
-        let url = format!("{base}v3/conversations/{conversation_id}/activities");
+        let url = activities_url(&base, conversation_id, None);
         let typing = ReplyActivity::typing();
         self.send_with_retry(&url, &typing).await
     }
@@ -233,7 +233,7 @@ impl TeamsClient {
     ) -> Result<()> {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
-        let url = format!("{base}v3/conversations/{conversation_id}/activities");
+        let url = activities_url(&base, conversation_id, None);
         self.send_with_retry(&url, activity).await
     }
 
@@ -247,7 +247,7 @@ impl TeamsClient {
     ) -> Result<()> {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
-        let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+        let url = activities_url(&base, conversation_id, Some(activity_id));
         self.send_with_retry(&url, activity).await
     }
 
@@ -390,6 +390,17 @@ fn ensure_trailing_slash(url: &str) -> String {
         url.to_string()
     } else {
         format!("{url}/")
+    }
+}
+
+/// Build the Bot Framework REST path for a conversation's activities,
+/// optionally scoped to one activity (reply/edit/delete) vs. the
+/// conversation-level collection (send/typing). `base` must already have
+/// a trailing slash (see `ensure_trailing_slash`).
+fn activities_url(base: &str, conversation_id: &str, activity_id: Option<&str>) -> String {
+    match activity_id {
+        Some(id) => format!("{base}v3/conversations/{conversation_id}/activities/{id}"),
+        None => format!("{base}v3/conversations/{conversation_id}/activities"),
     }
 }
 

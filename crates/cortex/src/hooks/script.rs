@@ -430,11 +430,11 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
 }
 
 fn drain_streams(child: &mut std::process::Child) {
-    const MAX: u64 = 8 * 1024;
+    const MAX: u64 = 8 * 1024; // cap so a runaway hook script can't grow the buffer unbounded
     if let Some(s) = child.stdout.take() {
         let mut buf = Vec::new();
+        // stdout is drained (to unblock the child) but not read; hooks communicate via side effects, not output.
         let _ = s.take(MAX).read_to_end(&mut buf);
-        // stdout intentionally unused in v1 (hooks communicate via side effects).
     }
     if let Some(s) = child.stderr.take() {
         let mut buf = Vec::new();
