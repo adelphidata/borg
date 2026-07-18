@@ -1508,6 +1508,27 @@ mod tests {
         session.close().await.expect("close must succeed");
     }
 
+    #[tokio::test]
+    #[ignore] // Requires a real Chromium-family browser; run with --ignored.
+    async fn two_local_sessions_launch_concurrently() {
+        // Concurrent local sessions are the daemon + TUI (or parallel
+        // sub-agents) case. Regression guard for two launch-time collisions:
+        // a fixed --remote-debugging-port, and chromiumoxide's shared
+        // fallback profile dir tripping Chrome's profile singleton lock —
+        // either would make the second launch fail instantly.
+        let config = BorgBrowserConfig::default();
+        let (a, b) = tokio::join!(
+            BrowserSession::launch(&config),
+            BrowserSession::launch(&config)
+        );
+        let a = a.expect("first concurrent launch must succeed");
+        let b = b.expect("second concurrent launch must succeed");
+        a.health_check().await.expect("first session healthy");
+        b.health_check().await.expect("second session healthy");
+        a.close().await.expect("first close");
+        b.close().await.expect("second close");
+    }
+
     #[test]
     fn attach_drifted_covers_backend_engine_and_cdp_transitions() {
         use crate::config::{BrowserBackend, BrowserEngine};

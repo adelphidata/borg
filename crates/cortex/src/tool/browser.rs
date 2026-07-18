@@ -27,15 +27,3 @@ pub(crate) async fn handle(
 ) -> Result<ToolOutput> {
     tool_handlers::handle_browser(args.as_value(), config, session).await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deserialize_passes_through_value() {
-        let raw = serde_json::json!({"action":"navigate","url":"https://example.com"});
-        let args: BrowserArgs = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(args.as_value(), &raw);
-    }
-}

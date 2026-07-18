@@ -145,6 +145,12 @@ pub fn format_results(query: &str, results: &[SearchResult]) -> String {
 /// Priority when `search_provider = "auto"`:
 ///   Tavily > Serper > Brave > DuckDuckGo (keyless fallback)
 pub fn resolve_provider_id(config: &WebConfig) -> &str {
+    resolve_provider_with(config, |var| std::env::var(var).is_ok())
+}
+
+/// [`resolve_provider_id`] with the env lookup injected, so the
+/// auto-detect priority is testable without racing on process env vars.
+fn resolve_provider_with(config: &WebConfig, has_env: impl Fn(&str) -> bool) -> &str {
     let p = config.search_provider.as_str();
     if p != "auto" {
         return p;
@@ -158,7 +164,7 @@ pub fn resolve_provider_id(config: &WebConfig) -> &str {
     ];
 
     for (id, env_var) in AUTO_DETECT {
-        if std::env::var(env_var).is_ok() {
+        if has_env(env_var) {
             return id;
         }
     }
@@ -738,78 +744,46 @@ mod tests {
         assert!(output.contains("A snippet"));
     }
 
-    #[test]
-    fn resolve_provider_explicit_brave() {
-        let config = WebConfig {
+    fn web_config(provider: &str) -> WebConfig {
+        WebConfig {
             enabled: true,
-            search_provider: "brave".into(),
+            search_provider: provider.into(),
             search_api_key_env: None,
             search_cache_ttl_secs: 3600,
-        };
-        assert_eq!(resolve_provider_id(&config), "brave");
+        }
     }
 
+    /// An explicitly configured provider must win even when API keys for
+    /// higher-priority providers are present — auto-detection only runs
+    /// for `"auto"`.
     #[test]
-    fn resolve_provider_explicit_tavily() {
-        let config = WebConfig {
-            enabled: true,
-            search_provider: "tavily".into(),
-            search_api_key_env: None,
-            search_cache_ttl_secs: 3600,
-        };
-        assert_eq!(resolve_provider_id(&config), "tavily");
+    fn explicit_provider_beats_available_keys() {
+        let config = web_config("duckduckgo");
+        assert_eq!(resolve_provider_with(&config, |_| true), "duckduckgo");
     }
 
+    /// Auto-detect priority: Tavily > Serper > Brave > DuckDuckGo, decided
+    /// by which API keys exist. Deterministic via the injected env lookup —
+    /// the old env-reading version of this test could not pin the fallback
+    /// row without racing other tests on process env vars.
     #[test]
-    fn resolve_provider_explicit_serper() {
-        let config = WebConfig {
-            enabled: true,
-            search_provider: "serper".into(),
-            search_api_key_env: None,
-            search_cache_ttl_secs: 3600,
-        };
-        assert_eq!(resolve_provider_id(&config), "serper");
-    }
-
-    #[test]
-    fn resolve_provider_explicit_duckduckgo() {
-        let config = WebConfig {
-            enabled: true,
-            search_provider: "duckduckgo".into(),
-            search_api_key_env: None,
-            search_cache_ttl_secs: 3600,
-        };
-        assert_eq!(resolve_provider_id(&config), "duckduckgo");
-    }
-
-    #[test]
-    fn resolve_provider_auto_fallback_duckduckgo() {
-        // When no env vars are set, auto should fall back to duckduckgo
-        // Note: this test may be flaky if TAVILY_API_KEY/SERPER_API_KEY/BRAVE_SEARCH_API_KEY
-        // are set in the test environment, but that's unlikely in CI.
-        let config = WebConfig {
-            enabled: true,
-            search_provider: "auto".into(),
-            search_api_key_env: None,
-            search_cache_ttl_secs: 3600,
-        };
-        // We can't guarantee env vars aren't set, so just verify it returns a valid provider
-        let provider = resolve_provider_id(&config);
-        assert!(
-            ["tavily", "serper", "brave", "duckduckgo"].contains(&provider),
-            "auto should resolve to a known provider, got: {provider}"
-        );
-    }
-
-    #[test]
-    fn backward_compat_default_config() {
-        // Existing configs with search_provider = "duckduckgo" should still work
-        let config = WebConfig {
-            enabled: true,
-            search_provider: "duckduckgo".into(),
-            search_api_key_env: None,
-            search_cache_ttl_secs: 3600,
-        };
-        assert_eq!(resolve_provider_id(&config), "duckduckgo");
+    fn auto_detect_follows_key_priority_order() {
+        let cases: &[(&[&str], &str)] = &[
+            (
+                &["TAVILY_API_KEY", "SERPER_API_KEY", "BRAVE_SEARCH_API_KEY"],
+                "tavily",
+            ),
+            (&["SERPER_API_KEY", "BRAVE_SEARCH_API_KEY"], "serper"),
+            (&["BRAVE_SEARCH_API_KEY"], "brave"),
+            (&[], "duckduckgo"),
+        ];
+        let config = web_config("auto");
+        for (available, expected) in cases {
+            assert_eq!(
+                resolve_provider_with(&config, |var| available.contains(&var)),
+                *expected,
+                "keys {available:?} must resolve to {expected}"
+            );
+        }
     }
 }
