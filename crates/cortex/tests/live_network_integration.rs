@@ -583,10 +583,12 @@ async fn live_browser_hn_top5_article_screenshots() {
             Ok(ToolOutput::Multimodal { text, parts }) => (text, parts),
             other => fail!("screenshot of story {i} ({url}) not multimodal: {other:?}"),
         };
-        if !parts.iter().any(|p| matches!(
-            p,
-            cortex::types::ContentPart::ImageBase64 { media } if media.mime_type == "image/png"
-        )) {
+        if !parts.iter().any(|p| {
+            matches!(
+                p,
+                cortex::types::ContentPart::ImageBase64 { media } if media.mime_type == "image/png"
+            )
+        }) {
             fail!("screenshot of story {i} has no PNG image part: {text}");
         }
 
@@ -607,7 +609,11 @@ async fn live_browser_hn_top5_article_screenshots() {
                 path.display()
             );
         }
-        eprintln!("story {i}: {url} -> {} ({} bytes)", path.display(), bytes.len());
+        eprintln!(
+            "story {i}: {url} -> {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
         saved.push(path);
     }
 

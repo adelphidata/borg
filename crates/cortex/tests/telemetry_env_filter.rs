@@ -12,6 +12,8 @@
 //! for the process-global dispatcher (scoped `with_default` dispatchers are
 //! demoted to `Interest::sometimes`, which would mask the bug).
 
+#![allow(clippy::expect_used)]
+
 use std::sync::{Arc, Mutex};
 
 use tracing::{Level, Subscriber};
