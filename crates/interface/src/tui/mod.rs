@@ -634,6 +634,9 @@ fn proto_skip_reason(skip_reason: &str, message: &str) -> heartbeat::scheduler::
         "duplicate_response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
         "empty_response" => heartbeat::scheduler::SkipReason::EmptyResponse,
         "no_llm_provider" => heartbeat::scheduler::SkipReason::NoLlmProvider,
+        "interactive_input_unavailable" => {
+            heartbeat::scheduler::SkipReason::InteractiveInputUnavailable
+        }
         _ => match message {
             "quiet hours" => heartbeat::scheduler::SkipReason::QuietHours,
             "duplicate response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
@@ -2311,6 +2314,37 @@ mod tests {
                 reason: heartbeat::scheduler::SkipReason::NoLlmProvider
             }
         ));
+    }
+
+    /// Guards the "no `[heartbeat error]` toast when the agent asks a
+    /// question" fix. When a proactive heartbeat turn calls
+    /// `request_user_input` (or asks for shell confirmation) there is no
+    /// client to answer, so borgd short-circuits and publishes a `skipped`
+    /// event with the `interactive_input_unavailable` wire reason. The TUI
+    /// MUST reconstruct that as `SkipReason::InteractiveInputUnavailable`
+    /// (silently logged) — decoding it as anything that routes through
+    /// `HeartbeatResult::Failed` would regress the alarming toast.
+    #[test]
+    fn proto_heartbeat_result_maps_interactive_input_unavailable_via_wire_field() {
+        let evt = PbHeartbeatEvent {
+            source: "scheduled".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "interactive input unavailable".to_string(),
+            duration_ms: 0.0,
+            skip_reason: "interactive_input_unavailable".to_string(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(
+            matches!(
+                result,
+                heartbeat::scheduler::HeartbeatResult::Skipped {
+                    reason: heartbeat::scheduler::SkipReason::InteractiveInputUnavailable
+                }
+            ),
+            "interactive-input skip must decode as a Skip, never a Failed toast"
+        );
     }
 
     // Source-level guards: read this file and app.rs via include_str! and

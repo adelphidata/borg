@@ -49,10 +49,12 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async_main())
+    // The agent loop runs on a worker thread; its deep poll chain (large tool
+    // futures like the browser handler + every `#[instrument]` layer) overflows
+    // tokio's 2 MiB default worker stack, and a stack overflow `abort()`s the
+    // whole daemon uncatchably. `build_runtime` enlarges the worker stack to
+    // give that poll chain the headroom it needs.
+    borgd::runtime::build_runtime()?.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {

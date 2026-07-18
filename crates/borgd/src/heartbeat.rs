@@ -500,8 +500,17 @@ pub async fn execute_heartbeat_turn(
             };
         }
         CollectOutcome::InteractivePromptRequested(detail) => {
-            return HeartbeatResult::Failed {
-                error: format!("agent requested interactive input during heartbeat ({detail})"),
+            // The agent decided it needs to ask the user something
+            // (`request_user_input`) or wants shell confirmation. A heartbeat
+            // is proactive and non-interactive — there is no client to answer,
+            // so there is nothing to deliver. This is a clean "no deliverable"
+            // outcome, not a failure: surfacing it as `Failed` produced an
+            // alarming `[heartbeat error: …]` toast for what is really the
+            // agent politely declining to act without input. Skip silently and
+            // log the detail for observability.
+            tracing::debug!("Heartbeat skipped: agent requested interactive input ({detail})");
+            return HeartbeatResult::Skipped {
+                reason: SkipReason::InteractiveInputUnavailable,
             };
         }
     };
@@ -598,6 +607,7 @@ fn skip_reason_wire(reason: &SkipReason) -> &'static str {
         SkipReason::EmptyResponse => "empty_response",
         SkipReason::DuplicateResponse => "duplicate_response",
         SkipReason::NoLlmProvider => "no_llm_provider",
+        SkipReason::InteractiveInputUnavailable => "interactive_input_unavailable",
     }
 }
 
@@ -1194,6 +1204,10 @@ mod tests {
         assert_eq!(
             skip_reason_wire(&SkipReason::DuplicateResponse),
             "duplicate_response"
+        );
+        assert_eq!(
+            skip_reason_wire(&SkipReason::InteractiveInputUnavailable),
+            "interactive_input_unavailable"
         );
     }
 

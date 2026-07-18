@@ -34,6 +34,9 @@ pub mod pairing;
 pub mod paths;
 pub mod pidlock;
 pub mod pki_grpc;
+/// Daemon tokio runtime construction — enlarged worker stack so the agent
+/// loop's poll chain cannot overflow and abort the process.
+pub mod runtime;
 pub mod scheduler;
 pub mod session;
 pub mod supervisor;

@@ -88,6 +88,12 @@ pub enum SkipReason {
     /// No LLM provider is configured — heartbeat has nothing to call.
     /// Onboarding-not-done, provider cleared, or all credentials revoked.
     NoLlmProvider,
+    /// The agent tried to ask the user a question (`request_user_input`) or
+    /// asked for shell confirmation during a heartbeat. Heartbeats are
+    /// non-interactive — there is no client waiting to answer — so the turn
+    /// short-circuits with no deliverable. Not an error the user can act on;
+    /// treated like an empty response.
+    InteractiveInputUnavailable,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -97,6 +103,7 @@ impl std::fmt::Display for SkipReason {
             Self::EmptyResponse => write!(f, "empty response"),
             Self::DuplicateResponse => write!(f, "duplicate response"),
             Self::NoLlmProvider => write!(f, "no llm provider"),
+            Self::InteractiveInputUnavailable => write!(f, "interactive input unavailable"),
         }
     }
 }

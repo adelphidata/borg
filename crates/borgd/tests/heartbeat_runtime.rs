@@ -147,21 +147,28 @@ impl SessionExecutor for StubExecutor {
 }
 
 /// Regression guard: when the heartbeat agent emits a `UserInputRequest`,
-/// the bus MUST see a terminal event within budget.
+/// the bus MUST see a terminal event within budget — and it must be a
+/// *skip*, not a failure.
 ///
-/// Pre-fix: when the heartbeat agent emitted a `UserInputRequest`, the wire
-/// proto event was silently dropped by `convert::from_proto`, the executor
-/// bridge produced no `CoreEvent`, and `execute_heartbeat_turn` waited on a
-/// never-closing channel until the `request_user_input` tool's 5-minute
-/// oneshot fired — well past the smorgasborg eval's 90s budget. The bus
-/// never saw a terminal event.
+/// Pre-fix (v1): when the heartbeat agent emitted a `UserInputRequest`, the
+/// wire proto event was silently dropped by `convert::from_proto`, the
+/// executor bridge produced no `CoreEvent`, and `execute_heartbeat_turn`
+/// waited on a never-closing channel until the `request_user_input` tool's
+/// 5-minute oneshot fired — well past the smorgasborg eval's 90s budget. The
+/// bus never saw a terminal event.
 ///
-/// Post-fix: `from_proto` lowers `UserInputRequest` to a SystemNotice with
-/// `prompt_request:user_input`, and `execute_heartbeat_turn` short-circuits
-/// on it, returning `Failed`. `run_and_broadcast` then publishes a
-/// terminal `failed` event to the bus inside the timeout window.
+/// Pre-fix (v2): `from_proto` lowered the request to a SystemNotice and the
+/// heartbeat short-circuited, but classified it as `Failed`, which surfaced
+/// an alarming `[heartbeat error: …]` toast for what is really the agent
+/// politely declining to act without input.
+///
+/// Post-fix: the short-circuit classifies the interactive-prompt request as
+/// `Skipped { InteractiveInputUnavailable }` — a clean "no deliverable"
+/// outcome, logged only, never a user-facing error. `run_and_broadcast`
+/// publishes a terminal `skipped` event with the
+/// `interactive_input_unavailable` wire reason inside the timeout window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_subscribe_heartbeat_events_emits_terminal_event_when_turn_hangs_on_user_input() {
+async fn admin_subscribe_heartbeat_events_skips_when_turn_requests_user_input() {
     let registry = SessionRegistry::new();
     let bus = HeartbeatBus::default();
     let admin = AdminSvc::new(registry).with_heartbeat_bus(bus.clone());
@@ -183,6 +190,11 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_when_turn_hangs_o
     config.heartbeat.quiet_hours_start = None;
     config.heartbeat.quiet_hours_end = None;
     config.heartbeat.turn_timeout_secs = 5;
+    // A provider must be set or `execute_heartbeat_turn` short-circuits on
+    // `NoLlmProvider` before it ever reaches the stub executor — masking the
+    // interactive-prompt path under test. The stub answers every turn itself,
+    // so no real LLM call is made regardless of the provider name.
+    config.llm.provider = Some("openrouter".to_string());
 
     let trigger = HeartbeatTrigger {
         source: HeartbeatSource::Scheduled,
@@ -210,15 +222,17 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_when_turn_hangs_o
         .expect("stream item ok");
 
     assert_eq!(
-        evt.status, "failed",
-        "interactive prompt during heartbeat must surface as failed"
+        evt.status, "skipped",
+        "interactive prompt during heartbeat is a clean skip, not a failure — \
+         it must never surface as a `[heartbeat error: …]` toast"
+    );
+    assert_eq!(
+        evt.skip_reason, "interactive_input_unavailable",
+        "skip reason must identify the interactive-input short-circuit so the \
+         TUI reconstructs it as a silent skip, got {:?}",
+        evt.skip_reason
     );
     assert_eq!(evt.source, "scheduled");
-    assert!(
-        evt.message.contains("interactive input"),
-        "message should explain the failure mode, got {:?}",
-        evt.message
-    );
 }
 
 /// Companion guard: even with no events at all on the channel, the bus

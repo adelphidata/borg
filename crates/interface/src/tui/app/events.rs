@@ -626,13 +626,17 @@ impl<'a> App<'a> {
                                 "[heartbeat: nothing to report ({reason})]"
                             ));
                         }
-                        SkipReason::QuietHours | SkipReason::NoLlmProvider => {
-                            // Configured-state skips — neither is an error nor
-                            // something the user can act on from a toast. Log
-                            // only. `NoLlmProvider` is the onboarding-race
-                            // path: first heartbeat fires before the
-                            // ConfigWatcher poll picks up the just-set
-                            // provider.
+                        SkipReason::QuietHours
+                        | SkipReason::NoLlmProvider
+                        | SkipReason::InteractiveInputUnavailable => {
+                            // Configured-state / non-actionable skips — none is
+                            // an error nor something the user can act on from a
+                            // toast. Log only. `NoLlmProvider` is the
+                            // onboarding-race path: first heartbeat fires before
+                            // the ConfigWatcher poll picks up the just-set
+                            // provider. `InteractiveInputUnavailable` is the
+                            // agent trying to ask a question in a proactive turn
+                            // that has no one to answer it.
                             tracing::debug!("Heartbeat skipped: {reason}");
                         }
                     }
