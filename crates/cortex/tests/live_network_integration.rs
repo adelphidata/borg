@@ -492,3 +492,125 @@ async fn live_ollama_chat_round_trip() {
         "expected 'pong' in local-model reply, got: {content:?}"
     );
 }
+
+/// Full E2E of the browser tool against a real content site: extract the
+/// top 5 story links from the Hacker News front page with `evaluate_js`,
+/// then `navigate` to each article detail page and `screenshot` it.
+///
+/// This exercises the complete production chain the model drives — lazy
+/// Chrome launch, URL policy, JS eval guard, PNG capture, disk save, and
+/// the multimodal envelope — against uncontrolled third-party pages.
+#[tokio::test]
+async fn live_browser_hn_top5_article_screenshots() {
+    require_live!("live_browser_hn_top5_article_screenshots");
+
+    let mut config = Config::default();
+    config.browser.enabled = true;
+    // Third-party article pages can be slow; default per-action timeout is
+    // tuned for snappy pages.
+    config.browser.timeout_ms = 45_000;
+
+    let mut session: Option<BrowserSession> = None;
+    let close = serde_json::json!({"action": "close"});
+
+    // Close the leaked Chrome on any failure path, then panic with context.
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = tool_handlers::handle_browser(&close, &config, &mut session).await;
+            panic!($($arg)*);
+        }};
+    }
+
+    let nav = tool_handlers::handle_browser(
+        &serde_json::json!({"action": "navigate", "url": "https://news.ycombinator.com/"}),
+        &config,
+        &mut session,
+    )
+    .await;
+    match &nav {
+        Ok(ToolOutput::Text(t)) if !t.starts_with("Error") => {}
+        other => fail!("front-page navigate failed: {other:?}"),
+    }
+
+    // Top 5 story links. `.titleline > a` is the story anchor; the source
+    // domain chip lives one level deeper (`.sitebit a`) so the direct-child
+    // combinator excludes it.
+    let eval = tool_handlers::handle_browser(
+        &serde_json::json!({
+            "action": "evaluate_js",
+            "expression": "Array.from(document.querySelectorAll('tr.athing .titleline > a')).slice(0, 5).map(a => a.href)",
+        }),
+        &config,
+        &mut session,
+    )
+    .await;
+    let eval_text = match eval {
+        Ok(ToolOutput::Text(t)) => t,
+        other => fail!("evaluate_js failed: {other:?}"),
+    };
+    let json_slice = match (eval_text.find('['), eval_text.rfind(']')) {
+        (Some(start), Some(end)) if end > start => &eval_text[start..=end],
+        _ => fail!("no JSON array in evaluate_js output: {eval_text}"),
+    };
+    let urls: Vec<String> = match serde_json::from_str(json_slice) {
+        Ok(u) => u,
+        Err(e) => fail!("could not parse story URLs ({e}): {eval_text}"),
+    };
+    if urls.len() != 5 || !urls.iter().all(|u| u.starts_with("http")) {
+        fail!("expected 5 absolute story URLs, got: {urls:?}");
+    }
+
+    let mut saved = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        let nav = tool_handlers::handle_browser(
+            &serde_json::json!({"action": "navigate", "url": url}),
+            &config,
+            &mut session,
+        )
+        .await;
+        match &nav {
+            Ok(ToolOutput::Text(t)) if !t.starts_with("Error") => {}
+            other => fail!("navigate to story {i} ({url}) failed: {other:?}"),
+        }
+
+        let shot = tool_handlers::handle_browser(
+            &serde_json::json!({"action": "screenshot"}),
+            &config,
+            &mut session,
+        )
+        .await;
+        let (text, parts) = match shot {
+            Ok(ToolOutput::Multimodal { text, parts }) => (text, parts),
+            other => fail!("screenshot of story {i} ({url}) not multimodal: {other:?}"),
+        };
+        if !parts.iter().any(|p| matches!(
+            p,
+            cortex::types::ContentPart::ImageBase64 { media } if media.mime_type == "image/png"
+        )) {
+            fail!("screenshot of story {i} has no PNG image part: {text}");
+        }
+
+        let path = match text.split("Saved to: ").nth(1) {
+            Some(p) => std::path::PathBuf::from(p.trim()),
+            None => fail!("screenshot of story {i} was not saved to disk: {text}"),
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => fail!("saved screenshot unreadable at {}: {e}", path.display()),
+        };
+        // A real page render, not a truncated or blank capture: PNG magic
+        // plus enough payload that an empty white viewport can't pass.
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.len() < 5_000 {
+            fail!(
+                "screenshot of story {i} is not a plausible page render ({} bytes) at {}",
+                bytes.len(),
+                path.display()
+            );
+        }
+        eprintln!("story {i}: {url} -> {} ({} bytes)", path.display(), bytes.len());
+        saved.push(path);
+    }
+
+    let _ = tool_handlers::handle_browser(&close, &config, &mut session).await;
+    assert_eq!(saved.len(), 5, "expected 5 saved screenshots");
+}
