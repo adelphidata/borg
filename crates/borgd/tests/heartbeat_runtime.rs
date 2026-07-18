@@ -257,6 +257,10 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_on_hang_timeout()
     config.heartbeat.quiet_hours_end = None;
     // Tight timeout so the test is fast.
     config.heartbeat.turn_timeout_secs = 1;
+    // Set a provider so the turn reaches the stub executor instead of
+    // short-circuiting on `NoLlmProvider`. The stub drives every turn itself,
+    // so no real LLM call is made.
+    config.llm.provider = Some("openrouter".to_string());
 
     let trigger = HeartbeatTrigger {
         source: HeartbeatSource::Scheduled,
@@ -324,6 +328,10 @@ async fn admin_subscribe_heartbeat_events_emits_ran_when_agent_completes_with_te
     config.heartbeat.quiet_hours_start = None;
     config.heartbeat.quiet_hours_end = None;
     config.heartbeat.turn_timeout_secs = 5;
+    // Set a provider so the turn reaches the stub executor instead of
+    // short-circuiting on `NoLlmProvider`. The stub drives every turn itself,
+    // so no real LLM call is made.
+    config.llm.provider = Some("openrouter".to_string());
 
     let trigger = HeartbeatTrigger {
         source: HeartbeatSource::Scheduled,
@@ -389,6 +397,10 @@ async fn admin_subscribe_heartbeat_events_emits_skipped_when_agent_returns_zero_
     config.heartbeat.quiet_hours_start = None;
     config.heartbeat.quiet_hours_end = None;
     config.heartbeat.turn_timeout_secs = 5;
+    // Set a provider so the turn reaches the stub executor instead of
+    // short-circuiting on `NoLlmProvider`. The stub drives every turn itself,
+    // so no real LLM call is made.
+    config.llm.provider = Some("openrouter".to_string());
 
     let trigger = HeartbeatTrigger {
         source: HeartbeatSource::Scheduled,

@@ -38,63 +38,68 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    /// The daemon worker stack must stay strictly above tokio's 2 MiB default.
-    /// This is the exact gap that let the browser tool's poll chain overflow
-    /// and `abort()` the whole daemon. If someone drops the size back to (or
-    /// below) the default, this fails before the crash can ship again.
-    #[test]
-    fn worker_stack_exceeds_tokio_default() {
-        const TOKIO_DEFAULT_STACK: usize = 2 * 1024 * 1024;
-        assert!(
-            WORKER_STACK_SIZE > TOKIO_DEFAULT_STACK,
-            "daemon worker stack ({WORKER_STACK_SIZE}) must exceed tokio's 2 MiB \
-             default; the agent loop's browser-tool poll chain overflows 2 MiB \
-             and aborts the daemon"
-        );
-    }
-
-    /// Behavioral regression guard: a spawned task (i.e. one running on a
-    /// worker thread, exactly like the agent loop) must be able to consume a
-    /// call stack deeper than tokio's 2 MiB default without overflowing.
-    ///
-    /// The recursion below consumes at least ~2.6 MiB of stack — comfortably
-    /// past the 2 MiB default (which would `abort()` the test binary here) yet
-    /// well under the configured 4 MiB. If `build_runtime` ever regresses to
-    /// the default worker stack, this task overflows and the process aborts,
-    /// turning the silent daemon-killing crash into a loud test failure.
-    #[test]
-    fn spawned_task_survives_deep_stack_use() {
-        /// ~1 KiB of live stack per frame, black-boxed so the optimizer can
-        /// neither elide the buffer nor turn the recursion into a loop.
-        #[inline(never)]
-        fn consume_stack(depth: usize) -> u8 {
-            let mut buf = [0u8; 1024];
-            std::hint::black_box(&mut buf[..]);
-            buf[depth % buf.len()] = depth as u8;
-            if depth == 0 {
-                buf[0]
+    /// Actual stack size of the calling thread, queried from the OS. Only the
+    /// platforms borg ships on (macOS, Linux) are wired up; both expose the
+    /// worker thread's real stack via pthread. Returns 0 if the query fails.
+    fn current_thread_stack_size() -> usize {
+        #[cfg(target_os = "macos")]
+        // SAFETY: `pthread_get_stacksize_np` reads the stack size of a valid,
+        // live pthread handle (`pthread_self`) and has no other effects.
+        unsafe {
+            libc::pthread_get_stacksize_np(libc::pthread_self())
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: `pthread_getattr_np` fills a zeroed `pthread_attr_t` for the
+        // current thread; on success we read the stack size and always destroy
+        // the attr. All handles are valid and confined to this call.
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+                return 0;
+            }
+            let mut size: libc::size_t = 0;
+            let rc = libc::pthread_attr_getstacksize(&attr, &mut size);
+            libc::pthread_attr_destroy(&mut attr);
+            if rc == 0 {
+                size
             } else {
-                buf[0].wrapping_add(consume_stack(depth - 1))
+                0
             }
         }
+    }
 
-        // 2600 frames × ≥1 KiB ⇒ ≥2.6 MiB: past the 2 MiB default, under 4 MiB.
-        const DEPTH: usize = 2600;
+    /// Regression guard: `build_runtime` must actually apply an enlarged worker
+    /// stack, not just define a large constant. We run on a *spawned* task —
+    /// exactly where the agent loop executes — and read the worker thread's
+    /// real OS stack size, asserting it exceeds tokio's 2 MiB default. That gap
+    /// is what let the browser tool's poll chain overflow and `abort()` the
+    /// daemon; if someone removes `.thread_stack_size(...)` (dropping workers
+    /// back to the default) or shrinks it, this fails with a clean assertion
+    /// rather than an uncatchable stack-overflow abort.
+    #[test]
+    fn build_runtime_applies_enlarged_worker_stack() {
+        const TOKIO_DEFAULT_STACK: usize = 2 * 1024 * 1024;
 
         let rt = build_runtime().expect("build daemon runtime");
-        let out = rt.block_on(async {
-            // `spawn` runs the work on a worker thread with WORKER_STACK_SIZE,
-            // mirroring where the agent loop actually executes — `block_on`'s
-            // own thread carries the larger OS main-thread stack and would mask
-            // an undersized worker stack.
-            tokio::spawn(async { consume_stack(DEPTH) })
-                .await
-                .expect("deep-stack task must complete without overflowing")
-        });
-        std::hint::black_box(out);
+        let worker_stack = rt
+            .block_on(async { tokio::spawn(async { current_thread_stack_size() }).await })
+            .expect("stack-size probe task must complete");
+
+        assert!(
+            worker_stack >= WORKER_STACK_SIZE,
+            "worker thread stack ({worker_stack}) must be at least the \
+             configured WORKER_STACK_SIZE ({WORKER_STACK_SIZE}); build_runtime \
+             is not applying .thread_stack_size()"
+        );
+        assert!(
+            worker_stack > TOKIO_DEFAULT_STACK,
+            "worker thread stack ({worker_stack}) must exceed tokio's 2 MiB \
+             default — the agent loop's browser-tool poll chain overflows 2 MiB \
+             and aborts the daemon"
+        );
     }
 }
