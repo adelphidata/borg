@@ -194,7 +194,14 @@ async fn web_fetch_applies_strip_query_params_transform() {
     let result = handle_web_fetch(&json!({ "url": url }), &config)
         .await
         .unwrap();
-    assert_eq!(result.trim(), "ok", "expected fetched body, got: {result}");
+    // Clean fetches come back inside the `<untrusted_content>` trust
+    // boundary — assert via the same helper the handler uses so this test
+    // tracks the wrapping spec instead of hardcoding the envelope.
+    assert_eq!(
+        result.trim(),
+        cortex::security::sanitize::wrap_untrusted("web_fetch", "ok").trim(),
+        "expected boundary-wrapped fetched body, got: {result}"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // Verify the recorded request had only the kept param.
