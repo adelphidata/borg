@@ -1003,6 +1003,13 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         user_msg = format!("{}{user_msg}", render_pre_run_block(&outcome));
     }
 
+    // Set when the agentic remediation turn short-circuited because the agent
+    // tried to ask the user a question (or requested shell confirmation) — a
+    // heartbeat has no client to answer, so the turn is a clean skip. Kept
+    // distinct from the empty/zero-info skip so the TUI classifies it as
+    // `InteractiveInputUnavailable` (silently logged) rather than surfacing a
+    // misleading "nothing to report" notice.
+    let mut interactive_input = false;
     let (result_text, followup) = match (go_agentic, ctx.executor.as_ref()) {
         (true, Some(executor)) => {
             // Agentic remediation: full agent loop (tools + the per-session
@@ -1021,6 +1028,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                     tracing::warn!(
                         "Heartbeat remediation: agent requested interactive input ({detail})"
                     );
+                    interactive_input = true;
                     String::new()
                 }
             };
@@ -1094,6 +1102,17 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     };
 
     if !force_deliver {
+        if interactive_input {
+            record_heartbeat_silent(
+                *run_id,
+                duration_ms,
+                "interactive_input_unavailable",
+                task_name,
+            )
+            .await;
+            publish_skip_event(started_unix, "interactive_input_unavailable");
+            return;
+        }
         if is_silent_response(&result_text) {
             record_heartbeat_silent(*run_id, duration_ms, "silent", task_name).await;
             publish_skip_event(started_unix, "silent");

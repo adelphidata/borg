@@ -26,6 +26,27 @@ pub fn is_recoverable_error(err: &anyhow::Error) -> bool {
         .any(|pattern| msg.contains(pattern))
 }
 
+/// `Runtime.evaluate` errors emitted while a navigation is committing: the
+/// old document's execution context is already gone and the new one does
+/// not exist yet. Unlike [`RECOVERABLE_PATTERNS`] the session is healthy —
+/// the remedy is a short in-place retry, not reconnect/relaunch.
+const TRANSIENT_CONTEXT_PATTERNS: &[&str] = &[
+    "cannot find context with specified id",
+    "execution context was destroyed",
+    "execution context is not available",
+    "inspected target navigated or closed",
+];
+
+/// True when a CDP evaluate failure is mid-navigation context churn that
+/// resolves by itself once the new document commits. Match on the formatted
+/// error (`{err:?}`) so patterns buried under `anyhow` contexts are seen.
+pub fn is_transient_context_error(formatted_error: &str) -> bool {
+    let msg = formatted_error.to_lowercase();
+    TRANSIENT_CONTEXT_PATTERNS
+        .iter()
+        .any(|pattern| msg.contains(pattern))
+}
+
 /// Attempt a health check by sending `Browser.getVersion` via CDP.
 /// Returns `Ok(())` if the browser responds within `timeout`.
 #[instrument(skip_all, fields(browser.action = "health_check"))]
@@ -82,6 +103,34 @@ mod tests {
         // `is_recoverable_error` must remain.
         assert!(is_recoverable_error(&make_err("TARGET CLOSED")));
         assert!(is_recoverable_error(&make_err("Page Crashed")));
+    }
+
+    /// Transient mid-navigation context churn must be distinguished from
+    /// both recoverable session failures (which trigger reconnect) and
+    /// plain logic errors: misclassifying either way would relaunch a
+    /// healthy browser or retry a genuine failure forever.
+    #[test]
+    fn transient_context_errors_are_not_recoverable_session_failures() {
+        for pattern in TRANSIENT_CONTEXT_PATTERNS {
+            assert!(
+                is_transient_context_error(&format!("JS evaluation failed: {pattern}")),
+                "{pattern:?} must classify as transient context churn"
+            );
+            assert!(
+                !is_recoverable_error(&make_err(pattern)),
+                "{pattern:?} must NOT trigger session reconnect/relaunch"
+            );
+        }
+        // Chromium's real casing.
+        assert!(is_transient_context_error(
+            "Cannot find context with specified id"
+        ));
+        for msg in ["target closed", "invalid selector", "timed out"] {
+            assert!(
+                !is_transient_context_error(msg),
+                "{msg:?} must not classify as transient context churn"
+            );
+        }
     }
 
     #[test]

@@ -212,7 +212,11 @@ pub struct BrowserConfig {
     pub headless: bool,
     /// Optional path to the Chrome executable.
     pub executable: Option<String>,
-    /// Chrome DevTools Protocol port.
+    /// Chrome DevTools Protocol port for locally launched browsers. `0`
+    /// (the default) lets Chrome pick an ephemeral port, so concurrent
+    /// sessions (daemon + TUI, parallel sub-agents) never collide on the
+    /// listener. Set a fixed port only to point external tooling at the
+    /// debug endpoint.
     pub cdp_port: u16,
     /// Disable Chrome's internal sandbox (needed in some containers).
     pub no_sandbox: bool,
@@ -282,7 +286,7 @@ impl Default for BrowserConfig {
             engine: BrowserEngine::default(),
             headless: true,
             executable: None,
-            cdp_port: constants::BROWSER_DEFAULT_CDP_PORT,
+            cdp_port: constants::BROWSER_LOCAL_CDP_PORT_EPHEMERAL,
             no_sandbox: false,
             timeout_ms: constants::BROWSER_DEFAULT_TIMEOUT_MS,
             startup_timeout_ms: constants::BROWSER_STARTUP_TIMEOUT_MS,

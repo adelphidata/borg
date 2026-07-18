@@ -57,6 +57,13 @@ pub struct BrowserSession {
     /// provider (and not leak a paid keep-alive session). `None` for local
     /// launches and operator-managed CDP attaches.
     remote: Option<backends::RemoteSession>,
+    /// Per-session throwaway Chrome profile for local launches, deleted when
+    /// the session drops. Without it chromiumoxide falls back to ONE fixed
+    /// temp path for every launch on the host, and concurrent sessions
+    /// (daemon + TUI, parallel sub-agents) die on Chrome's profile
+    /// singleton lock. `None` for attach/remote sessions — that Chrome's
+    /// profile is not ours to manage.
+    _profile_dir: Option<tempfile::TempDir>,
 }
 
 /// Pure drift decision backing [`BrowserSession::is_stale`], split out so it can
@@ -134,6 +141,15 @@ impl BrowserSession {
             .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage");
 
+        // See `_profile_dir` field doc: without an explicit profile,
+        // chromiumoxide points every launch at one shared temp path and
+        // concurrent sessions cannot start.
+        let profile_dir = tempfile::Builder::new()
+            .prefix("borg-browser-profile-")
+            .tempdir()
+            .context("Failed to create browser profile dir")?;
+        builder = builder.user_data_dir(profile_dir.path());
+
         let browser_config = builder
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build browser config: {e}"))?;
@@ -180,6 +196,7 @@ impl BrowserSession {
             snapshot_refs: HashMap::new(),
             connected_url: None,
             remote: None,
+            _profile_dir: Some(profile_dir),
         })
     }
 
@@ -237,6 +254,7 @@ impl BrowserSession {
             snapshot_refs: HashMap::new(),
             connected_url: Some(cdp_url.to_string()),
             remote: None,
+            _profile_dir: None,
         })
     }
 
@@ -970,12 +988,24 @@ async fn history_navigate(
         }})()"#
     );
     tokio::time::timeout(timeout, async {
-        let v: serde_json::Value = page
-            .evaluate(js.as_str())
-            .await
-            .context("history navigation failed")?
-            .into_value()
-            .context("history navigation result was not serialisable")?;
+        // `back`/`forward` typically arrive right after a `click` whose
+        // navigation is still committing; evaluating then hits a destroyed
+        // execution context. That churn is transient — retry in place (the
+        // outer timeout bounds the loop) instead of surfacing an error the
+        // model can only work around by re-issuing the call itself.
+        let v: serde_json::Value = loop {
+            match page.evaluate(js.as_str()).await {
+                Ok(res) => {
+                    break res
+                        .into_value()
+                        .context("history navigation result was not serialisable")?
+                }
+                Err(e) if health::is_transient_context_error(&format!("{e:?}")) => {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("history navigation failed")),
+            }
+        };
         let before = v.get("before").and_then(|v| v.as_str()).unwrap_or("");
         let len = v
             .get("len")

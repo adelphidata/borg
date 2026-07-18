@@ -594,8 +594,15 @@ pub const BROWSER_ERROR_BUFFER_SIZE: usize = 200;
 /// Default capacity of the network request ring buffer.
 pub const BROWSER_NETWORK_BUFFER_SIZE: usize = 500;
 
-/// Default Chrome DevTools Protocol port.
+/// Conventional Chrome DevTools Protocol port. Used by the CDP *attach*
+/// flow (`borg browser connect` and its auto-launched debug Chrome).
 pub const BROWSER_DEFAULT_CDP_PORT: u16 = 9222;
+
+/// CDP port for locally *launched* (headless) browsers: `0` makes Chrome
+/// bind an ephemeral port, which chromiumoxide discovers from the child's
+/// stderr. A fixed port here would make concurrent sessions (daemon + TUI,
+/// parallel sub-agents, test runners) fail to launch with a bind error.
+pub const BROWSER_LOCAL_CDP_PORT_EPHEMERAL: u16 = 0;
 
 /// Default cap on elements returned by `browser.snapshot`. Dense pages
 /// otherwise blow LLM context.
