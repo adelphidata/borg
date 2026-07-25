@@ -33,7 +33,7 @@ Restart `borgd` (or any `borg` command that respawns it). Hooks are discovered w
 | `PostToolUse` | After a tool call completes. Observer — exit code ignored. |
 | `Stop` | After a full agent turn completes. |
 
-Script hooks subscribe to these six events. The compiled-in `HookPoint` enum uses different names for two of them (`BeforeToolCall` = `PreToolUse`, `TurnComplete` = `Stop`) and adds three in-process-only variants (`BeforeLlmCall`, `AfterLlmResponse`, `OnError`) dispatched to compiled-in hooks (vitals, activity, bond, evolution) but not exposed to `hooks.json`.
+Script hooks subscribe to these six events. The compiled-in `HookPoint` enum uses different names for three of them (`BeforeAgentStart` = `UserPromptSubmit`, `BeforeToolCall` = `PreToolUse`, `TurnComplete` = `Stop`) and adds two in-process-only variants (`BeforeLlmCall`, `AfterLlmResponse`) dispatched to compiled-in hooks (vitals, activity, bond, evolution) but not exposed to `hooks.json`.
 
 ## Handler config
 
@@ -47,7 +47,11 @@ Script hooks subscribe to these six events. The compiled-in `HookPoint` enum use
 
 ## Payload
 
-Each hook receives a single JSON argument as `$1`:
+Each hook receives the same JSON payload on **two** channels: as `$1`, and on **stdin**. Use whichever you prefer — `"$1"` is the shorter form, while `input=$(cat)` is what Claude Code hooks expect, so scripts copied from a Claude Code config work unchanged.
+
+A hook that never reads stdin is fine: borg closes the pipe and ignores the resulting broken pipe, so your exit code and output are still honored.
+
+
 
 ```json
 {

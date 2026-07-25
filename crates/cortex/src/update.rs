@@ -413,6 +413,8 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
     let status = std::process::Command::new("tar")
         .args(["xzf", archive_str])
         .current_dir(&extract_dir)
+        // Archive comes from a file argument, never stdin.
+        .stdin(std::process::Stdio::null())
         .status()
         .context("Failed to run tar")?;
     if !status.success() {

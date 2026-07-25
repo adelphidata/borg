@@ -168,6 +168,7 @@ fn convert_heic_to_jpeg(heic_bytes: &[u8]) -> Result<Vec<u8>> {
             "--out",
             &output_path.to_string_lossy(),
         ])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;

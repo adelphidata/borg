@@ -60,7 +60,10 @@ pub struct TailscaleCliSource;
 /// we spawn the child, poll `try_wait`, and SIGKILL on timeout.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
     use std::io::Read;
-    cmd.stdout(std::process::Stdio::piped())
+    // Non-interactive probe: null stdin so an unexpected prompt fails fast
+    // instead of hanging until the deadline.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
     let deadline = Instant::now() + timeout;

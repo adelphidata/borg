@@ -100,12 +100,18 @@ impl<'a> App<'a> {
     // =========================================================================
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
-        // REPORT_EVENT_TYPES (kitty keyboard protocol, enabled in
+        // REPORT_EVENT_TYPES (kitty keyboard protocol, requested in
         // tui_lifecycle::set_modes) delivers both Press and Release for every
         // key. Forwarding Release would double-fire Enter/Esc handling — e.g.
         // the Enter that submits `/uninstall` would immediately re-trigger as
         // "cancel" inside ConfirmingUninstall. Only Press (and Repeat) reach
         // the per-state handlers below.
+        //
+        // The flag is not requested on every terminal (iTerm2 and tmux's
+        // `xterm` extended-keys format mishandle it — see
+        // `keyboard_enhancement_flags`). There, Release simply never arrives and
+        // this guard is inert; it must stay either way, since the same binary
+        // runs on terminals that do report it.
         if key.kind == crossterm::event::KeyEventKind::Release {
             return Ok(AppAction::Continue);
         }

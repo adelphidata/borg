@@ -958,9 +958,14 @@ Rules:
         )
     }
 
-    /// Emit a per-session toast/log warning when the skill budget had to drop
-    /// or downgrade skills. Re-warns only when the dropped-set actually changes
-    /// so a stable budget doesn't spam users every turn.
+    /// Log a per-session warning when the skill budget had to drop or downgrade
+    /// skills. Re-warns only when the dropped-set actually changes so a stable
+    /// budget doesn't spam the log every turn.
+    ///
+    /// Operator-facing only — there is no event channel at prompt-assembly time.
+    /// The *model* learns about omissions from the "N additional skills omitted"
+    /// marker that `skills::load_skills_context` writes into the catalog itself,
+    /// so the truncation is never silent on either side.
     pub(super) fn warn_skill_budget_loss(&mut self, report: &crate::skills::SkillBudgetReport) {
         if !report.is_lossy() {
             return;
@@ -1004,11 +1009,6 @@ Rules:
         // the transcript captures the steering for audit.
         self.drain_pending_goal_steering().await;
 
-        let mut system_prompt = self
-            .build_system_prompt()
-            .await
-            .context("Failed to build system prompt")?;
-
         // Extract user message early — needed for conditional tool loading and hooks.
         let user_msg = self
             .history
@@ -1019,6 +1019,10 @@ Rules:
             .unwrap_or("")
             .to_string();
 
+        // Tools are resolved BEFORE the system prompt: the prompt's `<tooling>`
+        // section is rendered from this exact slice, so it can never advertise a
+        // tool the model wasn't given. (It also means the setup turn below, which
+        // deliberately ships no tools, no longer describes tools it can't call.)
         let tool_defs = if self.setup_just_consumed {
             // First post-onboarding turn: starve the model of tool definitions
             // entirely. SETUP.md's "DO NOT call any tools on your first message"
@@ -1029,6 +1033,11 @@ Rules:
         } else {
             self.build_tool_definitions(&user_msg).await
         };
+
+        let mut system_prompt = self
+            .build_system_prompt(&tool_defs)
+            .await
+            .context("Failed to build system prompt")?;
 
         // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
         let hook_point = if iteration == 1 {

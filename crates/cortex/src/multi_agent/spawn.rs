@@ -257,6 +257,9 @@ pub(super) struct SubAgentSpawn {
     /// Prompt-cache scope inherited from the spawning controller — the root
     /// session of this agent tree, not necessarily the immediate parent.
     pub(super) prompt_cache_scope: String,
+    /// Sandbox confinement inherited from the parent. `None` only when the
+    /// parent itself never had a context installed (CLI/test paths).
+    pub(super) execution_context: Option<crate::execution_context::ExecutionContext>,
     pub(super) semaphore: Arc<Semaphore>,
     pub(super) completion_tx: mpsc::Sender<SubAgentCompletion>,
 }
@@ -287,6 +290,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         bus,
         info,
         prompt_cache_scope,
+        execution_context,
         semaphore,
         completion_tx,
     } = spawn;
@@ -335,6 +339,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         bus,
         info,
         prompt_cache_scope,
+        execution_context,
     )
     .await;
 
@@ -400,6 +405,7 @@ fn run_sub_agent(
     bus: Option<AgentTreeBus>,
     info: SubAgentInfo,
     prompt_cache_scope: String,
+    execution_context: Option<crate::execution_context::ExecutionContext>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         use crate::agent::{Agent, AgentEvent};
@@ -412,6 +418,14 @@ fn run_sub_agent(
             tools_filter,
         )
         .await?;
+
+        // Inherit the parent's sandbox confinement. `Agent::new_sub_agent`
+        // builds a process-derived (unrestricted) context, so without this the
+        // child runs unsandboxed while holding `auto_approve: ["*"]` — a
+        // one-hop escape from a workspace-confined parent.
+        if let Some(execution_context) = execution_context {
+            agent.set_execution_context(execution_context);
+        }
 
         // Share the spawning tree's prompt-cache key: parent and child
         // requests carry a near-identical prompt prefix, and OpenAI-family

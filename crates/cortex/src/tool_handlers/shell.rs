@@ -398,6 +398,12 @@ pub async fn handle_run_shell_with_context(
         wrap_run_shell_for_sandbox(ctx, config, shell, shell_flag, command, &cwd_path);
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&full_args)
+        // One-shot commands are non-interactive: nothing feeds this stdin, so
+        // inheriting the parent's would let the command consume the operator's
+        // keystrokes (or block forever on `cat`, `ssh`, an unexpected prompt)
+        // until the timeout fires. The persistent-session path below pipes
+        // stdin instead, because `write_stdin` needs a handle to write to.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     cmd.current_dir(&cwd_path);
@@ -613,9 +619,9 @@ fn wrap_run_shell_for_sandbox(
     // Enforce configured blocked_paths as sandbox deny rules so a shell command
     // can't read e.g. `~/.env` or `<workspace>/credentials` — the allow-list
     // scoping alone permits broad reads, and the hardcoded sensitive-home denies
-    // don't cover operator-configured entries. NOTE: deny-read here is enforced
-    // by Seatbelt (macOS) / the Windows backend; bwrap (Linux) currently honors
-    // only deny_write, so the read side is unenforced on Linux today.
+    // don't cover operator-configured entries. Enforced on all three backends:
+    // Seatbelt `(deny file-read*)`, the Windows backend, and bwrap via
+    // `hide_path` (tmpfs over directories, /dev/null over files).
     .with_blocked_paths_denied(
         &config.security.blocked_paths,
         std::slice::from_ref(&workspace_root_str),
@@ -804,11 +810,111 @@ fn redact_command_for_audit(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_run_shell, redact_command_for_audit, HeadTailBuffer};
+    use super::{
+        handle_run_shell, redact_command_for_audit, wrap_run_shell_for_sandbox, HeadTailBuffer,
+    };
     use crate::agent::AgentEvent;
     use crate::config::Config;
+    use crate::execution_context::ExecutionContext;
     use crate::policy::{ExecutionPolicy, PolicyDecision};
     use tokio::sync::mpsc;
+
+    /// A sub-agent derived from a workspace-confined parent must still be
+    /// sandbox-wrapped. Regression guard: children are granted
+    /// `auto_approve: ["*"]`, so if `for_child` ever stops carrying
+    /// `enforce_workspace_root` the child runs arbitrary commands unsandboxed.
+    #[test]
+    fn child_context_of_confined_parent_still_wraps_shell_in_sandbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        let parent =
+            ExecutionContext::for_workspace(root.clone(), root.clone()).expect("parent context");
+        let config = Config::default();
+
+        let (parent_program, _) =
+            wrap_run_shell_for_sandbox(&parent, &config, "/bin/sh", "-c", "echo hi", &root);
+        let child = parent.for_child();
+        let (child_program, child_args) =
+            wrap_run_shell_for_sandbox(&child, &config, "/bin/sh", "-c", "echo hi", &root);
+
+        assert!(
+            child.enforce_workspace_root(),
+            "child must inherit workspace enforcement"
+        );
+        assert_ne!(
+            child_program, "/bin/sh",
+            "child command must be wrapped by the sandbox, not executed bare"
+        );
+        assert_eq!(
+            child_program, parent_program,
+            "child must use the same sandbox program as its parent"
+        );
+        assert!(
+            child_args.iter().any(|arg| arg.contains("echo hi")),
+            "wrapped argv must still carry the original command: {child_args:?}"
+        );
+    }
+
+    /// The unconfined case must stay unwrapped — otherwise every CLI shell call
+    /// would start paying for `sandbox-exec`/`bwrap`.
+    #[test]
+    fn child_context_of_unconfined_parent_stays_bare() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = ExecutionContext::unrestricted(tmp.path().to_path_buf());
+        let config = Config::default();
+        let (program, args) = wrap_run_shell_for_sandbox(
+            &parent.for_child(),
+            &config,
+            "/bin/sh",
+            "-c",
+            "echo hi",
+            tmp.path(),
+        );
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    /// A child must not keep the parent's IDE text-file bridge: children run in
+    /// detached tasks that outlive the ACP request the bridge belongs to.
+    #[test]
+    fn child_context_drops_the_text_file_bridge_but_keeps_containment() {
+        struct StubBridge;
+        impl crate::execution_context::TextFileBridge for StubBridge {
+            fn supports_read_text_file(&self) -> bool {
+                true
+            }
+            fn supports_write_text_file(&self) -> bool {
+                true
+            }
+            fn read_text_file(&self, _path: &std::path::Path) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn write_text_file(
+                &self,
+                _path: &std::path::Path,
+                _content: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        let parent = ExecutionContext::for_workspace(root.clone(), root.clone())
+            .expect("parent context")
+            .with_text_file_bridge(Some(std::sync::Arc::new(StubBridge)));
+        assert!(parent.text_file_bridge().is_some());
+
+        let child = parent.for_child();
+        assert!(child.text_file_bridge().is_none());
+        assert!(child.enforce_workspace_root());
+        assert_eq!(child.workspace_root(), parent.workspace_root());
+        child
+            .resolve_path_for_write("/etc/passwd")
+            .expect_err("child must still reject paths outside the workspace root");
+    }
 
     #[test]
     fn head_tail_buffer_under_cap_is_verbatim() {
@@ -1300,6 +1406,60 @@ mod tests {
             !result.contains("require the borg daemon"),
             "control-plane guard must precede the registry check: {result}"
         );
+    }
+
+    /// A one-shot `run_shell` command must not inherit the parent's stdin.
+    ///
+    /// Regression shape: the parent's stdin is a pipe held open with nothing
+    /// ever written to it. If the child inherits it, `cat` blocks on read
+    /// forever and the call only returns when the command timeout fires. With
+    /// stdin nulled, `cat` sees immediate EOF and returns empty output. The
+    /// timeout here is much shorter than the shell timeout, so an inherited
+    /// stdin fails the test instead of merely slowing it down.
+    ///
+    /// Runs in a child process so the pipe replaces the *real* fd 0 — setting
+    /// it only for the spawned command would test nothing.
+    #[tokio::test]
+    async fn one_shot_run_shell_does_not_inherit_parent_stdin() {
+        const CHILD_ENV: &str = "BORG_RUN_SHELL_STDIN_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let config = Config::default();
+            let policy = ExecutionPolicy::default();
+            let (event_tx, _event_rx) = mpsc::channel(64);
+            let args = serde_json::json!({ "command": "cat" });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None),
+            )
+            .await
+            .expect("`cat` must not block on an inherited stdin")
+            .expect("run_shell should succeed");
+            assert!(
+                !result.contains("timed out"),
+                "command must complete, not time out: {result}"
+            );
+            return;
+        }
+
+        // `--exact` matches the fully qualified test path. Passing the bare
+        // function name would select zero tests, and a child that ran nothing
+        // still exits 0 — the assertion below would pass vacuously.
+        const CHILD_TEST: &str =
+            "tool_handlers::shell::tests::one_shot_run_shell_does_not_inherit_parent_stdin";
+        let exe = std::env::current_exe().expect("test executable path");
+        let mut child = std::process::Command::new(exe)
+            .args([CHILD_TEST, "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            // Hand the child an open-but-silent stdin. A `cat` that inherits
+            // this never sees EOF.
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+        let held_stdin = child.stdin.take().expect("hold child stdin open");
+        let status = child.wait().expect("wait for child test process");
+        drop(held_stdin);
+        assert!(status.success(), "child test process failed: {status}");
     }
 
     #[tokio::test]

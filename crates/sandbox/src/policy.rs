@@ -127,6 +127,27 @@ fn expand_tilde_paths(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// TLS trust-store roots a network-enabled policy needs to be able to read.
+const TLS_READ_ROOTS: &[&str] = &["/etc/ssl", "/etc/ssl/certs"];
+
+/// Append the TLS roots that `exists` reports as present, skipping duplicates.
+///
+/// Only existing paths are added: distros vary (`/etc/ssl/certs` is absent on
+/// some minimal container images and on macOS), and bwrap fails the *entire*
+/// spawn when a bind source is missing. Adding a path that isn't there turned a
+/// cosmetic default into "this host cannot run a sandboxed command at all".
+///
+/// `exists` is a parameter so tests are deterministic instead of asserting
+/// against whatever the build host happens to have in `/etc`.
+fn add_tls_read_roots(fs_read: &mut Vec<String>, exists: impl Fn(&str) -> bool) {
+    for tls_path in TLS_READ_ROOTS {
+        let candidate = (*tls_path).to_string();
+        if !fs_read.contains(&candidate) && exists(tls_path) {
+            fs_read.push(candidate);
+        }
+    }
+}
+
 impl SandboxPolicy {
     /// Filter blocked paths from fs_read/fs_write, consuming self.
     pub fn with_blocked_paths_filtered(mut self, blocked_paths: &[String]) -> Self {
@@ -188,12 +209,7 @@ impl SandboxPolicy {
     /// Idempotent: does not add paths that are already present.
     pub fn with_defaults_applied(mut self) -> Self {
         if self.network {
-            for tls_path in &["/etc/ssl", "/etc/ssl/certs"] {
-                let s = tls_path.to_string();
-                if !self.fs_read.contains(&s) {
-                    self.fs_read.push(s);
-                }
-            }
+            add_tls_read_roots(&mut self.fs_read, |p| std::path::Path::new(p).exists());
         }
         self
     }
@@ -519,23 +535,52 @@ mod tests {
 
     #[test]
     fn defaults_applied_adds_tls_for_network() {
-        let policy = SandboxPolicy {
-            network: true,
-            fs_read: vec!["/data".into()],
-            ..Default::default()
-        };
-        let applied = policy.with_defaults_applied();
+        let mut fs_read = vec!["/data".to_string()];
+        add_tls_read_roots(&mut fs_read, |_| true);
         assert!(
-            applied.fs_read.contains(&"/etc/ssl".to_string()),
-            "network=true should add /etc/ssl"
+            fs_read.contains(&"/etc/ssl".to_string()),
+            "network=true should add /etc/ssl when it exists"
         );
         assert!(
-            applied.fs_read.contains(&"/etc/ssl/certs".to_string()),
-            "network=true should add /etc/ssl/certs"
+            fs_read.contains(&"/etc/ssl/certs".to_string()),
+            "network=true should add /etc/ssl/certs when it exists"
         );
         assert!(
-            applied.fs_read.contains(&"/data".to_string()),
+            fs_read.contains(&"/data".to_string()),
             "original paths preserved"
+        );
+    }
+
+    /// Distros differ: `/etc/ssl/certs` is absent on some minimal container
+    /// images and on macOS. Because bwrap fails the whole spawn on a missing
+    /// bind source, an absent TLS root must never reach `fs_read` — otherwise
+    /// enabling network makes every sandboxed command unrunnable on that host.
+    #[test]
+    fn defaults_applied_skips_tls_roots_that_do_not_exist() {
+        let mut fs_read = Vec::new();
+        add_tls_read_roots(&mut fs_read, |p| p == "/etc/ssl");
+        assert_eq!(
+            fs_read,
+            vec!["/etc/ssl".to_string()],
+            "only the existing TLS root should be added"
+        );
+
+        let mut none_exist = Vec::new();
+        add_tls_read_roots(&mut none_exist, |_| false);
+        assert!(
+            none_exist.is_empty(),
+            "no TLS roots present ⇒ nothing added: {none_exist:?}"
+        );
+    }
+
+    #[test]
+    fn defaults_applied_does_not_duplicate_seeded_tls_roots() {
+        let mut fs_read = vec!["/etc/ssl".to_string()];
+        add_tls_read_roots(&mut fs_read, |_| true);
+        assert_eq!(
+            fs_read.iter().filter(|p| *p == "/etc/ssl").count(),
+            1,
+            "seeded entry must not be duplicated"
         );
     }
 
@@ -554,22 +599,10 @@ mod tests {
 
     #[test]
     fn defaults_applied_is_idempotent() {
-        // Idempotence guard: applying defaults twice — whether the seed
-        // already contains /etc/ssl or not — must never duplicate entries.
-        // Without this, repeated config reloads would grow fs_read unboundedly.
-        let seeded = SandboxPolicy {
-            network: true,
-            fs_read: vec!["/etc/ssl".into()],
-            ..Default::default()
-        };
-        let seeded_once = seeded.with_defaults_applied();
-        let ssl_count = seeded_once
-            .fs_read
-            .iter()
-            .filter(|p| *p == "/etc/ssl")
-            .count();
-        assert_eq!(ssl_count, 1, "should not duplicate existing /etc/ssl");
-
+        // Idempotence guard: applying defaults twice must never duplicate
+        // entries. Without this, repeated config reloads would grow fs_read
+        // unboundedly. (Seeded-entry dedup is covered host-independently by
+        // `defaults_applied_does_not_duplicate_seeded_tls_roots`.)
         let empty = SandboxPolicy {
             network: true,
             ..Default::default()

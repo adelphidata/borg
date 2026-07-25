@@ -137,6 +137,33 @@ pub struct Skill {
     pub scripts: Vec<PathBuf>,
 }
 
+/// Per-entry caps for the metadata (catalog) rendering level.
+///
+/// The catalog shares one global token budget, and entries are admitted in
+/// relevance order until it runs out. Without per-entry caps, a single skill with
+/// a 400-word description or fifty triggers eats a large slice of that budget and
+/// pushes later skills out of the catalog entirely. Only the *catalog* view is
+/// capped — `Summary` and `Full` still render the manifest verbatim.
+const MAX_CATALOG_DESCRIPTION_CHARS: usize = 320;
+const MAX_CATALOG_TRIGGERS: usize = 8;
+const TRUNCATION_SUFFIX: &str = "…";
+
+/// Truncate `text` to `max_chars` on a char boundary, appending an ellipsis.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    // Trim a dangling partial word so the ellipsis reads cleanly.
+    if let Some(last_space) = out.rfind(' ') {
+        if last_space >= max_chars / 2 {
+            out.truncate(last_space);
+        }
+    }
+    out.push_str(TRUNCATION_SUFFIX);
+    out
+}
+
 impl Skill {
     fn trigger_summary(&self) -> Option<String> {
         if self.manifest.triggers.is_empty() {
@@ -144,6 +171,21 @@ impl Skill {
         } else {
             Some(self.manifest.triggers.join(", "))
         }
+    }
+
+    /// [`Self::trigger_summary`] capped for the catalog view: at most
+    /// [`MAX_CATALOG_TRIGGERS`] entries, with a `+N more` tail.
+    fn catalog_trigger_summary(&self) -> Option<String> {
+        let triggers = &self.manifest.triggers;
+        if triggers.is_empty() {
+            return None;
+        }
+        if triggers.len() <= MAX_CATALOG_TRIGGERS {
+            return Some(triggers.join(", "));
+        }
+        let shown = triggers[..MAX_CATALOG_TRIGGERS].join(", ");
+        let extra = triggers.len() - MAX_CATALOG_TRIGGERS;
+        Some(format!("{shown} (+{extra} more)"))
     }
 
     /// Returns a display label for the skill's source ("built-in" or "user").
@@ -208,11 +250,13 @@ impl Skill {
         let status = self.status_label();
         match level {
             SkillLoadLevel::Metadata => {
+                let description =
+                    truncate_chars(&self.manifest.description, MAX_CATALOG_DESCRIPTION_CHARS);
                 let mut meta = format!(
                     "### {} ({}, {}) — {}",
-                    self.manifest.name, source, status, self.manifest.description
+                    self.manifest.name, source, status, description
                 );
-                if let Some(triggers) = self.trigger_summary() {
+                if let Some(triggers) = self.catalog_trigger_summary() {
                     meta.push_str(&format!("\nTriggers: {triggers}"));
                 }
                 meta

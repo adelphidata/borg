@@ -956,6 +956,10 @@ fn custom_synthesize(
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&cmd_str)
+        // Non-interactive: the command reads its text from the rendered
+        // argument, not stdin. Inheriting ours would let it swallow the
+        // operator's keystrokes or block until the timeout below.
+        .stdin(std::process::Stdio::null())
         .spawn()
         .context("spawn custom tts")?;
     let started = std::time::Instant::now();

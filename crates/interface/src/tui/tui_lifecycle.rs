@@ -100,6 +100,70 @@ fn keyboard_enhancement_disabled() -> bool {
     keyboard_enhancement_disabled_for(disable_env.as_deref(), is_wsl, is_vscode_terminal)
 }
 
+/// Which kitty-protocol flags to request from the *current* terminal.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` and `REPORT_ALTERNATE_KEYS` are unconditional.
+/// `REPORT_EVENT_TYPES` — which asks the terminal to report key *release* and
+/// *repeat* in addition to press — is dropped on two transports that mishandle
+/// it:
+///
+/// * **iTerm2** leaks the release half of an exit shortcut into the parent
+///   shell, so quitting borg types a stray character at your prompt.
+/// * **tmux with `extended-keys xterm`** loses Shift+Enter entirely when event
+///   types are requested; that format cannot encode both.
+///
+/// Every other terminal (including tmux's `csi-u` format) keeps it, so repeat
+/// events stay distinguishable from fresh presses.
+///
+/// Pure function of its inputs so it is unit-testable without a tty — the
+/// terminal probing lives in [`detected_keyboard_transport`].
+fn keyboard_enhancement_flags(
+    is_iterm2: bool,
+    tmux_extended_keys_format: Option<&str>,
+) -> KeyboardEnhancementFlags {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+    if is_iterm2 || tmux_extended_keys_format == Some("xterm") {
+        flags
+    } else {
+        flags | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+    }
+}
+
+/// Probe the host terminal for the inputs [`keyboard_enhancement_flags`] needs.
+fn detected_keyboard_transport() -> (bool, Option<String>) {
+    let is_iterm2 = std::env::var("TERM_PROGRAM")
+        .is_ok_and(|program| program.eq_ignore_ascii_case("iTerm.app"));
+    let tmux_format = if std::env::var_os("TMUX").is_some() {
+        read_tmux_extended_keys_format()
+    } else {
+        None
+    };
+    (is_iterm2, tmux_format)
+}
+
+/// Read tmux's `extended-keys` option value (`on`/`off`/`always` in newer tmux,
+/// `xterm`/`csi-u` for the key *format*). Best-effort: any failure yields `None`,
+/// which keeps the default (event types requested).
+fn read_tmux_extended_keys_format() -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["show-option", "-gqv", "extended-keys-format"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The flags to push on this host, resolved once per call site.
+fn resolved_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    let (is_iterm2, tmux_format) = detected_keyboard_transport();
+    keyboard_enhancement_flags(is_iterm2, tmux_format.as_deref())
+}
+
 fn keyboard_enhancement_disabled_for(
     disable_env: Option<&str>,
     is_wsl: bool,
@@ -215,11 +279,7 @@ pub(crate) fn write_set_modes_sequence(
     if !suppress_keyboard_enhancement {
         let _ = execute!(
             out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
+            PushKeyboardEnhancementFlags(resolved_keyboard_enhancement_flags())
         );
     }
     let _ = execute!(out, EnableFocusChange);
@@ -240,11 +300,7 @@ pub fn set_modes() -> Result<()> {
     if !keyboard_enhancement_disabled() {
         let _ = execute!(
             stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
+            PushKeyboardEnhancementFlags(resolved_keyboard_enhancement_flags())
         );
     }
     let _ = execute!(stdout(), EnableFocusChange);
@@ -569,6 +625,54 @@ mod tests {
         assert!(!vscode_terminal_detected(
             /*linux_term_program*/ None, /*windows_term_program*/ None,
         ));
+    }
+
+    /// iTerm2 leaks the *release* half of an exit shortcut into the parent
+    /// shell when event types are reported, so quitting borg types a stray
+    /// character at the user's prompt. Disambiguation and alternate keys must
+    /// survive — only event-type reporting is dropped.
+    #[test]
+    fn iterm2_does_not_request_event_type_reporting() {
+        let flags = keyboard_enhancement_flags(
+            /*is_iterm2*/ true, /*tmux_extended_keys_format*/ None,
+        );
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+    }
+
+    /// tmux's `xterm` extended-keys format cannot encode Shift+Enter alongside
+    /// event types, and silently drops it. `csi-u` can, so it keeps them.
+    #[test]
+    fn tmux_event_type_reporting_depends_on_extended_keys_format() {
+        let xterm = keyboard_enhancement_flags(/*is_iterm2*/ false, Some("xterm"));
+        assert!(
+            !xterm.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+            "tmux xterm format loses Shift+Enter when event types are requested"
+        );
+
+        let csi_u = keyboard_enhancement_flags(/*is_iterm2*/ false, Some("csi-u"));
+        assert!(
+            csi_u.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+            "csi-u encodes both, so repeat events must stay distinguishable"
+        );
+    }
+
+    /// Everything else — Kitty, Ghostty, Alacritty, bare xterm, unknown — keeps
+    /// the full flag set. This is the default path; narrowing it would lose
+    /// repeat/press discrimination for every well-behaved terminal.
+    #[test]
+    fn other_terminals_keep_full_flag_set() {
+        for tmux_format in [None, Some("csi-u")] {
+            let flags = keyboard_enhancement_flags(/*is_iterm2*/ false, tmux_format);
+            assert_eq!(
+                flags,
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+                "unexpected flags for tmux_format={tmux_format:?}"
+            );
+        }
     }
 
     /// Regression guard for the "Mouse Interaction — Hard Invariant" in

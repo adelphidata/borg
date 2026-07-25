@@ -83,6 +83,9 @@ impl Tunnel for CloudflareTunnel {
 
         let mut child = Command::new("cloudflared")
             .args(&args)
+            // Long-lived daemon child: it never reads stdin, but inheriting ours
+            // would hold the operator's input stream for the tunnel's lifetime.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

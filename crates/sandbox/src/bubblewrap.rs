@@ -58,6 +58,26 @@ fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
     args.extend([flag.to_string(), path.to_string(), path.to_string()]);
 }
 
+/// [`push_bind`] that drops the entry when the source path is absent.
+///
+/// bwrap exits non-zero on a missing bind source ("Can't find source path …")
+/// and runs nothing, so an allow-list entry for a path that happens not to
+/// exist would fail the *entire* sandboxed invocation rather than simply
+/// granting nothing. Skipping is safe by construction: these are allow rules,
+/// so omitting one only ever narrows access. Deny rules use [`hide_path`],
+/// which has its own missing-path handling.
+fn push_bind_if_exists(args: &mut Vec<String>, flag: &str, path: &str) {
+    if Path::new(path).exists() {
+        push_bind(args, flag, path);
+    } else {
+        tracing::debug!(
+            path,
+            flag,
+            "sandbox: skipping bind for a path that does not exist"
+        );
+    }
+}
+
 /// Make `path` unreadable inside the sandbox by overlaying it: an empty tmpfs
 /// for directories, a read-only bind of `/dev/null` for regular files. Skips
 /// non-existent paths — bwrap errors on a mount target that doesn't exist.
@@ -91,12 +111,10 @@ pub fn build_bwrap_args_versioned(
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    push_bind(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
+    push_bind_if_exists(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
 
     for path in SYSTEM_RO_BINDS {
-        if Path::new(path).exists() {
-            push_bind(&mut args, "--ro-bind", path);
-        }
+        push_bind_if_exists(&mut args, "--ro-bind", path);
     }
 
     for mount in SYSTEM_TMPFS_MOUNTS {
@@ -106,20 +124,18 @@ pub fn build_bwrap_args_versioned(
     args.extend(["--dev".to_string(), "/dev".to_string()]);
 
     for path in &policy.fs_read {
-        push_bind(&mut args, "--ro-bind", path);
+        push_bind_if_exists(&mut args, "--ro-bind", path);
     }
 
     for path in &policy.fs_write {
         let denied = policy.deny_write.iter().any(|d| path.starts_with(d));
         if !denied {
-            push_bind(&mut args, "--bind", path);
+            push_bind_if_exists(&mut args, "--bind", path);
         }
     }
 
     for path in &policy.deny_write {
-        if Path::new(path).exists() {
-            push_bind(&mut args, "--ro-bind", path);
-        }
+        push_bind_if_exists(&mut args, "--ro-bind", path);
     }
 
     // Deny reads. Emitted AFTER the fs_read `--ro-bind`s so these overlays win
@@ -171,13 +187,16 @@ mod tests {
 
     #[test]
     fn includes_tool_dir_ro_bind() {
-        let args = build_bwrap_args(
-            &default_policy(),
-            Path::new("/home/user/.borg/tools/my-tool"),
-        );
-        assert!(args.windows(3).any(|w| w[0] == "--ro-bind"
-            && w[1] == "/home/user/.borg/tools/my-tool"
-            && w[2] == "/home/user/.borg/tools/my-tool"));
+        // The tool dir must exist on disk: bwrap rejects a bind whose source is
+        // missing, so `build_bwrap_args` only emits binds for real paths.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_dir = tmp.path().join("tools/my-tool");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        let tool_dir_str = tool_dir.to_string_lossy().into_owned();
+        let args = build_bwrap_args(&default_policy(), &tool_dir);
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == tool_dir_str && w[2] == tool_dir_str));
     }
 
     #[test]
@@ -238,26 +257,100 @@ mod tests {
 
     #[test]
     fn additional_fs_read_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        std::fs::create_dir_all(&input).unwrap();
+        let input_str = input.to_string_lossy().into_owned();
         let policy = SandboxPolicy {
-            fs_read: vec!["/data/input".to_string()],
+            fs_read: vec![input_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(&policy, tmp.path());
         assert!(args
             .windows(3)
-            .any(|w| w[0] == "--ro-bind" && w[1] == "/data/input"));
+            .any(|w| w[0] == "--ro-bind" && w[1] == input_str));
     }
 
     #[test]
     fn additional_fs_write_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        let output_str = output.to_string_lossy().into_owned();
         let policy = SandboxPolicy {
-            fs_write: vec!["/data/output".to_string()],
+            fs_write: vec![output_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(&policy, tmp.path());
         assert!(args
             .windows(3)
-            .any(|w| w[0] == "--bind" && w[1] == "/data/output"));
+            .any(|w| w[0] == "--bind" && w[1] == output_str));
+    }
+
+    /// bwrap exits non-zero on a missing bind source and runs nothing, so a
+    /// policy entry for an absent path must be dropped rather than emitted —
+    /// otherwise one stale config line makes every sandboxed command fail.
+    /// Real trigger: `/etc/ssl/certs` is absent on some minimal container images
+    /// and `with_defaults_applied` used to add it unconditionally.
+    #[test]
+    fn missing_policy_paths_are_skipped_without_dropping_present_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present_read = tmp.path().join("present-read");
+        let present_write = tmp.path().join("present-write");
+        std::fs::create_dir_all(&present_read).unwrap();
+        std::fs::create_dir_all(&present_write).unwrap();
+        let present_read_str = present_read.to_string_lossy().into_owned();
+        let present_write_str = present_write.to_string_lossy().into_owned();
+        let missing_read = tmp
+            .path()
+            .join("missing-read")
+            .to_string_lossy()
+            .into_owned();
+        let missing_write = tmp
+            .path()
+            .join("missing-write")
+            .to_string_lossy()
+            .into_owned();
+
+        let policy = SandboxPolicy {
+            fs_read: vec![missing_read.clone(), present_read_str.clone()],
+            fs_write: vec![missing_write.clone(), present_write_str.clone()],
+            ..Default::default()
+        };
+        let args = build_bwrap_args(&policy, tmp.path());
+
+        assert!(
+            !args.contains(&missing_read),
+            "missing fs_read path must not be bound: {args:?}"
+        );
+        assert!(
+            !args.contains(&missing_write),
+            "missing fs_write path must not be bound: {args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == present_read_str),
+            "a missing sibling must not suppress a real fs_read bind: {args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == present_write_str),
+            "a missing sibling must not suppress a real fs_write bind: {args:?}"
+        );
+    }
+
+    /// A missing tool dir must not fail the spawn either. Tool dirs are created
+    /// lazily, so the first invocation can race ahead of the directory.
+    #[test]
+    fn missing_tool_dir_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("not-created-yet");
+        let absent_str = absent.to_string_lossy().into_owned();
+        let args = build_bwrap_args(&default_policy(), &absent);
+        assert!(
+            !args.contains(&absent_str),
+            "missing tool dir must not be bound: {args:?}"
+        );
     }
 
     #[test]
@@ -269,17 +362,29 @@ mod tests {
 
     #[test]
     fn deny_write_skips_writable_bind() {
+        // Both paths exist, so the absence of a writable bind is attributable to
+        // deny_write rather than to the missing-path skip.
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join("borg");
+        std::fs::create_dir_all(&protected).unwrap();
+        let protected_str = protected.to_string_lossy().into_owned();
         let policy = SandboxPolicy {
-            fs_write: vec!["/home/user/.borg".to_string()],
-            deny_write: vec!["/home/user/.borg".to_string()],
+            fs_write: vec![protected_str.clone()],
+            deny_write: vec![protected_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
-        // Should NOT have a writable --bind for the denied path
-        let has_writable = args
-            .windows(3)
-            .any(|w| w[0] == "--bind" && w[1] == "/home/user/.borg");
-        assert!(!has_writable);
+        let args = build_bwrap_args(&policy, tmp.path());
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == protected_str),
+            "denied path must not get a writable bind: {args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == protected_str),
+            "denied path must still be bound read-only: {args:?}"
+        );
     }
 
     #[test]

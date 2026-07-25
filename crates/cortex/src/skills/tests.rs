@@ -737,6 +737,129 @@ fn user_skill_overrides_builtin() {
     assert_eq!(skills[0].manifest.description, "user weather");
 }
 
+/// Build a skill whose catalog entry can be oversized on demand.
+fn catalog_fixture(name: &str, description: &str, triggers: Vec<String>) -> Skill {
+    Skill {
+        manifest: SkillManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            triggers,
+            requires: SkillRequires::default(),
+            os: vec![],
+            install: std::collections::HashMap::new(),
+            category: None,
+            ..Default::default()
+        },
+        body: "# Body\n\nContent.".to_string(),
+        source: SkillSource::BuiltIn,
+        available: true,
+        disabled: false,
+        references: Vec::new(),
+        scripts: Vec::new(),
+    }
+}
+
+/// The catalog shares one budget in relevance order, so an unbounded description
+/// on one skill silently pushes later skills out entirely. Cap it in the catalog
+/// view only — `Full` must still carry the manifest verbatim.
+#[test]
+fn catalog_metadata_truncates_an_oversized_description() {
+    let long = "word ".repeat(400);
+    let skill = catalog_fixture("fat-skill", &long, vec!["t".to_string()]);
+
+    let meta = skill.format_at_level(SkillLoadLevel::Metadata);
+    assert!(
+        meta.chars().count() < long.chars().count(),
+        "oversized description must be truncated in the catalog view"
+    );
+    assert!(
+        meta.contains('…'),
+        "truncation must be marked, got: {meta:?}"
+    );
+    assert!(
+        meta.starts_with("### fat-skill"),
+        "header must survive: {meta:?}"
+    );
+
+    // Truncation is a rendering concern only — the manifest keeps the full text,
+    // so `/plugins`, search, and the selectors still see the whole description.
+    assert_eq!(skill.manifest.description, long);
+}
+
+/// A description already inside the cap must pass through byte-for-byte —
+/// otherwise the cap would quietly mangle every normal entry.
+#[test]
+fn catalog_metadata_leaves_a_normal_description_untouched() {
+    let skill = catalog_fixture("lean-skill", "Does one thing well.", vec!["t".to_string()]);
+    let meta = skill.format_at_level(SkillLoadLevel::Metadata);
+    assert!(meta.contains("Does one thing well."));
+    assert!(!meta.contains('…'));
+}
+
+/// Fifty triggers on one skill is the same starvation problem as a long
+/// description. Show the first few and count the rest.
+#[test]
+fn catalog_metadata_caps_trigger_list() {
+    let triggers: Vec<String> = (0..50).map(|i| format!("trigger{i}")).collect();
+    let skill = catalog_fixture("many-triggers", "Short.", triggers);
+    let meta = skill.format_at_level(SkillLoadLevel::Metadata);
+
+    assert!(meta.contains("trigger0"), "leading triggers must show");
+    assert!(
+        !meta.contains("trigger49"),
+        "the tail must be elided: {meta:?}"
+    );
+    assert!(
+        meta.contains("+42 more"),
+        "the elided count must be reported: {meta:?}"
+    );
+}
+
+/// An omitted skill used to be invisible to the model: the catalog just ended.
+/// The marker must appear, name the count, and stay inside the budget.
+#[test]
+fn omitted_skills_are_announced_in_the_rendered_catalog() {
+    let budget = 50;
+    let (rendered, report) = load_skills_context(
+        budget,
+        &std::collections::HashMap::new(),
+        &SkillsConfig::default(),
+        "summarize my tooling",
+    )
+    .unwrap();
+    assert!(
+        !report.omitted_entirely.is_empty(),
+        "fixture must actually omit something: {report:?}"
+    );
+    assert!(
+        rendered.contains(&format!("{} additional", report.omitted_entirely.len())),
+        "rendered catalog must announce the omitted count:\n{rendered}"
+    );
+    assert!(
+        estimate_tokens(&rendered) <= budget,
+        "marker must not push the catalog over budget: {} > {budget}",
+        estimate_tokens(&rendered)
+    );
+}
+
+/// No omissions ⇒ no marker. A permanent "0 skills omitted" line would be pure
+/// prompt noise on every turn.
+#[test]
+fn no_omission_marker_when_everything_fits() {
+    let (rendered, report) = load_skills_context(
+        100_000,
+        &std::collections::HashMap::new(),
+        &SkillsConfig::default(),
+        "summarize my tooling",
+    )
+    .unwrap();
+    assert!(report.omitted_entirely.is_empty());
+    assert!(
+        !rendered.contains("additional"),
+        "unexpected omission marker:\n{rendered}"
+    );
+}
+
 #[test]
 fn metadata_only_is_compact() {
     let skill = Skill {

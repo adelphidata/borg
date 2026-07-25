@@ -87,6 +87,8 @@ impl Tunnel for NgrokTunnel {
         let mut child = Command::new("ngrok")
             .args(&args)
             .env("NGROK_AUTHTOKEN", &self.auth_token)
+            // Long-lived daemon child; see the cloudflare backend.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

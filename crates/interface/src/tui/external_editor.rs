@@ -34,6 +34,9 @@ pub fn open_external_editor(initial_text: &str) -> Result<String> {
     let default_editor = if cfg!(windows) { "notepad" } else { "vi" };
     let (cmd, args) = parts.split_first().unwrap_or((&default_editor, &[]));
 
+    // stdio is inherited on purpose: `$EDITOR` is a full-screen interactive
+    // program and must own the terminal for the duration. Do not null stdin
+    // here — unlike the non-interactive helpers elsewhere, this one needs it.
     let status = Command::new(cmd).args(args).arg(&path).status()?;
 
     if !status.success() {

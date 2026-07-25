@@ -384,6 +384,13 @@ pub struct AgentControl {
     /// parent/child pair — shares one `prompt_cache_key`.
     prompt_cache_scope: Option<String>,
     current_depth: u32,
+    /// Execution context children must run under, mirrored here from the
+    /// owning agent by `Agent::set_execution_context`. `None` means the owning
+    /// agent never had one installed (CLI/test paths), in which case children
+    /// keep the process-derived default. When the parent *is* confined this
+    /// must be `Some` — sub-agents are granted `auto_approve: ["*"]` on the
+    /// understanding that the sandbox still bounds them.
+    execution_context: Option<crate::execution_context::ExecutionContext>,
     /// Optional broadcast bus. Lifecycle events publish here when set so the
     /// gRPC `SubscribeAgentTreeEvents` stream can fan them out to operators.
     /// Optional so unit tests and embedded callers don't need to wire one.
@@ -428,8 +435,28 @@ impl AgentControl {
             parent_session_id: parent_session_id.to_string(),
             prompt_cache_scope: None,
             current_depth,
+            execution_context: None,
             bus: None,
         }
+    }
+
+    /// Mirror the owning agent's execution context so spawned children inherit
+    /// its sandbox confinement. Called from `Agent::set_execution_context`.
+    pub fn set_execution_context(
+        &mut self,
+        execution_context: crate::execution_context::ExecutionContext,
+    ) {
+        self.execution_context = Some(execution_context);
+    }
+
+    /// The context to install on a child, derived via
+    /// [`crate::execution_context::ExecutionContext::for_child`].
+    pub(super) fn child_execution_context(
+        &self,
+    ) -> Option<crate::execution_context::ExecutionContext> {
+        self.execution_context
+            .as_ref()
+            .map(crate::execution_context::ExecutionContext::for_child)
     }
 
     /// Re-scope the prompt cache for children spawned by this controller.
@@ -540,7 +567,13 @@ impl AgentControl {
         // auto-approve list is `["*"]` because borg's UX invariant
         // ("No Approval Prompts" — see CLAUDE.md) requires children to
         // execute without confirmation; there is no UI to prompt against.
-        // Catastrophic commands are still blocked at the sandbox layer.
+        //
+        // The wildcard is only safe because the child also inherits the
+        // parent's `ExecutionContext` (see `AgentControl::child_execution_context`),
+        // which is what keeps the sandbox wrapper and workspace containment in
+        // force. `is_catastrophic_command` runs regardless of policy, but it is
+        // documented defense-in-depth — the sandbox is the boundary, so that
+        // inheritance is load-bearing, not an optimization.
         child_config.policy = crate::policy::ExecutionPolicy {
             auto_approve: vec!["*".to_string()],
             deny: parent_config.policy.deny.clone(),
@@ -745,6 +778,7 @@ impl AgentControl {
             bus: self.bus.clone(),
             info: info.clone(),
             prompt_cache_scope: self.prompt_cache_scope().to_string(),
+            execution_context: self.child_execution_context(),
             semaphore: self.semaphore.clone(),
             completion_tx: self.completion_tx.clone(),
         };
@@ -1591,6 +1625,53 @@ mod sub_agent_surface_tests {
             tools_allowed: tools_allowed.map(|v| v.into_iter().map(str::to_string).collect()),
             max_iterations: None,
         }
+    }
+
+    /// The controller is the only channel by which a spawned child learns its
+    /// parent's confinement — `Agent::new_sub_agent` builds an unrestricted
+    /// context of its own. If this returns `None` for a confined parent, every
+    /// child runs unsandboxed while holding `auto_approve: ["*"]`.
+    #[test]
+    fn controller_hands_children_the_parents_confinement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("mkdir workspace");
+        let mut control = AgentControl::new(&MultiAgentConfig::default(), "parent-session", 0);
+
+        assert!(
+            control.child_execution_context().is_none(),
+            "no context installed yet — children keep the process default"
+        );
+
+        control.set_execution_context(
+            crate::execution_context::ExecutionContext::for_workspace(root.clone(), root.clone())
+                .expect("workspace context"),
+        );
+
+        let child = control
+            .child_execution_context()
+            .expect("child must receive the parent's context");
+        assert!(child.enforce_workspace_root());
+        assert_eq!(child.workspace_root(), root.canonicalize().unwrap());
+    }
+
+    /// `build_sub_agent_config` grants the wildcard auto-approve. That is only
+    /// defensible alongside inherited confinement, so pin both halves together
+    /// — a future change that drops the deny list would be a real escalation.
+    #[test]
+    fn sub_agent_config_keeps_parent_denies_under_wildcard_approve() {
+        let mut parent = Config::default();
+        parent.policy.deny = vec!["curl *".to_string()];
+        let control = AgentControl::new(&MultiAgentConfig::default(), "parent-session", 0);
+
+        let child = control.build_sub_agent_config(None, None, None, &parent);
+
+        assert_eq!(child.policy.auto_approve, vec!["*".to_string()]);
+        assert_eq!(
+            child.policy.deny,
+            vec!["curl *".to_string()],
+            "a child must never escape a parent's deny entry"
+        );
     }
 
     /// `<context trust="parent">…</context>` and `<goal>…</goal>` must

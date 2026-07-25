@@ -138,6 +138,10 @@ pub fn play_audio_file_with(file: &Path, resolver: &dyn PlayerResolver) -> Resul
 fn spawn_and_wait(invocation: &PlayerInvocation) -> Result<()> {
     let mut cmd = Command::new(&invocation.program);
     cmd.args(&invocation.args)
+        // Players such as `mpv` treat stdin as their keyboard control channel,
+        // so an inherited stdin makes the player and the TUI fight over the
+        // operator's keystrokes. Playback here is fire-and-forget.
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = cmd
@@ -381,6 +385,8 @@ async fn play_beep_file(file: &Path) -> Result<()> {
         for invocation in candidates {
             let status = Command::new(&invocation.program)
                 .args(&invocation.args)
+                // See `spawn_and_wait`: players read stdin as key input.
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

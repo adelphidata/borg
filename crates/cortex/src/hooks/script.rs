@@ -22,9 +22,16 @@
 //! event payload as `$1` (a JSON object). For `PreToolUse`, a non-zero exit or
 //! timeout returns [`HookAction::Skip`] to abort the tool call; all other events
 //! are observers.
+//!
+//! The payload is delivered on **both** channels: as `$1` and on the hook's
+//! stdin. Claude Code hooks read it from stdin (`input=$(cat)`), so a script
+//! copied from a Claude Code config would otherwise block until borg's timeout —
+//! which on `PreToolUse` silently turns into [`HookAction::Skip`] and blocks the
+//! tool call. Supporting both keeps borg's own `$1` convention working while
+//! making the documented compatibility real.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -395,51 +402,80 @@ enum SubprocessError {
     Io(std::io::Error),
 }
 
-/// Spawn `sh -c <command>` with the payload as `$1`, enforce `timeout`, reap the
-/// child on timeout. Follows the polling pattern from `host_audit::run_cmd_timeout`.
+/// Cap on retained hook output per stream, so a runaway script can't grow the
+/// buffer unbounded. Reading continues past the cap (the excess is discarded) —
+/// stopping the read would re-introduce the deadlock this cap exists alongside.
+const MAX_HOOK_STREAM_BYTES: u64 = 8 * 1024;
+
+/// Spawn `sh -c <command>` with the payload on both `$1` and stdin, enforce
+/// `timeout`, reap the child on timeout. Follows the polling pattern from
+/// `host_audit::run_cmd_timeout`.
+///
+/// All three pipes are serviced by dedicated threads *while* we poll, not after.
+/// Draining only once `try_wait` reports exit is a deadlock: a hook that writes
+/// more than the ~64 KiB pipe buffer blocks in `write`, so it never exits,
+/// `try_wait` never returns `Some`, and a perfectly good hook is SIGKILLed at the
+/// deadline and reported as a timeout. The same reasoning applies in reverse to
+/// the stdin write.
 fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32, SubprocessError> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
         .arg("borg-hook") // $0 inside the script
         .arg(payload) // $1
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(SubprocessError::Spawn)?;
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                drain_streams(&mut child);
-                return Ok(status.code().unwrap_or(-1));
+    // Feed stdin from its own thread and let the handle drop, closing the pipe so
+    // a hook blocked on `cat` sees EOF. A hook that exits without reading its
+    // input yields `BrokenPipe` (or `EPIPE`), which is not an error: the hook's
+    // exit status and output still stand. Any other write error is worth a warn,
+    // but still must not mask the child's own result.
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        let payload = payload.to_string();
+        std::thread::spawn(move || match stdin.write_all(payload.as_bytes()) {
+            Ok(()) => {
+                let _ = stdin.flush();
             }
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => tracing::warn!("hook stdin write failed: {e}"),
+        })
+    });
+
+    let stdout_reader = child.stdout.take().map(spawn_stream_drain);
+    let stderr_reader = child.stderr.take().map(spawn_stream_drain);
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.code().unwrap_or(-1)),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(SubprocessError::Timeout);
+                    break Err(SubprocessError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return Err(SubprocessError::Io(e)),
+            Err(e) => break Err(SubprocessError::Io(e)),
         }
-    }
-}
+    };
 
-fn drain_streams(child: &mut std::process::Child) {
-    const MAX: u64 = 8 * 1024; // cap so a runaway hook script can't grow the buffer unbounded
-    if let Some(s) = child.stdout.take() {
-        let mut buf = Vec::new();
-        // stdout is drained (to unblock the child) but not read; hooks communicate via side effects, not output.
-        let _ = s.take(MAX).read_to_end(&mut buf);
+    // The child is gone either way, so every pipe is at EOF and these joins
+    // return promptly.
+    if let Some(handle) = stdin_writer {
+        let _ = handle.join();
     }
-    if let Some(s) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = s.take(MAX).read_to_end(&mut buf);
-        if !buf.is_empty() {
+    if let Some(handle) = stdout_reader {
+        // stdout is drained (to unblock the child) but not surfaced; hooks
+        // communicate via side effects and exit codes, not output.
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_reader {
+        if let Ok(buf) = handle.join() {
             let text = String::from_utf8_lossy(&buf);
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -447,6 +483,32 @@ fn drain_streams(child: &mut std::process::Child) {
             }
         }
     }
+
+    outcome
+}
+
+/// Read a child pipe to EOF on a dedicated thread, retaining at most
+/// [`MAX_HOOK_STREAM_BYTES`] and discarding the rest.
+///
+/// Reading all the way to EOF is what keeps the child unblocked. Returning early
+/// at the cap would leave a chatty hook stuck writing into a full pipe, which is
+/// exactly the deadlock the caller's threading exists to prevent.
+fn spawn_stream_drain<R: Read + Send + 'static>(mut stream: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        if let Err(e) = (&mut stream)
+            .take(MAX_HOOK_STREAM_BYTES)
+            .read_to_end(&mut retained)
+        {
+            tracing::debug!("hook stream read failed: {e}");
+            return retained;
+        }
+        // Anything past the cap is discarded, but still consumed.
+        if let Err(e) = std::io::copy(&mut stream, &mut std::io::sink()) {
+            tracing::debug!("hook stream drain failed: {e}");
+        }
+        retained
+    })
 }
 
 #[cfg(test)]
@@ -1228,6 +1290,78 @@ mod tests {
             let body = r#"{"hooks":{"PostToolUse":[{"matcher":"x","hooks":[]}]}}"#;
             let path = write_hooks_file(dir.path(), body);
             assert!(ScriptHook::load_from_file(&path).is_empty());
+        }
+
+        /// Claude Code hooks read their payload from stdin. `docs/hooks.md`
+        /// advertises schema compatibility, so a script copied from a Claude Code
+        /// config must work — it used to block on `cat` until borg's timeout,
+        /// which on `PreToolUse` silently became `Skip` and blocked the tool.
+        #[test]
+        fn payload_is_delivered_on_stdin() {
+            let dir = tmp();
+            let out = dir.path().join("stdin-payload.json");
+            let command = format!("cat > {}", out.display());
+            let code = run_subprocess(
+                &command,
+                r#"{"event":"SessionStart","turn":7}"#,
+                Duration::from_secs(10),
+            )
+            .expect("hook must run");
+            assert_eq!(code, 0);
+            let captured = std::fs::read_to_string(&out).expect("hook should have written stdin");
+            assert_eq!(captured, r#"{"event":"SessionStart","turn":7}"#);
+        }
+
+        /// The `$1` convention must keep working alongside stdin — borg's own
+        /// documented hooks rely on it.
+        #[test]
+        fn payload_is_also_delivered_as_first_argument() {
+            let dir = tmp();
+            let out = dir.path().join("arg-payload.json");
+            let command = format!("printf '%s' \"$1\" > {}", out.display());
+            let code = run_subprocess(
+                &command,
+                r#"{"event":"SessionEnd"}"#,
+                Duration::from_secs(10),
+            )
+            .expect("hook must run");
+            assert_eq!(code, 0);
+            let captured = std::fs::read_to_string(&out).expect("hook should have written $1");
+            assert_eq!(captured, r#"{"event":"SessionEnd"}"#);
+        }
+
+        /// A hook that exits without consuming stdin makes our write fail with
+        /// `BrokenPipe`. That is not the hook's failure: its exit status must be
+        /// reported as-is rather than turned into an error (or, on `PreToolUse`,
+        /// into a silent tool block).
+        #[test]
+        fn hook_that_ignores_stdin_still_reports_its_exit_code() {
+            // Comfortably past the ~64 KiB pipe buffer so the write genuinely
+            // blocks, but well under `ARG_MAX` — the payload also rides on argv,
+            // and a megabyte there fails the spawn outright.
+            let big_payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(128 * 1024));
+            let code = run_subprocess("exit 0", &big_payload, Duration::from_secs(10))
+                .expect("broken pipe must not be reported as a subprocess error");
+            assert_eq!(code, 0);
+
+            let code = run_subprocess("exit 3", &big_payload, Duration::from_secs(10))
+                .expect("broken pipe must not mask a nonzero exit either");
+            assert_eq!(code, 3);
+        }
+
+        /// A hook writing more than the ~64 KiB pipe buffer used to deadlock:
+        /// stdout was only drained *after* `try_wait` reported exit, so the child
+        /// blocked in `write`, never exited, and was SIGKILLed at the deadline and
+        /// misreported as a timeout.
+        #[test]
+        fn hook_writing_more_than_the_pipe_buffer_does_not_time_out() {
+            let code = run_subprocess(
+                "printf 'x%.0s' $(seq 1 200000); exit 0",
+                "{}",
+                Duration::from_secs(20),
+            )
+            .expect("a chatty hook must complete, not time out");
+            assert_eq!(code, 0, "chatty hook should report its real exit code");
         }
     }
 }

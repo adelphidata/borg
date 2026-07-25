@@ -1492,6 +1492,7 @@ impl LlmClient {
                 &model,
                 u64::from(prompt_tokens),
                 u64::from(completion_tokens),
+                usage.map(|u| u.cached_input_tokens).unwrap_or(0),
             ) {
                 Some(cost) => (Some(cost), true, "table_openai".to_string()),
                 None => (None, false, "unknown".to_string()),
@@ -1512,6 +1513,7 @@ impl LlmClient {
                 &model,
                 u64::from(prompt_tokens),
                 u64::from(completion_tokens),
+                usage.map(|u| u.cached_input_tokens).unwrap_or(0),
             ) {
                 Some(cost) => (Some(cost), true, "table_gemini".to_string()),
                 None => (None, false, "unknown".to_string()),

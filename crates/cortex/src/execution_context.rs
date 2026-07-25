@@ -111,6 +111,27 @@ impl ExecutionContext {
         self.enforce_workspace_root
     }
 
+    /// Derive the context a spawned sub-agent should run under.
+    ///
+    /// Keeps everything that makes the sandbox a boundary — `workspace_root`,
+    /// `enforce_workspace_root`, the process registry, the owning session id —
+    /// so a workspace-confined parent cannot widen its blast radius by
+    /// delegating. Drops the IDE-backed text-file bridge: children outlive the
+    /// parent's turn (they run in detached tokio tasks), and writing through a
+    /// bridge whose ACP request is already finished has no defined behavior.
+    /// Children fall back to direct filesystem access, which is still
+    /// containment-checked by `ensure_within_workspace`.
+    pub fn for_child(&self) -> Self {
+        Self {
+            workspace_cwd: self.workspace_cwd.clone(),
+            workspace_root: self.workspace_root.clone(),
+            enforce_workspace_root: self.enforce_workspace_root,
+            text_file_bridge: None,
+            process_registry: self.process_registry.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+
     /// Attach an optional IDE-backed text-file bridge.
     pub fn with_text_file_bridge(mut self, bridge: Option<Arc<dyn TextFileBridge>>) -> Self {
         self.text_file_bridge = bridge;

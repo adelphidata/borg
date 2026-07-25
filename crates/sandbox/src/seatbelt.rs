@@ -25,6 +25,58 @@ fn validate_seatbelt_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve `path` through symlinks as far as it exists on disk, re-attaching any
+/// not-yet-created tail.
+///
+/// `Path::canonicalize` is all-or-nothing: it fails when the leaf is missing, so
+/// callers that fell back to the raw path emitted rules against a path the
+/// kernel never sees. On macOS `/var`, `/tmp`, and `/etc` are symlinks into
+/// `/private/…`, so an un-resolved `/var/folders/x/tool` allow rule is inert
+/// under `(deny default)` and a `/var/…` *deny* rule is worse — it silently
+/// fails to protect anything. Walking up to the deepest existing ancestor and
+/// canonicalizing that gives the right prefix in both cases.
+fn resolve_symlinks_best_effort(path: &Path) -> String {
+    let mut probe = path;
+    loop {
+        if let Ok(canonical) = probe.canonicalize() {
+            let suffix = path.strip_prefix(probe).unwrap_or(Path::new(""));
+            return canonical.join(suffix).to_string_lossy().into_owned();
+        }
+        match probe.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+            // Nothing on the way up resolved (relative path, or a root that
+            // cannot be canonicalized). Emit the input unchanged — the
+            // `validate_seatbelt_path` absolute-path check is the backstop.
+            _ => return path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// Emit a `subpath` rule for `path`, plus a second rule for its symlink-resolved
+/// form when that differs.
+///
+/// Both forms are emitted rather than only the resolved one, mirroring the
+/// existing unconditional `/tmp` + `/private/tmp` pair below: we do not want a
+/// correctness fix to narrow a rule that works today. For `deny` rules this is
+/// the security-relevant direction — an un-resolved `/var/…` deny protects
+/// nothing, since the kernel reports `/private/var/…`.
+fn push_subpath_rule(
+    profile: &mut String,
+    effect: &str,
+    operation: &str,
+    path: &str,
+) -> Result<(), String> {
+    validate_seatbelt_path(path)?;
+    profile.push_str(&format!("({effect} {operation} (subpath \"{path}\"))\n"));
+    let resolved = resolve_symlinks_best_effort(Path::new(path));
+    if resolved != path && validate_seatbelt_path(&resolved).is_ok() {
+        profile.push_str(&format!(
+            "({effect} {operation} (subpath \"{resolved}\"))\n"
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a macOS Seatbelt profile string for sandbox-exec.
 ///
 /// `runtime_bin` is the absolute path to the runtime binary (e.g. `/usr/bin/python3`)
@@ -35,11 +87,12 @@ pub fn generate_profile(
     tool_dir: &Path,
     runtime_bin: Option<&str>,
 ) -> Result<String, String> {
-    // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
-    let canonical_dir = tool_dir
-        .canonicalize()
-        .unwrap_or_else(|_| tool_dir.to_path_buf());
-    let tool_dir_str = canonical_dir.to_string_lossy();
+    // Resolve symlinks (e.g. /var -> /private/var on macOS) so the emitted
+    // `subpath` matches what the kernel sees. `canonicalize` fails outright when
+    // the leaf does not exist yet, which used to leave the un-resolved path in
+    // the profile — a write allow that silently never applied under
+    // `(deny default)`.
+    let tool_dir_str = resolve_symlinks_best_effort(tool_dir);
     validate_seatbelt_path(&tool_dir_str)?;
 
     let mut profile = String::from("(version 1)\n(deny default)\n");
@@ -107,13 +160,11 @@ pub fn generate_profile(
     ));
 
     for path in &policy.fs_read {
-        validate_seatbelt_path(path)?;
-        profile.push_str(&format!("(allow file-read* (subpath \"{path}\"))\n"));
+        push_subpath_rule(&mut profile, "allow", "file-read*", path)?;
     }
 
     for path in &policy.fs_write {
-        validate_seatbelt_path(path)?;
-        profile.push_str(&format!("(allow file-write* (subpath \"{path}\"))\n"));
+        push_subpath_rule(&mut profile, "allow", "file-write*", path)?;
     }
 
     // Defense-in-depth: deny reads to well-known sensitive directories even
@@ -133,14 +184,12 @@ pub fn generate_profile(
     // Deny read access to specific paths (overrides the blanket allow).
     // Deny rules are security-critical — invalid paths are hard errors.
     for path in &policy.deny_read {
-        validate_seatbelt_path(path)?;
-        profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));
+        push_subpath_rule(&mut profile, "deny", "file-read*", path)?;
     }
 
     // Deny write access to protected paths (e.g. ~/.borg/).
     for path in &policy.deny_write {
-        validate_seatbelt_path(path)?;
-        profile.push_str(&format!("(deny file-write* (subpath \"{path}\"))\n"));
+        push_subpath_rule(&mut profile, "deny", "file-write*", path)?;
     }
 
     if policy.network {
@@ -158,6 +207,64 @@ mod tests {
 
     fn default_policy() -> SandboxPolicy {
         SandboxPolicy::default()
+    }
+
+    /// A tool dir that does not exist yet must still be resolved through the
+    /// symlinked prefix. `canonicalize` fails on a missing leaf, and the old
+    /// fallback emitted the raw path — so on macOS a `/var/…` write allow was
+    /// inert under `(deny default)` because the kernel reports `/private/var/…`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_tool_dir_still_resolves_symlinked_prefix() {
+        let tool_dir = Path::new("/var/folders/borg-not-created-yet/tool");
+        let profile = generate_profile(&default_policy(), tool_dir, None).unwrap();
+        assert!(
+            profile.contains(
+                "(allow file-write* (subpath \"/private/var/folders/borg-not-created-yet/tool\"))"
+            ),
+            "tool dir write allow must use the kernel-visible path:\n{profile}"
+        );
+    }
+
+    /// Deny rules are the security-critical direction: an un-resolved `/var/…`
+    /// deny protects nothing. Emit both forms so whichever path the kernel
+    /// reports is covered.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_rules_cover_both_raw_and_resolved_paths() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/var/secrets".to_string()],
+            ..Default::default()
+        };
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
+        assert!(
+            profile.contains("(deny file-read* (subpath \"/var/secrets\"))"),
+            "raw deny path must be retained:\n{profile}"
+        );
+        assert!(
+            profile.contains("(deny file-read* (subpath \"/private/var/secrets\"))"),
+            "resolved deny path must also be emitted:\n{profile}"
+        );
+    }
+
+    /// A path with no symlinks in it must produce exactly one rule — the
+    /// dual-emission must not double every entry in the common case.
+    #[test]
+    fn unsymlinked_paths_emit_a_single_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().canonicalize().unwrap();
+        let plain_str = plain.to_string_lossy().into_owned();
+        let policy = SandboxPolicy {
+            deny_write: vec![plain_str.clone()],
+            ..Default::default()
+        };
+        let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
+        let rule = format!("(deny file-write* (subpath \"{plain_str}\"))\n");
+        assert_eq!(
+            profile.matches(&rule).count(),
+            1,
+            "already-canonical path must not be emitted twice:\n{profile}"
+        );
     }
 
     #[test]

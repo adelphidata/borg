@@ -62,11 +62,36 @@ fn conv_style(s: SynStyle) -> Style {
     style
 }
 
+/// Whether `code` is small enough to hand to `syntect`.
+///
+/// See the guardrail constants in [`crate::tui::constants`] for why each limit
+/// exists. Returning `false` costs only syntax colors — the text is preserved.
+fn within_highlight_limits(code: &str) -> bool {
+    use crate::tui::constants::{
+        HIGHLIGHT_MAX_LINES, HIGHLIGHT_MAX_LINE_BYTES, HIGHLIGHT_MAX_TOTAL_BYTES,
+    };
+    if code.len() > HIGHLIGHT_MAX_TOTAL_BYTES {
+        return false;
+    }
+    let mut lines = 0usize;
+    for line in code.split_inclusive('\n') {
+        lines += 1;
+        if lines > HIGHLIGHT_MAX_LINES || line.len() > HIGHLIGHT_MAX_LINE_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
 /// Highlight a multi-line code block. Returns one [`Line`] per source line.
 ///
-/// For unknown languages or when highlighting fails, falls back to a single
-/// cyan span per line (same as the existing code-style treatment).
+/// For unknown languages, oversized input, or when highlighting fails, falls
+/// back to a single cyan span per line (same as the existing code-style
+/// treatment).
 pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
+    if !within_highlight_limits(code) {
+        return fallback_lines(code);
+    }
     let ss = syntax_set();
     let Some(syntax) = find_syntax(ss, lang) else {
         return fallback_lines(code);
@@ -111,6 +136,81 @@ fn fallback_lines(code: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::constants::{
+        HIGHLIGHT_MAX_LINES, HIGHLIGHT_MAX_LINE_BYTES, HIGHLIGHT_MAX_TOTAL_BYTES,
+    };
+
+    /// A single very long line is the worst case for syntect's regex engine and
+    /// slips past both the total-size and line-count limits — a minified bundle
+    /// or long unterminated string in a tool result could wedge the render
+    /// thread. The content must survive verbatim; only the colors are dropped.
+    #[test]
+    fn long_single_line_falls_back_to_plain_text_preserving_content() {
+        let long = format!("let x = \"{}\";", "a".repeat(HIGHLIGHT_MAX_LINE_BYTES));
+        assert!(long.len() > HIGHLIGHT_MAX_LINE_BYTES);
+        let lines = highlight_code_block(&long, "rust");
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        assert_eq!(
+            spans.len(),
+            1,
+            "oversized line must render as one unstyled span, got {} spans",
+            spans.len()
+        );
+        assert_eq!(
+            spans[0].content.as_ref(),
+            long.as_str(),
+            "text must be preserved byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn oversized_total_input_falls_back_to_plain_text() {
+        // Every individual line is short, so only the total-size limit can fire.
+        let line = "let x = 1;\n";
+        let code = line.repeat(HIGHLIGHT_MAX_TOTAL_BYTES / line.len() + 1);
+        assert!(code.len() > HIGHLIGHT_MAX_TOTAL_BYTES);
+        let lines = highlight_code_block(&code, "rust");
+        let distinct: std::collections::HashSet<_> =
+            lines[0].spans.iter().map(|s| s.style).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "oversized input must not be syntax-highlighted"
+        );
+    }
+
+    #[test]
+    fn too_many_lines_falls_back_to_plain_text() {
+        // Short total per line keeps the byte limit clear of the line limit.
+        let code = "x\n".repeat(HIGHLIGHT_MAX_LINES + 1);
+        assert!(code.len() < HIGHLIGHT_MAX_TOTAL_BYTES);
+        let lines = highlight_code_block(&code, "rust");
+        let distinct: std::collections::HashSet<_> =
+            lines[0].spans.iter().map(|s| s.style).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "input over the line limit must not be syntax-highlighted"
+        );
+    }
+
+    /// The guards must not fire on ordinary input — otherwise they would silently
+    /// turn off highlighting for every code block.
+    #[test]
+    fn input_just_under_the_limits_is_still_highlighted() {
+        let body = "fn main() { let x = 1; }\n";
+        let code = body.repeat(50);
+        assert!(code.len() < HIGHLIGHT_MAX_TOTAL_BYTES);
+        assert!(body.len() < HIGHLIGHT_MAX_LINE_BYTES);
+        let lines = highlight_code_block(&code, "rust");
+        let distinct: std::collections::HashSet<_> =
+            lines[0].spans.iter().map(|s| s.style).collect();
+        assert!(
+            distinct.len() > 1,
+            "normal input must still be syntax-highlighted"
+        );
+    }
 
     #[test]
     fn highlights_rust_code_block_has_multiple_styles() {

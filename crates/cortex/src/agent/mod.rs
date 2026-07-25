@@ -588,6 +588,13 @@ impl Agent {
         &mut self,
         execution_context: crate::execution_context::ExecutionContext,
     ) {
+        // Mirror into the controller so sub-agents inherit this confinement.
+        // Sub-agents are granted `auto_approve: ["*"]` precisely because the
+        // sandbox is expected to still bound them; without this the child
+        // would run with a fresh unrestricted context.
+        if let Some(ref mut control) = self.agent_control {
+            control.set_execution_context(execution_context.clone());
+        }
         self.execution_context = execution_context;
         self.git_repo_root = crate::git::find_repo_root(self.execution_context.workspace_cwd());
         self.caches.clear_project_docs();

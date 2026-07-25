@@ -361,7 +361,53 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
 /// (so a wrapped insertion keeps its green column) and are prepended with a
 /// 2-space indent to visually attach them to the row above.
 pub fn render_patch_wrapped(patch: &str, width: usize) -> Vec<Line<'static>> {
-    wrap_lines(render_patch(patch), width)
+    with_patch_render_cache(patch, width, || wrap_lines(render_patch(patch), width))
+}
+
+/// Entries retained by the patch render cache. Only the handful of patch cells
+/// actually on screen matter, so a small bound is enough; scrolling past an old
+/// diff simply re-renders it once.
+const PATCH_RENDER_CACHE_ENTRIES: usize = 16;
+
+thread_local! {
+    /// Memo for [`render_patch_wrapped`], keyed by `(patch bytes, width)`.
+    ///
+    /// The transcript calls it from inside a cell's render function, so an
+    /// unmemoized patch is re-parsed *and* re-syntax-highlighted on every frame
+    /// — during streaming that is many times per second for a diff that never
+    /// changes. `thread_local` rather than a mutex because rendering is
+    /// single-threaded; this keeps the hot path lock-free.
+    static PATCH_RENDER_CACHE: std::cell::RefCell<Vec<((u64, usize), Vec<Line<'static>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_patch_render_cache(
+    patch: &str,
+    width: usize,
+    render: impl FnOnce() -> Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    patch.hash(&mut hasher);
+    let key = (hasher.finish(), width);
+
+    if let Some(hit) = PATCH_RENDER_CACHE.with_borrow(|cache| {
+        cache
+            .iter()
+            .find(|(cached_key, _)| *cached_key == key)
+            .map(|(_, lines)| lines.clone())
+    }) {
+        return hit;
+    }
+
+    let rendered = render();
+    PATCH_RENDER_CACHE.with_borrow_mut(|cache| {
+        if cache.len() >= PATCH_RENDER_CACHE_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push((key, rendered.clone()));
+    });
+    rendered
 }
 
 /// Replace literal tabs with [`TAB_REPLACEMENT`]. `render_patch` runs every
@@ -1020,5 +1066,65 @@ mod tests {
         assert_eq!(path_ext("dir/sub/file.py"), Some("py".into()));
         assert_eq!(path_ext("README"), None);
         assert_eq!(path_ext("archive.tar.gz"), Some("gz".into()));
+    }
+
+    /// The transcript calls `render_patch_wrapped` from inside a cell's render
+    /// function, so an unmemoized diff is re-parsed and re-highlighted on every
+    /// frame. The memo must hit for a repeat call at the same width, and must
+    /// *miss* on a width change — a stale-width hit would render a diff wrapped
+    /// for the wrong terminal size.
+    #[test]
+    fn patch_render_is_memoized_per_width() {
+        // The cache is thread-local and shared with other tests on this thread;
+        // a unique patch body keeps this test independent of them.
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: memo_probe.rs\n",
+            "@@ fn memo_probe() {\n",
+            " context\n",
+            "-old\n",
+            "+new\n",
+            "*** End Patch"
+        );
+
+        let first = render_patch_wrapped(patch, 60);
+        let cached = render_patch_wrapped(patch, 60);
+        assert_eq!(
+            first.len(),
+            cached.len(),
+            "a repeat call at the same width must return the same render"
+        );
+        assert!(
+            PATCH_RENDER_CACHE.with_borrow(|cache| cache.len() == 1),
+            "a repeat call must reuse the single cached entry, not add another"
+        );
+
+        let narrower = render_patch_wrapped(patch, 24);
+        assert!(
+            PATCH_RENDER_CACHE.with_borrow(|cache| cache.len() == 2),
+            "a different width must be cached separately"
+        );
+        assert!(
+            narrower.len() >= first.len(),
+            "narrower width should wrap into at least as many rows: {} vs {}",
+            narrower.len(),
+            first.len()
+        );
+    }
+
+    /// The cache must stay bounded — it lives for the process lifetime, and the
+    /// transcript can accumulate arbitrarily many distinct patches.
+    #[test]
+    fn patch_render_cache_is_bounded() {
+        for i in 0..(PATCH_RENDER_CACHE_ENTRIES * 3) {
+            let patch = format!(
+                "*** Begin Patch\n*** Add File: bound_probe_{i}.rs\n+let x = {i};\n*** End Patch"
+            );
+            render_patch_wrapped(&patch, 80);
+        }
+        assert!(
+            PATCH_RENDER_CACHE.with_borrow(|cache| cache.len() <= PATCH_RENDER_CACHE_ENTRIES),
+            "cache grew past its bound"
+        );
     }
 }

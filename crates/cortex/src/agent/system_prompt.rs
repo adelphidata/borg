@@ -14,6 +14,8 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use tracing::instrument;
 
+use crate::types::ToolDefinition;
+
 use crate::constants;
 use crate::identity::load_identity;
 use crate::skills::load_skills_context;
@@ -146,7 +148,7 @@ impl Agent {
     /// `build_system_prompt_*` tests source-grep for them to detect
     /// reordering regressions.
     #[instrument(skip_all)]
-    pub(super) async fn build_system_prompt(&mut self) -> Result<String> {
+    pub(super) async fn build_system_prompt(&mut self, tools: &[ToolDefinition]) -> Result<String> {
         let identity = self.caches.identity_or_load(load_identity)?;
         let memory = self.load_memory_with_ranking().await?;
         let knowledge = self.load_knowledge_with_ranking().await?;
@@ -161,8 +163,9 @@ impl Agent {
         system.push_str(&identity);
         system.push_str("\n</system_instructions>\n\n");
 
-        // Tooling: list available tools with summaries
-        system.push_str(&self.build_tooling_section().await);
+        // Tooling: list available tools with summaries. Driven by the same
+        // filtered array the model receives, so the two can never disagree.
+        system.push_str(&Self::build_tooling_section(tools));
 
         // Tool call style guidance
         system.push_str(Self::build_tool_call_style_section());
@@ -388,15 +391,19 @@ impl Agent {
     /// wait/close set). Dynamic tools (WASM plugins, integrations registered
     /// via skills) won't have a static entry — for those the section falls
     /// back to the first sentence of the tool's `ToolDefinition::description`.
-    pub(super) async fn build_tooling_section(&self) -> String {
-        let mut defs = crate::tool::definitions::core_tool_definitions(&self.config).await;
-        if self.agent_control.is_some() {
-            defs.extend(crate::multi_agent::tools::tool_definitions(
-                self.spawn_depth,
-                self.config.agents.max_spawn_depth,
-            ));
+    /// `tools` MUST be the same, already-filtered slice handed to the model.
+    ///
+    /// This section used to recompute the catalog from
+    /// `core_tool_definitions` and applied none of `tools_filter`,
+    /// `tool::policy::filter_tools`, or `filter_tools_by_relevance`. The prompt
+    /// therefore advertised tools that had been stripped from the tools array —
+    /// the model would call one and hit `UnknownToolTracker` — and the list grew
+    /// a line per MCP tool with no budget of its own. Taking the array as an
+    /// argument makes drift impossible rather than merely unlikely.
+    pub(super) fn build_tooling_section(tools: &[ToolDefinition]) -> String {
+        if tools.is_empty() {
+            return String::new();
         }
-
         let static_summary = |name: &str| -> Option<&'static str> {
             crate::tool::definitions::TOOL_SUMMARIES
                 .iter()
@@ -408,7 +415,7 @@ impl Agent {
             "## Tooling".to_string(),
             "Available tools (filtered by config):".to_string(),
         ];
-        for def in &defs {
+        for def in tools {
             let name = def.function.name.as_str();
             let summary = static_summary(name).unwrap_or_else(|| {
                 // Fallback for dynamic tools (WASM plugins / integrations).
@@ -1193,6 +1200,70 @@ mod build_system_prompt_tests {
             "build_scheduled_tasks_section must be invoked AFTER the DYNAMIC \
              SUFFIX marker so it does not invalidate the prompt-cache prefix \
              (call_idx={call_idx}, suffix_marker={suffix_marker})",
+        );
+    }
+
+    /// The prose `<tooling>` list must describe exactly the tools array the
+    /// model receives. It used to be rebuilt from `core_tool_definitions` with
+    /// none of the filters applied, so a denied tool was still advertised — the
+    /// model would call it and hit `UnknownToolTracker`.
+    #[test]
+    fn tooling_section_lists_exactly_the_tools_it_is_given() {
+        use crate::agent::Agent;
+        use crate::types::{FunctionDefinition, ToolDefinition};
+
+        let tool = |name: &str| ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: "Does a thing. And more.".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+
+        let section = Agent::build_tooling_section(&[tool("run_shell"), tool("read_file")]);
+        assert!(section.contains("- run_shell:"), "got: {section}");
+        assert!(section.contains("- read_file:"), "got: {section}");
+        assert!(
+            !section.contains("- browser:"),
+            "a tool absent from the array must not be advertised: {section}"
+        );
+        assert!(section.starts_with("\n<tooling>"));
+        assert!(section.trim_end().ends_with("</tooling>"));
+    }
+
+    /// The setup turn deliberately ships zero tools. Emitting a header with no
+    /// entries — or worse, the unfiltered catalog — tells the model to call
+    /// tools it does not have.
+    #[test]
+    fn tooling_section_is_empty_when_no_tools_are_offered() {
+        use crate::agent::Agent;
+        assert_eq!(Agent::build_tooling_section(&[]), "");
+    }
+
+    /// Dynamic tools (WASM plugins, MCP) have no static summary row, so the
+    /// first sentence of their description is used. Regression guard for the
+    /// fallback branch, which is the only source of text for those tools.
+    #[test]
+    fn tooling_section_falls_back_to_first_sentence_for_unknown_tools() {
+        use crate::agent::Agent;
+        use crate::types::{FunctionDefinition, ToolDefinition};
+
+        let section = Agent::build_tooling_section(&[ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "mcp_acme_widget".to_string(),
+                description: "Creates a widget. Ignore this second sentence.".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }]);
+        assert!(
+            section.contains("- mcp_acme_widget: Creates a widget"),
+            "got: {section}"
+        );
+        assert!(
+            !section.contains("Ignore this second sentence"),
+            "only the first sentence should be used: {section}"
         );
     }
 

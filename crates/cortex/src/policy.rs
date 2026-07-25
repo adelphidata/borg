@@ -25,7 +25,19 @@ const HARDCODED_DENY: &[&str] = &[
     "rm -rf ~",
     "rm -rf ~/*",
     "mkfs *",
+    // `mkfs` is almost always invoked through its filesystem-specific alias —
+    // `mkfs.ext4 /dev/sda1`, `mkfs.xfs`, `mkfs.btrfs`, `mkfs.vfat`. The `mkfs *`
+    // glob needs a literal space after `mkfs`, so it matched only the (rarer)
+    // `mkfs -t ext4 …` form and let the common one straight through.
+    "mkfs.* *",
+    // `dd`'s operands are order-independent, so anchoring on `if=` as the first
+    // one missed `dd of=/dev/disk0 if=/dev/zero` and `dd bs=1m if=… of=…`.
+    // Deny `if=`/`of=` in any position, matching the breadth the original
+    // `dd if=*` entry already implied.
     "dd if=*",
+    "dd of=*",
+    "dd * if=*",
+    "dd * of=*",
     ":(){ :|:& };:",
     "> /dev/sd*",
     "chmod -R 777 /",
@@ -494,6 +506,16 @@ fn strip_wrappers_and_control_flow(tokens: &mut Vec<String>) {
     strip_wrappers_inner(tokens, true)
 }
 
+/// Whether `token` is a shell environment assignment (`NAME=value`).
+///
+/// Requires a non-empty name of `[A-Za-z0-9_]` so a path or flag that merely
+/// contains `=` is not mistaken for one.
+fn is_env_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
 fn strip_wrappers_inner(tokens: &mut Vec<String>, strip_control_flow: bool) {
     loop {
         let Some(first) = tokens.first() else { return };
@@ -522,6 +544,17 @@ fn strip_wrappers_inner(tokens: &mut Vec<String>, strip_control_flow: bool) {
                 tokens.remove(0);
                 continue;
             }
+            // A bare `VAR=value` prefix is a shell assignment applying only to
+            // the following command — `FOO=1 rm -rf /`, `IFS=x rm -rf /`,
+            // `LC_ALL=C rm -rf /` all run `rm`. The `env`-wrapper branch below
+            // only eats assignments *after* removing a wrapper, so without this
+            // the assignment stayed in token 0 and every start-anchored deny
+            // glob missed. Catastrophic path only: on the operator-glob path,
+            // stripping a token the user may have matched on is fail-open.
+            if is_env_assignment(first) {
+                tokens.remove(0);
+                continue;
+            }
         }
         if !LEADING_WRAPPERS.contains(&verb.as_str()) {
             return;
@@ -540,9 +573,7 @@ fn strip_wrappers_inner(tokens: &mut Vec<String>, strip_control_flow: bool) {
         // `nice -n 1` leaves `1` as a bare arg). Stop at the wrapped verb.
         while let Some(tok) = tokens.first() {
             let is_option = tok.starts_with('-');
-            let is_assignment = tok.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            });
+            let is_assignment = is_env_assignment(tok);
             let is_numeric = tok.chars().next().is_some_and(|c| c.is_ascii_digit());
             if is_option || is_assignment || is_numeric {
                 let takes_placeholder = placeholder_flags.contains(&tok.as_str());
@@ -618,19 +649,23 @@ fn canonicalize_rm_flags(tokens: &mut Vec<String>) {
 
 /// Strip common bin path prefixes, returning the basename.
 fn strip_path_prefix(token: &str) -> &str {
-    const PREFIXES: &[&str] = &[
-        "/usr/local/bin/",
-        "/usr/bin/",
-        "/bin/",
-        "/usr/sbin/",
-        "/sbin/",
-    ];
-    for prefix in PREFIXES {
-        if let Some(rest) = token.strip_prefix(prefix) {
-            return rest;
-        }
+    // Take the basename rather than matching a fixed prefix list. A hardcoded
+    // list can only ever cover the directories someone thought of: `rm` also
+    // lives in `/opt/homebrew/bin` (which `sandbox::constants` already
+    // allowlists for exec), `/usr/local/opt/coreutils/libexec/gnubin`, `./`, and
+    // `../bin/`. Every start-anchored deny glob matches on token 0, so any
+    // unlisted directory used to walk straight through.
+    //
+    // Only tokens that actually look like paths are reduced: a bare `rm` has no
+    // separator and is returned unchanged, and a trailing separator (`foo/`)
+    // yields no file name, so the token is left alone rather than emptied.
+    if !token.contains('/') {
+        return token;
     }
-    token
+    match token.rsplit('/').next() {
+        Some(basename) if !basename.is_empty() => basename,
+        _ => token,
+    }
 }
 
 /// Split a shell command into coarse execution fragments so deny rules can
@@ -1276,6 +1311,111 @@ mod tests {
     fn hardcoded_deny_mkfs() {
         let policy = ExecutionPolicy::default();
         assert_eq!(policy.check("mkfs /dev/sda1"), PolicyDecision::Deny);
+    }
+
+    /// `mkfs.<fstype>` is how the tool is actually invoked; the `mkfs *` glob
+    /// needs a literal space after `mkfs`, so it only ever caught `mkfs -t …`.
+    #[test]
+    fn hardcoded_deny_covers_dotted_mkfs_family() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![],
+        };
+        for cmd in [
+            "mkfs.ext4 /dev/sda1",
+            "mkfs.xfs /dev/nvme0n1",
+            "mkfs.btrfs /dev/sdb",
+            "mkfs.vfat /dev/disk2",
+            "sudo mkfs.ext4 /dev/sda1",
+            "FOO=1 mkfs.ext4 /dev/sda1",
+        ] {
+            assert_eq!(policy.check(cmd), PolicyDecision::Deny, "must deny: {cmd}");
+        }
+    }
+
+    /// `dd` operands are order-independent, so anchoring on a leading `if=`
+    /// missed the destructive orderings.
+    #[test]
+    fn hardcoded_deny_covers_dd_operands_in_any_position() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![],
+        };
+        for cmd in [
+            "dd if=/dev/zero of=/dev/disk0",
+            "dd of=/dev/disk0 if=/dev/zero",
+            "dd bs=1m if=/dev/zero of=/dev/disk0",
+            "dd bs=4M of=/dev/sda if=/dev/urandom",
+        ] {
+            assert_eq!(policy.check(cmd), PolicyDecision::Deny, "must deny: {cmd}");
+        }
+    }
+
+    /// A `VAR=value` prefix is a shell assignment scoped to the command that
+    /// follows it, so the catastrophic verb still runs. Wrapper stripping only
+    /// consumed assignments *after* an `env`/`sudo` wrapper, leaving the bare
+    /// form in token 0 where no start-anchored deny glob could see past it.
+    #[test]
+    fn hardcoded_deny_sees_past_leading_env_assignments() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![],
+        };
+        for cmd in [
+            "FOO=1 rm -rf /",
+            "IFS=x rm -rf /",
+            "LC_ALL=C rm -rf /",
+            "A=1 B=2 rm -rf /",
+            "FOO=1 sudo rm -rf /",
+            "bash -lc 'FOO=1 rm -rf /'",
+        ] {
+            assert_eq!(policy.check(cmd), PolicyDecision::Deny, "must deny: {cmd}");
+        }
+    }
+
+    /// An assignment prefix must not be confused with a real command. `x=1` on
+    /// its own sets a variable and runs nothing, and a token that merely
+    /// contains `=` (a flag, a path) is not an assignment.
+    #[test]
+    fn leading_assignment_stripping_does_not_over_match() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![],
+        };
+        for cmd in [
+            "FOO=1 ls -la",
+            "make CFLAGS=-O2",
+            "grep --color=always rm -rf /etc",
+            "./configure --prefix=/usr",
+        ] {
+            assert_eq!(
+                policy.check(cmd),
+                PolicyDecision::AutoApprove,
+                "must not deny: {cmd}"
+            );
+        }
+    }
+
+    /// Deny globs are start-anchored on token 0, so the executable's directory
+    /// has to be reduced to its basename. A fixed prefix list can only cover the
+    /// directories someone enumerated — `/opt/homebrew/bin` is allowlisted for
+    /// exec by the sandbox crate yet was absent from that list.
+    #[test]
+    fn hardcoded_deny_reduces_any_executable_path_to_its_basename() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![],
+        };
+        for cmd in [
+            "/bin/rm -rf /",
+            "/opt/homebrew/bin/rm -rf /",
+            "/usr/local/opt/coreutils/libexec/gnubin/rm -rf /",
+            "./rm -rf /",
+            "../bin/rm -rf /",
+            "/opt/homebrew/sbin/mkfs.ext4 /dev/sda1",
+        ] {
+            assert_eq!(policy.check(cmd), PolicyDecision::Deny, "must deny: {cmd}");
+        }
     }
 
     /// `sudo X` does at least as much damage as `X` — privilege-escalation

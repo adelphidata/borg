@@ -495,6 +495,10 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
 fn run_cmd_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut child = Command::new(program)
         .args(args)
+        // Audit probes are non-interactive. Inheriting stdin would let a probe
+        // that unexpectedly reads it consume operator keystrokes, and would
+        // stall until the deadline below rather than returning promptly.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

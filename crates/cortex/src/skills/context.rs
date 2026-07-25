@@ -207,12 +207,41 @@ pub fn load_skills_context(
         "skills context built"
     );
 
-    let rendered = if parts.is_empty() {
-        String::new()
-    } else {
-        format!("# Skills\n\n{}\n", parts.join("\n---\n\n"))
+    // Tell the model what it can't see. Without this the omission is invisible:
+    // the catalog simply ends, and the model has no way to know that skills exist
+    // beyond the ones listed (it would have to think to call `list`). The marker
+    // is charged against the same budget and shrunk until it fits, so it can
+    // never be the reason the budget is blown.
+    let omission_marker = (!report.omitted_entirely.is_empty()).then(|| {
+        omission_marker_within_budget(
+            report.omitted_entirely.len(),
+            max_tokens.saturating_sub(estimated_tokens),
+        )
+    });
+
+    let rendered = match (parts.is_empty(), omission_marker.as_deref()) {
+        (true, _) => String::new(),
+        (false, Some(marker)) => {
+            format!("# Skills\n\n{}\n\n{marker}\n", parts.join("\n---\n\n"))
+        }
+        (false, None) => format!("# Skills\n\n{}\n", parts.join("\n---\n\n")),
     };
     Ok((rendered, report))
+}
+
+/// Render the "N skills omitted" notice, shortened until it fits `spare_tokens`.
+///
+/// Falls back to the terse form and then to `None` rather than overshooting the
+/// budget — the marker exists to explain a truncation, so it must not cause one.
+fn omission_marker_within_budget(omitted: usize, spare_tokens: usize) -> String {
+    let noun = if omitted == 1 { "skill" } else { "skills" };
+    let verbose = format!(
+        "_{omitted} additional {noun} omitted from this bounded list — call `list` with `what: \"skills\"` to see them._"
+    );
+    if estimate_tokens(&verbose) <= spare_tokens {
+        return verbose;
+    }
+    format!("_{omitted} additional {noun} omitted._")
 }
 
 /// What each shadow selection method WOULD have injected this turn, versus what

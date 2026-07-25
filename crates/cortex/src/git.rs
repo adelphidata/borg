@@ -37,6 +37,22 @@ pub(crate) fn hardened_prelude() -> [&'static str; 4] {
     ["-c", FSMONITOR_OVERRIDE, "-c", HOOKS_OVERRIDE]
 }
 
+/// Make a `git` invocation non-interactive.
+///
+/// Every git command we run is local plumbing, so nothing should ever prompt.
+/// Two independent channels have to be closed:
+///
+/// * **stdin** — `.output()` nulls it implicitly, but stating it keeps a future
+///   `.status()`/`.spawn()` refactor from silently handing git the operator's
+///   input stream.
+/// * **the controlling terminal** — git opens `/dev/tty` *directly* for
+///   credential prompts, so nulling stdin alone does not stop it.
+///   `GIT_TERMINAL_PROMPT=0` turns a would-be prompt into an immediate error.
+fn make_git_non_interactive(cmd: &mut tokio::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
+}
+
 /// Parse `git config --null --name-only --get-regexp` output (NUL-separated
 /// keys) into the set of filter driver prefixes, e.g. `filter.lfs.clean` →
 /// `filter.lfs`.
@@ -93,14 +109,10 @@ pub(crate) fn git_config_env(overrides: &[(String, String)]) -> Vec<(String, Str
 /// the `GIT_CONFIG_*` env entries that neutralize them. Best-effort: discovery
 /// failures log and yield no overrides (the hardening prelude still applies).
 async fn filter_neutralizing_env(cwd: &Path) -> Vec<(String, String)> {
-    let result = tokio::time::timeout(
-        GIT_COMMAND_TIMEOUT,
-        tokio::process::Command::new("git")
-            .args(filter_discovery_argv())
-            .current_dir(cwd)
-            .output(),
-    )
-    .await;
+    let mut discovery = tokio::process::Command::new("git");
+    discovery.args(filter_discovery_argv()).current_dir(cwd);
+    make_git_non_interactive(&mut discovery);
+    let result = tokio::time::timeout(GIT_COMMAND_TIMEOUT, discovery.output()).await;
     let stdout = match result {
         // `--get-regexp` exits 1 when nothing matches — that's the common case.
         Ok(Ok(o)) if o.status.success() || o.status.code() == Some(1) => o.stdout,
@@ -309,6 +321,7 @@ async fn run_git_inner(
     argv.extend_from_slice(args);
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&argv).current_dir(cwd);
+    make_git_non_interactive(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

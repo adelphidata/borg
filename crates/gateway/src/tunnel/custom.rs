@@ -108,6 +108,8 @@ impl Tunnel for CustomTunnel {
 
         let mut child = Command::new(program)
             .args(args)
+            // Long-lived daemon child; see the cloudflare backend.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

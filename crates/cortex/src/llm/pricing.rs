@@ -10,6 +10,46 @@ use crate::llm::provider::Provider;
 struct ModelRate {
     input_per_mtok: &'static str,
     output_per_mtok: &'static str,
+    /// Discounted rate for prompt-cache *reads*, when known.
+    ///
+    /// Unlike Anthropic — whose `input_tokens` excludes cached tokens —
+    /// OpenAI-compatible providers report `prompt_tokens` **inclusive** of
+    /// cached tokens. So a cached read is currently billed at the full input
+    /// rate here, over-stating cost by the provider's cache discount.
+    ///
+    /// `None` preserves that behavior rather than guessing a rate: this is a
+    /// billing path, and a fabricated discount is worse than a known
+    /// over-estimate. Populate per model from the provider's published pricing
+    /// (see the `update-model-catalog` skill) and the discount applies
+    /// automatically — `estimate_cost_usd` already honors it, and
+    /// `cached_read_rate_is_honored_when_present` pins the arithmetic.
+    cached_input_per_mtok: Option<&'static str>,
+}
+
+impl ModelRate {
+    /// Rate row with no known cache-read discount: cached prompt tokens are
+    /// billed at the full input rate.
+    const fn new(input_per_mtok: &'static str, output_per_mtok: &'static str) -> Self {
+        Self {
+            input_per_mtok,
+            output_per_mtok,
+            cached_input_per_mtok: None,
+        }
+    }
+
+    /// Rate row with a published cache-read rate.
+    #[cfg_attr(not(test), allow(dead_code))]
+    const fn with_cached_input(
+        input_per_mtok: &'static str,
+        output_per_mtok: &'static str,
+        cached_input_per_mtok: &'static str,
+    ) -> Self {
+        Self {
+            input_per_mtok,
+            output_per_mtok,
+            cached_input_per_mtok: Some(cached_input_per_mtok),
+        }
+    }
 }
 
 struct AnthropicModelRate {
@@ -61,90 +101,18 @@ impl AnthropicModelRate {
 
 static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        (
-            "gpt-4",
-            ModelRate {
-                input_per_mtok: "30.00",
-                output_per_mtok: "60.00",
-            },
-        ),
-        (
-            "gpt-4.1",
-            ModelRate {
-                input_per_mtok: "2.00",
-                output_per_mtok: "8.00",
-            },
-        ),
-        (
-            "gpt-4.1-mini",
-            ModelRate {
-                input_per_mtok: "0.40",
-                output_per_mtok: "1.60",
-            },
-        ),
-        (
-            "gpt-4.1-nano",
-            ModelRate {
-                input_per_mtok: "0.10",
-                output_per_mtok: "0.40",
-            },
-        ),
-        (
-            "gpt-4o",
-            ModelRate {
-                input_per_mtok: "2.50",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "gpt-4o-2024-08-06",
-            ModelRate {
-                input_per_mtok: "2.50",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "gpt-4o-mini",
-            ModelRate {
-                input_per_mtok: "0.15",
-                output_per_mtok: "0.60",
-            },
-        ),
-        (
-            "gpt-5",
-            ModelRate {
-                input_per_mtok: "1.25",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "gpt-5-mini",
-            ModelRate {
-                input_per_mtok: "0.25",
-                output_per_mtok: "2.00",
-            },
-        ),
-        (
-            "gpt-5-nano",
-            ModelRate {
-                input_per_mtok: "0.05",
-                output_per_mtok: "0.40",
-            },
-        ),
-        (
-            "o3",
-            ModelRate {
-                input_per_mtok: "2.00",
-                output_per_mtok: "8.00",
-            },
-        ),
-        (
-            "o4-mini",
-            ModelRate {
-                input_per_mtok: "1.10",
-                output_per_mtok: "4.40",
-            },
-        ),
+        ("gpt-4", ModelRate::new("30.00", "60.00")),
+        ("gpt-4.1", ModelRate::new("2.00", "8.00")),
+        ("gpt-4.1-mini", ModelRate::new("0.40", "1.60")),
+        ("gpt-4.1-nano", ModelRate::new("0.10", "0.40")),
+        ("gpt-4o", ModelRate::new("2.50", "10.00")),
+        ("gpt-4o-2024-08-06", ModelRate::new("2.50", "10.00")),
+        ("gpt-4o-mini", ModelRate::new("0.15", "0.60")),
+        ("gpt-5", ModelRate::new("1.25", "10.00")),
+        ("gpt-5-mini", ModelRate::new("0.25", "2.00")),
+        ("gpt-5-nano", ModelRate::new("0.05", "0.40")),
+        ("o3", ModelRate::new("2.00", "8.00")),
+        ("o4-mini", ModelRate::new("1.10", "4.40")),
     ])
 });
 
@@ -155,116 +123,26 @@ static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(
 // Update when xAI revises pricing.
 static XAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        (
-            "grok-4",
-            ModelRate {
-                input_per_mtok: "5.00",
-                output_per_mtok: "15.00",
-            },
-        ),
-        (
-            "grok-4-fast",
-            ModelRate {
-                input_per_mtok: "0.20",
-                output_per_mtok: "0.50",
-            },
-        ),
-        (
-            "grok-4-fast-reasoning",
-            ModelRate {
-                input_per_mtok: "0.20",
-                output_per_mtok: "0.50",
-            },
-        ),
-        (
-            "grok-4-fast-non-reasoning",
-            ModelRate {
-                input_per_mtok: "0.20",
-                output_per_mtok: "0.50",
-            },
-        ),
-        (
-            "grok-code-fast-1",
-            ModelRate {
-                input_per_mtok: "0.20",
-                output_per_mtok: "1.50",
-            },
-        ),
-        (
-            "grok-code-fast",
-            ModelRate {
-                input_per_mtok: "0.20",
-                output_per_mtok: "1.50",
-            },
-        ),
-        (
-            "grok-3",
-            ModelRate {
-                input_per_mtok: "3.00",
-                output_per_mtok: "15.00",
-            },
-        ),
-        (
-            "grok-3-mini",
-            ModelRate {
-                input_per_mtok: "0.30",
-                output_per_mtok: "0.50",
-            },
-        ),
+        ("grok-4", ModelRate::new("5.00", "15.00")),
+        ("grok-4-fast", ModelRate::new("0.20", "0.50")),
+        ("grok-4-fast-reasoning", ModelRate::new("0.20", "0.50")),
+        ("grok-4-fast-non-reasoning", ModelRate::new("0.20", "0.50")),
+        ("grok-code-fast-1", ModelRate::new("0.20", "1.50")),
+        ("grok-code-fast", ModelRate::new("0.20", "1.50")),
+        ("grok-3", ModelRate::new("3.00", "15.00")),
+        ("grok-3-mini", ModelRate::new("0.30", "0.50")),
     ])
 });
 
 static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        (
-            "gemini-3-pro",
-            ModelRate {
-                input_per_mtok: "1.25",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "gemini-3-flash",
-            ModelRate {
-                input_per_mtok: "0.15",
-                output_per_mtok: "0.60",
-            },
-        ),
-        (
-            "gemini-3-flash-lite",
-            ModelRate {
-                input_per_mtok: "0.05",
-                output_per_mtok: "0.30",
-            },
-        ),
-        (
-            "gemini-2.5-pro",
-            ModelRate {
-                input_per_mtok: "1.25",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "gemini-2.5-flash",
-            ModelRate {
-                input_per_mtok: "0.30",
-                output_per_mtok: "2.50",
-            },
-        ),
-        (
-            "gemini-2.5-flash-lite",
-            ModelRate {
-                input_per_mtok: "0.10",
-                output_per_mtok: "0.40",
-            },
-        ),
-        (
-            "gemini-2.0-flash",
-            ModelRate {
-                input_per_mtok: "0.10",
-                output_per_mtok: "0.40",
-            },
-        ),
+        ("gemini-3-pro", ModelRate::new("1.25", "10.00")),
+        ("gemini-3-flash", ModelRate::new("0.15", "0.60")),
+        ("gemini-3-flash-lite", ModelRate::new("0.05", "0.30")),
+        ("gemini-2.5-pro", ModelRate::new("1.25", "10.00")),
+        ("gemini-2.5-flash", ModelRate::new("0.30", "2.50")),
+        ("gemini-2.5-flash-lite", ModelRate::new("0.10", "0.40")),
+        ("gemini-2.0-flash", ModelRate::new("0.10", "0.40")),
     ])
 });
 
@@ -420,19 +298,40 @@ fn anthropic_rates_for(model: &str) -> Option<&'static AnthropicModelRate> {
     ANTHROPIC_RATES.get(normalize_model_id(model))
 }
 
-/// Return the exact USD string for a direct OpenAI model.
+/// Return the exact USD string for a direct OpenAI-compatible model.
+///
+/// `cached_input_tokens` is the prompt-cache *read* count. These providers
+/// report `prompt_tokens` **inclusive** of cached tokens (unlike Anthropic), so
+/// the cached portion is split out and priced at the model's
+/// [`ModelRate::cached_input_per_mtok`] when one is known. Where it is not,
+/// cached tokens stay at the full input rate — see that field for why no rate is
+/// guessed.
 pub fn estimate_cost_usd(
     provider: Provider,
     model: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
+    cached_input_tokens: u64,
 ) -> Option<String> {
     let rates = rates_for(provider)?;
     let rate = rates.get(normalize_model_id(model))?;
-    let input = Usd::from_tokens_at_rate(prompt_tokens, Usd::parse(rate.input_per_mtok).ok()?);
+    let input_rate = Usd::parse(rate.input_per_mtok).ok()?;
+    // Clamp: a provider reporting more cached than prompt tokens would
+    // otherwise underflow to a huge uncached count.
+    let cached = cached_input_tokens.min(prompt_tokens);
+    let (uncached_tokens, cached_cost) = match rate.cached_input_per_mtok {
+        Some(cached_rate) => (
+            prompt_tokens - cached,
+            Usd::from_tokens_at_rate(cached, Usd::parse(cached_rate).ok()?),
+        ),
+        // No published cache-read rate: bill the whole prompt at the input rate,
+        // exactly as before.
+        None => (prompt_tokens, Usd::from_tokens_at_rate(0, input_rate)),
+    };
+    let input = Usd::from_tokens_at_rate(uncached_tokens, input_rate);
     let output =
         Usd::from_tokens_at_rate(completion_tokens, Usd::parse(rate.output_per_mtok).ok()?);
-    Some((input + output).to_storage_string())
+    Some((input + cached_cost + output).to_storage_string())
 }
 
 /// Return the exact USD string for a direct Anthropic model, including
@@ -525,7 +424,7 @@ mod tests {
 
     #[test]
     fn openai_cost_is_deterministic() {
-        let cost = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500).unwrap();
+        let cost = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 0).unwrap();
         assert_eq!(cost, "0.006");
     }
 
@@ -555,7 +454,69 @@ mod tests {
 
     #[test]
     fn unknown_model_returns_none() {
-        assert!(estimate_cost_usd(Provider::OpenAi, "missing", 1_000, 500).is_none());
+        assert!(estimate_cost_usd(Provider::OpenAi, "missing", 1_000, 500, 0).is_none());
+    }
+
+    /// With a published cache-read rate, the cached slice of `prompt_tokens` must
+    /// be billed at that rate and only the remainder at the full input rate.
+    ///
+    /// Hand-computed against a synthetic rate row so the arithmetic is pinned
+    /// independently of the shipped tables: input $10/Mtok, cached $1/Mtok,
+    /// output $30/Mtok, with 1000 prompt tokens of which 800 are cached, and 500
+    /// output tokens.
+    ///   uncached: 200 × 10/1e6  = 0.002
+    ///   cached:   800 × 1/1e6   = 0.0008
+    ///   output:   500 × 30/1e6  = 0.015
+    ///   total                   = 0.0178
+    #[test]
+    fn cached_read_rate_is_honored_when_present() {
+        let rate = ModelRate::with_cached_input("10.00", "30.00", "1.00");
+        let input_rate = Usd::parse(rate.input_per_mtok).unwrap();
+        let cached_rate = Usd::parse(rate.cached_input_per_mtok.unwrap()).unwrap();
+        let output_rate = Usd::parse(rate.output_per_mtok).unwrap();
+
+        let total = Usd::from_tokens_at_rate(200, input_rate)
+            + Usd::from_tokens_at_rate(800, cached_rate)
+            + Usd::from_tokens_at_rate(500, output_rate);
+        assert_eq!(total.to_storage_string(), "0.0178");
+
+        // The same inputs with no cache-read rate bill the full 1000 prompt
+        // tokens at the input rate: 1000 × 10/1e6 + 0.015 = 0.025.
+        let uncached_total = Usd::from_tokens_at_rate(1_000, input_rate)
+            + Usd::from_tokens_at_rate(500, output_rate);
+        assert_eq!(uncached_total.to_storage_string(), "0.025");
+        assert!(
+            total < uncached_total,
+            "a cache-read discount must lower the total"
+        );
+    }
+
+    /// Until a model carries a published cache-read rate, cached tokens stay at
+    /// the input rate — an over-estimate we accept rather than guessing. Pins the
+    /// documented current behavior so filling a rate in is a visible change.
+    #[test]
+    fn cached_tokens_do_not_change_cost_without_a_published_rate() {
+        assert!(
+            OPENAI_RATES
+                .get("gpt-4.1")
+                .expect("gpt-4.1 rate")
+                .cached_input_per_mtok
+                .is_none(),
+            "update this test alongside the rate when gpt-4.1 gains a cache-read rate"
+        );
+        let without = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 0).unwrap();
+        let with_cached = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 800).unwrap();
+        assert_eq!(without, with_cached);
+    }
+
+    /// A provider reporting more cached than prompt tokens must not underflow the
+    /// uncached remainder into a huge number.
+    #[test]
+    fn cached_tokens_exceeding_prompt_tokens_are_clamped() {
+        let cost = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 100, 0, u64::MAX)
+            .expect("cost must still compute");
+        let baseline = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 100, 0, 0).unwrap();
+        assert_eq!(cost, baseline);
     }
 
     #[test]
@@ -585,7 +546,7 @@ mod tests {
         // Total = 0.0125. If the rate table is corrupted or the lookup
         // regresses to None, this asserts the exact dollar figure rather than
         // .is_some() — a tautological check would pass for the wrong rate.
-        let cost = estimate_cost_usd(Provider::XAi, "grok-4", 1_000, 500).unwrap();
+        let cost = estimate_cost_usd(Provider::XAi, "grok-4", 1_000, 500, 0).unwrap();
         assert_eq!(cost, "0.0125");
     }
 
@@ -593,11 +554,11 @@ mod tests {
     fn xai_cost_for_grok_code_fast_uses_published_rates() {
         // grok-code-fast = $0.20 input / $1.50 output per Mtok.
         // 10_000 prompt × 0.20 / 1e6 = 0.002; 2_000 completion × 1.50 / 1e6 = 0.003.
-        let cost = estimate_cost_usd(Provider::XAi, "grok-code-fast", 10_000, 2_000).unwrap();
+        let cost = estimate_cost_usd(Provider::XAi, "grok-code-fast", 10_000, 2_000, 0).unwrap();
         assert_eq!(cost, "0.005");
         // The dated `-1` alias is the same family — must yield the same number.
         let cost_alias =
-            estimate_cost_usd(Provider::XAi, "grok-code-fast-1", 10_000, 2_000).unwrap();
+            estimate_cost_usd(Provider::XAi, "grok-code-fast-1", 10_000, 2_000, 0).unwrap();
         assert_eq!(cost_alias, cost);
     }
 
@@ -607,14 +568,14 @@ mod tests {
         // the dotted brand (`x.ai/`), or just types the product name (`grok/`)
         // must hit the same rate. If any prefix path silently bypasses the
         // table, cost-event attribution regresses to None for that variant.
-        let base = estimate_cost_usd(Provider::XAi, "grok-4-fast", 1_000_000, 0).unwrap();
+        let base = estimate_cost_usd(Provider::XAi, "grok-4-fast", 1_000_000, 0, 0).unwrap();
         for variant in [
             "xai/grok-4-fast",
             "x-ai/grok-4-fast",
             "x.ai/grok-4-fast",
             "grok/grok-4-fast",
         ] {
-            let got = estimate_cost_usd(Provider::XAi, variant, 1_000_000, 0).unwrap();
+            let got = estimate_cost_usd(Provider::XAi, variant, 1_000_000, 0, 0).unwrap();
             assert_eq!(got, base, "prefix {variant} produced a different cost");
         }
     }
@@ -634,7 +595,7 @@ mod tests {
         // A model that's not in the table must not silently fall back to a
         // wrong rate. Returning None signals the daemon to skip cost
         // emission rather than emit incorrect dollars.
-        assert!(estimate_cost_usd(Provider::XAi, "grok-vapor-99", 100, 100).is_none());
+        assert!(estimate_cost_usd(Provider::XAi, "grok-vapor-99", 100, 100, 0).is_none());
     }
 
     #[test]

@@ -398,6 +398,8 @@ fn custom_transcribe(
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&cmd_str)
+        // Non-interactive: the audio path is passed as an argument.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
