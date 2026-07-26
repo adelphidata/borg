@@ -7,8 +7,6 @@ use super::models::{ModelUsageRow, TokenSummary};
 use super::Database;
 
 impl Database {
-    // ── Token usage ──
-
     fn month_start_ts() -> Result<i64> {
         let now = chrono::Utc::now();
         let first_of_month = now.date_naive().with_day(1).unwrap_or(now.date_naive());

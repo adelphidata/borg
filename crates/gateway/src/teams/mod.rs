@@ -32,7 +32,6 @@ pub fn handle_teams_webhook(
     app_secret: Option<&str>,
     dedup: Option<&Mutex<ActivityDeduplicator>>,
 ) -> Result<Option<(InboundMessage, Activity)>> {
-    // Verify HMAC signature if secret is provided
     if let Some(secret) = app_secret {
         verify::verify_teams_signature(headers, body.as_bytes(), secret)?;
     }

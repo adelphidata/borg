@@ -50,7 +50,6 @@ impl Database {
     }
 
     /// Keep the `keep` most recent rows in `doctor_runs`, delete the rest.
-    /// Returns number of rows deleted.
     pub async fn prune_doctor_runs(&self, keep: usize) -> Result<usize> {
         let deleted = self
             .conn

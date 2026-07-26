@@ -35,6 +35,10 @@ use mcp::registry::{McpRegistry, RegisteredTool, ToolRegistrationOutcome};
 use mcp::session::SessionActor;
 use mcp::transport::Transport;
 
+/// Tracing target for every MCP log line, so operators can isolate MCP noise
+/// with `RUST_LOG=borg.mcp=debug` without touching the rest of the agent.
+const MCP_LOG_TARGET: &str = "borg.mcp";
+
 /// Process-global registry. `OnceLock` — the *cell* is fixed at first
 /// initialize, but [`McpRegistry`]'s internals are already
 /// `Arc<RwLock<…>>`, so we can re-run `replace_server_tools` and
@@ -653,7 +657,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         )
         .await;
         tracing::info!(
-            target: "borg.mcp",
+            target: MCP_LOG_TARGET,
             event = "rate_limited",
             server = %tool.server,
             tool = %tool.full_name,
@@ -734,7 +738,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             // OTEL-style structured event — `borg.mcp.executes_total{outcome="error"}`
             // plus the error kind and message for correlation with logs.
             tracing::info!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "execute",
                 server = %tool.server,
                 tool = %tool.full_name,
@@ -889,7 +893,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     // `docs/mcp.md`. Off-daemon contexts (CLI, tests) get the same data via
     // plain log output.
     tracing::info!(
-        target: "borg.mcp",
+        target: MCP_LOG_TARGET,
         event = "execute",
         server = %tool.server,
         tool = %tool.full_name,
@@ -1055,7 +1059,7 @@ async fn serve_cached_catalog(
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "catalog_cache_unavailable",
                 server = %server_name,
                 error = %e,
@@ -1070,7 +1074,7 @@ async fn serve_cached_catalog(
         // flag would only stop future writes.
         if let Err(e) = db.mcp_catalog_cache_delete_server(server_name).await {
             tracing::warn!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "catalog_cache_purge_failed",
                 server = %server_name,
                 error = %e,
@@ -1084,7 +1088,7 @@ async fn serve_cached_catalog(
         Ok(k) => k,
         Err(e) => {
             tracing::warn!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "catalog_cache_key_unavailable",
                 server = %server_name,
                 error = %e,
@@ -1103,7 +1107,7 @@ async fn serve_cached_catalog(
         Ok(None) => return false,
         Err(e) => {
             tracing::warn!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "catalog_cache_read_failed",
                 server = %server_name,
                 error = %e,
@@ -1123,7 +1127,7 @@ async fn serve_cached_catalog(
             Ok(count) => count,
             Err(e) => {
                 tracing::warn!(
-                    target: "borg.mcp",
+                    target: MCP_LOG_TARGET,
                     event = "catalog_cache_unusable",
                     server = %server_name,
                     error = %e,
@@ -1134,7 +1138,7 @@ async fn serve_cached_catalog(
         };
 
     tracing::info!(
-        target: "borg.mcp",
+        target: MCP_LOG_TARGET,
         event = "catalog_cache_hit",
         server = %server_name,
         tools = registered,
@@ -1182,7 +1186,7 @@ async fn serve_cached_catalog(
                 reg_owned.drop_server(&server_owned);
                 purge_cached_catalog(&server_owned).await;
                 tracing::info!(
-                    target: "borg.mcp",
+                    target: MCP_LOG_TARGET,
                     event = "catalog_cache_start_superseded",
                     server = %server_owned,
                     "MCP server was removed while starting; its registration was rolled back",
@@ -1198,7 +1202,7 @@ async fn serve_cached_catalog(
         if let Err(join_err) = start.await {
             reg_owned.drop_server(&server_owned);
             tracing::error!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 event = "catalog_cache_start_task_died",
                 server = %server_owned,
                 error = %join_err,
@@ -1388,7 +1392,7 @@ async fn start_server(
     if let mcp::manifest::Transport::Stdio { command, args, .. } = &manifest.transport {
         if let Some(reason) = mcp::validate_stdio_command(command, args) {
             tracing::warn!(
-                target: "borg.mcp",
+                target: MCP_LOG_TARGET,
                 server = %server_name,
                 command = %command,
                 reason = %reason,
@@ -1449,7 +1453,7 @@ async fn start_server(
                 // free-text Display string. Mirrors the tool-exec audit row.
                 let (error_kind, _) = classify_startup_failure(&e);
                 tracing::warn!(
-                    target: "borg.mcp",
+                    target: MCP_LOG_TARGET,
                     event = "transport_error",
                     server = %server_name,
                     transport = transport_label(&manifest.transport),
@@ -1471,7 +1475,7 @@ async fn start_server(
                     continue;
                 }
                 tracing::warn!(
-                    target: "borg.mcp",
+                    target: MCP_LOG_TARGET,
                     event = "transport_error",
                     server = %server_name,
                     transport = transport_label(&manifest.transport),
@@ -1522,7 +1526,7 @@ fn log_startup_retry(
     error: &str,
 ) {
     tracing::warn!(
-        target: "borg.mcp",
+        target: MCP_LOG_TARGET,
         event = "startup_retry",
         server = %server_name,
         transport = transport_label(&manifest.transport),
@@ -1606,7 +1610,7 @@ async fn purge_cached_catalog(server_name: &str) {
     };
     if let Err(e) = purge.await {
         tracing::warn!(
-            target: "borg.mcp",
+            target: MCP_LOG_TARGET,
             event = "catalog_cache_purge_failed",
             server = %server_name,
             error = %e,
@@ -1651,7 +1655,7 @@ async fn store_catalog_in_cache(
 
     if let Err(e) = write.await {
         tracing::warn!(
-            target: "borg.mcp",
+            target: MCP_LOG_TARGET,
             event = "catalog_cache_write_failed",
             server = %server_name,
             error = %e,
@@ -1673,7 +1677,7 @@ async fn register_discovered(
     builtin: &[&str],
 ) -> Result<()> {
     tracing::info!(
-        target: "borg.mcp",
+        target: MCP_LOG_TARGET,
         event = "tools_listed",
         server = %server_name,
         count = discovered.tools.len(),

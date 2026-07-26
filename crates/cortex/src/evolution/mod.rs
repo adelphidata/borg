@@ -79,8 +79,6 @@ pub(crate) fn rate_limit_for(event_type: &str) -> u32 {
     crate::hmac_chain::lookup_rate_limit(RATE_LIMITS, event_type, RATE_LIMIT_DEFAULT)
 }
 
-// ── Types ──
-
 /// The 11 archetypes that classify usage patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Archetype {
@@ -374,15 +372,12 @@ pub struct EvolutionState {
     pub readiness: Option<ReadinessReport>,
 }
 
-// ── XP Curve ──
 //
 // Level/XP math lives in `evolution::xp`; re-exported here for call-site
 // compatibility.
 
 mod xp;
 pub use xp::{level_from_xp, total_xp_for_level, xp_for_level};
-
-// ── Scoring ──
 
 /// Base XP awarded for a successful tool call.
 const BASE_XP_TOOL_SUCCESS: i32 = 1;
@@ -462,8 +457,6 @@ fn dominant_archetype(scores: &HashMap<Archetype, u32>) -> Option<Archetype> {
         .filter(|(_, &score)| score > 0)
         .map(|(&arch, _)| arch)
 }
-
-// ── Evolution Gates ──
 
 /// Ratio at which we treat the top archetype as dominant for surface decisions
 /// (heartbeat seeds, memory consolidation weighting, skill priority tiebreaks,
@@ -600,8 +593,6 @@ async fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>
     sorted.truncate(5);
     Ok(sorted)
 }
-
-// ── Milestone helpers ──
 
 /// Load the current evolution + bond state as a snapshot pair. Returns
 /// `(None, 0)` for the evolution slot if the DB read fails; callers should
@@ -758,8 +749,6 @@ fn parse_level_from_id(id: &str) -> Option<u8> {
     let (num, _) = rest.split_once('_')?;
     num.parse::<u8>().ok()
 }
-
-// ── EvolutionHook ──
 
 /// Lifecycle hook that passively records evolution XP events and injects context.
 pub struct EvolutionHook {
@@ -1245,8 +1234,6 @@ impl std::fmt::Debug for EvolutionHook {
         f.debug_struct("EvolutionHook").finish()
     }
 }
-
-// ── Tests ──
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;

@@ -97,7 +97,6 @@ mod tests {
             run_keepalive(config, stop_rx, || async { Ok(()) }).await;
         });
 
-        // Send stop immediately
         stop_tx.send(()).unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), handle)

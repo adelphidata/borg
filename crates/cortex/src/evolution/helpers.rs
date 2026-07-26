@@ -331,8 +331,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-// ── Tests ──
-
 #[cfg(test)]
 mod tests {
     use super::*;

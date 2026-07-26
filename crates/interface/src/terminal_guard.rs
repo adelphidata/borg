@@ -15,6 +15,8 @@ pub(crate) struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Drop can't propagate, and a failed restore leaves nothing worth
+        // reporting on a terminal we may no longer own — best-effort only.
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
     }

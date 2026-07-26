@@ -55,6 +55,7 @@ fn format_subprocess_offenders(
     entries: &[crate::process_registry::ProcessEntry],
     now: i64,
 ) -> String {
+    // 3 names fit on one terminal line alongside the "and N more" suffix.
     const MAX_NAMED: usize = 3;
     let mut parts: Vec<String> = entries
         .iter()

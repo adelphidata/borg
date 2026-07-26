@@ -129,8 +129,6 @@ use transport::{Transport, TransportRequest};
 
 pub use crate::llm::llm_error::*;
 
-// ── Data types ──
-
 /// Which wire transport a request is routed to, once provider + model are
 /// known. Produced by [`LlmClient::wire_path`] — the single classifier shared
 /// by the streaming and non-streaming dispatch paths.
@@ -451,6 +449,17 @@ pub struct LlmClient {
     /// Sent as `prompt_cache_key` on OpenAI-family requests to bias the
     /// provider's auto-cache toward a consistent shard across turns.
     prompt_cache_key: Option<String>,
+    /// The byte-stable head of the system prompt for the turn in flight, set by
+    /// [`Self::set_system_stable_prefix`]. Providers with explicit cache
+    /// breakpoints anchor the system marker at the end of this instead of the
+    /// end of the whole prompt.
+    ///
+    /// Stored as the prefix text rather than an offset so a value left over from
+    /// a previous turn cannot corrupt anything: the transport honors it only
+    /// while it still prefixes the system message being sent, and a prefix that
+    /// still matches is still stable. Callers that never set it (aux
+    /// summarizers, title generation) just don't get the split.
+    system_stable_prefix: Option<String>,
     /// Optional best-effort sink for daemon cost events.
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
     /// Per-call metadata supplied by borgd.
@@ -1105,6 +1114,22 @@ impl LlmClient {
     pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
         self.prompt_cache_key = Some(key.into());
         self
+    }
+
+    /// Declare the byte-stable head of the system prompt for the next call, so
+    /// providers with explicit cache breakpoints anchor the system marker at the
+    /// end of the *prefix* instead of the end of the whole prompt. Marking the
+    /// whole prompt caches nothing, because its dynamic tail carries a
+    /// second-resolution clock.
+    ///
+    /// A setter rather than a call parameter because only the main agent turn has
+    /// a prefix worth caching; the aux paths (summarization, title generation)
+    /// would all pass `None`. It is safe to leave set across calls: the transport
+    /// honors the value only while it still prefixes the system message actually
+    /// being sent, so a stale prefix degrades to no split rather than to a
+    /// mismatched breakpoint.
+    pub fn set_system_stable_prefix(&mut self, prefix: Option<String>) {
+        self.system_stable_prefix = prefix;
     }
 
     /// Attach a best-effort daemon sink for per-call cost events.
@@ -2079,6 +2104,7 @@ impl LlmClient {
             tools,
             llm_config: &self.llm_config,
             prompt_cache_key: self.prompt_cache_key.as_deref(),
+            system_stable_prefix: self.system_stable_prefix.as_deref(),
             cost_events_enabled: self.cost_events_enabled(),
         }
     }

@@ -135,8 +135,6 @@ fn box_line(text: &str) -> String {
     format!("\u{2502} {}{} \u{2502}", truncated, " ".repeat(pad))
 }
 
-// ── Tests ──
-
 #[cfg(test)]
 mod tests {
     use super::*;

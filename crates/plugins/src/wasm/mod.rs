@@ -28,6 +28,14 @@ const SCHEMA_VERSION: &str = "borg.plugin.v1";
 const ABI_EXPORT_ALLOC: &str = "alloc";
 const ABI_EXPORT_CALL: &str = "borg_tool_call";
 const ABI_EXPORT_MEMORY: &str = "memory";
+// Host-import module names. Shared by the static-validation allowlist
+// (`validate.rs`) and the runtime linker (`execute.rs`) — if those two drift,
+// a module that passed capability validation can bind a host function it never
+// declared, so they must read from one source.
+const ABI_IMPORT_LOG: &str = "borg:log";
+const ABI_IMPORT_HTTP: &str = "borg:http";
+const ABI_IMPORT_STATE: &str = "borg:state";
+const ABI_IMPORT_CREDENTIALS: &str = "borg:credentials";
 // Sandbox resource caps. `*_DEFAULT` apply when a manifest omits a limit;
 // `*_LIMIT` are the hard ceilings a manifest can request. WASM pages are
 // 64 KiB, so 256 pages = 16 MiB max guest heap. Fuel bounds total executed
@@ -35,6 +43,10 @@ const ABI_EXPORT_MEMORY: &str = "memory";
 // fuel-heavy-but-not-fuel-exhausting loops.
 const MAX_OUTPUT_BYTES_DEFAULT: u64 = 64 * 1024;
 const MAX_MEMORY_PAGES_DEFAULT: u64 = 16;
+// 10M fuel is order-of-100ms of guest work — comfortably more than any
+// request/response-shaped tool needs, while an unbounded loop trips it almost
+// immediately. The 5x ceiling gives compute-heavy plugins headroom to opt into
+// without letting a manifest ask for an effectively unbounded budget.
 const FUEL_DEFAULT: u64 = 10_000_000;
 const MAX_FUEL_LIMIT: u64 = 50_000_000;
 const MAX_TIMEOUT_MS_LIMIT: u64 = 60_000;

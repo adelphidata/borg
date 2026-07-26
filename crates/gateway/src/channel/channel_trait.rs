@@ -323,7 +323,6 @@ pub async fn dispatch_webhook(
                         )
                         .await;
 
-                        // Stop typing regardless of outcome
                         if let Some(t) = typing {
                             t.stop().await;
                         }
@@ -433,6 +432,8 @@ pub async fn dispatch_webhook(
                                 tracing::warn!("Failed to send {channel_name} response: {e}");
                                 // Mark as failed — drain loop will retry
                                 if let Some(ref db) = db {
+                                    // 30s backs off past a transient channel-API
+                                    // blip without stalling a user-visible reply.
                                     let retry_at = chrono::Utc::now().timestamp() + 30;
                                     if let Err(e2) = db
                                         .mark_failed(&delivery_id, &e.to_string(), Some(retry_at))

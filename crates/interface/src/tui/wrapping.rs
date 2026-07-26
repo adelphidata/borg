@@ -672,7 +672,6 @@ where
         return vec![rt_opts.initial_indent.clone()];
     };
 
-    // Build first wrapped line with initial indent.
     let mut first_line = rt_opts.initial_indent.clone().style(line.style);
     {
         let sliced = slice_line_spans(line, &span_bounds, first_line_range);

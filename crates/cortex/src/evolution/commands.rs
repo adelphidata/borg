@@ -207,8 +207,6 @@ async fn format_posture_line(db: &Database) -> String {
     )
 }
 
-// ── Tests ──
-
 #[cfg(test)]
 mod tests {
     use super::*;

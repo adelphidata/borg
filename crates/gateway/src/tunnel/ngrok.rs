@@ -11,6 +11,9 @@ use crate::tunnel::{
 };
 
 const NGROK_INSTALL_URL: &str = "https://ngrok.com/download";
+/// ngrok surfaces its URL over the local agent API almost immediately, so the
+/// deadline is half cloudflared's; the bounded error tail keeps a crash loop
+/// from flooding the log.
 const URL_DEADLINE: Duration = Duration::from_secs(15);
 const PER_LINE_TIMEOUT: Duration = Duration::from_secs(3);
 const ERROR_TAIL_TIMEOUT: Duration = Duration::from_secs(1);

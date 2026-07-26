@@ -93,17 +93,30 @@ pub fn generate_root_ca(common_name: &str) -> Result<RootCa, PkiError> {
     })
 }
 
+/// Rebuild the issuer `Certificate` from its stored PEMs.
+///
+/// `self_signed` here does NOT mint a new CA — rcgen requires a live
+/// `Certificate` value to sign with, and re-self-signing the parsed params with
+/// the original key reproduces the existing root deterministically.
+fn load_issuer(
+    root_cert_pem: &str,
+    root_key_pkcs8_pem: &str,
+) -> Result<(rcgen::Certificate, KeyPair), PkiError> {
+    let issuer_key =
+        KeyPair::from_pem(root_key_pkcs8_pem).map_err(|e| PkiError::KeyGen(e.to_string()))?;
+    let issuer_params = CertificateParams::from_ca_cert_pem(root_cert_pem)
+        .map_err(|e| PkiError::Parse(e.to_string()))?;
+    let issuer_cert = issuer_params.self_signed(&issuer_key)?;
+    Ok((issuer_cert, issuer_key))
+}
+
 /// Issue a server cert signed by the supplied root CA.
 pub fn issue_server_cert(
     root_cert_pem: &str,
     root_key_pkcs8_pem: &str,
     params_in: &ServerCertParams<'_>,
 ) -> Result<(IssuedCert, String), PkiError> {
-    let issuer_key =
-        KeyPair::from_pem(root_key_pkcs8_pem).map_err(|e| PkiError::KeyGen(e.to_string()))?;
-    let issuer_params = CertificateParams::from_ca_cert_pem(root_cert_pem)
-        .map_err(|e| PkiError::Parse(e.to_string()))?;
-    let issuer_cert = issuer_params.self_signed(&issuer_key)?;
+    let (issuer_cert, issuer_key) = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
 
     let mut params = CertificateParams::default();
     params.distinguished_name = name(params_in.common_name);
@@ -149,11 +162,7 @@ pub fn issue_client_cert(
     root_key_pkcs8_pem: &str,
     params_in: &ClientCertParams<'_>,
 ) -> Result<IssuedCert, PkiError> {
-    let issuer_key =
-        KeyPair::from_pem(root_key_pkcs8_pem).map_err(|e| PkiError::KeyGen(e.to_string()))?;
-    let issuer_params = CertificateParams::from_ca_cert_pem(root_cert_pem)
-        .map_err(|e| PkiError::Parse(e.to_string()))?;
-    let issuer_cert = issuer_params.self_signed(&issuer_key)?;
+    let (issuer_cert, issuer_key) = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
 
     let client_pubkey = KeyPair::from_pem(params_in.client_public_key_pem)
         .map_err(|e| PkiError::KeyGen(format!("client pubkey parse: {e}")))?;

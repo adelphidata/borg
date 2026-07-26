@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -110,7 +109,6 @@ pub fn uninstall(def: &PluginDef, data_dir: &std::path::Path) -> Result<()> {
         }
     }
 
-    // Remove keychain entries and verify removal
     let service = def.service_name();
     for cred in def.required_credentials {
         remove_credential(&service, cred.key);
@@ -172,10 +170,10 @@ pub fn compute_file_hashes(def: &PluginDef, data_dir: &std::path::Path) -> Vec<(
         let full_path = tmpl.target.base_dir(data_dir).join(tmpl.relative_path);
         match std::fs::read(&full_path) {
             Ok(content) => {
-                let mut hasher = Sha256::new();
-                hasher.update(&content);
-                let hex = format!("{:x}", hasher.finalize());
-                hashes.push((tmpl.relative_path.to_string(), hex));
+                hashes.push((
+                    tmpl.relative_path.to_string(),
+                    crate::wasm::sha256_hex(&content),
+                ));
             }
             Err(e) => {
                 tracing::warn!("Failed to read {} for hashing: {e}", full_path.display());

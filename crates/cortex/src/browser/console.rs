@@ -13,6 +13,8 @@ impl<T> RingBuffer<T> {
     /// Create a new ring buffer with the given maximum capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
+            // Preallocate at most 1024 slots: `capacity` is caller-supplied and
+            // may be huge, but the ring fills lazily so growth is cheap.
             buf: VecDeque::with_capacity(capacity.min(1024)),
             capacity,
         }

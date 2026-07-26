@@ -60,7 +60,11 @@ pub const MAX_SCHEMA_BYTES: usize = 32 * 1024;
 /// adversarial schemas that try to balloon prompt size.
 pub const MAX_PROPERTIES: usize = 64;
 
-/// Global cap on the total number of MCP tools across all servers.
+/// Global cap on the total number of MCP tools across all servers. Sized as
+/// roughly four servers at the per-server [`ToolFilter::DEFAULT_MAX`] of 32;
+/// past that, MCP schemas crowd out borg's own tools in the system prompt.
+///
+/// [`ToolFilter::DEFAULT_MAX`]: crate::manifest::ToolFilter::DEFAULT_MAX
 pub const DEFAULT_GLOBAL_TOOL_CAP: usize = 128;
 
 /// One registered MCP tool, ready for the agent loop to dispatch.

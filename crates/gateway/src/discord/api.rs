@@ -201,7 +201,6 @@ impl DiscordClient {
         })
         .await?;
 
-        // Send remaining chunks as follow-up messages
         for chunk in &chunks[1..] {
             let followup_url =
                 format!("{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}");

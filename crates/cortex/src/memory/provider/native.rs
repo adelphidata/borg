@@ -13,6 +13,8 @@ use super::{
 };
 use crate::memory::WriteMode;
 
+const PROVIDER_NAME: &str = "native";
+
 /// Adapter onto Borg's in-process SQLite memory store.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeProvider;
@@ -26,7 +28,7 @@ impl NativeProvider {
 #[async_trait]
 impl MemoryProvider for NativeProvider {
     fn name(&self) -> &'static str {
-        "native"
+        PROVIDER_NAME
     }
 
     async fn write(
@@ -45,7 +47,7 @@ impl MemoryProvider for NativeProvider {
             .await
             .map(|_| ())
             .map_err(|e| MemoryError::Backend {
-                provider: "native",
+                provider: PROVIDER_NAME,
                 detail: e.to_string(),
             })
     }
@@ -155,14 +157,14 @@ impl MemoryProvider for NativeProvider {
 
 fn backend(detail: String) -> MemoryError {
     MemoryError::Backend {
-        provider: "native",
+        provider: PROVIDER_NAME,
         detail,
     }
 }
 
 fn transport(detail: String) -> MemoryError {
     MemoryError::Transport {
-        provider: "native",
+        provider: PROVIDER_NAME,
         detail,
     }
 }

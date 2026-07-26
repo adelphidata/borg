@@ -187,8 +187,6 @@ pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
     out
 }
 
-// ── Milestone celebrations ──
-
 /// Compact payload emitted for sub-evolution milestones.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MilestonePayload {

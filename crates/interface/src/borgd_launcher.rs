@@ -1,9 +1,5 @@
 //! Launcher for the standalone `borgd` daemon binary.
 //!
-//! Replaces the legacy `service::*` helpers that spawned the daemon via
-//! `borg daemon`. Every helper in this module targets the `borgd` binary —
-//! the `borg` CLI no longer hosts the daemon event loop itself.
-//!
 //! Resolution order for the `borgd` binary:
 //! 1. `$BORG_DAEMON_BIN` environment variable.
 //! 2. Sibling of the current executable (`current_exe().parent()/borgd`),
@@ -265,6 +261,8 @@ pub async fn restart_service() -> Result<()> {
     if let Err(e) = stop_service().await {
         tracing::warn!("Stop during restart failed: {e}");
     }
+    // Bounded so a wedged daemon that never closes its socket still lets the
+    // restart proceed rather than hanging the CLI indefinitely.
     let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < drain_deadline {
         if !daemon_reachable().await {
@@ -748,6 +746,8 @@ pub fn kill_other_borg_processes() {
                 }
             }
         }
+        // SIGKILL is asynchronous: give the kernel a moment to reap before the
+        // caller deletes `~/.borg/`, or a dying daemon can recreate it.
         std::thread::sleep(Duration::from_millis(200));
     }
 }

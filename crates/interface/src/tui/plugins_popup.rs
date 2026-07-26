@@ -388,7 +388,6 @@ impl PluginsPopup {
                         return None;
                     }
 
-                    // Build final actions list
                     let mut all_actions: Vec<PluginAction> = skill_actions;
 
                     // Process channel actions — separate into needs-creds and immediate

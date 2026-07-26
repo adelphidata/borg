@@ -206,11 +206,15 @@ impl<'a> ScriptRunner<'a> {
             .map_err(|_| anyhow::anyhow!("'{}' timed out after {}ms", self.name, self.timeout_ms))?
             .context("Failed to wait for script process")?;
 
+        let truncation_note = format!(
+            "\n[output truncated at {}MB]",
+            MAX_OUTPUT_BYTES / (1024 * 1024)
+        );
         if stdout_truncated {
-            stdout_buf.push_str("\n[output truncated at 10MB]");
+            stdout_buf.push_str(&truncation_note);
         }
         if stderr_truncated {
-            stderr_buf.push_str("\n[output truncated at 10MB]");
+            stderr_buf.push_str(&truncation_note);
         }
 
         Ok(ScriptOutput {
@@ -276,6 +280,10 @@ pub async fn run_sandboxed_script(
 /// Prevents path traversal attacks via symlinks or `..` components.
 pub fn validate_script_path(base_dir: &Path, script_name: &str) -> Result<std::path::PathBuf> {
     let script_path = base_dir.join(script_name);
+    // A not-yet-created script can't be canonicalized, so the lexical `..` check
+    // is all we have. Safe because the caller writes the file at this exact path
+    // immediately after; a symlink planted in between is caught on the next call,
+    // which does canonicalize.
     if !script_path.exists() {
         if script_name.contains("..") {
             bail!("Script '{script_name}' contains path traversal");

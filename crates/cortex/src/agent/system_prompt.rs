@@ -132,6 +132,35 @@ const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/
 
 const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
+/// What one [`Agent::build_system_prompt`] call produced.
+///
+/// `withhold_tools` rides back with the text rather than living on `Agent`
+/// because it is decided *during* this call — SETUP.md's turn-1 injection is what
+/// raises it. As a field it was an implicit channel between two functions, and a
+/// caller that read it before calling this got the previous turn's answer:
+/// tools on the one turn that must not have them, and none on the turn that
+/// needs `request_user_input`.
+pub(super) struct BuiltSystemPrompt {
+    /// The assembled prompt.
+    pub(super) text: String,
+    /// Ship an empty tools array for this turn (runtime enforcement of SETUP.md's
+    /// "do not call any tools on your first message"). Applies to this turn only.
+    pub(super) withhold_tools: bool,
+    /// Byte length of the stable prefix — the offset in [`Self::text`] where
+    /// `// === DYNAMIC SUFFIX ===` begins.
+    ///
+    /// The prefix/suffix boundary is a real value here rather than only the
+    /// comment markers below, because the wire needs it: providers with explicit
+    /// cache breakpoints must mark the end of the *prefix*, not the end of the
+    /// whole prompt. Marking the whole prompt caches nothing — the suffix ends
+    /// with a second-resolution `Current Time`, so the block is byte-different
+    /// every turn and never hits.
+    ///
+    /// Always a char boundary: every section is pushed whole, so the offset
+    /// falls between sections.
+    pub(super) stable_prefix_len: usize,
+}
+
 impl Agent {
     /// Build the full system prompt for this turn.
     ///
@@ -148,7 +177,11 @@ impl Agent {
     /// `build_system_prompt_*` tests source-grep for them to detect
     /// reordering regressions.
     #[instrument(skip_all)]
-    pub(super) async fn build_system_prompt(&mut self, tools: &[ToolDefinition]) -> Result<String> {
+    pub(super) async fn build_system_prompt(
+        &mut self,
+        tools: &[ToolDefinition],
+    ) -> Result<BuiltSystemPrompt> {
+        let mut withhold_tools = false;
         let identity = self.caches.identity_or_load(load_identity)?;
         let memory = self.load_memory_with_ranking().await?;
         let knowledge = self.load_knowledge_with_ranking().await?;
@@ -259,6 +292,13 @@ impl Agent {
 
         // === DYNAMIC SUFFIX === per-turn content that invalidates the prefix cache.
 
+        // Captured here, at the boundary itself, so it cannot drift from the
+        // ordering above the way a separately-maintained constant or a
+        // search-for-a-section-header scan would. (A scan is actively unsafe:
+        // `<project_instructions>` above embeds user AGENTS.md/CLAUDE.md content,
+        // which can name any section header we might search for.)
+        let stable_prefix_len = system.len();
+
         // Active memory: per-turn hybrid search of memory + past sessions
         // keyed off the latest user message. Placed at the start of the
         // dynamic suffix so it sits adjacent to <working_memory> and after
@@ -310,13 +350,17 @@ impl Agent {
                         // `write_memory` call anyway). Subsequent turns
                         // keep SETUP.md in context but unblock tools so
                         // the model can call `request_user_input`.
-                        self.setup_just_consumed = true;
+                        withhold_tools = true;
                     }
                 }
             }
         }
 
-        Ok(system)
+        Ok(BuiltSystemPrompt {
+            text: system,
+            withhold_tools,
+            stable_prefix_len,
+        })
     }
 
     /// Build the optional `<context_window_guidance>` developer section from
@@ -391,15 +435,9 @@ impl Agent {
     /// wait/close set). Dynamic tools (WASM plugins, integrations registered
     /// via skills) won't have a static entry — for those the section falls
     /// back to the first sentence of the tool's `ToolDefinition::description`.
-    /// `tools` MUST be the same, already-filtered slice handed to the model.
-    ///
-    /// This section used to recompute the catalog from
-    /// `core_tool_definitions` and applied none of `tools_filter`,
-    /// `tool::policy::filter_tools`, or `filter_tools_by_relevance`. The prompt
-    /// therefore advertised tools that had been stripped from the tools array —
-    /// the model would call one and hit `UnknownToolTracker` — and the list grew
-    /// a line per MCP tool with no budget of its own. Taking the array as an
-    /// argument makes drift impossible rather than merely unlikely.
+    /// `tools` MUST be the same, already-filtered slice handed to the model:
+    /// advertising a tool that was stripped from the array makes the model call
+    /// it and trip `UnknownToolTracker`.
     pub(super) fn build_tooling_section(tools: &[ToolDefinition]) -> String {
         if tools.is_empty() {
             return String::new();
@@ -1113,8 +1151,13 @@ mod build_system_prompt_tests {
         let start = SYSTEM_PROMPT_RS_SRC
             .find("async fn build_system_prompt")
             .expect("build_system_prompt must exist");
-        // Extract ~6KB following the signature — plenty to cover the body.
-        let end = (start + 6000).min(SYSTEM_PROMPT_RS_SRC.len());
+        // End at the next item's doc comment rather than a byte count: a fixed
+        // window silently truncates the body when the function grows, and a guard
+        // that stops finding the call it checks for panics on `expect` instead of
+        // reporting the ordering it exists to protect.
+        let end = SYSTEM_PROMPT_RS_SRC[start..]
+            .find("\n    /// ")
+            .map_or(SYSTEM_PROMPT_RS_SRC.len(), |offset| start + offset);
         &SYSTEM_PROMPT_RS_SRC[start..end]
     }
 

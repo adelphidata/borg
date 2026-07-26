@@ -176,17 +176,15 @@ impl VadFsm {
                     }
                 }
             }
-        } else if let Some(start) = self.speech_start {
+        } else if self.speech_start.is_some() {
             // Pre-confirmation dip — tolerate `dip_tolerance_secs` of
             // sub-threshold before resetting the speech-attempt timer.
-            //
             match self.dip_start {
                 None => self.dip_start = Some(now),
                 Some(dip) => {
                     if now.duration_since(dip) >= dip_tol {
                         self.speech_start = None;
                         self.dip_start = None;
-                        let _ = start;
                     }
                 }
             }
@@ -716,8 +714,9 @@ fn process_chunk(shared: &Arc<RecorderShared>, samples: &[i16]) {
             thread::Builder::new()
                 .name("borg-voice-silence-cb".into())
                 .spawn(cb)
+                // Detached on purpose: the callback thread self-terminates, and a
+                // spawn failure here must not abort silence detection.
                 .map(|h| {
-                    // Detach.
                     let _ = h;
                 })
                 .ok();

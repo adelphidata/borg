@@ -154,8 +154,6 @@ fn parse_string_field(e: &EvolutionEvent, key: &str) -> Option<String> {
         .map(String::from)
 }
 
-// ── Tests ──
-
 #[cfg(test)]
 mod tests {
     use super::*;

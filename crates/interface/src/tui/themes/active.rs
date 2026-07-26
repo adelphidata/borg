@@ -6,10 +6,15 @@
 //! rare writes. The Arc indirection keeps the readback-and-drop pattern
 //! deadlock-free even under concurrent preview swaps.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use super::builtins;
 use super::palette::Theme;
+
+/// Bumped on every [`set_active`] so render caches can key on the active palette
+/// without cloning or structurally comparing a [`Theme`].
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn cell() -> &'static RwLock<Arc<Theme>> {
     static CELL: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
@@ -38,6 +43,18 @@ pub fn set_active(theme: Arc<Theme>) {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = theme;
+    GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Identity of the currently-active palette, changing on every [`set_active`].
+///
+/// Any memoized render output that baked concrete colors into its result MUST
+/// include this in its cache key. `theme.rs` is built on the assumption that the
+/// palette is read fresh on every render pass, so a cache that outlives a
+/// `/theme` swap (including the popup's live preview, which swaps on cursor
+/// move) would keep painting the old colors.
+pub fn active_generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
 }
 
 /// Lock for tests that mutate the process-global active cell. `cargo test`

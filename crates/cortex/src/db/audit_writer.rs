@@ -3,7 +3,6 @@
 use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
-use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::{AuditChainOutcome, Database};
@@ -126,7 +125,10 @@ impl AuditWriter {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
+use serde_json::Value;
+
+#[cfg(test)]
 pub fn payload(pairs: &[(&str, Value)]) -> Value {
     let mut map = serde_json::Map::with_capacity(pairs.len());
     for (k, v) in pairs {

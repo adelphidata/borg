@@ -124,7 +124,6 @@ async fn compute_listeners(db: &Database) -> Result<Vec<ListenerPosture>> {
     Ok(listeners)
 }
 
-// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests {
     use super::*;

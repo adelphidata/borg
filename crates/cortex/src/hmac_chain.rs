@@ -165,9 +165,6 @@ pub struct ChainCheckpoint {
     pub created_at: i64,
 }
 
-/// How often to write checkpoints (every N verified events).
-pub const CHECKPOINT_INTERVAL: u32 = constants::HMAC_CHECKPOINT_INTERVAL;
-
 #[cfg(test)]
 mod tests {
     use super::*;

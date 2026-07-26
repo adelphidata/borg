@@ -12,6 +12,10 @@ use crate::tunnel::{
 
 const CLOUDFLARED_INSTALL_URL: &str =
     "https://github.com/cloudflare/cloudflared/releases (or `brew install cloudflared`)";
+/// `cloudflared` prints its URL only after the edge handshake completes, so the
+/// deadline must cover a cold connection; the per-line timeout keeps a silent
+/// child from pinning the deadline, and the error tail is bounded so a chatty
+/// crash loop can't be dumped wholesale into the log.
 const URL_DEADLINE: Duration = Duration::from_secs(30);
 const PER_LINE_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_TAIL_TIMEOUT: Duration = Duration::from_secs(1);

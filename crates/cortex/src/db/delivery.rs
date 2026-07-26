@@ -5,8 +5,6 @@ use super::models::{DeliveryRow, NewDelivery};
 use super::Database;
 
 impl Database {
-    // ── Delivery Queue ──
-
     pub async fn enqueue_delivery(&self, d: &NewDelivery<'_>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(

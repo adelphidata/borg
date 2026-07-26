@@ -149,7 +149,6 @@ impl MigrateState {
         if idx < Tab::ALL.len() - 1 {
             self.tab = Tab::ALL[idx + 1];
 
-            // Build plan when entering Preview
             if self.tab == Tab::Preview && self.plan.is_none() {
                 self.build_preview();
             }

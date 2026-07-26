@@ -97,7 +97,6 @@ impl Database {
     }
 
     /// Delete activity log entries older than the given cutoff timestamp.
-    /// Returns the number of deleted rows.
     pub async fn prune_activity_before(&self, cutoff_timestamp: i64) -> Result<usize> {
         let deleted = self
             .conn

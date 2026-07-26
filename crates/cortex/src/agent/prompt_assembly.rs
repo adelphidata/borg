@@ -1021,23 +1021,24 @@ Rules:
 
         // Tools are resolved BEFORE the system prompt: the prompt's `<tooling>`
         // section is rendered from this exact slice, so it can never advertise a
-        // tool the model wasn't given. (It also means the setup turn below, which
-        // deliberately ships no tools, no longer describes tools it can't call.)
-        let tool_defs = if self.setup_just_consumed {
-            // First post-onboarding turn: starve the model of tool definitions
-            // entirely. SETUP.md's "DO NOT call any tools on your first message"
-            // prompt rule is not enough for weak models — this is the runtime
-            // enforcement. Flag is single-shot; the next turn gets tools back.
-            self.setup_just_consumed = false;
-            Vec::new()
-        } else {
-            self.build_tool_definitions(&user_msg).await
-        };
+        // tool the model wasn't given.
+        let mut tool_defs = self.build_tool_definitions(&user_msg).await;
 
-        let mut system_prompt = self
+        let built = self
             .build_system_prompt(&tool_defs)
             .await
             .context("Failed to build system prompt")?;
+        let mut system_prompt = built.text;
+
+        // The decision comes back from the call that makes it, so it always
+        // describes *this* turn. SETUP.md's "DO NOT call any tools on your first
+        // message" prompt rule is not enough for weak models — an empty tools
+        // array is the runtime enforcement. It applies to the setup turn only;
+        // the next turn gets tools back so the model can call
+        // `request_user_input`.
+        if built.withhold_tools {
+            tool_defs.clear();
+        }
 
         // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
         let hook_point = if iteration == 1 {

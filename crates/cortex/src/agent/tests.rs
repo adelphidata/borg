@@ -21,8 +21,13 @@ fn extract_build_system_prompt_body() -> &'static str {
     let start = SYSTEM_PROMPT_RS_SRC
         .find("async fn build_system_prompt")
         .expect("build_system_prompt must exist in system_prompt.rs");
-    // Extract ~6KB following the signature — plenty to cover the body.
-    let end = (start + 6000).min(SYSTEM_PROMPT_RS_SRC.len());
+    // End at the next item's doc comment rather than a byte count: a fixed
+    // window silently truncates the body when the function grows, and a guard
+    // that stops finding the call it checks for panics on `expect` instead of
+    // reporting the ordering it exists to protect.
+    let end = SYSTEM_PROMPT_RS_SRC[start..]
+        .find("\n    /// ")
+        .map_or(SYSTEM_PROMPT_RS_SRC.len(), |offset| start + offset);
     &SYSTEM_PROMPT_RS_SRC[start..end]
 }
 
@@ -299,7 +304,6 @@ fn minimal_test_agent(config: Config) -> Agent {
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
-        setup_just_consumed: false,
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
         llm_role: LlmRole::Primary,

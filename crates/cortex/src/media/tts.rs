@@ -344,6 +344,8 @@ struct GeminiTtsProvider {
     default_voice: String,
 }
 
+/// Fixed by the Gemini TTS API — it returns raw PCM with no container, so the
+/// rate can't be sniffed and must be hardcoded to build a valid WAV header.
 const GEMINI_TTS_SAMPLE_RATE: u32 = 24_000;
 
 #[async_trait::async_trait]

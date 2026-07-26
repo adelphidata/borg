@@ -44,7 +44,6 @@ pub struct DiagnosticCheck {
 }
 
 impl DiagnosticCheck {
-    /// Create a passing check.
     pub fn pass(category: &'static str, name: impl Into<String>) -> Self {
         Self {
             category,
@@ -56,7 +55,6 @@ impl DiagnosticCheck {
         }
     }
 
-    /// Create a warning check.
     pub fn warn(category: &'static str, name: impl Into<String>, msg: impl Into<String>) -> Self {
         Self {
             category,
@@ -68,7 +66,6 @@ impl DiagnosticCheck {
         }
     }
 
-    /// Create a failing check.
     pub fn fail(category: &'static str, name: impl Into<String>, msg: impl Into<String>) -> Self {
         Self {
             category,

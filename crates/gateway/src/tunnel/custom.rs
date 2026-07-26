@@ -12,6 +12,8 @@ use crate::tunnel::{
     TunnelProcess,
 };
 
+/// Operator commands are arbitrary, so budget for a cloudflared-class startup
+/// rather than assuming a fast local agent.
 const URL_DEADLINE: Duration = Duration::from_secs(30);
 const PER_LINE_TIMEOUT: Duration = Duration::from_secs(5);
 

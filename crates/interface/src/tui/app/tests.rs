@@ -8,11 +8,9 @@ fn make_app() -> App<'static> {
     App::new(config, None, None, None, client, None)
 }
 
-// ========================================================================
 // build_doctor_warning_lines — pure rendering helper for the startup
 // amber warning card. Drives the formatter directly without touching the
 // daemon or SQLite.
-// ========================================================================
 
 fn warns(s: &[&str]) -> Vec<String> {
     s.iter().map(|w| (*w).to_string()).collect()
@@ -113,10 +111,8 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-// ========================================================================
 // /btw routing — popup visibility does not disturb main agent state, late
 // results against a dismissed/superseded popup are discarded.
-// ========================================================================
 
 #[test]
 fn cmd_btw_empty_pushes_usage_does_not_open_popup() {
@@ -217,9 +213,7 @@ fn btw_result_err_transitions_popup_to_error() {
     }
 }
 
-// ========================================================================
 // Transcript pager (Ctrl+T) — opening, routing, dismissal.
-// ========================================================================
 
 #[test]
 fn ctrl_t_opens_transcript_pager_from_idle() {
@@ -254,13 +248,11 @@ fn esc_in_pager_dismisses_back_to_idle() {
     assert!(!app.transcript_pager.visible);
 }
 
-// ========================================================================
 // Alt-screen wrap — emit EnterAltScreen / LeaveAltScreen and
 // surface the desired alt-screen state to the event loop.
 //
 // Regression guard: if any of these break, large popups will paint into
 // the inline viewport and clip / overwrite the composer.
-// ========================================================================
 
 #[test]
 fn ctrl_t_emits_enter_alt_screen() {
@@ -1879,9 +1871,7 @@ fn model_prefix_rejects_malformed() {
     assert!(has_usage, "malformed /model should show usage hint");
 }
 
-// ========================================================================
 // StreamStatus — the live header + details shown in the status row.
-// ========================================================================
 
 #[test]
 fn stream_status_set_details_passes_short_string_through() {
@@ -2314,9 +2304,7 @@ fn voice_help_lists_command() {
     );
 }
 
-// ========================================================================
 // extract_at_query — decides whether the composer is mid-`@file` mention.
-// ========================================================================
 
 /// Whitespace ends the mention token; punctuation must not, because paths
 /// legitimately contain `.`, `-` and `/`.

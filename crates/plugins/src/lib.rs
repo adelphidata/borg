@@ -236,6 +236,3 @@ pub enum InstallEvent {
     },
 }
 
-// Behavioral coverage of `Platform`, `PluginKind`, `Category`, `TemplateTarget`
-// lives at the integration points that consume them (e.g. installer's
-// `check_prerequisites`, catalog filtering).

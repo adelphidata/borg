@@ -101,6 +101,8 @@ impl WaitCondition {
     }
 }
 
+// 100ms keeps a CDP round-trip per poll well under the interval while still
+// resolving sub-frame conditions faster than a human notices.
 const POLL_INTERVAL_MS: u64 = 100;
 
 /// Poll the page until `condition` is met or `timeout` expires.

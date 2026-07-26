@@ -214,8 +214,7 @@ mod tests {
     fn malformed_json_surfaces_as_error() {
         // The pool catches the Err and logs+continues, so the agent still
         // boots. But the source itself must report the error rather than
-        // silently swallowing it (CLAUDE.md: "If we report success to the
-        // user, it MUST actually succeed").
+        // silently swallowing it — a success return here would be a lie.
         let home = tempfile::tempdir().unwrap();
         write_fixture(home.path(), ".claude/.credentials.json", "not json");
         assert!(ClaudeCodeSource.discover(home.path()).is_err());

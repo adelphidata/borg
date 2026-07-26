@@ -310,12 +310,12 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
     let mut operations = Vec::new();
     let mut i = 0;
 
-    // Skip leading whitespace/empty lines
     while i < lines.len() && lines[i].trim().is_empty() {
         i += 1;
     }
 
-    // Expect "*** Begin Patch" (optional — be lenient for backward compat)
+    // `check_patch_boundaries` already required the sentinel in both parse
+    // modes, so this only consumes it.
     if i < lines.len() && lines[i].trim() == BEGIN_PATCH_MARKER {
         i += 1;
     }

@@ -149,11 +149,8 @@ impl OwnedPseudoConsole {
             }
             return Err(io::Error::from_raw_os_error(hr));
         }
-        // PTY now owns input_read and output_write; drop our local
-        // references by zeroing them is unnecessary — we never use
-        // them again from Rust, and ClosePseudoConsole handles cleanup.
-        // But ensure they aren't accidentally closed on a future
-        // refactor by sticking `let _ = …` markers in.
+        // Named bindings mark the ownership transfer for readers: from here on
+        // ClosePseudoConsole is the only thing allowed to close these two.
         let _pty_owns_input_read = input_read;
         let _pty_owns_output_write = output_write;
         Ok(Self {

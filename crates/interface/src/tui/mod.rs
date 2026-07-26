@@ -481,7 +481,6 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         });
     }
 
-    // Auto-start gateway if enabled and any channels are installed
     let gateway_shutdown_token = CancellationToken::new();
     let _gateway_guard = gateway_shutdown_token.clone().drop_guard();
     spawn_gateway(&config, gateway_shutdown_token.clone(), metrics.clone());
@@ -570,6 +569,8 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     }
 
     let mut event_stream = EventStream::new();
+    // 100ms keeps the elapsed clock / spinner visibly smooth without waking
+    // the loop often enough to matter when the agent is idle.
     let tick_rate = Duration::from_millis(100);
 
     run_event_loop(
@@ -1111,6 +1112,9 @@ async fn run_event_loop(
                     // The shell printed job-control output and the user may have
                     // typed while we were stopped; drop those buffered bytes so
                     // focus reports and stray keys do not leak into the composer.
+                    // Short window + hard cap: buffered bytes are already in
+                    // the pty, so 10ms is ample, and the cap stops a key-repeat
+                    // flood from stalling the resume path.
                     let dropped =
                         drain_pending_events(event_stream, Duration::from_millis(10), 64).await;
                     if dropped > 0 {
@@ -1902,6 +1906,8 @@ async fn run_event_loop(
 
                 // Fullscreen ASCII art goodbye
                 goodbye::render(tui)?;
+                // Hold the farewell frame long enough to be read before the
+                // process exits and the terminal is restored.
                 tokio::time::sleep(Duration::from_secs(3)).await;
 
                 // Final sweep: delete data dir again in case a background task

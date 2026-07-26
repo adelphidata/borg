@@ -141,7 +141,6 @@ pub async fn handle_telegram_webhook(
     // Validate and parse the update JSON
     let update = verify::validate_update(body)?;
 
-    // Verify secret token if configured
     if let Some(secret) = secret {
         if !verify::verify_secret_token(headers, secret) {
             anyhow::bail!("Telegram webhook secret verification failed");
@@ -156,7 +155,6 @@ pub async fn handle_telegram_webhook(
         }
     }
 
-    // Parse into InboundMessage + optional media refs
     Ok(parse::parse_update(&update))
 }
 

@@ -66,8 +66,6 @@ pub fn load_or_create_signing_key(store: &dyn KeyStore) -> Result<(SigningKey, b
     Ok((SigningKey::from_bytes(&seed), created))
 }
 
-// ── In-memory test impl ──
-
 /// Test-only keystore. Persists the key for the lifetime of the process so
 /// `load_or_create()` is deterministic across calls within a test.
 #[derive(Default)]
@@ -96,8 +94,6 @@ impl KeyStore for InMemoryKeyStore {
         Ok((seed, true))
     }
 }
-
-// ── Platform impls ──
 
 #[cfg(target_os = "macos")]
 struct MacKeychain {

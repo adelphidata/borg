@@ -582,7 +582,6 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Set up a global cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
     {
         let shutdown = shutdown.clone();
@@ -792,7 +791,6 @@ fn init_data_dir() -> Result<()> {
     let data_dir = cortex::config::Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
-    // Run interactive onboarding wizard
     match onboarding::run_onboarding()? {
         Some(result) => {
             onboarding::apply_onboarding(&result)?;
@@ -922,10 +920,8 @@ mod tests {
     }
 
     // Onboarding-sentinel round-trip is covered in `borgd`'s
-    // `admin_rpc_smoke::onboarding_state_round_trips_through_settings_table`
-    // — that exercises the live daemon path the cli now uses, which is more
-    // honest than testing a since-removed `is_onboarded_from_db` helper
-    // against an in-memory DB.
+    // `admin_rpc_smoke::onboarding_state_round_trips_through_settings_table`,
+    // which exercises the live daemon path the cli actually uses.
 
     #[test]
     fn delete_data_dir_removes_directory() {

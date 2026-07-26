@@ -78,6 +78,31 @@ fn push_bind_if_exists(args: &mut Vec<String>, flag: &str, path: &str) {
     }
 }
 
+/// [`push_bind`] for a write grant, materializing the directory when absent.
+///
+/// Silently skipping a write grant is worse than either alternative: the path
+/// often still *exists* inside the namespace — under `--tmpfs /tmp`, or beneath a
+/// broader bind — so the tool creates it, writes its output, exits 0, and
+/// everything it produced dies with the namespace. We would report success for
+/// work that never landed on the host. Creating the directory keeps the grant
+/// real; if that fails we warn and drop the entry rather than let bwrap refuse
+/// the entire invocation over one stale config line.
+fn push_write_bind(args: &mut Vec<String>, path: &str) {
+    let p = Path::new(path);
+    if !p.exists() {
+        if let Err(e) = std::fs::create_dir_all(p) {
+            tracing::warn!(
+                path,
+                error = %e,
+                "sandbox: dropping write grant — path is absent and could not be created; \
+                 writes there will not persist"
+            );
+            return;
+        }
+    }
+    push_bind(args, "--bind", path);
+}
+
 /// Make `path` unreadable inside the sandbox by overlaying it: an empty tmpfs
 /// for directories, a read-only bind of `/dev/null` for regular files. Skips
 /// non-existent paths — bwrap errors on a mount target that doesn't exist.
@@ -130,7 +155,7 @@ pub fn build_bwrap_args_versioned(
     for path in &policy.fs_write {
         let denied = policy.deny_write.iter().any(|d| path.starts_with(d));
         if !denied {
-            push_bind_if_exists(&mut args, "--bind", path);
+            push_write_bind(&mut args, path);
         }
     }
 
@@ -141,9 +166,7 @@ pub fn build_bwrap_args_versioned(
     // Deny reads. Emitted AFTER the fs_read `--ro-bind`s so these overlays win
     // when a deny_read path sits under a broadly-bound read root (e.g. the
     // `trusted` profile binds `/`). Directories are hidden with an empty tmpfs;
-    // regular files are shadowed by a read-only bind of /dev/null. Previously
-    // bwrap ignored deny_read entirely, so on Linux a tool could read
-    // ~/.ssh / ~/.aws / ~/.borg/secrets despite the policy.
+    // regular files are shadowed by a read-only bind of /dev/null.
     for path in &policy.deny_read {
         hide_path(&mut args, path);
     }
@@ -158,15 +181,12 @@ pub fn build_bwrap_args_versioned(
         }
     }
 
-    // Network isolation (unshare network namespace unless allowed)
     if !policy.network {
         args.push("--unshare-net".to_string());
     }
 
-    // Unshare other namespaces for isolation
     args.push("--unshare-pid".to_string());
 
-    // --die-with-parent requires bwrap >= 0.1.8
     let supports_die = version.is_none_or(BwrapVersion::supports_die_with_parent);
     if supports_die {
         args.push("--die-with-parent".to_string());
@@ -288,33 +308,23 @@ mod tests {
     }
 
     /// bwrap exits non-zero on a missing bind source and runs nothing, so a
-    /// policy entry for an absent path must be dropped rather than emitted —
+    /// read entry for an absent path must be dropped rather than emitted —
     /// otherwise one stale config line makes every sandboxed command fail.
-    /// Real trigger: `/etc/ssl/certs` is absent on some minimal container images
-    /// and `with_defaults_applied` used to add it unconditionally.
+    /// Real trigger: `/etc/ssl/certs` is absent on some minimal container images.
     #[test]
-    fn missing_policy_paths_are_skipped_without_dropping_present_ones() {
+    fn missing_read_path_is_skipped_without_dropping_present_ones() {
         let tmp = tempfile::tempdir().unwrap();
         let present_read = tmp.path().join("present-read");
-        let present_write = tmp.path().join("present-write");
         std::fs::create_dir_all(&present_read).unwrap();
-        std::fs::create_dir_all(&present_write).unwrap();
         let present_read_str = present_read.to_string_lossy().into_owned();
-        let present_write_str = present_write.to_string_lossy().into_owned();
         let missing_read = tmp
             .path()
             .join("missing-read")
             .to_string_lossy()
             .into_owned();
-        let missing_write = tmp
-            .path()
-            .join("missing-write")
-            .to_string_lossy()
-            .into_owned();
 
         let policy = SandboxPolicy {
             fs_read: vec![missing_read.clone(), present_read_str.clone()],
-            fs_write: vec![missing_write.clone(), present_write_str.clone()],
             ..Default::default()
         };
         let args = build_bwrap_args(&policy, tmp.path());
@@ -324,18 +334,37 @@ mod tests {
             "missing fs_read path must not be bound: {args:?}"
         );
         assert!(
-            !args.contains(&missing_write),
-            "missing fs_write path must not be bound: {args:?}"
-        );
-        assert!(
             args.windows(3)
                 .any(|w| w[0] == "--ro-bind" && w[1] == present_read_str),
             "a missing sibling must not suppress a real fs_read bind: {args:?}"
         );
+    }
+
+    /// A write grant must never be silently dropped. `/tmp` is an internal tmpfs
+    /// inside the namespace, so a skipped `--bind` leaves the tool writing into
+    /// scratch that evaporates with the sandbox while still exiting 0 — success
+    /// reported for output that never reached the host. Materialize instead.
+    #[test]
+    fn missing_write_path_is_created_and_bound_rather_than_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_write = tmp.path().join("nested").join("output");
+        let missing_write_str = missing_write.to_string_lossy().into_owned();
+        assert!(!missing_write.exists());
+
+        let policy = SandboxPolicy {
+            fs_write: vec![missing_write_str.clone()],
+            ..Default::default()
+        };
+        let args = build_bwrap_args(&policy, tmp.path());
+
+        assert!(
+            missing_write.is_dir(),
+            "the write grant's target must exist on the host after arg building"
+        );
         assert!(
             args.windows(3)
-                .any(|w| w[0] == "--bind" && w[1] == present_write_str),
-            "a missing sibling must not suppress a real fs_write bind: {args:?}"
+                .any(|w| w[0] == "--bind" && w[1] == missing_write_str),
+            "an absent write grant must still be bound: {args:?}"
         );
     }
 

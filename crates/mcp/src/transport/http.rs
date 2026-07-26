@@ -163,8 +163,7 @@ pub const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 /// the same session state. On `404 Not Found` the cached id is dropped and
 /// `send` returns `TransportClosed` — the cortex session task tears the
 /// session down so the operator sees one clear failure rather than a
-/// wedged transport that keeps POSTing without the header. Auto-reconnect
-/// (calling `start_server` again on a torn-down session) is a follow-up.
+/// wedged transport that keeps POSTing without the header.
 pub struct HttpTransport {
     client: Client,
     url: Url,
@@ -338,7 +337,10 @@ impl Transport for HttpTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Stateless: nothing to close.
+        // Streamable HTTP is request-scoped; there is no long-lived socket to
+        // tear down. The server-side session expires on its own TTL — we
+        // deliberately do not send the spec's `DELETE` since a hostile or
+        // unreachable server must not be able to block shutdown.
         Ok(())
     }
 }

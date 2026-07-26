@@ -314,7 +314,24 @@ pub fn estimate_cost_usd(
     cached_input_tokens: u64,
 ) -> Option<String> {
     let rates = rates_for(provider)?;
-    let rate = rates.get(normalize_model_id(model))?;
+    cost_for_rate(
+        rates.get(normalize_model_id(model))?,
+        prompt_tokens,
+        completion_tokens,
+        cached_input_tokens,
+    )
+}
+
+/// The arithmetic behind [`estimate_cost_usd`], split out so it can be pinned
+/// against a synthetic rate row — no shipped model carries a
+/// [`ModelRate::cached_input_per_mtok`] yet, so the discounted branch would
+/// otherwise be untestable through the public entry point.
+fn cost_for_rate(
+    rate: &ModelRate,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_input_tokens: u64,
+) -> Option<String> {
     let input_rate = Usd::parse(rate.input_per_mtok).ok()?;
     // Clamp: a provider reporting more cached than prompt tokens would
     // otherwise underflow to a huge uncached count.
@@ -470,24 +487,22 @@ mod tests {
     ///   total                   = 0.0178
     #[test]
     fn cached_read_rate_is_honored_when_present() {
-        let rate = ModelRate::with_cached_input("10.00", "30.00", "1.00");
-        let input_rate = Usd::parse(rate.input_per_mtok).unwrap();
-        let cached_rate = Usd::parse(rate.cached_input_per_mtok.unwrap()).unwrap();
-        let output_rate = Usd::parse(rate.output_per_mtok).unwrap();
+        let discounted = ModelRate::with_cached_input("10.00", "30.00", "1.00");
+        assert_eq!(
+            cost_for_rate(&discounted, 1_000, 500, 800).unwrap(),
+            "0.0178"
+        );
 
-        let total = Usd::from_tokens_at_rate(200, input_rate)
-            + Usd::from_tokens_at_rate(800, cached_rate)
-            + Usd::from_tokens_at_rate(500, output_rate);
-        assert_eq!(total.to_storage_string(), "0.0178");
-
-        // The same inputs with no cache-read rate bill the full 1000 prompt
+        // Same rate row without the cache-read tier bills the full 1000 prompt
         // tokens at the input rate: 1000 × 10/1e6 + 0.015 = 0.025.
-        let uncached_total = Usd::from_tokens_at_rate(1_000, input_rate)
-            + Usd::from_tokens_at_rate(500, output_rate);
-        assert_eq!(uncached_total.to_storage_string(), "0.025");
-        assert!(
-            total < uncached_total,
-            "a cache-read discount must lower the total"
+        let plain = ModelRate::new("10.00", "30.00");
+        assert_eq!(cost_for_rate(&plain, 1_000, 500, 800).unwrap(), "0.025");
+
+        // A cached count exceeding the prompt total must clamp, not underflow into
+        // a huge uncached slice.
+        assert_eq!(
+            cost_for_rate(&discounted, 1_000, 500, 5_000).unwrap(),
+            cost_for_rate(&discounted, 1_000, 500, 1_000).unwrap()
         );
     }
 

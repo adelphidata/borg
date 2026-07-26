@@ -59,7 +59,6 @@ impl TeamsClient {
             }
         }
 
-        // Fetch a new token
         let resp = self
             .client
             .post(TOKEN_ENDPOINT)
@@ -99,7 +98,6 @@ impl TeamsClient {
 
         let access_token = token_resp.access_token.clone();
 
-        // Update cache
         {
             let mut cache = self
                 .token_cache

@@ -300,6 +300,9 @@ async fn check_task_health_inner(_config: &Config, db: Option<&Database>) -> Opt
 }
 boxed_check!(check_task_health => check_task_health_inner);
 
+/// One day of failures, at most five named — the nudge is injected into a
+/// heartbeat prompt, so a longer window or a full list would burn context on
+/// stale failures the user has already seen.
 const TASK_HEALTH_WINDOW_SECS: i64 = 24 * 60 * 60;
 const TASK_HEALTH_MAX_LISTED: usize = 5;
 

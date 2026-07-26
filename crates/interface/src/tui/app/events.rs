@@ -343,7 +343,6 @@ impl<'a> App<'a> {
         } else {
             DEFAULT_FLUSH_WIDTH
         };
-        // Clean up steer channel on turn completion
         self.steer_tx = None;
         self.pending_steers.clear();
         // Clean up any leftover empty thinking or assistant placeholders

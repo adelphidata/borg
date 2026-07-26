@@ -120,11 +120,18 @@ pub fn load_skills_context(
     });
 
     let mut metadata_parts: Vec<Option<String>> = Vec::with_capacity(sorted_skills.len());
-    let mut estimated_tokens: usize = 0;
+    // The rendered catalog costs more than the sum of its entries: a `# Skills`
+    // header, a `\n---\n\n` rule between consecutive entries, and a trailing
+    // newline. Charging those makes `max_tokens` a bound on what actually reaches
+    // the prompt instead of on the entry bodies alone.
+    let framing_tokens = estimate_tokens(CATALOG_HEADER) + estimate_tokens("\n");
+    let separator_tokens = estimate_tokens(ENTRY_SEPARATOR);
+    let mut estimated_tokens: usize = framing_tokens;
+    let mut admitted = 0usize;
 
     for skill in &sorted_skills {
         let meta = skill.format_at_level(SkillLoadLevel::Metadata);
-        let tokens = estimate_tokens(&meta);
+        let tokens = estimate_tokens(&meta) + if admitted == 0 { 0 } else { separator_tokens };
         if estimated_tokens.saturating_add(tokens) > max_tokens {
             trace!(
                 "Skipping skill '{}' entirely — metadata exceeds budget",
@@ -135,7 +142,39 @@ pub fn load_skills_context(
             continue;
         }
         estimated_tokens += tokens;
+        admitted += 1;
         metadata_parts.push(Some(meta));
+    }
+
+    // A marker that does not fit is worse than one fewer entry: the budget is
+    // tightest exactly when the most is hidden, which is when the model most needs
+    // to know that something is. Evict admitted entries from the tail — they are
+    // the least relevant — until the terse marker has room.
+    //
+    // Never down to zero, though: one real skill entry is worth more to the model
+    // than a bare "N omitted" note with no catalog attached. If the marker cannot
+    // coexist with even a single entry, the marker is the thing that goes.
+    while admitted > 1
+        && !report.omitted_entirely.is_empty()
+        && omission_marker_within_budget(
+            report.omitted_entirely.len(),
+            max_tokens.saturating_sub(estimated_tokens),
+        )
+        .is_none()
+    {
+        let Some(last) = metadata_parts.iter().rposition(Option::is_some) else {
+            break;
+        };
+        let Some(evicted) = metadata_parts[last].take() else {
+            break;
+        };
+        estimated_tokens = estimated_tokens
+            .saturating_sub(estimate_tokens(&evicted))
+            .saturating_sub(if admitted > 1 { separator_tokens } else { 0 });
+        admitted -= 1;
+        report
+            .omitted_entirely
+            .push(sorted_skills[last].manifest.name.clone());
     }
 
     let mut full_overrides: std::collections::HashMap<usize, String> =
@@ -184,6 +223,9 @@ pub fn load_skills_context(
         full_overrides.insert(i, full);
     }
 
+    // Read before the drain below empties the map.
+    let full_count = full_overrides.len();
+
     // Build final output: full body for upgraded skills, metadata for the rest,
     // skipping omitted entries.
     let parts: Vec<String> = metadata_parts
@@ -192,13 +234,37 @@ pub fn load_skills_context(
         .filter_map(|(i, maybe_meta)| full_overrides.remove(&i).or(maybe_meta))
         .collect();
 
-    report.used_tokens = estimated_tokens;
+    // Tell the model what it can't see. Without this the omission is invisible:
+    // the catalog simply ends, and the model has no way to know that skills exist
+    // beyond the ones listed (it would have to think to call `list`). The marker
+    // is charged against the same budget and shrunk until it fits, so it can
+    // never be the reason the budget is blown.
+    let omission_marker = if report.omitted_entirely.is_empty() {
+        None
+    } else {
+        omission_marker_within_budget(
+            report.omitted_entirely.len(),
+            max_tokens.saturating_sub(estimated_tokens),
+        )
+    };
+    if let Some(marker) = omission_marker.as_deref() {
+        // The marker goes into the prompt, so it belongs in `used_tokens` —
+        // otherwise the report under-states what this turn actually spent.
+        estimated_tokens += omission_marker_cost(marker);
+    }
+
+    // Nothing admitted renders an empty string, framing included.
+    report.used_tokens = if parts.is_empty() {
+        0
+    } else {
+        estimated_tokens
+    };
 
     // Single per-turn summary in place of the previous per-skill spam.
-    let metadata_only = parts.len().saturating_sub(full_overrides.len());
+    let metadata_only = parts.len().saturating_sub(full_count);
     debug!(
         loaded = parts.len(),
-        full = full_overrides.len(),
+        full = full_count,
         metadata_only,
         dropped_full = ?report.dropped_full_body,
         omitted = ?report.omitted_entirely,
@@ -207,41 +273,42 @@ pub fn load_skills_context(
         "skills context built"
     );
 
-    // Tell the model what it can't see. Without this the omission is invisible:
-    // the catalog simply ends, and the model has no way to know that skills exist
-    // beyond the ones listed (it would have to think to call `list`). The marker
-    // is charged against the same budget and shrunk until it fits, so it can
-    // never be the reason the budget is blown.
-    let omission_marker = (!report.omitted_entirely.is_empty()).then(|| {
-        omission_marker_within_budget(
-            report.omitted_entirely.len(),
-            max_tokens.saturating_sub(estimated_tokens),
-        )
-    });
-
     let rendered = match (parts.is_empty(), omission_marker.as_deref()) {
         (true, _) => String::new(),
-        (false, Some(marker)) => {
-            format!("# Skills\n\n{}\n\n{marker}\n", parts.join("\n---\n\n"))
-        }
-        (false, None) => format!("# Skills\n\n{}\n", parts.join("\n---\n\n")),
+        (false, Some(marker)) => format!(
+            "{CATALOG_HEADER}{}\n\n{marker}\n",
+            parts.join(ENTRY_SEPARATOR)
+        ),
+        (false, None) => format!("{CATALOG_HEADER}{}\n", parts.join(ENTRY_SEPARATOR)),
     };
     Ok((rendered, report))
+}
+
+/// Framing of the rendered catalog. Named so the budget arithmetic above and the
+/// `format!` calls below can never disagree about what the output costs.
+const CATALOG_HEADER: &str = "# Skills\n\n";
+const ENTRY_SEPARATOR: &str = "\n---\n\n";
+
+/// Token cost of an omission marker as it is actually emitted — the rendered
+/// catalog wraps it in blank-line separators, which the budget must account for.
+fn omission_marker_cost(marker: &str) -> usize {
+    estimate_tokens(&format!("\n\n{marker}\n"))
 }
 
 /// Render the "N skills omitted" notice, shortened until it fits `spare_tokens`.
 ///
 /// Falls back to the terse form and then to `None` rather than overshooting the
 /// budget — the marker exists to explain a truncation, so it must not cause one.
-fn omission_marker_within_budget(omitted: usize, spare_tokens: usize) -> String {
+fn omission_marker_within_budget(omitted: usize, spare_tokens: usize) -> Option<String> {
     let noun = if omitted == 1 { "skill" } else { "skills" };
     let verbose = format!(
         "_{omitted} additional {noun} omitted from this bounded list — call `list` with `what: \"skills\"` to see them._"
     );
-    if estimate_tokens(&verbose) <= spare_tokens {
-        return verbose;
+    if omission_marker_cost(&verbose) <= spare_tokens {
+        return Some(verbose);
     }
-    format!("_{omitted} additional {noun} omitted._")
+    let terse = format!("_{omitted} additional {noun} omitted._");
+    (omission_marker_cost(&terse) <= spare_tokens).then_some(terse)
 }
 
 /// What each shadow selection method WOULD have injected this turn, versus what
@@ -342,3 +409,48 @@ pub(super) fn skill_relevance_score(skill: &Skill, user_request: &str) -> u32 {
 
 // `collect_skill_env`, `collect_required_env_vars`, `install_skill_deps`,
 // and the test-only `format_skill_info` live in `skills::environment`.
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    /// The marker explains a truncation, so it must never cause one. With no
+    /// room left it has to be dropped entirely rather than silently appended —
+    /// the terse fallback used to be returned without any budget check.
+    #[test]
+    fn marker_is_dropped_when_even_the_terse_form_does_not_fit() {
+        assert_eq!(omission_marker_within_budget(3, 0), None);
+        assert_eq!(omission_marker_within_budget(3, 1), None);
+    }
+
+    /// Whatever comes back must fit the spare budget it was handed, at every
+    /// width — that is the entire contract.
+    #[test]
+    fn returned_marker_always_fits_the_spare_budget() {
+        for spare in 0..40 {
+            if let Some(marker) = omission_marker_within_budget(7, spare) {
+                assert!(
+                    omission_marker_cost(&marker) <= spare,
+                    "spare {spare}: {marker:?} costs {}",
+                    omission_marker_cost(&marker)
+                );
+            }
+        }
+    }
+
+    /// A generous budget keeps the actionable form, which names the `list` call.
+    /// Degrading to the terse form unconditionally would lose that.
+    #[test]
+    fn ample_budget_keeps_the_actionable_wording() {
+        let marker = omission_marker_within_budget(7, 1_000).expect("marker must fit");
+        assert!(marker.contains("`list`"), "{marker:?}");
+        assert!(marker.contains("7 additional skills"), "{marker:?}");
+    }
+
+    /// Singular/plural: "1 additional skills omitted" reads as a bug to the model.
+    #[test]
+    fn single_omission_uses_the_singular_noun() {
+        let marker = omission_marker_within_budget(1, 1_000).expect("marker must fit");
+        assert!(marker.contains("1 additional skill "), "{marker:?}");
+    }
+}

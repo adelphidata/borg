@@ -12,7 +12,8 @@ use wasmparser::{ExternalKind, Imports, Parser, Payload, TypeRef};
 use super::verify::is_hex_64;
 use super::{
     HostHttpRequest, StaticValidation, WasmPluginManifest, ABI_EXPORT_ALLOC, ABI_EXPORT_CALL,
-    ABI_EXPORT_MEMORY, CAP_CREDENTIALS, CAP_HTTP, CAP_LOG, CAP_STATE, MAX_FUEL_LIMIT,
+    ABI_EXPORT_MEMORY, ABI_IMPORT_CREDENTIALS, ABI_IMPORT_HTTP, ABI_IMPORT_LOG, ABI_IMPORT_STATE,
+    CAP_CREDENTIALS, CAP_HTTP, CAP_LOG, CAP_STATE, MAX_FUEL_LIMIT,
     MAX_MEMORY_PAGES_LIMIT, MAX_OUTPUT_BYTES_LIMIT, MAX_TIMEOUT_MS_LIMIT, RESERVED_KEY_PREFIX,
     SCHEMA_VERSION,
 };
@@ -272,10 +273,10 @@ fn validate_import(
     }
     let has_cap = |cap: &str| manifest.capabilities.iter().any(|c| c == cap);
     let allowed = match (module, name) {
-        ("borg:log", "log") => has_cap(CAP_LOG),
-        ("borg:http", "fetch") => has_cap(CAP_HTTP),
-        ("borg:state", "read" | "write") => has_cap(CAP_STATE),
-        ("borg:credentials", "get") => has_cap(CAP_CREDENTIALS),
+        (ABI_IMPORT_LOG, "log") => has_cap(CAP_LOG),
+        (ABI_IMPORT_HTTP, "fetch") => has_cap(CAP_HTTP),
+        (ABI_IMPORT_STATE, "read" | "write") => has_cap(CAP_STATE),
+        (ABI_IMPORT_CREDENTIALS, "get") => has_cap(CAP_CREDENTIALS),
         _ => false,
     };
     if !allowed {

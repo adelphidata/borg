@@ -205,7 +205,6 @@ pub fn check_activation(
                 let lower_text = text.to_lowercase();
                 let lower_bot = bot_id.to_lowercase();
                 if let Some(pos) = lower_text.find(&lower_bot) {
-                    // Strip mention from original text at the found position
                     let cleaned = format!("{}{}", &text[..pos], &text[pos + bot_id.len()..])
                         .trim()
                         .to_string();
@@ -946,7 +945,6 @@ async fn invoke_agent_inner(
         }
     };
 
-    // Prepare the message text (link understanding, injection scan, truncation, wrapping)
     let (message_text, has_image_attachments) =
         crate::message_processing::inbound_prep::prepare_message_text(
             channel_name,
@@ -1003,7 +1001,6 @@ async fn invoke_agent_inner(
         }
     };
 
-    // Collect the full response text
     let mut response_text = collect_agent_response(
         channel_name,
         config,
@@ -1057,7 +1054,6 @@ async fn process_message(
 ) -> Result<String> {
     let channel_name = &channel.manifest.name;
 
-    // Prepare auth tokens (resolve from credential store, falling back to env vars)
     let token = channel
         .manifest
         .auth
@@ -1775,7 +1771,6 @@ mod tests {
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
 
-        // Get challenge
         let result = cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
             .await
             .unwrap();

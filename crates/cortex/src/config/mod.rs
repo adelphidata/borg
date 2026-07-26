@@ -48,7 +48,9 @@ pub use voice::VoiceConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::warn;
 
@@ -371,8 +373,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Load config from a specific TOML file path (used by tests).
-    #[allow(dead_code)]
+    /// Load config from a specific TOML file path.
+    #[cfg(test)]
     pub(crate) fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -408,6 +410,7 @@ impl Config {
     /// Remove duplicate TOML table headers that would cause parse errors.
     /// Keeps the first occurrence of each `[table]` header and drops subsequent
     /// duplicates along with their content until the next section header.
+    #[cfg(test)]
     pub(crate) fn dedup_toml_tables(input: &str) -> String {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
@@ -479,7 +482,6 @@ impl Config {
 
     /// Resolve the API key from config or environment.
     pub fn api_key(&self) -> Result<String> {
-        // Try SecretRef first, then fall back to env var name
         if let Some(ref secret_ref) = self.llm.api_key {
             return secret_ref.resolve();
         }
@@ -646,7 +648,6 @@ impl Config {
             }
         }
 
-        // Fall back to single key via resolve_provider
         let (provider, key) = self.resolve_provider()?;
         let provider = correct_provider_from_key(provider, &key);
         Ok((provider, vec![key]))

@@ -704,15 +704,11 @@ fn find_optional_context_anchor(
     }
 }
 
-/// Render a unified diff between two file contents using the `similar` crate.
+/// Render a unified diff between two file contents.
 ///
-/// Why `similar` instead of a hand-rolled prefix/suffix trim: the prior
-/// implementation collapsed every change in a file into a single mega-hunk by
-/// stripping common prefix/suffix lines, which masked structurally distinct
-/// edits (e.g. two non-adjacent edits would be reported as one giant hunk
-/// covering everything between them). `similar::TextDiff::unified_diff` groups
-/// edits into separate `@@` hunks with the conventional 3-line context window,
-/// matching what humans (and review tools) expect.
+/// Uses `similar::TextDiff::unified_diff` so non-adjacent edits become separate
+/// `@@` hunks with the conventional 3-line context window, rather than one
+/// mega-hunk spanning everything between them.
 fn render_unified_diff(
     old: Option<&str>,
     new: Option<&str>,

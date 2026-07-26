@@ -495,22 +495,6 @@ pub async fn rank_embeddings_by_similarity_scoped(
     Ok(scored)
 }
 
-/// Convenience: rank memories by query text (generates embedding then ranks).
-#[instrument(skip_all)]
-pub async fn rank_memories_by_similarity(
-    config: &Config,
-    query: &str,
-    scope: &str,
-) -> Result<Vec<(String, f32)>> {
-    let (_provider, query_embedding) = generate_query_embedding(config, query).await?;
-    rank_embeddings_by_similarity(
-        &query_embedding,
-        scope,
-        config.memory.embeddings.recency_weight,
-    )
-    .await
-}
-
 /// Embed a memory file using chunking. Chunks the content, hashes each chunk,
 /// skips unchanged chunks, generates embeddings for new/changed chunks,
 /// and upserts all chunks to the database.

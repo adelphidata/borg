@@ -89,7 +89,6 @@ impl<'a> ChannelExecutor<'a> {
         let script_path = self.validated_script_path(script_name)?;
         let sandbox_policy = self.manifest.sandbox_policy().configured(blocked_paths);
 
-        // Collect auth env vars
         let mut extra_env = Vec::new();
         if let Some(ref secret_env) = self.manifest.auth.secret_env {
             if let Ok(val) = std::env::var(secret_env) {

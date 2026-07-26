@@ -154,9 +154,14 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     let mut out: String = text.chars().take(max_chars).collect();
-    // Trim a dangling partial word so the ellipsis reads cleanly.
+    // Trim a dangling partial word so the ellipsis reads cleanly, but only when
+    // the break point is late enough that we aren't throwing most of the entry
+    // away. `rfind` yields a *byte* offset, so the "late enough" test has to be
+    // made in chars — for CJK or accented text a byte offset runs 2–3× the char
+    // index and the guard would pass no matter how early the space sits.
     if let Some(last_space) = out.rfind(' ') {
-        if last_space >= max_chars / 2 {
+        let chars_kept = out[..last_space].chars().count();
+        if chars_kept >= max_chars / 2 {
             out.truncate(last_space);
         }
     }

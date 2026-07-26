@@ -136,7 +136,6 @@ fn find_triple_backtick(chars: &[char], start: usize) -> Option<usize> {
 }
 
 fn find_markdown_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
-    // Find closing ]
     let text_end = find_char(chars, ']', start + 1)?;
     // Must be immediately followed by (
     if text_end + 1 >= chars.len() || chars[text_end + 1] != '(' {

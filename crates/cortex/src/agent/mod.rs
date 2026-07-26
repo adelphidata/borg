@@ -249,17 +249,6 @@ pub struct Agent {
     pub(super) cost_event_sink: Option<Arc<dyn crate::llm::CostEventSink>>,
     /// Short-term working memory for the current session.
     pub(super) short_term_memory: crate::memory::short_term_memory::ShortTermMemory,
-    /// True for exactly one turn: set on the call that first injected
-    /// `SETUP.md` and atomically created the `SETUP.md.first_turn_done`
-    /// marker. The turn that consumed it must not offer tools to the
-    /// model (SETUP.md forbids first-message tool calls but weak models
-    /// ignore the prompt instruction). Reset after the prompt is built
-    /// and the tool list is selected. Subsequent turns of the same
-    /// first-conversation keep SETUP.md injected (marker already
-    /// exists → flag stays false → tools are available so the agent can
-    /// call `request_user_input`); SETUP.md is retired only once an
-    /// `IDENTITY` entry exists in long-term memory.
-    pub(super) setup_just_consumed: bool,
     /// Tracks runs of identical consecutive tool calls within a turn —
     /// drives the exponential-backoff-then-block ladder. Reset at the
     /// start of each `run_agent_loop`.
@@ -457,7 +446,6 @@ impl Agent {
             short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
                 session_id, 2000,
             ),
-            setup_just_consumed: false,
             tool_call_repeat,
             unknown_tool_tracker,
             llm_role,

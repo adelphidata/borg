@@ -483,7 +483,18 @@ fn normalize_inner(command: &str, strip_control_flow: bool) -> String {
     strip_wrappers_inner(&mut tokens, strip_control_flow);
     canonicalize_rm_flags(&mut tokens);
     if let Some(first) = tokens.first_mut() {
-        *first = strip_path_prefix(first).to_string();
+        // Basename reduction is catastrophic-path only. On the operator-glob path
+        // it is fail-open: an operator who writes `deny = ["./scripts/wipe.sh*"]`
+        // or `deny = ["/opt/mytool/bin/deploy *"]` would see the residual reduced
+        // to `wipe.sh` / `deploy …`, their rule stop matching, and `check` fall
+        // through to `AutoApprove`. That path keeps the historical fixed list of
+        // standard bin directories instead — members an operator glob is very
+        // unlikely to have spelled out.
+        *first = if strip_control_flow {
+            strip_path_prefix(first).to_string()
+        } else {
+            strip_standard_bin_prefix(first).to_string()
+        };
     }
     tokens.join(" ")
 }
@@ -647,7 +658,29 @@ fn canonicalize_rm_flags(tokens: &mut Vec<String>) {
     }
 }
 
-/// Strip common bin path prefixes, returning the basename.
+/// Strip only the standard system bin directories, leaving any other path
+/// intact.
+///
+/// The conservative counterpart to [`strip_path_prefix`], for the
+/// operator-configured-glob path where reducing a token the operator may have
+/// spelled out in full is fail-open.
+fn strip_standard_bin_prefix(token: &str) -> &str {
+    const PREFIXES: &[&str] = &[
+        "/usr/local/bin/",
+        "/usr/bin/",
+        "/bin/",
+        "/usr/sbin/",
+        "/sbin/",
+    ];
+    for prefix in PREFIXES {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    token
+}
+
+/// Strip any leading directory, returning the basename.
 fn strip_path_prefix(token: &str) -> &str {
     // Take the basename rather than matching a fixed prefix list. A hardcoded
     // list can only ever cover the directories someone thought of: `rm` also
@@ -1416,6 +1449,38 @@ mod tests {
         ] {
             assert_eq!(policy.check(cmd), PolicyDecision::Deny, "must deny: {cmd}");
         }
+    }
+
+    /// Basename reduction is catastrophic-path only. Applying it to the
+    /// operator-glob path is fail-open: `check` falls through to `AutoApprove`
+    /// when nothing matches, so a `deny` pattern that spells out a path would
+    /// silently stop denying while the operator still believes it is in force.
+    #[test]
+    fn operator_deny_patterns_that_name_a_path_still_match() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec![
+                "./scripts/wipe.sh*".to_string(),
+                "/opt/mytool/bin/deploy *".to_string(),
+            ],
+        };
+        for cmd in [
+            "./scripts/wipe.sh --all",
+            "/opt/mytool/bin/deploy production",
+        ] {
+            assert_eq!(
+                policy.check(cmd),
+                PolicyDecision::Deny,
+                "operator deny naming a path must still match: {cmd}"
+            );
+        }
+        // The historical standard-bin stripping stays, so a glob written against
+        // the bare name keeps covering the absolute form.
+        let by_name = ExecutionPolicy {
+            auto_approve: vec!["*".to_string()],
+            deny: vec!["shutdown*".to_string()],
+        };
+        assert_eq!(by_name.check("/sbin/shutdown -h now"), PolicyDecision::Deny);
     }
 
     /// `sudo X` does at least as much damage as `X` — privilege-escalation

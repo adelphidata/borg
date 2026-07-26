@@ -139,7 +139,6 @@ fn parse_markdown_blocks(text: &str) -> Vec<Block> {
             continue;
         }
 
-        // Regular content line
         if current_lines.is_empty() {
             block_start = line_num;
             if current_kind != BlockKind::Paragraph {
@@ -205,7 +204,6 @@ pub fn chunk_content(text: &str, chunk_size_tokens: usize, overlap_tokens: usize
         let block_tokens = estimate_tokens(&block.content);
 
         if current_tokens > 0 && current_tokens + block_tokens > chunk_size_tokens {
-            // Emit current chunk
             chunks.push(Chunk {
                 content: current_content.clone(),
                 start_line: current_start,
@@ -239,7 +237,6 @@ pub fn chunk_content(text: &str, chunk_size_tokens: usize, overlap_tokens: usize
         current_end = block.end_line;
     }
 
-    // Emit final chunk
     if !current_content.is_empty() {
         chunks.push(Chunk {
             content: current_content,

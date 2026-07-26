@@ -307,7 +307,8 @@ fn restrict_install_dir_permissions(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
             .with_context(|| format!("failed to chmod {} to 0700", dir.display()))?;
     }
-    // The chmod above is unix-only; silence the unused binding elsewhere.
+    // Non-unix: no equivalent permission model, so installs are NOT
+    // mode-restricted on Windows — the ACL work lives in the installer, not here.
     let _ = dir;
     Ok(())
 }

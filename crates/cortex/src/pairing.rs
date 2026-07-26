@@ -565,7 +565,6 @@ mod tests {
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        // Approve the code
         db.approve_pairing("telegram", &code).await.unwrap();
 
         // Second call should be allowed
@@ -685,7 +684,6 @@ mod tests {
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        // Approve the code
         db.approve_pairing("telegram", &code).await.unwrap();
 
         // Should no longer be found as pending

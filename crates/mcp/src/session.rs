@@ -60,6 +60,11 @@ pub(crate) const SERVER_LOG_CAP: usize = 256;
 /// cortex per-call response cap, so they need their own bound.
 pub(crate) const SERVER_LOG_MAX_BYTES: usize = 2048;
 
+/// Byte caps for the level / logger fields of a server log line. Both are
+/// short identifiers in the spec, so anything longer is a flooding attempt.
+pub(crate) const SERVER_LOG_LEVEL_MAX_BYTES: usize = 32;
+pub(crate) const SERVER_LOG_LOGGER_MAX_BYTES: usize = 128;
+
 /// Coarse `tracing` severity for a server-supplied RFC-5424 level string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogSeverity {
@@ -79,7 +84,6 @@ pub(crate) fn map_log_level(level: &str) -> LogSeverity {
     match level.to_ascii_lowercase().as_str() {
         "warning" => LogSeverity::Warn,
         "error" | "critical" | "alert" | "emergency" => LogSeverity::Error,
-        // debug / info / notice, plus anything unrecognized.
         _ => LogSeverity::Info,
     }
 }
@@ -291,8 +295,8 @@ impl SessionActor {
             Some(Value::String(s)) => s.clone(),
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
         };
-        let level = neutralize_control_chars(bounded(level_raw, 32));
-        let logger = neutralize_control_chars(bounded(logger, 128));
+        let level = neutralize_control_chars(bounded(level_raw, SERVER_LOG_LEVEL_MAX_BYTES));
+        let logger = neutralize_control_chars(bounded(logger, SERVER_LOG_LOGGER_MAX_BYTES));
         let body = neutralize_control_chars(bounded(&body, SERVER_LOG_MAX_BYTES));
         let (level, logger, body) = (level.as_ref(), logger.as_ref(), body.as_ref());
 

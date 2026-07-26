@@ -786,6 +786,32 @@ fn catalog_metadata_truncates_an_oversized_description() {
     assert_eq!(skill.manifest.description, long);
 }
 
+/// The word-trim heuristic drops a dangling partial word only when the break
+/// point is late enough to still leave a useful entry. That test has to be made
+/// in chars: `rfind` returns a byte offset, which for CJK text runs ~3× the char
+/// index, so a byte-vs-char comparison passes no matter how early the space sits
+/// and truncates a long description down to its first word.
+#[test]
+fn catalog_truncation_of_non_ascii_keeps_most_of_the_description() {
+    // The only space sits at char index 120 — under half the 320-char cap, so the
+    // heuristic must NOT trim back to it. Its byte offset is 360, well over half,
+    // so a byte-vs-char comparison trims anyway and throws away ~200 chars the
+    // budget already paid for.
+    let long = format!("{} {}", "説明".repeat(60), "説明".repeat(400));
+    let skill = catalog_fixture("cjk-skill", &long, vec!["t".to_string()]);
+
+    let meta = skill.format_at_level(SkillLoadLevel::Metadata);
+    let kept = meta.chars().filter(|c| *c == '説' || *c == '明').count();
+    assert!(
+        kept > 250,
+        "truncation must keep the cap's worth of description, kept only {kept} chars: {meta:?}"
+    );
+    assert!(
+        meta.contains('…'),
+        "truncation must still be marked: {meta:?}"
+    );
+}
+
 /// A description already inside the cap must pass through byte-for-byte —
 /// otherwise the cap would quietly mangle every normal entry.
 #[test]
@@ -817,9 +843,14 @@ fn catalog_metadata_caps_trigger_list() {
 
 /// An omitted skill used to be invisible to the model: the catalog just ended.
 /// The marker must appear, name the count, and stay inside the budget.
+///
+/// Budget is large enough to hold several entries *and* the marker. Tighter
+/// budgets are covered by `omission_marker_never_pushes_the_catalog_over_budget`
+/// and `a_single_entry_outranks_the_omission_marker`, which pin the trade-off the
+/// marker loses.
 #[test]
 fn omitted_skills_are_announced_in_the_rendered_catalog() {
-    let budget = 50;
+    let budget = 400;
     let (rendered, report) = load_skills_context(
         budget,
         &std::collections::HashMap::new(),
@@ -840,6 +871,61 @@ fn omitted_skills_are_announced_in_the_rendered_catalog() {
         "marker must not push the catalog over budget: {} > {budget}",
         estimate_tokens(&rendered)
     );
+}
+
+/// The marker is worth evicting a low-relevance entry for, but not the last one:
+/// a bare "N omitted" note with no catalog attached tells the model less than one
+/// real skill does. At a budget that fits exactly one entry, the entry wins.
+#[test]
+fn a_single_entry_outranks_the_omission_marker() {
+    let (rendered, report) = load_skills_context(
+        50,
+        &std::collections::HashMap::new(),
+        &SkillsConfig::default(),
+        "commit this with git",
+    )
+    .unwrap();
+    assert!(
+        !report.omitted_entirely.is_empty(),
+        "budget must be tight enough to omit: {report:?}"
+    );
+    assert!(
+        rendered.contains("### git"),
+        "the one entry that fits must be the relevant one:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("additional"),
+        "the marker must yield rather than displace the only entry:\n{rendered}"
+    );
+    assert!(estimate_tokens(&rendered) <= 50);
+}
+
+/// Swept across budgets rather than pinned to one, because the case that breaks
+/// is the one where admitted entries leave almost no slack — and which budget
+/// that is depends on the shipped skill set, so a single hardcoded value passes
+/// or fails by luck. `used_tokens` must cover the marker too, or the report
+/// under-states what the turn actually spent.
+#[test]
+fn omission_marker_never_pushes_the_catalog_over_budget() {
+    for budget in [1usize, 5, 10, 20, 30, 40, 50, 80, 120, 200] {
+        let (rendered, report) = load_skills_context(
+            budget,
+            &std::collections::HashMap::new(),
+            &SkillsConfig::default(),
+            "summarize my tooling",
+        )
+        .unwrap();
+        assert!(
+            estimate_tokens(&rendered) <= budget,
+            "budget {budget}: rendered {} tokens:\n{rendered}",
+            estimate_tokens(&rendered)
+        );
+        assert!(
+            report.used_tokens <= budget,
+            "budget {budget}: report claims {} tokens used",
+            report.used_tokens
+        );
+    }
 }
 
 /// No omissions ⇒ no marker. A permanent "0 skills omitted" line would be pure

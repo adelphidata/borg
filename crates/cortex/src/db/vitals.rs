@@ -183,7 +183,6 @@ impl Database {
                 return Ok(()); // silently drop — at capacity
             }
 
-            // Get the HMAC of the last event for chaining
             let prev_hmac: String = {
                 let mut rows = self
                     .conn

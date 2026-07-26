@@ -6,8 +6,6 @@ use super::models::{ApprovedSenderRow, PairingRequestRow};
 use super::Database;
 
 impl Database {
-    // ── Pairing CRUD ──
-
     pub async fn create_pairing_request(
         &self,
         channel_name: &str,
@@ -106,7 +104,6 @@ impl Database {
 
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<PairingRequestRow> = async {
-            // Find the pending request within the transaction
             let request = {
                 let mut rows = self.conn.query(
                     "SELECT id, channel_name, sender_id, code_hash, status, display_name, created_at, expires_at, approved_at

@@ -40,8 +40,6 @@ fn sanitize_body(body: &str) -> String {
     }
 }
 
-// ── Error classification ──
-
 /// Why a provider failed — drives cooldown duration, key rotation, failover,
 /// and reactive recovery decisions (compaction, payload shrink).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

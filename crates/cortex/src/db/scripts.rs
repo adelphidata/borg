@@ -5,8 +5,6 @@ use super::models::{NewScript, ScriptRow};
 use super::Database;
 
 impl Database {
-    // ── Scripts CRUD ──
-
     pub async fn create_script(&self, s: &NewScript<'_>) -> Result<()> {
         self.conn
             .execute(

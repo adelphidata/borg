@@ -176,7 +176,6 @@ impl TelegramClient {
                 return Ok(());
             }
 
-            // Handle 429 rate limiting
             if status.as_u16() == 429 {
                 attempts += 1;
                 if attempts > MAX_SEND_RETRIES {

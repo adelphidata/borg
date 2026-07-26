@@ -628,7 +628,6 @@ fn classify_text(text: &str) -> Option<Archetype> {
     None
 }
 
-// ── Fallback evolution naming ──
 //
 // LLM generation is best-effort; when it fails or is disabled these
 // deterministic names guarantee the user is never left with "Base Borg"

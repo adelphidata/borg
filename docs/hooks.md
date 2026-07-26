@@ -81,6 +81,7 @@ Hooks **cannot break the agent.** Every failure path resolves to a safe default 
 - Unknown event names, invalid matcher regex, missing `command` field → that entry is dropped, other hooks still load.
 - Subprocess spawn failure, timeout, non-zero exit, non-UTF-8 output, panic inside the runner → logged, action defaults to `Continue` (or `Skip` for PreToolUse on timeout/non-zero).
 - Hook output is capped at 8 KiB per stream. Stdout is discarded; stderr is logged.
+- A hook that backgrounds a process (`some-daemon &`) leaks the output pipe to that process. Borg stops waiting on the pipe once the hook itself exits, so `timeout` still holds — but that hook's stderr may not make it into the log. Redirect it (`some-daemon >/dev/null 2>&1 &`) if you care.
 
 Check `~/.borg/logs/daemon.log` and `~/.borg/logs/daemon.err` for hook warnings.
 

@@ -78,10 +78,8 @@ pub fn filter_subagent_tools(
     tools: Vec<ToolDefinition>,
     policy: &ToolPolicyConfig,
 ) -> Vec<ToolDefinition> {
-    // First apply normal policy
     let mut filtered = filter_tools(tools, policy);
 
-    // Then apply subagent deny list
     let subagent_deny: HashSet<String> = expand_entries(&policy.subagent_deny);
     if !subagent_deny.is_empty() {
         filtered.retain(|td| !subagent_deny.contains(td.function.name.as_str()));

@@ -1570,8 +1570,6 @@ mod tests {
         );
     }
 
-    // Queue preview rendering.
-
     fn line_text(l: &Line<'static>) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
     }

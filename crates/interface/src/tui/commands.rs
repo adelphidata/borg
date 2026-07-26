@@ -16,7 +16,6 @@ impl App<'_> {
     /// `None` if it should be treated as a user message.
     pub(super) fn try_handle_command(&mut self, trimmed: &str) -> Option<Result<AppAction>> {
         // Exact matches
-        // Exact matches
         match trimmed {
             "quit" | "exit" | "/exit" => return Some(Ok(AppAction::Quit)),
             "help" | "/help" => return Some(self.cmd_help()),
@@ -176,7 +175,6 @@ impl App<'_> {
             return Some(Ok(AppAction::LoadSession { id: id.to_string() }));
         }
 
-        // Prefix commands
         if let Some(rest) = trimmed.strip_prefix("/logs ") {
             return Some(self.handle_logs_command(Some(rest.trim())));
         }
@@ -345,7 +343,6 @@ impl App<'_> {
             return Some(self.cmd_terminal_setup(rest));
         }
 
-        // Reject unknown slash commands
         if trimmed.starts_with('/') {
             self.push_system_message(format!(
                 "Unknown command: {trimmed}\nType /help for available commands."

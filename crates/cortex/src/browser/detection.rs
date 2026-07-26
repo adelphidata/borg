@@ -148,6 +148,8 @@ fn engine_candidates(engine: BrowserEngine) -> Vec<String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let paths: &[&str] = &[];
 
+    // `engine` is only read by the per-OS cfg arms above; discard it so the
+    // fallback platform build doesn't warn.
     let _ = engine;
     paths.iter().map(|s| (*s).to_string()).collect()
 }

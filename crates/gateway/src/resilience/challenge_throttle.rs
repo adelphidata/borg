@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 /// Default cooldown: 5 minutes between challenge messages per sender.
 const DEFAULT_COOLDOWN_SECS: u64 = 300;
 
-/// Maximum entries before pruning expired ones.
+/// Entry count that triggers a prune of expired scopes. Bounded because the map
+/// is keyed by attacker-supplied sender IDs — unbounded growth would be a memory
+/// DoS from a single spamming channel.
 const MAX_ENTRIES: usize = 200;
 
 /// Scope key identifying a unique channel + sender combination.

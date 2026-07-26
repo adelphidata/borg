@@ -12,6 +12,9 @@ use crate::tunnel::{
 };
 
 const TAILSCALE_INSTALL_URL: &str = "https://tailscale.com/download";
+/// `tailscale serve` can block on tailnet re-auth, so it gets the longest
+/// budget; status/health are local IPC and must fail fast to stay out of the
+/// startup path.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);

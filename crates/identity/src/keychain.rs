@@ -378,11 +378,12 @@ fn encrypt_map(map: &HashMap<String, Vec<u8>>, passphrase: &[u8]) -> Result<Vec<
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: encrypt: {e}")))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
     let env = EncryptedKekFile {
         version: KEK_FILE_VERSION,
-        salt_b64: base64::engine::general_purpose::STANDARD.encode(salt),
-        nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
-        ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+        salt_b64: b64.encode(salt),
+        nonce_b64: b64.encode(nonce_bytes),
+        ciphertext_b64: b64.encode(ciphertext),
     };
     serde_json::to_vec_pretty(&env)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: envelope serialize: {e}")))

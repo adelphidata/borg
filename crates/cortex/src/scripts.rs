@@ -35,27 +35,22 @@ fn validate_script_name(name: &str) -> Result<()> {
 /// Get or create the HMAC-SHA256 signing key.
 /// Tries OS keychain first, falls back to file at `~/.borg/.scripts_key` (mode 0600).
 pub fn get_or_create_hmac_key() -> Result<Vec<u8>> {
-    // Try reading from keychain
     if let Some(key) = read_key_keychain() {
         return Ok(key);
     }
 
-    // Try reading from file
     let key_path = key_file_path()?;
     if key_path.exists() {
         let hex = std::fs::read_to_string(&key_path).context("Failed to read HMAC key file")?;
         return hex_decode(hex.trim());
     }
 
-    // Generate new key
     let key = generate_random_key();
 
-    // Try storing in keychain first
     if store_key_keychain(&key) {
         return Ok(key);
     }
 
-    // Fall back to file
     write_key_file(&key_path, &key)?;
     Ok(key)
 }

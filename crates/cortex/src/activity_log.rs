@@ -63,19 +63,6 @@ pub async fn log_activity(db: &Database, level: &str, category: &str, msg: &str)
     }
 }
 
-/// Log an activity event with detail, swallowing errors with tracing::debug.
-pub async fn log_activity_detail(
-    db: &Database,
-    level: &str,
-    category: &str,
-    msg: &str,
-    detail: &str,
-) {
-    if let Err(e) = db.log_activity(level, category, msg, Some(detail)).await {
-        tracing::debug!("activity_log: failed to record: {e}");
-    }
-}
-
 /// Format an activity entry for display in TUI or CLI.
 pub fn format_activity_entry(entry: &crate::db::ActivityEntry) -> String {
     let dt = chrono::DateTime::from_timestamp(entry.created_at, 0)

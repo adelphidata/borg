@@ -56,7 +56,6 @@ pub fn handle_discord_webhook(
     public_key_hex: Option<&str>,
     guild_allowlist: Option<&[String]>,
 ) -> Result<DiscordWebhookResult> {
-    // Verify signature if public key is configured
     if let Some(key) = public_key_hex {
         verify::verify_discord_signature(headers, body, key)?;
     }

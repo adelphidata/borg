@@ -62,7 +62,6 @@ impl NativeChannel for TelegramChannel {
             self.secret.as_deref(),
             "TELEGRAM_WEBHOOK_SECRET",
         )?;
-        // Verify and parse
         let parsed = match super::handle_telegram_webhook(
             headers,
             body,

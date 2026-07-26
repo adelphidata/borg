@@ -180,7 +180,6 @@ pub fn load_all_skills(
                                         body = sanitize::wrap_with_injection_warning(&name, &body);
                                     }
 
-                                    // Detect scripts
                                     let mut scripts = Vec::new();
                                     let scripts_dir = skill_dir.join("scripts");
                                     if scripts_dir.is_dir() {

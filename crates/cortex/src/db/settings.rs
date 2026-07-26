@@ -4,8 +4,6 @@ use libsql::params;
 use super::Database;
 
 impl Database {
-    // ── Settings CRUD ──
-
     /// Ensure every key in SETTING_REGISTRY has a row in the settings table.
     /// Missing keys are inserted with their compiled default value.
     /// Existing rows are never overwritten (`INSERT OR IGNORE` on PRIMARY KEY).

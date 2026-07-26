@@ -221,12 +221,9 @@ fn is_configured(def: &PluginDef, config: &Config) -> bool {
 /// Set up a plugin: prompt for credentials, store in keychain (or `.env`
 /// fallback), and persist the merged credentials map via the daemon.
 ///
-/// All settings live in the SQLite settings table — this used to write
-/// `~/.borg/config.toml` directly, but the schema imports that file into
-/// the DB once and renames it to `.bak`, so post-import writes were
-/// silently dropped. We now mirror the onboarding flow: store the secret
-/// locally, build a `CredentialValue::Ref`, and round-trip the full
-/// `credentials` map through `Admin.SetSetting`.
+/// All settings live in the SQLite settings table, so writes must go through
+/// the daemon: store the secret locally, build a `CredentialValue::Ref`, and
+/// round-trip the full `credentials` map through `Admin.SetSetting`.
 pub fn add_plugin(name: &str) -> Result<()> {
     let def = find_plugin(name).ok_or_else(|| anyhow::anyhow!("Unknown plugin: {name}"))?;
 

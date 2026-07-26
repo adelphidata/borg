@@ -118,11 +118,7 @@ macro_rules! define_settings {
             )*
         ];
 
-        // ── setter arms ──
-
     };
-
-    // ── @apply arms: generate the setter code for each kind ──
 
     (@apply $self:ident, $key:ident, $value:ident, $($path:ident).+ , string) => {{
         $self.$($path).+ = $value.to_string();
@@ -185,8 +181,6 @@ macro_rules! define_settings {
             .with_context(|| format!("{}: {}", $err, $value))?;
         Ok(format!("{} = {}", $key, $value))
     }};
-
-    // ── @extract arms: generate the registry extractor for each kind ──
 
     (@extract $($path:ident).+ , string) => {
         |c| c.$($path).+.clone()

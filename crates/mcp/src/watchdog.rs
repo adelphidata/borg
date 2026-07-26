@@ -173,6 +173,8 @@ mod unix {
         };
         let pgid = child.id() as i32; // group leader pid == pgid
 
+        // 100ms trades a little orphan-reap latency for ~10 wakeups/sec on a
+        // thread that lives as long as every stdio MCP server.
         let poll = Duration::from_millis(100);
         loop {
             match child.try_wait() {
@@ -207,13 +209,17 @@ mod unix {
     /// SIGTERM the server's process group, allow a brief grace to exit, then
     /// SIGKILL and reap the direct child so it isn't left a zombie.
     fn reap_group(pgid: i32, child: &mut Child) {
+        // 15 x 20ms = 300ms of grace — enough for a node/python MCP server to
+        // flush stdio and unwind, short enough that daemon shutdown doesn't stall.
+        const SIGTERM_GRACE_POLLS: u32 = 15;
+        const SIGTERM_GRACE_POLL: Duration = Duration::from_millis(20);
         unsafe { libc::killpg(pgid, libc::SIGTERM) };
-        for _ in 0..15 {
+        for _ in 0..SIGTERM_GRACE_POLLS {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 let _ = child.wait();
                 return;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(SIGTERM_GRACE_POLL);
         }
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
         let _ = child.wait();

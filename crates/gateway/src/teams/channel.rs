@@ -54,7 +54,6 @@ impl NativeChannel for TeamsChannel {
         let (mut inbound, activity) = match parsed {
             Some(pair) => pair,
             None => {
-                // Check for bot-added welcome scenario
                 if let Ok(activity) = serde_json::from_str::<super::types::Activity>(body) {
                     if super::parse::is_bot_added(&activity) {
                         if let (Some(svc), Some(conv)) =

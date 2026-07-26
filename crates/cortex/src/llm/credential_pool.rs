@@ -32,8 +32,6 @@ pub use builders::{
 pub use helpers::{fingerprint, is_safe_base_url};
 use helpers::{needs_refresh, random_id, truncate_error_msg, COOLDOWN_MAX_SECS};
 
-// ── Strategy / status / source ────────────────────────────────────────────
-
 /// How `pick()` chooses the next credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -149,22 +147,6 @@ impl CredentialSource {
             // (port flip on a self-hosted endpoint) but the credential's
             // identity is the operator-chosen name.
             Self::Custom { name, .. } => name.clone(),
-        }
-    }
-    #[allow(dead_code)]
-    fn from_db(kind: &str, value: &str) -> Self {
-        match kind {
-            "env" => Self::Env { var: value.into() },
-            "config" => Self::Config { name: value.into() },
-            "oauth" => Self::OAuth { name: value.into() },
-            "custom" => Self::Custom {
-                name: value.into(),
-                // base_url is not round-trippable from the suppression value
-                // alone; suppression entries don't need it (the lookup key is
-                // (provider, kind="custom", name)). Empty here is fine.
-                base_url: String::new(),
-            },
-            _ => Self::Manual,
         }
     }
 }
@@ -2217,6 +2199,5 @@ async fn delete_suppression(
     Ok(())
 }
 
-// TODO: needs async DB harness
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;

@@ -27,12 +27,6 @@ pub(crate) struct GeminiTransport;
 /// SSE accumulator for Gemini's `streamGenerateContent?alt=sse` endpoint.
 #[derive(Default)]
 pub(crate) struct GeminiStreamState {
-    /// Reserved scratch buffer for partial-frame reassembly. The SSE
-    /// processor today hands us complete lines, so the field stays inert
-    /// behind the public surface — present for adapter symmetry with
-    /// transports that need cross-chunk buffering.
-    #[allow(dead_code)]
-    pub(crate) buf: String,
     /// Accumulator for the assistant message under construction.
     pub(crate) accumulator: AssistantAccumulator,
 }
@@ -49,10 +43,6 @@ pub(crate) struct AssistantAccumulator {
 /// One in-flight function call. Gemini doesn't emit a synthetic call id, so
 /// we mint one of the form `gem_call_<name>_<index>` at finalisation time.
 /// The id stays stable for the next user turn's `functionResponse` matching.
-///
-/// Fields are populated for accumulator parity with other transports;
-/// today the values are emitted directly via `StreamEvent::ToolCallDelta`
-/// rather than being re-read here, so the struct sits at the boundary.
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct PendingFunctionCall {

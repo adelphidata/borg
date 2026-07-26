@@ -15,7 +15,8 @@ use super::limits::{EpochTimer, PluginLimits, WASM_PAGE_BYTES};
 use super::validate::validate_wasm_module;
 use super::{
     HostServices, NoHostServices, WasmPluginManifest, ABI_EXPORT_ALLOC, ABI_EXPORT_CALL,
-    ABI_EXPORT_MEMORY, MAX_LOG_LINES_PER_CALL, RESERVED_TOOL_KEY,
+    ABI_EXPORT_MEMORY, ABI_IMPORT_CREDENTIALS, ABI_IMPORT_HTTP, ABI_IMPORT_LOG, ABI_IMPORT_STATE,
+    MAX_LOG_LINES_PER_CALL, RESERVED_TOOL_KEY,
 };
 
 /// Execute one verified WASM tool using Borg's narrow ABI with default
@@ -140,11 +141,11 @@ pub fn execute_tool_prepared(
         std::time::Duration::from_millis(manifest.limits.timeout_ms),
     );
     let mut linker = wasmtime::Linker::new(engine);
-    linker.func_wrap("borg:log", "log", host_log)?;
-    linker.func_wrap("borg:http", "fetch", host_http_fetch)?;
-    linker.func_wrap("borg:state", "read", host_state_read)?;
-    linker.func_wrap("borg:state", "write", host_state_write)?;
-    linker.func_wrap("borg:credentials", "get", host_credentials_get)?;
+    linker.func_wrap(ABI_IMPORT_LOG, "log", host_log)?;
+    linker.func_wrap(ABI_IMPORT_HTTP, "fetch", host_http_fetch)?;
+    linker.func_wrap(ABI_IMPORT_STATE, "read", host_state_read)?;
+    linker.func_wrap(ABI_IMPORT_STATE, "write", host_state_write)?;
+    linker.func_wrap(ABI_IMPORT_CREDENTIALS, "get", host_credentials_get)?;
 
     let instance = linker.instantiate(&mut store, module)?;
     let memory = instance

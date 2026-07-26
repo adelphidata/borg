@@ -4,8 +4,6 @@ use libsql::params;
 use super::Database;
 
 impl Database {
-    // ── Meta key-value ──
-
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let mut rows = self
             .conn

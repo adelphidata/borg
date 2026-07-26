@@ -43,6 +43,19 @@ pub struct SandboxCommand {
     pub(crate) _resources: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+impl SandboxCommand {
+    /// Run `program` with no sandbox wrapper at all. Every unsandboxed escape
+    /// hatch funnels through here so a security audit has a single grep-point
+    /// for "where can borg run a tool outside the sandbox".
+    pub(crate) fn passthrough(program: &str, args: &[String]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.to_vec(),
+            _resources: None,
+        }
+    }
+}
+
 impl std::fmt::Debug for SandboxCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SandboxCommand")
@@ -66,7 +79,6 @@ impl Clone for SandboxCommand {
 /// Blocked patterns are matched against individual path components (split by `/`)
 /// to avoid false positives from substring matching (e.g., `.aws_backup` matching `.aws`).
 fn is_path_blocked(path: &str, blocked_paths: &[String]) -> bool {
-    // Extract normal path components (skips `.`, `..`, root, and prefix components)
     let normalized = std::path::Path::new(path);
     let components: Vec<&str> = normalized
         .components()
@@ -269,11 +281,7 @@ impl SandboxPolicy {
             self.wrap_windows(program, args, tool_dir)
         } else {
             tracing::warn!("Sandboxing not available on this platform; running unsandboxed");
-            SandboxCommand {
-                program: program.to_string(),
-                args: args.to_vec(),
-                _resources: None,
-            }
+            SandboxCommand::passthrough(program, args)
         }
     }
 
@@ -316,7 +324,7 @@ impl SandboxPolicy {
                 tracing::error!(
                     "Failed to generate sandbox profile: {e}. Refusing to run unsandboxed."
                 );
-                // Fail closed: return a command that immediately exits with error
+                // Fail closed: a stub that exits non-zero, never the raw program.
                 return SandboxCommand {
                     program: "/bin/sh".to_string(),
                     args: vec![
@@ -345,11 +353,7 @@ impl SandboxPolicy {
         args: &[String],
         _tool_dir: &std::path::Path,
     ) -> SandboxCommand {
-        SandboxCommand {
-            program: program.to_string(),
-            args: args.to_vec(),
-            _resources: None,
-        }
+        SandboxCommand::passthrough(program, args)
     }
 
     #[cfg(target_os = "linux")]
@@ -359,14 +363,13 @@ impl SandboxPolicy {
         args: &[String],
         tool_dir: &std::path::Path,
     ) -> SandboxCommand {
-        // Fall back to unsandboxed if bwrap is not installed
+        // Deliberate divergence from `wrap_windows`, which fails closed: bwrap is
+        // an optional distro package, and hard-failing here would brick every
+        // tool call on a host that simply never installed it. The warn is the
+        // operator's signal to install bubblewrap.
         if which::which("bwrap").is_err() {
             tracing::warn!("bwrap not found; running without sandbox");
-            return SandboxCommand {
-                program: program.to_string(),
-                args: args.to_vec(),
-                _resources: None,
-            };
+            return SandboxCommand::passthrough(program, args);
         }
         use crate::bubblewrap::build_bwrap_args;
         let mut bwrap_args = build_bwrap_args(self, tool_dir);
@@ -387,11 +390,7 @@ impl SandboxPolicy {
         args: &[String],
         _tool_dir: &std::path::Path,
     ) -> SandboxCommand {
-        SandboxCommand {
-            program: program.to_string(),
-            args: args.to_vec(),
-            _resources: None,
-        }
+        SandboxCommand::passthrough(program, args)
     }
 }
 

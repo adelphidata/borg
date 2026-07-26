@@ -17,14 +17,11 @@ pub fn handle_google_chat_webhook(
     body: &str,
     expected_token: Option<&str>,
 ) -> Result<Option<InboundMessage>> {
-    // Parse the event body (single parse)
     let event: ChatEvent = serde_json::from_str(body)
         .map_err(|e| anyhow::anyhow!("Invalid Google Chat event JSON: {e}"))?;
 
-    // Verify token on the parsed event
     verify::verify_google_chat_token(&event, expected_token)?;
 
-    // Parse into InboundMessage
     Ok(parse::parse_event(&event))
 }
 

@@ -63,12 +63,8 @@ mod tests {
 
     #[test]
     fn rcgen_error_converts_to_cert_variant() {
-        // rcgen::Error doesn't have a public constructor we can rely on,
-        // so trigger a real one by signing with a refused config.
-        let mut params = rcgen::CertificateParams::default();
-        // An empty SAN list combined with the wrong KeyUsage *won't* fail
-        // by itself, so instead force an Ia5String violation via PEM parse.
-        params.distinguished_name = rcgen::DistinguishedName::new();
+        // rcgen::Error has no public constructor, so trigger a real one by
+        // parsing a malformed CA PEM.
         let bogus_pem = "-----BEGIN CERTIFICATE-----\nnot valid\n-----END CERTIFICATE-----\n";
         let rcgen_err = rcgen::CertificateParams::from_ca_cert_pem(bogus_pem)
             .expect_err("malformed PEM must fail");

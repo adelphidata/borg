@@ -53,7 +53,6 @@ pub async fn run_polling(
             break;
         }
 
-        // Apply backoff if we have consecutive errors
         if consecutive_errors > 0 {
             let backoff = calculate_backoff(consecutive_errors);
             tokio::select! {
@@ -62,7 +61,6 @@ pub async fn run_polling(
             }
         }
 
-        // Call getUpdates with stall watchdog
         let result = tokio::select! {
             _ = shutdown.cancelled() => break,
             result = tokio::time::timeout(
@@ -99,7 +97,6 @@ pub async fn run_polling(
                         }
                     }
 
-                    // Extract chat_id for the callback
                     let chat_id = extract_chat_id(&update);
 
                     // Parse into a TelegramParsed so the caller can perform

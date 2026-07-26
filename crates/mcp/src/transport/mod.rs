@@ -38,6 +38,9 @@ pub async fn open(
     manifest: &ServerManifest,
     policy: http::HttpPolicy,
 ) -> Result<Box<dyn Transport>> {
+    // `*_bytes: 0` in every arm means "use the transport's own default". The
+    // cortex dispatch path threads the operator-tuned ceiling instead; this
+    // generic builder deliberately keeps the safe default.
     match &manifest.transport {
         TransportSpec::Stdio { command, args, env } => {
             let cfg = stdio::StdioConfig {
@@ -45,9 +48,6 @@ pub async fn open(
                 command: command.clone(),
                 args: args.clone(),
                 env: env.clone(),
-                // 0 → transport applies its own DEFAULT_MAX_LINE_BYTES. The
-                // cortex dispatch path overrides this with an operator-tuned
-                // ceiling; this generic builder keeps the safe default.
                 max_line_bytes: 0,
             };
             let sink: stdio::StderrSink = Arc::new(|srv: &str, line: &str| {
@@ -71,9 +71,6 @@ pub async fn open(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
-                // 0 → transport applies its own DEFAULT_MAX_RESPONSE_BYTES. The
-                // cortex dispatch path overrides this with an operator-tuned
-                // ceiling; this generic builder keeps the safe default.
                 max_response_bytes: 0,
             };
             let t = http::open(cfg).await?;

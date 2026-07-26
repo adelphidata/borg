@@ -523,6 +523,8 @@ fn cleanup_tmp_files(data_dir: &std::path::Path) {
     ] {
         let tmp = data_dir.join(name);
         if tmp.exists() {
+            // Best-effort: a stale tmp we cannot delete is overwritten by the
+            // next atomic write anyway, so failure must not abort onboarding.
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -538,7 +540,6 @@ fn cleanup_tmp_files(data_dir: &std::path::Path) {
 pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     let data_dir = Config::data_dir()?;
 
-    // Clean up any leftover temp files from a prior failed attempt
     cleanup_tmp_files(&data_dir);
 
     for sub in BORG_SUBDIRS {
@@ -550,7 +551,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         Err(e) => eprintln!("  Warning: failed to install default skills: {e}"),
     }
 
-    // Determine key storage automatically
     let use_keychain = result.api_key.is_some() && keychain_available();
 
     // Write settings via the daemon (single writer, cache-coherent).
@@ -631,7 +631,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 Err(e) => {
                     eprintln!("  Warning: Failed to store in keychain: {e}");
                     eprintln!("  Falling back to .env file");
-                    // Update DB to use env var instead of keychain (via daemon).
                     let provider = Provider::from_str(&result.provider)?;
                     let env_var_owned = provider.default_env_var().to_string();
                     if let Err(e) = block_on(async {

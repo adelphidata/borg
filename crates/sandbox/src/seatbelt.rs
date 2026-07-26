@@ -40,6 +40,14 @@ fn resolve_symlinks_best_effort(path: &Path) -> String {
     loop {
         if let Ok(canonical) = probe.canonicalize() {
             let suffix = path.strip_prefix(probe).unwrap_or(Path::new(""));
+            // `PathBuf::join("")` appends a separator, so joining the empty
+            // suffix of an already-existing path would yield `/private/var/x/`.
+            // Seatbelt's `subpath` is documented without a trailing separator,
+            // and the extra form also made `push_subpath_rule` emit a duplicate
+            // rule for every path that exists — which is the common case.
+            if suffix.as_os_str().is_empty() {
+                return canonical.to_string_lossy().into_owned();
+            }
             return canonical.join(suffix).to_string_lossy().into_owned();
         }
         match probe.parent() {
@@ -97,7 +105,6 @@ pub fn generate_profile(
 
     let mut profile = String::from("(version 1)\n(deny default)\n");
 
-    // Restrict process-exec to the runtime binary and standard system paths
     if let Some(bin) = runtime_bin {
         validate_seatbelt_path(bin)?;
         profile.push_str(&format!("(allow process-exec (literal \"{bin}\"))\n"));
@@ -151,10 +158,10 @@ pub fn generate_profile(
 
     // Allow writing to /dev (stdout/stderr file descriptors)
     profile.push_str("(allow file-write* (subpath \"/dev\"))\n");
-    // Allow writing to /tmp
+    // Both spellings are needed: /tmp is a symlink to /private/tmp on macOS and
+    // Seatbelt matches the literal path the process opens, not the resolved one.
     profile.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
     profile.push_str("(allow file-write* (subpath \"/tmp\"))\n");
-    // Allow writing to the tool's working directory
     profile.push_str(&format!(
         "(allow file-write* (subpath \"{tool_dir_str}\"))\n"
     ));
@@ -170,8 +177,7 @@ pub fn generate_profile(
     // Defense-in-depth: deny reads to well-known sensitive directories even
     // though file-read* is broadly allowed. Emitted AFTER the fs_read allows so
     // that under last-match-wins these denies still hold when a policy grants a
-    // broad read root (e.g. the `trusted` profile's `/`) — previously this block
-    // came before the allows, so a broad fs_read could override it.
+    // broad read root (e.g. the `trusted` profile's `/`).
     if let Ok(home_str) = std::env::var("HOME") {
         for sensitive in SENSITIVE_HOME_PATHS {
             let path = format!("{home_str}/{sensitive}");
@@ -259,11 +265,31 @@ mod tests {
             ..Default::default()
         };
         let profile = generate_profile(&policy, Path::new(TEST_TOOL_DIR), None).unwrap();
-        let rule = format!("(deny file-write* (subpath \"{plain_str}\"))\n");
+        // Match on *any* rule mentioning the path, not the one exact string we
+        // expect: a near-miss variant (e.g. a trailing separator from joining an
+        // empty suffix) would leave an exact-string count at 1 and slip through.
+        let referencing: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.starts_with("(deny file-write* (subpath ") && l.contains(&plain_str))
+            .collect();
         assert_eq!(
-            profile.matches(&rule).count(),
-            1,
-            "already-canonical path must not be emitted twice:\n{profile}"
+            referencing,
+            vec![format!("(deny file-write* (subpath \"{plain_str}\"))")],
+            "already-canonical path must produce exactly one rule:\n{profile}"
+        );
+    }
+
+    /// An existing path resolves to its canonical form with no trailing
+    /// separator. `PathBuf::join("")` appends one, which both doubled every
+    /// emitted rule and left the tool dir's only write grant depending on an
+    /// undocumented `subpath` spelling.
+    #[test]
+    fn resolving_an_existing_path_adds_no_trailing_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        assert_eq!(
+            resolve_symlinks_best_effort(&canonical),
+            canonical.to_string_lossy()
         );
     }
 

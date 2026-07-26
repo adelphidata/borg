@@ -1,5 +1,6 @@
 use super::AgentRole;
 use crate::db::Database;
+use crate::tool::names;
 
 /// Built-in role definitions.
 pub const BUILTIN_ROLES: &[(&str, &str, f32, &[&str])] = &[
@@ -7,19 +8,31 @@ pub const BUILTIN_ROLES: &[(&str, &str, f32, &[&str])] = &[
         "researcher",
         "Information gathering and analysis. Use this role for tasks that require searching, reading, and synthesizing information.",
         0.3,
-        &["run_shell", "web_fetch", "web_search", "read_memory", "write_memory"],
+        &[
+            names::RUN_SHELL,
+            names::WEB_FETCH,
+            names::WEB_SEARCH,
+            names::READ_MEMORY,
+            names::WRITE_MEMORY,
+        ],
     ),
     (
         "coder",
         "Code writing and modification. Use this role for tasks that require creating or modifying code files.",
         0.2,
-        &["run_shell", "apply_patch", "read_memory"],
+        &[names::RUN_SHELL, names::APPLY_PATCH, names::READ_MEMORY],
     ),
     (
         "writer",
         "Documentation and content writing. Use this role for tasks that require writing documentation, notes, or creative content.",
         0.7,
-        &["run_shell", "apply_patch", "read_memory", "write_memory", "web_search"],
+        &[
+            names::RUN_SHELL,
+            names::APPLY_PATCH,
+            names::READ_MEMORY,
+            names::WRITE_MEMORY,
+            names::WEB_SEARCH,
+        ],
     ),
 ];
 
@@ -37,29 +50,6 @@ pub fn builtin_role(name: &str) -> Option<AgentRole> {
             tools_allowed: Some(tools.iter().map(ToString::to_string).collect()),
             max_iterations: None,
         })
-}
-
-/// Seed the built-in roles into the database if they don't already exist.
-pub async fn seed_builtin_roles(db: &Database) -> anyhow::Result<()> {
-    for (name, desc, temp, tools) in BUILTIN_ROLES {
-        if db.get_role(name).await?.is_none() {
-            let tools_json =
-                serde_json::to_string(&tools.iter().collect::<Vec<_>>()).unwrap_or_default();
-            db.insert_role(
-                name,
-                desc,
-                None,
-                None,
-                Some(*temp),
-                None,
-                Some(&tools_json),
-                None,
-                true,
-            )
-            .await?;
-        }
-    }
-    Ok(())
 }
 
 /// Load a role from the database, falling back to built-in defaults.

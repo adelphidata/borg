@@ -35,6 +35,11 @@ use crate::memory::injection::scan_for_injection;
 use crate::memory::tokenizer::estimate_tokens;
 use crate::memory::WriteMode;
 
+/// Cap on how much of a failed backend response body lands in the error
+/// string: enough to identify the fault, short enough that a hostile or
+/// verbose provider cannot flood the transcript with attacker-chosen text.
+const ERROR_BODY_PREVIEW_CHARS: usize = 400;
+
 pub mod honcho;
 pub mod letta;
 pub mod mem0;
@@ -344,7 +349,10 @@ pub(crate) async fn send_json<T: for<'de> Deserialize<'de>>(
             detail: format!(
                 "{}: {}",
                 status.as_u16(),
-                redacted.chars().take(400).collect::<String>()
+                redacted
+                    .chars()
+                    .take(ERROR_BODY_PREVIEW_CHARS)
+                    .collect::<String>()
             ),
         });
     }
@@ -387,7 +395,10 @@ pub(crate) async fn send_ok(
             detail: format!(
                 "{}: {}",
                 status.as_u16(),
-                redacted.chars().take(400).collect::<String>()
+                redacted
+                    .chars()
+                    .take(ERROR_BODY_PREVIEW_CHARS)
+                    .collect::<String>()
             ),
         });
     }

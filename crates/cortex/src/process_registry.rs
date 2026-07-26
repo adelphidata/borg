@@ -38,6 +38,7 @@
 //! 3. **Per-entry pin** — [`ProcessRegistry::pin`] flips a `pinned` flag
 //!    that the TUI exposes as an inline toggle on the subprocess view.
 
+use crate::util::time::now_unix;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -311,7 +312,7 @@ impl ProcessRegistry {
         command: impl Into<String>,
         session_id: Option<String>,
     ) -> ProcessGuard {
-        let now = unix_now();
+        let now = now_unix();
         let mut inner = self.lock();
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
         let id = inner.next_id;
@@ -560,7 +561,7 @@ impl ProcessRegistry {
         };
         entry.status = status;
         entry.exit_code = exit_code;
-        entry.finished_at = Some(unix_now());
+        entry.finished_at = Some(now_unix());
         entry.pinned = false;
         push_finished(&mut inner.finished, entry);
         true
@@ -660,14 +661,6 @@ fn normalize_command(command: &str) -> String {
     } else {
         format!("{first} {second}")
     }
-}
-
-fn unix_now() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,7 +913,7 @@ mod tests {
             let _g1 = reg.register(1, ProcessKind::Hook, "init guard", None);
             let _g2 = reg.register(0xFFFF_FFFE, ProcessKind::Hook, "ghost", None);
             assert_eq!(reg.running().len(), 2);
-            let reaped = reg.reap_dead(unix_now());
+            let reaped = reg.reap_dead(now_unix());
             assert_eq!(reaped, 1, "exactly the ghost was reaped");
             let snap = reg.snapshot();
             assert_eq!(snap.running.len(), 1);
@@ -950,12 +943,12 @@ mod tests {
                 .iter_mut()
                 .find(|e| e.id == id_old)
                 .expect("found");
-            e.finished_at = Some(unix_now() - 10_000);
+            e.finished_at = Some(now_unix() - 10_000);
         }
         let g_new = reg.register(222, ProcessKind::RunShell, "new", None);
         g_new.complete(Some(0));
         // TTL = 1h, max = 256. The 10k-second-old entry exceeds TTL.
-        let pruned = reg.prune_finished(unix_now(), 3600, 256);
+        let pruned = reg.prune_finished(now_unix(), 3600, 256);
         assert_eq!(pruned, 1);
         let snap = reg.snapshot();
         assert_eq!(snap.finished.len(), 1);
@@ -972,7 +965,7 @@ mod tests {
             ids.push(g.id());
             g.complete(Some(0));
         }
-        let pruned = reg.prune_finished(unix_now(), 1_000_000, 3);
+        let pruned = reg.prune_finished(now_unix(), 1_000_000, 3);
         assert_eq!(pruned, 2);
         let snap = reg.snapshot();
         assert_eq!(snap.finished.len(), 3);
@@ -999,7 +992,7 @@ mod tests {
         // 3601s old → warn; 14401s old → fail. Pinned entries omitted
         // from warn/fail and counted separately.
         let reg = ProcessRegistry::new();
-        let now = unix_now();
+        let now = now_unix();
         let g_young = reg.register(11, ProcessKind::RunShell, "young", None);
         let g_warn = reg.register(12, ProcessKind::RunShell, "warn-age", None);
         let g_fail = reg.register(13, ProcessKind::RunShell, "fail-age", None);
@@ -1028,13 +1021,13 @@ mod tests {
     fn auto_reap_disabled_when_max_age_zero() {
         let reg = ProcessRegistry::new();
         let g = reg.register(123, ProcessKind::RunShell, "ancient", None);
-        force_started_at(&reg, g.id(), unix_now() - 999_999);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
         let policy = AutoReapPolicy {
             max_age_secs: 0,
             never_kill_patterns: vec![],
             sigterm_grace_secs: 1,
         };
-        let rep = reg.auto_reap(unix_now(), &policy);
+        let rep = reg.auto_reap(now_unix(), &policy);
         assert_eq!(rep.killed_count(), 0);
         assert_eq!(rep.exempted_count(), 0);
         g.complete(Some(0));
@@ -1046,13 +1039,13 @@ mod tests {
         // it's been alive for days.
         let reg = ProcessRegistry::new();
         let g = reg.register(0, ProcessKind::Browser, "chromium", None);
-        force_started_at(&reg, g.id(), unix_now() - 999_999);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
         let policy = AutoReapPolicy {
             max_age_secs: 60,
             never_kill_patterns: vec![],
             sigterm_grace_secs: 1,
         };
-        let rep = reg.auto_reap(unix_now(), &policy);
+        let rep = reg.auto_reap(now_unix(), &policy);
         assert_eq!(rep.killed_count(), 0);
         assert_eq!(rep.exempted_by_kind, 1);
         g.complete(Some(0));
@@ -1062,14 +1055,14 @@ mod tests {
     fn auto_reap_exempts_pinned_entry() {
         let reg = ProcessRegistry::new();
         let g = reg.register(99999, ProcessKind::RunShell, "long-build", None);
-        force_started_at(&reg, g.id(), unix_now() - 999_999);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
         reg.pin(g.id()).expect("pin");
         let policy = AutoReapPolicy {
             max_age_secs: 60,
             never_kill_patterns: vec![],
             sigterm_grace_secs: 1,
         };
-        let rep = reg.auto_reap(unix_now(), &policy);
+        let rep = reg.auto_reap(now_unix(), &policy);
         assert_eq!(rep.killed_count(), 0);
         assert_eq!(rep.exempted_by_pin, 1);
         g.complete(Some(0));
@@ -1082,14 +1075,14 @@ mod tests {
         let reg = ProcessRegistry::new();
         let g_match = reg.register(11, ProcessKind::RunShell, "cargo build --release", None);
         let g_cousin = reg.register(12, ProcessKind::RunShell, "cargo-incompatible-tool", None);
-        force_started_at(&reg, g_match.id(), unix_now() - 999_999);
-        force_started_at(&reg, g_cousin.id(), unix_now() - 999_999);
+        force_started_at(&reg, g_match.id(), now_unix() - 999_999);
+        force_started_at(&reg, g_cousin.id(), now_unix() - 999_999);
         let policy = AutoReapPolicy {
             max_age_secs: 60,
             never_kill_patterns: compile_never_kill_patterns(&["cargo build*".into()]),
             sigterm_grace_secs: 1,
         };
-        let rep = reg.auto_reap(unix_now(), &policy);
+        let rep = reg.auto_reap(now_unix(), &policy);
         assert_eq!(rep.exempted_by_pattern, 1);
         // The cousin should have been a kill candidate. We don't have a
         // real PID to TERM, so `send_term_then_kill` returns SignalFailed
@@ -1121,13 +1114,13 @@ mod tests {
                 .expect("spawn sh");
             let pid = child.id();
             let g = reg.register(pid, ProcessKind::RunShell, "sleep 99", None);
-            force_started_at(&reg, g.id(), unix_now() - 999_999);
+            force_started_at(&reg, g.id(), now_unix() - 999_999);
             let policy = AutoReapPolicy {
                 max_age_secs: 60,
                 never_kill_patterns: vec![],
                 sigterm_grace_secs: 2,
             };
-            let rep = reg.auto_reap(unix_now(), &policy);
+            let rep = reg.auto_reap(now_unix(), &policy);
             assert_eq!(rep.killed_count(), 1, "real child was reaped");
             // The process must actually be dead.
             let _ = child.wait();
@@ -1164,7 +1157,7 @@ mod tests {
                 "platform must supply a start-time fingerprint for this test to be meaningful"
             );
             let g = reg.register(pid, ProcessKind::RunShell, "sleep 99", None);
-            force_started_at(&reg, g.id(), unix_now() - 999_999);
+            force_started_at(&reg, g.id(), now_unix() - 999_999);
             // Stamp a fingerprint that cannot match the live process → "recycled".
             force_fingerprint(&reg, g.id(), Some(0xDEAD_BEEF_DEAD_BEEF));
 
@@ -1173,7 +1166,7 @@ mod tests {
                 never_kill_patterns: vec![],
                 sigterm_grace_secs: 2,
             };
-            let rep = reg.auto_reap(unix_now(), &policy);
+            let rep = reg.auto_reap(now_unix(), &policy);
 
             assert_eq!(
                 rep.recycled_skipped, 1,
@@ -1214,13 +1207,13 @@ mod tests {
             "rustc --emit=link foo.rs",
             None,
         );
-        force_started_at(&reg, g.id(), unix_now() - 999_999);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
         let policy = AutoReapPolicy {
             max_age_secs: 60,
             never_kill_patterns: vec![],
             sigterm_grace_secs: 0,
         };
-        let _ = reg.auto_reap(unix_now(), &policy);
+        let _ = reg.auto_reap(now_unix(), &policy);
         let last = reg.previous_auto_reaped_commands();
         assert_eq!(last, vec!["rustc --emit=link".to_string()]);
         drop(g);

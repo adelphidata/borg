@@ -139,7 +139,10 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove a credential from the OS keychain. Errors are silently ignored.
+/// Remove a credential from the OS keychain. Errors are ignored: the backends
+/// don't distinguish "not present" from "delete failed" in their exit codes, so
+/// the caller (`installer::uninstall`) re-checks with `credential_store::check`
+/// and warns on a genuine leftover instead.
 ///
 /// Output is captured (not inherited) — `security delete-generic-password`
 /// prints `password has been deleted.` and an attribute dump to stdout, which

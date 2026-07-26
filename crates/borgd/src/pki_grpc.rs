@@ -49,6 +49,8 @@ impl PkiSvc {
     }
 }
 
+/// Pairing codes are short and human-transcribed, so the window is kept to the
+/// length of one supervised pairing attempt to limit brute-force surface.
 const PAIRING_TTL_SECS: i64 = 300;
 // `pub(crate)` so the `pairing::device` test module can mint codes against
 // the same intent the server uses; otherwise tests get "inaccessible" errors.

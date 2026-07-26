@@ -38,7 +38,6 @@ pub fn markdown_to_mrkdwn(text: &str) -> String {
             continue;
         }
 
-        // Process inline formatting character by character
         let chars: Vec<char> = line.chars().collect();
         let len = chars.len();
         let mut i = 0;
@@ -119,7 +118,6 @@ fn find_closing(chars: &[char], start: usize, delim: [char; 2]) -> Option<usize>
 /// Parse a markdown link `[text](url)` starting at position `start`.
 /// Returns (link_text, url, end_position) where end_position is after the closing `)`.
 fn parse_markdown_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    // Find closing ]
     let mut i = start + 1;
     let len = chars.len();
     while i < len && chars[i] != ']' {
@@ -136,7 +134,6 @@ fn parse_markdown_link(chars: &[char], start: usize) -> Option<(String, String, 
         return None;
     }
 
-    // Find closing )
     let url_start = i + 1;
     while i < len && chars[i] != ')' {
         i += 1;

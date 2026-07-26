@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
 use super::theme;
+use super::themes;
 
 /// Literal tabs are replaced with this at span construction, so no rendered
 /// buffer carries a `\t`. Emitting the tab instead would let the terminal
@@ -369,15 +370,25 @@ pub fn render_patch_wrapped(patch: &str, width: usize) -> Vec<Line<'static>> {
 /// diff simply re-renders it once.
 const PATCH_RENDER_CACHE_ENTRIES: usize = 16;
 
+/// `(patch content hash, wrap width, active theme generation)`.
+type PatchRenderKey = (u64, usize, u64);
+
 thread_local! {
-    /// Memo for [`render_patch_wrapped`], keyed by `(patch bytes, width)`.
+    /// Memo for [`render_patch_wrapped`], keyed by
+    /// `(patch bytes, width, theme generation)`.
     ///
     /// The transcript calls it from inside a cell's render function, so an
     /// unmemoized patch is re-parsed *and* re-syntax-highlighted on every frame
     /// — during streaming that is many times per second for a diff that never
     /// changes. `thread_local` rather than a mutex because rendering is
     /// single-threaded; this keeps the hot path lock-free.
-    static PATCH_RENDER_CACHE: std::cell::RefCell<Vec<((u64, usize), Vec<Line<'static>>)>> =
+    ///
+    /// The theme generation is part of the key because the cached `Line`s carry
+    /// resolved colors. `theme.rs` is written on the assumption that the palette
+    /// is read fresh every render, so without it a `/theme` swap — including the
+    /// popup's per-keystroke live preview — would leave every on-screen diff
+    /// painted in the previous palette.
+    static PATCH_RENDER_CACHE: std::cell::RefCell<Vec<(PatchRenderKey, Vec<Line<'static>>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -389,7 +400,7 @@ fn with_patch_render_cache(
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     patch.hash(&mut hasher);
-    let key = (hasher.finish(), width);
+    let key = (hasher.finish(), width, themes::active_generation());
 
     if let Some(hit) = PATCH_RENDER_CACHE.with_borrow(|cache| {
         cache
@@ -1109,6 +1120,50 @@ mod tests {
             "narrower width should wrap into at least as many rows: {} vs {}",
             narrower.len(),
             first.len()
+        );
+    }
+
+    /// Cached lines carry already-resolved colors, so the memo must not outlive a
+    /// palette swap. `/theme` swaps on every cursor move for live preview, and
+    /// `theme.rs` is built on the assumption that the palette is read fresh each
+    /// render — a content+width-only key left on-screen diffs in the old colors.
+    #[test]
+    fn patch_render_cache_is_invalidated_by_a_theme_swap() {
+        use crate::tui::themes;
+        let _lock = themes::active::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = themes::active();
+
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: theme_probe.rs\n",
+            "+let x = 1;\n",
+            "*** End Patch"
+        );
+        let styles = |lines: &[Line<'static>]| -> Vec<ratatui::style::Style> {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.style)
+                .collect()
+        };
+
+        themes::set_active(std::sync::Arc::new(
+            themes::builtin("default").expect("default theme").clone(),
+        ));
+        let with_default = styles(&render_patch_wrapped(patch, 60));
+
+        themes::set_active(std::sync::Arc::new(
+            themes::builtin("mono").expect("mono theme").clone(),
+        ));
+        let with_mono = styles(&render_patch_wrapped(patch, 60));
+
+        themes::set_active(before);
+
+        assert_ne!(
+            with_default, with_mono,
+            "a theme swap must re-render the patch, not replay the cached colors"
         );
     }
 

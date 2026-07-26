@@ -1,7 +1,7 @@
 //! Windows-only pipe transport for the trampoline's `SpawnRequest`.
 //!
-//! Replaces the original argv-encoded policy with an anonymous-pipe
-//! handoff. The parent creates a pipe, writes the framed
+//! The policy travels over an anonymous pipe rather than on argv. The
+//! parent creates a pipe, writes the framed
 //! [`SpawnRequest`](super::ipc::SpawnRequest), marks the read-end
 //! inheritable, and embeds the read-end's HANDLE value on the
 //! trampoline argv. The child inherits the read-end via
@@ -16,19 +16,12 @@
 //! the inheritance race-free: the read-end is in the parent's handle
 //! table at the moment `CreateProcess` snapshots inheritable handles.
 //!
-//! # SECURITY — what this transport does and does not buy
+//! # SECURITY
 //!
-//! Replacing argv with a HANDLE value defeats *passive* command-line
-//! scraping (WMI `Win32_Process.CommandLine`, `tasklist /v`,
-//! `Get-CimInstance`). A co-tenant scraping the system no longer sees
-//! deny-paths or allowed-domains in cleartext.
-//!
-//! It does NOT defeat an *active* same-session attacker who can
-//! `OpenProcess(PROCESS_DUP_HANDLE, ...)` on the parent and call
-//! `DuplicateHandle` to grab a copy of the read-end. Default Windows
-//! ACLs allow same-session, same-integrity processes to do this. The
-//! elevated-runner named-pipe transport closes that gap by
-//! authenticating the caller via the pipe's security descriptor.
+//! This transport defeats *passive* command-line scraping only; it does
+//! not stop an active same-session `DuplicateHandle` attacker. The full
+//! threat model lives in [`super`] — kept in one place so the two copies
+//! cannot drift.
 
 use std::io;
 use std::ptr;

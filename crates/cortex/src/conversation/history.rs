@@ -7,7 +7,6 @@ use crate::types::Message;
 /// Undo the last agent turn: remove everything after the last user message.
 /// Returns the number of messages removed, or 0 if there is nothing to undo.
 pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
-    // Find the index of the last user message
     let last_user_idx = history
         .iter()
         .rposition(|m| m.role == crate::types::Role::User);
@@ -71,21 +70,18 @@ const SYNTHETIC_RESULT_TEXT: &str = "[tool call aborted — no result received]"
 pub fn normalize_history(history: &mut Vec<Message>) {
     dedup_tool_calls(history);
 
-    // Collect all tool call IDs from assistant messages
     let call_ids: HashSet<String> = history
         .iter()
         .filter_map(|m| m.tool_calls.as_ref())
         .flat_map(|tcs| tcs.iter().map(|tc| tc.id.clone()))
         .collect();
 
-    // Collect all tool result IDs
     let result_ids: HashSet<String> = history
         .iter()
         .filter_map(|m| m.tool_call_id.as_ref())
         .cloned()
         .collect();
 
-    // Synthesize missing results for tool calls that have no result
     let missing: Vec<(usize, String)> = history
         .iter()
         .enumerate()
@@ -105,7 +101,6 @@ pub fn normalize_history(history: &mut Vec<Message>) {
         history.insert(insert_at, synthetic);
     }
 
-    // Remove orphaned tool results (results with no matching call)
     history.retain(|m| {
         if let Some(ref tid) = m.tool_call_id {
             call_ids.contains(tid)

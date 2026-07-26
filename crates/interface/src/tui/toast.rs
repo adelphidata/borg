@@ -14,6 +14,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::theme;
 
+// Long enough to read a one-line notice, short enough that a burst of toasts
+// clears before it buries the composer.
 const DEFAULT_TTL: Duration = Duration::from_secs(3);
 const DEFAULT_MAX: usize = 4;
 const MIN_WIDTH: u16 = 18;

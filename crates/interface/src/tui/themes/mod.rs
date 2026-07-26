@@ -19,7 +19,7 @@ pub mod builtins;
 pub mod loader;
 pub mod palette;
 
-pub use active::{active, set_active};
+pub use active::{active, active_generation, set_active};
 pub use builtins::{builtin, builtin_names};
 pub use loader::{list_user_themes, user_themes_dir};
 pub use palette::{Theme, ThemeSource};

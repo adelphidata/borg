@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::security::sanitize;
+use crate::util::truncate::floor_char_boundary;
 
 /// Filenames to search for, checked in order per directory.
 const DOC_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
@@ -74,18 +75,6 @@ pub fn discover_project_docs(cwd: &Path) -> Result<Option<String>> {
     } else {
         Ok(Some(combined))
     }
-}
-
-/// Find the largest byte index <= `max` that is a valid UTF-8 char boundary.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
-    }
-    let mut idx = max;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
 
 /// Scan project doc content for prompt injection and wrap if suspicious.
@@ -326,8 +315,6 @@ mod tests {
         assert!(result.contains("---")); // HR separator between docs
     }
 
-    // --- collect_doc_paths coverage ---
-
     #[test]
     fn collect_doc_paths_multiple_dirs_with_docs() {
         let tmp = TempDir::new().unwrap();
@@ -399,8 +386,6 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("CLAUDE.md"));
     }
-
-    // --- discover_project_docs coverage ---
 
     #[test]
     fn discover_empty_doc_file() {
@@ -506,8 +491,6 @@ mod tests {
         assert!(result.unwrap().contains("worktree content"));
     }
 
-    // --- floor_char_boundary additional coverage ---
-
     #[test]
     fn floor_char_boundary_at_exact_char_boundary() {
         let s = "ab\u{00e9}cd"; // é is 2 bytes: 0xc3 0xa9
@@ -516,8 +499,6 @@ mod tests {
         assert_eq!(floor_char_boundary(s, e_end), e_end);
         assert!(s.is_char_boundary(e_end));
     }
-
-    // --- discover_project_docs ordering verification ---
 
     #[test]
     fn discover_nested_three_levels_ordering() {
@@ -560,8 +541,6 @@ mod tests {
         // Verify the constant order hasn't accidentally changed
         assert_eq!(DOC_FILENAMES, &["AGENTS.md", "CLAUDE.md"]);
     }
-
-    // --- Injection scanning tests ---
 
     #[test]
     fn scan_doc_content_clean_passes_through() {

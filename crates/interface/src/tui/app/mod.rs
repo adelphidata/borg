@@ -970,7 +970,6 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Structured activity log
         let level_filter = match arg {
             None | Some("info") => Some("info"),
             Some("error") => Some("error"),
@@ -1029,13 +1028,11 @@ impl<'a> App<'a> {
             }
         }
 
-        // Prepare to send to agent
         self.cells.push(HistoryCell::User {
             text: input.to_string(),
         });
         self.cells.push(HistoryCell::assistant(String::new(), true));
 
-        // Take image attachments before file refs
         let images = self.composer.take_image_attachments();
 
         // Client-side `@path` expansion. Files get read (≤50 KB),
@@ -1146,7 +1143,6 @@ fn try_paste_clipboard_image(composer: &mut Composer) -> bool {
         return false;
     };
 
-    // Try image data first
     if let Ok(img_data) = clipboard.get_image() {
         if let Some(png_bytes) = rgba_to_png(
             &img_data.bytes,
@@ -1158,7 +1154,6 @@ fn try_paste_clipboard_image(composer: &mut Composer) -> bool {
         }
     }
 
-    // Try text that looks like an image file path
     if let Ok(text) = clipboard.get_text() {
         let trimmed = text.trim();
         let path = std::path::Path::new(trimmed);

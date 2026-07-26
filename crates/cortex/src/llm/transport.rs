@@ -17,6 +17,16 @@ pub(crate) struct TransportRequest<'a> {
     pub(crate) tools: Option<&'a [ToolDefinition]>,
     pub(crate) llm_config: &'a LlmConfig,
     pub(crate) prompt_cache_key: Option<&'a str>,
+    /// The byte-stable head of this turn's system prompt, when the caller knows
+    /// it. Providers with explicit cache breakpoints put the system marker at
+    /// the end of *this* rather than at the end of the whole system prompt.
+    ///
+    /// Carried as the prefix text — not an offset — so a value left over from an
+    /// earlier turn is harmless: it is honored only while it still genuinely
+    /// prefixes the system message in hand, and if it does, it is still a
+    /// correct stable prefix. A mismatched or absent value costs the split, not
+    /// correctness.
+    pub(crate) system_stable_prefix: Option<&'a str>,
     pub(crate) cost_events_enabled: bool,
 }
 
@@ -130,6 +140,42 @@ pub(crate) fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
         .and_then(parse_usage_cost)
 }
 
+/// Render the Anthropic top-level `system` field as cacheable text blocks.
+///
+/// The cache breakpoint goes at the end of the *stable prefix*, not the end of
+/// the whole prompt. Marking the whole prompt is what the naive shape does, and
+/// it caches nothing: the prompt's dynamic suffix ends with a second-resolution
+/// `Current Time`, so the marked block is byte-different on every turn and never
+/// hits. Splitting moves the marker back to content that actually repeats.
+///
+/// This does **not** spend an extra breakpoint — there is still exactly one
+/// `cache_control` here, so the default layout (tools + system + 2 rolling)
+/// stays inside Anthropic's budget of 4.
+///
+/// Falls back to a single marked block when `stable_prefix` is absent, doesn't
+/// match, or would leave either side empty. Those cases lose the split, not
+/// correctness.
+fn anthropic_system_blocks(
+    system: &str,
+    stable_prefix: Option<&str>,
+    cache_marker: &serde_json::Value,
+) -> serde_json::Value {
+    let split = stable_prefix
+        .filter(|prefix| !prefix.is_empty() && prefix.len() < system.len())
+        .filter(|prefix| system.starts_with(*prefix))
+        .map(str::len);
+
+    match split {
+        Some(at) => serde_json::json!([
+            { "type": "text", "text": &system[..at], "cache_control": cache_marker },
+            { "type": "text", "text": &system[at..] },
+        ]),
+        None => serde_json::json!([
+            { "type": "text", "text": system, "cache_control": cache_marker },
+        ]),
+    }
+}
+
 pub(crate) fn build_anthropic_request(
     request: &TransportRequest<'_>,
     stream: bool,
@@ -181,13 +227,11 @@ pub(crate) fn build_anthropic_request(
 
     if let Some(sys) = system_text {
         if cache_enabled && cache_system_eff {
-            body["system"] = serde_json::json!([
-                {
-                    "type": "text",
-                    "text": sys,
-                    "cache_control": &cache_marker,
-                }
-            ]);
+            body["system"] = anthropic_system_blocks(
+                &sys,
+                request.system_stable_prefix,
+                &cache_marker,
+            );
         } else {
             body["system"] = serde_json::json!(sys);
         }

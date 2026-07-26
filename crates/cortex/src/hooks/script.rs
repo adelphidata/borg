@@ -407,6 +407,12 @@ enum SubprocessError {
 /// stopping the read would re-introduce the deadlock this cap exists alongside.
 const MAX_HOOK_STREAM_BYTES: u64 = 8 * 1024;
 
+/// How long to wait for a drain thread's retained bytes once the child itself
+/// has exited. In the normal case the pipe is already at EOF and the value is
+/// waiting; this only bounds the case where the hook leaked a pipe end to a
+/// process that outlives it.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
 /// Spawn `sh -c <command>` with the payload on both `$1` and stdin, enforce
 /// `timeout`, reap the child on timeout. Follows the polling pattern from
 /// `host_audit::run_cmd_timeout`.
@@ -445,8 +451,8 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
         })
     });
 
-    let stdout_reader = child.stdout.take().map(spawn_stream_drain);
-    let stderr_reader = child.stderr.take().map(spawn_stream_drain);
+    let stdout_drain = child.stdout.take().map(spawn_stream_drain);
+    let stderr_drain = child.stderr.take().map(spawn_stream_drain);
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
@@ -464,18 +470,21 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
         }
     };
 
-    // The child is gone either way, so every pipe is at EOF and these joins
-    // return promptly.
-    if let Some(handle) = stdin_writer {
-        let _ = handle.join();
-    }
-    if let Some(handle) = stdout_reader {
-        // stdout is drained (to unblock the child) but not surfaced; hooks
-        // communicate via side effects and exit codes, not output.
-        let _ = handle.join();
-    }
-    if let Some(handle) = stderr_reader {
-        if let Ok(buf) = handle.join() {
+    // The child is gone, but its pipes are NOT necessarily at EOF: a hook that
+    // backgrounds anything without redirecting (`some-daemon &`) leaks the write
+    // end of stdout/stderr — and the read end of stdin — to a grandchild that
+    // outlives it. Joining these threads unconditionally would block for the
+    // grandchild's entire lifetime. `ScriptHook::execute` runs this synchronously
+    // on a runtime worker with no outer timeout, so that would hold a tool call
+    // and one worker hostage while silently voiding the configured `timeout`.
+    // Abandon the threads instead; each exits on its own once the last writer
+    // closes, and none of them touch state the caller still owns.
+    drop(stdin_writer);
+    // stdout is drained (to unblock the child) but never surfaced; hooks
+    // communicate via side effects and exit codes, not output.
+    drop(stdout_drain);
+    if let Some(rx) = stderr_drain {
+        if let Ok(buf) = rx.recv_timeout(STREAM_DRAIN_GRACE) {
             let text = String::from_utf8_lossy(&buf);
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -493,7 +502,14 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
 /// Reading all the way to EOF is what keeps the child unblocked. Returning early
 /// at the cap would leave a chatty hook stuck writing into a full pipe, which is
 /// exactly the deadlock the caller's threading exists to prevent.
-fn spawn_stream_drain<R: Read + Send + 'static>(mut stream: R) -> std::thread::JoinHandle<Vec<u8>> {
+///
+/// The retained bytes come back over a channel rather than a `JoinHandle` so the
+/// caller can give up on a thread that is still waiting on a leaked pipe — see
+/// [`STREAM_DRAIN_GRACE`].
+fn spawn_stream_drain<R: Read + Send + 'static>(
+    mut stream: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut retained = Vec::new();
         if let Err(e) = (&mut stream)
@@ -501,14 +517,18 @@ fn spawn_stream_drain<R: Read + Send + 'static>(mut stream: R) -> std::thread::J
             .read_to_end(&mut retained)
         {
             tracing::debug!("hook stream read failed: {e}");
-            return retained;
+            // Send what we got: the caller may already have stopped listening,
+            // in which case the error is just a dropped receiver.
+            let _ = tx.send(retained);
+            return;
         }
         // Anything past the cap is discarded, but still consumed.
         if let Err(e) = std::io::copy(&mut stream, &mut std::io::sink()) {
             tracing::debug!("hook stream drain failed: {e}");
         }
-        retained
-    })
+        let _ = tx.send(retained);
+    });
+    rx
 }
 
 #[cfg(test)]
@@ -1362,6 +1382,25 @@ mod tests {
             )
             .expect("a chatty hook must complete, not time out");
             assert_eq!(code, 0, "chatty hook should report its real exit code");
+        }
+
+        /// A hook that backgrounds a process leaks the stdout/stderr write ends to
+        /// a grandchild, so those pipes never reach EOF. Joining the drain threads
+        /// unconditionally blocked `run_subprocess` for the grandchild's whole
+        /// lifetime — far past `timeout`, on a runtime worker, with a `PreToolUse`
+        /// tool call waiting on it.
+        #[test]
+        fn hook_that_backgrounds_a_process_returns_within_its_timeout() {
+            let started = Instant::now();
+            let code = run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1))
+                .expect("a hook that exits promptly must not be reported as failed");
+            let elapsed = started.elapsed();
+            assert_eq!(code, 0, "the hook's own exit status must be reported");
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "returned after {elapsed:?}; the leaked pipe held it for the \
+                 background process's lifetime instead of honoring the timeout"
+            );
         }
     }
 }

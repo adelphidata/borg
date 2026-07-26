@@ -299,6 +299,8 @@ impl BrowserSession {
     /// Check if the browser process is still alive and responsive.
     #[instrument(skip_all, fields(browser.action = "health_check"))]
     pub async fn health_check(&self) -> Result<()> {
+        // 5s is generous for a local CDP version probe; longer just delays the
+        // recovery path when the browser is already wedged.
         health::check_browser_health(&self.browser, Duration::from_secs(5)).await
     }
 
@@ -943,15 +945,14 @@ impl BrowserSession {
             backends::close_remote_session(&self.config, remote).await;
         }
 
-        // Abort event listener tasks
         for h in &self.event_listener_handles {
             h.abort();
         }
 
-        // Send CDP Browser.close (drop sends it)
         drop(self.browser);
 
-        // Wait for the handler loop to finish, with timeout
+        // Bounded grace period: the handler exits as soon as the CDP socket
+        // closes, so a 3s overrun means it is stuck and we drop it instead.
         match tokio::time::timeout(Duration::from_secs(3), self._event_handle).await {
             Ok(_) => {}
             Err(_) => {
@@ -1000,6 +1001,8 @@ async fn history_navigate(
                         .into_value()
                         .context("history navigation result was not serialisable")?
                 }
+                // Execution-context churn during a navigation resolves within a
+                // frame or two; 150ms lets the new context install before retry.
                 Err(e) if health::is_transient_context_error(&format!("{e:?}")) => {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }

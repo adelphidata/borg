@@ -198,7 +198,8 @@ pub async fn fill(
                 .with_context(|| format!("Element not found: {selector}"))?;
             el.click().await.context("Focus click failed")?;
 
-            // Clear existing value first
+            // Best-effort clear: on non-input elements the assignment throws,
+            // and typing over existing text is still better than aborting.
             let esc_sel = selector.replace('\\', "\\\\").replace('\'', "\\'");
             let clear_js = format!("document.querySelector('{esc_sel}').value = ''");
             page.evaluate(clear_js.as_str()).await.ok();

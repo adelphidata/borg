@@ -74,7 +74,6 @@ pub(crate) async fn init_telegram(
                     log_gateway_activity("Telegram native integration active").await;
                     let bot_username = me.username.clone();
 
-                    // Set webhook if public_url is configured
                     if let Some(ref url) = config.gateway.public_url {
                         let webhook_url = format!("{url}/webhook/telegram");
                         if let Err(e) = client
@@ -347,7 +346,6 @@ mod tests {
     fn resolve_credential_config_takes_priority_over_keychain() {
         let mut config = Config::default();
         let key = "BORG_TEST_CHANNEL_INIT_CONFIG_CRED";
-        // Set via env var (simulating config resolution)
         unsafe { std::env::set_var(key, "config-value") };
         config.credentials.insert(
             key.to_string(),

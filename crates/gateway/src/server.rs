@@ -483,7 +483,6 @@ impl GatewayServer {
 
                 let typing = crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id);
 
-                // Extract thread/reply IDs before passing inbound to invoke_agent
                 let thread_id: Option<i64> =
                     inbound.thread_id.as_deref().and_then(|id| id.parse().ok());
                 let reply_to: Option<i64> =
@@ -1216,7 +1215,6 @@ fn extract_client_ip(
     // local reverse proxy). This prevents arbitrary clients from spoofing their IP
     // via X-Forwarded-For to bypass rate limiting.
     if peer_ip.is_loopback() {
-        // Check X-Forwarded-For first
         if let Some(xff) = headers.get("x-forwarded-for") {
             if let Ok(val) = xff.to_str() {
                 if let Some(first) = val.split(',').next() {
@@ -1228,7 +1226,6 @@ fn extract_client_ip(
             }
         }
 
-        // Check X-Real-IP
         if let Some(xri) = headers.get("x-real-ip") {
             if let Ok(val) = xri.to_str() {
                 let trimmed = val.trim();
@@ -1320,7 +1317,6 @@ async fn webhook_handler_inner(
         WebhookTarget::Script(channel) => channel,
     };
 
-    // Convert headers to JSON
     let mut headers_map = serde_json::Map::new();
     for (key, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
@@ -1358,6 +1354,8 @@ async fn webhook_handler_inner(
                     Ok(Err(e)) => Err(format!("{e:#}")),
                     Err(_) => Err("Request timed out".to_string()),
                 };
+                // Best-effort: the HTTP caller may have disconnected and dropped
+                // the receiver, which is not an error worth surfacing here.
                 let _ = tx.send(response);
             }),
         )
@@ -1437,7 +1435,6 @@ async fn slack_command_handler(
         }
     }
 
-    // Parse form-urlencoded payload
     let payload: crate::slack::types::SlashCommandPayload = match serde_urlencoded::from_str(&body)
     {
         Ok(p) => p,
@@ -1854,7 +1851,6 @@ description = "Script fallback"
 
     #[test]
     fn readyz_provider_detection_logic() {
-        // Verify the provider check logic used in readyz_handler
         let config = Config::default();
         let has_provider = config.llm.provider.is_some()
             || !config.llm.api_key_env.is_empty()

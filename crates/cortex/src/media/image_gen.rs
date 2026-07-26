@@ -38,7 +38,6 @@ impl ImageGenProvider {
         let resolve_key =
             |var: &str| -> Option<String> { std::env::var(var).ok().filter(|k| !k.is_empty()) };
 
-        // Explicit provider override
         if let Some(ref provider_name) = config.provider {
             return match provider_name.as_str() {
                 "openai" => {
