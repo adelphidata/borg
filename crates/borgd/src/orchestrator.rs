@@ -229,13 +229,14 @@ pub async fn start(
                     let probe = gateway::imessage::probe::probe_imessage().await;
                     match probe.status {
                         gateway::imessage::probe::ProbeStatus::Ok => {
-                            if let Err(e) =
-                                gateway::imessage::start_imessage_monitor(im_config, im_cancel)
-                                    .await
-                            {
-                                return Err(anyhow::anyhow!("iMessage monitor failed: {e}"));
-                            }
-                            Ok(())
+                            // Awaits the monitor itself, not a spawn. The
+                            // spawning variant returns immediately, which the
+                            // supervisor reads as a clean exit — it would stop
+                            // supervising at boot and leave a detached,
+                            // unwatched monitor whose panic goes unlogged.
+                            gateway::imessage::run_imessage_monitor(im_config, im_cancel)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("iMessage monitor failed: {e}"))
                         }
                         gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
                             tracing::warn!(

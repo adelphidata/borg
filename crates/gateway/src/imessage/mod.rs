@@ -26,10 +26,20 @@ use cortex::config::Config;
 /// and reflection guards, dispatches to the agent, and sends replies via
 /// osascript.
 ///
-/// Returns a `JoinHandle` for the monitor task.
+/// Returns a `JoinHandle` for the monitor task. The handle is detached, so a
+/// panic inside the loop is not observable through it — supervised callers
+/// want [`run_imessage_monitor`].
 pub async fn start_imessage_monitor(
     config: Config,
     shutdown: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     monitor::spawn_monitor(config, shutdown)
+}
+
+/// Run the iMessage monitor in the caller's task, resolving only when the
+/// monitor stops. This is the form a supervisor must await: it surfaces
+/// errors and panics for restart, where [`start_imessage_monitor`] would
+/// return `Ok` immediately and end supervision at boot.
+pub async fn run_imessage_monitor(config: Config, shutdown: CancellationToken) -> Result<()> {
+    monitor::run_monitor(config, shutdown).await
 }

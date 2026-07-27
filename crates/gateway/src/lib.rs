@@ -69,6 +69,8 @@ pub mod session_executor;
 pub mod session_queue;
 pub mod signal;
 pub mod slack;
+/// Panic-isolating respawn wrapper for the long-running channel loops.
+pub mod supervised_loop;
 pub mod teams;
 pub mod telegram;
 /// Public-internet tunnel providers (cloudflared, ngrok, tailscale, custom, none).

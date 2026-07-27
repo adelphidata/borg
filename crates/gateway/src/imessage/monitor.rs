@@ -30,6 +30,10 @@ const STATE_FILE: &str = "state.json";
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Start the iMessage monitor loop in a background task.
+///
+/// The returned handle is detached from the caller's lifetime — a panic in
+/// the loop is not observable through it. Supervised callers want
+/// [`run_monitor`] instead, whose future *is* the monitor.
 pub fn spawn_monitor(config: Config, shutdown: CancellationToken) -> Result<JoinHandle<()>> {
     let data_dir = Config::data_dir()?;
     let channel_dir = data_dir.join("channels/imessage");
@@ -41,6 +45,20 @@ pub fn spawn_monitor(config: Config, shutdown: CancellationToken) -> Result<Join
     });
 
     Ok(handle)
+}
+
+/// Run the iMessage monitor loop to completion in the caller's task.
+///
+/// Unlike [`spawn_monitor`], this future resolves only when the monitor
+/// stops, so a supervisor awaiting it observes errors, panics, and
+/// cancellation and can restart accordingly. `spawn_monitor` returns as soon
+/// as the task is spawned, which reads to a supervisor as an immediate clean
+/// exit — it would stop supervising within milliseconds of boot and leave the
+/// real monitor running unwatched.
+pub async fn run_monitor(config: Config, shutdown: CancellationToken) -> Result<()> {
+    let data_dir = Config::data_dir()?;
+    let channel_dir = data_dir.join("channels/imessage");
+    monitor_loop(config, channel_dir, shutdown).await
 }
 
 async fn monitor_loop(

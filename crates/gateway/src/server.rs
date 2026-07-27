@@ -432,17 +432,26 @@ impl GatewayServer {
         health: Arc<RwLock<ChannelHealthRegistry>>,
     ) {
         let drain_shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                tokio::select! {
-                    _ = drain_shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        drain_pending_deliveries(&state, &health).await;
+        crate::supervised_loop::spawn_supervised_loop(
+            "delivery-drain",
+            drain_shutdown.clone(),
+            move || {
+                let state = state.clone();
+                let health = health.clone();
+                let drain_shutdown = drain_shutdown.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(10));
+                    loop {
+                        tokio::select! {
+                            _ = drain_shutdown.cancelled() => break,
+                            _ = interval.tick() => {
+                                drain_pending_deliveries(&state, &health).await;
+                            }
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Spawn Telegram long-polling when no public_url is configured
@@ -578,15 +587,25 @@ impl GatewayServer {
         });
 
         let polling_client = tg_client.clone();
-        tokio::spawn(async move {
-            crate::telegram::polling::run_polling(
-                polling_client,
-                poll_dedup,
-                callback,
-                poll_shutdown,
-            )
-            .await;
-        });
+        crate::supervised_loop::spawn_supervised_loop(
+            "telegram-polling",
+            poll_shutdown.clone(),
+            move || {
+                let polling_client = polling_client.clone();
+                let poll_dedup = poll_dedup.clone();
+                let callback = callback.clone();
+                let poll_shutdown = poll_shutdown.clone();
+                async move {
+                    crate::telegram::polling::run_polling(
+                        polling_client,
+                        poll_dedup,
+                        callback,
+                        poll_shutdown,
+                    )
+                    .await;
+                }
+            },
+        );
     }
 
     /// Spawn the Signal SSE inbound loop. No-op when Signal is not configured.
@@ -670,10 +689,25 @@ impl GatewayServer {
 
         let sig_sse_client = sig_client.clone();
         let sse_config = self.config.clone();
-        tokio::spawn(async move {
-            crate::signal::sse::run_sse_loop(sig_sse_client, callback, sse_shutdown, sse_config)
-                .await;
-        });
+        crate::supervised_loop::spawn_supervised_loop(
+            "signal-sse",
+            sse_shutdown.clone(),
+            move || {
+                let sig_sse_client = sig_sse_client.clone();
+                let callback = callback.clone();
+                let sse_shutdown = sse_shutdown.clone();
+                let sse_config = sse_config.clone();
+                async move {
+                    crate::signal::sse::run_sse_loop(
+                        sig_sse_client,
+                        callback,
+                        sse_shutdown,
+                        sse_config,
+                    )
+                    .await;
+                }
+            },
+        );
     }
 
     /// Spawn one generic poll loop per script channel with `mode = "poll"`,
@@ -708,14 +742,25 @@ impl GatewayServer {
                 channel.manifest.name, poll_interval_ms
             );
 
-            let handle = tokio::spawn(run_channel_poll_loop(
-                channel.clone(),
-                poll_interval_ms,
-                state.config.clone(),
-                self.shutdown.clone(),
-                health.clone(),
-                state.request_timeout,
-            ));
+            let channel = channel.clone();
+            let poll_config = state.config.clone();
+            let poll_shutdown = self.shutdown.clone();
+            let poll_health = health.clone();
+            let request_timeout = state.request_timeout;
+            let handle = crate::supervised_loop::spawn_supervised_loop(
+                "channel-poll",
+                poll_shutdown.clone(),
+                move || {
+                    run_channel_poll_loop(
+                        channel.clone(),
+                        poll_interval_ms,
+                        poll_config.clone(),
+                        poll_shutdown.clone(),
+                        poll_health.clone(),
+                        request_timeout,
+                    )
+                },
+            );
 
             poll_handles.push(handle);
         }
@@ -763,8 +808,13 @@ async fn run_channel_poll_loop(
                     if consecutive_errors >= max_consecutive_errors {
                         total_error_cycles += 1;
                         if total_error_cycles >= 3 {
+                            // Bail out of this run and let the supervisor
+                            // restart the loop after its backoff. Previously
+                            // this was terminal — the channel stayed dead
+                            // until someone restarted the gateway, even after
+                            // a transient upstream outage had recovered.
                             tracing::error!(
-                                "Poll loop for '{}' permanently failed after {} error cycles ({} total errors). Restart gateway to retry.",
+                                "Poll loop for '{}' failed {} error cycles ({} total errors); restarting after backoff",
                                 channel_name, total_error_cycles, consecutive_errors + (total_error_cycles - 1) * max_consecutive_errors
                             );
                             break;
