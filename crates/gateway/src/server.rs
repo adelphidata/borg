@@ -629,13 +629,18 @@ impl GatewayServer {
                     .await
                     {
                         Ok((response_text, _)) => {
-                            let send_result = if let Some(ref gid) = group_id {
-                                client.send_group_message(gid, &response_text).await
-                            } else {
-                                client.send_message(&recipient, &response_text).await
-                            };
-                            if let Err(e) = send_result {
-                                warn!("Failed to send Signal response: {e}");
+                            // Empty = skip the send (silence marker or
+                            // non-activated group message); still ack the
+                            // inbound with a read receipt below.
+                            if !response_text.trim().is_empty() {
+                                let send_result = if let Some(ref gid) = group_id {
+                                    client.send_group_message(gid, &response_text).await
+                                } else {
+                                    client.send_message(&recipient, &response_text).await
+                                };
+                                if let Err(e) = send_result {
+                                    warn!("Failed to send Signal response: {e}");
+                                }
                             }
                             if let Some(ref mid) = inbound.message_id {
                                 if let Ok(ts) = mid.parse::<i64>() {
@@ -1499,6 +1504,12 @@ async fn slack_command_handler(
                         slack_mention.as_deref(),
                     )
                     .await?;
+
+                    // Empty = skip delivery (silence marker or non-activated
+                    // group message); chat.postMessage rejects empty text.
+                    if response_text.trim().is_empty() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
 
                     let formatted = crate::slack::format::markdown_to_mrkdwn(&response_text);
 

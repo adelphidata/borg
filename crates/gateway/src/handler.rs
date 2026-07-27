@@ -1010,6 +1010,17 @@ async fn invoke_agent_inner(
     )
     .await;
 
+    // Intentional silence: the `<silent_replies>` protocol promises the model
+    // that a marker-only reply means "deliver nothing". Interactive lanes use
+    // the strict check — a human is waiting, so a reply that merely *starts*
+    // with a marker is still delivered rather than risk swallowing a real
+    // answer. An empty response is the established skip-delivery shape
+    // (native channels drop it; `process_message` skips the outbound send).
+    if cortex::agent::silence::is_silent_interactive(&response_text) {
+        info!("Channel '{channel_name}': silence marker reply — suppressing delivery");
+        return Ok((String::new(), session_id));
+    }
+
     if response_text.is_empty() {
         response_text = "(no response)".to_string();
     }
@@ -1143,6 +1154,14 @@ async fn process_message(
         }
     }
     let (response_text, _session_id) = invoke_result?;
+
+    // Empty response = skip delivery (silence marker or non-activated group
+    // message). Sending an empty payload to the outbound script would deliver
+    // a blank message on most platforms.
+    if response_text.trim().is_empty() {
+        debug!("Channel '{channel_name}': empty response, skipping outbound delivery");
+        return Ok(response_text);
+    }
 
     // Chunk text if max_message_chars is configured
     let chunks = match channel.manifest.settings.max_message_chars {

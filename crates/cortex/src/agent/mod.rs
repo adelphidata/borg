@@ -36,6 +36,7 @@ mod goal_loop;
 mod hooks_dispatch;
 mod prompt_assembly;
 mod session_manager;
+pub mod silence;
 mod stream_handler;
 mod system_prompt;
 pub(crate) mod system_prompt_cache;
@@ -629,10 +630,15 @@ impl Agent {
     }
 
     async fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
+        // Every client this agent builds — main loop, compaction, aux —
+        // carries the session-scoped cache/routing key. Background calls
+        // without it route independently of the conversation they serve
+        // (no provider stickiness, no shard-stable auto-caching).
         let mut client = match self.llm_role {
             LlmRole::Primary => LlmClient::new(config).await?,
             LlmRole::Auxiliary => LlmClient::for_auxiliary(config).await?,
-        };
+        }
+        .with_prompt_cache_key(self.prompt_cache_key());
         if let Some(ref sink) = self.cost_event_sink {
             if config.telemetry.cost_events {
                 // Tag the sink so dashboards can split spend by role —
@@ -770,7 +776,7 @@ impl Agent {
         // output-cap floor) so a manual /compact can't truncate the summary
         // mid-section any more than the automatic paths can.
         let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
-        let llm = match self.make_llm_client_from_config(&compaction_config).await {
+        let mut llm = match self.make_llm_client_from_config(&compaction_config).await {
             Ok(l) => l,
             Err(e) => {
                 warn!("Manual compaction could not build a summarizer client: {e}");
@@ -778,7 +784,7 @@ impl Agent {
             }
         };
         let max_hist = self.effective_history_budget();
-        let (dropped, failure) = self.run_llm_compaction(max_hist, &llm).await;
+        let (dropped, failure) = self.run_llm_compaction(max_hist, &mut llm).await;
         // No event channel here — the caller renders the before/after counts.
         // Still record the outcome so a persistent outage latches (and gets
         // announced by the next path that can reach the user) instead of
@@ -1103,7 +1109,6 @@ impl Agent {
                     .make_llm_client_from_config(&self.config)
                     .await
                     .context("Failed to initialize LLM client")?
-                    .with_prompt_cache_key(self.prompt_cache_key())
                     .with_system_stable_prefix(system_stable_prefix);
                 tokio::spawn(async move {
                     if let Err(e) = llm_client
@@ -1674,12 +1679,12 @@ impl Agent {
         self.metrics.record_memory_pressure("reactive");
 
         let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
-        let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
+        let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         // Whether this pass updates a prior summary (UX hint only).
         let iterative =
             crate::conversation::extract_last_compaction_summary(&self.history).is_some();
 
-        let (dropped, failure) = self.run_llm_compaction(target, &compaction_llm).await;
+        let (dropped, failure) = self.run_llm_compaction(target, &mut compaction_llm).await;
         // Fold the outcome into the outage latch. This path reports its own
         // context-overflow error below, so it suppresses the generic notice by
         // passing no channel — the message here is strictly more specific.

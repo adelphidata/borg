@@ -1035,7 +1035,11 @@ impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
             max_history_tokens: 32000,
-            max_iterations: 25,
+            // 200: complex multi-step work routinely exceeds the old 25-call
+            // budget. The iteration cap is a backstop, not the cost control —
+            // loop_guard (identical-call/unknown-tool trackers) and the
+            // BudgetHook fire on the actual pathologies long before this.
+            max_iterations: 200,
             show_thinking: true,
             tool_output_max_tokens: constants::TOOL_OUTPUT_MAX_TOKENS,
             compaction_marker_tokens: constants::COMPACTION_MARKER_TOKENS,

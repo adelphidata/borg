@@ -546,6 +546,7 @@ async fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
@@ -910,6 +911,90 @@ async fn custom_provider_constructs_keyless_with_base_url() {
     );
 }
 
+/// A provider that returns 200 + headers and then stalls the body must not
+/// hang `chat()` forever. Regression: the send_request timeout only wrapped
+/// `send()` (headers), leaving `response.json()` unbounded.
+#[tokio::test]
+async fn chat_body_stall_times_out_instead_of_hanging() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            // Claim a large body, deliver one byte, then go quiet.
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{",
+            );
+            let _ = sock.flush();
+            std::thread::sleep(std::time::Duration::from_secs(20));
+        }
+    });
+
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
+    config.llm.request_timeout_ms = 400;
+    config.llm.max_retries = 0;
+    let client = LlmClient::new(&config).await.expect("client builds");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat(&[Message::user("hi")], None),
+    )
+    .await
+    .expect("chat must fail within the body budget, not hang");
+    let err = result.expect_err("stalled body must surface an error");
+    assert!(
+        format!("{err:#}").contains("stalled"),
+        "error should name the body stall, got: {err:#}"
+    );
+}
+
+/// `chat_streamed` runs the streaming wire path and aggregates the deltas
+/// into one message — the non-streaming result compaction and title
+/// generation consume, with the stream's inactivity-based timeouts.
+#[tokio::test]
+async fn chat_streamed_aggregates_sse_text_deltas() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"summary world\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+            );
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
+    config.llm.max_retries = 0;
+    let mut client = LlmClient::new(&config).await.expect("client builds");
+
+    let message = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_streamed(&[Message::user("summarize")]),
+    )
+    .await
+    .expect("stream must complete promptly")
+    .expect("aggregation must succeed");
+    assert_eq!(message.text_content(), Some("Hello summary world"));
+}
+
 #[tokio::test]
 async fn ollama_connection_refused_error_says_ollama_serve() {
     // Bind then drop a listener so the port is provably closed.
@@ -1224,6 +1309,7 @@ fn openai_request_includes_reasoning_effort() {
         reasoning_effort: Some("high".to_string()),
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -1243,6 +1329,7 @@ fn openai_request_omits_reasoning_effort_when_none() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -1262,6 +1349,7 @@ fn openai_request_serializes_prompt_cache_key_when_set() {
         reasoning_effort: None,
         prompt_cache_key: Some("sess-abc-123".to_string()),
         user: Some("sess-abc-123".to_string()),
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -1282,6 +1370,7 @@ fn openai_request_omits_prompt_cache_key_when_none() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -1306,6 +1395,7 @@ fn openai_stream_request_serializes_include_usage() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
@@ -1329,6 +1419,7 @@ fn openai_nonstream_request_omits_stream_options() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -1485,6 +1576,7 @@ fn openai_sanitizes_null_content_on_tool_call_messages() {
         reasoning_effort: None,
         prompt_cache_key: None,
         user: None,
+        session_id: None,
         stream_options: None,
         usage: None,
     };
@@ -2254,6 +2346,72 @@ async fn with_prompt_cache_key_sets_field() {
         .await
         .with_prompt_cache_key("sess-xyz");
     assert_eq!(client.prompt_cache_key.as_deref(), Some("sess-xyz"));
+}
+
+/// OpenRouter uses a request-body `session_id` as its sticky routing key —
+/// without it each call (especially aux calls) can route to a different
+/// upstream provider than the conversation it serves.
+#[tokio::test]
+async fn openrouter_body_carries_session_id_sticky_key() {
+    let client = make_test_openrouter_client(false)
+        .await
+        .with_prompt_cache_key("sess-root-1");
+    let messages = vec![Message::user("hi")];
+    let model = client.provider.normalize_model(&client.llm_config.model);
+    let request = client.transport_request(&messages, None, &model);
+    let body = crate::llm::transport::build_openai_request(&request, false).unwrap();
+    assert_eq!(body["session_id"], "sess-root-1");
+}
+
+/// The `session_id` field is OpenRouter-specific — other OpenAI-compatible
+/// hosts must not receive an unknown field they could reject.
+#[tokio::test]
+async fn non_openrouter_body_omits_session_id() {
+    let client = make_test_openai_client()
+        .await
+        .with_prompt_cache_key("sess-root-1");
+    let messages = vec![Message::user("hi")];
+    let model = client.provider.normalize_model(&client.llm_config.model);
+    let request = client.transport_request(&messages, None, &model);
+    let body = crate::llm::transport::build_openai_request(&request, false).unwrap();
+    assert!(body.get("session_id").is_none());
+    assert_eq!(body["prompt_cache_key"], "sess-root-1");
+}
+
+/// xAI cache affinity rides in the `x-grok-conv-id` header, gated to grok
+/// model slugs; absent without a cache key, and never sent for other models.
+#[tokio::test]
+async fn xai_grok_header_gated_on_model_and_key() {
+    let env_var = "BORG_TEST_XAI_LLM";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("xai".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "grok-4".to_string();
+
+    let client = LlmClient::new(&config)
+        .await
+        .unwrap()
+        .with_prompt_cache_key("conv-9");
+    let headers = client.request_headers().await.unwrap();
+    assert_eq!(
+        headers.get("x-grok-conv-id").map(|v| v.to_str().unwrap()),
+        Some("conv-9")
+    );
+
+    // No cache key → no header.
+    let bare = LlmClient::new(&config).await.unwrap();
+    let headers = bare.request_headers().await.unwrap();
+    assert!(headers.get("x-grok-conv-id").is_none());
+
+    // Non-grok slug on the xAI endpoint → no header.
+    config.llm.model = "other-model".to_string();
+    let other = LlmClient::new(&config)
+        .await
+        .unwrap()
+        .with_prompt_cache_key("conv-9");
+    let headers = other.request_headers().await.unwrap();
+    assert!(headers.get("x-grok-conv-id").is_none());
 }
 
 // Helper: build a minimal ToolDefinition for request-shape tests.

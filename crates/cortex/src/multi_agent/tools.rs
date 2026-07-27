@@ -499,7 +499,7 @@ pub async fn handle_wait_for_agent(
     let agent_id = require_str_param(args, "agent_id")?;
     let timeout_secs = args["timeout_secs"]
         .as_u64()
-        .unwrap_or(crate::constants::DEFAULT_SUB_AGENT_TIMEOUT_SECS);
+        .unwrap_or(agent_control.delegate_timeout_secs);
 
     let completion = agent_control.wait_for_agent(agent_id, timeout_secs).await?;
 
@@ -534,17 +534,28 @@ pub fn handle_list_agents(agent_control: &AgentControl) -> Result<String> {
         return Ok("No active sub-agents.".to_string());
     }
 
+    let now = chrono::Utc::now().timestamp();
     let list: Vec<serde_json::Value> = agents
         .iter()
         .map(|a| {
-            json!({
+            let mut entry = json!({
                 "id": a.id,
                 "nickname": a.nickname,
                 "role": a.role,
                 "depth": a.depth,
                 "status": a.status.as_str(),
                 "created_at": a.created_at,
-            })
+            });
+            // Live activity, present only while it says something useful:
+            // lets the parent distinguish "grinding through a long tool
+            // call" from "wedged since spawn" without waiting on the child.
+            if let Some(tool) = &a.current_tool {
+                entry["current_tool"] = json!(tool);
+            }
+            if let Some(ts) = a.last_activity_at {
+                entry["seconds_since_activity"] = json!(now.saturating_sub(ts).max(0));
+            }
+            entry
         })
         .collect();
 

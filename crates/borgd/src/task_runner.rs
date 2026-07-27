@@ -19,31 +19,15 @@ const PRE_RUN_OUTPUT_CAP: usize = 64 * 1024;
 /// task prompt and pre-run preamble.
 const SCHEDULED_TURN_MEMORY_TOKENS: usize = 4000;
 
-/// Sentinel string the LLM may return on its first non-empty line to
-/// suppress channel delivery for a scheduled-task run. Used for "ping me
-/// only when something changed"-style automations where the agent inspects
-/// the preprocessed context and decides nothing's worth saying.
-pub const SILENT_SENTINEL: &str = "[SILENT]";
+/// Sentinel string the LLM may return to suppress channel delivery for a
+/// scheduled-task run. Re-exported from the shared silence module so the
+/// prompt text below and the detection logic can never disagree.
+pub use cortex::agent::silence::SILENT_SENTINEL;
 
-/// Returns true if the LLM's response should suppress delivery — i.e. its
-/// first non-empty, trimmed line is `[SILENT]`, tolerating trailing punctuation
-/// or whitespace the model may append (`[SILENT].`, `[SILENT]!`). Substring
-/// matches (e.g. discussing the sentinel in prose, or `status=[SILENT]`) MUST
-/// NOT trigger suppression: the sentinel must be the whole line up to that
-/// trailing punctuation. Note we can't just trim trailing punctuation off the
-/// line, since the sentinel itself ends in `]`.
-pub(crate) fn is_silent_response(text: &str) -> bool {
-    text.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(|first| match first.strip_prefix(SILENT_SENTINEL) {
-            Some(rest) => rest
-                .chars()
-                .all(|c| c.is_ascii_punctuation() || c.is_whitespace()),
-            None => false,
-        })
-        .unwrap_or(false)
-}
+/// Scheduled tasks and heartbeats are autonomous lanes — nobody is waiting on
+/// the other end — so they use the lenient marker check (marker alone on the
+/// first or last non-empty line suppresses, even with an appended explanation).
+pub(crate) use cortex::agent::silence::is_silent_autonomous as is_silent_response;
 
 /// Spawn a single scheduled-task execution.
 pub async fn spawn_task_execution(
@@ -792,7 +776,15 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     ];
 
     let llm = match LlmClient::for_auxiliary(config).await {
-        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
+        // Stable per-task cache/routing key: the same scheduled task sends a
+        // near-identical prompt every run, so keying on the task id gives
+        // provider stickiness + shard-stable auto-caching across runs.
+        Ok(l) => maybe_attach_cost_event_sink(
+            l.with_prompt_cache_key(format!("task-{task_id}")),
+            config,
+            cost_event_sink.clone(),
+            "auxiliary",
+        ),
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
             match cortex::db::Database::open().await {
@@ -1053,9 +1045,14 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                 cortex::types::Message::user(&user_msg),
             ];
             let llm = match LlmClient::for_auxiliary(config).await {
-                Ok(l) => {
-                    maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary")
-                }
+                // Heartbeat check-ins share one near-identical prompt shape;
+                // a fixed key keeps them on one provider shard across ticks.
+                Ok(l) => maybe_attach_cost_event_sink(
+                    l.with_prompt_cache_key("heartbeat"),
+                    config,
+                    cost_event_sink.clone(),
+                    "auxiliary",
+                ),
                 Err(e) => {
                     let err_str = format!("{e}");
                     record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
@@ -1528,58 +1525,20 @@ mod pre_run_tests {
     use super::*;
 
     // ── [SILENT] sentinel detection ──
+    // Marker-form coverage lives with the shared helper in
+    // `cortex::agent::silence`. This pins the scheduled-task lane's contract:
+    // the lenient autonomous check, so a marker plus an appended explanation
+    // still suppresses delivery on this lane.
 
     #[test]
-    fn silent_sentinel_exact_match_suppresses() {
-        assert!(is_silent_response("[SILENT]"));
-        assert!(is_silent_response("  [SILENT]  "));
-    }
-
-    #[test]
-    fn silent_sentinel_tolerates_trailing_punctuation() {
-        // Models routinely append a stray period/bang/whitespace to the marker;
-        // that must still suppress. Regression for `[SILENT].` leaking to chat.
-        for s in [
-            "[SILENT].",
-            "[SILENT]!",
-            "[SILENT]?",
-            "  [SILENT].  ",
-            "[SILENT] .",
-        ] {
-            assert!(is_silent_response(s), "{s:?} should suppress delivery");
-        }
-        // Trailing *words* (real content, not a decorated marker) must NOT
-        // suppress — otherwise a genuine reply beginning with the marker text
-        // would be silenced.
+    fn scheduled_lane_suppresses_marker_with_explanation() {
+        assert!(is_silent_response("[SILENT]\nbackground notes go here"));
+        assert!(is_silent_response(
+            "Nothing actionable changed since the last run.\n[SILENT]"
+        ));
         assert!(!is_silent_response(
             "[SILENT] but actually here's an update"
         ));
-    }
-
-    #[test]
-    fn silent_sentinel_first_line_match_suppresses() {
-        // Leading sentinel with trailing notes still suppresses.
-        assert!(is_silent_response("[SILENT]\nbackground notes go here"));
-        assert!(is_silent_response("\n\n[SILENT]\nlater context"));
-    }
-
-    #[test]
-    fn silent_sentinel_substring_does_not_match() {
-        // Substring or in-prose mention must NOT trigger suppression — that
-        // would let a model accidentally silence itself by quoting the sentinel.
-        assert!(!is_silent_response(
-            "Result: [SILENT] mode triggered later."
-        ));
-        assert!(!is_silent_response("status=[SILENT]"));
-        assert!(!is_silent_response("preamble\n[SILENT]"));
-    }
-
-    #[test]
-    fn silent_sentinel_empty_response_is_not_silent() {
-        // Empty / whitespace-only response is a different failure mode (the
-        // dedup-empty path handles it). The sentinel matcher must not claim it.
-        assert!(!is_silent_response(""));
-        assert!(!is_silent_response("   \n\n  "));
     }
 
     // ── pre_run wake gate ──

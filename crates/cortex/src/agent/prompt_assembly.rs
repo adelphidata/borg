@@ -626,12 +626,12 @@ Rules:
             }
 
             let compaction_config = compaction_llm_config(&self.config);
-            let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
+            let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
             let (mut dropped_count, mut failure) =
-                self.run_llm_compaction(max_hist, &compaction_llm).await;
+                self.run_llm_compaction(max_hist, &mut compaction_llm).await;
 
             // A `[compaction]` override that stops working (retired model
             // slug, dead key) would otherwise wedge compaction forever: the
@@ -645,12 +645,12 @@ Rules:
                 warn!(
                     "compaction via [compaction] override made no progress; retrying with the primary model"
                 );
-                let primary_llm = self.make_llm_client_from_config(&self.config).await?;
+                let mut primary_llm = self.make_llm_client_from_config(&self.config).await?;
                 // The primary's verdict replaces the override's: if the primary
                 // can summarize, there is no outage to report — and if it can't
                 // either, the outage is real rather than an override typo.
                 let (retry_dropped, retry_failure) =
-                    self.run_llm_compaction(max_hist, &primary_llm).await;
+                    self.run_llm_compaction(max_hist, &mut primary_llm).await;
                 dropped_count = retry_dropped;
                 failure = retry_failure;
             }
@@ -781,7 +781,7 @@ Rules:
     pub(super) async fn run_llm_compaction(
         &mut self,
         target: usize,
-        llm: &LlmClient,
+        llm: &mut LlmClient,
     ) -> (usize, Option<SummarizeFailure>) {
         // Seed the iterative summary from the marker already in the working set
         // (itself a projection of the log) — no separate cached field to drift.

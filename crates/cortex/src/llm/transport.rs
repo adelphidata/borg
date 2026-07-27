@@ -933,6 +933,11 @@ pub(crate) fn build_openai_request(
         reasoning_effort,
         prompt_cache_key: request.prompt_cache_key.map(str::to_string),
         user: request.prompt_cache_key.map(str::to_string),
+        // OpenRouter-only sticky routing key; other OpenAI-compatible hosts
+        // could reject or misread an unknown `session_id` field.
+        session_id: (request.provider == Provider::OpenRouter)
+            .then(|| request.prompt_cache_key.map(str::to_string))
+            .flatten(),
         stream_options: stream.then_some(StreamOptions {
             include_usage: true,
         }),

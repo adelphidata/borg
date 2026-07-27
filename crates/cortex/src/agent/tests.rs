@@ -336,16 +336,19 @@ async fn compaction_retries_with_primary_model_when_override_fails() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
-    // The primary model still summarizes fine.
+    // The primary model still summarizes fine. The summarizer rides the
+    // streaming wire path (liveness-based timeouts), so the mock answers
+    // in SSE.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_string_contains("live-primary-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {"role": "assistant", "content": "summary of earlier work"},
-                "finish_reason": "stop"
-            }]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"summary of earlier work\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            "text/event-stream",
+        ))
         .mount(&server)
         .await;
 

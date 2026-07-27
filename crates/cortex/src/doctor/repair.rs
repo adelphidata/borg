@@ -107,7 +107,7 @@ async fn take_backup() -> Result<PathBuf> {
     let out_dir = home.join("backups");
     std::fs::create_dir_all(&out_dir)?;
     let schema_version = crate::backup::live_schema_version().await?;
-    crate::backup::create_backup(&home, &out_dir, schema_version)
+    crate::backup::create_backup(&home, &out_dir, schema_version).await
 }
 
 #[cfg(test)]

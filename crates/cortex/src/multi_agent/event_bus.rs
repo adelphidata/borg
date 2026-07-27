@@ -156,6 +156,8 @@ mod tests {
             created_at: 0,
             ended_at: None,
             metrics: SubAgentMetrics::default(),
+            last_activity_at: None,
+            current_tool: None,
         }
     }
 

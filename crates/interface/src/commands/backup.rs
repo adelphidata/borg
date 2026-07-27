@@ -17,7 +17,9 @@ pub async fn run_create() -> Result<()> {
     let home = Config::data_dir().context("locate BORG_HOME")?;
     let out_dir = paths::subdir(&home, BorgSubdir::Backups);
     let schema_version = live_schema_version().await?;
-    let path = create_backup(&home, &out_dir, schema_version).context("create backup")?;
+    let path = create_backup(&home, &out_dir, schema_version)
+        .await
+        .context("create backup")?;
     println!("backup: {}", path.display());
     Ok(())
 }

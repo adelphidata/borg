@@ -242,6 +242,14 @@ struct ChatRequest {
     /// to route consistent traffic to the same shard.
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    /// OpenRouter sticky routing key (mirrors `prompt_cache_key`). Per
+    /// OpenRouter's prompt-caching docs, a present `session_id` is used
+    /// directly as the routing key and activates provider stickiness on the
+    /// first successful request — without it, routing falls back to hashing
+    /// the opening messages and each call can land on a different upstream
+    /// than the conversation it serves. Attached only for OpenRouter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
     /// OpenAI streaming option. When `stream: true`, set
     /// `stream_options.include_usage = true` so the provider emits a final
     /// `usage` chunk — without this, OpenAI-compatible providers (OpenRouter,
@@ -1594,6 +1602,90 @@ impl LlmClient {
             .await
     }
 
+    /// Run the streaming path and aggregate the deltas into one complete
+    /// message, for callers that want a non-streaming result with
+    /// liveness-based timeouts (context compaction, title generation).
+    ///
+    /// The plain [`Self::chat`] wall-clock budget cuts a slow-but-healthy
+    /// summary model off mid-generation; here the streaming layer's
+    /// per-chunk stall timeout (with its reasoning-model floor) bounds
+    /// *inactivity* instead, so tokens flowing = alive, while a wedged
+    /// stream still dies. A total ceiling — `max(600s, 4 × per-chunk
+    /// budget)` — bounds degenerate trickle streams with no new config
+    /// knob. Models without tool support fall back to plain `chat` (the
+    /// streaming entrypoint rejects them).
+    ///
+    /// Text-only by design: no `tools` parameter, because tool-call stream
+    /// events would be silently discarded by the aggregation below. Callers
+    /// that need tools use [`Self::chat`] or [`Self::stream_chat`].
+    pub async fn chat_streamed(&mut self, messages: &[Message]) -> Result<Message> {
+        if !self.provider.supports_tools(&self.llm_config.model) {
+            return self.chat(messages, None).await;
+        }
+
+        // Ceiling: 0 chunk-timeout means the operator disabled idle
+        // timeouts entirely — respect that by not imposing a ceiling.
+        let chunk_secs = {
+            let configured = self.llm_config.stream_chunk_timeout_secs;
+            if configured == 0 {
+                0
+            } else {
+                configured.max(reasoning_timeouts::stale_timeout_floor_secs(
+                    &self.llm_config.model,
+                ))
+            }
+        };
+        let ceiling = (chunk_secs > 0).then(|| Duration::from_secs((4 * chunk_secs).max(600)));
+
+        let provider = self.provider;
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
+        let cancel = CancellationToken::new();
+        let deadline = ceiling.map(|c| tokio::time::Instant::now() + c);
+
+        let stream_fut = self.stream_chat_with_cancel(messages, None, tx, cancel.clone());
+        tokio::pin!(stream_fut);
+
+        let mut text = String::new();
+        let mut stream_result: Option<Result<()>> = None;
+        loop {
+            tokio::select! {
+                r = &mut stream_fut, if stream_result.is_none() => {
+                    // The sender is dropped with the future; keep draining
+                    // rx until it reports closed so no tail deltas are lost.
+                    stream_result = Some(r);
+                }
+                ev = rx.recv() => {
+                    match ev {
+                        Some(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                () = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        // Ceiling disabled: park this arm forever.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    cancel.cancel();
+                    bail!(
+                        "streamed completion from {provider} exceeded its total ceiling \
+                         ({}s) while still trickling output",
+                        ceiling.map(|c| c.as_secs()).unwrap_or(0)
+                    );
+                }
+            }
+        }
+        if let Some(result) = stream_result {
+            result?;
+        } else {
+            // Channel closed before the driving future resolved — settle it.
+            stream_fut.await?;
+        }
+        Ok(Message::assistant(&text))
+    }
+
     /// Try rotating to the next fallback API key. Returns true if rotation succeeded.
     /// If `keep_old` is false, the current key is discarded (e.g. on 401/403 auth failure).
     /// If `keep_old` is true, the current key is pushed to the back of the pool (e.g. on 429 rate limit).
@@ -2057,10 +2149,20 @@ impl LlmClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(crate::llm::llm_error::parse_retry_after_header);
-            let body = response.text().await.unwrap_or_else(|e| {
-                tracing::warn!("Failed to read error response body: {e}");
-                String::new()
-            });
+            // Bound the error-body read too — an error status with a stalled
+            // body must not hang the failover chain. Best-effort: a timeout
+            // degrades to classifying on the status alone.
+            let body = match tokio::time::timeout(timeout, response.text()).await {
+                Ok(Ok(text)) => text,
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to read error response body: {e}");
+                    String::new()
+                }
+                Err(_) => {
+                    tracing::warn!("Error response body stalled; classifying on status only");
+                    String::new()
+                }
+            };
             let err = classify_status(status, &body, self.provider);
             return Err(crate::llm::llm_error::override_retry_after(
                 err,
@@ -2130,12 +2232,27 @@ impl LlmClient {
                 })?;
             return bearer_headers(&token.access_token);
         }
-        self.provider
-            .build_headers(&self.api_key)
-            .map_err(|e| LlmError::Fatal {
-                source: e,
-                reason: FailoverReason::Unknown,
-            })
+        let mut headers =
+            self.provider
+                .build_headers(&self.api_key)
+                .map_err(|e| LlmError::Fatal {
+                    source: e,
+                    reason: FailoverReason::Unknown,
+                })?;
+        // xAI cache-affinity: `x-grok-conv-id` pins consecutive requests for
+        // the same conversation to the same cache shard. Model-gated to the
+        // grok family (the only models the header is documented for) and
+        // best-effort — an unrepresentable key just skips the header.
+        if self.provider == Provider::XAi {
+            if let Some(key) = self.prompt_cache_key.as_deref() {
+                if self.llm_config.model.to_ascii_lowercase().contains("grok") {
+                    if let Ok(val) = reqwest::header::HeaderValue::from_str(key) {
+                        headers.insert("x-grok-conv-id", val);
+                    }
+                }
+            }
+        }
+        Ok(headers)
     }
 
     #[instrument(skip_all, fields(llm.wire_path = self.wire_path().transport().protocol_name()))]
@@ -2332,7 +2449,22 @@ impl LlmClient {
         for attempt in 0..=max_retries {
             match self.send_request(&request_url, &body, &cancel).await {
                 Ok(response) => {
-                    let response_json: serde_json::Value = response.json().await?;
+                    // The `send_request` timeout only bounds the wait for
+                    // response *headers* — a provider that returns 200 and
+                    // then stalls the body would otherwise hang this read
+                    // forever. Same budget, applied to the body phase.
+                    let response_json: serde_json::Value = tokio::time::timeout(
+                        Duration::from_millis(self.llm_config.request_timeout_ms),
+                        response.json(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Response body from {} stalled past {}ms",
+                            self.provider,
+                            self.llm_config.request_timeout_ms
+                        )
+                    })??;
                     let parsed = transport.parse_chat_response(
                         response_json,
                         self.provider.as_str(),

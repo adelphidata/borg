@@ -43,7 +43,20 @@ pub async fn live_schema_version() -> Result<u32> {
 }
 
 /// File names / directories excluded from a backup tarball.
-const EXCLUDED_NAMES: &[&str] = &["borgd.sock", "logs", "backups"];
+///
+/// The SQLite database and its WAL/SHM siblings are excluded from the raw
+/// directory walk: raw-copying a live database that borgd is writing can
+/// produce a torn, unrestorable image (the tarball's SHA then certifies the
+/// torn bytes as "verified"). The database enters the archive exclusively via
+/// the `VACUUM INTO` snapshot taken in [`create_backup`].
+const EXCLUDED_NAMES: &[&str] = &[
+    "borgd.sock",
+    "logs",
+    "backups",
+    "borg.db",
+    "borg.db-wal",
+    "borg.db-shm",
+];
 
 /// File-extension suffix excluded from the archive.
 const EXCLUDED_SUFFIXES: &[&str] = &[".lock", ".sock"];
@@ -79,7 +92,11 @@ pub struct BackupVerifyReport {
 /// tarball includes a top-level `metadata.json` with the schema version
 /// and a SHA-256 of the uncompressed tar stream — `verify_backup` checks
 /// the digest before declaring the tarball restorable.
-pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> Result<PathBuf> {
+pub async fn create_backup(
+    borg_home: &Path,
+    out_dir: &Path,
+    schema_version: u32,
+) -> Result<PathBuf> {
     if !borg_home.is_dir() {
         bail!("borg_home {} is not a directory", borg_home.display());
     }
@@ -87,6 +104,21 @@ pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> R
         .with_context(|| format!("failed to create backup output dir {}", out_dir.display()))?;
     let now = chrono::Utc::now().timestamp();
     let dest = out_dir.join(format!("borg-backup-{now}.tar.zst"));
+
+    // Snapshot the live SQLite database FIRST, via `VACUUM INTO` over a real
+    // connection — SQLite's sanctioned online-copy path. The raw directory
+    // walk below deliberately excludes `borg.db`/`-wal`/`-shm` (see
+    // `EXCLUDED_NAMES`): byte-copying them while borgd has writes in flight
+    // can tar a torn database. Fail closed — no raw-copy fallback: a missing
+    // backup beats one that reports success and cannot be restored.
+    let db_path = crate::paths::db_path(borg_home);
+    let snap_dir = tempfile::tempdir().context("create tempdir for db snapshot")?;
+    let db_snapshot = if db_path.exists() {
+        Some(snapshot_live_db(&db_path, snap_dir.path()).await?)
+    } else {
+        // Fresh install with no database yet — nothing to snapshot.
+        None
+    };
 
     // Two-pass: write the tar to a temp file (so we can SHA the bytes),
     // then zstd-compress it into the final destination together with a
@@ -101,6 +133,13 @@ pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> R
         let mut builder = tar::Builder::new(writer);
         builder.follow_symlinks(false);
         append_dir_filtered(&mut builder, borg_home, Path::new("borg_home"))?;
+        if let Some(snapshot) = &db_snapshot {
+            // The snapshot rides under the same archive path the raw copy
+            // used, so restore/verify are unchanged.
+            builder
+                .append_path_with_name(snapshot, Path::new("borg_home").join("borg.db"))
+                .context("append db snapshot")?;
+        }
         builder.finish().context("finalize tar")?;
     }
     let manifest = BackupManifest {
@@ -287,6 +326,33 @@ pub async fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Resul
 }
 
 // ── helpers ──
+
+/// Produce a consistent point-in-time copy of the SQLite database at
+/// `db_path` into `work_dir`, using `VACUUM INTO` over a live connection.
+/// Safe against concurrent writers (the statement runs inside its own read
+/// transaction) and never touches the source file with raw I/O.
+///
+/// Opens a bare libsql connection rather than `Database::open_at` on
+/// purpose: the recovering opener quarantine-renames a file it cannot read,
+/// which a backup must never do to the live database. An unreadable source
+/// simply fails the backup here. Unlike the in-place compaction in
+/// `db::wal` (see its note on why `VACUUM INTO` + rename is unsafe there),
+/// the live file is never replaced — the copy is only read into the tarball.
+async fn snapshot_live_db(db_path: &Path, work_dir: &Path) -> Result<PathBuf> {
+    let dest = work_dir.join("borg.db");
+    let db = libsql::Builder::new_local(db_path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .context("snapshot: open source database")?;
+    let conn = db.connect().context("snapshot: connect")?;
+    // Escape single quotes for the SQL string literal. The destination is
+    // our own tempdir path, but tempdirs can live under arbitrary prefixes.
+    let dest_sql = dest.to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{dest_sql}'"), ())
+        .await
+        .context("snapshot: VACUUM INTO")?;
+    Ok(dest)
+}
 
 fn append_dir_filtered<W: Write>(
     builder: &mut tar::Builder<W>,
@@ -499,7 +565,6 @@ mod tests {
         fs::create_dir_all(home.join("blobs")).unwrap();
         fs::create_dir_all(home.join("logs")).unwrap();
         fs::create_dir_all(home.join("skills/example")).unwrap();
-        fs::write(home.join("borg.db"), b"not really a sqlite file").unwrap();
         fs::write(home.join("blobs/a.bin"), b"blob-a").unwrap();
         fs::write(home.join("blobs/b.bin"), b"blob-b-content").unwrap();
         fs::write(home.join("skills/example/SKILL.md"), b"# example skill").unwrap();
@@ -547,7 +612,7 @@ mod tests {
         fs::write(home.join("logs/daemon.log"), b"noisy").unwrap();
         fs::write(home.join("borgd.lock"), b"x").unwrap();
 
-        let path = create_backup(&home, &out, 47).expect("create");
+        let path = create_backup(&home, &out, 47).await.expect("create");
         assert!(path.exists());
 
         let report = verify_backup(&path).await.expect("verify");
@@ -564,7 +629,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let db_path = home.join("borg.db");
         Database::open_at(&db_path).await.unwrap();
-        let backup = create_backup(&home, &out, 47).expect("create");
+        let backup = create_backup(&home, &out, 47).await.expect("create");
 
         let err = restore_backup(&backup, &home, false)
             .await
@@ -584,7 +649,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         Database::open_at(&home.join("borg.db")).await.unwrap();
         fs::write(home.join("hooks.json"), b"{}").unwrap();
-        let backup = create_backup(&home, &out, 47).expect("create");
+        let backup = create_backup(&home, &out, 47).await.expect("create");
 
         fs::write(home.join("hooks.json"), b"{\"before\":1}").unwrap();
 
@@ -616,7 +681,7 @@ mod tests {
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
         Database::open_at(&home.join("borg.db")).await.unwrap();
-        let backup = create_backup(&home, &out, 47).expect("create");
+        let backup = create_backup(&home, &out, 47).await.expect("create");
 
         let mut bytes = fs::read(&backup).unwrap();
         let idx = bytes.len() / 2;
@@ -645,13 +710,18 @@ mod tests {
             "backups",
             "backups/borg-backup-1.tar.zst",
             "subdir/.lock",
+            // The database and its WAL/SHM siblings never enter via the raw
+            // walk — only via the VACUUM INTO snapshot.
+            "borg.db",
+            "borg.db-wal",
+            "borg.db-shm",
         ] {
             assert!(
                 should_skip_entry(Path::new(skip)),
                 "expected to skip {skip}"
             );
         }
-        for keep in ["borg.db", "skills/x/SKILL.md", "blobs/a.bin", "hooks.json"] {
+        for keep in ["skills/x/SKILL.md", "blobs/a.bin", "hooks.json"] {
             assert!(
                 !should_skip_entry(Path::new(keep)),
                 "expected to keep {keep}"
@@ -659,15 +729,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_backup_excludes_logs_socket_and_lock() {
+    #[tokio::test]
+    async fn create_backup_excludes_logs_socket_and_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("borg_home");
         let out = tmp.path().join("backups");
         fs::create_dir_all(&home).unwrap();
         populate_borg_home(&home);
+        Database::open_at(&home.join("borg.db")).await.unwrap();
 
-        let path = create_backup(&home, &out, 47).expect("create");
+        let path = create_backup(&home, &out, 47).await.expect("create");
 
         let inspect = tempfile::tempdir().unwrap();
         let (_manifest, body_tar) = extract_outer(&path, inspect.path()).expect("outer");
@@ -689,6 +760,94 @@ mod tests {
         assert!(
             !restored.join("borgd.lock").exists(),
             ".lock files must be excluded"
+        );
+        assert!(
+            !restored.join("borg.db-wal").exists() && !restored.join("borg.db-shm").exists(),
+            "WAL/SHM siblings must never be tarred — the db enters only via snapshot"
+        );
+    }
+
+    /// The archived database must be a consistent snapshot even while a live
+    /// connection holds unmerged WAL content. A raw byte-copy of `borg.db`
+    /// alone (WAL excluded) would silently lose the un-checkpointed rows —
+    /// this pins that the `VACUUM INTO` snapshot carries them.
+    #[tokio::test]
+    async fn snapshot_captures_unmerged_wal_content_from_live_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        let out = tmp.path().join("backups");
+        fs::create_dir_all(&home).unwrap();
+
+        let db = Database::open_at(&home.join("borg.db")).await.unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages (session_id, role, content, created_at)
+                 VALUES ('s', 'user', 'in-wal-1', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages (session_id, role, content, created_at)
+                 VALUES ('s', 'assistant', 'in-wal-2', 2)",
+                (),
+            )
+            .await
+            .unwrap();
+        // Keep `db` alive: the connection stays open across the backup, so
+        // the rows may still sit in the WAL rather than the main file.
+        let path = create_backup(&home, &out, 47).await.expect("create");
+        drop(db);
+
+        let report = verify_backup(&path).await.expect("verify");
+        assert_eq!(
+            report.messages_count, 2,
+            "snapshot must include rows still in the live connection's WAL"
+        );
+
+        // Belt-and-braces: the extracted database passes integrity_check.
+        let inspect = tempfile::tempdir().unwrap();
+        let (_m, body_tar) = extract_outer(&path, inspect.path()).expect("outer");
+        let inner = inspect.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let f = fs::File::open(&body_tar).unwrap();
+        tar::Archive::new(BufReader::new(f)).unpack(&inner).unwrap();
+        let extracted = Database::open_at(&inner.join("borg_home/borg.db"))
+            .await
+            .unwrap();
+        let mut rows = extracted
+            .conn()
+            .query("PRAGMA integrity_check", ())
+            .await
+            .unwrap();
+        let verdict = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert_eq!(verdict, "ok", "extracted db failed integrity_check");
+    }
+
+    /// Fail closed: an unreadable/garbage database must fail the backup —
+    /// never fall back to a raw byte copy that would tar the garbage and
+    /// report success.
+    #[tokio::test]
+    async fn create_backup_fails_closed_on_unreadable_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        let out = tmp.path().join("backups");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("borg.db"), b"not really a sqlite file").unwrap();
+
+        let err = create_backup(&home, &out, 47)
+            .await
+            .expect_err("garbage db must abort the backup");
+        assert!(
+            format!("{err:#}").contains("snapshot"),
+            "error should name the snapshot step: {err:#}"
         );
     }
 }

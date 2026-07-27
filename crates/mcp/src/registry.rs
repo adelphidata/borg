@@ -78,8 +78,14 @@ pub struct RegisteredTool {
     pub original_name: String,
     /// Description forwarded to the LLM.
     pub description: Option<String>,
-    /// Validated JSON schema for `inputSchema`.
+    /// Validated JSON schema for `inputSchema`, with provider-illegal
+    /// property keys renamed (see [`sanitize_property_keys`]).
     pub input_schema: Value,
+    /// Reverse map (sanitized → original) for property keys renamed in
+    /// [`Self::input_schema`]. Applied to tool-call arguments at dispatch via
+    /// [`unrename_tool_args`] so the server receives its original wire names.
+    /// Empty for the common case of an already-conforming schema.
+    pub arg_renames: BTreeMap<String, String>,
     /// True when the tool is parallel-safe to fan out with other read-only
     /// calls. Set by the operator via per-server `tools.read_only` config,
     /// OR — additively — by the server itself via
@@ -189,6 +195,26 @@ impl McpRegistry {
     ) -> Vec<ToolRegistrationOutcome> {
         let mut outcomes = Vec::new();
         let global_cap = *read_recovering(&self.global_cap, "registry.global_cap");
+
+        // Surface glob entries that matched nothing in the server's declared
+        // catalog — an unmatched pattern used to silently match nothing, so a
+        // filter meant to trim (or vet) a tool family actually did nothing.
+        let declared: Vec<&str> = discovered.iter().map(|t| t.name.as_str()).collect();
+        for (label, list) in [
+            ("include", &filter.include),
+            ("exclude", &filter.exclude),
+            ("read_only", &filter.read_only),
+        ] {
+            for pattern in ToolFilter::unmatched_patterns(list, &declared) {
+                tracing::warn!(
+                    server = %server,
+                    list = label,
+                    pattern = %pattern,
+                    "tools.{label} glob pattern matched no declared tool",
+                );
+            }
+        }
+
         let mut inner = write_recovering(&self.inner, "registry.inner");
 
         // Drop existing entries for this server first — `tools/list_changed`
@@ -256,6 +282,21 @@ impl McpRegistry {
                 continue;
             }
 
+            // Rename provider-illegal property keys once, at registration —
+            // one bad key anywhere in the tools array 400s the entire LLM
+            // request. The reverse map restores wire names at dispatch.
+            let mut input_schema = tool.input_schema.clone();
+            let arg_renames = sanitize_property_keys(&mut input_schema);
+            if !arg_renames.is_empty() {
+                tracing::warn!(
+                    server = %server,
+                    tool = %tool.name,
+                    renamed = arg_renames.len(),
+                    "renamed provider-illegal property keys in tool schema \
+                     (originals restored at dispatch)",
+                );
+            }
+
             // Read-only is true when either the operator opted in
             // (`tools.read_only`) OR the server advertised
             // `annotations.readOnlyHint: true`. The latter is untrusted,
@@ -276,7 +317,8 @@ impl McpRegistry {
                 server: server.to_string(),
                 original_name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
+                input_schema,
+                arg_renames,
                 read_only,
                 operator_read_only,
             };
@@ -474,6 +516,205 @@ fn sanitize_component(s: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_string()
+}
+
+/// Max length providers accept for a schema property key (Anthropic's
+/// `^[a-zA-Z0-9_.-]{1,64}$` pattern; OpenAI-compatible endpoints are no
+/// stricter).
+const MAX_PROPERTY_KEY_LEN: usize = 64;
+
+/// True iff `key` already conforms to the provider property-key pattern
+/// `^[a-zA-Z0-9_.-]{1,64}$`.
+fn property_key_conforms(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_PROPERTY_KEY_LEN
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Rename provider-illegal property keys throughout `schema`, in place.
+///
+/// Some servers ship property keys that violate the provider pattern
+/// (query-filter params like `issue_class~neq` or `meta.<field>[<op>]`).
+/// One bad key anywhere in the tools array 400s the *entire* request at
+/// provider validation, killing every tool with it. Renaming here keeps the
+/// tool usable; [`unrename_tool_args`] restores the wire names at dispatch so
+/// the server never sees the renamed form.
+///
+/// Rules, deterministic on both sides so the rendered tools array stays
+/// byte-stable across assemblies (prompt-prefix-cache safe):
+/// - every non-conforming char → `_`
+/// - truncate to 64 chars
+/// - collisions deduped with a numeric `_2`/`_3`… suffix in schema order
+/// - `required` arrays remapped alongside their sibling `properties`
+/// - nested schemas (`properties`, `items`, `additionalProperties`, …) are
+///   walked recursively
+///
+/// Returns the reverse map (sanitized → original). Empty when the schema was
+/// already clean — the schema is then byte-identical to its input.
+pub fn sanitize_property_keys(schema: &mut Value) -> BTreeMap<String, String> {
+    let mut renames = BTreeMap::new();
+    // One `taken` set for the WHOLE schema, pre-seeded with every conforming
+    // property key at every nesting level. `unrename_tool_args` applies the
+    // reverse map to object keys at any depth, so a sanitized name must be
+    // unique across the entire schema: a per-level set would let two levels
+    // produce the same sanitized name for different originals (the second
+    // silently overwriting the first in the map), or let a rename collide
+    // with a legitimate conforming key elsewhere and rewrite that key's
+    // arguments at dispatch.
+    let mut taken = std::collections::BTreeSet::new();
+    collect_conforming_property_keys(schema, &mut taken);
+    sanitize_property_keys_inner(schema, &mut renames, &mut taken);
+    renames
+}
+
+/// Seed pass for [`sanitize_property_keys`]: every already-conforming
+/// `properties` key, at every nesting level, is off-limits as a rename target.
+fn collect_conforming_property_keys(value: &Value, taken: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(obj) => {
+            if let Some(Value::Object(props)) = obj.get("properties") {
+                for key in props.keys() {
+                    if property_key_conforms(key) {
+                        taken.insert(key.clone());
+                    }
+                }
+            }
+            for v in obj.values() {
+                collect_conforming_property_keys(v, taken);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_conforming_property_keys(item, taken);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_property_keys_inner(
+    value: &mut Value,
+    renames: &mut BTreeMap<String, String>,
+    taken: &mut std::collections::BTreeSet<String>,
+) {
+    let Value::Object(obj) = value else {
+        // Arrays of schemas (`oneOf`, `anyOf`, tuple `items`) are handled by
+        // the recursion below via their owning object.
+        if let Value::Array(items) = value {
+            for item in items {
+                sanitize_property_keys_inner(item, renames, taken);
+            }
+        }
+        return;
+    };
+
+    // Rename this level's `properties` keys, tracking old → new for the
+    // sibling `required` remap.
+    let mut local: Vec<(String, String)> = Vec::new();
+    if let Some(Value::Object(props)) = obj.get_mut("properties") {
+        let needs_rename = props.keys().any(|k| !property_key_conforms(k));
+        if needs_rename {
+            let entries: Vec<(String, Value)> = std::mem::take(props).into_iter().collect();
+            for (key, val) in entries {
+                if property_key_conforms(&key) {
+                    props.insert(key, val);
+                    continue;
+                }
+                let renamed = dedupe_key(&sanitize_property_key(&key), taken);
+                renames.insert(renamed.clone(), key.clone());
+                local.push((key, renamed.clone()));
+                props.insert(renamed, val);
+            }
+        }
+    }
+    if !local.is_empty() {
+        if let Some(Value::Array(required)) = obj.get_mut("required") {
+            for entry in required {
+                if let Value::String(name) = entry {
+                    if let Some((_, renamed)) = local.iter().find(|(old, _)| old == name) {
+                        *name = renamed.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into every nested value. This covers `properties` values,
+    // `items`, `additionalProperties`, `oneOf`/`anyOf`/`allOf`, `$defs`, and
+    // anything else carrying sub-schemas — renaming only ever happens at a
+    // `properties` map, so visiting non-schema values is harmless.
+    for (_, v) in obj.iter_mut() {
+        sanitize_property_keys_inner(v, renames, taken);
+    }
+}
+
+/// Map a non-conforming key onto the provider alphabet.
+fn sanitize_property_key(key: &str) -> String {
+    let mut out: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    out.truncate(MAX_PROPERTY_KEY_LEN);
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// Resolve collisions against already-taken keys with a numeric suffix,
+/// truncating the stem so the result stays within the length cap.
+fn dedupe_key(candidate: &str, taken: &mut std::collections::BTreeSet<String>) -> String {
+    if !taken.contains(candidate) {
+        taken.insert(candidate.to_string());
+        return candidate.to_string();
+    }
+    for n in 2usize.. {
+        let suffix = format!("_{n}");
+        let stem_len = MAX_PROPERTY_KEY_LEN.saturating_sub(suffix.len());
+        let mut attempt = candidate.to_string();
+        attempt.truncate(stem_len);
+        attempt.push_str(&suffix);
+        if !taken.contains(&attempt) {
+            taken.insert(attempt.clone());
+            return attempt;
+        }
+    }
+    unreachable!("dedupe_key: unbounded suffix search always terminates")
+}
+
+/// Restore original wire names in tool-call `args` before they reach the MCP
+/// server, reversing [`sanitize_property_keys`]. Applies the map to every
+/// object key at any depth and recurses into array items — the model only
+/// ever sees the renamed schema, so any occurrence of a renamed key in its
+/// arguments refers to the original.
+pub fn unrename_tool_args(args: &mut Value, renames: &BTreeMap<String, String>) {
+    if renames.is_empty() {
+        return;
+    }
+    match args {
+        Value::Object(obj) => {
+            let entries: Vec<(String, Value)> = std::mem::take(obj).into_iter().collect();
+            for (key, mut val) in entries {
+                unrename_tool_args(&mut val, renames);
+                let restored = renames.get(&key).cloned().unwrap_or(key);
+                obj.insert(restored, val);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                unrename_tool_args(item, renames);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Run an MCP tool's `inputSchema` through the validation gauntlet.
@@ -901,5 +1142,246 @@ mod tests {
             !entry.read_only,
             "tool without readOnlyHint must remain mutating-by-default"
         );
+    }
+
+    // ── Property-key sanitization ──
+
+    #[test]
+    fn sanitize_property_keys_renames_illegal_chars_and_remaps_required() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "issue_class~neq": {"type": "string"},
+                "meta.field[gt]": {"type": "number"},
+                "has space": {"type": "boolean"},
+                "clean_key": {"type": "string"},
+            },
+            "required": ["issue_class~neq", "clean_key"],
+        });
+        let renames = sanitize_property_keys(&mut schema);
+
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("issue_class_neq"));
+        assert!(props.contains_key("meta.field_gt_"));
+        assert!(props.contains_key("has_space"));
+        assert!(props.contains_key("clean_key"), "clean keys untouched");
+
+        // Reverse map restores originals.
+        assert_eq!(renames["issue_class_neq"], "issue_class~neq");
+        assert_eq!(renames["meta.field_gt_"], "meta.field[gt]");
+        assert_eq!(renames["has_space"], "has space");
+        assert_eq!(renames.len(), 3, "clean key must not be mapped");
+
+        // `required` follows the rename.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, ["issue_class_neq", "clean_key"]);
+    }
+
+    #[test]
+    fn sanitize_property_keys_truncates_and_dedupes_deterministically() {
+        let long_a = format!("{}~a", "x".repeat(70));
+        let long_b = format!("{}~b", "x".repeat(70));
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                long_a.clone(): {"type": "string"},
+                long_b.clone(): {"type": "string"},
+                "key!": {"type": "string"},
+                "key?": {"type": "string"},
+            },
+        });
+        let renames = sanitize_property_keys(&mut schema);
+        let props = schema["properties"].as_object().unwrap();
+
+        // Both long keys truncate to the same 64-char stem; the collision is
+        // deduped with a numeric suffix and every key stays within the cap.
+        for key in props.keys() {
+            assert!(key.len() <= 64, "key '{key}' exceeds 64 chars");
+        }
+        assert_eq!(props.len(), 4, "no keys lost to collisions");
+        assert_eq!(renames.len(), 4);
+
+        // Determinism: sanitizing the same input again yields identical output.
+        let mut schema2 = json!({
+            "type": "object",
+            "properties": {
+                long_a: {"type": "string"},
+                long_b: {"type": "string"},
+                "key!": {"type": "string"},
+                "key?": {"type": "string"},
+            },
+        });
+        let renames2 = sanitize_property_keys(&mut schema2);
+        assert_eq!(schema, schema2);
+        assert_eq!(renames, renames2);
+    }
+
+    #[test]
+    fn sanitize_property_keys_recurses_into_nested_schemas() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "properties": {"nested~key": {"type": "string"}},
+                    "required": ["nested~key"],
+                },
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"item[0]": {"type": "string"}},
+                    },
+                },
+            },
+        });
+        let renames = sanitize_property_keys(&mut schema);
+        assert!(schema["properties"]["filters"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("nested_key"));
+        assert_eq!(
+            schema["properties"]["filters"]["required"][0],
+            json!("nested_key")
+        );
+        assert!(schema["properties"]["list"]["items"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("item_0_"));
+        assert_eq!(renames.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_property_keys_cross_level_collisions_stay_globally_unique() {
+        // Two failure modes of a per-level dedupe scope, both must be pinned:
+        // (1) `a~x` (top) and `a!x` (nested) sanitize to the same stem — the
+        //     second must take a suffix, or the reverse map silently maps one
+        //     sanitized name to two originals and restores the wrong one;
+        // (2) `b~y` (top) sanitizes to `b_y`, which is a LEGITIMATE conforming
+        //     key in the nested schema — the rename must dodge it, or
+        //     `unrename_tool_args` (applied at every depth) rewrites the
+        //     nested legit arg to an original it never was.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "a~x": {"type": "string"},
+                "b~y": {"type": "string"},
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "a!x": {"type": "integer"},
+                        "b_y": {"type": "integer"},
+                    },
+                },
+            },
+        });
+        let renames = sanitize_property_keys(&mut schema);
+
+        let top = schema["properties"].as_object().unwrap();
+        let nested = schema["properties"]["nested"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(top.contains_key("a_x"));
+        assert!(top.contains_key("b_y_2"), "must dodge the nested legit b_y");
+        assert!(nested.contains_key("a_x_2"), "cross-level stem collision");
+        assert!(nested.contains_key("b_y"), "legit key untouched");
+
+        assert_eq!(renames["a_x"], "a~x");
+        assert_eq!(renames["a_x_2"], "a!x");
+        assert_eq!(renames["b_y_2"], "b~y");
+
+        // Round-trip: every level restores its own original, and the nested
+        // legitimate `b_y` survives unrenamed.
+        let mut args = json!({
+            "a_x": "top",
+            "b_y_2": "renamed-top",
+            "nested": {"a_x_2": 1, "b_y": 2},
+        });
+        unrename_tool_args(&mut args, &renames);
+        assert_eq!(
+            args,
+            json!({
+                "a~x": "top",
+                "b~y": "renamed-top",
+                "nested": {"a!x": 1, "b_y": 2},
+            })
+        );
+    }
+
+    #[test]
+    fn sanitize_property_keys_clean_schema_is_untouched() {
+        let original = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "dotted.key": {"type": "string"},
+                "hyphen-key": {"type": "number"},
+            },
+            "required": ["name"],
+        });
+        let mut schema = original.clone();
+        let renames = sanitize_property_keys(&mut schema);
+        assert!(renames.is_empty());
+        assert_eq!(schema, original, "clean schema must be byte-identical");
+    }
+
+    #[test]
+    fn unrename_tool_args_round_trips_originals_recursively() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "issue_class~neq": {"type": "string"},
+                "filters": {
+                    "type": "object",
+                    "properties": {"meta.f[gt]": {"type": "number"}},
+                },
+            },
+        });
+        let renames = sanitize_property_keys(&mut schema);
+
+        // Model calls with the sanitized names it was shown, at any depth.
+        let mut args = json!({
+            "issue_class_neq": "spoof",
+            "filters": {"meta.f_gt_": 5},
+            "batch": [{"issue_class_neq": "x"}],
+        });
+        unrename_tool_args(&mut args, &renames);
+        assert_eq!(
+            args,
+            json!({
+                "issue_class~neq": "spoof",
+                "filters": {"meta.f[gt]": 5},
+                "batch": [{"issue_class~neq": "x"}],
+            })
+        );
+    }
+
+    #[test]
+    fn registration_stores_sanitized_schema_and_reverse_map() {
+        let reg = McpRegistry::new();
+        let tools = vec![McpToolSchema {
+            name: "query".into(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {"class~neq": {"type": "string"}},
+            }),
+            annotations: None,
+        }];
+        reg.replace_server_tools("srv", &tools, &ToolFilter::default(), &[]);
+        let entry = reg.lookup("mcp_srv_query").unwrap();
+        assert!(
+            entry.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("class_neq"),
+            "registered schema must carry the sanitized key"
+        );
+        assert_eq!(entry.arg_renames["class_neq"], "class~neq");
     }
 }

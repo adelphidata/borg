@@ -132,7 +132,7 @@ fn classify_summarize_failure(err: &anyhow::Error) -> SummarizeFailure {
 /// the summarized range for a degraded placeholder.
 pub(super) async fn summarize_with_llm(
     messages: &[Message],
-    llm: &LlmClient,
+    llm: &mut LlmClient,
 ) -> Result<String, SummarizeFailure> {
     // Build a transcript of dropped messages for the LLM to summarize
     let mut transcript = String::new();
@@ -200,7 +200,7 @@ pub(super) async fn summarize_with_llm(
 pub(super) async fn summarize_with_llm_v2(
     messages: &[Message],
     previous_summary: Option<&str>,
-    llm: &LlmClient,
+    llm: &mut LlmClient,
 ) -> Result<String, SummarizeFailure> {
     // Build a transcript of the middle region. Reuses the same trivial-result
     // skipping and truncation as the legacy summarizer.
@@ -263,7 +263,7 @@ pub(super) async fn summarize_with_llm_v2(
 
     let request = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
-    match llm.chat(&request, None).await {
+    match llm.chat_streamed(&request).await {
         Ok(response) => {
             let text = response.text_content().unwrap_or("").trim().to_string();
             if text.is_empty() {
@@ -284,7 +284,7 @@ pub(super) async fn summarize_with_llm_v2(
 /// than dropping the middle for a degraded placeholder.
 async fn summarize_single_chunk(
     transcript: &str,
-    llm: &LlmClient,
+    llm: &mut LlmClient,
 ) -> Result<String, SummarizeFailure> {
     let capped: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
 
@@ -293,7 +293,7 @@ async fn summarize_single_chunk(
         Message::user(format!("Summarize this earlier conversation:\n\n{capped}")),
     ];
 
-    match llm.chat(&messages, None).await {
+    match llm.chat_streamed(&messages).await {
         Ok(response) => {
             let text = response.text_content().unwrap_or("").trim().to_string();
             if text.is_empty() {
@@ -312,7 +312,10 @@ async fn summarize_single_chunk(
 /// Split a long transcript into chunks, summarize each, then merge. Returns
 /// `Err` when every chunk failed — the caller aborts compaction rather than
 /// substituting a degraded placeholder.
-async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Result<String, SummarizeFailure> {
+async fn summarize_chunked(
+    transcript: &str,
+    llm: &mut LlmClient,
+) -> Result<String, SummarizeFailure> {
     // Cap at 5 chunks to avoid runaway LLM calls on very long conversations
     const MAX_SUMMARY_CHUNKS: usize = 5;
     let chars: Vec<char> = transcript
@@ -345,7 +348,7 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Result<String, 
             )),
         ];
 
-        match llm.chat(&messages, None).await {
+        match llm.chat_streamed(&messages).await {
             Ok(response) => {
                 // Trim before the emptiness gate so a whitespace-only chunk
                 // response is dropped, matching summarize_single_chunk — a blank
@@ -393,7 +396,7 @@ async fn summarize_chunked(transcript: &str, llm: &LlmClient) -> Result<String, 
         )),
     ];
 
-    match llm.chat(&merge_messages, None).await {
+    match llm.chat_streamed(&merge_messages).await {
         Ok(response) => {
             let text = response.text_content().unwrap_or("").trim().to_string();
             // A successful merge that came back empty still has the per-chunk

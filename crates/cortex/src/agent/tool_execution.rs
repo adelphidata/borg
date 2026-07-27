@@ -739,7 +739,7 @@ impl Agent {
                 )
             }
             crate::tool::Tool::ApplySkillPatch(args) => {
-                crate::tool::apply_patch::handle_apply_skill_patch(args)
+                crate::tool::apply_patch::handle_apply_skill_patch(args, &self.config)
             }
             crate::tool::Tool::CreateChannel(args) => {
                 crate::tool::apply_patch::handle_create_channel(args)
@@ -1028,7 +1028,7 @@ pub(super) async fn dispatch_parallel_safe_tool(
         }
         .map(ToolOutput::Text),
         crate::tool::Tool::ApplySkillPatch(args) => {
-            crate::tool::apply_patch::handle_apply_skill_patch(args).map(ToolOutput::Text)
+            crate::tool::apply_patch::handle_apply_skill_patch(args, config).map(ToolOutput::Text)
         }
         // Anything still reaching here despite `parallel_safe()` returning true
         // is a closed-set inconsistency — fail loudly so tests catch it.

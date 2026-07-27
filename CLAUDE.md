@@ -112,12 +112,12 @@ Server cert SAN is `localhost` — exposing beyond loopback needs operator's hos
 
 | System | Lives in | Notable gotcha |
 |---|---|---|
-| Tools | `crates/cortex/src/tool_definitions.rs` + `tool_handlers/` | `schedule.create` `pre_run_command` injects stdout as `<preprocessed_context>` before LLM; `[SILENT]` first line suppresses channel delivery |
+| Tools | `crates/cortex/src/tool_definitions.rs` + `tool_handlers/` | `schedule.create` `pre_run_command` injects stdout as `<preprocessed_context>` before LLM; silence markers (`[SILENT]`/`<SILENT>`/`HEARTBEAT_OK`) detected via `cortex::agent::silence` — autonomous lanes suppress on first/last marker line, interactive lanes only on marker-only replies |
 | Goals | `crates/cortex/src/goals/` | Per-session Ralph loop; `goals` row is source of truth; sub-agents do NOT inherit parent goal |
-| Multi-Agent | `crates/cortex/src/multi_agent/` | `toolsets: []` ≠ None (means "no tools"); orchestrator role requires `agents.orchestrator_enabled` + depth check; Plan-mode children stay read-only even at orchestrator role |
+| Multi-Agent | `crates/cortex/src/multi_agent/` | `toolsets: []` ≠ None (means "no tools"); orchestrator role requires `agents.orchestrator_enabled` + depth check; Plan-mode children stay read-only even at orchestrator role; stall watchdog cancels a child after 450s no-progress + 120s grace (terminal `Errored{stalled: …}`) |
 | Config | `crates/cortex/src/config/` | DB-only, no config.toml; add fields to `<section>.rs` + `define_settings!` in `settings_table.rs` |
 | Memory | `crates/cortex/src/memory/` | Two-tier (session + `memory_entries`); `write_memory` enforces 20k-token cap + prompt-injection scan; `memory.provider` (default `native`) selects backend; external impls fall back to native with one-shot warn |
-| Skills | `crates/cortex/skills/` + `crates/cortex/src/skills.rs` | SKILL.md + YAML frontmatter; user skills at `~/.borg/skills/<name>/` override built-ins |
+| Skills | `crates/cortex/skills/` + `crates/cortex/src/skills.rs` | SKILL.md + YAML frontmatter; user skills at `~/.borg/skills/<name>/`; same-name shadows of built-ins are ignored by the loader (embedded copy wins), but a skill dir's `scripts/` executes from disk — skill patches refuse built-in names |
 | Channels | `crates/gateway/src/<name>/` | Per-channel/sender LLM routing via `[[gateway.bindings]]`; thread-scoped session key `{sender_id}:{thread_id}` |
 | Collaboration Modes | `crates/cortex/templates/collaboration_mode/` | Execute (default) + Plan (read-only); "Default" mode removed — `"default"` is a `FromStr` legacy alias only |
 | Agent Loop | `crates/cortex/src/agent/` | `<internal>` tags stripped real-time; loop safety: `ToolCallRepeatTracker` (Allow→Backoff→Block, cap `loop_guard.identical_call_max=3`), `UnknownToolTracker` (soft error then terminal at `unknown_tool_max_per_name=2`) |

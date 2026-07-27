@@ -47,8 +47,8 @@ pub(crate) fn handle_apply_patch_with_context(
 }
 
 /// `apply_skill_patch` alias — always lands in `~/.borg/skills/`.
-pub(crate) fn handle_apply_skill_patch(args: &ApplyPatchArgs) -> Result<String> {
-    tool_handlers::handle_apply_skill_patch(&args.to_value())
+pub(crate) fn handle_apply_skill_patch(args: &ApplyPatchArgs, config: &Config) -> Result<String> {
+    tool_handlers::handle_apply_skill_patch(&args.to_value(), config)
 }
 
 /// `create_channel` alias — always lands in `~/.borg/channels/`.

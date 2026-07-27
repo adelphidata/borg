@@ -15,9 +15,16 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 
 use super::{
-    AgentRole, AgentRoleKind, AgentTreeBus, AgentTreeEventKind, SubAgentCompletion, SubAgentInfo,
-    SubAgentStatus,
+    AgentRole, AgentRoleKind, AgentTreeBus, AgentTreeEventKind, LiveActivity, SubAgentCompletion,
+    SubAgentInfo, SubAgentStatus,
 };
+
+/// Heartbeat cycles of grace after the stall threshold trips before the
+/// watchdog cancels the child (default interval 30s → 120s of grace). A child
+/// that produces real progress inside the window recovers and finalizes
+/// normally; one that stays frozen is cancelled with a structured stall
+/// error so the parent hears a terminal outcome instead of waiting forever.
+const STALL_GRACE_CYCLES: u32 = 4;
 
 /// Prefixed to every parent-supplied `<context>` block so the child reads the
 /// handoff as a snapshot taken when it was spawned, not guaranteed-current
@@ -262,6 +269,9 @@ pub(super) struct SubAgentSpawn {
     pub(super) execution_context: Option<crate::execution_context::ExecutionContext>,
     pub(super) semaphore: Arc<Semaphore>,
     pub(super) completion_tx: mpsc::Sender<SubAgentCompletion>,
+    /// Live progress mirror shared with the parent's handle (last progress
+    /// time + currently executing tool), read by `list_agents`.
+    pub(super) live: Arc<LiveActivity>,
 }
 
 /// Driver for the tokio task `spawn_agent` creates. Acquires the concurrency
@@ -293,6 +303,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         execution_context,
         semaphore,
         completion_tx,
+        live,
     } = spawn;
 
     let _permit = match semaphore.acquire().await {
@@ -340,6 +351,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         info,
         prompt_cache_scope,
         execution_context,
+        live,
     )
     .await;
 
@@ -406,6 +418,7 @@ fn run_sub_agent(
     info: SubAgentInfo,
     prompt_cache_scope: String,
     execution_context: Option<crate::execution_context::ExecutionContext>,
+    live: Arc<LiveActivity>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         use crate::agent::{Agent, AgentEvent};
@@ -466,7 +479,7 @@ fn run_sub_agent(
         let cancel_clone = cancel.clone();
 
         // Send initial message in a spawned task
-        let send_handle = {
+        let mut send_handle = {
             let event_tx_clone = event_tx.clone();
             let cancel = cancel_clone.clone();
             tokio::spawn(async move {
@@ -479,20 +492,25 @@ fn run_sub_agent(
         // Heartbeat: tick every `heartbeat_interval_secs` and publish a
         // Heartbeat event on the bus. If no real progress (TextDelta /
         // ToolResult) for `heartbeat_stale_cycles` consecutive ticks,
-        // publish a single Stalled event so the operator/TUI can
-        // intervene. `heartbeat_interval_secs == 0` is the explicit
-        // disable sentinel — no ticks, no events, no extra work.
+        // publish a Stalled event and start the grace window; if the child
+        // still produces nothing for `STALL_GRACE_CYCLES` further ticks, the
+        // watchdog cancels it and returns a structured stall error — the
+        // parent hears a terminal outcome instead of waiting on a wedged
+        // child forever. Real progress inside the grace window recovers.
+        // `heartbeat_interval_secs == 0` is the explicit disable sentinel —
+        // no ticks, no events, no watchdog.
         let heartbeat_enabled = agents_config.heartbeat_interval_secs > 0;
+        let heartbeat_interval_secs = agents_config.heartbeat_interval_secs.max(1);
         let stale_threshold = agents_config.heartbeat_stale_cycles.max(1);
-        let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_secs(
-            agents_config.heartbeat_interval_secs.max(1),
-        ));
+        let mut heartbeat_tick =
+            tokio::time::interval(std::time::Duration::from_secs(heartbeat_interval_secs));
         // Skip the immediate first tick — we want to wait one full interval
         // before the first heartbeat fires, not race the spawn.
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat_tick.tick().await;
         let mut idle_cycles: u32 = 0;
         let mut stalled_emitted = false;
+        let mut stall_error: Option<String> = None;
 
         // Track apply_patch calls that have NOT yet had a ToolResult: the
         // patch paths are known at ToolExecuting time (from args), but
@@ -556,6 +574,8 @@ fn run_sub_agent(
                     match event {
                         Some(AgentEvent::TextDelta(delta)) => {
                             idle_cycles = 0;
+                            stalled_emitted = false;
+                            live.touch();
                             final_text.push_str(&delta);
                         }
                         Some(AgentEvent::TurnComplete) | None => {
@@ -567,6 +587,7 @@ fn run_sub_agent(
                             }
                         }
                         Some(AgentEvent::ToolExecuting { tool_call_id, name, args }) => {
+                            live.set_current_tool(Some(name.clone()));
                             // Stash the apply_patch paths keyed by call id;
                             // commit to files_written only when the matching
                             // ToolResult comes back successful. Buffered here
@@ -583,6 +604,13 @@ fn run_sub_agent(
                             // idle counter even on failure (a failed tool
                             // is still observable forward progress).
                             idle_cycles = 0;
+                            stalled_emitted = false;
+                            live.touch();
+                            // Display-only: under parallel tool fan-out the
+                            // first result clears the field while a sibling
+                            // is still running; the next ToolExecuting
+                            // repopulates it.
+                            live.set_current_tool(None);
                             if name == "apply_patch" {
                                 if let Some(paths) = pending_patch_paths.remove(&tool_call_id) {
                                     if is_apply_patch_success(&result) {
@@ -611,6 +639,35 @@ fn run_sub_agent(
                             b.publish(AgentTreeEventKind::Stalled, &info);
                         }
                     }
+                    if stalled_emitted
+                        && idle_cycles >= stale_threshold.saturating_add(STALL_GRACE_CYCLES)
+                    {
+                        // Grace exhausted with zero progress: cancel the
+                        // wedged child and surface a structured stall error.
+                        // The cancel unwinds cancel-aware await points in the
+                        // send task; the bounded join below covers the rest.
+                        let (_, in_tool) = live.snapshot();
+                        let phase = if in_tool.is_some() { "in_tool" } else { "idle" };
+                        let quiet_secs = u64::from(idle_cycles) * heartbeat_interval_secs;
+                        let threshold_secs =
+                            u64::from(stale_threshold) * heartbeat_interval_secs;
+                        let grace_secs =
+                            u64::from(STALL_GRACE_CYCLES) * heartbeat_interval_secs;
+                        tracing::warn!(
+                            %agent_id,
+                            nickname = %nickname,
+                            quiet_secs,
+                            phase,
+                            "sub-agent stalled — cancelling after exhausted grace window",
+                        );
+                        stall_error = Some(format!(
+                            "stalled: no progress for {quiet_secs}s \
+                             (threshold {threshold_secs}s, phase {phase}, \
+                             grace {grace_secs}s exhausted)"
+                        ));
+                        cancel.cancel();
+                        break;
+                    }
                 }
                 msg = input_rx.recv() => {
                     match msg {
@@ -621,6 +678,33 @@ fn run_sub_agent(
                     }
                 }
             }
+        }
+
+        if let Some(stall) = stall_error {
+            // The cancel above unwinds cancel-aware await points, but a
+            // blocking, non-cancel-aware operation inside the agent loop can
+            // ignore it — bound the join so the watchdog's terminal guarantee
+            // holds even against the wedge it just detected. One grace window
+            // is the budget; past it, abort and abandon the task.
+            let join_budget = std::time::Duration::from_secs(
+                u64::from(STALL_GRACE_CYCLES) * heartbeat_interval_secs,
+            );
+            match tokio::time::timeout(join_budget, &mut send_handle).await {
+                Ok(Err(e)) => tracing::warn!("sub-agent send_message task panicked: {e}"),
+                Ok(Ok(_)) => {}
+                Err(_) => {
+                    send_handle.abort();
+                    tracing::warn!(
+                        %agent_id,
+                        "stalled sub-agent ignored cancellation within the join budget; \
+                         task aborted and abandoned",
+                    );
+                }
+            }
+            // Terminal stall: surfaces as `Errored { error }` (persisted +
+            // shipped in the completion), so the parent gets the structured
+            // stall context instead of a partial "completed" result.
+            return Err(anyhow::anyhow!(stall));
         }
 
         if let Err(e) = send_handle.await {

@@ -282,7 +282,7 @@ pub fn compaction_checkpoint_range(
 pub async fn compact_history(
     history: &mut Vec<Message>,
     max_tokens: usize,
-    llm: &LlmClient,
+    llm: &mut LlmClient,
 ) -> Result<(), SummarizeFailure> {
     let Some(keep_from) = plan_compaction(history, max_tokens) else {
         return Ok(());
@@ -342,7 +342,7 @@ pub async fn compact_history_v2(
     max_tokens: usize,
     protect_first_n: usize,
     previous_summary: &mut Option<String>,
-    llm: &LlmClient,
+    llm: &mut LlmClient,
 ) -> Result<usize, SummarizeFailure> {
     let Some(plan) = plan_compaction_v2(history, max_tokens, protect_first_n) else {
         return Ok(0);
@@ -1025,11 +1025,11 @@ mod tests {
         config.llm.base_url = Some("http://127.0.0.1:1/v1/chat/completions".to_string());
         config.llm.max_retries = 0;
         config.llm.initial_retry_delay_ms = 0;
-        let llm = LlmClient::new(&config)
+        let mut llm = LlmClient::new(&config)
             .await
             .expect("offline ollama client builds");
 
-        let outcome = compact_history(&mut history, tight_budget, &llm).await;
+        let outcome = compact_history(&mut history, tight_budget, &mut llm).await;
         assert_eq!(
             outcome,
             Err(SummarizeFailure::Transient),

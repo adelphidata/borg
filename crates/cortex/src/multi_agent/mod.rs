@@ -208,6 +208,45 @@ impl SubAgentMetrics {
     }
 }
 
+/// Live progress signals shared between a running spawn task and the parent's
+/// `AgentControl` handle. The spawn task writes on real progress events; the
+/// parent reads when listing agents. In-memory only — the DB row is updated
+/// on terminal transitions, not per event.
+#[derive(Debug, Default)]
+pub struct LiveActivity {
+    /// Unix seconds of the last real progress signal (LLM text or a tool
+    /// result — the same signals that reset the stall watchdog). 0 = none yet.
+    last_activity_at: std::sync::atomic::AtomicI64,
+    /// Tool currently executing, if any.
+    current_tool: std::sync::Mutex<Option<String>>,
+}
+
+impl LiveActivity {
+    /// Record a progress signal at the current wall clock.
+    pub fn touch(&self) {
+        self.last_activity_at
+            .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    }
+
+    /// Set (on `ToolExecuting`) or clear (on `ToolResult`) the current tool.
+    pub fn set_current_tool(&self, tool: Option<String>) {
+        match self.current_tool.lock() {
+            Ok(mut guard) => *guard = tool,
+            Err(poisoned) => *poisoned.into_inner() = tool,
+        }
+    }
+
+    /// `(last_activity_at, current_tool)` snapshot for display.
+    pub fn snapshot(&self) -> (Option<i64>, Option<String>) {
+        let ts = self.last_activity_at.load(Ordering::Relaxed);
+        let tool = match self.current_tool.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        ((ts > 0).then_some(ts), tool)
+    }
+}
+
 /// Metadata for a running or completed sub-agent.
 #[derive(Debug, Clone)]
 pub struct SubAgentInfo {
@@ -233,6 +272,13 @@ pub struct SubAgentInfo {
     pub ended_at: Option<i64>,
     /// Accumulated execution metrics. Updated on tool dispatch + LLM usage.
     pub metrics: SubAgentMetrics,
+    /// Unix seconds of the child's last real progress signal (LLM text or a
+    /// tool result). Populated at read time from the live handle
+    /// ([`LiveActivity`]); `None` until the child first progresses. Not
+    /// persisted.
+    pub last_activity_at: Option<i64>,
+    /// Tool the child is currently executing, if any. Live, not persisted.
+    pub current_tool: Option<String>,
 }
 
 /// One unit of work for `spawn_batch_and_wait`.
@@ -355,6 +401,8 @@ struct SubAgentHandle {
     pub info: SubAgentInfo,
     pub input_tx: mpsc::Sender<String>,
     pub cancel: CancellationToken,
+    /// Live progress signals written by the spawn task, read at listing time.
+    pub live: Arc<LiveActivity>,
     /// Set true when the operator requests pause. The agent loop checks this
     /// at the top of each iteration and parks on `pause_notify` until cleared.
     pub is_paused: Arc<AtomicBool>,
@@ -375,6 +423,11 @@ pub struct AgentControl {
     pub max_spawn_depth: u32,
     /// Maximum number of active children a single agent can spawn.
     pub max_children_per_agent: u32,
+    /// Default blocking-wait budget (`agents.delegate_timeout_secs`), used by
+    /// `wait_for_agent` when the caller passes no explicit timeout. Single
+    /// source of truth — `spawn_agent(blocking=true)` reads the same config
+    /// key, so the two paths cannot drift.
+    pub delegate_timeout_secs: u64,
     _max_concurrent: u32,
     name_pool: names::NamePool,
     parent_session_id: String,
@@ -430,6 +483,7 @@ impl AgentControl {
             semaphore: Arc::new(Semaphore::new(config.max_concurrent as usize)),
             max_spawn_depth: config.max_spawn_depth,
             max_children_per_agent: config.max_children_per_agent,
+            delegate_timeout_secs: config.delegate_timeout_secs,
             _max_concurrent: config.max_concurrent,
             name_pool: names::NamePool::new(),
             parent_session_id: parent_session_id.to_string(),
@@ -604,6 +658,8 @@ impl AgentControl {
             created_at: chrono::Utc::now().timestamp(),
             ended_at: None,
             metrics: SubAgentMetrics::default(),
+            last_activity_at: None,
+            current_tool: None,
         };
 
         match crate::db::Database::open().await {
@@ -755,6 +811,7 @@ impl AgentControl {
         let cancel = CancellationToken::new();
         let is_paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
+        let live = Arc::new(LiveActivity::default());
         let tools_filter =
             compute_tools_filter(role.as_ref(), toolsets, tools_blocklist, parent_config).await;
 
@@ -781,6 +838,7 @@ impl AgentControl {
             execution_context: self.child_execution_context(),
             semaphore: self.semaphore.clone(),
             completion_tx: self.completion_tx.clone(),
+            live: live.clone(),
         };
         let join_handle = tokio::spawn(run_sub_agent_task(spawn_ctx));
 
@@ -788,6 +846,7 @@ impl AgentControl {
             info,
             input_tx,
             cancel,
+            live,
             is_paused,
             pause_notify,
             _join_handle: join_handle,
@@ -964,7 +1023,8 @@ impl AgentControl {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                bail!("Timeout waiting for agent '{agent_id}'");
+                self.cancel_timed_out_child(agent_id).await;
+                bail!("Timeout waiting for agent '{agent_id}' (cancellation requested)");
             }
 
             match tokio::time::timeout(remaining, self.completion_rx.recv()).await {
@@ -986,14 +1046,42 @@ impl AgentControl {
                     self.completion_buffer.push(completion);
                 }
                 Ok(None) => bail!("Completion channel closed"),
-                Err(_) => bail!("Timeout waiting for agent '{agent_id}'"),
+                Err(_) => {
+                    self.cancel_timed_out_child(agent_id).await;
+                    bail!("Timeout waiting for agent '{agent_id}' (cancellation requested)");
+                }
             }
         }
     }
 
-    /// List all sub-agents with their current info.
+    /// Cancel a child the parent has stopped waiting for. Without this, a
+    /// blocking-wait timeout left the wedged child running — and burning
+    /// tokens — indefinitely after the parent gave up on it.
+    async fn cancel_timed_out_child(&mut self, agent_id: &str) {
+        match self.agents.get(agent_id) {
+            Some(handle) if handle.info.status.is_terminal() => {}
+            Some(_) => {
+                if let Err(e) = self.shutdown_agent(agent_id).await {
+                    tracing::warn!(%agent_id, "failed to cancel timed-out child: {e}");
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// List all sub-agents with their current info, including the live
+    /// activity snapshot (last progress time + currently executing tool).
     pub fn list_agents(&self) -> Vec<SubAgentInfo> {
-        self.agents.values().map(|h| h.info.clone()).collect()
+        self.agents
+            .values()
+            .map(|h| {
+                let mut info = h.info.clone();
+                let (last_activity_at, current_tool) = h.live.snapshot();
+                info.last_activity_at = last_activity_at;
+                info.current_tool = current_tool;
+                info
+            })
+            .collect()
     }
 
     pub fn get_status(&self, agent_id: &str) -> Option<&SubAgentInfo> {
@@ -1222,9 +1310,12 @@ impl AgentControl {
                 created_at: chrono::Utc::now().timestamp(),
                 ended_at: None,
                 metrics: SubAgentMetrics::default(),
+                last_activity_at: None,
+                current_tool: None,
             },
             input_tx,
             cancel: cancel.clone(),
+            live: Arc::new(LiveActivity::default()),
             is_paused,
             pause_notify,
             _join_handle: tokio::spawn(async {}),
@@ -1359,6 +1450,89 @@ mod agents_feature_tests {
         assert_eq!(c.get_status("a").unwrap().status, SubAgentStatus::Running);
         let handle_running = c.agents.get("a").unwrap().is_paused.load(Ordering::Acquire);
         assert!(!handle_running, "is_paused must clear on resume");
+    }
+
+    /// A blocking wait that times out must cancel the child, not leave it
+    /// running. Regression: `wait_for_agent` used to `bail!` without
+    /// touching the child's cancel token, so a wedged child kept burning
+    /// tokens indefinitely after the parent gave up on it.
+    #[tokio::test]
+    async fn wait_for_agent_timeout_cancels_the_child() {
+        let mut c = ctrl();
+        let cancel = c.insert_mock_handle("wedged", "atlas");
+        assert!(!cancel.is_cancelled(), "precondition: child alive");
+
+        let err = c
+            .wait_for_agent("wedged", 0)
+            .await
+            .expect_err("zero-second wait on a never-completing child must time out");
+        assert!(
+            err.to_string().contains("Timeout"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "timed-out blocking wait must cancel the child"
+        );
+        assert!(
+            c.get_status("wedged").unwrap().status.is_terminal(),
+            "cancelled child must be in a terminal state"
+        );
+    }
+
+    /// Waiting on an already-terminal child returns its completion via the
+    /// fast path — the timeout-cancel machinery must never touch it.
+    #[tokio::test]
+    async fn wait_on_terminal_child_returns_completion_without_cancel() {
+        let mut c = ctrl();
+        let cancel = c.insert_mock_handle("done", "atlas");
+        if let Some(h) = c.agents.get_mut("done") {
+            h.info.status = SubAgentStatus::Completed {
+                result: "ok".into(),
+            };
+        }
+        let completion = c
+            .wait_for_agent("done", 0)
+            .await
+            .expect("terminal child must return immediately even at timeout 0");
+        assert_eq!(completion.final_response.as_deref(), Some("ok"));
+        assert!(
+            !cancel.is_cancelled(),
+            "terminal child must not be cancelled"
+        );
+    }
+
+    /// `list_agents` surfaces the live-activity snapshot the spawn task
+    /// writes: last progress time and the currently executing tool. Without
+    /// this the parent cannot distinguish "grinding through a long tool
+    /// call" from "wedged since spawn".
+    #[tokio::test]
+    async fn list_agents_carries_live_activity_snapshot() {
+        let mut c = ctrl();
+        c.insert_mock_handle("a", "atlas");
+
+        // Before any progress: both fields absent.
+        let listed = c.list_agents();
+        assert_eq!(listed[0].last_activity_at, None);
+        assert_eq!(listed[0].current_tool, None);
+
+        // Simulate the spawn task reporting progress + an executing tool.
+        let live = c.agents.get("a").unwrap().live.clone();
+        live.touch();
+        live.set_current_tool(Some("run_shell".into()));
+
+        let listed = c.list_agents();
+        assert!(
+            listed[0].last_activity_at.is_some(),
+            "touch() must surface a last-activity timestamp"
+        );
+        assert_eq!(listed[0].current_tool.as_deref(), Some("run_shell"));
+
+        // Tool completion clears the current tool but keeps the timestamp.
+        live.set_current_tool(None);
+        let listed = c.list_agents();
+        assert_eq!(listed[0].current_tool, None);
+        assert!(listed[0].last_activity_at.is_some());
     }
 
     /// Driving a fake counter under the gate proves pause is not just

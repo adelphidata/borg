@@ -694,10 +694,16 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         }
     };
 
+    // Restore original wire names for any property keys the registry renamed
+    // at registration (provider-illegal chars) — the server must see the
+    // names it declared, not the sanitized forms the model was shown.
+    let mut wire_args = args.clone();
+    mcp::registry::unrename_tool_args(&mut wire_args, &tool.arg_renames);
+
     let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = SessionCmd::Call {
         original_name: tool.original_name.clone(),
-        args: args.clone(),
+        args: wire_args,
         reply: reply_tx,
     };
     if tx.send(cmd).await.is_err() {

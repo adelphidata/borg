@@ -152,16 +152,149 @@ impl ToolFilter {
     /// passes the include/exclude filter.
     pub fn admits(&self, tool_name: &str) -> bool {
         if !self.include.is_empty() {
-            return self.include.iter().any(|n| n == tool_name);
+            return list_matches(&self.include, tool_name);
         }
-        !self.exclude.iter().any(|n| n == tool_name)
+        !list_matches(&self.exclude, tool_name)
     }
 
     /// True iff the operator has marked `tool_name` as safe to call in Plan
-    /// mode.
+    /// mode. Glob entries apply here exactly as in [`Self::admits`] — a
+    /// `read_only` list that silently no-oped on patterns would be a
+    /// Plan-mode trust hole in the other direction (operator *believes* the
+    /// family is vetted, nothing actually is).
     pub fn is_read_only(&self, tool_name: &str) -> bool {
-        self.read_only.iter().any(|n| n == tool_name)
+        list_matches(&self.read_only, tool_name)
     }
+
+    /// Entries from `list` (any of `include`/`exclude`/`read_only`) that
+    /// contain glob metacharacters but matched none of `tool_names`.
+    /// Surfaced as a registration-time warning: an unmatched pattern used to
+    /// silently match nothing, so a config meant to trim a large server
+    /// actually changed nothing.
+    pub fn unmatched_patterns<'a>(list: &'a [String], tool_names: &[&str]) -> Vec<&'a str> {
+        list.iter()
+            .filter(|entry| is_glob_entry(entry))
+            .filter(|entry| !tool_names.iter().any(|name| glob_match(entry, name)))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// True iff `tool_name` matches any entry in `list`. Entries without glob
+/// metacharacters stay strictly literal (`"docs"` never matches
+/// `"docs_search"`); entries containing `*`, `?`, or `[` are glob patterns.
+/// Exact membership is checked first so literal lists keep their O(n)
+/// string-compare cost.
+fn list_matches(list: &[String], tool_name: &str) -> bool {
+    if list.iter().any(|n| n == tool_name) {
+        return true;
+    }
+    list.iter()
+        .any(|entry| is_glob_entry(entry) && glob_match(entry, tool_name))
+}
+
+/// True when `entry` should be treated as a glob pattern rather than a
+/// literal name.
+fn is_glob_entry(entry: &str) -> bool {
+    entry.contains(['*', '?', '['])
+}
+
+/// Minimal glob matcher: `*` any run (including empty), `?` exactly one
+/// char, `[abc]` / `[a-z]` / `[!abc]` char classes. An unterminated `[`
+/// matches a literal `[`. Case-sensitive, matching the exact-name semantics
+/// of the surrounding filter.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    glob_match_at(&pat, 0, &txt, 0)
+}
+
+fn glob_match_at(pat: &[char], mut p: usize, txt: &[char], mut t: usize) -> bool {
+    // Backtracking points for the most recent `*`.
+    let mut star_p: Option<usize> = None;
+    let mut star_t = 0usize;
+
+    while t < txt.len() {
+        if p < pat.len() {
+            match pat[p] {
+                '*' => {
+                    // Record the star and greedily try to match nothing first.
+                    star_p = Some(p);
+                    star_t = t;
+                    p += 1;
+                    continue;
+                }
+                '?' => {
+                    p += 1;
+                    t += 1;
+                    continue;
+                }
+                '[' => {
+                    if let Some((matched, next_p)) = match_char_class(pat, p, txt[t]) {
+                        if matched {
+                            p = next_p;
+                            t += 1;
+                            continue;
+                        }
+                    } else if txt[t] == '[' {
+                        // Unterminated class: literal `[`.
+                        p += 1;
+                        t += 1;
+                        continue;
+                    }
+                }
+                c if c == txt[t] => {
+                    p += 1;
+                    t += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        // Mismatch: backtrack to the last `*`, consuming one more text char.
+        match star_p {
+            Some(sp) => {
+                p = sp + 1;
+                star_t += 1;
+                t = star_t;
+            }
+            None => return false,
+        }
+    }
+    // Text consumed; remaining pattern must be all `*`.
+    pat[p..].iter().all(|&c| c == '*')
+}
+
+/// Match `c` against the char class opening at `pat[start]` (which is `[`).
+/// Returns `(matched, index_past_class)`, or `None` when the class is
+/// unterminated.
+fn match_char_class(pat: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+    let mut i = start + 1;
+    let negated = pat.get(i) == Some(&'!');
+    if negated {
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while i < pat.len() {
+        if pat[i] == ']' && !first {
+            return Some((matched != negated, i + 1));
+        }
+        // Range form `a-z` (a `-` at the edges is literal).
+        if i + 2 < pat.len() && pat[i + 1] == '-' && pat[i + 2] != ']' {
+            if pat[i] <= c && c <= pat[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if pat[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+        first = false;
+    }
+    None
 }
 
 impl Default for ToolFilter {
@@ -249,6 +382,77 @@ mod tests {
         assert!(f.admits("search"));
         assert!(!f.admits("search_pro"));
         assert!(!f.admits("pre_search"));
+    }
+
+    // ── Glob entries ──
+
+    #[test]
+    fn glob_entries_match_families_literals_stay_literal() {
+        // A flat-API server declaring hundreds of `*_radar_*` tools can be
+        // trimmed with one pattern; the literal "docs" entry must never widen
+        // to "docs_search".
+        let f = ToolFilter {
+            exclude: vec!["*_radar_*".into(), "docs".into()],
+            ..Default::default()
+        };
+        assert!(!f.admits("get_radar_report"), "glob must exclude family");
+        assert!(!f.admits("accounts_radar_x"));
+        assert!(!f.admits("docs"), "literal still excludes exact name");
+        assert!(f.admits("docs_search"), "literal must stay literal");
+        assert!(f.admits("radar"), "*_radar_* needs both underscores");
+    }
+
+    #[test]
+    fn glob_include_and_question_and_class_forms() {
+        let f = ToolFilter {
+            include: vec!["get_?".into(), "purge_[cd]ache".into()],
+            ..Default::default()
+        };
+        assert!(f.admits("get_a"), "? matches exactly one char");
+        assert!(!f.admits("get_ab"));
+        assert!(!f.admits("get_"));
+        assert!(f.admits("purge_cache"), "char class member matches");
+        assert!(f.admits("purge_dache"));
+        assert!(!f.admits("purge_ecache"));
+    }
+
+    #[test]
+    fn glob_negated_class_and_range() {
+        let f = ToolFilter {
+            include: vec!["v[0-9]".into(), "x[!a]".into()],
+            ..Default::default()
+        };
+        assert!(f.admits("v7"));
+        assert!(!f.admits("va"));
+        assert!(f.admits("xb"));
+        assert!(!f.admits("xa"));
+    }
+
+    #[test]
+    fn glob_applies_to_read_only_identically() {
+        // A read_only pattern that silently no-oped would leave the operator
+        // believing a family is Plan-mode vetted when nothing is.
+        let f = ToolFilter {
+            read_only: vec!["list_*".into(), "get_item".into()],
+            ..Default::default()
+        };
+        assert!(f.is_read_only("list_records"));
+        assert!(f.is_read_only("list_"));
+        assert!(f.is_read_only("get_item"));
+        assert!(!f.is_read_only("get_items"), "literal stays literal");
+        assert!(!f.is_read_only("delete_record"));
+    }
+
+    #[test]
+    fn unmatched_patterns_reports_only_dead_globs() {
+        let list = vec![
+            "*_radar_*".into(),
+            "purge_cache".into(), // literal — never reported even if absent
+            "list_*".into(),
+        ];
+        let declared = ["list_records", "delete_record"];
+        let dead = ToolFilter::unmatched_patterns(&list, &declared);
+        assert_eq!(dead, vec!["*_radar_*"]);
     }
 
     #[test]

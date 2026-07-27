@@ -150,8 +150,14 @@ pub const DEFAULT_ENABLED_SKILLS: &[&str] = &registry_filtered_names!(e => e.def
 pub const HIDDEN_SKILLS: &[&str] = &registry_filtered_names!(e => e.hidden);
 
 /// Returns `true` if the given name matches a built-in skill.
+///
+/// Case-insensitive: the default macOS filesystem is, so `Scheduler/` and
+/// `scheduler/` are the same on-disk directory — an exact match here would
+/// let a case-twiddled path bypass guards that key on this check.
 pub fn is_builtin_skill_name(name: &str) -> bool {
-    BUNDLED_SKILLS.iter().any(|(n, _)| *n == name)
+    BUNDLED_SKILLS
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(name))
 }
 
 fn bundled_skill_content(name: &str) -> Option<&'static str> {

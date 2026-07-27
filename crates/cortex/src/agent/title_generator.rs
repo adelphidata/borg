@@ -110,6 +110,7 @@ fn is_default_title(current_title: &str, first_user_message: &str) -> bool {
 /// Build the aux LLM client and request a title for the given exchange.
 /// Returns `None` on any aux-pipeline failure (cleaned and logged at `warn`).
 async fn generate_session_title(
+    session_id: &str,
     user_message: &str,
     assistant_response: &str,
     config: &Config,
@@ -117,8 +118,8 @@ async fn generate_session_title(
     let user_snippet = char_truncate(user_message, SNIPPET_CHAR_CAP);
     let assistant_snippet = char_truncate(assistant_response, SNIPPET_CHAR_CAP);
 
-    let llm = match LlmClient::for_auxiliary(config).await {
-        Ok(c) => c,
+    let mut llm = match LlmClient::for_auxiliary(config).await {
+        Ok(c) => c.with_prompt_cache_key(session_id),
         Err(e) => {
             warn!("auto-title: aux LLM init failed: {e}");
             return None;
@@ -131,7 +132,9 @@ async fn generate_session_title(
             "User: {user_snippet}\n\nAssistant: {assistant_snippet}"
         )),
     ];
-    let response = match llm.chat(&messages, None).await {
+    // Streamed aggregate: the timeout is inactivity-based (same contract as
+    // compaction), so a slow aux model finishes while a wedged one dies.
+    let response = match llm.chat_streamed(&messages).await {
         Ok(m) => m,
         Err(e) => {
             warn!("auto-title: aux chat failed: {e}");
@@ -161,7 +164,8 @@ pub(super) async fn auto_title_session(
         }
     }
 
-    let Some(title) = generate_session_title(&user_message, &assistant_response, &config).await
+    let Some(title) =
+        generate_session_title(&session_id, &user_message, &assistant_response, &config).await
     else {
         return;
     };

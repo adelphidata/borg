@@ -517,7 +517,13 @@ pub async fn execute_heartbeat_turn(
 
     let trimmed = response.trim().to_string();
 
-    if trimmed.is_empty() || is_zero_info_heartbeat(&trimmed) {
+    // Silence-marker check first: the heartbeat protocol tells the model to
+    // ack with `HEARTBEAT_OK`/`<SILENT>` when there's nothing to report, and
+    // the zero-info phrase list below doesn't know those tokens.
+    if trimmed.is_empty()
+        || cortex::agent::silence::is_silent_autonomous(&trimmed)
+        || is_zero_info_heartbeat(&trimmed)
+    {
         return HeartbeatResult::Skipped {
             reason: SkipReason::EmptyResponse,
         };

@@ -459,9 +459,6 @@ pub const DEFAULT_HEARTBEAT_QUIET_START: &str = "00:00";
 /// Default heartbeat quiet-hours window end (HH:MM, local time).
 pub const DEFAULT_HEARTBEAT_QUIET_END: &str = "06:00";
 
-/// Default timeout (seconds) when waiting for a sub-agent to complete.
-pub const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 300;
-
 /// SSE streaming buffer size (10 MB).
 pub const MAX_SSE_BUFFER: usize = 10 * 1024 * 1024;
 

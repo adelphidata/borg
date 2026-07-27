@@ -29,8 +29,83 @@ fn apply_patch_to(
     }
 }
 
-pub fn handle_apply_skill_patch(args: &serde_json::Value) -> Result<String> {
-    apply_patch_to(args, &Config::skills_dir()?, "Skill")
+pub fn handle_apply_skill_patch(args: &serde_json::Value, config: &Config) -> Result<String> {
+    let patch = require_str_param(args, "patch")?;
+    let skills_dir = Config::skills_dir()?;
+    if let Some(denial) = deny_skill_patch(patch, &skills_dir, config) {
+        return Ok(denial);
+    }
+    apply_patch_to(args, &skills_dir, "Skill")
+}
+
+/// Guard for `apply_patch` with `target: "skills"`. Returns a denial message
+/// when the patch must not be applied, `None` when it may proceed.
+///
+/// Fails closed: every path must be extractable, relative, made of plain
+/// components (no `..`, no absolute, no `~`), and must not land inside a
+/// bundled skill's directory — the compiled-in skills are Borg's own operating
+/// instructions. The loader ignores on-disk SKILL.md shadows of bundled names
+/// (the embedded copy wins), but the installed directory's supporting files —
+/// notably executable `scripts/` — run from disk, so a patched copy still
+/// changes agent behavior. User-authored skills remain freely editable. The
+/// blocked-path and control-plane deny lists apply on top, same as the cwd
+/// branch.
+fn deny_skill_patch(
+    patch_text: &str,
+    skills_dir: &std::path::Path,
+    config: &Config,
+) -> Option<String> {
+    let paths = extract_patch_paths(patch_text);
+    if paths.is_empty() {
+        // No extractable file markers: nothing legitimate to write. Refuse
+        // rather than hand an unvetted patch body to the applicator.
+        return Some(
+            "Access denied: could not determine target paths from the skill patch".to_string(),
+        );
+    }
+    for raw_path in &paths {
+        let path = std::path::Path::new(raw_path);
+        let mut components = path.components();
+        let first = match components.next() {
+            Some(std::path::Component::Normal(c)) => c.to_string_lossy().into_owned(),
+            // Absolute paths, `..`, `.`, or an empty path — anything that
+            // could escape the skills dir or defeat the skill-name check.
+            _ => {
+                return Some(format!(
+                    "Access denied: {raw_path} — skill patches must use plain paths \
+                     relative to the skills directory (no absolute paths or '..')"
+                ))
+            }
+        };
+        if raw_path.starts_with('~')
+            || components.any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Some(format!(
+                "Access denied: {raw_path} — skill patches must use plain paths \
+                 relative to the skills directory (no absolute paths or '..')"
+            ));
+        }
+        if crate::skills::is_builtin_skill_name(&first) {
+            return Some(format!(
+                "Access denied: '{first}' is a built-in skill and cannot be modified. \
+                 Create a new skill under a different name instead."
+            ));
+        }
+        let resolved = skills_dir.join(path);
+        if is_blocked_path(
+            &resolved,
+            &config.security.blocked_paths,
+            &config.security.allowed_paths,
+        ) {
+            return Some(format!("Access denied: {raw_path} is in a blocked path"));
+        }
+        if is_control_plane_write_denied(&resolved) {
+            return Some(format!(
+                "Access denied: {raw_path} is a Borg control-plane file"
+            ));
+        }
+    }
+    None
 }
 
 /// Unified apply_patch handler with `target` parameter.
@@ -51,7 +126,7 @@ pub fn handle_apply_patch_unified_with_context(
 
     match target {
         "cwd" => handle_apply_patch_with_context(args, config, ctx),
-        "skills" => handle_apply_skill_patch(args),
+        "skills" => handle_apply_skill_patch(args, config),
         "channels" => handle_create_channel(args),
         other => Ok(format!(
             "Unknown target: {other}. Use: cwd, skills, channels."
@@ -1127,8 +1202,87 @@ mod tests {
     #[test]
     fn apply_skill_patch_missing_patch_param() {
         let args = json!({});
-        let result = handle_apply_skill_patch(&args);
+        let result = handle_apply_skill_patch(&args, &Config::default());
         assert!(result.is_err(), "should error on missing patch param");
+    }
+
+    // ── Skill-patch guard tests ──
+
+    fn skill_patch_args(path: &str) -> serde_json::Value {
+        json!({
+            "patch": format!("*** Begin Patch\n*** Add File: {path}\n+content\n*** End Patch")
+        })
+    }
+
+    #[test]
+    fn skill_patch_refuses_builtin_skill() {
+        let config = Config::default();
+        // `scheduler` is a MANDATORY_SKILLS entry; every bundled name must
+        // refuse. `Scheduler` pins case-insensitivity: the default macOS
+        // filesystem maps it onto the same on-disk directory.
+        for name in ["scheduler", "skill-creator", "Scheduler"] {
+            let result =
+                handle_apply_skill_patch(&skill_patch_args(&format!("{name}/SKILL.md")), &config)
+                    .unwrap();
+            assert!(
+                result.contains("Access denied") && result.contains("built-in"),
+                "bundled skill '{name}' must be refused, got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_patch_refuses_escape_paths() {
+        let config = Config::default();
+        for path in [
+            "../outside.txt",
+            "/etc/passwd",
+            "~/other/file.txt",
+            "sub/../../escape.txt",
+        ] {
+            let result = handle_apply_skill_patch(&skill_patch_args(path), &config).unwrap();
+            assert!(
+                result.contains("Access denied"),
+                "path '{path}' must be refused, got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_patch_refuses_when_no_paths_extractable() {
+        let config = Config::default();
+        let args = json!({"patch": "*** Begin Patch\n*** End Patch"});
+        let result = handle_apply_skill_patch(&args, &config).unwrap();
+        assert!(
+            result.contains("Access denied"),
+            "pathless patch must fail closed, got: {result}"
+        );
+    }
+
+    #[test]
+    fn deny_skill_patch_allows_new_user_skill() {
+        // Guard-only check (no filesystem write): a fresh user skill under a
+        // non-bundled name passes validation.
+        let config = Config::default();
+        let patch = "*** Begin Patch\n*** Add File: my-custom-skill/SKILL.md\n+body\n*** End Patch";
+        let denial = deny_skill_patch(patch, std::path::Path::new("/tmp/skills"), &config);
+        assert!(
+            denial.is_none(),
+            "new user skill must be allowed, got: {denial:?}"
+        );
+    }
+
+    #[test]
+    fn deny_skill_patch_refuses_blocked_path_component() {
+        // `.env` is in the default blocked list; a skill patch must not be a
+        // side door for writing into blocked names inside the skills dir.
+        let config = Config::default();
+        let patch = "*** Begin Patch\n*** Add File: my-skill/.env\n+SECRET=1\n*** End Patch";
+        let denial = deny_skill_patch(patch, std::path::Path::new("/tmp/skills"), &config);
+        assert!(
+            denial.is_some_and(|d| d.contains("blocked path")),
+            "blocked-path component must be refused"
+        );
     }
 
     // ── Cross-directory apply_patch tests ──
