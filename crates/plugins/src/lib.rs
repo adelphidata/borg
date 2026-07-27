@@ -235,4 +235,3 @@ pub enum InstallEvent {
         message: String,
     },
 }
-

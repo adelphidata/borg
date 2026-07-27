@@ -995,7 +995,7 @@ Rules:
     pub(super) async fn prepare_llm_request(
         &mut self,
         iteration: usize,
-    ) -> Result<Option<(Vec<Message>, Vec<ToolDefinition>)>> {
+    ) -> Result<Option<PreparedLlmRequest>> {
         // Goal sync runs BEFORE building the system prompt so a goal
         // replaced between iterations is picked up in this iteration's
         // <goal_context> block. mark_turn_started is idempotent within a
@@ -1073,12 +1073,50 @@ Rules:
             HookAction::Continue => {}
         }
 
+        // Sliced before `system_prompt` is moved into the message. Taken from the
+        // assembled text rather than rebuilt, so the two can never disagree about
+        // where the prefix ends. `InjectContext` above only ever appends, which
+        // leaves a shorter prefix still a prefix.
+        let system_stable_prefix = match system_prompt.get(..built.stable_prefix_len) {
+            Some(prefix) => prefix.to_string(),
+            None => {
+                // Unreachable: the offset is captured from this same string at a
+                // section boundary. Falling back to "" only costs caching, but a
+                // silent fallback would surface as an unexplained billing jump
+                // months later, so say so.
+                tracing::warn!(
+                    stable_prefix_len = built.stable_prefix_len,
+                    system_prompt_len = system_prompt.len(),
+                    "system prompt stable-prefix offset is out of range or off a char \
+                     boundary — prompt caching disabled for this turn"
+                );
+                String::new()
+            }
+        };
+
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::system(&system_prompt));
         messages.extend(self.history.iter().cloned());
 
-        Ok(Some((messages, tool_defs)))
+        Ok(Some(PreparedLlmRequest {
+            messages,
+            tool_defs,
+            system_stable_prefix,
+        }))
     }
+}
+
+/// One turn's assembled LLM request, as produced by
+/// [`Agent::prepare_llm_request`].
+pub(super) struct PreparedLlmRequest {
+    /// System prompt followed by conversation history.
+    pub(super) messages: Vec<Message>,
+    /// Tools this turn is allowed to call — possibly empty by design.
+    pub(super) tool_defs: Vec<ToolDefinition>,
+    /// The byte-stable head of `messages[0]`, handed to the LLM client so
+    /// providers with explicit cache breakpoints mark the end of the cacheable
+    /// prefix rather than the end of a prompt whose tail carries a clock.
+    pub(super) system_stable_prefix: String,
 }
 
 /// Build the role-tagged transcript fed to the pre-compaction memory writer.

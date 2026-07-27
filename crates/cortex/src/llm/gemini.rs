@@ -757,6 +757,7 @@ mod tests {
             tools,
             llm_config: cfg,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         }
     }
@@ -1087,6 +1088,7 @@ mod tests {
             tools: None,
             llm_config: cfg,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         }
     }

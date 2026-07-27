@@ -1176,6 +1176,7 @@ fn openai_build_request_minimal_emits_minimal_effort() {
         tools: None,
         llm_config: &cfg,
         prompt_cache_key: None,
+        system_stable_prefix: None,
         cost_events_enabled: false,
     };
 
@@ -1203,6 +1204,7 @@ fn openai_build_request_per_model_override_applied() {
         tools: None,
         llm_config: &cfg,
         prompt_cache_key: None,
+        system_stable_prefix: None,
         cost_events_enabled: false,
     };
 

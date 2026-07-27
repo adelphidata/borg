@@ -1063,7 +1063,11 @@ impl Agent {
             self.compact_history_if_needed(&event_tx).await?;
             self.warm_skills_cache();
 
-            let (messages, tool_defs) = match self.prepare_llm_request(iteration).await? {
+            let crate::agent::prompt_assembly::PreparedLlmRequest {
+                messages,
+                tool_defs,
+                system_stable_prefix,
+            } = match self.prepare_llm_request(iteration).await? {
                 Some(r) => r,
                 None => {
                     // Pre-flight hook (e.g. budget cap) refused this call.
@@ -1099,7 +1103,8 @@ impl Agent {
                     .make_llm_client_from_config(&self.config)
                     .await
                     .context("Failed to initialize LLM client")?
-                    .with_prompt_cache_key(self.prompt_cache_key());
+                    .with_prompt_cache_key(self.prompt_cache_key())
+                    .with_system_stable_prefix(system_stable_prefix);
                 tokio::spawn(async move {
                     if let Err(e) = llm_client
                         .stream_chat_with_cancel(

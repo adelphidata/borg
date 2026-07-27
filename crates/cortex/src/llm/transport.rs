@@ -165,6 +165,11 @@ fn anthropic_system_blocks(
         .filter(|prefix| system.starts_with(*prefix))
         .map(str::len);
 
+    // `starts_with` above proves bytes [0..at) are exactly the prefix's bytes,
+    // and the prefix is a valid `&str`, so `at` is necessarily a char boundary.
+    // Assert it rather than leaving the argument in a comment.
+    debug_assert!(split.is_none_or(|at| system.is_char_boundary(at)));
+
     match split {
         Some(at) => serde_json::json!([
             { "type": "text", "text": &system[..at], "cache_control": cache_marker },
@@ -227,11 +232,8 @@ pub(crate) fn build_anthropic_request(
 
     if let Some(sys) = system_text {
         if cache_enabled && cache_system_eff {
-            body["system"] = anthropic_system_blocks(
-                &sys,
-                request.system_stable_prefix,
-                &cache_marker,
-            );
+            body["system"] =
+                anthropic_system_blocks(&sys, request.system_stable_prefix, &cache_marker);
         } else {
             body["system"] = serde_json::json!(sys);
         }
@@ -1476,7 +1478,178 @@ mod tests {
             tools: None,
             llm_config: default_llm_config(),
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
+        }
+    }
+
+    /// An Anthropic request whose system prompt is `stable` + `dynamic`, with
+    /// `prefix` declared as the cacheable head.
+    fn anthropic_system_request<'a>(
+        messages: &'a [Message],
+        prefix: Option<&'a str>,
+    ) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::Anthropic,
+            model: "claude-opus-5",
+            messages,
+            tools: None,
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            system_stable_prefix: prefix,
+            cost_events_enabled: false,
+        }
+    }
+
+    fn system_blocks(body: &serde_json::Value) -> &Vec<serde_json::Value> {
+        body["system"]
+            .as_array()
+            .expect("system must be an array of text blocks")
+    }
+
+    /// Count every `cache_control` in the request. Anthropic's hard limit is 4,
+    /// and the default layout already spends all of them (tools + system + 2
+    /// rolling) — so splitting the system block must MOVE its breakpoint, never
+    /// add one.
+    fn breakpoint_count(body: &serde_json::Value) -> usize {
+        fn walk(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .map(|(k, v)| usize::from(k == "cache_control") + walk(v))
+                    .sum(),
+                serde_json::Value::Array(items) => items.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+        walk(body)
+    }
+
+    /// The bug this split exists to fix: the system prompt's dynamic tail
+    /// carries a second-resolution clock, so marking the whole prompt produces a
+    /// block that is byte-different every turn and can never hit the cache. The
+    /// marked block must be the stable head only.
+    #[test]
+    fn anthropic_system_cache_block_is_stable_across_a_clock_tick() {
+        let stable = "<system_instructions>\nidentity\n</system_instructions>\n\n";
+        let turn_one = format!("{stable}<environment>\nCurrent Time: 12:00:01\n</environment>\n");
+        let turn_two = format!("{stable}<environment>\nCurrent Time: 12:00:02\n</environment>\n");
+
+        let m1 = vec![Message::system(&turn_one), Message::user("hi")];
+        let m2 = vec![Message::system(&turn_two), Message::user("hi")];
+
+        let b1 = build_anthropic_request(&anthropic_system_request(&m1, Some(stable)), false);
+        let b2 = build_anthropic_request(&anthropic_system_request(&m2, Some(stable)), false);
+
+        let (s1, s2) = (system_blocks(&b1), system_blocks(&b2));
+        assert_eq!(s1.len(), 2, "system must split into prefix + suffix");
+        assert_eq!(
+            s1[0], s2[0],
+            "the cached block must be byte-identical across turns"
+        );
+        assert_eq!(s1[0]["text"], stable);
+        assert!(s1[0].get("cache_control").is_some());
+
+        // The suffix carries the volatile content and must NOT be marked.
+        assert!(s1[1].get("cache_control").is_none());
+        assert_ne!(s1[1], s2[1], "the clock lives in the unmarked suffix");
+
+        // Reassembling the blocks must reproduce the prompt exactly — a split
+        // that drops or duplicates a byte would silently corrupt the prompt.
+        let rejoined = format!(
+            "{}{}",
+            s1[0]["text"].as_str().unwrap(),
+            s1[1]["text"].as_str().unwrap()
+        );
+        assert_eq!(rejoined, turn_one);
+    }
+
+    /// Splitting relocates the system breakpoint; it must not spend a second one.
+    #[test]
+    fn anthropic_system_split_does_not_spend_an_extra_breakpoint() {
+        let stable = "stable head\n";
+        let system = format!("{stable}volatile tail");
+        let messages = vec![Message::system(&system), Message::user("hi")];
+
+        let unsplit = build_anthropic_request(&anthropic_system_request(&messages, None), false);
+        let split =
+            build_anthropic_request(&anthropic_system_request(&messages, Some(stable)), false);
+
+        assert_eq!(system_blocks(&unsplit).len(), 1);
+        assert_eq!(system_blocks(&split).len(), 2);
+        assert_eq!(
+            breakpoint_count(&split),
+            breakpoint_count(&unsplit),
+            "split must move the system breakpoint, not add one"
+        );
+        assert!(
+            breakpoint_count(&split) <= 4,
+            "Anthropic allows at most 4 cache breakpoints"
+        );
+    }
+
+    /// The split slices at `prefix.len()`, a byte offset. Multi-byte content
+    /// either side of the boundary must not panic or corrupt the text — and a
+    /// *mismatched* prefix whose byte length lands mid-codepoint in the system
+    /// prompt must be rejected by `starts_with` before any slicing happens.
+    #[test]
+    fn anthropic_system_split_is_safe_across_multibyte_boundaries() {
+        // Prefix ends with a 4-byte emoji; suffix opens with 3-byte CJK.
+        let stable = "identity 🙂\n";
+        let system = format!("{stable}環境 Current Time: 12:00:01");
+        let messages = vec![Message::system(&system), Message::user("hi")];
+
+        let body =
+            build_anthropic_request(&anthropic_system_request(&messages, Some(stable)), false);
+        let blocks = system_blocks(&body);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], stable);
+        assert_eq!(
+            format!(
+                "{}{}",
+                blocks[0]["text"].as_str().unwrap(),
+                blocks[1]["text"].as_str().unwrap()
+            ),
+            system,
+            "multi-byte split must round-trip exactly"
+        );
+
+        // A non-matching prefix whose length (10 bytes) falls inside the leading
+        // 4-byte emoji of `system`. Slicing there would panic; `starts_with`
+        // must reject it first.
+        let emoji_system = "🙂🙂🙂 rest of prompt";
+        let emoji_messages = vec![Message::system(emoji_system), Message::user("hi")];
+        let mismatched = "0123456789";
+        assert!(!emoji_system.is_char_boundary(mismatched.len()));
+
+        let body = build_anthropic_request(
+            &anthropic_system_request(&emoji_messages, Some(mismatched)),
+            false,
+        );
+        let blocks = system_blocks(&body);
+        assert_eq!(blocks.len(), 1, "mismatched prefix must not split");
+        assert_eq!(blocks[0]["text"], emoji_system);
+    }
+
+    /// A prefix that no longer matches the prompt (stale client, reused aux
+    /// client) must degrade to the single-block shape rather than slicing at a
+    /// meaningless offset.
+    #[test]
+    fn anthropic_system_falls_back_to_one_block_on_prefix_mismatch() {
+        let system = "a completely different system prompt";
+        let messages = vec![Message::system(system), Message::user("hi")];
+
+        for prefix in [
+            Some("prefix from an earlier turn"), // no longer matches
+            Some(""),                            // empty
+            Some(system),                        // whole prompt: suffix would be empty
+            None,                                // never declared
+        ] {
+            let body = build_anthropic_request(&anthropic_system_request(&messages, prefix), false);
+            let blocks = system_blocks(&body);
+            assert_eq!(blocks.len(), 1, "prefix {prefix:?} must not split");
+            assert_eq!(blocks[0]["text"], system);
+            assert!(blocks[0].get("cache_control").is_some());
         }
     }
 
@@ -1577,6 +1750,7 @@ mod tests {
             tools: None,
             llm_config: cfg_box,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         };
         let transport = BedrockTransport;
@@ -1611,6 +1785,7 @@ mod tests {
             tools: None,
             llm_config: fips_box,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         };
         let fips_url = BedrockTransport
@@ -1636,6 +1811,7 @@ mod tests {
             tools: None,
             llm_config: vpce_box,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         };
         let vpce_url = BedrockTransport
@@ -1889,6 +2065,7 @@ mod tests {
             tools: Some(&tools),
             llm_config: default_llm_config(),
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         };
         let body = build_openai_request(&xai_req, false).expect("xai body");
@@ -1924,6 +2101,7 @@ mod tests {
             tools: Some(&tools),
             llm_config: default_llm_config(),
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_events_enabled: false,
         };
         let body = build_openai_request(&openai_req, false).expect("openai body");

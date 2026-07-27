@@ -450,7 +450,7 @@ pub struct LlmClient {
     /// provider's auto-cache toward a consistent shard across turns.
     prompt_cache_key: Option<String>,
     /// The byte-stable head of the system prompt for the turn in flight, set by
-    /// [`Self::set_system_stable_prefix`]. Providers with explicit cache
+    /// [`Self::with_system_stable_prefix`]. Providers with explicit cache
     /// breakpoints anchor the system marker at the end of this instead of the
     /// end of the whole prompt.
     ///
@@ -1006,6 +1006,7 @@ impl LlmClient {
             active_slot_index: usize::MAX,
             debug_logging,
             prompt_cache_key: None,
+            system_stable_prefix: None,
             cost_event_sink: None,
             cost_event_context: None,
         })
@@ -1122,14 +1123,15 @@ impl LlmClient {
     /// whole prompt caches nothing, because its dynamic tail carries a
     /// second-resolution clock.
     ///
-    /// A setter rather than a call parameter because only the main agent turn has
-    /// a prefix worth caching; the aux paths (summarization, title generation)
-    /// would all pass `None`. It is safe to leave set across calls: the transport
-    /// honors the value only while it still prefixes the system message actually
-    /// being sent, so a stale prefix degrades to no split rather than to a
-    /// mismatched breakpoint.
-    pub fn set_system_stable_prefix(&mut self, prefix: Option<String>) {
-        self.system_stable_prefix = prefix;
+    /// A builder rather than a call parameter because only the main agent turn
+    /// has a prefix worth caching; the aux paths (summarization, title
+    /// generation, classification) would all pass `None`. Safe even on a reused
+    /// client: the transport honors the value only while it still prefixes the
+    /// system message actually being sent, so a stale prefix degrades to no
+    /// split rather than to a misplaced breakpoint.
+    pub fn with_system_stable_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.system_stable_prefix = Some(prefix.into());
+        self
     }
 
     /// Attach a best-effort daemon sink for per-call cost events.

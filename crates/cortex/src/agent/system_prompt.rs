@@ -1161,6 +1161,37 @@ mod build_system_prompt_tests {
         &SYSTEM_PROMPT_RS_SRC[start..end]
     }
 
+    /// `stable_prefix_len` is what the Anthropic transport marks as cacheable.
+    /// If the capture drifts below a dynamic section, that section lands inside
+    /// the cached block and the cache stops hitting — silently, and only in
+    /// production. Pin it between the `=== DYNAMIC SUFFIX ===` marker and the
+    /// first dynamic section pushed after it.
+    #[test]
+    fn stable_prefix_len_is_captured_at_the_dynamic_suffix_boundary() {
+        let body = extract_build_system_prompt_body();
+        let marker_idx = body
+            .find("=== DYNAMIC SUFFIX ===")
+            .expect("DYNAMIC SUFFIX marker must exist in build_system_prompt");
+        let capture_idx = body
+            .find("let stable_prefix_len = system.len();")
+            .expect("stable_prefix_len must be captured in build_system_prompt");
+        let first_dynamic_idx = body
+            .find("build_active_memory_section")
+            .expect("build_active_memory_section must be the first dynamic section");
+
+        assert!(
+            capture_idx > marker_idx,
+            "stable_prefix_len must be captured AFTER the DYNAMIC SUFFIX marker \
+             (capture_idx={capture_idx}, marker_idx={marker_idx})",
+        );
+        assert!(
+            capture_idx < first_dynamic_idx,
+            "stable_prefix_len must be captured BEFORE the first dynamic section, \
+             otherwise per-turn content is billed inside the cached prefix \
+             (capture_idx={capture_idx}, first_dynamic_idx={first_dynamic_idx})",
+        );
+    }
+
     #[test]
     fn build_system_prompt_environment_is_after_security_policy() {
         let body = extract_build_system_prompt_body();
