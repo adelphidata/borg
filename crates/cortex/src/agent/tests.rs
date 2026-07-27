@@ -306,6 +306,7 @@ fn minimal_test_agent(config: Config) -> Agent {
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
+        turn_reasoning: String::new(),
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,
@@ -1144,8 +1145,14 @@ fn should_nudge_for_response_matrix() {
         ("", true, false, true),       // empty after tools → nudge
         ("  \n  ", true, false, true), // whitespace-only counts as empty
         ("Done!", true, false, false), // non-empty text → no nudge
-        ("", false, false, false),     // no tools ran → no nudge
-        ("", true, true, false),       // already retried once → no nudge
+        // No tools ran and still nothing to say: a pure-reasoning first
+        // iteration used to end the turn in total silence. One nudge.
+        ("", false, false, true),
+        ("", true, true, false), // already retried once → no nudge
+        ("", false, true, false),
+        // A silence marker is real text, so an intentionally-silent
+        // autonomous turn is never nudged.
+        (crate::agent::silence::SILENT_SENTINEL, false, false, false),
     ];
     for (text, tools, retried, expected) in cases {
         let got = should_nudge_for_response(text, *tools, *retried);
@@ -1154,6 +1161,34 @@ fn should_nudge_for_response_matrix() {
             "should_nudge_for_response({text:?}, tools={tools}, retried={retried}) = {got}, expected {expected}"
         );
     }
+}
+
+#[test]
+fn empty_response_terminal_labels_reasoning_excerpt() {
+    // When the model produced reasoning but no visible answer, the turn must
+    // not end in silence — the reasoning frequently holds the actual answer.
+    // The label is unconditional so it can't read as a normal reply.
+    let mut agent = minimal_test_agent(Config::default());
+    agent.turn_reasoning = "  The answer is 42 because of the mice.  ".to_string();
+    let out = agent.empty_response_terminal();
+    assert!(
+        out.starts_with(crate::agent::EMPTY_RESPONSE_REASONING_LABEL),
+        "excerpt must be labeled: {out}"
+    );
+    assert!(out.contains("The answer is 42"), "{out}");
+
+    // Nothing at all → an explicit notice, still never silence.
+    agent.turn_reasoning.clear();
+    assert_eq!(
+        agent.empty_response_terminal(),
+        crate::agent::EMPTY_RESPONSE_NO_REASONING
+    );
+    agent.turn_reasoning = "   \n  ".to_string();
+    assert_eq!(
+        agent.empty_response_terminal(),
+        crate::agent::EMPTY_RESPONSE_NO_REASONING,
+        "whitespace-only reasoning is not an excerpt"
+    );
 }
 
 // NOTE: the `build_system_prompt_*_after_*` ordering tests above are the

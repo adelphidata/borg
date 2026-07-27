@@ -854,11 +854,15 @@ impl Agent {
         if !cfg.enabled {
             return String::new();
         }
+        // Compaction markers are Role::User rows — skip them so the ranking
+        // query is the user's actual request, not the summary text.
         let query = self
             .history
             .iter()
             .rev()
-            .find(|m| m.role == crate::types::Role::User)
+            .find(|m| {
+                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
+            })
             .and_then(|m| m.text_content())
             .unwrap_or("")
             .trim()

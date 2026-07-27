@@ -2,10 +2,18 @@
 
 use std::collections::HashSet;
 
+use crate::conversation::is_compaction_marker;
 use crate::types::Message;
 
 /// Undo the last agent turn: remove everything after the last user message.
 /// Returns the number of messages removed, or 0 if there is nothing to undo.
+///
+/// Compaction markers are `Role::User` rows but are never user-authored:
+/// when the most recent `Role::User` row is a marker (the protected tail
+/// held only assistant/tool rows), undo removes the agent turn *after* it
+/// and leaves the marker in place — popping the marker would silently
+/// delete the summary of the entire compacted conversation, far more than
+/// one turn.
 pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
     let last_user_idx = history
         .iter()
@@ -16,6 +24,10 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
             // If the last message IS the user message, pop it too (undo the user's input)
             // Otherwise, pop everything after the last user message (undo the assistant turn)
             let remove_from = if idx == history.len() - 1 {
+                if is_compaction_marker(&history[idx]) {
+                    // A trailing marker is not an undoable user input.
+                    return 0;
+                }
                 // Last msg is user — remove it and find the *previous* user message
                 // to also remove the prior assistant response
                 idx
@@ -33,11 +45,15 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
 /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
 /// Truncates everything from that user message onward (inclusive).
 /// Returns the number of messages removed, or 0 if the index is out of range.
+///
+/// Only user-authored rows count toward `n` — a compaction marker is a
+/// `Role::User` row the user never typed, and counting it would shift every
+/// later index by one (callers number the user's visible messages).
 pub fn rewind_to_nth_user(history: &mut Vec<Message>, n: usize) -> usize {
     let user_positions: Vec<usize> = history
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == crate::types::Role::User)
+        .filter(|(_, m)| m.role == crate::types::Role::User && !is_compaction_marker(m))
         .map(|(i, _)| i)
         .collect();
 
@@ -554,6 +570,76 @@ mod tests {
         let removed = rewind_to_nth_user(&mut history, 0);
         assert_eq!(removed, 1);
         assert!(history.is_empty());
+    }
+
+    // -- compaction-marker awareness --
+
+    fn make_marker() -> Message {
+        crate::conversation::render_compaction_marker("earlier context summary")
+    }
+
+    #[test]
+    fn undo_after_marker_removes_agent_turn_but_keeps_marker() {
+        // Marker is the most recent Role::User row (protected tail held only
+        // assistant/tool rows). Undo must remove the agent turn after it and
+        // leave the summary in the working set.
+        let mut history = vec![
+            make_user("original request"),
+            make_marker(),
+            make_tool_call_msg("", "call_1", "run_shell"),
+            make_tool_result("call_1", "ok"),
+            make_assistant("done"),
+        ];
+        let removed = undo_last_turn(&mut history);
+        assert_eq!(removed, 3);
+        assert_eq!(history.len(), 2);
+        assert!(
+            crate::conversation::is_compaction_marker(&history[1]),
+            "marker must survive undo"
+        );
+    }
+
+    #[test]
+    fn undo_trailing_marker_is_a_noop() {
+        // A trailing marker is not user-authored input — popping it would
+        // delete the summary of the entire compacted conversation.
+        let mut history = vec![make_user("original request"), make_marker()];
+        let removed = undo_last_turn(&mut history);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn rewind_does_not_count_marker_as_user_position() {
+        // Callers number the user's visible messages; the marker must not
+        // shift those indices. n=1 is "world", not the marker.
+        let mut history = vec![
+            make_user("hello"),
+            make_assistant("hi"),
+            make_marker(),
+            make_user("world"),
+            make_assistant("ok"),
+        ];
+        let removed = rewind_to_nth_user(&mut history, 1);
+        assert_eq!(removed, 2);
+        assert_eq!(history.len(), 3);
+        assert!(crate::conversation::is_compaction_marker(&history[2]));
+    }
+
+    #[test]
+    fn marker_predicate_rejects_user_text_resembling_marker() {
+        // A user typing the heading alone (the fence is stripped from
+        // untrusted input by sanitize_xml_boundaries) must not be treated as
+        // a marker — otherwise /undo skips over real user input.
+        let lookalike = Message::user(format!(
+            "{}\n\nsome pasted text",
+            crate::conversation::COMPACTION_MARKER_HEADING
+        ));
+        assert!(!crate::conversation::is_compaction_marker(&lookalike));
+        assert!(crate::conversation::is_compaction_marker(&make_marker()));
+        assert!(!crate::conversation::is_compaction_marker(&make_assistant(
+            "not a user row"
+        )));
     }
 
     // -- normalize_history edge cases --

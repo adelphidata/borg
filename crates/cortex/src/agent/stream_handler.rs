@@ -223,6 +223,20 @@ impl Agent {
                 return StreamEventOutcome::Terminal;
             }
             StreamEvent::ThinkingDelta(delta) => {
+                // Buffer regardless of `show_thinking`: the empty-response
+                // terminal delivers an excerpt of this, and a user who turned
+                // the thinking trace off still deserves an answer when the
+                // model put one only in its reasoning. Never persisted.
+                self.turn_reasoning.push_str(&delta);
+                if self.turn_reasoning.len() > super::REASONING_BUFFER_CAP {
+                    // Keep the tail (the concluding thought), trimmed to a
+                    // char boundary so the excerpt stays valid UTF-8.
+                    let cut = self.turn_reasoning.len() - super::REASONING_BUFFER_CAP;
+                    let cut = (cut..self.turn_reasoning.len())
+                        .find(|i| self.turn_reasoning.is_char_boundary(*i))
+                        .unwrap_or(self.turn_reasoning.len());
+                    self.turn_reasoning.drain(..cut);
+                }
                 if self.config.conversation.show_thinking {
                     let _ = event_tx.send(AgentEvent::ThinkingDelta(delta)).await;
                 }
@@ -251,12 +265,37 @@ impl Agent {
         if !text_content.trim().is_empty() {
             self.log_and_persist(Message::assistant(text_content)).await;
         } else {
-            tracing::debug!("Skipping persistence of empty assistant response");
+            // The turn is ending with nothing visible. Silence here reads as
+            // a completed turn, so deliver the model's own reasoning tail if
+            // it produced any (it frequently holds the actual answer), and an
+            // explicit notice otherwise. Delivery-only: the excerpt is
+            // emitted and persisted as an assistant message, but raw
+            // reasoning is never promoted earlier in the turn.
+            let terminal = self.empty_response_terminal();
+            tracing::debug!("Empty assistant response; delivering terminal notice");
+            let _ = event_tx.send(AgentEvent::TextDelta(terminal.clone())).await;
+            self.log_and_persist(Message::assistant(&terminal)).await;
         }
         self.maybe_record_plan_emission(text_content).await;
         self.auto_save();
         self.metrics.agent_turns.add(1, &[]);
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
+    }
+
+    /// Build the message delivered when a turn ends with no visible text:
+    /// a labeled excerpt of the buffered reasoning, or an explicit notice
+    /// when the model produced nothing at all.
+    ///
+    /// The label is unconditional so the excerpt can never be mistaken for a
+    /// normal answer, and the text is redacted on the same terms as any other
+    /// assistant output.
+    pub(super) fn empty_response_terminal(&self) -> String {
+        let reasoning = self.turn_reasoning.trim();
+        if reasoning.is_empty() {
+            return super::EMPTY_RESPONSE_NO_REASONING.to_string();
+        }
+        let excerpt = self.maybe_redact(reasoning.to_string());
+        format!("{}\n\n{excerpt}", super::EMPTY_RESPONSE_REASONING_LABEL)
     }
 
     /// Award plan-emission XP when in Plan mode and the response carries a
@@ -305,12 +344,19 @@ impl Agent {
         // next turn (and any later resume) sees that the response was cut
         // short, not a normal completion.
         if let Some(err) = stream_error {
+            let marker = format!("[stream interrupted: {err}]");
             let content = if text_content.trim().is_empty() {
-                format!("[stream interrupted: {err}]")
+                marker.clone()
             } else {
-                format!("{text_content}\n\n[stream interrupted: {err}]")
+                format!("{text_content}\n\n{marker}")
             };
             self.log_and_persist(Message::assistant(&content)).await;
+            // The marker went to history but never to the user: a truncated
+            // or interrupted turn looked identical to a complete one on
+            // screen. Emit just the marker — `text_content` already streamed.
+            let _ = event_tx
+                .send(AgentEvent::TextDelta(format!("\n\n{marker}")))
+                .await;
             let _ = event_tx.send(AgentEvent::TurnComplete).await;
             return TextOnlyOutcome::TerminateTurn;
         }

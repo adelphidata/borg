@@ -321,10 +321,15 @@ impl Agent {
     }
 
     pub(super) fn latest_user_query(&self) -> String {
+        // Skip compaction markers: they are Role::User rows, and when the
+        // protected tail holds no real user row the summary text would
+        // otherwise become the "query" driving memory retrieval.
         self.history
             .iter()
             .rev()
-            .find(|m| m.role == crate::types::Role::User)
+            .find(|m| {
+                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
+            })
             .and_then(|m| m.text_content())
             .unwrap_or("")
             .to_string()
@@ -1009,12 +1014,16 @@ Rules:
         // the transcript captures the steering for audit.
         self.drain_pending_goal_steering().await;
 
-        // Extract user message early — needed for conditional tool loading and hooks.
+        // Extract user message early — needed for conditional tool loading and
+        // hooks. Compaction markers are skipped: gating tools on the summary
+        // text instead of the user's actual request loads the wrong toolset.
         let user_msg = self
             .history
             .iter()
             .rev()
-            .find(|m| m.role == crate::types::Role::User)
+            .find(|m| {
+                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
+            })
             .and_then(|m| m.text_content())
             .unwrap_or("")
             .to_string();

@@ -56,6 +56,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
         tool_call_repeat: ToolCallRepeatTracker::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
+        turn_reasoning: String::new(),
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,

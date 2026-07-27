@@ -183,14 +183,40 @@ pub enum AgentEvent {
 }
 
 /// Returns true if the agent should retry the LLM call because it returned
-/// empty text after tool execution (safety net for silent completions).
+/// no visible text (safety net for silent completions).
+///
+/// `needs_response` (tool calls ran this turn) is deliberately NOT required:
+/// a first-iteration reply that is pure reasoning with no text ended the turn
+/// in total silence — no message, no error, nothing for the user to act on.
+/// One nudge is the cheapest recovery, and `already_nudged` keeps it
+/// single-shot so a persistently-empty model can't loop.
+///
+/// An intentionally silent autonomous turn is unaffected: those carry a
+/// silence marker (`[SILENT]` / `HEARTBEAT_OK`, see [`silence`]) as real text,
+/// so they are never empty here.
 fn should_nudge_for_response(
     text_content: &str,
-    needs_response: bool,
+    _needs_response: bool,
     already_nudged: bool,
 ) -> bool {
-    text_content.trim().is_empty() && needs_response && !already_nudged
+    text_content.trim().is_empty() && !already_nudged
 }
+
+/// Maximum bytes of reasoning retained for the empty-response terminal.
+/// Large enough to carry a concluding thought, small enough that a
+/// long-thinking model can't balloon the agent's footprint.
+pub(super) const REASONING_BUFFER_CAP: usize = 4096;
+
+/// Label prefixing the reasoning excerpt delivered when a turn ends with no
+/// visible text. Explicit about provenance so the excerpt is never mistaken
+/// for a normal answer.
+pub(super) const EMPTY_RESPONSE_REASONING_LABEL: &str =
+    "[No visible answer was produced. The model's reasoning ended with:]";
+
+/// Terminal message when a turn produced neither text nor reasoning. Silence
+/// leaves the user unable to tell a finished turn from a broken one.
+pub(super) const EMPTY_RESPONSE_NO_REASONING: &str =
+    "[The model returned an empty response. Try rephrasing, or check the provider status.]";
 
 use tool_validation::UnknownToolTracker;
 use tool_validation::{partition_tool_calls, PartialToolCall, ToolCallRepeatTracker};
@@ -261,6 +287,15 @@ pub struct Agent {
     /// cycle instead of burning iteration budget. Reset at the start of
     /// each `run_agent_loop`.
     pub(super) unknown_tool_tracker: UnknownToolTracker,
+    /// Tail of the reasoning/thinking text streamed during the current
+    /// iteration, capped at [`REASONING_BUFFER_CAP`].
+    ///
+    /// Display-only and never persisted to history — the sole consumer is the
+    /// empty-response terminal, where the model produced reasoning but no
+    /// visible answer and the reasoning frequently *contains* the answer.
+    /// Buffered regardless of `show_thinking` because the terminal excerpt is
+    /// a fallback for a broken turn, not a thinking-trace feature.
+    pub(super) turn_reasoning: String,
     /// Which LLM chain this agent's `make_llm_client_from_config` builds.
     /// `Primary` is the default — interactive turns and tool-spawned
     /// sub-agents always run on the user's primary chain. `Auxiliary` is
@@ -390,10 +425,14 @@ impl Agent {
     // live in `agent::credentials`.
 
     pub(super) fn latest_user_message_text(&self) -> &str {
+        // Compaction markers are Role::User rows — skip them so callers get
+        // the user's actual latest message, never the summary text.
         self.history
             .iter()
             .rev()
-            .find(|m| m.role == crate::types::Role::User)
+            .find(|m| {
+                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
+            })
             .and_then(|m| m.text_content())
             .unwrap_or("")
     }
@@ -449,6 +488,7 @@ impl Agent {
             ),
             tool_call_repeat,
             unknown_tool_tracker,
+            turn_reasoning: String::new(),
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -1099,6 +1139,10 @@ impl Agent {
             // next iteration reports the configured primary again. A failover
             // during this stream re-sets it via `StreamEvent::Failover`.
             self.active_failover_identity = None;
+            // Reasoning is scoped to one stream: the empty-response terminal
+            // must quote the thinking that led to *this* silence, not a
+            // previous iteration's.
+            self.turn_reasoning.clear();
             let llm_start = Instant::now();
             self.metrics.llm_requests.add(1, &[]);
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);

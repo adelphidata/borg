@@ -213,12 +213,25 @@ pub(super) struct InvalidToolCall {
 ///
 /// Calls without a usable id are fully discarded (no way to address a
 /// `tool_result`); they show up only in `tracing::warn!` for ops visibility.
+///
+/// Duplicate ids within one batch are uniquified here — first occurrence
+/// keeps its id, later collisions get a deterministic `<id>_d<n>` suffix.
+/// Some providers reuse one id across different calls in a batch (degraded
+/// models at long context, OpenAI-compatible shims); left as-is, both calls
+/// execute but the next iteration's history dedup keeps only the first
+/// call/result pair per id, so the second call's real output silently
+/// vanishes and the model confabulates it. The suffix is deterministic —
+/// never a random UUID — so replayed histories stay byte-stable for prompt
+/// caching. Renaming here (before the assistant message is built from the
+/// partitioned output) keeps the call record, dispatch, and results
+/// consistent under the same renamed id.
 pub(super) fn partition_tool_calls(
     tool_calls: &[PartialToolCall],
     truncated_due_to_length: bool,
 ) -> (Vec<ToolCall>, Vec<InvalidToolCall>) {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
     for ptc in tool_calls
         .iter()
         .take(constants::MAX_TOOL_CALLS_PER_RESPONSE)
@@ -230,6 +243,22 @@ pub(super) fn partition_tool_calls(
             );
             continue;
         }
+        let id = if seen_ids.insert(ptc.id.clone()) {
+            ptc.id.clone()
+        } else {
+            let mut n = 1usize;
+            let mut candidate = format!("{}_d{n}", ptc.id);
+            while !seen_ids.insert(candidate.clone()) {
+                n += 1;
+                candidate = format!("{}_d{n}", ptc.id);
+            }
+            warn!(
+                "Duplicate tool call id '{}' (name='{}') renamed to '{candidate}' to keep \
+                 call/result pairing lossless",
+                ptc.id, ptc.name
+            );
+            candidate
+        };
         if ptc.name.is_empty() {
             // A tool call with an id but no name is a "phantom" the model can
             // loop on. Unlike a missing id, this one is addressable, so we feed
@@ -248,7 +277,7 @@ pub(super) fn partition_tool_calls(
                 ptc.id
             );
             invalid.push(InvalidToolCall {
-                id: ptc.id.clone(),
+                id: id.clone(),
                 name: "missing_name".to_string(),
                 reason: "tool call had no tool name — re-issue the call with a valid tool name"
                     .to_string(),
@@ -260,7 +289,7 @@ pub(super) fn partition_tool_calls(
             let reason = format!("tool name exceeds {} bytes", constants::MAX_TOOL_NAME_LEN);
             warn!("Invalid tool call '{}': {}", ptc.name, reason);
             invalid.push(InvalidToolCall {
-                id: ptc.id.clone(),
+                id: id.clone(),
                 name: ptc.name.clone(),
                 reason,
                 raw_arguments: ptc.arguments.clone(),
@@ -275,7 +304,7 @@ pub(super) fn partition_tool_calls(
             );
             warn!("Invalid tool call '{}': {}", ptc.name, reason);
             invalid.push(InvalidToolCall {
-                id: ptc.id.clone(),
+                id: id.clone(),
                 name: ptc.name.clone(),
                 reason,
                 raw_arguments: ptc.arguments.clone(),
@@ -300,7 +329,7 @@ pub(super) fn partition_tool_calls(
             };
             warn!("Invalid tool call '{}': {}", ptc.name, reason);
             invalid.push(InvalidToolCall {
-                id: ptc.id.clone(),
+                id: id.clone(),
                 name: ptc.name.clone(),
                 reason,
                 raw_arguments: ptc.arguments.clone(),
@@ -308,7 +337,7 @@ pub(super) fn partition_tool_calls(
             continue;
         }
         valid.push(ToolCall {
-            id: ptc.id.clone(),
+            id: id.clone(),
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: ptc.name.clone(),
@@ -706,6 +735,54 @@ mod tests {
         assert_eq!(valid[0].id, "call_1");
         assert_eq!(valid[0].function.name, "read_file");
         assert_eq!(valid[0].function.arguments, "{\"path\": \"a.txt\"}");
+    }
+
+    #[test]
+    fn partition_tool_calls_uniquifies_duplicate_ids() {
+        // Providers can reuse one call id across different calls in a batch.
+        // Both calls must survive with distinct, deterministic ids — losing
+        // one means its result silently vanishes from replayed history and
+        // the model confabulates the missing output.
+        let calls = vec![
+            ptc("call_1", "read_file", "{\"path\": \"a.txt\"}"),
+            ptc("call_1", "read_file", "{\"path\": \"b.txt\"}"),
+            ptc("call_1", "read_file", "{\"path\": \"c.txt\"}"),
+        ];
+        let (valid, invalid) = partition_tool_calls(&calls, false);
+        assert!(invalid.is_empty());
+        assert_eq!(valid.len(), 3, "all duplicate-id calls must survive");
+        assert_eq!(valid[0].id, "call_1", "first occurrence keeps its id");
+        assert_eq!(valid[1].id, "call_1_d1");
+        assert_eq!(valid[2].id, "call_1_d2");
+        // Deterministic across runs: same batch → same renames (prompt-cache
+        // prefix stability on replay depends on this).
+        let (again, _) = partition_tool_calls(&calls, false);
+        assert_eq!(
+            valid.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            again.iter().map(|c| &c.id).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn partition_tool_calls_uniquify_spans_valid_and_invalid() {
+        // A duplicate between a valid call and an invalid one must also be
+        // renamed — both produce tool_results, and a shared id would collapse
+        // them into one pair on the next iteration's history dedup. A crafted
+        // id that pre-collides with the rename scheme must be stepped over.
+        let calls = vec![
+            ptc("call_1", "read_file", "{\"path\": \"a.txt\"}"),
+            ptc("call_1_d1", "read_file", "{}"),
+            ptc("call_1", "apply_patch", "{not json"),
+        ];
+        let (valid, invalid) = partition_tool_calls(&calls, false);
+        assert_eq!(valid.len(), 2);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(valid[0].id, "call_1");
+        assert_eq!(valid[1].id, "call_1_d1");
+        assert_eq!(
+            invalid[0].id, "call_1_d2",
+            "rename must step over a pre-existing colliding id"
+        );
     }
 
     #[test]

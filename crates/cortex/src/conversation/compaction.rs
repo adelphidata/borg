@@ -397,6 +397,29 @@ pub async fn compact_history_v2(
     Ok(dropped)
 }
 
+/// True when `msg` is an agent-generated compaction marker row.
+///
+/// Markers are `Role::User` rows by design (the model treats the summary as
+/// conversational input), which makes every "find the latest user message"
+/// scan a potential aliasing hazard: when the protected tail holds only
+/// assistant/tool rows, the marker IS the most recent `Role::User` row, and
+/// naive scans read the summary as the user's request (memory ranking,
+/// conditional tool loading) or truncate at it (`/undo`), silently deleting
+/// the compacted context. Spoof-resistance matches
+/// [`extract_last_compaction_summary`]: the exact agent-generated prefix
+/// `{HEADING}\n\n{OPEN_FENCE}\n` is required, and
+/// [`crate::security::sanitize::sanitize_xml_boundaries`] strips the fence
+/// from untrusted content.
+pub fn is_compaction_marker(msg: &Message) -> bool {
+    msg.role == Role::User
+        && msg
+            .text_content()
+            .and_then(|t| t.strip_prefix(COMPACTION_MARKER_HEADING))
+            .and_then(|t| t.strip_prefix("\n\n"))
+            .and_then(|t| t.strip_prefix(COMPACTION_MARKER_OPEN))
+            .is_some_and(|t| t.starts_with('\n'))
+}
+
 /// Extract a previous-summary body from a compacted history, if any.
 ///
 /// Walks `history` in reverse looking for the most recent agent-generated
