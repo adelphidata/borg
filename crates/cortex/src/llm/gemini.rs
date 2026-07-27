@@ -404,6 +404,20 @@ pub(crate) fn sanitize_schema_for_gemini(value: &mut Value) {
                 map.remove("format");
             }
         }
+        // Gemini requires `enum` members to be strings even when the declared
+        // parameter type is numeric or boolean — `"enum": [1, 2]` is an
+        // INVALID_ARGUMENT that kills the whole request (schemas arriving via
+        // MCP tools commonly use typed enums).
+        if let Some(Value::Array(members)) = map.get_mut("enum") {
+            for member in members.iter_mut() {
+                match member {
+                    Value::String(_) => {}
+                    Value::Number(n) => *member = Value::String(n.to_string()),
+                    Value::Bool(b) => *member = Value::String(b.to_string()),
+                    other => *other = Value::String(other.to_string()),
+                }
+            }
+        }
         for (_, v) in map.iter_mut() {
             sanitize_schema_for_gemini(v);
         }
@@ -1026,6 +1040,42 @@ mod tests {
         // is in Gemini's accepted set -> preserved.
         assert!(schema["properties"]["name"].get("format").is_none());
         assert_eq!(schema["properties"]["ts"]["format"], "date-time");
+    }
+
+    #[test]
+    fn build_request_sanitize_schema_stringifies_typed_enum_members() {
+        // Gemini rejects non-string enum members with INVALID_ARGUMENT even
+        // when the declared type is numeric/boolean, and MCP-sourced schemas
+        // use typed enums freely. Nested sites (properties, items) must be
+        // covered by the recursive walk; string enums stay untouched.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "enum": [1, 2, 3]},
+                "ratio": {"type": "number", "enum": [0.5, 1.5]},
+                "active": {"type": "boolean", "enum": [true, false]},
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "tags": {"type": "array", "items": {"type": "integer", "enum": [10, 20]}},
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(
+            schema["properties"]["level"]["enum"],
+            json!(["1", "2", "3"])
+        );
+        assert_eq!(schema["properties"]["ratio"]["enum"], json!(["0.5", "1.5"]));
+        assert_eq!(
+            schema["properties"]["active"]["enum"],
+            json!(["true", "false"])
+        );
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            json!(["fast", "slow"])
+        );
+        assert_eq!(
+            schema["properties"]["tags"]["items"]["enum"],
+            json!(["10", "20"])
+        );
     }
 
     #[test]

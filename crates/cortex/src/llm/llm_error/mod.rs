@@ -172,18 +172,23 @@ impl LlmError {
     }
 
     /// True when, after retries and rotation fail, the agent should try the
-    /// next provider in the fallback chain. `ModelNotFound` and
-    /// `AuthPermanent` skip fallback — they're user-fixable, not transient.
+    /// next provider in the fallback chain. `AuthPermanent` skips fallback —
+    /// the account itself is denied, which is user-fixable, not transient.
+    /// `ModelNotFound` DOES fall back: the failure is specific to the active
+    /// (provider, model) slot, and a sibling slot with a different model can
+    /// serve the turn — aborting without trying it strands users whose
+    /// primary model id went stale.
     pub fn should_fallback(&self) -> bool {
-        !matches!(
-            self.reason(),
-            FailoverReason::ModelNotFound | FailoverReason::AuthPermanent
-        )
+        !matches!(self.reason(), FailoverReason::AuthPermanent)
     }
 
-    /// True when the agent should surface the error immediately without
-    /// retrying or compacting — the request is structurally broken and
-    /// retrying would just burn tokens.
+    /// True when retrying the *current* slot is pointless — the request is
+    /// structurally broken or user-fixable, so a retry just burns tokens.
+    ///
+    /// Orthogonal to [`Self::should_fallback`], which asks whether a
+    /// *different* slot deserves a try: `ModelNotFound` is fast-fail here
+    /// (this model will never appear) yet falls back (a sibling model may
+    /// serve).
     pub fn is_fast_fail(&self) -> bool {
         matches!(
             self.reason(),
@@ -813,8 +818,12 @@ mod tests {
         let body = r#"{"error":{"message":"The model 'gpt-6-ultra' does not exist"}}"#;
         let err = classify_status(reqwest::StatusCode::NOT_FOUND, body, Provider::OpenAi);
         assert_eq!(err.reason(), FailoverReason::ModelNotFound);
+        // Don't retry this slot — the model id will never resolve. But DO
+        // fall back: a sibling slot running a different model can serve the
+        // turn, and aborting without trying strands users whose primary
+        // model slug went stale.
         assert!(err.is_fast_fail());
-        assert!(!err.should_fallback());
+        assert!(err.should_fallback());
     }
 
     #[test]
@@ -893,16 +902,16 @@ mod tests {
     }
 
     #[test]
-    fn should_fallback_skips_model_not_found_and_auth_permanent() {
+    fn should_fallback_skips_only_auth_permanent() {
+        // ModelNotFound must fall back: the failure is slot-specific, and a
+        // sibling (provider, model) slot can serve the turn. Only a denied
+        // account (AuthPermanent) makes the whole chain pointless.
         for reason in ALL_REASONS {
             let err = LlmError::Fatal {
                 source: anyhow::anyhow!("test"),
                 reason: *reason,
             };
-            let expected = !matches!(
-                reason,
-                FailoverReason::ModelNotFound | FailoverReason::AuthPermanent
-            );
+            let expected = !matches!(reason, FailoverReason::AuthPermanent);
             assert_eq!(
                 err.should_fallback(),
                 expected,
@@ -1006,6 +1015,22 @@ mod tests {
             "rate_limit_error: 5000 input tokens per minute exceeded",
             FailoverReason::RateLimit,
         ),
+        // Throttle bodies that embed token/size wording must stay RateLimit:
+        // the Bedrock/proxy "Throttling error" prefix and OpenAI's
+        // abbreviated per-minute window both previously fell into the
+        // overflow needles and compacted a healthy session on every 429.
+        (
+            "Throttling error: Too many tokens, please wait before trying again.",
+            FailoverReason::RateLimit,
+        ),
+        (
+            "Request too large for gpt-4o in organization org-123 on tokens per min (TPM): Limit 30000, Requested 40000",
+            FailoverReason::RateLimit,
+        ),
+        (
+            "rate limit reached on requests per min (RPM): Limit 500",
+            FailoverReason::RateLimit,
+        ),
         // Overloaded: server-side 5xx, both classifier-marker-shaped and
         // the SSE `overloaded_error` structured-error name.
         (
@@ -1039,6 +1064,21 @@ mod tests {
         ),
         (
             "prompt is too long: 205000 tokens > 200000 maximum",
+            FailoverReason::ContextOverflow,
+        ),
+        (
+            "Input length 131393 exceeds the maximum allowed input length of 131040 tokens.",
+            FailoverReason::ContextOverflow,
+        ),
+        // Structured 413-style types re-wrapped as plain text by proxies:
+        // no status survives, so the string path must route them to the
+        // compaction recovery itself.
+        (
+            "error type request_too_large returned by upstream",
+            FailoverReason::ContextOverflow,
+        ),
+        (
+            "Request exceeds the maximum size allowed by the provider",
             FailoverReason::ContextOverflow,
         ),
     ];

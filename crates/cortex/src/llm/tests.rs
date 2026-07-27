@@ -2516,7 +2516,7 @@ fn openrouter_claude_request_carries_cache_control_markers() {
     // OpenRouter's tools envelope can't carry the marker).
     let mut body = build_test_openai_body(false);
     let cfg = crate::config::PromptCacheConfig::default();
-    super::apply_openai_cache_markers(&mut body, &cfg);
+    super::apply_openai_cache_markers(&mut body, &cfg, None);
 
     let messages = body["messages"].as_array().expect("messages array");
     let system = messages
@@ -2556,13 +2556,60 @@ fn openrouter_claude_request_carries_cache_control_markers() {
 }
 
 #[test]
+fn openrouter_system_marker_splits_at_stable_prefix() {
+    // Same invariant as the native-Anthropic split: the system breakpoint
+    // must sit at the end of the stable prefix, not the end of the whole
+    // message — the dynamic suffix ends with a second-resolution clock, so
+    // a whole-message marker is byte-different every turn and never hits.
+    let mut body = build_test_openai_body(false);
+    let system_text = body["messages"][0]["content"]
+        .as_str()
+        .expect("string system content")
+        .to_string();
+    let (prefix, tail) = system_text.split_at(system_text.len() / 2);
+    let cfg = crate::config::PromptCacheConfig::default();
+    super::apply_openai_cache_markers(&mut body, &cfg, Some(prefix));
+
+    let blocks = body["messages"][0]["content"]
+        .as_array()
+        .expect("system content split into blocks");
+    assert_eq!(blocks.len(), 2, "expected stable + volatile blocks");
+    assert_eq!(blocks[0]["text"], prefix);
+    assert_eq!(
+        blocks[0]["cache_control"]["type"], "ephemeral",
+        "marker must sit on the stable block"
+    );
+    assert_eq!(blocks[1]["text"], tail);
+    assert!(
+        blocks[1].get("cache_control").is_none(),
+        "volatile tail must NOT be marked: {}",
+        blocks[1]
+    );
+}
+
+#[test]
+fn openrouter_system_marker_falls_back_to_one_block_on_prefix_mismatch() {
+    // A stale or non-matching prefix must lose the split, not correctness:
+    // one block, marked, same as the pre-split behavior.
+    let mut body = build_test_openai_body(false);
+    let cfg = crate::config::PromptCacheConfig::default();
+    super::apply_openai_cache_markers(&mut body, &cfg, Some("not a prefix of the system text"));
+
+    let blocks = body["messages"][0]["content"]
+        .as_array()
+        .expect("system content upgraded to blocks");
+    assert_eq!(blocks.len(), 1, "mismatch must not split");
+    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
 fn openrouter_skips_cache_control_on_tool_role() {
     // Silent-hang guard: OpenRouter rejects `cache_control` on a role:tool
     // message by hanging the request indefinitely. The rolling window must
     // skip past tool messages without consuming a breakpoint.
     let mut body = build_test_openai_body(true);
     let cfg = crate::config::PromptCacheConfig::default();
-    super::apply_openai_cache_markers(&mut body, &cfg);
+    super::apply_openai_cache_markers(&mut body, &cfg, None);
 
     let messages = body["messages"].as_array().expect("messages array");
     let tool_msg = messages
@@ -2601,7 +2648,7 @@ fn openrouter_disabled_cache_skips_helper_entirely() {
         rolling_messages: 0,
         ..crate::config::PromptCacheConfig::default()
     };
-    super::apply_openai_cache_markers(&mut body, &cfg);
+    super::apply_openai_cache_markers(&mut body, &cfg, None);
 
     let messages = body["messages"].as_array().expect("messages array");
     for msg in messages {

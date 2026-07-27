@@ -26,6 +26,11 @@ const OVERFLOW_NEEDLES: &[&str] = &[
     "prompt too long",
     "maximum token",
     "exceeds the model",
+    // Structured 413-style type re-wrapped into a plain message by
+    // aggregators/proxies (no status attribute survives). Routed here so the
+    // reactive-compaction recovery fires; the underscored form does not match
+    // the spaced "request too large" needle above.
+    "request_too_large",
 ];
 
 const AUTH_PERMANENT_NEEDLES: &[&str] = &[
@@ -76,6 +81,13 @@ const RATE_LIMIT_NEEDLES: &[&str] = &[
     "rate_limit_error",
     "too many requests",
     "throttl",
+    // Per-minute rate windows. Substring-matches both the spelled-out forms
+    // ("tokens per minute") and the abbreviated ones OpenAI actually sends
+    // ("tokens per min (TPM)"). A body naming a per-minute window is a rate
+    // limit even when it also contains overflow-ish wording like "request
+    // too large" or "too many tokens".
+    "tokens per min",
+    "requests per min",
 ];
 
 const OVERLOADED_NEEDLES: &[&str] = &[
@@ -203,8 +215,10 @@ pub(super) fn body_indicates_no_allowed_providers(body: &str) -> bool {
 /// from drifting apart on what counts as "auth" vs "billing" vs "transient".
 ///
 /// Order matters because some phrases overlap:
-/// - context-overflow phrases beat rate-limit unless the body explicitly
-///   names a TPM/RPM rate (Anthropic 429s name the window),
+/// - a rate-limit needle beats context-overflow phrases: throttle bodies
+///   routinely embed token wording ("Throttling error: Too many tokens",
+///   "Request too large ... on tokens per min (TPM)"), and compacting a
+///   healthy session on every 429 is far worse than backing off,
 /// - auth-permanent beats auth (403 needles would otherwise look like 401),
 /// - billing beats rate-limit ("throttl" rarely co-occurs with billing
 ///   phrases, but quota-style errors should not retry).
@@ -228,13 +242,17 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
         return Some(FailoverReason::AuthPermanent);
     }
 
-    // Disambiguation: a context-overflow phrase wins over rate-limit unless
-    // the body explicitly mentions a per-minute rate (TPM/RPM). Anthropic
-    // 429s often include both "rate_limit_error" and a prompt-length number,
-    // so without this guard the wrong branch fires on each direction.
+    // Disambiguation: a context-overflow phrase wins only when nothing in
+    // the body signals a rate limit. Throttle bodies routinely embed token
+    // wording — Bedrock's "Throttling error: Too many tokens, please wait
+    // before trying again." and OpenAI's "Request too large for ... on
+    // tokens per min (TPM)" are both 429-class — and a genuine overflow
+    // (400 "prompt is too long") never carries a rate-limit needle. Guarding
+    // on the full needle set keeps a throttle from triggering spurious
+    // reactive compaction of a healthy session.
     let mentions_overflow = matches_any(lower, OVERFLOW_NEEDLES);
-    let mentions_tpm = lower.contains("tokens per minute") || lower.contains("requests per minute");
-    if mentions_overflow && !mentions_tpm {
+    let mentions_rate_limit = matches_any(lower, RATE_LIMIT_NEEDLES);
+    if mentions_overflow && !mentions_rate_limit {
         return Some(FailoverReason::ContextOverflow);
     }
 

@@ -950,7 +950,11 @@ pub(crate) fn build_openai_request(
         && supports_anthropic_cache_control(request.provider, request.model)
         && request.provider != Provider::Anthropic
     {
-        apply_openai_cache_markers(&mut body, &request.llm_config.cache);
+        apply_openai_cache_markers(
+            &mut body,
+            &request.llm_config.cache,
+            request.system_stable_prefix,
+        );
     }
     // OpenAI's reasoning families (o-series, gpt-5*) replaced `max_tokens` with
     // `max_completion_tokens` on the Chat Completions wire. Rewrite at the JSON

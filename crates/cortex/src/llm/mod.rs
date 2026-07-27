@@ -64,9 +64,17 @@ pub(crate) fn supports_anthropic_cache_control(provider: Provider, model: &str) 
 /// applied here — OpenRouter's tools array uses OpenAI's
 /// `{type: "function", function: {…}}` envelope which doesn't accept
 /// `cache_control`.
+///
+/// The system breakpoint goes at the end of the *stable prefix* when one is
+/// supplied, mirroring the native-Anthropic split: marking the whole system
+/// message caches nothing because the prompt's dynamic suffix ends with a
+/// second-resolution `Current Time` and is byte-different every turn. On a
+/// missing or non-matching prefix this degrades to marking the whole
+/// message — the split is lost, never correctness.
 fn apply_openai_cache_markers(
     body: &mut serde_json::Value,
     cache_cfg: &crate::config::PromptCacheConfig,
+    system_stable_prefix: Option<&str>,
 ) {
     let marker = build_cache_control_marker(cache_cfg.ttl);
     // cache_tools_eff is intentionally ignored: OpenAI's tools envelope
@@ -82,7 +90,23 @@ fn apply_openai_cache_markers(
             .iter_mut()
             .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
         {
-            apply_cache_control_to_message(sys, &marker);
+            let split = sys
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .zip(system_stable_prefix)
+                .filter(|(text, prefix)| {
+                    !prefix.is_empty() && prefix.len() < text.len() && text.starts_with(prefix)
+                })
+                .map(|(text, prefix)| {
+                    serde_json::json!([
+                        { "type": "text", "text": &text[..prefix.len()], "cache_control": marker },
+                        { "type": "text", "text": &text[prefix.len()..] },
+                    ])
+                });
+            match split {
+                Some(blocks) => sys["content"] = blocks,
+                None => apply_cache_control_to_message(sys, &marker),
+            }
         }
     }
     apply_message_cache_control(messages, rolling_eff, &marker, true);
@@ -1874,9 +1898,10 @@ impl LlmClient {
 
                         if !e.is_retryable() || attempt == max_retries {
                             // Record failure and attempt provider failover.
-                            // ModelNotFound / AuthPermanent opt out — they're
-                            // user-fixable, and pointlessly burning the whole
-                            // fallback chain just delays the real error.
+                            // AuthPermanent opts out — the account is denied
+                            // and burning the fallback chain just delays the
+                            // real error. ModelNotFound cools this slot and
+                            // moves on: a sibling slot's model may serve.
                             self.record_provider_failure(e.reason());
                             // Defer fallback when the primary pool will
                             // recover soon — jumping providers while a
