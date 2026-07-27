@@ -6,10 +6,91 @@ struct SecretPattern {
     label: &'static str,
     /// If true, only the first capture group is replaced (preserves leading context).
     capture_only: bool,
+    /// Post-match validator over the full match text; a `false` verdict keeps
+    /// the match unredacted. Used where the false-positive boundary can't be
+    /// expressed in the pattern itself (the regex crate has no lookarounds).
+    validator: Option<fn(&str) -> bool>,
+}
+
+/// Credential keywords a key may end with, including real-world concatenated
+/// compounds ("authtoken" ngrok, "secretkey" minio) that would otherwise fail
+/// the word-boundary check below.
+const CREDENTIAL_KEY_SUFFIXES: &[&str] = &[
+    "password",
+    "passphrase",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "apitoken",
+    "authtoken",
+    "authkey",
+    "accesstoken",
+    "secretkey",
+    "key",
+];
+
+/// True at a word-start boundary inside an identifier: the key's edge, after
+/// a non-letter (`_ - . 3`), or at a camelCase/acronym juncture
+/// (`clientSecret`, `APIKey`).
+fn is_word_start(s: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let b = s.as_bytes();
+    let prev = b[i - 1] as char;
+    let cur = b[i] as char;
+    if !prev.is_ascii_alphabetic() {
+        return true;
+    }
+    if cur.is_ascii_uppercase() && prev.is_ascii_lowercase() {
+        return true; // camelCase: clientSecret
+    }
+    // Acronym run ending: APIKey — the 'K' begins a word when the preceding
+    // run is uppercase and the following char is lowercase.
+    if cur.is_ascii_uppercase()
+        && prev.is_ascii_uppercase()
+        && b.get(i + 1)
+            .is_some_and(|n| (*n as char).is_ascii_lowercase())
+    {
+        return true;
+    }
+    false
+}
+
+/// Validate a Credential Assignment match: the key (text before `=`) must
+/// carry a credential keyword at a word boundary, not merely embed one.
+///
+/// The pattern's key class allows arbitrary alphanumeric prefixes so real
+/// keys like `client_secret` and `spring.datasource.password` match — the
+/// side effect is that ordinary words that merely *end* in a keyword
+/// (`turkey=`, `mypassword=` in prose-shaped text) get value-masked,
+/// corrupting legitimate content on every sink that runs redaction.
+///
+/// ALL-CAPS keys keep the legacy embedded matching (`MYTOKEN=…`, `MONKEY=…`
+/// included) — an all-caps name is env-var-shaped and almost never prose, so
+/// over-masking there is the safer failure.
+fn credential_assignment_key_is_real(full_match: &str) -> bool {
+    let Some(eq) = full_match.find('=') else {
+        return true; // defensive: pattern guarantees a '='
+    };
+    let key = full_match[..eq]
+        .trim_start_matches([' ', '\t', '\n', ';'])
+        .trim_start_matches("export ")
+        .trim();
+    let letters: Vec<char> = key.chars().filter(char::is_ascii_alphabetic).collect();
+    if !letters.is_empty() && letters.iter().all(char::is_ascii_uppercase) {
+        return true;
+    }
+    let lower = key.to_ascii_lowercase();
+    CREDENTIAL_KEY_SUFFIXES
+        .iter()
+        .any(|kw| lower.ends_with(kw) && is_word_start(key, key.len() - kw.len()))
 }
 
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
-    let patterns: Vec<(&str, &str, bool)> = vec![
+    type Validator = Option<fn(&str) -> bool>;
+    let patterns: Vec<(&str, &str, bool, Validator)> = vec![
         // AWS key IDs share a 4-letter prefix + 16 base32 chars. Beyond the
         // long-lived `AKIA` access key, cover temporary/STS creds (`ASIA`) and
         // the unique-ID prefixes for users/roles/groups (`AIDA`/`AROA`/`AGPA`)
@@ -18,60 +99,74 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             r"(?:AKIA|ASIA|AIDA|AROA|AGPA)[0-9A-Z]{16}",
             "AWS Access Key",
             false,
+            None,
         ),
         (
             r"(?:ghp|ghs|gho|ghu|ghm)_[A-Za-z0-9_]{36,}",
             "GitHub Token",
             false,
+            None,
         ),
         // GitHub fine-grained personal access tokens (`github_pat_...`) — a
         // distinct shape from the classic `ghp_` prefix above.
-        (r"github_pat_[0-9A-Za-z_]{20,}", "GitHub Token", false),
+        (r"github_pat_[0-9A-Za-z_]{20,}", "GitHub Token", false, None),
         // Google API keys are `AIza` + 35 url-safe base64 chars. The prefix is
         // distinctive enough that a 30+ char lower bound won't false-positive.
-        (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false),
+        (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
         // Stripe live secret/restricted keys (`sk_live_`/`rk_live_`). Test-mode
         // keys are deliberately left alone.
-        (r"[sr]k_live_[0-9A-Za-z]{16,}", "Stripe Key", false),
+        (r"[sr]k_live_[0-9A-Za-z]{16,}", "Stripe Key", false, None),
         (
             r"sk[-_]ant[-_][A-Za-z0-9_-]{32,}",
             "Anthropic API Key",
             false,
+            None,
         ),
         (
             r"sk[-_]proj[-_][A-Za-z0-9_-]{32,}",
             "OpenAI Project Key",
             false,
+            None,
         ),
-        (r"sk-[A-Za-z0-9]{48,}", "API Key", false),
+        (r"sk-[A-Za-z0-9]{48,}", "API Key", false, None),
         (
             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
             "JWT",
             false,
+            None,
         ),
         (
             r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
             "Private Key",
             false,
+            None,
         ),
-        (r"xox[bpsar]-[A-Za-z0-9-]{24,}", "Slack Token", false),
+        (r"xox[bpsar]-[A-Za-z0-9-]{24,}", "Slack Token", false, None),
         // Slack app-level tokens (`xapp-1-...`) are distinct from the `xox*`
         // bot/user tokens above.
-        (r"xapp-[0-9]-[A-Za-z0-9-]{10,}", "Slack Token", false),
+        (r"xapp-[0-9]-[A-Za-z0-9-]{10,}", "Slack Token", false, None),
+        // `(?i)` so `Password:`/`PASSWORD:` are caught, not just lowercase —
+        // the case asymmetry previously let a capitalized doc line leak while
+        // masking the same text lowercased. `\b` keeps the keyword from
+        // matching mid-word (`wordpassword…`); underscore/dotted keys like
+        // `db_password=` are the Credential Assignment pattern's job.
         (
-            r#"(?:password|passwd|pwd|passphrase)\s*[=:]\s*"[^"]{8,}""#,
+            r#"(?i)\b(?:password|passwd|pwd|passphrase)\s*[=:]\s*"[^"]{8,}""#,
             "Quoted Password",
             false,
+            None,
         ),
         (
-            r"(?:password|passwd|pwd|passphrase)\s*[=:]\s*(\S{8,64})",
+            r"(?i)\b(?:password|passwd|pwd|passphrase)\s*[=:]\s*(\S{8,64})",
             "Password Assignment",
             true,
+            None,
         ),
         (
             r"(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql)://[^\s]{8,}",
             "Database Connection String",
             false,
+            None,
         ),
         // Bare-token credential in a URL's userinfo, e.g.
         // `git remote set-url origin https://ghp_xxx@github.com/org/repo`. The
@@ -85,6 +180,7 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             r"(?:https?|ssh|git\+https?)://[A-Za-z0-9._~%+-]{20,}@\S+",
             "URL Credential",
             false,
+            None,
         ),
         // HTTP auth headers. capture_only=true masks only the credential value and
         // keeps the header name + scheme word visible for debuggability, e.g.
@@ -95,6 +191,7 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             r"(?i)authorization\s*:\s*(?:bearer|basic|digest|token)\s+(\S{4,})",
             "Authorization Header",
             true,
+            None,
         ),
         // Opaque API-key headers (`x-api-key:`, `api-key:`, `apikey:`) carry the secret
         // directly after the colon.
@@ -102,6 +199,7 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             r"(?i)(?:x-api-key|api[-_]?key)\s*:\s*(\S{4,})",
             "API Key Header",
             true,
+            None,
         ),
         // Generic assignment patterns — run last so specific patterns above take priority.
         // capture_only=true: only the captured value (group 1) is replaced, preserving the
@@ -119,26 +217,33 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // masked on every sink. It matches neither `KEY` (that's "KEK") nor the
         // `password|passwd|pwd` value patterns above, so without it the KEK
         // passphrase leaked through redaction entirely.
+        // The post-match validator rejects keys that merely EMBED a keyword
+        // (`turkey=`, `mypassword=` prose shapes) — the keyword must sit at a
+        // word boundary in the key. See `credential_assignment_key_is_real`.
         (
             r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
             "Credential Assignment",
             true,
+            Some(credential_assignment_key_is_real as fn(&str) -> bool),
         ),
     ];
 
     patterns
         .into_iter()
-        .filter_map(|(pattern, label, capture_only)| match Regex::new(pattern) {
-            Ok(regex) => Some(SecretPattern {
-                regex,
-                label,
-                capture_only,
-            }),
-            Err(e) => {
-                tracing::error!("Failed to compile secret pattern '{label}': {e} — skipping");
-                None
-            }
-        })
+        .filter_map(
+            |(pattern, label, capture_only, validator)| match Regex::new(pattern) {
+                Ok(regex) => Some(SecretPattern {
+                    regex,
+                    label,
+                    capture_only,
+                    validator,
+                }),
+                Err(e) => {
+                    tracing::error!("Failed to compile secret pattern '{label}': {e} — skipping");
+                    None
+                }
+            },
+        )
         .collect()
 });
 
@@ -189,6 +294,9 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
                     if value.starts_with("[REDACTED") {
                         return full.to_string();
                     }
+                    if pattern.validator.is_some_and(|v| !v(full)) {
+                        return full.to_string();
+                    }
                     count += 1;
                     let prefix_len = full.len() - value.len();
                     format!("{}[REDACTED {label}]", &full[..prefix_len])
@@ -197,7 +305,10 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
         } else {
             result = pattern
                 .regex
-                .replace_all(&result, |_caps: &regex::Captures| {
+                .replace_all(&result, |caps: &regex::Captures| {
+                    if pattern.validator.is_some_and(|v| !v(&caps[0])) {
+                        return caps[0].to_string();
+                    }
                     count += 1;
                     format!("[REDACTED {label}]")
                 })
@@ -210,9 +321,14 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
     RedactionOutcome { text: result, hits }
 }
 
-/// Check whether text contains any detectable secrets.
+/// Check whether text contains any detectable secrets. Honors per-pattern
+/// validators so a match `redact_with_audit` would leave unredacted doesn't
+/// count as a secret here either.
 pub fn contains_secrets(text: &str) -> bool {
-    SECRET_PATTERNS.iter().any(|p| p.regex.is_match(text))
+    SECRET_PATTERNS.iter().any(|p| match p.validator {
+        None => p.regex.is_match(text),
+        Some(v) => p.regex.find_iter(text).any(|m| v(m.as_str())),
+    })
 }
 
 /// One representative sample per secret pattern. Used by cross-module tests
@@ -399,6 +515,59 @@ mod tests {
     fn no_false_positive_on_normal_text() {
         let input = "Hello world, this is a normal message with no secrets.";
         assert!(!contains_secrets(input));
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn credential_assignment_spares_prose_words_embedding_keywords() {
+        // Words that merely END in a credential keyword are document text,
+        // not keys — masking them corrupts legitimate content on every sink
+        // that runs redaction (tool output, logs, channel replies).
+        for input in [
+            "turkey=delicious-roast-recipe",
+            "the monkey=cheeky-little-fellow story",
+            "mypassword=is-a-common-phrase-in-docs", // embedded, lowercase word shape
+            "donkey=eeyore-the-gloomy",
+        ] {
+            assert_eq!(redact_secrets(input), input, "wrongly masked: {input}");
+            assert!(!contains_secrets(input), "false secret hit: {input}");
+        }
+    }
+
+    #[test]
+    fn credential_assignment_still_masks_real_key_shapes() {
+        // Word-boundary keys, dotted config keys, camelCase, acronym runs,
+        // concatenated compounds, and ALL-CAPS env shapes must all keep
+        // masking. (ALL-CAPS keeps legacy embedded matching — env-var-shaped
+        // names are near-never prose, so over-masking is the safer failure.)
+        for input in [
+            "client_secret=abcd1234efgh5678",
+            "spring.datasource.password=hunter22hunter22",
+            "clientSecret=abcd1234efgh5678",
+            "APIKey=abcd1234efgh5678",
+            "authtoken=ngrok-1234567890",
+            "export DB_PASSWORD=supersecret99",
+            "MONKEY=allcaps-env-shape-stays-masked",
+        ] {
+            let out = redact_secrets(input);
+            assert!(
+                out.contains("[REDACTED"),
+                "real key shape not masked: {input} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_assignment_is_case_insensitive_and_word_bounded() {
+        // `Password:` previously escaped while `password:` was masked — the
+        // asymmetry leaked capitalized doc lines. `\b` keeps the keyword from
+        // firing mid-word.
+        let out = redact_secrets("Password: hunter2trustno1");
+        assert!(out.contains("[REDACTED Password Assignment]"), "{out}");
+        let out = redact_secrets("PASSWORD=hunter2trustno1");
+        assert!(out.contains("[REDACTED"), "{out}");
+        // Mid-word: "crosswordpassword" must not anchor at "password".
+        let input = "crosswordpassword: not-a-credential-here";
         assert_eq!(redact_secrets(input), input);
     }
 

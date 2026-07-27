@@ -928,6 +928,11 @@ fn is_catastrophic_command_at_depth(command: &str, depth: u8) -> bool {
     }
 
     for candidate in candidates {
+        // Runs on the raw candidate: normalization strips a leading
+        // `DOCKER_HOST=…` assignment, which is itself the redirect.
+        if is_container_daemon_redirect(candidate) {
+            return true;
+        }
         let normalized = normalize_for_catastrophic(candidate);
         if matches_hardcoded_deny(&normalized) {
             return true;
@@ -1174,6 +1179,120 @@ fn is_download_piped_to_interpreter(fragment: &str) -> bool {
         if downloader_before && stage_runs_interpreter(stages[i]) {
             return true;
         }
+    }
+    false
+}
+
+/// Environment variables that repoint a container CLI at a different daemon.
+const CONTAINER_DAEMON_ENV: &[&str] = &[
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+];
+
+/// True when `fragment` invokes a container CLI against a *different* daemon
+/// than the local default — a remote host over ssh/tcp, an alternate context,
+/// or a podman remote connection.
+///
+/// A daemon redirect turns a local-looking command into one that operates on
+/// other infrastructure: `docker -H ssh://prod stop app` reads as a local
+/// container stop but takes down production. It also sidesteps the sandbox
+/// entirely — the confined process never performs the destructive action
+/// itself, it asks an unconfined daemon to, and a container with a host bind
+/// mount is a full escape. That makes it catastrophic rather than merely
+/// unwanted.
+///
+/// Scanned on the raw fragment, before wrapper stripping: `strip_wrappers_inner`
+/// drops a leading `VAR=value` on the catastrophic path, which would erase the
+/// `DOCKER_HOST=…` prefix that *is* the redirect.
+///
+/// Deliberately NOT matched: `docker -h` (help) and subcommand flags such as
+/// `docker run -h <hostname>`, which set a container's hostname. The
+/// value-carrying redirect flags must appear in the global-flag position,
+/// before the subcommand, and `-H`/`-h` are distinguished case-sensitively
+/// because that is how the container CLI itself parses them.
+fn is_container_daemon_redirect(fragment: &str) -> bool {
+    let tokens: Vec<&str> = fragment.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    // Env-prefix form: `DOCKER_HOST=tcp://prod docker run …`. Only the leading
+    // assignment run is a shell prefix; an assignment later in the line is an
+    // argument, not an env override for this command.
+    let mut idx = 0;
+    let mut env_redirect = false;
+    while let Some(tok) = tokens.get(idx) {
+        if !is_env_assignment(tok) {
+            break;
+        }
+        let name = tok.split_once('=').map(|(n, _)| n).unwrap_or("");
+        if CONTAINER_DAEMON_ENV
+            .iter()
+            .any(|v| name.eq_ignore_ascii_case(v))
+        {
+            env_redirect = true;
+        }
+        idx += 1;
+    }
+
+    let mut rest: Vec<String> = tokens[idx..].iter().map(|t| (*t).to_string()).collect();
+    strip_wrappers_and_control_flow(&mut rest);
+    let Some(first) = rest.first() else {
+        return false;
+    };
+    let binary = strip_path_prefix(first).to_ascii_lowercase();
+    let is_docker = matches!(binary.as_str(), "docker" | "docker-compose");
+    let is_podman = matches!(binary.as_str(), "podman" | "podman-compose");
+    if !is_docker && !is_podman {
+        return false;
+    }
+    if env_redirect {
+        return true;
+    }
+
+    // Walk the global-flag position: everything between the binary and the
+    // first non-flag token (the subcommand).
+    let mut i = 1;
+    while let Some(tok) = rest.get(i) {
+        if !tok.starts_with('-') {
+            break;
+        }
+        let (flag, attached_value) = match tok.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (tok.as_str(), None),
+        };
+        let value_flag = if is_podman {
+            matches!(flag, "--url" | "--connection" | "--identity")
+        } else {
+            // `-H`/`--host` and `-c`/`--context`. Case-sensitive `-H`: the
+            // lowercase `-h` is help.
+            matches!(flag, "-H" | "--host" | "-c" | "--context")
+        };
+        if value_flag {
+            // A redirect only takes effect with a value — either attached
+            // (`--host=tcp://x`) or as the next token.
+            let has_value = attached_value.is_some_and(|v| !v.is_empty())
+                || rest.get(i + 1).is_some_and(|v| !v.starts_with('-'));
+            if has_value {
+                return true;
+            }
+        }
+        if is_podman && matches!(flag, "-r" | "--remote") {
+            return true;
+        }
+        // Skip this flag's value when it took one as a separate token.
+        if value_flag && attached_value.is_none() {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    // `docker context use <name>` persistently repoints every later command.
+    if is_docker && rest.get(i).is_some_and(|t| t == "context") {
+        return rest.get(i + 1).is_some_and(|t| t == "use");
     }
     false
 }
@@ -1557,6 +1676,74 @@ mod tests {
         }
         // cwd-scoped recursive deletes still auto-approve.
         for ok in ["rm -fr ./build", "rm -r -f target", "rm file.txt"] {
+            assert!(!is_catastrophic_command(ok), "{ok} must pass");
+        }
+    }
+
+    #[test]
+    fn catastrophic_rm_flags_after_operands() {
+        // GNU rm permutes options, so a recursive flag group may legally
+        // FOLLOW the operands. `canonicalize_rm_flags` scans all tokens, so
+        // these are equivalent to the flags-first spellings above — pin it.
+        for bad in [
+            "rm / -rf",
+            "rm / -r -f",
+            "rm / --recursive --force",
+            "rm /etc -rf",
+            "rm ~ -fr",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+        for ok in ["rm ./build -rf", "rm target -r -f"] {
+            assert!(!is_catastrophic_command(ok), "{ok} must pass");
+        }
+    }
+
+    #[test]
+    fn catastrophic_container_daemon_redirect() {
+        // A redirect makes a local-looking command act on another daemon —
+        // and lets a sandboxed process ask an unconfined daemon to do what it
+        // cannot do itself.
+        for bad in [
+            "docker -H ssh://prod stop app",
+            "docker --host tcp://10.0.0.1:2375 ps",
+            "docker --host=tcp://10.0.0.1:2375 run alpine",
+            "docker -c production stop app",
+            "docker --context=remote ps",
+            "docker context use production",
+            "podman --url ssh://prod ps",
+            "podman --connection prod run alpine",
+            "podman --identity ~/.ssh/id_rsa ps",
+            "podman -r ps",
+            "podman --remote run alpine",
+            // Env-prefix forms — normalization strips the assignment, so the
+            // check must run before it.
+            "DOCKER_HOST=tcp://prod:2375 docker run alpine",
+            "DOCKER_CONTEXT=prod docker ps",
+            "CONTAINER_HOST=ssh://prod podman ps",
+            "CONTAINER_CONNECTION=prod podman run alpine",
+            // Wrapper in front.
+            "sudo docker -H tcp://prod stop app",
+            // Hidden in an inline shell payload.
+            "sh -c 'docker -H ssh://prod stop app'",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+        // Local container work stays allowed — including the flag spellings
+        // that only *look* like redirects.
+        for ok in [
+            "docker ps",
+            "docker -h",
+            "docker --help",
+            "docker run -h myhostname alpine",
+            "docker compose up -d",
+            "docker build -t app .",
+            "docker logs -f app",
+            "podman ps",
+            "podman run -h container-host alpine",
+            "docker context ls",
+            "DOCKER_BUILDKIT=1 docker build .",
+        ] {
             assert!(!is_catastrophic_command(ok), "{ok} must pass");
         }
     }

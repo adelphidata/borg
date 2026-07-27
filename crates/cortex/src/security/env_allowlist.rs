@@ -19,8 +19,9 @@
 //! 1. Explicit allowlist of known-safe names (categorized below).
 //! 2. Prefix allowlist for variant-family vars (`LC_`, `XDG_`, build-script
 //!    `CARGO_FEATURE_`, …).
-//! 3. Defense-in-depth substring deny (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/
-//!    `PASSWD`/`CREDENTIAL`/`AUTH`, case-insensitive). Applied AFTER the
+//! 3. Defense-in-depth segment deny (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/
+//!    `PASSWD`/`CREDENTIAL`/`AUTH` + compounds, case-insensitive, matched
+//!    against whole `_`/`-`/`.`-separated name segments). Applied AFTER the
 //!    allow checks — a tripwire for refactor mistakes, not the main gate.
 //!
 //! Callers needing to forward a credential a skill explicitly declared pass
@@ -216,7 +217,12 @@ const ALLOWED_NAMES: &[&str] = &[
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_NOSYSTEM",
     // -- Docker / container (non-credential subset only). --
-    "DOCKER_HOST",
+    // `DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` /
+    // `CONTAINER_CONNECTION` are deliberately absent: they repoint the
+    // container CLI at a different (often remote) daemon, so forwarding an
+    // ambient value would let a confined child ask an unconfined daemon to
+    // act on its behalf. `crate::policy` denies the command-line spellings
+    // for the same reason.
     "DOCKER_BUILDKIT",
     "DOCKER_CONFIG",
     "DOCKER_DEFAULT_PLATFORM",
@@ -253,11 +259,15 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "__BORG_TEST_",
 ];
 
-/// Substring patterns that, when present in a var name (case-insensitive),
-/// override an allow decision. This is the tripwire layer — primary gate is
-/// the allowlist. Entries are pre-lowercased so the matching path doesn't
-/// allocate per call.
-const DENY_SUBSTRINGS: &[&str] = &[
+/// Credential words that, when they appear as a whole `_`/`-`/`.`-separated
+/// segment of a var name (case-insensitive, plural allowed), override an
+/// allow decision. This is the tripwire layer — the primary gate is the
+/// allowlist, so a name that slips this check is still only forwarded if it
+/// was explicitly allowlisted. Segment matching (not substring) keeps names
+/// that merely EMBED a word — `XAUTHORITY` (auth), `TOKENIZERS_PARALLELISM`
+/// (token) — from tripping the deny; concatenated real-world compounds are
+/// covered by the explicit entries (`apikey`, `authtoken`, …).
+const DENY_SEGMENTS: &[&str] = &[
     "key",
     "token",
     "secret",
@@ -265,6 +275,13 @@ const DENY_SUBSTRINGS: &[&str] = &[
     "passwd",
     "credential",
     "auth",
+    "apikey",
+    "authkey",
+    "authtoken",
+    "apitoken",
+    "accesstoken",
+    "secretkey",
+    "passphrase",
 ];
 
 /// Allowlist entries that legitimately contain a deny substring but are
@@ -306,10 +323,15 @@ pub fn is_allowed(name: &str) -> bool {
 }
 
 fn contains_deny_substring(name: &str) -> bool {
-    // Names are conventionally ASCII; lowercase once for the substring scan.
-    // DENY_SUBSTRINGS is already lowercase so this is a single pass.
+    // Names are conventionally ASCII; lowercase once for the scan.
+    // DENY_SEGMENTS is already lowercase so this is a single pass. A trailing
+    // plural `s` counts as part of the word (`SECRETS`, `TOKENS`).
     let lowered = name.to_ascii_lowercase();
-    DENY_SUBSTRINGS.iter().any(|s| lowered.contains(s))
+    lowered.split(['_', '-', '.']).any(|seg| {
+        DENY_SEGMENTS
+            .iter()
+            .any(|s| seg == *s || seg.strip_suffix('s') == Some(s))
+    })
 }
 
 /// Apply the filter to a pre-collected env iterator. Pulled out so unit
@@ -525,6 +547,34 @@ mod tests {
                 "test setup bug: {name} doesn't start with any allowed prefix"
             );
             assert!(!is_allowed(name), "deny tripwire missed {name}");
+        }
+    }
+
+    #[test]
+    fn deny_is_segment_aware_not_substring() {
+        // Names that merely EMBED a credential word must not trip the deny —
+        // the substring rule stripped prefix-allowed vars like a tokenizer
+        // knob (contains "token") for no security gain (the allowlist is the
+        // primary gate). Segment matching keeps the tripwire for real
+        // credential-shaped names.
+        for name in [
+            "__BORG_TEST_TOKENIZERS_PARALLELISM", // "token" embedded in a word
+            "__BORG_TEST_MONKEYPATCH",            // "key" embedded in a word
+            "__BORG_TEST_AUTHORS",                // "auth" embedded in a word
+        ] {
+            assert!(
+                ALLOWED_PREFIXES.iter().any(|p| name.starts_with(p)),
+                "test setup bug: {name} doesn't start with any allowed prefix"
+            );
+            assert!(is_allowed(name), "embedded word wrongly denied: {name}");
+        }
+        // Whole segments (including plural and compound forms) still trip.
+        for name in [
+            "__BORG_TEST_TOKENS_LIST",
+            "__BORG_TEST_APIKEY",
+            "__BORG_TEST_AUTH_URL",
+        ] {
+            assert!(!is_allowed(name), "segment deny missed {name}");
         }
     }
 
