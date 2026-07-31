@@ -268,6 +268,22 @@ impl Database {
         Ok(())
     }
 
+    /// Shape repair for stranded DBs. All worktrees share `~/.borg/borg.db`,
+    /// so a binary whose migration numbering differed can stamp
+    /// `schema_version` past a column-adding migration without ever running
+    /// it — e.g. a DB at version 10 whose `messages` table still lacks the
+    /// v8 `hmac`/`prev_hmac`/`event_*` columns, making every message persist
+    /// fail with "no such column: hmac". Re-run the idempotent ALTER-based
+    /// migrations; each probes `PRAGMA table_info` first, so on a healthy DB
+    /// this is a no-op.
+    pub(super) async fn migrate_v11(&self) -> Result<()> {
+        self.migrate_v5().await?;
+        self.migrate_v6().await?;
+        self.migrate_v8().await?;
+        self.migrate_v9().await?;
+        Ok(())
+    }
+
     pub(super) async fn migrate_v4(&self) -> Result<()> {
         // Fresh installs already emit the final shape via `SCHEMA_SQL`
         // (which defines `code_hash`). Only DBs that ran through the v3
@@ -1363,5 +1379,62 @@ mod tests {
             SCHEMA_SQL.contains("pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000,"),
             "scheduled_tasks.pre_run_timeout_ms default drifted from 60000"
         );
+    }
+
+    // Worktrees share ~/.borg/borg.db, so a binary with different migration
+    // numbering can stamp schema_version past a column-adding migration
+    // without running it. Observed in the wild: a version-10 DB whose
+    // messages table lacked the v8 hmac/prev_hmac/event_* columns, failing
+    // every message persist with "no such column: hmac". migrate_v11 must
+    // repair the shape and advance the version.
+    #[tokio::test]
+    async fn stranded_schema_version_gets_messages_columns_repaired() {
+        let db = Database::test_db().await;
+
+        // Simulate the stranded state: rebuild `messages` with the exact
+        // pre-v8 column set observed in the wild, version stamped past 8.
+        db.conn
+            .execute_batch(
+                "DROP TABLE messages;
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_calls_json TEXT,
+                    tool_call_id TEXT,
+                    timestamp TEXT,
+                    created_at INTEGER NOT NULL,
+                    content_parts_json TEXT
+                 );",
+            )
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "10").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let mut rows = db.conn.query("PRAGMA table_info(messages)", ()).await.unwrap();
+        let mut cols: Vec<String> = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            cols.push(row.get::<String>(1).unwrap());
+        }
+        for required in ["event_kind", "event_json", "hmac", "prev_hmac"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "messages must regain {required}; columns: {cols:?}"
+            );
+        }
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION,
+            "repair must advance the version so it doesn't re-run every boot"
+        );
+
+        // The originally-failing operation now succeeds end-to-end.
+        db.upsert_session("s1", 100, 100, 0, "m", "test").await.unwrap();
+        db.insert_message("s1", "user", Some("hello"), None, None, None, None)
+            .await
+            .unwrap();
     }
 }

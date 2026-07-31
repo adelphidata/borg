@@ -735,18 +735,31 @@ impl<'a> App<'a> {
     /// mutated by an in-flight stream (see the predicate in
     /// `inline-viewport-port.md` §"Stability predicate").
     ///
-    /// The current cell at `cells.len() - 1` is always treated as the live
-    /// tail and never flushed here — `handle_event_turn_complete` is the one
-    /// site that finalizes the tail.
+    /// While a turn is in flight the current cell at `cells.len() - 1` is
+    /// reserved as the live tail — stream deltas mutate it in place and
+    /// `handle_event_turn_complete` finalizes it. With no turn in flight
+    /// (heartbeats or system notices pushed while idle) nothing can mutate
+    /// the tail anymore, and reserving it would strand the cell in the
+    /// height-capped inline viewport, where anything past a few wrapped
+    /// rows is clipped and unreachable by terminal scrollback.
     pub fn flush_stable_cells(&mut self, width: u16) {
         let len = self.cells.len();
         if len == 0 || self.cells_emitted >= len {
             return;
         }
+        let turn_in_flight = matches!(
+            self.state,
+            AppState::Streaming { .. } | AppState::AwaitingApproval { .. }
+        );
+        let flush_end = if turn_in_flight {
+            len.saturating_sub(1)
+        } else {
+            len
+        };
         // Walk forward from `cells_emitted`; stop on the first non-stable
-        // cell or on the live tail. The tail (last cell) is always reserved.
+        // cell or on the reserved live tail.
         let mut stable_end = self.cells_emitted;
-        while stable_end < len.saturating_sub(1) {
+        while stable_end < flush_end {
             if !self.is_cell_stable(stable_end) {
                 break;
             }
@@ -761,8 +774,14 @@ impl<'a> App<'a> {
     /// True if the cell at `idx` is no longer subject to mutation by an
     /// in-flight stream.
     fn is_cell_stable(&self, idx: usize) -> bool {
-        use super::super::history::HistoryCell;
+        use super::super::history::{ApprovalStatus, HistoryCell};
         match &self.cells[idx] {
+            // A pending ShellApproval is resolved in place (via `last_mut`)
+            // by the approval key handler; flushing it early would freeze
+            // "[y/N]" in scrollback with the resolution never shown.
+            HistoryCell::ShellApproval { status, .. } => {
+                !matches!(status, ApprovalStatus::Pending)
+            }
             // Thinking placeholders accept further deltas.
             HistoryCell::Thinking { .. } => false,
             // An open ToolStart can still be mutated by a later ToolResult.
@@ -1089,6 +1108,65 @@ mod tests {
         assert_eq!(
             consecutive_blanks, 1,
             "expected exactly one blank between warning card and heartbeat, got: {flushed:?}"
+        );
+    }
+
+    // flush_stable_cells — tail reservation is scoped to in-flight turns.
+
+    #[test]
+    fn idle_heartbeat_tail_flushes_to_scrollback() {
+        // Regression: a heartbeat arriving while idle sat as the reserved
+        // live tail forever, so its full text existed only in the
+        // height-capped inline viewport — clipped after ~3 wrapped rows and
+        // unreachable by terminal scrollback.
+        let mut app = make_app();
+        app.cells.push(HistoryCell::Heartbeat {
+            text: "a long proactive message".into(),
+        });
+        app.flush_stable_cells(80);
+        assert_eq!(
+            app.cells_emitted, 1,
+            "idle stable tail must flush to scrollback"
+        );
+        assert!(
+            app.pending_scrollback
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains("[heartbeat]"))),
+            "heartbeat text should be in pending_scrollback"
+        );
+    }
+
+    #[test]
+    fn streaming_tail_stays_reserved() {
+        // While a turn is in flight the last cell may still be mutated in
+        // place by stream deltas — it must never flush early.
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.cells.push(HistoryCell::User { text: "hi".into() });
+        app.flush_stable_cells(80);
+        assert_eq!(
+            app.cells_emitted, 0,
+            "live tail must stay in the viewport while streaming"
+        );
+    }
+
+    #[test]
+    fn pending_shell_approval_blocks_flush() {
+        // A pending approval cell is resolved in place via `last_mut`;
+        // flushing it (or letting later cells leapfrog it) would freeze
+        // "[y/N]" in scrollback with the resolution never rendered.
+        let mut app = make_app();
+        app.cells.push(HistoryCell::ShellApproval {
+            command: "ls".into(),
+            status: super::super::super::history::ApprovalStatus::Pending,
+        });
+        app.cells.push(HistoryCell::Heartbeat { text: "hb".into() });
+        app.flush_stable_cells(80);
+        assert_eq!(
+            app.cells_emitted, 0,
+            "pending approval must block the flush walk"
         );
     }
 
