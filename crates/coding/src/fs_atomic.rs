@@ -48,6 +48,13 @@ pub fn split_bom(s: &str) -> (bool, &str) {
 ///
 /// The caller is responsible for any parent-directory creation and symlink
 /// checks on `full_path` before calling this.
+///
+/// Permissions (Unix): the `rename` installs the temp file's mode, so the temp
+/// must end up with the right one. An existing target keeps its exact mode
+/// (executable bits, `0600` hardening) — the temp is created `0600` so the
+/// content is never world-readable during the write window, then chmod'd to the
+/// target's mode before the rename. A brand-new target gets ordinary
+/// umask-masked `0666` (the same default a plain create would produce).
 pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = full_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = full_path
@@ -60,15 +67,46 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id()
     ));
 
+    // NotFound is the only error that means "new file"; anything else
+    // (EACCES, EIO, ELOOP) must propagate — treating it as new would let the
+    // rename below rewrite a 0600-hardened target with umask-default perms.
+    #[cfg(unix)]
+    let existing_perms = match std::fs::metadata(full_path) {
+        Ok(m) => Some(m.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+
     // Inner closure so a single `?`-chain covers create/write/flush, and we can
     // clean up the temp file on any failure.
     let write_result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // 0600 while an existing target's content is in flight; 0666 (the
+            // kernel applies the umask) when the target is new.
+            let mode = if existing_perms.is_some() {
+                0o600
+            } else {
+                0o666
+            };
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(bytes)?;
         f.flush()?;
         // Ensure bytes hit the disk before the rename so a crash right after the
         // rename can't surface an empty file.
         f.sync_all()?;
+        #[cfg(unix)]
+        if let Some(perms) = existing_perms.clone() {
+            std::fs::set_permissions(&tmp_path, perms)?;
+        }
         Ok(())
     })();
 
@@ -128,6 +166,46 @@ mod tests {
         std::fs::write(&target, "old content that is longer").unwrap();
         atomic_write(&target, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // An executable script and a 0600-hardened secret file must keep
+        // their modes across a patch rewrite — resetting them to umask
+        // defaults would silently strip the exec bit / widen a private file.
+        for mode in [0o755u32, 0o600] {
+            let target = dir.path().join(format!("target-{mode:o}"));
+            std::fs::write(&target, "old").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            atomic_write(&target, b"new").unwrap();
+            let got = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "mode {mode:o} not preserved, got {got:o}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_new_file_gets_umask_default_not_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fresh.txt");
+        atomic_write(&target, b"content").unwrap();
+        let got = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        // The exact value depends on the process umask; the contract is that a
+        // new file is a normal readable file (owner r/w set, not locked to
+        // 0600 by the private write window, never world-writable under any
+        // sane umask).
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, "content").unwrap();
+        let want = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            got, want,
+            "new-file mode {got:o} != plain-create mode {want:o}"
+        );
     }
 
     #[test]

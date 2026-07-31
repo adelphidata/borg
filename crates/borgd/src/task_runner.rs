@@ -278,8 +278,8 @@ pub(crate) async fn run_pre_run_command(
         Ok(Ok(output)) => PreRunOutcome {
             success: output.status.success(),
             exit_code: output.status.code(),
-            stdout: truncate_capture(&String::from_utf8_lossy(&output.stdout)),
-            stderr: truncate_capture(&String::from_utf8_lossy(&output.stderr)),
+            stdout: truncate_capture(&redact_capture(&String::from_utf8_lossy(&output.stdout))),
+            stderr: truncate_capture(&redact_capture(&String::from_utf8_lossy(&output.stderr))),
             timed_out: false,
         },
         Ok(Err(spawn_err)) => PreRunOutcome {
@@ -297,6 +297,14 @@ pub(crate) async fn run_pre_run_command(
             timed_out: true,
         },
     }
+}
+
+/// Mask secrets in captured pre-run output before it is injected into the
+/// prompt as `<preprocessed_context>` and persisted with the session. A
+/// pre-run command that echoes its own auth headers (or any token) must not
+/// hand the raw value to the model or the transcript.
+fn redact_capture(s: &str) -> String {
+    cortex::security::secrets::redact_secrets(s)
 }
 
 fn truncate_capture(s: &str) -> String {
@@ -1832,6 +1840,45 @@ mod pre_run_tests {
             outcome.stderr
         );
         assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn run_pre_run_command_redacts_secrets_from_capture() {
+        // A pre-run script that echoes an auth header (its own curl -v, an
+        // env dump, a misbehaving API) must not hand the raw token to the
+        // model or the persisted transcript. Redaction happens at capture,
+        // before <preprocessed_context> rendering.
+        let outcome = run_pre_run_command(
+            "echo 'Authorization: Bearer abcDEF123456ghiJKL789'; \
+             echo 'plain diagnostic line'; \
+             echo 'Authorization: Bearer zzzSECRET999888777xyz' 1>&2; \
+             exit 3",
+            None,
+            5_000,
+        )
+        .await;
+        assert!(!outcome.success);
+        for (label, capture) in [("stdout", &outcome.stdout), ("stderr", &outcome.stderr)] {
+            assert!(
+                !capture.contains("abcDEF123456ghiJKL789")
+                    && !capture.contains("zzzSECRET999888777xyz"),
+                "{label} leaked a bearer token: {capture:?}"
+            );
+        }
+        assert!(
+            outcome.stdout.contains("[REDACTED"),
+            "stdout should carry a redaction marker: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stdout.contains("plain diagnostic line"),
+            "non-secret text must pass through unchanged: {:?}",
+            outcome.stdout
+        );
+        // And the rendered prompt block inherits the masked capture.
+        let block = render_pre_run_block(&outcome);
+        assert!(!block.contains("abcDEF123456ghiJKL789"));
+        assert!(!block.contains("zzzSECRET999888777xyz"));
     }
 
     #[tokio::test]

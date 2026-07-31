@@ -601,3 +601,150 @@ async fn rate_limit_snapshot_captured_from_429_response() {
     assert_eq!(req.remaining, 0);
     assert_eq!(req.limit, 1000);
 }
+
+// ── 401 grace: force one OAuth refresh before tombstoning ────────────────
+
+use cortex::db::Database;
+use cortex::llm::credential_pool::{CredentialPool, CredentialStrategy, PoolLoadConfig};
+use cortex::llm::llm_error::FailoverReason;
+use cortex::llm::provider::Provider;
+
+async fn oauth_pool(
+    access: &str,
+    refresh: &str,
+    expires_at_ms: i64,
+) -> (
+    std::sync::Arc<CredentialPool>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(
+        home.path().join(".claude/.credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":{expires_at_ms}}}}}"#
+        ),
+    )
+    .unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let pool = CredentialPool::load(
+        &db,
+        &db_path,
+        Provider::ClaudeCodeOAuth,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![],
+            env_vars: vec![],
+            oauth_home: Some(home.path().to_path_buf()),
+        },
+    )
+    .await
+    .unwrap();
+    (pool, home, db_dir)
+}
+
+#[tokio::test]
+async fn auth_failure_on_refreshable_oauth_forces_refresh_instead_of_removal() {
+    // A 401 can mean the access token is stale-but-unexpired (rotated by
+    // another device) while the refresh token is still good. The first Auth
+    // failure must spend a one-shot grace — force-expire the token so the
+    // next lease refreshes it — instead of permanently removing a fixable
+    // credential.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"access_token":"refreshed-access","refresh_token":"refreshed-r","expires_in":3600}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Expiry far in the future — the provider rejected a "valid" token.
+    let (pool, _home, _db) = oauth_pool("stale-but-unexpired", "r1", 9_999_999_999_000).await;
+    pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+    let id = pool.entries()[0].id.clone();
+
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, Some("401"));
+    assert!(
+        !pool.entries()[0].is_removed(),
+        "first 401 on a refreshable OAuth credential must not tombstone"
+    );
+
+    // The forced expiry makes the next lease run the real refresh path.
+    let lease = pool.acquire_lease_refreshing(None).await.unwrap();
+    assert_eq!(
+        lease.credential().unwrap().key,
+        "refreshed-access",
+        "401 grace must lead to a refreshed access token"
+    );
+}
+
+#[tokio::test]
+async fn second_auth_failure_after_grace_tombstones() {
+    // The grace is one-shot per incident: if the refreshed token still 401s,
+    // the credential is dead — removed exactly as before.
+    let (pool, _home, _db) = oauth_pool("a", "r", 9_999_999_999_000).await;
+    let id = pool.entries()[0].id.clone();
+
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+    assert!(!pool.entries()[0].is_removed(), "grace on first 401");
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+    assert!(
+        pool.entries()[0].is_removed(),
+        "second 401 in the same incident must tombstone"
+    );
+}
+
+#[tokio::test]
+async fn success_between_auth_incidents_rearms_the_grace() {
+    let (pool, _home, _db) = oauth_pool("a", "r", 9_999_999_999_000).await;
+    let id = pool.entries()[0].id.clone();
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+    pool.report_success(&id);
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+    assert!(
+        !pool.entries()[0].is_removed(),
+        "a success between auth incidents re-arms the one-shot grace"
+    );
+}
+
+#[tokio::test]
+async fn auth_failure_still_tombstones_api_keys_and_permanent_denials() {
+    // The grace is scoped to refreshable OAuth credentials: a 401 on a plain
+    // API key means the key is bad (nothing to refresh), and a 403
+    // (AuthPermanent) means the account is denied — both remove immediately.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _dir = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (config, _key_a, _key_b) = two_key_config(&server.uri());
+    let client = LlmClient::new(&config).await.expect("client");
+    let pool = client.primary_pool().cloned().expect("pool");
+    let id = pool.entries()[0].id.clone();
+    pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+    assert!(
+        pool.entries()
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .is_removed(),
+        "401 on an API key must remove it immediately"
+    );
+
+    let (pool2, _home, _db) = oauth_pool("a", "r", 9_999_999_999_000).await;
+    let id2 = pool2.entries()[0].id.clone();
+    pool2.report_failure(&id2, FailoverReason::AuthPermanent, Some(403), None, None);
+    assert!(
+        pool2.entries()[0].is_removed(),
+        "403 must remove even a refreshable OAuth credential"
+    );
+}

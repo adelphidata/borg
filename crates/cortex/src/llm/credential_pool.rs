@@ -209,6 +209,13 @@ pub struct PooledCredential {
     /// (seconds-to-minutes), so persisting across restart would just mean
     /// acting on stale data. Populated by `report_rate_limit_headers`.
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// True once a 401 has already spent this credential's one forced-refresh
+    /// grace. An OAuth credential's first `Auth` failure force-expires the
+    /// access token (the next lease acquisition refreshes it) instead of
+    /// tombstoning — a stale-but-unexpired token is fixable. A second `Auth`
+    /// failure while this flag is set tombstones as usual. Cleared on
+    /// `report_success`. In-memory only.
+    pub auth_refresh_grace_used: bool,
 }
 
 impl PooledCredential {
@@ -710,6 +717,7 @@ impl CredentialPool {
                         base_url: row.base_url.clone(),
                         extra_json: row.extra_json.clone(),
                         rate_limit: None,
+                        auth_refresh_grace_used: false,
                     });
                 }
             }
@@ -1203,6 +1211,9 @@ impl CredentialPool {
         c.last_error_reason = None;
         c.last_error_message = None;
         c.last_error_reset_at_ms = None;
+        // A completed request re-arms the one-shot 401 refresh grace: the
+        // next auth incident is a fresh one, not a continuation.
+        c.auth_refresh_grace_used = false;
         g.emitted_exhausted_warn = false;
         let cred = g.creds.iter().find(|c| c.id == credential_id).cloned();
         drop(g);
@@ -1238,6 +1249,36 @@ impl CredentialPool {
         let truncated = error_message.map(truncate_error_msg);
 
         match reason {
+            // First 401 on an OAuth credential that can refresh: the access
+            // token may merely be stale (revoked-and-rotated by another
+            // device, clock skew) while the refresh token is still good.
+            // Force-expire the access token so the next
+            // `acquire_lease_refreshing` runs the serialized refresh, and
+            // spend the one-shot grace flag. Bounded: a second Auth failure
+            // with the flag set falls through to the tombstone arm below,
+            // and 403 (`AuthPermanent`) never gets the grace.
+            FailoverReason::Auth
+                if matches!(c.auth_type, AuthType::OAuth)
+                    && c.refresh_token.is_some()
+                    && !c.auth_refresh_grace_used =>
+            {
+                c.auth_refresh_grace_used = true;
+                c.expires_at_ms = Some(now - 1);
+                c.last_status = CredentialStatus::Ok;
+                c.last_status_at_ms = Some(now);
+                c.last_error_code = status_code;
+                c.last_error_reason = Some(reason.to_string());
+                c.last_error_message = truncated;
+                c.last_error_reset_at_ms = None;
+                info!(
+                    target: "cortex::llm::credential_pool",
+                    id = %c.id,
+                    label = %c.label,
+                    fingerprint = %c.fingerprint,
+                    status_code = ?status_code,
+                    "auth failure on refreshable OAuth credential — forcing one token refresh before removal"
+                );
+            }
             FailoverReason::Auth | FailoverReason::AuthPermanent => {
                 c.removed_at_ms = Some(now);
                 c.last_status = CredentialStatus::Exhausted;
@@ -1451,6 +1492,7 @@ impl CredentialPool {
             base_url,
             extra_json,
             rate_limit: None,
+            auth_refresh_grace_used: false,
         };
         g.creds.push(cred.clone());
         g.emitted_exhausted_warn = false;
@@ -1933,6 +1975,7 @@ fn reconcile_or_new(
             base_url: row.base_url.clone(),
             extra_json: row.extra_json.clone(),
             rate_limit: None,
+            auth_refresh_grace_used: false,
         }
     } else {
         PooledCredential {
@@ -1956,6 +1999,7 @@ fn reconcile_or_new(
             base_url: None,
             extra_json: None,
             rate_limit: None,
+            auth_refresh_grace_used: false,
         }
     }
 }
@@ -2003,6 +2047,7 @@ fn reconcile_or_new_oauth(
             base_url: disc.base_url.or_else(|| row.base_url.clone()),
             extra_json: disc.extra_json.or_else(|| row.extra_json.clone()),
             rate_limit: None,
+            auth_refresh_grace_used: false,
         }
     } else {
         PooledCredential {
@@ -2026,6 +2071,7 @@ fn reconcile_or_new_oauth(
             base_url: disc.base_url,
             extra_json: disc.extra_json,
             rate_limit: None,
+            auth_refresh_grace_used: false,
         }
     }
 }
