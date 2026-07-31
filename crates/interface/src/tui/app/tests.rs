@@ -2039,6 +2039,84 @@ fn tool_output_delta_surfaces_latest_nonempty_line_as_details() {
     );
 }
 
+#[test]
+fn tool_streaming_retention_stays_bounded() {
+    use super::super::constants::{TOOL_STREAM_MAX_LINES, TOOL_STREAM_MAX_LINE_BYTES};
+
+    // A newline-free flood must not grow one String without bound: the
+    // retained line clamps at TOOL_STREAM_MAX_LINE_BYTES.
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::ToolExecuting {
+        tool_call_id: "call-1".into(),
+        name: "run_shell".into(),
+        args: "{}".into(),
+    });
+    // 3-byte chars in 1023-byte deltas (341 × 3) drift the fill so the cap
+    // cut eventually lands mid-char, forcing the boundary walk in
+    // clamp_at_char_boundary rather than always cutting on a boundary.
+    for _ in 0..64 {
+        app.process_agent_event(AgentEvent::ToolOutputDelta {
+            tool_call_id: "call-1".into(),
+            name: "run_shell".into(),
+            delta: "€".repeat(341),
+            is_stderr: false,
+        });
+    }
+    let Some(HistoryCell::ToolStreaming { lines, dropped }) = app.cells.last() else {
+        panic!("expected a ToolStreaming cell at the tail");
+    };
+    assert_eq!(lines.len(), 1, "no newline seen, so exactly one line");
+    assert!(
+        lines[0].0.len() <= TOOL_STREAM_MAX_LINE_BYTES,
+        "retained line grew to {} bytes past the {} cap",
+        lines[0].0.len(),
+        TOOL_STREAM_MAX_LINE_BYTES,
+    );
+    assert_eq!(*dropped, 0);
+
+    // A long-running many-line stream keeps only the newest
+    // TOOL_STREAM_MAX_LINES lines and counts what it evicted.
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::ToolExecuting {
+        tool_call_id: "call-2".into(),
+        name: "run_shell".into(),
+        args: "{}".into(),
+    });
+    let total_lines = TOOL_STREAM_MAX_LINES * 3;
+    for i in 0..total_lines {
+        app.process_agent_event(AgentEvent::ToolOutputDelta {
+            tool_call_id: "call-2".into(),
+            name: "run_shell".into(),
+            delta: format!("line {i}\n"),
+            is_stderr: false,
+        });
+    }
+    let Some(HistoryCell::ToolStreaming { lines, dropped }) = app.cells.last() else {
+        panic!("expected a ToolStreaming cell at the tail");
+    };
+    assert!(
+        lines.len() <= TOOL_STREAM_MAX_LINES,
+        "retained {} lines past the {} cap",
+        lines.len(),
+        TOOL_STREAM_MAX_LINES,
+    );
+    assert!(
+        *dropped > 0,
+        "evictions must be counted for the elision notice"
+    );
+    // The newest output survives; each "line {i}\n" delta also opens an
+    // empty continuation line, so the last non-empty line is the final one.
+    let last_content = lines
+        .iter()
+        .rev()
+        .find(|(l, _)| !l.is_empty())
+        .map(|(l, _)| l.as_str())
+        .unwrap();
+    assert_eq!(last_content, format!("line {}", total_lines - 1));
+}
+
 // summarize_tool_args ----------------------------------------------------
 
 #[test]

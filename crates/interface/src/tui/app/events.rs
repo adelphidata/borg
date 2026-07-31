@@ -531,8 +531,10 @@ impl<'a> App<'a> {
         let target = match self.cells.last() {
             Some(HistoryCell::ToolStreaming { .. }) => Some(self.cells.len() - 1),
             Some(HistoryCell::ToolStart { .. }) => {
-                self.cells
-                    .push(HistoryCell::ToolStreaming { lines: Vec::new() });
+                self.cells.push(HistoryCell::ToolStreaming {
+                    lines: Vec::new(),
+                    dropped: 0,
+                });
                 Some(self.cells.len() - 1)
             }
             _ => {
@@ -545,17 +547,50 @@ impl<'a> App<'a> {
         };
         if let Some(idx) = target {
             debug_assert!(idx >= self.cells_emitted, "mutating flushed cell at {idx}");
-            if let HistoryCell::ToolStreaming { lines } = &mut self.cells[idx] {
+            if let HistoryCell::ToolStreaming { lines, dropped } = &mut self.cells[idx] {
                 let parts: Vec<&str> = delta.split('\n').collect();
                 for (i, part) in parts.iter().enumerate() {
                     if i == 0 {
                         match lines.last_mut() {
-                            Some((buf, stream)) if *stream == is_stderr => buf.push_str(part),
-                            _ => lines.push((part.to_string(), is_stderr)),
+                            Some((buf, stream)) if *stream == is_stderr => {
+                                // Per-line byte clamp: rendering truncates to
+                                // viewport width anyway, and an unclamped
+                                // newline-free stream grows one String without
+                                // bound and re-parses it every frame.
+                                let budget = super::super::constants::TOOL_STREAM_MAX_LINE_BYTES
+                                    .saturating_sub(buf.len());
+                                if budget > 0 {
+                                    buf.push_str(clamp_at_char_boundary(part, budget));
+                                }
+                            }
+                            _ => lines.push((
+                                clamp_at_char_boundary(
+                                    part,
+                                    super::super::constants::TOOL_STREAM_MAX_LINE_BYTES,
+                                )
+                                .to_string(),
+                                is_stderr,
+                            )),
                         }
                     } else {
-                        lines.push((part.to_string(), is_stderr));
+                        lines.push((
+                            clamp_at_char_boundary(
+                                part,
+                                super::super::constants::TOOL_STREAM_MAX_LINE_BYTES,
+                            )
+                            .to_string(),
+                            is_stderr,
+                        ));
                     }
+                }
+                // Line-count cap: only the tail is ever rendered live; evict
+                // from the front and remember how much so the "(N lines
+                // above)" notice stays truthful.
+                let cap = super::super::constants::TOOL_STREAM_MAX_LINES;
+                if lines.len() > cap {
+                    let excess = lines.len() - cap;
+                    lines.drain(..excess);
+                    *dropped += excess as u64;
                 }
             }
         }
@@ -826,6 +861,19 @@ impl<'a> App<'a> {
         }
         None
     }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a multi-byte char.
+/// Used to clamp retained live-stream lines; slicing mid-char would panic.
+pub(super) fn clamp_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
 }
 
 fn write_tmp_audio(bytes: &[u8], ext: &str) -> anyhow::Result<std::path::PathBuf> {

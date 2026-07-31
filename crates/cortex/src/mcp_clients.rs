@@ -274,9 +274,7 @@ fn record_limits(server: &str, cfg: &McpServerConfig) {
     map.insert(server.to_string(), limits);
     // Drop any pre-existing bucket so a burst/per-minute change reseeds
     // the bucket on the next call rather than carrying stale capacity.
-    if let Ok(mut b) = buckets().lock() {
-        b.remove(server);
-    }
+    lock_recover(buckets()).remove(server);
 }
 
 /// Process-global snapshot of `mcp.disabled_servers`, refreshed at
@@ -971,23 +969,104 @@ pub async fn initialize(config: &Config) -> Result<()> {
     let builtin = builtin_tool_names();
     let builtin_refs: Vec<&str> = builtin.to_vec();
 
+    // Serve a fresh cached catalog while the server starts in the
+    // background, so a restart doesn't hide a stdio server's tools behind
+    // its spawn + handshake. Cache misses are collected and started
+    // concurrently below, which is also what populates the cache.
+    let mut cold: Vec<(String, McpServerConfig)> = Vec::new();
     for (server_name, server_cfg) in &config.mcp.servers {
         if !server_cfg.enabled || config.mcp.disabled_servers.contains(server_name) {
             tracing::info!(server = %server_name, "MCP server disabled — skipping");
             continue;
         }
-
-        // Serve a fresh cached catalog while the server starts in the
-        // background, so a restart doesn't hide a stdio server's tools behind
-        // its spawn + handshake. On a miss we fall through to the original
-        // blocking start, which is also what populates the cache.
         if serve_cached_catalog(server_name, server_cfg, config, reg, &builtin_refs).await {
             continue;
         }
+        cold.push((server_name.clone(), server_cfg.clone()));
+    }
+    if cold.is_empty() {
+        return Ok(());
+    }
 
-        if let Err(e) = start_server(server_name, server_cfg, config, reg, &builtin_refs).await {
-            report_start_failure(server_name, &e, reg).await;
+    // Cold starts run concurrently — one unreachable server's connect
+    // timeout must not queue in front of every other server — and the whole
+    // batch shares one boot-time grace. Whatever is still starting when the
+    // grace expires continues in the background and registers its tools on
+    // completion, exactly as a cache-warmed server already does. The agent
+    // always boots promptly.
+    let mut join_set = tokio::task::JoinSet::new();
+    for (name, cfg) in cold {
+        let config = config.clone();
+        let reg = reg.clone();
+        let builtin_owned: Vec<String> = builtin_refs.iter().map(ToString::to_string).collect();
+        // Captured before spawning: if a reload tears this server down while
+        // the start is in flight, the epoch moves and the task undoes its
+        // registration (mirrors the cached-catalog background start).
+        let epoch = server_epoch(&name);
+        join_set.spawn(async move {
+            let refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
+            if let Err(e) = start_server(&name, &cfg, &config, &reg, &refs).await {
+                report_start_failure(&name, &e, &reg).await;
+                return name;
+            }
+            if server_epoch(&name) != epoch {
+                // A reload removed this server while we were starting it, and
+                // `start_server` has just registered it again. Undo that —
+                // the operator's config is the authority, not our stale
+                // in-flight work.
+                lock_recover(session_map()).remove(&name);
+                reg.drop_server(&name);
+                purge_cached_catalog(&name).await;
+                tracing::info!(
+                    target: MCP_LOG_TARGET,
+                    event = "cold_start_superseded",
+                    server = %name,
+                    "MCP server was removed while starting; its registration was rolled back",
+                );
+            }
+            name
+        });
+    }
+
+    // checked_add: `startup_grace_ms` is an open-ended operator setting, and
+    // a huge value must mean "wait as long as it takes", not an overflow
+    // panic at boot. A day is far beyond any real grace.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(config.mcp.startup_grace_ms))
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
+        match tokio::time::timeout(remaining, join_set.join_next()).await {
+            Ok(Some(Ok(_name))) => {}
+            Ok(Some(Err(join_err))) => {
+                // A panic in start_server must not take initialize down with
+                // it — the server is simply absent, like any other failure.
+                tracing::error!(error = %join_err, "MCP start task panicked during initialize");
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => break,
+        }
+    }
+    let stragglers = join_set.len();
+    if stragglers > 0 {
+        tracing::info!(
+            servers = stragglers,
+            grace_ms = config.mcp.startup_grace_ms,
+            "MCP startup grace elapsed; remaining servers continue starting in the background",
+        );
+        tokio::spawn(async move {
+            while let Some(res) = join_set.join_next().await {
+                if let Err(join_err) = res {
+                    tracing::error!(
+                        error = %join_err,
+                        "background MCP start task panicked after the startup grace",
+                    );
+                }
+            }
+        });
     }
     Ok(())
 }
@@ -1186,9 +1265,7 @@ async fn serve_cached_catalog(
                 // `start_server` has just registered it again. Undo that — the
                 // operator's config is the authority, not our stale in-flight
                 // work.
-                if let Ok(mut map) = session_map().lock() {
-                    map.remove(&server_owned);
-                }
+                lock_recover(session_map()).remove(&server_owned);
                 reg_owned.drop_server(&server_owned);
                 purge_cached_catalog(&server_owned).await;
                 tracing::info!(
@@ -1287,16 +1364,10 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
     for name in &to_remove {
         // Dropping the sender closes the actor's receiver — the task exits
         // and the transport's Drop closes the underlying connection.
-        if let Ok(mut map) = session_map().lock() {
-            map.remove(name);
-        }
+        lock_recover(session_map()).remove(name);
         reg.drop_server(name);
-        if let Ok(mut b) = buckets().lock() {
-            b.remove(name);
-        }
-        if let Ok(mut l) = limits_map().lock() {
-            l.remove(name);
-        }
+        lock_recover(buckets()).remove(name);
+        lock_recover(limits_map()).remove(name);
         // Tell any in-flight cache-warmed start that this server is gone, so it
         // doesn't register its tools back after we've dropped them.
         bump_server_epoch(name);
@@ -1914,9 +1985,7 @@ async fn teardown_dead_session(
         }),
     )
     .await;
-    if let Ok(mut map) = session_map().lock() {
-        map.remove(server_name);
-    }
+    lock_recover(session_map()).remove(server_name);
     registry.drop_server(server_name);
 }
 

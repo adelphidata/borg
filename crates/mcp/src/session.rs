@@ -65,6 +65,15 @@ pub(crate) const SERVER_LOG_MAX_BYTES: usize = 2048;
 pub(crate) const SERVER_LOG_LEVEL_MAX_BYTES: usize = 32;
 pub(crate) const SERVER_LOG_LOGGER_MAX_BYTES: usize = 128;
 
+/// Hard bounds on `tools/list` pagination. Discovery follows `nextCursor`
+/// so multi-page servers aren't silently truncated to page one, but a
+/// hostile peer must not be able to keep the cursor loop running or growing
+/// without limit. The per-server tool caps in the registry still apply on
+/// top of these.
+pub(crate) const TOOLS_LIST_MAX_PAGES: usize = 100;
+pub(crate) const TOOLS_LIST_MAX_ITEMS: usize = 1024;
+pub(crate) const TOOLS_LIST_MAX_CURSOR_BYTES: usize = 64 * 1024;
+
 /// Coarse `tracing` severity for a server-supplied RFC-5424 level string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogSeverity {
@@ -200,11 +209,62 @@ impl SessionActor {
             .map(|si| format!("{} {}", si.name, si.version)))
     }
 
-    /// Issue `tools/list` and return the discovered tools.
+    /// Issue `tools/list`, following `nextCursor` pagination, and return the
+    /// discovered tools.
+    ///
+    /// The whole pagination operation shares one wall-clock budget (the
+    /// per-call timeout) in addition to each page's own request timeout, so
+    /// a server drip-feeding pages can't stretch discovery indefinitely.
+    /// Repeated cursors, oversized cursors, and page/item overflow are hard
+    /// errors — bad pagination excludes the server rather than truncating
+    /// its catalog silently.
     pub async fn list_tools(&mut self) -> Result<DiscoveredTools> {
-        let result: ToolsListResult = self.request_typed(methods::TOOLS_LIST, None).await?;
+        let deadline = Instant::now() + self.call_timeout;
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        for page in 0.. {
+            if page == TOOLS_LIST_MAX_PAGES {
+                return Err(McpError::Protocol(format!(
+                    "{}: tools/list exceeded the pagination limit of {TOOLS_LIST_MAX_PAGES} pages",
+                    self.server_name
+                )));
+            }
+            if page > 0 && Instant::now() >= deadline {
+                return Err(McpError::Timeout {
+                    ms: self.call_timeout.as_millis() as u64,
+                });
+            }
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let result: ToolsListResult = self.request_typed(methods::TOOLS_LIST, params).await?;
+            if tools.len() + result.tools.len() > TOOLS_LIST_MAX_ITEMS {
+                return Err(McpError::Protocol(format!(
+                    "{}: tools/list exceeded the catalog limit of {TOOLS_LIST_MAX_ITEMS} tools",
+                    self.server_name
+                )));
+            }
+            tools.extend(result.tools);
+            match result.next_cursor {
+                None => break,
+                Some(next) => {
+                    if next.len() > TOOLS_LIST_MAX_CURSOR_BYTES {
+                        return Err(McpError::Protocol(format!(
+                            "{}: tools/list cursor exceeds {TOOLS_LIST_MAX_CURSOR_BYTES} bytes",
+                            self.server_name
+                        )));
+                    }
+                    if !seen_cursors.insert(next.clone()) {
+                        return Err(McpError::Protocol(format!(
+                            "{}: tools/list repeated a pagination cursor",
+                            self.server_name
+                        )));
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
         Ok(DiscoveredTools {
-            tools: result.tools,
+            tools,
             server_info: None,
         })
     }
@@ -808,6 +868,146 @@ mod tests {
             "kept {} notifications, cap is {}",
             drained.len(),
             NOTIFICATION_BUFFER_CAP,
+        );
+    }
+
+    /// One `tools/list` page response addressed to request `id`.
+    fn tools_page(id: u64, names: &[&str], next: Option<&str>) -> Message {
+        let tools: Vec<Value> = names
+            .iter()
+            .map(|n| json!({"name": n, "inputSchema": {"type": "object"}}))
+            .collect();
+        let mut result = json!({ "tools": tools });
+        if let Some(cursor) = next {
+            result["nextCursor"] = json!(cursor);
+        }
+        Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(id),
+            method: None,
+            result: Some(result),
+            error: None,
+            params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_follows_next_cursor_across_pages() {
+        // Spec: MCP `tools/list` is paginated; a server may return any page
+        // size with a `nextCursor`. Stopping after page one silently drops
+        // every later tool. The client must echo the cursor back in the
+        // next request's params.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            q.push_back(tools_page(1, &["alpha"], Some("c1")));
+            q.push_back(tools_page(2, &["beta"], Some("c2")));
+            q.push_back(tools_page(3, &["gamma"], None));
+        }
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound));
+        let mut session = SessionActor::new(&manifest(), transport);
+
+        let discovered = session.list_tools().await.expect("pagination");
+        let names: Vec<_> = discovered.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert!(sent[0].get("params").is_none() || sent[0]["params"].is_null());
+        assert_eq!(sent[1]["params"]["cursor"], "c1");
+        assert_eq!(sent[2]["params"]["cursor"], "c2");
+    }
+
+    #[tokio::test]
+    async fn tools_list_rejects_repeated_cursor() {
+        // A server replaying the same cursor would otherwise loop forever
+        // (or until the page cap) re-collecting the same tools.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            q.push_back(tools_page(1, &["a"], Some("same")));
+            q.push_back(tools_page(2, &["b"], Some("same")));
+        }
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        let err = session.list_tools().await.unwrap_err();
+        assert!(
+            matches!(&err, McpError::Protocol(m) if m.contains("repeated")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_rejects_oversized_cursor() {
+        // Cursors are opaque tokens, not payloads: a multi-megabyte cursor
+        // is a memory-flooding attempt, not pagination.
+        let big = "x".repeat(TOOLS_LIST_MAX_CURSOR_BYTES + 1);
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        inbound
+            .lock()
+            .unwrap()
+            .push_back(tools_page(1, &["a"], Some(&big)));
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        let err = session.list_tools().await.unwrap_err();
+        assert!(
+            matches!(&err, McpError::Protocol(m) if m.contains("cursor exceeds")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_enforces_page_and_item_limits() {
+        // Page cap: a server that never returns a terminal page is cut off
+        // at TOOLS_LIST_MAX_PAGES rather than looping until timeout.
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            for page in 0..TOOLS_LIST_MAX_PAGES {
+                q.push_back(tools_page(
+                    page as u64 + 1,
+                    &["t"],
+                    Some(&format!("c{page}")),
+                ));
+            }
+        }
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        let err = session.list_tools().await.unwrap_err();
+        assert!(
+            matches!(&err, McpError::Protocol(m) if m.contains("pagination limit")),
+            "got {err:?}"
+        );
+
+        // Item cap: total tools across pages must stay under
+        // TOOLS_LIST_MAX_ITEMS; overflow is an error, not a silent trim.
+        let bulk: Vec<String> = (0..TOOLS_LIST_MAX_ITEMS).map(|i| format!("t{i}")).collect();
+        let bulk_refs: Vec<&str> = bulk.iter().map(String::as_str).collect();
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut q = inbound.lock().unwrap();
+            q.push_back(tools_page(1, &bulk_refs, Some("c1")));
+            q.push_back(tools_page(2, &["one-too-many"], None));
+        }
+        let transport = Box::new(ScriptedTransport::new(
+            Arc::new(Mutex::new(Vec::new())),
+            inbound,
+        ));
+        let mut session = SessionActor::new(&manifest(), transport);
+        let err = session.list_tools().await.unwrap_err();
+        assert!(
+            matches!(&err, McpError::Protocol(m) if m.contains("catalog limit")),
+            "got {err:?}"
         );
     }
 

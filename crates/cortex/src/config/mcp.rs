@@ -61,6 +61,13 @@ pub struct McpConfig {
     /// doubles each attempt. Default: 250.
     #[serde(default = "default_startup_retry_base_ms")]
     pub startup_retry_base_ms: u64,
+    /// How long `initialize` waits for cache-miss servers before letting the
+    /// daemon finish booting. Servers start concurrently; any still starting
+    /// when the grace expires continue in the background and register their
+    /// tools on completion (the same behaviour a cached catalog already has).
+    /// `0` means don't wait at all. Default: 2_000.
+    #[serde(default = "default_startup_grace_ms")]
+    pub startup_grace_ms: u64,
     /// Defer MCP tool schemas out of the per-turn LLM tool list and expose
     /// them through the `search_tools` meta-tool instead. The model searches
     /// registered MCP tools by keyword and receives matching specs on demand,
@@ -86,6 +93,7 @@ impl Default for McpConfig {
             max_response_bytes: default_max_response_bytes(),
             startup_max_retries: default_startup_max_retries(),
             startup_retry_base_ms: default_startup_retry_base_ms(),
+            startup_grace_ms: default_startup_grace_ms(),
             tool_search: false,
         }
     }
@@ -114,6 +122,10 @@ fn default_startup_max_retries() -> u32 {
 
 fn default_startup_retry_base_ms() -> u64 {
     250
+}
+
+fn default_startup_grace_ms() -> u64 {
+    2_000
 }
 
 /// Per-server config.

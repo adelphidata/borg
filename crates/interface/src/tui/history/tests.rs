@@ -183,7 +183,10 @@ fn tool_flow_classification() {
         args_json: None,
         collapsed: false,
     };
-    let tool_streaming = HistoryCell::ToolStreaming { lines: vec![] };
+    let tool_streaming = HistoryCell::ToolStreaming {
+        lines: vec![],
+        dropped: 0,
+    };
     assert!(tool_start.is_tool_flow());
     assert!(tool_result.is_tool_flow());
     assert!(tool_streaming.is_tool_flow());
@@ -217,7 +220,10 @@ fn stream_continuation_classification() {
     };
     assert!(tool_result.is_stream_continuation());
 
-    let tool_streaming = HistoryCell::ToolStreaming { lines: vec![] };
+    let tool_streaming = HistoryCell::ToolStreaming {
+        lines: vec![],
+        dropped: 0,
+    };
     assert!(tool_streaming.is_stream_continuation());
 
     let assistant = HistoryCell::assistant("hi".to_string(), false);
@@ -755,7 +761,10 @@ fn render_tool_streaming_truncates() {
     let tool_lines: Vec<(String, bool)> = (0..12)
         .map(|i| (format!("output line {i}"), i % 3 == 0))
         .collect();
-    let cell = HistoryCell::ToolStreaming { lines: tool_lines };
+    let cell = HistoryCell::ToolStreaming {
+        lines: tool_lines,
+        dropped: 0,
+    };
     let rendered = cell.render(80, None);
     let all_text: String = rendered
         .iter()

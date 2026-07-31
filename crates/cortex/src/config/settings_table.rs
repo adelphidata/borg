@@ -318,6 +318,7 @@ define_settings! {
         "mcp.max_response_bytes" => mcp.max_response_bytes, parsed(usize);
         "mcp.startup_max_retries" => mcp.startup_max_retries, parsed(u32);
         "mcp.startup_retry_base_ms" => mcp.startup_retry_base_ms, parsed(u64);
+        "mcp.startup_grace_ms" => mcp.startup_grace_ms, parsed(u64);
         "mcp.tool_search" => mcp.tool_search, parsed(bool);
 
         // ── Credentials ──

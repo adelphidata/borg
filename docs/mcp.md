@@ -136,6 +136,8 @@ Each tool's `inputSchema` is validated at registration time. We reject schemas t
 
 Rejections do not fail the whole server — the offending tool is dropped, the rest stay, and an audit event records the reason.
 
+Discovery itself is also bounded: `tools/list` follows `nextCursor` pagination (so multi-page catalogs aren't silently truncated to page one), but at most 100 pages / 1024 tools per server, cursors over 64 KiB or repeated cursors are rejected, and the whole pagination loop shares the per-call timeout. Violating any bound excludes the server for that discovery pass.
+
 ### Layer 6 — Plan-mode opt-in
 
 Plan mode (`/plan`) blocks all MCP tools by default. The operator promotes a tool into Plan mode by listing it in the per-server `tools.read_only` config. The server's own `annotations.readOnlyHint` is **not** trusted for Plan mode — only the operator's explicit list. (The server's hint is still honored for parallel-fanout batching decisions in Execute mode, where the trust requirement is lower.)
@@ -201,6 +203,7 @@ borg settings set 'mcp.servers.<id>.tools.read_only=["search","read_resource"]'
 - **No sampling — actively refused.** Server-initiated requests (`sampling/createMessage`, `roots/list`, anything else) are answered with JSON-RPC `-32601` (Method not found) inside `crates/mcp/src/session.rs`. The refusal is also drained by the cortex supervisor and surfaces as an `mcp_sampling_refused` audit row so an operator can SEE that a server tried to drive borg's LLM. Letting an untrusted server steer Borg's LLM is exactly the wrong direction for the threat model.
 - **`Mcp-Session-Id` resumability** is supported by the streamable-HTTP transport. The transport captures the server-emitted `Mcp-Session-Id` on first response, echoes it on every subsequent POST, refreshes on rotation, and drops the cached id on a 404 so the supervisor can transparently re-initialize. Without this, a server-side restart would loop forever sending invalid session ids.
 - **No resources/prompts in the catalog.** Phase 1 surfaces `tools` only; resources and prompts are deferred. The protocol layer parses them; the cortex adapter does not yet expose them.
+- **Startup never gates the boot.** Cache-warmed stdio servers register their previous catalog instantly and re-handshake in the background. Cache-miss servers start concurrently and share one boot budget (`mcp.startup_grace_ms`, default 2 s); anything still starting when it expires continues in the background and registers its tools on completion. One unreachable server's 60 s connect timeout can no longer serialize in front of the daemon's boot.
 
 ## See also
 

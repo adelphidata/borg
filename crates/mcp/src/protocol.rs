@@ -220,11 +220,15 @@ pub struct ServerInfo {
     pub version: String,
 }
 
-/// `tools/list` response: a flat list of tool schemas.
+/// `tools/list` response: one page of tool schemas.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolsListResult {
     /// Discovered tools.
     pub tools: Vec<McpToolSchema>,
+    /// Opaque cursor for the next page, when the server paginates. The
+    /// session follows it under hard bounds (page/item/cursor-size caps).
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 /// One tool entry as advertised by an MCP server.

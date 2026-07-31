@@ -238,6 +238,11 @@ pub(crate) struct PreRunOutcome {
 pub(crate) fn build_filtered_sh_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
+    // Scheduled commands run unattended: a child that reads stdin must see
+    // EOF immediately, not inherit the daemon's stdin and wait forever.
+    // `.output()` callers get this implicitly, but the guarantee belongs
+    // here so a future `.spawn()`/`.status()` caller can't lose it.
+    cmd.stdin(std::process::Stdio::null());
     cortex::security::env_allowlist::apply_filtered_env(
         &mut cmd,
         &std::collections::HashMap::new(),
@@ -1893,6 +1898,27 @@ mod pre_run_tests {
             stdout.contains("PATH="),
             "PATH must survive the filter: {stdout}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_filtered_sh_command_child_stdin_is_closed() {
+        // Helper-level regression: scheduled commands run unattended, so a
+        // child that reads stdin must see immediate EOF. Today's callers
+        // use `.output()` (which nulls stdin implicitly); this guards the
+        // guarantee at the builder so a future `.spawn()`/`.status()`
+        // caller doesn't inherit the daemon's stdin and hang forever.
+        // `cat` blocks until stdin EOF — with a null stdin it exits at
+        // once; with inherited stdin this test times out.
+        let mut cmd = build_filtered_sh_command("cat");
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("cat must exit immediately on closed stdin")
+            .expect("wait");
+        assert!(status.success(), "cat should exit 0 at stdin EOF");
     }
 
     #[tokio::test]

@@ -80,9 +80,15 @@ pub fn install_skill_deps(skill: &Skill) -> Result<Vec<String>> {
                 let (shell, shell_flag) = ("sh", "-c");
                 #[cfg(windows)]
                 let (shell, shell_flag) = ("cmd.exe", "/C");
+                // Null stdin: every generated command is non-interactive
+                // (`apt -y`, brew, npm), and an installer that does prompt
+                // should fail fast at EOF instead of hanging the agent on a
+                // read of the operator's terminal. sudo still works — it
+                // prompts on /dev/tty, not stdin.
                 let status = std::process::Command::new(shell)
                     .arg(shell_flag)
                     .arg(&c)
+                    .stdin(std::process::Stdio::null())
                     .status()?;
                 if status.success() {
                     installed.push(dep_name.clone());

@@ -49,3 +49,21 @@ pub const HIGHLIGHT_MAX_LINES: usize = 10_000;
 /// of the three in practice: a 2 MB one-line minified bundle passes both limits
 /// above while being the worst case for the regex engine.
 pub const HIGHLIGHT_MAX_LINE_BYTES: usize = 4 * 1024;
+
+// Live tool-output streaming retains raw lines in the ToolStreaming history
+// cell until the tool completes. Only the last few lines are ever rendered,
+// but without retention caps a long-running (or newline-free) stream grows
+// the cell without bound and every frame re-parses ANSI over the whole
+// oversized tail line.
+
+/// Maximum lines retained in a live ToolStreaming cell. Older lines are
+/// dropped from the front and counted in the "... (N lines above)" notice.
+/// Comfortably above the handful of lines actually rendered.
+pub const TOOL_STREAM_MAX_LINES: usize = 64;
+
+/// Byte cap on a single retained streaming line. A newline-free stream
+/// otherwise accumulates into one ever-growing `String` that is re-parsed
+/// every frame; rendering truncates to the viewport width anyway, so bytes
+/// past this cap can never be shown live. The full output still arrives in
+/// the ToolResult cell when the call finishes.
+pub const TOOL_STREAM_MAX_LINE_BYTES: usize = 4 * 1024;

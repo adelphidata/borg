@@ -427,6 +427,10 @@ pub enum HistoryCell {
     },
     ToolStreaming {
         lines: Vec<(String, bool)>,
+        /// Lines already evicted from the front of `lines` to honor
+        /// [`super::constants::TOOL_STREAM_MAX_LINES`]; folded into the
+        /// "(N lines above)" notice so the elision stays visible.
+        dropped: u64,
     },
     /// Structured plan with step tracking.
     Plan {
@@ -1299,16 +1303,18 @@ impl HistoryCell {
                 out
             }
             HistoryCell::ToolStreaming {
-                lines: tool_lines, ..
+                lines: tool_lines,
+                dropped,
             } => {
                 let _ = width;
                 let mut rendered: Vec<Line<'static>> = Vec::new();
                 let total = tool_lines.len();
                 let max_visible = 8;
                 let skip = total.saturating_sub(max_visible);
-                if skip > 0 {
+                let hidden = skip as u64 + dropped;
+                if hidden > 0 {
                     rendered.push(Line::from(Span::styled(
-                        format!("  ... ({skip} lines above)"),
+                        format!("  ... ({hidden} lines above)"),
                         theme::dim(),
                     )));
                 }
