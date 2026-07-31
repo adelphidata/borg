@@ -39,8 +39,14 @@ fn updates_with_kind<'a>(outcome: &'a PromptOutcome, kind: &str) -> Vec<&'a Valu
     outcome
         .updates
         .iter()
-        .filter(|u| u["update"]["kind"] == json!(kind))
+        .filter(|u| u["update"]["sessionUpdate"] == json!(kind))
         .collect()
+}
+
+/// Extract the text payload of a message-chunk update (spec shape:
+/// `update.content` is a `{type:"text", text}` ContentBlock).
+fn chunk_text(update: &Value) -> Option<&str> {
+    update["update"]["content"]["text"].as_str()
 }
 
 #[tokio::test]
@@ -54,10 +60,7 @@ async fn text_delta_arrives_as_agent_message_chunk_in_order() {
     ])
     .await;
     let chunks = updates_with_kind(&outcome, "agent_message_chunk");
-    let texts: Vec<&str> = chunks
-        .iter()
-        .filter_map(|u| u["update"]["text"].as_str())
-        .collect();
+    let texts: Vec<&str> = chunks.iter().filter_map(|u| chunk_text(u)).collect();
     assert_eq!(
         texts,
         vec!["Hello, ", "world"],
@@ -78,10 +81,7 @@ async fn internal_tags_are_stripped_from_text_deltas() {
     ])
     .await;
     let chunks = updates_with_kind(&outcome, "agent_message_chunk");
-    let combined: String = chunks
-        .iter()
-        .filter_map(|u| u["update"]["text"].as_str())
-        .collect();
+    let combined: String = chunks.iter().filter_map(|u| chunk_text(u)).collect();
     assert!(
         !combined.contains("secret thoughts"),
         "internal-tag content must be stripped before reaching the IDE; got: {combined:?}"
@@ -135,7 +135,13 @@ async fn tool_lifecycle_preserves_stable_tool_call_id() {
         json!("call-abc"),
         "kickoff carries the scripted id"
     );
-    assert_eq!(tool_calls[0]["update"]["status"], json!("running"));
+    // Spec shape: required `title`, `kind` (not toolKind), valid status
+    // enum (`in_progress`, never the non-spec `running`), structured
+    // rawInput parsed from the args JSON.
+    assert_eq!(tool_calls[0]["update"]["status"], json!("in_progress"));
+    assert_eq!(tool_calls[0]["update"]["title"], json!("read_file"));
+    assert_eq!(tool_calls[0]["update"]["kind"], json!("read"));
+    assert_eq!(tool_calls[0]["update"]["rawInput"]["path"], json!("foo.txt"));
 
     assert_eq!(
         tool_updates.len(),
@@ -149,8 +155,17 @@ async fn tool_lifecycle_preserves_stable_tool_call_id() {
             "every lifecycle event must carry the SAME tool_call_id"
         );
     }
-    assert_eq!(tool_updates[0]["update"]["status"], json!("running"));
+    assert_eq!(tool_updates[0]["update"]["status"], json!("in_progress"));
+    assert_eq!(
+        tool_updates[0]["update"]["content"][0]["content"]["text"],
+        json!("partial output"),
+        "tool output rides in a ToolCallContent array, not a raw string"
+    );
     assert_eq!(tool_updates[1]["update"]["status"], json!("completed"));
+    assert_eq!(
+        tool_updates[1]["update"]["content"][0]["content"]["text"],
+        json!("final result")
+    );
 }
 
 #[tokio::test]
@@ -186,14 +201,16 @@ async fn tool_output_delta_marks_stderr_stream_separately() {
     .await;
 
     let updates = updates_with_kind(&outcome, "tool_call_update");
+    // Spec content blocks carry no stdout/stderr distinction; Borg surfaces
+    // it via `_meta` (ACP's sanctioned extension point) on output deltas.
     let streams: Vec<&str> = updates
         .iter()
-        .filter_map(|u| u["update"]["stream"].as_str())
+        .filter_map(|u| u["update"]["_meta"]["borg"]["stream"].as_str())
         .collect();
     assert_eq!(
         streams,
         vec!["stdout", "stderr"],
-        "stream tag must distinguish stdout vs stderr in order"
+        "_meta stream tag must distinguish stdout vs stderr in order"
     );
 }
 
@@ -234,8 +251,13 @@ async fn plan_updated_emits_full_entries_with_medium_priority() {
         3,
         "all steps must be emitted, not just changed"
     );
-    let titles: Vec<&str> = entries.iter().filter_map(|e| e["title"].as_str()).collect();
-    assert_eq!(titles, vec!["step one", "step two", "step three"]);
+    // Spec plan entries are {content, priority, status} — `content` carries
+    // the human-readable step text; there is no id/title field.
+    let contents: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e["content"].as_str())
+        .collect();
+    assert_eq!(contents, vec!["step one", "step two", "step three"]);
     let statuses: Vec<&str> = entries
         .iter()
         .filter_map(|e| e["status"].as_str())
@@ -247,10 +269,9 @@ async fn plan_updated_emits_full_entries_with_medium_priority() {
             json!("medium"),
             "every step must default to priority `medium` (entry {i})"
         );
-        assert_eq!(
-            e["id"],
-            json!(i.to_string()),
-            "step id must be the stringified index (entry {i})"
+        assert!(
+            e.get("id").is_none() && e.get("title").is_none(),
+            "plan entries must use the spec `content` field, not id/title (entry {i}): {e}"
         );
     }
 }

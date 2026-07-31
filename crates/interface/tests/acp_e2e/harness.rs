@@ -397,13 +397,18 @@ impl PromptOutcome {
     pub fn updates_of_kind(&self, kind: &str) -> Vec<&Value> {
         self.updates
             .iter()
-            .filter(|u| u["update"]["kind"] == json!(kind))
+            .filter(|u| u["update"]["sessionUpdate"] == json!(kind))
             .collect()
     }
     pub fn agent_message_text(&self) -> String {
         self.updates_of_kind("agent_message_chunk")
             .into_iter()
-            .map(|u| u["update"]["text"].as_str().unwrap_or("").to_string())
+            .map(|u| {
+                u["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("")
     }
@@ -657,10 +662,15 @@ impl AcpClient {
         let captured: Vec<&Notification> = nots[nots_before..].iter().collect();
         let mut outcome = PromptOutcome::default();
         for n in captured {
-            match n.method.as_str() {
-                "session/update" => outcome.updates.push(n.params.clone()),
-                "session_info_update" => outcome.session_info_updates.push(n.params.clone()),
-                _ => {}
+            if n.method == "session/update" {
+                // Session metadata is a `session_info_update` *variant* of
+                // `session/update` per spec; partition it from the
+                // content/tool/plan stream so tests can assert each shape.
+                if n.params["update"]["sessionUpdate"] == json!("session_info_update") {
+                    outcome.session_info_updates.push(n.params.clone());
+                } else {
+                    outcome.updates.push(n.params.clone());
+                }
             }
         }
         if let Some(result) = envelope.get("result") {
@@ -749,8 +759,16 @@ fn handle_fs_callback(
     params: &Value,
     fs_map: &FsMap,
 ) -> std::result::Result<Value, String> {
+    // Spec-strict emulation: `fs/read_text_file` and `fs/write_text_file`
+    // REQUIRE `sessionId` per the ACP schema. A real IDE (Zed) rejects the
+    // request without it, so the harness does too — a regression that drops
+    // sessionId from the callback fails every fs-bridge test loudly.
+    let session_ok = params["sessionId"].as_str().is_some_and(|s| !s.is_empty());
     match method {
         "fs/read_text_file" => {
+            if !session_ok {
+                return Err("spec violation: fs/read_text_file missing sessionId".to_string());
+            }
             let path = params["path"]
                 .as_str()
                 .ok_or_else(|| "missing path".to_string())?;
@@ -759,6 +777,9 @@ fn handle_fs_callback(
                 .map(|content| json!({"content": content}))
         }
         "fs/write_text_file" => {
+            if !session_ok {
+                return Err("spec violation: fs/write_text_file missing sessionId".to_string());
+            }
             let path = params["path"]
                 .as_str()
                 .ok_or_else(|| "missing path".to_string())?;

@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 
 use super::translate::{event_to_update, history_replay_update};
 use super::transport::{
-    send_error, send_notification, send_result, JsonRpcCallbackClient, JsonRpcRequest, SharedWriter,
+    send_error, send_notification, send_result, JsonRpcCallbackClient, JsonRpcRequest,
+    SessionFsClient, SharedWriter,
 };
 use super::{
     AcpDaemon, AcpRequestError, AcpState, ClientCapabilities, PromptImage, PromptInput,
@@ -60,6 +61,31 @@ pub(super) enum PromptBlock {
         data: String,
         #[serde(default)]
         filename: Option<String>,
+    },
+    /// Reference to a resource the agent can access (e.g. a Zed `@file`
+    /// mention). ACP baseline: agents MUST accept `resource_link` in
+    /// prompts regardless of advertised prompt capabilities.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// Embedded resource context. Gated behind the `embeddedContext`
+    /// prompt capability, which Borg does not advertise — parsed
+    /// structurally so we can reject it with a clean invalid_params
+    /// instead of a serde "unknown variant" catch-all.
+    Resource {
+        #[serde(default)]
+        resource: Value,
+    },
+    /// Audio content. Gated behind the `audio` prompt capability, which
+    /// Borg does not advertise.
+    Audio {
+        #[serde(default, rename = "mimeType")]
+        mime_type: Option<String>,
+        #[serde(default)]
+        data: Option<String>,
     },
 }
 
@@ -132,7 +158,7 @@ async fn finish_open_session<D: AcpDaemon>(
         info.workspace_cwd = Some(record.workspace_cwd.display().to_string());
         info.workspace_root = Some(record.workspace_root.display().to_string());
     }
-    send_notification(writer, "session_info_update", session_info_params(&info)).await?;
+    send_notification(writer, "session/update", session_info_update(&info)).await?;
     Ok(info)
 }
 
@@ -216,9 +242,11 @@ pub(super) async fn handle_request<D: AcpDaemon>(
                 session.runtime.prompt_in_flight = true;
                 session.runtime.cancel_requested = false;
             }
+            let fs_client =
+                SessionFsClient::new(callback_client.clone(), params.session_id.clone());
             let mut events = match state
                 .daemon
-                .send_prompt(&params.session_id, prompt, callback_client.clone())
+                .send_prompt(&params.session_id, prompt, fs_client)
                 .await
             {
                 Ok(rx) => rx,
@@ -462,6 +490,34 @@ pub(super) fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput>
                     filename: filename.clone(),
                 });
             }
+            PromptBlock::ResourceLink { uri, name, title } => {
+                // Render the mention as a markdown link so the model sees
+                // both the human label and the resolvable URI. The daemon's
+                // workspace-scoped file tools can follow `file://` paths.
+                let label = title.as_deref().unwrap_or(name);
+                let rendered = format!("[{label}]({uri})");
+                let separator_bytes = if text_parts.is_empty() { 0 } else { 1 };
+                let cost = rendered.len().saturating_add(separator_bytes);
+                if cost > budget {
+                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
+                        "prompt too large: resource_link exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
+                    ))));
+                }
+                budget -= cost;
+                text_parts.push(rendered);
+            }
+            PromptBlock::Resource { .. } => {
+                return Err(anyhow!(AcpRequestError::invalid_params(
+                    "embedded resource content is not supported: the agent does not \
+                     advertise the `embeddedContext` prompt capability",
+                )));
+            }
+            PromptBlock::Audio { .. } => {
+                return Err(anyhow!(AcpRequestError::invalid_params(
+                    "audio content is not supported: the agent does not advertise \
+                     the `audio` prompt capability",
+                )));
+            }
         }
     }
     Ok(PromptInput {
@@ -533,15 +589,32 @@ fn initialize_response() -> Value {
             },
         },
         "authMethods": [],
+        "agentInfo": {
+            "name": "borg",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
     })
 }
 
-fn session_info_params(info: &SessionMetadata) -> Value {
+/// Build the spec-shaped `session/update` params carrying session metadata.
+///
+/// ACP models session metadata as a `session_info_update` variant of the
+/// `session/update` notification (there is no standalone top-level method).
+/// Only `title`/`updatedAt` are spec fields; Borg-specific extras (model,
+/// workspace paths) ride in `_meta`, the sanctioned extension point.
+fn session_info_update(info: &SessionMetadata) -> Value {
     json!({
         "sessionId": info.session_id,
-        "title": info.title,
-        "model": info.model,
-        "workspaceCwd": info.workspace_cwd,
-        "workspaceRoot": info.workspace_root,
+        "update": {
+            "sessionUpdate": "session_info_update",
+            "title": info.title,
+            "_meta": {
+                "borg": {
+                    "model": info.model,
+                    "workspaceCwd": info.workspace_cwd,
+                    "workspaceRoot": info.workspace_root,
+                }
+            }
+        }
     })
 }

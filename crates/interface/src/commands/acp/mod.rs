@@ -614,29 +614,37 @@ mod tests {
         let lines = parse_lines(output.lock().unwrap().clone());
         let updates: Vec<&Value> = lines
             .iter()
-            .filter(|l| l["method"] == "session/update")
+            .filter(|l| {
+                l["method"] == "session/update"
+                    && l["params"]["update"]["sessionUpdate"] != "session_info_update"
+            })
             .collect();
         assert_eq!(updates.len(), 2, "system role must be dropped: {lines:?}");
-        assert_eq!(updates[0]["params"]["update"]["kind"], "user_message_chunk");
-        assert_eq!(updates[0]["params"]["update"]["text"], "hi");
         assert_eq!(
-            updates[1]["params"]["update"]["kind"],
+            updates[0]["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+        assert_eq!(updates[0]["params"]["update"]["content"]["type"], "text");
+        assert_eq!(updates[0]["params"]["update"]["content"]["text"], "hi");
+        assert_eq!(
+            updates[1]["params"]["update"]["sessionUpdate"],
             "agent_message_chunk"
         );
         assert_eq!(
-            updates[1]["params"]["update"]["text"], "hello  world",
+            updates[1]["params"]["update"]["content"]["text"], "hello  world",
             "internal tags must be stripped on replay",
         );
         assert!(
             !lines
                 .iter()
-                .any(|l| l["params"]["update"]["kind"] == "history_message"),
+                .any(|l| l["params"]["update"]["sessionUpdate"] == "history_message"),
             "history_message is non-spec and must not appear",
         );
         let info = lines
             .iter()
-            .find(|l| l["method"] == "session_info_update")
-            .expect("session_info_update missing");
+            .find(|l| l["params"]["update"]["sessionUpdate"] == "session_info_update")
+            .expect("session_info_update variant missing");
+        assert_eq!(info["method"], "session/update");
         assert_eq!(info["params"]["sessionId"], "sess-1");
         let result = lines
             .iter()
@@ -700,15 +708,45 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("json"))
             .collect();
         assert_eq!(lines[2]["method"], "session/update");
-        assert_eq!(lines[2]["params"]["update"]["kind"], "agent_message_chunk");
-        assert_eq!(lines[2]["params"]["update"]["text"], "ok  visible");
-        assert_eq!(lines[3]["params"]["update"]["toolCallId"], "call_1");
-        // Tool updates must carry an ACP toolKind so
-        // clients can render category-specific affordances. `read_file`
-        // categorises as `read`.
-        assert_eq!(lines[3]["params"]["update"]["toolKind"], "read");
-        assert_eq!(lines[4]["params"]["update"]["toolKind"], "read");
-        assert_eq!(lines[5]["params"]["update"]["toolKind"], "read");
+        assert_eq!(
+            lines[2]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(
+            lines[2]["params"]["update"]["content"]["text"],
+            "ok  visible"
+        );
+        // Tool kickoff must be a spec-shaped tool_call: required `title`,
+        // `kind` (spec field name — NOT `toolKind`), a valid status enum
+        // value, and rawInput parsed from the args JSON so IDEs can render
+        // structured params. `read_file` categorises as `read`.
+        let kickoff = &lines[3]["params"]["update"];
+        assert_eq!(kickoff["sessionUpdate"], "tool_call");
+        assert_eq!(kickoff["toolCallId"], "call_1");
+        assert_eq!(kickoff["title"], "read_file");
+        assert_eq!(kickoff["kind"], "read");
+        assert_eq!(kickoff["status"], "in_progress");
+        assert_eq!(kickoff["rawInput"]["path"], "/tmp/x");
+        // Output delta + result are tool_call_update frames carrying a
+        // ToolCallContent array.
+        let delta = &lines[4]["params"]["update"];
+        assert_eq!(delta["sessionUpdate"], "tool_call_update");
+        assert_eq!(delta["status"], "in_progress");
+        assert_eq!(delta["content"][0]["type"], "content");
+        assert_eq!(delta["content"][0]["content"]["text"], "partial");
+        let result_update = &lines[5]["params"]["update"];
+        assert_eq!(result_update["status"], "completed");
+        assert_eq!(result_update["content"][0]["content"]["text"], "done");
+        // Plan entries are spec-shaped {content, priority, status}.
+        let plan = &lines[6]["params"]["update"];
+        assert_eq!(plan["sessionUpdate"], "plan");
+        assert_eq!(plan["entries"][0]["content"], "Ship ACP");
+        assert_eq!(plan["entries"][0]["priority"], "medium");
+        assert_eq!(plan["entries"][0]["status"], "in_progress");
+        assert!(
+            plan["entries"][0].get("id").is_none() && plan["entries"][0].get("title").is_none(),
+            "plan entries must use spec field `content`, not id/title: {plan}"
+        );
         assert_eq!(
             lines.last().expect("final line")["result"]["stopReason"],
             "end_turn"
@@ -757,9 +795,12 @@ mod tests {
             is_stderr: false,
         };
         let update = event_to_update(&event, "sess-1").expect("update");
-        assert_eq!(update["update"]["content"], "before  after");
-        assert_eq!(update["update"]["toolKind"], "execute");
-        assert_eq!(update["update"]["stream"], "stdout");
+        assert_eq!(
+            update["update"]["content"][0]["content"]["text"],
+            "before  after"
+        );
+        assert_eq!(update["update"]["sessionUpdate"], "tool_call_update");
+        assert_eq!(update["update"]["_meta"]["borg"]["stream"], "stdout");
 
         let stderr_event = AgentEvent::ToolOutputDelta {
             tool_call_id: "c1".into(),
@@ -768,8 +809,8 @@ mod tests {
             is_stderr: true,
         };
         let stderr_update = event_to_update(&stderr_event, "sess-1").expect("update");
-        assert_eq!(stderr_update["update"]["content"], "err");
-        assert_eq!(stderr_update["update"]["stream"], "stderr");
+        assert_eq!(stderr_update["update"]["content"][0]["content"]["text"], "err");
+        assert_eq!(stderr_update["update"]["_meta"]["borg"]["stream"], "stderr");
     }
 
     #[tokio::test]
@@ -881,6 +922,15 @@ mod tests {
             json!(false),
         );
         assert_eq!(result["authMethods"], json!([]));
+        assert_eq!(
+            result["agentInfo"]["name"],
+            json!("borg"),
+            "agentInfo identifies the agent to the client: {result}"
+        );
+        assert!(
+            result["agentInfo"]["version"].is_string(),
+            "agentInfo.version must be present: {result}"
+        );
         assert!(
             result.get("clientCapabilities").is_none(),
             "agent must not echo clientCapabilities back: {result}"
@@ -987,9 +1037,22 @@ mod tests {
         .expect("transport");
         let lines = parse_lines(output.lock().unwrap().clone());
         // Notification must precede the result so the IDE has metadata before
-        // it considers the session ready.
-        assert_eq!(lines[0]["method"], "session_info_update");
+        // it considers the session ready. Session metadata rides inside the
+        // spec `session/update` notification as a `session_info_update`
+        // variant — a bare top-level `session_info_update` method is
+        // non-spec and real clients would drop it.
+        assert_eq!(lines[0]["method"], "session/update");
+        assert_eq!(
+            lines[0]["params"]["update"]["sessionUpdate"],
+            "session_info_update"
+        );
         assert_eq!(lines[0]["params"]["sessionId"], "sess-1");
+        assert_eq!(lines[0]["params"]["update"]["title"], "ACP Session");
+        assert_eq!(
+            lines[0]["params"]["update"]["_meta"]["borg"]["model"],
+            "test-model",
+            "Borg extras (model) must ride in _meta, the spec extension point"
+        );
         assert_eq!(lines[1]["id"], json!(42));
         assert_eq!(lines[1]["result"]["sessionId"], "sess-1");
     }
@@ -1007,6 +1070,95 @@ mod tests {
         .expect("prompt");
         assert_eq!(prompt.text, "first\nsecond");
         assert!(prompt.images.is_empty());
+    }
+
+    /// ACP baseline: agents MUST accept `resource_link` prompt blocks
+    /// regardless of advertised capabilities — Zed sends them for `@file`
+    /// mentions. A serde reject here breaks every mention-carrying prompt.
+    #[test]
+    fn resource_link_blocks_render_as_markdown_links_in_text() {
+        let prompt = parse_prompt_blocks(&[
+            PromptBlock::Text {
+                text: "look at".into(),
+            },
+            PromptBlock::ResourceLink {
+                uri: "file:///ws/src/main.rs".into(),
+                name: "main.rs".into(),
+                title: None,
+            },
+        ])
+        .expect("resource_link must be accepted");
+        assert_eq!(prompt.text, "look at\n[main.rs](file:///ws/src/main.rs)");
+        assert!(prompt.images.is_empty());
+    }
+
+    /// `title` (display label) wins over `name` when present.
+    #[test]
+    fn resource_link_prefers_title_over_name() {
+        let prompt = parse_prompt_blocks(&[PromptBlock::ResourceLink {
+            uri: "file:///ws/README.md".into(),
+            name: "README.md".into(),
+            title: Some("Project readme".into()),
+        }])
+        .expect("prompt");
+        assert_eq!(prompt.text, "[Project readme](file:///ws/README.md)");
+    }
+
+    /// Audio and embedded-resource blocks are gated behind prompt
+    /// capabilities Borg does not advertise. A compliant client never sends
+    /// them; a non-compliant one must get a clean invalid_params (-32602)
+    /// naming the missing capability — not a serde "unknown variant" blob.
+    #[test]
+    fn audio_and_resource_blocks_reject_with_capability_error() {
+        let audio_err = parse_prompt_blocks(&[PromptBlock::Audio {
+            mime_type: Some("audio/wav".into()),
+            data: Some("AAAA".into()),
+        }])
+        .expect_err("audio must reject");
+        let mapped = AcpRequestError::from_anyhow(&audio_err);
+        assert_eq!(mapped.code, -32602);
+        assert!(
+            audio_err.to_string().contains("audio"),
+            "error must name the capability: {audio_err}"
+        );
+
+        let resource_err = parse_prompt_blocks(&[PromptBlock::Resource {
+            resource: json!({"uri": "file:///x", "text": "embedded"}),
+        }])
+        .expect_err("embedded resource must reject");
+        let mapped = AcpRequestError::from_anyhow(&resource_err);
+        assert_eq!(mapped.code, -32602);
+        assert!(
+            resource_err.to_string().contains("embeddedContext"),
+            "error must name the capability: {resource_err}"
+        );
+    }
+
+    /// Tool args stream from the daemon as a JSON string; `rawInput` must be
+    /// the parsed object so IDEs can render structured parameters. Garbled
+    /// args (truncated stream) must degrade to the raw string, not drop the
+    /// whole tool_call frame.
+    #[test]
+    fn tool_call_raw_input_parses_json_and_falls_back_to_string() {
+        let event = AgentEvent::ToolExecuting {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"ls"}"#.into(),
+        };
+        let update = event_to_update(&event, "s").expect("update");
+        assert_eq!(update["update"]["rawInput"]["command"], "ls");
+
+        let garbled = AgentEvent::ToolExecuting {
+            tool_call_id: "c2".into(),
+            name: "run_shell".into(),
+            args: r#"{"command": trunc"#.into(),
+        };
+        let update = event_to_update(&garbled, "s").expect("update");
+        assert_eq!(
+            update["update"]["rawInput"],
+            json!(r#"{"command": trunc"#),
+            "unparseable args must fall back to the raw string"
+        );
     }
 
     #[test]
@@ -1033,9 +1185,12 @@ mod tests {
         let update =
             event_to_update(&event, "sess-1").expect("ThinkingDelta must produce a session/update");
         assert_eq!(update["sessionId"], json!("sess-1"));
-        assert_eq!(update["update"]["kind"], json!("agent_thought_chunk"));
         assert_eq!(
-            update["update"]["text"],
+            update["update"]["sessionUpdate"],
+            json!("agent_thought_chunk")
+        );
+        assert_eq!(
+            update["update"]["content"]["text"],
             json!("let me think about this"),
             "internal tags must be stripped from agent_thought_chunk too: {update}"
         );

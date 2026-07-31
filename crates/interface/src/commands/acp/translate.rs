@@ -1,6 +1,13 @@
 //! Pure translation from Borg agent events and persisted history into
 //! ACP `session/update` frames. No I/O — every function here maps an
 //! input value to an optional JSON payload.
+//!
+//! Wire shapes follow the ACP v1 schema
+//! (<https://agentclientprotocol.com/protocol/schema>): the `update`
+//! object is discriminated by `sessionUpdate`, message/thought chunks
+//! carry a `ContentBlock` under `content`, tool updates carry a
+//! `ToolCallContent` array, and plan entries are
+//! `{content, priority, status}`.
 
 use cortex::agent::AgentEvent;
 use cortex::internal_tag_filter::strip_internal_tags;
@@ -25,20 +32,43 @@ pub(super) fn tool_kind_for(name: &str) -> &'static str {
     }
 }
 
+/// Wrap stripped text as the ACP `ContentBlock` used in message chunks.
+fn text_content_block(text: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": strip_internal_tags(text),
+    })
+}
+
+/// Wrap stripped text as a single-element ACP `ToolCallContent` array.
+fn tool_text_content(text: &str) -> Value {
+    json!([{
+        "type": "content",
+        "content": text_content_block(text),
+    }])
+}
+
+/// Parse the tool arguments JSON the daemon streams as a string. Tool args
+/// originate as JSON from the LLM, but a truncated/garbled string must not
+/// drop the update — fall back to carrying the raw string.
+fn raw_input_value(args: &str) -> Value {
+    serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.to_string()))
+}
+
 pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
     match event {
         AgentEvent::TextDelta(text) => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "agent_message_chunk",
-                "text": strip_internal_tags(text),
+                "sessionUpdate": "agent_message_chunk",
+                "content": text_content_block(text),
             }
         })),
         AgentEvent::ThinkingDelta(text) => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "agent_thought_chunk",
-                "text": strip_internal_tags(text),
+                "sessionUpdate": "agent_thought_chunk",
+                "content": text_content_block(text),
             }
         })),
         AgentEvent::ToolExecuting {
@@ -48,56 +78,56 @@ pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Va
         } => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "tool_call",
+                "sessionUpdate": "tool_call",
                 "toolCallId": tool_call_id,
-                "name": name,
-                "toolKind": tool_kind_for(name),
-                "status": "running",
-                "arguments": args,
+                "title": name,
+                "kind": tool_kind_for(name),
+                "status": "in_progress",
+                "rawInput": raw_input_value(args),
             }
         })),
         AgentEvent::ToolOutputDelta {
             tool_call_id,
-            name,
+            name: _,
             delta,
             is_stderr,
         } => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "tool_call_update",
+                "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_call_id,
-                "name": name,
-                "toolKind": tool_kind_for(name),
-                "status": "running",
-                "stream": if *is_stderr { "stderr" } else { "stdout" },
-                "content": strip_internal_tags(delta),
+                "status": "in_progress",
+                "content": tool_text_content(delta),
+                // `_meta` is ACP's sanctioned extension point; spec content
+                // blocks carry no stdout/stderr distinction, so surface it
+                // there for clients that want to style error output.
+                "_meta": {
+                    "borg": { "stream": if *is_stderr { "stderr" } else { "stdout" } }
+                }
             }
         })),
         AgentEvent::ToolResult {
             tool_call_id,
-            name,
+            name: _,
             result,
         } => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "tool_call_update",
+                "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_call_id,
-                "name": name,
-                "toolKind": tool_kind_for(name),
                 "status": "completed",
-                "content": strip_internal_tags(result),
+                "content": tool_text_content(result),
             }
         })),
         AgentEvent::PlanUpdated { steps } => Some(json!({
             "sessionId": session_id,
             "update": {
-                "kind": "plan",
-                "entries": steps.iter().enumerate().map(|(idx, step)| {
+                "sessionUpdate": "plan",
+                "entries": steps.iter().map(|step| {
                     json!({
-                        "id": idx.to_string(),
-                        "title": step.title,
+                        "content": step.title,
+                        "priority": "medium",
                         "status": step.status.as_wire_str(),
-                        "priority": "medium"
                     })
                 }).collect::<Vec<_>>()
             }
@@ -127,8 +157,8 @@ pub(super) fn history_replay_update(session_id: &str, message: &HistoryMessage) 
     Some(json!({
         "sessionId": session_id,
         "update": {
-            "kind": kind,
-            "text": strip_internal_tags(&message.text),
+            "sessionUpdate": kind,
+            "content": text_content_block(&message.text),
         }
     }))
 }

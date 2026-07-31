@@ -74,6 +74,130 @@ async fn initialize_advertises_documented_capability_shape() {
         json!([]),
         "authMethods must be returned explicitly empty so IDEs skip auth UI"
     );
+    assert_eq!(
+        result["agentInfo"]["name"],
+        json!("borg"),
+        "agentInfo must identify the agent to the client"
+    );
+}
+
+#[tokio::test]
+async fn session_new_emits_session_info_as_spec_session_update_variant() {
+    // Real failure mode: session metadata used to go out as a bare
+    // top-level `session_info_update` JSON-RPC method, which is not in the
+    // ACP schema — real clients drop unknown methods, so the IDE never saw
+    // a session title. Spec shape: a `session/update` notification whose
+    // update object is discriminated `sessionUpdate: "session_info_update"`.
+    let (_fix, client, session_id) = boot(initialize_params_with_fs()).await;
+    let lines = client.raw_stdout_lines().await;
+    let frames: Vec<Value> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(
+        !frames.iter().any(|f| f["method"] == "session_info_update"),
+        "top-level session_info_update method is non-spec and must not appear: {lines:?}"
+    );
+    let info = frames
+        .iter()
+        .find(|f| {
+            f["method"] == "session/update"
+                && f["params"]["update"]["sessionUpdate"] == json!("session_info_update")
+        })
+        .unwrap_or_else(|| panic!("no spec session_info_update frame found: {lines:?}"));
+    assert_eq!(info["params"]["sessionId"], json!(session_id));
+    assert!(
+        info["params"]["update"]["title"].is_string(),
+        "session_info_update must carry a title: {info}"
+    );
+}
+
+#[tokio::test]
+async fn resource_link_prompt_block_reaches_daemon_as_rendered_mention() {
+    // ACP baseline: agents MUST accept `resource_link` prompt blocks (Zed
+    // sends them for `@file` mentions) even though Borg advertises no extra
+    // prompt capabilities. The scripted backend echoes the prompt text it
+    // received, so we can assert the mention survived the transport as a
+    // resolvable markdown link rather than being dropped or erroring.
+    let backend = borgd::session::scripted::ScriptedBackend::new(
+        "resource-link",
+        move |text, _images, tx, _cancel, _bridge| {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(cortex::agent::AgentEvent::TextDelta(format!("ECHO:{text}")))
+                    .await;
+                let _ = tx.send(cortex::agent::AgentEvent::TurnComplete).await;
+            })
+        },
+    );
+    let fixture = BorgdFixture::with_backend(backend).await;
+    let mut client = AcpClient::spawn(&fixture).await.expect("spawn");
+    let _ = client
+        .request("initialize", initialize_params_with_fs())
+        .await
+        .expect("initialize");
+    let cwd = fixture.workspace_path().display().to_string();
+    let new = client
+        .request("session/new", json!({"cwd": cwd}))
+        .await
+        .expect("session/new");
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let resp = client
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [
+                    {"type": "text", "text": "explain"},
+                    {"type": "resource_link", "uri": "file:///ws/src/main.rs", "name": "main.rs"},
+                ],
+            }),
+        )
+        .await
+        .expect("session/prompt with resource_link");
+    assert_eq!(
+        resp["result"]["stopReason"],
+        json!("end_turn"),
+        "resource_link prompt must succeed: {resp}"
+    );
+    let lines = client.raw_stdout_lines().await;
+    let echoed: String = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|f| f["params"]["update"]["sessionUpdate"] == json!("agent_message_chunk"))
+        .filter_map(|f| {
+            f["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        echoed.contains("explain\n[main.rs](file:///ws/src/main.rs)"),
+        "daemon must receive the rendered mention; echoed prompt: {echoed:?}"
+    );
+}
+
+#[tokio::test]
+async fn audio_prompt_block_rejected_with_invalid_params() {
+    // Borg advertises `audio: false`; a client that sends audio anyway must
+    // get a clean -32602 rather than a crash or a silent drop.
+    let (_fix, mut client, session_id) = boot(initialize_params_with_fs()).await;
+    let resp = client
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "audio", "mimeType": "audio/wav", "data": "AAAA"}],
+            }),
+        )
+        .await
+        .expect("session/prompt with audio");
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "audio block must reject as invalid params: {resp}"
+    );
 }
 
 #[tokio::test]

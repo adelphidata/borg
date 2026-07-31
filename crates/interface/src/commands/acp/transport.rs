@@ -59,11 +59,31 @@ impl JsonRpcCallbackClient {
     }
 }
 
+/// Per-session [`AcpFsClient`]: pairs the process-wide callback client with
+/// the session the current turn belongs to. The ACP spec requires every
+/// `fs/read_text_file` / `fs/write_text_file` request the agent sends to
+/// carry the `sessionId`; spec-strict IDEs reject the call without it.
+#[derive(Clone)]
+pub(super) struct SessionFsClient {
+    inner: JsonRpcCallbackClient,
+    session_id: String,
+}
+
+impl SessionFsClient {
+    pub(super) fn new(inner: JsonRpcCallbackClient, session_id: String) -> Self {
+        Self { inner, session_id }
+    }
+}
+
 #[async_trait]
-impl AcpFsClient for JsonRpcCallbackClient {
+impl AcpFsClient for SessionFsClient {
     async fn read_text_file(&self, path: &str) -> Result<String> {
         let result = self
-            .request("fs/read_text_file", json!({ "path": path }))
+            .inner
+            .request(
+                "fs/read_text_file",
+                json!({ "sessionId": self.session_id, "path": path }),
+            )
             .await?;
         let content = result
             .get("content")
@@ -75,9 +95,10 @@ impl AcpFsClient for JsonRpcCallbackClient {
     async fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
         // fs/write returns an ack payload we don't consume; only the error matters.
         let _ = self
+            .inner
             .request(
                 "fs/write_text_file",
-                json!({ "path": path, "content": content }),
+                json!({ "sessionId": self.session_id, "path": path, "content": content }),
             )
             .await?;
         Ok(())
@@ -85,6 +106,7 @@ impl AcpFsClient for JsonRpcCallbackClient {
 
     fn capabilities(&self) -> protocols::session::AcpFsCapabilities {
         let caps = self
+            .inner
             .capabilities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
