@@ -320,6 +320,7 @@ define_settings! {
         "mcp.startup_retry_base_ms" => mcp.startup_retry_base_ms, parsed(u64);
         "mcp.startup_grace_ms" => mcp.startup_grace_ms, parsed(u64);
         "mcp.tool_search" => mcp.tool_search, parsed(bool);
+        "mcp.listing_max_tokens" => mcp.listing_max_tokens, parsed(usize);
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
@@ -345,6 +346,8 @@ define_settings! {
         "loop_guard.backoff_initial_ms" => loop_guard.backoff_initial_ms, parsed(u64);
         "loop_guard.backoff_max_ms" => loop_guard.backoff_max_ms, parsed(u64);
         "loop_guard.unknown_tool_max_per_name" => loop_guard.unknown_tool_max_per_name, nonzero(u32);
+        "loop_guard.web_search_max_per_turn" => loop_guard.web_search_max_per_turn, parsed(u32);
+        "loop_guard.subagent_max_per_turn" => loop_guard.subagent_max_per_turn, parsed(u32);
 
         // ── Subprocess process registry ──
         "process_registry.orphan_warn_secs" => process_registry.orphan_warn_secs, parsed(u64);
@@ -559,6 +562,14 @@ define_settings! {
             let kind: crate::config::media::MemoryProviderKind = value.parse()?;
             s.memory.provider = kind;
             Ok(format!("{key} = {kind}"))
+        };
+
+        // mcp.tool_search_mode: FromStr enum (off | on | auto). Tiered MCP
+        // schema disclosure — see `McpToolSearchMode`.
+        "mcp.tool_search_mode" => |s, key, value| {
+            let mode: crate::config::mcp::McpToolSearchMode = value.parse()?;
+            s.mcp.tool_search_mode = mode;
+            Ok(format!("{key} = {mode}"))
         };
 
         // memory.mem0.api_key / memory.honcho.api_key /
@@ -779,6 +790,7 @@ define_settings! {
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
         "security.verifier" => |c| format!("{}", c.security.verifier);
         "security.kek_backend" => |c| format!("{}", c.security.kek_backend);
+        "mcp.tool_search_mode" => |c| format!("{}", c.mcp.tool_search_mode);
         "skills.budget_pct" => |c| match c.skills.budget_pct {
             Some(pct) => format!("{pct}"),
             None => "(none)".to_string(),
@@ -939,6 +951,8 @@ define_settings! {
         "loop_guard.backoff_initial_ms" => "Repeat backoff initial (ms)", Uint, "Reliability";
         "loop_guard.backoff_max_ms" => "Repeat backoff max (ms)", Uint, "Reliability";
         "loop_guard.unknown_tool_max_per_name" => "Unknown-tool max / name", Uint, "Reliability";
+        "loop_guard.web_search_max_per_turn" => "Web searches / turn (0=off)", Uint, "Reliability";
+        "loop_guard.subagent_max_per_turn" => "Sub-agent spawns / turn (0=off)", Uint, "Reliability";
 
         "process_registry.orphan_warn_secs" => "Subprocess warn age (s)", Uint, "Subprocesses";
         "process_registry.orphan_fail_secs" => "Subprocess fail age (s)", Uint, "Subprocesses";
@@ -962,6 +976,8 @@ define_settings! {
         // in the TUI popup.
         "mcp.enabled" => "MCP", Bool, "MCP";
         "mcp.tool_search" => "MCP tool search", Bool, "MCP";
+        "mcp.tool_search_mode" => "MCP disclosure mode", Select, "MCP";
+        "mcp.listing_max_tokens" => "MCP listing budget (tokens)", Uint, "MCP";
 
         // — Browser — automation backend + engine picker and cloud creds.
         // Cloud backends (browserbase / browser_use / firecrawl) create a
@@ -1015,6 +1031,7 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         &["fill_first", "round_robin", "least_used", "random"],
     ),
     ("security.verifier", &["tofu", "tailscale"]),
+    ("mcp.tool_search_mode", &["off", "on", "auto"]),
     (
         "browser.backend",
         &[

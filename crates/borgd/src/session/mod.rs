@@ -165,6 +165,11 @@ impl SessionHost {
         self.inner.backend.compact().await
     }
 
+    /// Component-level context-window usage snapshot. Forwards to the backend.
+    pub async fn context_breakdown(&self) -> Result<cortex::agent::ContextBreakdown> {
+        self.inner.backend.context_breakdown().await
+    }
+
     /// Wipe history (keeps the agent alive for new turns).
     pub fn clear_history(&self) -> Result<()> {
         self.inner.backend.clear_history()

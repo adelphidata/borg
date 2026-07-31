@@ -34,6 +34,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch LLM provider/model"),
     ("/theme", "Pick TUI theme (alias: /skin)"),
     // Conversation
+    (
+        "/context",
+        "Context-window usage breakdown (system prompt, tools, history)",
+    ),
     ("/compact", "Compact conversation history"),
     ("/clear", "Clear conversation"),
     ("/cancel", "Stop the current in-progress turn"),

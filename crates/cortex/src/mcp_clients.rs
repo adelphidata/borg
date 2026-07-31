@@ -328,7 +328,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 
 /// Search registered MCP tools by keyword and return the result as a JSON
 /// string. Backs the `search_tools` meta-tool used when
-/// [`crate::config::McpConfig::tool_search_active`] holds MCP schemas out of
+/// [`crate::config::McpConfig::disclosure_tier`] holds MCP schemas out of
 /// the per-turn tool list.
 ///
 /// Dispatch is registry-keyed, not advertisement-keyed, so any tool surfaced
@@ -596,6 +596,22 @@ pub fn is_operator_read_only_mcp_tool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Top-level `required` properties of `schema` that are absent from `args`.
+/// Only the object's own `required` list is checked — nested/conditional
+/// constraints are the server's job to enforce; this probe exists to catch
+/// blind calls on deferred tools whose spec the model never saw.
+fn missing_required_args(schema: &Value, args: &Value) -> Vec<String> {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    required
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|key| args.get(key).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Attempt to execute an MCP tool. Returns `Ok(None)` if `name` is not an
 /// MCP tool name (so the agent loop's dispatcher can fall through to the
 /// next handler); `Ok(Some(text))` on success (text is already wrapped in
@@ -620,6 +636,28 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         return Err(anyhow!(
             "MCP server '{server}' is operator-disabled",
             server = tool.server
+        ));
+    }
+
+    // Blind-call probe: a deferred tool can be invoked without its
+    // schema-required arguments (the model never saw the spec). Dispatching
+    // anyway produces an opaque server-side failure that teaches the model
+    // nothing — echo the tool's parameter schema instead so the retry is
+    // informed. Checked before the rate-limit gate: a call that cannot
+    // succeed must not consume a rate token.
+    let missing = missing_required_args(&tool.input_schema, args);
+    if !missing.is_empty() {
+        return Ok(Some(
+            serde_json::json!({
+                "error": format!(
+                    "missing required argument(s): {}",
+                    missing.join(", ")
+                ),
+                "tool": &tool.full_name,
+                "input_schema": &tool.input_schema,
+                "note": "The call was not dispatched. Re-call this tool with the required arguments per input_schema.",
+            })
+            .to_string(),
         ));
     }
 
@@ -2909,6 +2947,45 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["tools"].as_array().unwrap().is_empty());
         assert!(v["note"].as_str().unwrap().contains("no MCP tools matched"));
+    }
+
+    #[test]
+    fn missing_required_args_reports_only_absent_keys() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repo": {"type": "string"},
+                "title": {"type": "string"}
+            },
+            "required": ["owner", "repo", "title"]
+        });
+        // Blind call: model saw only the tool name via a names-only listing.
+        let missing = missing_required_args(&schema, &serde_json::json!({"title": "bug"}));
+        assert_eq!(missing, vec!["owner".to_string(), "repo".to_string()]);
+        // Fully-specified call: nothing missing, dispatch proceeds.
+        assert!(missing_required_args(
+            &schema,
+            &serde_json::json!({"owner": "a", "repo": "b", "title": "c"})
+        )
+        .is_empty());
+        // Explicit null counts as provided — nullability is the server's call.
+        assert!(missing_required_args(
+            &schema,
+            &serde_json::json!({"owner": null, "repo": "b", "title": "c"})
+        )
+        .is_empty());
+        // Non-object args (model sent nothing at all) → every required key.
+        assert_eq!(
+            missing_required_args(&schema, &serde_json::Value::Null).len(),
+            3
+        );
+        // Schema without `required` never blocks.
+        assert!(missing_required_args(
+            &serde_json::json!({"type": "object"}),
+            &serde_json::Value::Null
+        )
+        .is_empty());
     }
 
     #[test]

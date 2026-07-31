@@ -33,6 +33,10 @@ service Session {
   // — replaces direct `agent.session()` / `agent.config()` reads from the TUI.
   rpc GetState(SessionStateRequest) returns (SessionState);
 
+  // Component-level context-window usage for the active agent (system
+  // prompt, tool schemas, history, free space). On-demand — powers /context.
+  rpc GetContextBreakdown(SessionStateRequest) returns (ContextBreakdown);
+
   // History operations on the active agent.
   rpc Compact(CompactRequest) returns (CompactResponse);
   rpc ClearHistory(ClearRequest) returns (Empty);
@@ -286,6 +290,16 @@ message SessionState {
   string llm_model = 8;
   string collab_mode = 9;
   bool turn_in_flight = 10;
+}
+
+message ContextComponent {
+  string label = 1;
+  uint64 tokens = 2;
+}
+
+message ContextBreakdown {
+  uint64 context_window = 1;
+  repeated ContextComponent components = 2;
 }
 
 message CompactRequest { string session_id = 1; }

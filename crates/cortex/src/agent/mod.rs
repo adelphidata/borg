@@ -49,6 +49,7 @@ use stream_handler::{StreamEventOutcome, TextOnlyOutcome};
 use system_prompt_cache::SystemPromptCache;
 
 pub use btw::{parse_btw_command, run_btw};
+pub use prompt_assembly::{ContextBreakdown, ContextComponent};
 pub use tool_classification::{conditionally_mutating_tool_names, mutating_tool_names};
 // `tool_classification` is consumed by `agent::tool_execution`; nothing in
 // this module references it directly.
@@ -219,7 +220,9 @@ pub(super) const EMPTY_RESPONSE_NO_REASONING: &str =
     "[The model returned an empty response. Try rephrasing, or check the provider status.]";
 
 use tool_validation::UnknownToolTracker;
-use tool_validation::{partition_tool_calls, PartialToolCall, ToolCallRepeatTracker};
+use tool_validation::{
+    partition_tool_calls, ExpensiveToolBudget, PartialToolCall, ToolCallRepeatTracker,
+};
 
 /// Which LLM chain a particular agent instance routes through.
 ///
@@ -280,6 +283,10 @@ pub struct Agent {
     /// drives the exponential-backoff-then-block ladder. Reset at the
     /// start of each `run_agent_loop`.
     pub(super) tool_call_repeat: ToolCallRepeatTracker,
+    /// Per-turn call budgets for expensive tools (web search, sub-agent
+    /// spawns) whose distinct-argument volume the identical-call guard
+    /// cannot bound. Reset at turn start.
+    pub(super) expensive_tool_budget: ExpensiveToolBudget,
     /// Per-turn count of attempts on each hallucinated tool name. The first
     /// `unknown_tool_max_per_name - 1` attempts surface the soft
     /// `"Unknown tool"` error so a typo can be corrected; the next strikes
@@ -296,6 +303,16 @@ pub struct Agent {
     /// Buffered regardless of `show_thinking` because the terminal excerpt is
     /// a fallback for a broken turn, not a thinking-trace feature.
     pub(super) turn_reasoning: String,
+    /// Provider signalled tool use for the current stream (`finish_reason ==
+    /// "tool_calls"` / `stop_reason == "tool_use"`). Scoped to one iteration —
+    /// cleared where the stream collectors re-bind. Lets the text-only path
+    /// tell "the model chose to answer in text" apart from "the model
+    /// signalled a tool call whose payload never arrived".
+    pub(super) tool_intent_signalled: bool,
+    /// Once-per-turn guard for the dropped-tool-call nudge, so a provider
+    /// that persistently signals tool use without shipping a call can't
+    /// loop the nudge. Reset at turn start with the other loop guards.
+    pub(super) nudged_for_dropped_tools: bool,
     /// Which LLM chain this agent's `make_llm_client_from_config` builds.
     /// `Primary` is the default — interactive turns and tool-spawned
     /// sub-agents always run on the user's primary chain. `Auxiliary` is
@@ -458,6 +475,7 @@ impl Agent {
         let session_id = common.session.meta.id.clone();
         let tool_call_repeat = ToolCallRepeatTracker::new(&config.loop_guard);
         let unknown_tool_tracker = UnknownToolTracker::new(&config.loop_guard);
+        let expensive_tool_budget = ExpensiveToolBudget::new(&config.loop_guard);
         Self {
             config,
             history: Vec::new(),
@@ -487,8 +505,11 @@ impl Agent {
                 session_id, 2000,
             ),
             tool_call_repeat,
+            expensive_tool_budget,
             unknown_tool_tracker,
             turn_reasoning: String::new(),
+            tool_intent_signalled: false,
+            nudged_for_dropped_tools: false,
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -1047,6 +1068,8 @@ impl Agent {
         // previously-refused hallucinated name is not immediately blocked.
         self.tool_call_repeat.reset();
         self.unknown_tool_tracker.reset();
+        self.expensive_tool_budget.reset();
+        self.nudged_for_dropped_tools = false;
 
         // Cross-turn stale-stream circuit breaker: a session whose streams
         // keep dying as stale would otherwise burn the full stall timeout
@@ -1143,6 +1166,9 @@ impl Agent {
             // must quote the thinking that led to *this* silence, not a
             // previous iteration's.
             self.turn_reasoning.clear();
+            // Tool intent is likewise per-stream: a prior iteration's signal
+            // must not make this iteration's text-only answer look dropped.
+            self.tool_intent_signalled = false;
             let llm_start = Instant::now();
             self.metrics.llm_requests.add(1, &[]);
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);

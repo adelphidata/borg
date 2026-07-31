@@ -1059,6 +1059,14 @@ async fn run_event_loop(
                     Err(e) => app.push_system_message(format!("Fork failed: {e}")),
                 }
             }
+            AppAction::ShowContextBreakdown => {
+                match client.get_context_breakdown(session_id).await {
+                    Ok(breakdown) => {
+                        app.push_system_message(commands::format_context_breakdown(&breakdown))
+                    }
+                    Err(e) => app.push_system_message(format!("/context failed: {e}")),
+                }
+            }
             AppAction::CompactHistory => match client.compact(session_id).await {
                 Ok(r) => {
                     let dropped = r.dropped as usize;

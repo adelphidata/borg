@@ -146,6 +146,12 @@ pub trait SessionBackend: Send + Sync + 'static {
     async fn compact(&self) -> anyhow::Result<(usize, usize)> {
         Err(anyhow::anyhow!("compact not supported by this backend"))
     }
+    /// Component-level context-window usage snapshot (powers `/context`).
+    async fn context_breakdown(&self) -> anyhow::Result<cortex::agent::ContextBreakdown> {
+        Err(anyhow::anyhow!(
+            "context_breakdown not supported by this backend"
+        ))
+    }
     /// Wipe history (keeping the agent alive for a fresh turn).
     fn clear_history(&self) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(
@@ -494,6 +500,15 @@ impl SessionBackend for AgentBackend {
     async fn compact(&self) -> anyhow::Result<(usize, usize)> {
         let mut agent = self.agent.lock().await;
         Ok(agent.compact().await)
+    }
+
+    async fn context_breakdown(&self) -> anyhow::Result<cortex::agent::ContextBreakdown> {
+        // Waits on the agent mutex like `compact` does: during an in-flight
+        // turn the RPC (and the /context caller) blocks until the turn
+        // releases the lock. Accepted — same precedent as /compact, and a
+        // mid-turn snapshot would be assembled from a half-mutated history.
+        let mut agent = self.agent.lock().await;
+        agent.context_breakdown().await
     }
 
     fn clear_history(&self) -> anyhow::Result<()> {

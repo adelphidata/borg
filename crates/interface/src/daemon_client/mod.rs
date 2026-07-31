@@ -54,10 +54,10 @@ use protocols::session::{
     AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsResponse, AcpReadTextFileResponse,
     AcpServerMessage, AcpStartTurn, AcpWriteTextFileResponse, AgentEvent,
     AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
-    CompactRequest, CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest, PromptResponse,
-    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
-    StreamRequest, UndoRequest, UndoResponse,
+    CompactRequest, CompactResponse, ContextBreakdown, ForkRequest, ForkResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
+    PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
+    SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::{
@@ -769,6 +769,12 @@ rpc_wrappers! {
     /// Snapshot of agent state for the given session_id.
     session fn get_state(session_id: &str) -> SessionState =
         get_state("Session.GetState", SessionStateRequest {
+            session_id: session_id.to_string(),
+        });
+
+    /// Component-level context-window usage for the given session.
+    session fn get_context_breakdown(session_id: &str) -> ContextBreakdown =
+        get_context_breakdown("Session.GetContextBreakdown", SessionStateRequest {
             session_id: session_id.to_string(),
         });
 

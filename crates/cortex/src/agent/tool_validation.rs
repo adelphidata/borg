@@ -181,6 +181,74 @@ impl UnknownToolTracker {
     }
 }
 
+/// Per-turn budget for expensive tools whose *distinct-argument* volume the
+/// identical-call guard cannot bound: a runaway loop issuing 50 different
+/// `web_search` queries or spawning 50 sub-agents never repeats a byte, so
+/// [`ToolCallRepeatTracker`] waves every call through. This tracker counts
+/// total calls per budgeted tool name within one turn and blocks past the
+/// configured cap with a soft error tool_result. A cap of 0 disables that
+/// tool's budget. Rate-limit boundary, not an approval prompt.
+#[derive(Debug)]
+pub(crate) struct ExpensiveToolBudget {
+    counts: HashMap<&'static str, u32>,
+    web_search_max: u32,
+    subagent_max: u32,
+}
+
+impl Default for ExpensiveToolBudget {
+    fn default() -> Self {
+        Self::new(&LoopGuardConfig::default())
+    }
+}
+
+impl ExpensiveToolBudget {
+    pub(crate) fn new(cfg: &LoopGuardConfig) -> Self {
+        Self {
+            counts: HashMap::new(),
+            web_search_max: cfg.web_search_max_per_turn,
+            subagent_max: cfg.subagent_max_per_turn,
+        }
+    }
+
+    /// `(canonical name, cap)` when `name` is a budgeted tool with its cap
+    /// enabled. The canonical `&'static str` keys the counter map so counting
+    /// never allocates.
+    fn budget_for(&self, name: &str) -> Option<(&'static str, u32)> {
+        let (key, cap) = match name {
+            "web_search" => ("web_search", self.web_search_max),
+            "spawn_agent" => ("spawn_agent", self.subagent_max),
+            _ => return None,
+        };
+        (cap > 0).then_some((key, cap))
+    }
+
+    /// Record one call of `name`. Returns `Some(cap)` when the call is over
+    /// budget and must be skipped with [`expensive_budget_block_message`];
+    /// `None` means execute normally (unbudgeted tool, cap disabled, or
+    /// still within budget).
+    pub(super) fn observe(&mut self, name: &str) -> Option<u32> {
+        let (key, cap) = self.budget_for(name)?;
+        let count = self.counts.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+        (*count > cap).then_some(cap)
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.counts.clear();
+    }
+}
+
+/// Synthetic tool_result body for a call past its per-turn budget. Tells the
+/// model the budget is exhausted for the rest of the turn so it stops
+/// retrying variants and works with what it already gathered.
+pub(super) fn expensive_budget_block_message(name: &str, cap: u32) -> String {
+    format!(
+        "Error: per-turn budget for `{name}` exhausted ({cap} calls this turn). \
+         Further `{name}` calls will be refused until the next user turn — \
+         finish the task with the results you already have."
+    )
+}
+
 /// Synthetic tool_result body for a hallucinated tool name that has been
 /// refused enough times to break the retry cycle. The "does not exist"
 /// phrasing is stable across providers so any future grep / regression
@@ -474,6 +542,57 @@ mod tests {
             timestamp: None,
             seq: None,
         }
+    }
+
+    #[test]
+    fn expensive_tool_budget_blocks_past_cap_and_resets_per_turn() {
+        let cfg = LoopGuardConfig {
+            web_search_max_per_turn: 2,
+            subagent_max_per_turn: 1,
+            ..LoopGuardConfig::default()
+        };
+        let mut budget = ExpensiveToolBudget::new(&cfg);
+
+        // Distinct-argument calls are exactly what the identical-call guard
+        // misses — the budget counts them all.
+        assert_eq!(budget.observe("web_search"), None, "1st search within cap");
+        assert_eq!(budget.observe("web_search"), None, "2nd search within cap");
+        assert_eq!(
+            budget.observe("web_search"),
+            Some(2),
+            "3rd search must be blocked with the cap value"
+        );
+        // Budgets are per tool: exhausting web_search doesn't touch spawns.
+        assert_eq!(budget.observe("spawn_agent"), None);
+        assert_eq!(budget.observe("spawn_agent"), Some(1));
+        // Once over budget, every further call stays blocked this turn.
+        assert_eq!(budget.observe("web_search"), Some(2));
+
+        // Turn boundary: reset restores the full budget.
+        budget.reset();
+        assert_eq!(budget.observe("web_search"), None);
+        assert_eq!(budget.observe("spawn_agent"), None);
+    }
+
+    #[test]
+    fn expensive_tool_budget_ignores_unbudgeted_tools_and_zero_caps() {
+        let cfg = LoopGuardConfig {
+            web_search_max_per_turn: 0, // 0 disables
+            subagent_max_per_turn: 1,
+            ..LoopGuardConfig::default()
+        };
+        let mut budget = ExpensiveToolBudget::new(&cfg);
+        // Ordinary tools are never budgeted, no matter the volume.
+        for _ in 0..200 {
+            assert_eq!(budget.observe("read_file"), None);
+        }
+        // A zero cap means unlimited for that tool.
+        for _ in 0..200 {
+            assert_eq!(budget.observe("web_search"), None);
+        }
+        // Other budgets stay live.
+        assert_eq!(budget.observe("spawn_agent"), None);
+        assert_eq!(budget.observe("spawn_agent"), Some(1));
     }
 
     #[test]
@@ -855,7 +974,7 @@ mod tests {
             identical_call_max: cap,
             backoff_initial_ms: initial,
             backoff_max_ms: max,
-            unknown_tool_max_per_name: 2,
+            ..LoopGuardConfig::default()
         })
     }
 
@@ -956,7 +1075,7 @@ mod tests {
             identical_call_max: 1,
             backoff_initial_ms: 50,
             backoff_max_ms: 200,
-            unknown_tool_max_per_name: 2,
+            ..LoopGuardConfig::default()
         };
         let mut t = ToolCallRepeatTracker::new(&cfg);
         assert_eq!(
@@ -1043,10 +1162,8 @@ mod tests {
 
     fn unknown_tracker_with(max_per_name: u32) -> UnknownToolTracker {
         UnknownToolTracker::new(&LoopGuardConfig {
-            identical_call_max: 3,
-            backoff_initial_ms: 500,
-            backoff_max_ms: 5000,
             unknown_tool_max_per_name: max_per_name,
+            ..LoopGuardConfig::default()
         })
     }
 

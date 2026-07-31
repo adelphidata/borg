@@ -201,6 +201,12 @@ impl Agent {
                 // unclosed by the cut-off.
                 *truncated_due_to_length = true;
             }
+            StreamEvent::ToolIntent => {
+                // The provider says this response ends in tool calls. If none
+                // actually parse, the text-only path uses this to nudge once
+                // instead of ending the turn on the model's narration.
+                self.tool_intent_signalled = true;
+            }
             StreamEvent::Failover { provider, model } => {
                 // The client switched to a fallback slot mid-request. Record it
                 // so the next iteration's <environment> section reports the
@@ -359,6 +365,22 @@ impl Agent {
                 .await;
             let _ = event_tx.send(AgentEvent::TurnComplete).await;
             return TextOnlyOutcome::TerminateTurn;
+        }
+
+        // The provider signalled tool use but the payload carried no calls
+        // (observed in the wild as finish_reason="tool_calls" with an empty
+        // array). Ending the turn here would silently accept the model's
+        // narration ("Let me check…") as the final answer — on autonomous
+        // lanes that is a no-op run with nothing to show. Nudge once.
+        if self.tool_intent_signalled && !self.nudged_for_dropped_tools {
+            self.nudged_for_dropped_tools = true;
+            warn!("provider signalled tool use but no tool calls arrived; nudging once");
+            self.log_and_persist(Message::system(
+                "Your response signalled a tool call, but no tool call was received. \
+                 Issue the tool call now, or state plainly that you are finished.",
+            ))
+            .await;
+            return TextOnlyOutcome::NudgeAndContinue;
         }
 
         if should_nudge_for_response(text_content, needs_response, nudged_for_response) {

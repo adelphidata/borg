@@ -14,10 +14,10 @@ use protocols::session::{
     AcpFsResponse, AcpReadTextFileRequest, AcpReadTextFileResponse, AcpServerMessage,
     AcpWriteTextFileRequest, AcpWriteTextFileResponse, AgentEvent, AppendAssistantMessageRequest,
     AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
-    CompactRequest, CompactResponse, Empty, ForkRequest, ForkResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse,
-    PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
-    SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ForkRequest,
+    ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest,
+    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -572,6 +572,32 @@ impl Session for SessionSvc {
             llm_model: snap.llm_model,
             collab_mode: snap.collab_mode,
             turn_in_flight: false,
+        }))
+    }
+
+    async fn get_context_breakdown(
+        &self,
+        req: Request<SessionStateRequest>,
+    ) -> Result<Response<ContextBreakdown>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        let breakdown = host.context_breakdown().await.map_err(|e| {
+            let msg = format!("context_breakdown: {e}");
+            if e.to_string().contains("not supported by this backend") {
+                TStatus::unimplemented(msg)
+            } else {
+                TStatus::internal(msg)
+            }
+        })?;
+        Ok(Response::new(ContextBreakdown {
+            context_window: breakdown.context_window as u64,
+            components: breakdown
+                .components
+                .into_iter()
+                .map(|c| ContextComponent {
+                    label: c.label,
+                    tokens: c.tokens as u64,
+                })
+                .collect(),
         }))
     }
 

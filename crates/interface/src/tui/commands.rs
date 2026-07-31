@@ -103,6 +103,7 @@ impl App<'_> {
             "/browser" => return Some(self.cmd_browser("")),
             "/cancel" | "/stop" | "/abort" => return Some(self.cmd_cancel()),
             "/restart" => return Some(Ok(AppAction::RestartGateway)),
+            "/context" => return Some(Ok(AppAction::ShowContextBreakdown)),
             "/compact" => return Some(Ok(AppAction::CompactHistory)),
             "/clear" => {
                 self.cells.clear();
@@ -1618,6 +1619,45 @@ pub(super) enum VoiceMode {
     Single,
 }
 
+/// Render a daemon `ContextBreakdown` as transcript text: one bar-chart row
+/// per component plus a free-space row and a total line. Pure so the format
+/// is testable without a daemon.
+pub(super) fn format_context_breakdown(breakdown: &protocols::session::ContextBreakdown) -> String {
+    const BAR_WIDTH: usize = 24;
+    let window = breakdown.context_window.max(1);
+    let used: u64 = breakdown.components.iter().map(|c| c.tokens).sum();
+    let free = breakdown.context_window.saturating_sub(used);
+    let label_width = breakdown
+        .components
+        .iter()
+        .map(|c| c.label.len())
+        .chain(std::iter::once("Free space".len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut out = format!(
+        "Context window: ~{used} / {} tokens ({:.0}% used)\n",
+        breakdown.context_window,
+        (used as f64 / window as f64) * 100.0
+    );
+    for (label, tokens) in breakdown
+        .components
+        .iter()
+        .map(|c| (c.label.as_str(), c.tokens))
+        .chain(std::iter::once(("Free space", free)))
+    {
+        let frac = tokens as f64 / window as f64;
+        let filled = ((frac * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
+        let bar: String = "█".repeat(filled) + &"░".repeat(BAR_WIDTH - filled);
+        out.push_str(&format!(
+            "  {label:<label_width$}  {bar}  ~{tokens:>8} ({:>4.1}%)\n",
+            frac * 100.0
+        ));
+    }
+    out.push_str("Estimates reflect the next request, not cumulative session spend.");
+    out
+}
+
 /// Pure precheck for `/voice on` / `/voice rec`. Returns the system-message
 /// text to surface when the command can't run; `None` means "go ahead and
 /// open the mic". Keeps the guard table out of the App so it can be tested
@@ -2682,6 +2722,62 @@ mod tests {
         );
 
         unsafe { std::env::remove_var(var) };
+    }
+
+    #[test]
+    fn format_context_breakdown_renders_all_components_and_free_space() {
+        use protocols::session::{ContextBreakdown, ContextComponent};
+        let breakdown = ContextBreakdown {
+            context_window: 100_000,
+            components: vec![
+                ContextComponent {
+                    label: "System prompt (cache-stable prefix)".into(),
+                    tokens: 10_000,
+                },
+                ContextComponent {
+                    label: "Conversation history".into(),
+                    tokens: 40_000,
+                },
+            ],
+        };
+        let out = format_context_breakdown(&breakdown);
+        assert!(
+            out.contains("~50000 / 100000 tokens (50% used)"),
+            "header must total the components: {out}"
+        );
+        assert!(out.contains("System prompt (cache-stable prefix)"));
+        assert!(out.contains("Conversation history"));
+        // Free space is derived (window − used), never trusted from the wire.
+        assert!(
+            out.contains("Free space") && out.contains("~   50000 (50.0%)"),
+            "free-space row must be derived from the same numbers: {out}"
+        );
+        // A 40% component paints 40% of the 24-cell bar.
+        let history_line = out
+            .lines()
+            .find(|l| l.contains("Conversation history"))
+            .unwrap();
+        let filled = history_line.matches('█').count();
+        assert_eq!(filled, 10, "40% of 24 cells rounds to 10: {history_line}");
+    }
+
+    #[test]
+    fn format_context_breakdown_overfull_window_clamps_free_space() {
+        use protocols::session::{ContextBreakdown, ContextComponent};
+        // Estimates can overshoot a genuinely full window; free space must
+        // clamp to zero instead of underflowing.
+        let breakdown = ContextBreakdown {
+            context_window: 1_000,
+            components: vec![ContextComponent {
+                label: "Conversation history".into(),
+                tokens: 1_500,
+            }],
+        };
+        let out = format_context_breakdown(&breakdown);
+        assert!(
+            out.contains("~       0") || out.contains("~0 "),
+            "free space must clamp at zero: {out}"
+        );
     }
 
     /// Order spec: when voice is disabled AND a loop is somehow already

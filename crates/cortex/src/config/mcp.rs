@@ -68,17 +68,86 @@ pub struct McpConfig {
     /// `0` means don't wait at all. Default: 2_000.
     #[serde(default = "default_startup_grace_ms")]
     pub startup_grace_ms: u64,
-    /// Defer MCP tool schemas out of the per-turn LLM tool list and expose
-    /// them through the `search_tools` meta-tool instead. The model searches
-    /// registered MCP tools by keyword and receives matching specs on demand,
-    /// then calls them directly the next turn (dispatch is registry-keyed, not
-    /// advertisement-keyed, so a discovered tool is immediately callable).
-    ///
-    /// Off by default — existing behaviour (every MCP schema sent every turn)
-    /// is unchanged. Turn on to reclaim context when many MCP tools are
-    /// registered. Native/compiled-in tools are never deferred.
+    /// Legacy switch for MCP schema deferral: `true` forces
+    /// [`McpToolSearchMode::On`] (full deferral behind `search_tools`)
+    /// regardless of `tool_search_mode`. `false` (the default) delegates to
+    /// `tool_search_mode`, whose `auto` default keeps small catalogs eager
+    /// but defers a catalog whose schemas outgrow `listing_max_tokens`.
+    /// Prefer `tool_search_mode`. Native/compiled-in tools are never
+    /// deferred; dispatch is registry-keyed, so a deferred tool is callable
+    /// as soon as the model discovers it.
     #[serde(default)]
     pub tool_search: bool,
+    /// Tiered disclosure policy for MCP tool schemas — see
+    /// [`McpToolSearchMode`]. Default `auto`: small catalogs stay eager
+    /// (schemas advertised directly, unchanged behaviour); a catalog whose
+    /// schemas outgrow `listing_max_tokens` is deferred behind
+    /// `search_tools` with a budget-scaled catalog listing.
+    #[serde(default)]
+    pub tool_search_mode: McpToolSearchMode,
+    /// Token budget for the deferred-mode catalog listing embedded in the
+    /// `search_tools` description (name + one-line description per tool).
+    /// Over budget the listing degrades to names-only; over budget even
+    /// names-only, to the bare meta-tool. In `auto` mode this is also the
+    /// eager-vs-defer activation threshold: full schemas are advertised
+    /// eagerly only while they fit this budget. Default: 2000.
+    #[serde(default = "default_listing_max_tokens")]
+    pub listing_max_tokens: usize,
+}
+
+/// Disclosure policy for MCP tool schemas in the per-turn tool list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolSearchMode {
+    /// Always advertise every MCP schema directly (legacy eager behaviour).
+    Off,
+    /// Always defer MCP schemas behind `search_tools`.
+    On,
+    /// Defer only when the full schemas exceed `listing_max_tokens` —
+    /// small catalogs pay nothing, pathological ones stop flooding the
+    /// context window.
+    #[default]
+    Auto,
+}
+
+impl std::str::FromStr for McpToolSearchMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            "auto" => Ok(Self::Auto),
+            other => Err(anyhow::anyhow!(
+                "invalid tool_search_mode '{other}' (expected off|on|auto)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for McpToolSearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Auto => "auto",
+        })
+    }
+}
+
+/// Which disclosure shape the per-turn tool list should use for MCP tools.
+/// Produced by [`McpConfig::disclosure_tier`] from the three size estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpDisclosureTier {
+    /// Advertise every MCP schema directly.
+    Eager,
+    /// Defer schemas; `search_tools` carries a name + one-line-description
+    /// catalog listing.
+    Listed,
+    /// Defer schemas; the listing degrades to tool names only.
+    NamesOnly,
+    /// Defer schemas; even names don't fit — bare `search_tools`, discovery
+    /// through queries only.
+    Bare,
 }
 
 impl Default for McpConfig {
@@ -95,17 +164,57 @@ impl Default for McpConfig {
             startup_retry_base_ms: default_startup_retry_base_ms(),
             startup_grace_ms: default_startup_grace_ms(),
             tool_search: false,
+            tool_search_mode: McpToolSearchMode::default(),
+            listing_max_tokens: default_listing_max_tokens(),
         }
     }
 }
 
 impl McpConfig {
-    /// True when MCP tool-search deferral is in effect. Requires MCP itself to
-    /// be enabled — `tool_search` alone with `enabled = false` is a no-op (no
-    /// sessions, no tools to defer).
-    pub fn tool_search_active(&self) -> bool {
-        self.enabled && self.tool_search
+    /// Resolve the effective disclosure mode, honoring the legacy
+    /// `tool_search` boolean: `true` forces `On` so existing installs that
+    /// opted into full deferral keep it.
+    pub fn effective_tool_search_mode(&self) -> McpToolSearchMode {
+        if self.tool_search {
+            McpToolSearchMode::On
+        } else {
+            self.tool_search_mode
+        }
     }
+
+    /// Decide the MCP disclosure tier from three size estimates (in tokens):
+    /// the full schema payload, the name+description listing, and the
+    /// names-only listing. All three are estimates of what the corresponding
+    /// shape would add to every request.
+    pub fn disclosure_tier(
+        &self,
+        schema_tokens: usize,
+        listing_tokens: usize,
+        names_tokens: usize,
+    ) -> McpDisclosureTier {
+        if !self.enabled {
+            return McpDisclosureTier::Eager; // no MCP tools — moot
+        }
+        let deferred = match self.effective_tool_search_mode() {
+            McpToolSearchMode::Off => false,
+            McpToolSearchMode::On => true,
+            McpToolSearchMode::Auto => schema_tokens > self.listing_max_tokens,
+        };
+        if !deferred {
+            return McpDisclosureTier::Eager;
+        }
+        if listing_tokens <= self.listing_max_tokens {
+            McpDisclosureTier::Listed
+        } else if names_tokens <= self.listing_max_tokens {
+            McpDisclosureTier::NamesOnly
+        } else {
+            McpDisclosureTier::Bare
+        }
+    }
+}
+
+fn default_listing_max_tokens() -> usize {
+    2000
 }
 
 fn default_max_tools_total() -> usize {

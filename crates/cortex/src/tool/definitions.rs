@@ -115,14 +115,29 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     defs.push(build_schedule_tool_def());
 
     defs.extend(crate::wasm_plugins::tool_definitions().await);
-    // MCP tools: either advertised directly (default) or held back behind the
-    // `search_tools` meta-tool when deferral is on. Only the MCP surface is
-    // gated — native and WASM-plugin tools above are always advertised. Dispatch
-    // is registry-keyed, so a deferred tool stays callable once discovered.
-    if config.mcp.tool_search_active() {
-        defs.push(build_search_tools_def());
-    } else {
-        defs.extend(crate::mcp_clients::tool_definitions());
+    // MCP tools: tiered disclosure. Small catalogs are advertised directly
+    // (eager, unchanged behaviour); a catalog whose schemas outgrow the
+    // listing budget is held behind the `search_tools` meta-tool, carrying a
+    // budget-scaled catalog listing that degrades to names-only and then to
+    // the bare meta-tool. Only the MCP surface is gated — native and
+    // WASM-plugin tools above are always advertised. Dispatch is
+    // registry-keyed, so a deferred tool stays callable once discovered.
+    {
+        use crate::config::mcp::McpDisclosureTier;
+        let mcp_defs = crate::mcp_clients::tool_definitions();
+        let (listing, names) = render_mcp_catalog_listings(&mcp_defs);
+        let schema_tokens = estimate_defs_tokens(&mcp_defs);
+        let tier = config.mcp.disclosure_tier(
+            schema_tokens,
+            crate::memory::tokenizer::estimate_tokens(&listing),
+            crate::memory::tokenizer::estimate_tokens(&names),
+        );
+        match tier {
+            McpDisclosureTier::Eager => defs.extend(mcp_defs),
+            McpDisclosureTier::Listed => defs.push(build_search_tools_def(Some(&listing))),
+            McpDisclosureTier::NamesOnly => defs.push(build_search_tools_def(Some(&names))),
+            McpDisclosureTier::Bare => defs.push(build_search_tools_def(None)),
+        }
     }
 
     if config.browser.enabled {
@@ -412,20 +427,67 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     defs
 }
 
+/// Estimated token cost of advertising one tool definition (name +
+/// description + serialized schema). Single owner for this formula so the
+/// disclosure-tier activation numbers and the `/context` breakdown can't
+/// drift apart.
+pub(crate) fn estimate_def_tokens(def: &ToolDefinition) -> usize {
+    let schema = serde_json::to_string(&def.function.parameters).unwrap_or_default();
+    crate::memory::tokenizer::estimate_tokens(&def.function.name)
+        + crate::memory::tokenizer::estimate_tokens(&def.function.description)
+        + crate::memory::tokenizer::estimate_tokens(&schema)
+}
+
+/// Estimated token cost of advertising `defs` eagerly (serialized schemas).
+fn estimate_defs_tokens(defs: &[ToolDefinition]) -> usize {
+    defs.iter().map(estimate_def_tokens).sum()
+}
+
+/// Build the two deferred-mode catalog listings from the MCP tool
+/// definitions: `(name — one-line description, names-only)`. Sorted by name
+/// so the rendered text is deterministic for a given registry state (a
+/// stable tools array is what keeps provider prompt caches warm).
+fn render_mcp_catalog_listings(defs: &[ToolDefinition]) -> (String, String) {
+    let mut rows: Vec<(&str, &str)> = defs
+        .iter()
+        .map(|d| {
+            let first_line = d.function.description.lines().next().unwrap_or_default();
+            (d.function.name.as_str(), first_line)
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let listing = rows
+        .iter()
+        .map(|(n, desc)| format!("{n} — {desc}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let names = rows.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\n");
+    (listing, names)
+}
+
 /// Build the `search_tools` meta-tool definition, advertised in place of the
-/// individual MCP tool schemas when `mcp.tool_search` is on.
-///
-/// The description is deliberately **static** (no dynamic tool count) so the
-/// advertised tools array stays byte-identical every turn, preserving the
-/// prompt-cache prefix regardless of what the model has searched.
-fn build_search_tools_def() -> ToolDefinition {
-    ToolDefinition::new(
-        tool_names::SEARCH_TOOLS,
-        "Search external tools provided by connected MCP servers, which are not \
+/// individual MCP tool schemas on the deferred disclosure tiers, optionally
+/// carrying the budget-scaled catalog listing.
+fn build_search_tools_def(catalog_listing: Option<&str>) -> ToolDefinition {
+    // The base text is static (no dynamic counts) so the definition stays
+    // byte-identical across turns for a given registry state — provider
+    // prompt caches key on the tools array. The optional listing only
+    // changes when the registry itself changes (server install/teardown).
+    let mut description = "Search external tools provided by connected MCP servers, which are not \
          listed directly here. Call with a `query` of keywords (e.g. \"create \
          github issue\") to get matching tools and their input schemas, then call \
          the returned tool by its `name` on your next turn. Call with no arguments \
-         to browse the full list of available external tools.",
+         to browse the full list of available external tools."
+        .to_string();
+    if let Some(listing) = catalog_listing {
+        if !listing.is_empty() {
+            description.push_str("\n\nAvailable external tools:\n");
+            description.push_str(listing);
+        }
+    }
+    ToolDefinition::new(
+        tool_names::SEARCH_TOOLS,
+        description,
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -680,10 +742,11 @@ mod tests {
 
     #[test]
     fn search_tools_def_schema_is_static_and_valid() {
-        // The advertised description must stay static (no dynamic tool count) so
-        // the tools array — and thus the prompt-cache prefix — is byte-identical
-        // every turn. Also lock the optional-args schema the model relies on.
-        let def = build_search_tools_def();
+        // The advertised base description must stay static (no dynamic tool
+        // count) so the tools array — and thus the prompt-cache prefix — is
+        // byte-identical every turn for a given registry state. Also lock the
+        // optional-args schema the model relies on.
+        let def = build_search_tools_def(None);
         assert_eq!(def.function.name, tool_names::SEARCH_TOOLS);
         let props = &def.function.parameters["properties"];
         assert_eq!(props["query"]["type"], "string");
@@ -693,9 +756,10 @@ mod tests {
             def.function.parameters.get("required").is_none(),
             "search_tools must have no required args"
         );
-        // Steers the model to the discover→call flow. (Static-ness itself is
-        // compile-enforced: `build_search_tools_def` takes no args, so it cannot
-        // interpolate a per-turn tool count.)
+        // Steers the model to the discover→call flow. The optional catalog
+        // listing appends after this base and only varies with registry
+        // state, never per turn (see `search_tools_def_embeds_listing_after_
+        // stable_base`).
         assert!(
             def.function.description.contains("connected MCP servers"),
             "description must explain these are external MCP tools"
@@ -1011,6 +1075,119 @@ mod move_to_discoverability_tests {
         assert!(
             line.contains("Move to:"),
             "apply_patch tool description must document the `*** Move to:` rename directive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_disclosure_tests {
+    use super::*;
+
+    fn def(name: &str, desc: &str) -> ToolDefinition {
+        ToolDefinition::new(
+            name,
+            desc,
+            serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+        )
+    }
+
+    #[test]
+    fn catalog_listings_are_sorted_and_first_line_only() {
+        let defs = vec![
+            def(
+                "mcp_b_two",
+                "Second tool.\nExtra detail that must not leak.",
+            ),
+            def("mcp_a_one", "First tool."),
+        ];
+        let (listing, names) = render_mcp_catalog_listings(&defs);
+        assert_eq!(
+            listing, "mcp_a_one — First tool.\nmcp_b_two — Second tool.",
+            "listing must be name-sorted with one-line descriptions"
+        );
+        assert_eq!(names, "mcp_a_one\nmcp_b_two");
+    }
+
+    #[test]
+    fn search_tools_def_embeds_listing_after_stable_base() {
+        let bare = build_search_tools_def(None);
+        let listed = build_search_tools_def(Some("mcp_a_one — First tool."));
+        assert!(
+            listed
+                .function
+                .description
+                .starts_with(&bare.function.description),
+            "the static base text must be a stable prefix in every tier"
+        );
+        assert!(
+            listed
+                .function
+                .description
+                .contains("Available external tools:")
+                && listed
+                    .function
+                    .description
+                    .contains("mcp_a_one — First tool."),
+            "listed tier must carry the catalog"
+        );
+        assert!(
+            !bare
+                .function
+                .description
+                .contains("Available external tools:"),
+            "bare tier carries no catalog block"
+        );
+        // An empty listing must not leave a dangling header.
+        let empty = build_search_tools_def(Some(""));
+        assert_eq!(empty.function.description, bare.function.description);
+    }
+
+    #[test]
+    fn disclosure_tier_matrix() {
+        use crate::config::mcp::{McpConfig, McpDisclosureTier, McpToolSearchMode};
+        let mut cfg = McpConfig {
+            enabled: true,
+            listing_max_tokens: 100,
+            ..McpConfig::default()
+        };
+
+        // Auto: small catalogs stay eager, oversized ones defer and degrade.
+        cfg.tool_search_mode = McpToolSearchMode::Auto;
+        let cases: &[(usize, usize, usize, McpDisclosureTier)] = &[
+            (50, 20, 5, McpDisclosureTier::Eager),    // schemas fit → eager
+            (500, 80, 20, McpDisclosureTier::Listed), // schemas big, listing fits
+            (500, 300, 60, McpDisclosureTier::NamesOnly), // only names fit
+            (500, 300, 200, McpDisclosureTier::Bare), // nothing fits
+        ];
+        for (schema, listing, names, want) in cases {
+            let got = cfg.disclosure_tier(*schema, *listing, *names);
+            assert_eq!(
+                got, *want,
+                "auto tier for schema={schema} listing={listing} names={names}"
+            );
+        }
+
+        // Off: always eager, no matter the size.
+        cfg.tool_search_mode = McpToolSearchMode::Off;
+        assert_eq!(
+            cfg.disclosure_tier(1_000_000, 300, 200),
+            McpDisclosureTier::Eager
+        );
+
+        // On: always deferred, even when tiny.
+        cfg.tool_search_mode = McpToolSearchMode::On;
+        assert_eq!(cfg.disclosure_tier(10, 5, 2), McpDisclosureTier::Listed);
+
+        // Legacy bool forces On regardless of mode.
+        cfg.tool_search_mode = McpToolSearchMode::Off;
+        cfg.tool_search = true;
+        assert_eq!(cfg.disclosure_tier(10, 5, 2), McpDisclosureTier::Listed);
+
+        // MCP disabled → moot, eager passthrough.
+        cfg.enabled = false;
+        assert_eq!(
+            cfg.disclosure_tier(1_000_000, 300, 200),
+            McpDisclosureTier::Eager
         );
     }
 }

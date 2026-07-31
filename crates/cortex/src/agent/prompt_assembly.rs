@@ -202,6 +202,39 @@ impl CompactionStrikes {
     }
 }
 
+/// One labeled slice of the context window in [`ContextBreakdown`].
+#[derive(Debug, Clone)]
+pub struct ContextComponent {
+    /// Human-facing component name (e.g. "Conversation history").
+    pub label: String,
+    /// Estimated token count for this component.
+    pub tokens: usize,
+}
+
+/// Component-level context-usage snapshot produced by
+/// [`Agent::context_breakdown`]. `components` never includes free space —
+/// derive it via [`Self::free_tokens`] so the two can't disagree.
+#[derive(Debug, Clone)]
+pub struct ContextBreakdown {
+    /// The active model's practical context window, in tokens.
+    pub context_window: usize,
+    /// Labeled component estimates, in prompt order.
+    pub components: Vec<ContextComponent>,
+}
+
+impl ContextBreakdown {
+    /// Sum of all component estimates.
+    pub fn used_tokens(&self) -> usize {
+        self.components.iter().map(|c| c.tokens).sum()
+    }
+
+    /// Remaining window after all components (clamped at zero — estimates
+    /// can overshoot a genuinely full window).
+    pub fn free_tokens(&self) -> usize {
+        self.context_window.saturating_sub(self.used_tokens())
+    }
+}
+
 /// LLM config for compaction summarizer calls: the operator's compaction
 /// overrides, with the output cap floored at [`SUMMARY_OUTPUT_TOKENS_FLOOR`]
 /// so a small default `max_tokens` can't truncate summaries mid-section.
@@ -934,6 +967,68 @@ Rules:
     /// model registry; falls back to `DEFAULT_CONTEXT_WINDOW` for unknown models.
     pub(super) fn active_context_window(&self) -> u32 {
         crate::llm::model_registry::context_window_for(&self.config.llm.model)
+    }
+
+    /// Compute a component-level breakdown of the next request's context
+    /// usage: system prompt (split at the cache-stable boundary), tool
+    /// schemas (native vs MCP), conversation history, and free space.
+    /// On-demand observability for `/context` — assembles the same prompt
+    /// and tool list a real turn would, so the numbers reflect what the
+    /// provider will actually be sent, not a cumulative session total.
+    ///
+    /// Not a pure read: it runs the real prompt assembly, so it warms the
+    /// identity/skills caches and executes memory + knowledge ranking —
+    /// deliberately, since that is the only way the numbers stay honest.
+    pub async fn context_breakdown(&mut self) -> Result<ContextBreakdown> {
+        let user_msg = self.latest_user_message_text().to_string();
+        let tool_defs = self.build_tool_definitions(&user_msg).await;
+        let built = self
+            .build_system_prompt(&tool_defs)
+            .await
+            .context("Failed to build system prompt")?;
+        let est = crate::memory::tokenizer::estimate_tokens;
+
+        let stable = &built.text[..built.stable_prefix_len];
+        let dynamic = &built.text[built.stable_prefix_len..];
+        let (mut native_tools, mut mcp_tools) = (0usize, 0usize);
+        for d in &tool_defs {
+            // Same per-definition formula the disclosure tier uses, so the
+            // two surfaces can't drift.
+            let tokens = crate::tool::definitions::estimate_def_tokens(d);
+            if d.function.name.starts_with("mcp_")
+                || d.function.name == crate::tool::names::SEARCH_TOOLS
+            {
+                mcp_tools += tokens;
+            } else {
+                native_tools += tokens;
+            }
+        }
+        let components = vec![
+            ContextComponent {
+                label: "System prompt (cache-stable prefix)".to_string(),
+                tokens: est(stable),
+            },
+            ContextComponent {
+                label: "System prompt (dynamic suffix)".to_string(),
+                tokens: est(dynamic),
+            },
+            ContextComponent {
+                label: "Tool schemas (native)".to_string(),
+                tokens: native_tools,
+            },
+            ContextComponent {
+                label: "Tool schemas (MCP)".to_string(),
+                tokens: mcp_tools,
+            },
+            ContextComponent {
+                label: "Conversation history".to_string(),
+                tokens: crate::conversation::history_tokens(&self.history),
+            },
+        ];
+        Ok(ContextBreakdown {
+            context_window: self.active_context_window() as usize,
+            components,
+        })
     }
 
     /// Working-history token budget with the model's output reservation carved

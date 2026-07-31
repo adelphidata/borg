@@ -305,8 +305,11 @@ fn minimal_test_agent(config: Config) -> Agent {
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
         tool_call_repeat: ToolCallRepeatTracker::default(),
+        expensive_tool_budget: super::tool_validation::ExpensiveToolBudget::default(),
         unknown_tool_tracker: UnknownToolTracker::default(),
         turn_reasoning: String::new(),
+        tool_intent_signalled: false,
+        nudged_for_dropped_tools: false,
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,
@@ -1161,6 +1164,137 @@ fn should_nudge_for_response_matrix() {
             "should_nudge_for_response({text:?}, tools={tools}, retried={retried}) = {got}, expected {expected}"
         );
     }
+}
+
+#[tokio::test]
+async fn dropped_tool_call_nudges_once_then_terminates() {
+    use super::stream_handler::TextOnlyOutcome;
+    // A provider that says finish_reason="tool_calls" but ships no tool call
+    // must not have its narration accepted as the final answer — on
+    // autonomous lanes that is a silent no-op run. Exactly one nudge, then
+    // the turn is allowed to end so a persistently-broken provider can't loop.
+    let mut agent = minimal_test_agent(Config::default());
+    agent.tool_intent_signalled = true;
+    let (tx, mut rx) = mpsc::channel(64);
+
+    let outcome = agent
+        .handle_text_only_response("Let me check the file...", None, false, false, &tx)
+        .await;
+    assert!(matches!(outcome, TextOnlyOutcome::NudgeAndContinue));
+    let nudge = agent
+        .history
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, crate::types::Role::System))
+        .and_then(|m| m.text_content())
+        .expect("nudge must be persisted as a system message");
+    assert!(
+        nudge.contains("no tool call was received"),
+        "unexpected nudge text: {nudge}"
+    );
+
+    // Second occurrence in the same turn (intent still signalled, guard set):
+    // the turn ends normally with the text as the answer.
+    agent.tool_intent_signalled = true;
+    let outcome = agent
+        .handle_text_only_response("Still narrating.", None, false, false, &tx)
+        .await;
+    assert!(matches!(outcome, TextOnlyOutcome::TerminateTurn));
+    // Drain events so the channel send in finalize didn't error.
+    while rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn dropped_tool_call_with_empty_text_still_nudges() {
+    use super::stream_handler::TextOnlyOutcome;
+    // The strongest dropped-call shape: tool-intent finish reason, zero text,
+    // zero calls. The tool-intent nudge must win over the empty-response
+    // terminal — ending such a turn silently is exactly the failure class.
+    let mut agent = minimal_test_agent(Config::default());
+    agent.tool_intent_signalled = true;
+    let (tx, _rx) = mpsc::channel(64);
+    let outcome = agent
+        .handle_text_only_response("", None, false, false, &tx)
+        .await;
+    assert!(
+        matches!(outcome, TextOnlyOutcome::NudgeAndContinue),
+        "empty text with tool intent must nudge, not terminate"
+    );
+}
+
+#[tokio::test]
+async fn text_only_response_without_tool_intent_is_unchanged() {
+    use super::stream_handler::TextOnlyOutcome;
+    // A normal stop-reason text answer must terminate exactly as before —
+    // the dropped-tool-call path only arms on the provider's signal.
+    let mut agent = minimal_test_agent(Config::default());
+    let (tx, _rx) = mpsc::channel(64);
+    let outcome = agent
+        .handle_text_only_response("A complete answer.", None, false, false, &tx)
+        .await;
+    assert!(matches!(outcome, TextOnlyOutcome::TerminateTurn));
+    assert!(
+        !agent.nudged_for_dropped_tools,
+        "guard must not arm without a provider tool-intent signal"
+    );
+}
+
+#[tokio::test]
+async fn context_breakdown_components_reflect_prompt_and_history() {
+    // The breakdown must reflect what the next request would actually send:
+    // a non-empty system prompt, tool schemas, and a history component that
+    // tracks the real conversation size.
+    let mut agent = minimal_test_agent(Config::default());
+    agent
+        .history
+        .push(crate::types::Message::user("hello there, agent"));
+    let breakdown = agent.context_breakdown().await.expect("breakdown");
+
+    assert!(breakdown.context_window > 0);
+    let labels: Vec<&str> = breakdown
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.contains("System prompt")),
+        "must report the system prompt: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("Tool schemas")),
+        "must report tool schemas: {labels:?}"
+    );
+    let history = breakdown
+        .components
+        .iter()
+        .find(|c| c.label == "Conversation history")
+        .expect("history component");
+    assert_eq!(
+        history.tokens,
+        crate::conversation::history_tokens(&agent.history),
+        "history component must equal the real history estimate"
+    );
+    // System prompt and native tool schemas are never empty on a default
+    // config — a zero here means a component silently fell out.
+    let stable = breakdown
+        .components
+        .iter()
+        .find(|c| c.label.contains("cache-stable"))
+        .expect("stable-prefix component");
+    assert!(stable.tokens > 0, "stable prefix cannot be empty");
+    let native_tools = breakdown
+        .components
+        .iter()
+        .find(|c| c.label == "Tool schemas (native)")
+        .expect("native tool component");
+    assert!(native_tools.tokens > 0, "native tools cannot be empty");
+    // Free space derives from the same numbers, clamped at zero.
+    assert_eq!(
+        breakdown.free_tokens(),
+        breakdown
+            .context_window
+            .saturating_sub(breakdown.used_tokens())
+    );
 }
 
 #[test]

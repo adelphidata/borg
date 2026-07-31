@@ -127,6 +127,7 @@ pub async fn run_btw(
             StreamEvent::ThinkingDelta(_)
             | StreamEvent::Usage(_)
             | StreamEvent::Truncated
+            | StreamEvent::ToolIntent
             | StreamEvent::Failover { .. } => {}
         }
     }

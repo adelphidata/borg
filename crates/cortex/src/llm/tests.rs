@@ -235,6 +235,70 @@ async fn openrouter_missing_cost_emits_unknown_cost() {
 }
 
 #[test]
+fn openai_sse_tool_calls_finish_reason_emits_tool_intent() {
+    // A finish_reason="tool_calls" chunk must surface StreamEvent::ToolIntent
+    // even when the delta carries no tool-call payload — some providers ship
+    // the signal with an empty array, and the agent uses the event to nudge
+    // instead of silently ending the turn on the model's narration.
+    use crate::sse::SseAction;
+    let line = r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+    let action = transport::parse_openai_sse_line(line, "openai", "gpt-4o");
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected tool-intent emit"),
+    };
+    assert!(
+        events.iter().any(|e| matches!(e, StreamEvent::ToolIntent)),
+        "finish_reason=tool_calls must emit ToolIntent"
+    );
+
+    // An ordinary stop must NOT signal tool intent.
+    let line = r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#;
+    let action = transport::parse_openai_sse_line(line, "openai", "gpt-4o");
+    if let SseAction::Emit(ev) | SseAction::Done(ev) = action {
+        assert!(
+            !ev.iter().any(|e| matches!(e, StreamEvent::ToolIntent)),
+            "finish_reason=stop must not emit ToolIntent"
+        );
+    }
+}
+
+#[test]
+fn anthropic_sse_tool_use_stop_reason_emits_tool_intent() {
+    use crate::sse::SseAction;
+    let mut tool_idx = 0usize;
+    let mut is_tool = false;
+    let mut is_thinking = false;
+    let mut pending_input = 0u64;
+    let mut pending_cached = 0u64;
+    let mut pending_created = 0u64;
+    let line = r#"data: {"type":"message_delta","usage":{"output_tokens":5},"delta":{"stop_reason":"tool_use"}}"#;
+    let action = transport::parse_anthropic_sse_line(
+        line,
+        "anthropic",
+        "claude-opus-4",
+        &mut tool_idx,
+        &mut is_tool,
+        &mut is_thinking,
+        &mut pending_input,
+        &mut pending_cached,
+        &mut pending_created,
+    );
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected terminal emit"),
+    };
+    assert!(
+        events.iter().any(|e| matches!(e, StreamEvent::ToolIntent)),
+        "stop_reason=tool_use must emit ToolIntent"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, StreamEvent::Done)),
+        "stop_reason chunk stays terminal"
+    );
+}
+
+#[test]
 fn openrouter_sse_usage_total_cost_populates_provider_cost_usd() {
     // Regression: OpenRouter's streaming usage chunk reports the dollar
     // total under `total_cost` (not `cost`). The SSE parser must accept

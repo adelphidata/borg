@@ -28,6 +28,17 @@ pub struct LoopGuardConfig {
     /// the soft "Unknown tool: X" error. The default of 2 allows one
     /// typo-recovery attempt then stops the retry cycle.
     pub unknown_tool_max_per_name: u32,
+    /// Maximum `web_search` calls in a single turn. Distinct-argument calls
+    /// count too (the identical-call guard only catches byte-identical
+    /// repeats); a runaway research loop issuing 50 different queries is
+    /// already pathological. Exceeding the budget returns a soft error
+    /// tool_result — a rate-limit boundary, not an approval prompt.
+    /// `0` disables the cap.
+    pub web_search_max_per_turn: u32,
+    /// Maximum sub-agent spawns (`spawn_agent`) in a single turn. Same
+    /// rationale and semantics as `web_search_max_per_turn`; sub-agents are
+    /// the most expensive tool in the catalog. `0` disables the cap.
+    pub subagent_max_per_turn: u32,
 }
 
 impl Default for LoopGuardConfig {
@@ -37,6 +48,8 @@ impl Default for LoopGuardConfig {
             backoff_initial_ms: 500,
             backoff_max_ms: 5000,
             unknown_tool_max_per_name: 2,
+            web_search_max_per_turn: 50,
+            subagent_max_per_turn: 50,
         }
     }
 }

@@ -229,6 +229,14 @@ pub enum StreamEvent {
     /// `delta.stop_reason == "max_tokens"`. Non-terminal — the SSE driver
     /// still relies on `[DONE]` / `message_stop` to end the stream.
     Truncated,
+    /// Provider signaled the response was ending because the model chose to
+    /// call tools (OpenAI-compat `finish_reason == "tool_calls"`, Anthropic
+    /// `stop_reason == "tool_use"`). Some providers emit this with an empty
+    /// tool-call payload — the model signalled intent but no call shipped.
+    /// The agent records the flag so a tool-intent turn that arrives with
+    /// zero parsed tool calls can be nudged instead of silently treated as
+    /// a finished text answer. Non-terminal.
+    ToolIntent,
     /// The client failed over to a fallback provider/model mid-request. Emitted
     /// at the switch, before the (re)attempt that produces the response, so it
     /// arrives ahead of `Done`. The agent records `(provider, model)` and the

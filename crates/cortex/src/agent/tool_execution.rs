@@ -23,8 +23,8 @@ use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolOutput};
 
 use super::tool_classification::{classify_action, is_mutating_tool_call};
 use super::tool_validation::{
-    format_invalid_tool_result, repeated_tool_call_block_message, unknown_tool_refusal_message,
-    InvalidToolCall, RepeatDecision,
+    expensive_budget_block_message, format_invalid_tool_result, repeated_tool_call_block_message,
+    unknown_tool_refusal_message, InvalidToolCall, RepeatDecision,
 };
 use super::{Agent, AgentEvent};
 
@@ -298,6 +298,16 @@ impl Agent {
                 }
             }
 
+            // Per-turn expensive-tool budget: distinct-argument web searches /
+            // sub-agent spawns evade the identical-call guard above, so a
+            // runaway loop is bounded here by total volume instead.
+            if let Some(cap) = self.expensive_tool_budget.observe(name) {
+                warn!("Per-turn budget exhausted for '{name}' (cap {cap}); skipping call");
+                self.skip_tool_call(&tool_call.id, &expensive_budget_block_message(name, cap))
+                    .await;
+                continue;
+            }
+
             // Rate limiting
             let action_type = classify_action(name);
             match self.rate_guard.record(action_type) {
@@ -483,6 +493,16 @@ impl Agent {
                     });
                     continue;
                 }
+            }
+
+            // Per-turn expensive-tool budget — same boundary as the
+            // sequential path so a parallel batch can't sidestep it.
+            if let Some(cap) = self.expensive_tool_budget.observe(&name) {
+                warn!("Per-turn budget exhausted for '{name}' (cap {cap}); skipping call");
+                slots.push(Slot::Skipped {
+                    reason: expensive_budget_block_message(&name, cap),
+                });
+                continue;
             }
 
             let action_type = classify_action(&name);

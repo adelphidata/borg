@@ -1,7 +1,7 @@
 //! `search_tools` meta-tool: keyword search over deferred MCP tools.
 //!
-//! Only advertised when `mcp.tool_search` is on (see
-//! [`crate::config::McpConfig::tool_search_active`]). When active, the MCP tool
+//! Only advertised on the deferred disclosure tiers (see
+//! [`crate::config::McpConfig::disclosure_tier`]). When active, the MCP tool
 //! schemas are held out of the per-turn tool list; the model searches here to
 //! discover a tool's spec, then calls the real `mcp_*` tool directly the next
 //! turn. Dispatch is registry-keyed, so a discovered tool is callable even

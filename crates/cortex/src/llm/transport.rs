@@ -335,6 +335,9 @@ pub(crate) fn parse_openai_sse_line(
                     if choice.finish_reason.as_deref() == Some("length") {
                         events.push(StreamEvent::Truncated);
                     }
+                    if choice.finish_reason.as_deref() == Some("tool_calls") {
+                        events.push(StreamEvent::ToolIntent);
+                    }
                 }
             }
 
@@ -493,6 +496,9 @@ pub(crate) fn parse_anthropic_sse_line(
             if let Some(stop_reason) = event["delta"]["stop_reason"].as_str() {
                 if stop_reason == "max_tokens" {
                     events.push(StreamEvent::Truncated);
+                }
+                if stop_reason == "tool_use" {
+                    events.push(StreamEvent::ToolIntent);
                 }
                 events.push(StreamEvent::Done);
                 return SseAction::Done(events);
