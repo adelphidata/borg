@@ -41,9 +41,25 @@ pub(crate) async fn run_acp_stdio() -> Result<()> {
     let stdout = tokio::io::stdout();
     let exit_code = run_transport(AcpDaemonClient::new(daemon), stdin, stdout).await?;
     if exit_code != 0 {
+        // `process::exit` skips destructors, so flush the tracing worker
+        // first — the tail of acp.log is exactly the lines explaining why
+        // the daemon connection failed.
+        flush_acp_logs();
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// Drop the non-blocking writer guard (if we own one) so buffered log lines
+/// reach disk. Safe to call at most once, right before a hard exit.
+fn flush_acp_logs() {
+    if let Some(slot) = ACP_LOG_GUARD.get() {
+        drop(
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
 }
 
 /// Holds the non-blocking writer guard for the lifetime of the process so
@@ -51,8 +67,9 @@ pub(crate) async fn run_acp_stdio() -> Result<()> {
 /// `static OnceLock` is preferred over `Box::leak` because we can detect
 /// double-init (which can happen if a cortex code path lazy-installed a
 /// subscriber before us) and degrade gracefully instead of panicking.
-static ACP_LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    std::sync::OnceLock::new();
+static ACP_LOG_GUARD: std::sync::OnceLock<
+    StdMutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+> = std::sync::OnceLock::new();
 
 fn init_acp_logging() -> Result<()> {
     let log_dir = cortex::config::Config::logs_dir().context("resolve logs dir")?;
@@ -90,7 +107,7 @@ fn init_acp_logging() -> Result<()> {
         drop(guard);
         return Ok(());
     }
-    let _ = ACP_LOG_GUARD.set(guard);
+    let _ = ACP_LOG_GUARD.set(StdMutex::new(Some(guard)));
     Ok(())
 }
 
@@ -1880,13 +1897,18 @@ mod tests {
             .filter(|l| l["error"]["code"] == json!(-32700))
             .count();
         // `42` and `{"method":42}` are unparseable in every reading.
-        // `[]` is tolerated: serde accepts a JSON sequence for the
-        // all-default response envelope, so it lands in the response path
-        // with no id and is silently dropped — harmless either way.
         assert_eq!(
             parse_errors, 2,
             "malformed frames (42, method:42) must yield -32700: {lines:?}"
         );
+        // `[]` is a JSON-RPC batch, which ACP does not use. Without an
+        // explicit check, serde would accept the sequence as an all-default
+        // response envelope and silently drop it — spec says -32600.
+        let invalid = lines
+            .iter()
+            .find(|l| l["error"]["code"] == json!(-32600))
+            .expect("batch array must yield -32600 Invalid Request");
+        assert_eq!(invalid["id"], Value::Null, "batch reject carries null id");
         let init = lines
             .iter()
             .find(|l| l["id"] == json!(9))
@@ -1896,8 +1918,8 @@ mod tests {
         // frame — JSON-RPC forbids replying to notifications, even errors.
         assert_eq!(
             lines.len(),
-            3,
-            "2 parse errors + 1 init result and nothing else: {lines:?}"
+            4,
+            "2 parse errors + 1 batch reject + 1 init result and nothing else: {lines:?}"
         );
     }
 
@@ -2607,6 +2629,146 @@ mod tests {
             "no `tokio::io::stderr()` calls are allowed in ACP mode; the \
              panic hook + tracing layer route all diagnostic output to \
              acp.log. Found {stderr_count}."
+        );
+    }
+
+    /// Writer that fails every write — models the IDE side of the pipe
+    /// going away mid-turn.
+    #[derive(Clone)]
+    struct FailingWriter;
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ide hung up",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn callback_client_over(writer: SharedWriter) -> JsonRpcCallbackClient {
+        JsonRpcCallbackClient {
+            writer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            capabilities: Arc::new(StdMutex::new(ClientCapabilities::default())),
+        }
+    }
+
+    /// A write failure on an outbound fs callback must error the call AND
+    /// reap the pending-response entry — no reply will ever arrive for a
+    /// request the client never received, so a leftover entry leaks per
+    /// failed callback for the life of the process.
+    #[tokio::test]
+    async fn fs_callback_write_failure_does_not_leak_pending_entry() {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(FailingWriter)));
+        let client = callback_client_over(writer);
+        let pending = client.pending.clone();
+        let fs = SessionFsClient::new(client, "sess-1".into());
+        let err = fs
+            .read_text_file("f.txt")
+            .await
+            .expect_err("broken pipe must fail the callback");
+        assert!(
+            err.to_string().contains("ide hung up"),
+            "error must surface the io failure: {err}"
+        );
+        assert!(
+            pending.lock().await.is_empty(),
+            "failed write must remove its pending entry"
+        );
+    }
+
+    /// An IDE that accepts the fs request but never answers must not wedge
+    /// the turn forever: the callback times out (virtual clock — paused
+    /// runtime auto-advances) and reaps its pending entry.
+    #[tokio::test(start_paused = true)]
+    async fn fs_callback_times_out_when_ide_never_answers() {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(tokio::io::sink())));
+        let client = callback_client_over(writer);
+        let pending = client.pending.clone();
+        let fs = SessionFsClient::new(client, "sess-1".into());
+        let err = fs
+            .read_text_file("f.txt")
+            .await
+            .expect_err("unanswered callback must time out");
+        assert!(
+            err.to_string().contains("did not answer"),
+            "error must name the timeout: {err}"
+        );
+        assert!(
+            pending.lock().await.is_empty(),
+            "timed-out callback must remove its pending entry"
+        );
+    }
+
+    /// `session/load` for a session that is already tracked (e.g. an IDE
+    /// re-loading while a prompt streams) must NOT reset the runtime flags:
+    /// clobbering `prompt_in_flight` would bypass the per-session busy gate
+    /// and drop a pending cancel.
+    #[tokio::test]
+    async fn session_load_preserves_in_flight_runtime_flags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let daemon = fake_daemon();
+        let state = AcpState {
+            daemon,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            client_capabilities: Arc::new(StdMutex::new(ClientCapabilities::default())),
+            onboarding_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            daemon_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        state.sessions.lock().await.insert(
+            "sess-1".into(),
+            SessionRecord {
+                workspace_cwd: workspace.clone(),
+                workspace_root: workspace.clone(),
+                runtime: SessionRuntime {
+                    prompt_in_flight: true,
+                    cancel_requested: true,
+                },
+            },
+        );
+        let (writer_impl, _output) = CaptureWriter::new();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer_impl)));
+        let callback_client = callback_client_over(writer.clone());
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(5)),
+            method: "session/load".to_string(),
+            params: Some(json!({
+                "sessionId": "sess-1",
+                "cwd": workspace.to_string_lossy(),
+            })),
+        };
+        handle_request(state.clone(), req, writer, callback_client)
+            .await
+            .expect("session/load must succeed");
+        let sessions = state.sessions.lock().await;
+        let runtime = &sessions.get("sess-1").expect("session tracked").runtime;
+        assert!(
+            runtime.prompt_in_flight,
+            "session/load must not clear prompt_in_flight"
+        );
+        assert!(
+            runtime.cancel_requested,
+            "session/load must not clear cancel_requested"
         );
     }
 }

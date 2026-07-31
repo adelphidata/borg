@@ -124,14 +124,21 @@ async fn finish_open_session<D: AcpDaemon>(
 ) -> Result<SessionMetadata> {
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(
-            session_id.to_string(),
-            SessionRecord {
+        // Preserve runtime flags if the session is already tracked: a
+        // `session/load` racing an in-flight prompt must not reset
+        // `prompt_in_flight`/`cancel_requested`, or the per-session busy
+        // gate and a pending cancel would be silently lost.
+        sessions
+            .entry(session_id.to_string())
+            .and_modify(|record| {
+                record.workspace_cwd = cwd.to_path_buf();
+                record.workspace_root = cwd.to_path_buf();
+            })
+            .or_insert_with(|| SessionRecord {
                 workspace_cwd: cwd.to_path_buf(),
                 workspace_root: cwd.to_path_buf(),
                 runtime: SessionRuntime::default(),
-            },
-        );
+            });
     }
     if replay_history {
         let history = state

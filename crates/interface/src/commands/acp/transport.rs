@@ -33,29 +33,46 @@ pub(super) struct JsonRpcCallbackClient {
     pub(super) capabilities: Arc<StdMutex<ClientCapabilities>>,
 }
 
+/// How long the agent waits for the IDE to answer an outbound callback
+/// (`fs/*`) before giving up. Real clients answer in milliseconds; without
+/// a bound, a client that silently drops the request would wedge the turn
+/// until a human sends `session/cancel`.
+const CALLBACK_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl JsonRpcCallbackClient {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = Value::Number(serde_json::Number::from(id_num));
         let key = rpc_id_key(&id);
+        let frame = serde_json::to_value(JsonRpcOutboundRequest {
+            jsonrpc: "2.0",
+            id,
+            method: method.to_string(),
+            params,
+        })?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(key, tx);
+            pending.insert(key.clone(), tx);
         }
-        write_json(
-            &self.writer,
-            &serde_json::to_value(JsonRpcOutboundRequest {
-                jsonrpc: "2.0",
-                id,
-                method: method.to_string(),
-                params,
-            })?,
-        )
-        .await?;
-        rx.await
-            .map_err(|_| anyhow!("ACP callback response channel closed"))?
-            .map_err(anyhow::Error::msg)
+        if let Err(e) = write_json(&self.writer, &frame).await {
+            // The request never reached the client, so no response will
+            // arrive to reap this entry — remove it or it leaks.
+            self.pending.lock().await.remove(&key);
+            return Err(e);
+        }
+        match tokio::time::timeout(CALLBACK_RESPONSE_TIMEOUT, rx).await {
+            Ok(response) => response
+                .map_err(|_| anyhow!("ACP callback response channel closed"))?
+                .map_err(anyhow::Error::msg),
+            Err(_) => {
+                self.pending.lock().await.remove(&key);
+                Err(anyhow!(
+                    "ACP client did not answer {method} within {}s",
+                    CALLBACK_RESPONSE_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 }
 
@@ -183,6 +200,9 @@ struct JsonRpcError<'a> {
 enum InboundTransportMessage {
     Request(JsonRpcRequest),
     Response(JsonRpcResponseEnvelope),
+    /// Structurally invalid frame (e.g. a JSON-RPC batch array, which ACP
+    /// does not use) — answered with -32600 Invalid Request.
+    InvalidRequest(String),
     ParseError(String),
 }
 
@@ -235,6 +255,22 @@ where
                             continue;
                         }
                     };
+                    if value.is_array() {
+                        // JSON-RPC batch arrays would otherwise structurally
+                        // deserialize as an all-default response envelope
+                        // (serde sequence semantics) and vanish. ACP doesn't
+                        // use batching; reject per JSON-RPC 2.0.
+                        if inbound_tx
+                            .send(InboundTransportMessage::InvalidRequest(
+                                "batch requests are not supported".to_string(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     if value.get("method").is_some() {
                         match serde_json::from_value::<JsonRpcRequest>(value) {
                             Ok(req) => {
@@ -382,6 +418,16 @@ where
                         });
                     }
                 }
+            }
+            InboundTransportMessage::InvalidRequest(reason) => {
+                send_error(
+                    &writer,
+                    Value::Null,
+                    -32600,
+                    "Invalid Request",
+                    Some(json!(reason)),
+                )
+                .await?;
             }
             InboundTransportMessage::ParseError(e) => {
                 send_error(
