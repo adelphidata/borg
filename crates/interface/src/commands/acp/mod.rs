@@ -445,11 +445,33 @@ mod tests {
         /// test exercise the cancel flag wiring without stuffing the events
         /// list with a pre-baked `Error("cancelled")`.
         cancel_gate: Option<Arc<tokio::sync::Notify>>,
+        /// When set, send_prompt drives a full fs-callback roundtrip through
+        /// the provided [`AcpFsClient`] (read then write) instead of playing
+        /// canned events — exercising the transport's outbound-request /
+        /// inbound-response plumbing that canned events never touch.
+        fs_roundtrip: bool,
+        /// With `cancel_gate`: drop the event channel after the gate fires
+        /// instead of emitting `TurnComplete` — models a daemon that winds
+        /// the turn down (channel close, no terminal event) in response to
+        /// cancel, exercising the Disconnected+cancel race branch.
+        cancel_gate_drops: bool,
+        /// `onboarding_complete` returns Err — models a daemon that's up
+        /// but can't answer the onboarding probe.
+        onboarding_err: bool,
+        /// `cancel` returns Err — models a daemon-side cancel failure,
+        /// which must be logged and treated as a no-op.
+        cancel_fails: bool,
+        /// When present, `open_session` blocks acquiring a permit — lets a
+        /// test pile up in-flight requests to hit the dispatcher cap.
+        open_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[async_trait]
     impl AcpDaemon for FakeDaemon {
         async fn onboarding_complete(&self) -> Result<bool> {
+            if self.onboarding_err {
+                return Err(anyhow!("daemon unreachable during onboarding probe"));
+            }
             Ok(self.onboarded)
         }
 
@@ -460,6 +482,9 @@ mod tests {
             _workspace_root: Option<&Path>,
             _enforce_workspace_root: bool,
         ) -> Result<(String, u64)> {
+            if let Some(gate) = self.open_gate.as_ref() {
+                let _permit = gate.acquire().await;
+            }
             Ok((resume_id.unwrap_or(&self.open_session_id).to_string(), 0))
         }
 
@@ -467,10 +492,31 @@ mod tests {
             &self,
             session_id: &str,
             prompt: PromptInput,
-            _fs_client: F,
+            fs_client: F,
         ) -> Result<mpsc::Receiver<AgentEvent>> {
             self.prompts.lock().await.push(prompt);
             let (tx, rx) = mpsc::channel(16);
+            if self.fs_roundtrip {
+                tokio::spawn(async move {
+                    match fs_client.read_text_file("buffer.txt").await {
+                        Ok(content) => {
+                            let _ = tx
+                                .send(AgentEvent::TextDelta(format!("FS:{content}")))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AgentEvent::Error(format!("fs read: {e}"))).await;
+                            return;
+                        }
+                    }
+                    if let Err(e) = fs_client.write_text_file("out.txt", "data").await {
+                        let _ = tx.send(AgentEvent::Error(format!("fs write: {e}"))).await;
+                        return;
+                    }
+                    let _ = tx.send(AgentEvent::TurnComplete).await;
+                });
+                return Ok(rx);
+            }
             let events = self
                 .events
                 .lock()
@@ -478,12 +524,16 @@ mod tests {
                 .remove(session_id)
                 .unwrap_or_default();
             if let Some(gate) = self.cancel_gate.clone() {
+                let drop_after = self.cancel_gate_drops;
                 tokio::spawn(async move {
                     for event in events {
                         let _ = tx.send(event).await;
                     }
                     gate.notified().await;
-                    let _ = tx.send(AgentEvent::TurnComplete).await;
+                    if !drop_after {
+                        let _ = tx.send(AgentEvent::TurnComplete).await;
+                    }
+                    // drop_after: channel closes with no terminal event.
                 });
             } else {
                 for event in events {
@@ -495,6 +545,9 @@ mod tests {
 
         async fn cancel(&self, session_id: &str) -> Result<()> {
             self.cancels.lock().await.push(session_id.to_string());
+            if self.cancel_fails {
+                return Err(anyhow!("daemon cancel RPC failed"));
+            }
             if let Some(gate) = self.cancel_gate.as_ref() {
                 // notify_one stores a permit so the gate fires even if the
                 // spawned send_prompt task hasn't reached `notified().await`
@@ -529,6 +582,11 @@ mod tests {
             events: Arc::new(Mutex::new(HashMap::new())),
             cancels: Arc::new(Mutex::new(Vec::new())),
             cancel_gate: None,
+            fs_roundtrip: false,
+            cancel_gate_drops: false,
+            onboarding_err: false,
+            cancel_fails: false,
+            open_gate: None,
         }
     }
 
@@ -809,7 +867,10 @@ mod tests {
             is_stderr: true,
         };
         let stderr_update = event_to_update(&stderr_event, "sess-1").expect("update");
-        assert_eq!(stderr_update["update"]["content"][0]["content"]["text"], "err");
+        assert_eq!(
+            stderr_update["update"]["content"][0]["content"]["text"],
+            "err"
+        );
         assert_eq!(stderr_update["update"]["_meta"]["borg"]["stream"], "stderr");
     }
 
@@ -1049,8 +1110,7 @@ mod tests {
         assert_eq!(lines[0]["params"]["sessionId"], "sess-1");
         assert_eq!(lines[0]["params"]["update"]["title"], "ACP Session");
         assert_eq!(
-            lines[0]["params"]["update"]["_meta"]["borg"]["model"],
-            "test-model",
+            lines[0]["params"]["update"]["_meta"]["borg"]["model"], "test-model",
             "Borg extras (model) must ride in _meta, the spec extension point"
         );
         assert_eq!(lines[1]["id"], json!(42));
@@ -1668,6 +1728,677 @@ mod tests {
         assert_eq!(
             prompt_response["error"]["data"]["kind"],
             json!("daemon_disconnected"),
+        );
+    }
+
+    /// A grab-bag of malformed inbound frames: non-object JSON, wrong-typed
+    /// `method`, blank/whitespace lines, and a notification whose handler
+    /// errors (bad params). The transport must answer each parse failure
+    /// with -32700, stay silent for the errored notification, and keep
+    /// serving valid requests afterwards.
+    #[tokio::test]
+    async fn transport_survives_garbage_frames_and_errored_notifications() {
+        let input = concat!(
+            "[]\n",
+            "42\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":42}\n",
+            "\n",
+            "   \n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"initialize\",\"params\":{}}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            fake_daemon(),
+            BufReader::new(std::io::Cursor::new(input)),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let parse_errors = lines
+            .iter()
+            .filter(|l| l["error"]["code"] == json!(-32700))
+            .count();
+        // `42` and `{"method":42}` are unparseable in every reading.
+        // `[]` is tolerated: serde accepts a JSON sequence for the
+        // all-default response envelope, so it lands in the response path
+        // with no id and is silently dropped — harmless either way.
+        assert_eq!(
+            parse_errors, 2,
+            "malformed frames (42, method:42) must yield -32700: {lines:?}"
+        );
+        let init = lines
+            .iter()
+            .find(|l| l["id"] == json!(9))
+            .expect("initialize after garbage must be served");
+        assert!(init["result"].is_object(), "got: {init}");
+        // The errored cancel notification (bad params) must produce NO
+        // frame — JSON-RPC forbids replying to notifications, even errors.
+        assert_eq!(
+            lines.len(),
+            3,
+            "2 parse errors + 1 init result and nothing else: {lines:?}"
+        );
+    }
+
+    /// Response envelopes whose id matches no pending callback are dropped
+    /// silently (both numeric and string ids) — a late or duplicated IDE
+    /// reply must not wedge or spam the transport.
+    #[tokio::test]
+    async fn response_with_unknown_id_is_silently_ignored() {
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            fake_daemon(),
+            BufReader::new(std::io::Cursor::new(input)),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        assert_eq!(
+            lines.len(),
+            1,
+            "stray responses must produce no output: {lines:?}"
+        );
+        assert_eq!(lines[0]["id"], json!(1));
+    }
+
+    /// A prompt to a session id that was never opened must reject with the
+    /// structured unknown_session error, and never reach the daemon.
+    #[tokio::test]
+    async fn prompt_for_unknown_session_rejects_with_unknown_session_kind() {
+        let daemon = fake_daemon();
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/prompt\",",
+            "\"params\":{\"sessionId\":\"ghost\",\"prompt\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            daemon.clone(),
+            BufReader::new(std::io::Cursor::new(input)),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let frame = lines.iter().find(|l| l["id"] == json!(1)).expect("frame");
+        assert_eq!(frame["error"]["code"], json!(-32602));
+        assert_eq!(frame["error"]["data"]["kind"], json!("unknown_session"));
+        assert_eq!(frame["error"]["data"]["sessionId"], json!("ghost"));
+        assert!(
+            daemon.prompts.lock().await.is_empty(),
+            "unknown-session prompt must never reach the daemon"
+        );
+    }
+
+    /// Missing required params (session/new without cwd) must map to a
+    /// -32602 with the serde detail, not a hang or an internal error.
+    #[tokio::test]
+    async fn session_new_missing_cwd_param_yields_invalid_params() {
+        let input = br#"{"jsonrpc":"2.0","id":4,"method":"session/new","params":{}}
+"#;
+        let (writer, output) = CaptureWriter::new();
+        run_transport(fake_daemon(), BufReader::new(&input[..]), writer)
+            .await
+            .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let frame = lines.iter().find(|l| l["id"] == json!(4)).expect("frame");
+        assert_eq!(frame["error"]["code"], json!(-32602));
+        assert!(
+            frame["error"]["data"]
+                .as_str()
+                .is_some_and(|s| s.contains("invalid params")),
+            "detail must explain the parse failure: {frame}"
+        );
+    }
+
+    /// Cancel race: the client cancels, and the daemon reacts by closing the
+    /// event channel *without* a terminal event. That must surface as
+    /// stopReason=cancelled — NOT as daemon_disconnected — and must not
+    /// poison the process exit code.
+    #[tokio::test]
+    async fn cancel_then_channel_close_reports_cancelled_not_disconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy();
+        let mut daemon = fake_daemon();
+        daemon.cancel_gate = Some(Arc::new(tokio::sync::Notify::new()));
+        daemon.cancel_gate_drops = true;
+        daemon.events.lock().await.insert(
+            "sess-1".into(),
+            vec![AgentEvent::TextDelta("partial".into())],
+        );
+        let input = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"sess-1\",\"prompt\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{{\"sessionId\":\"sess-1\"}}}}\n"
+            ),
+            cwd
+        );
+        let (writer, output) = CaptureWriter::new();
+        let exit = run_transport(
+            daemon,
+            BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            writer,
+        )
+        .await
+        .expect("transport");
+        assert_eq!(exit, 0, "cancel race must not flag daemon failure");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let frame = lines.iter().find(|l| l["id"] == json!(2)).expect("frame");
+        assert_eq!(
+            frame["result"]["stopReason"],
+            json!("cancelled"),
+            "channel-close after cancel is a cancellation, not a crash: {frame}"
+        );
+    }
+
+    /// A daemon-side cancel RPC failure is logged and treated as a no-op —
+    /// it must not surface an error frame to the IDE.
+    #[tokio::test]
+    async fn daemon_cancel_failure_is_swallowed_as_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy();
+        let mut daemon = fake_daemon();
+        daemon.cancel_fails = true;
+        let input = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{{\"sessionId\":\"sess-1\"}}}}\n"
+            ),
+            cwd
+        );
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            daemon.clone(),
+            BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        assert!(
+            !lines.iter().any(|l| l["error"].is_object()),
+            "cancel failure must not produce an error frame: {lines:?}"
+        );
+        assert_eq!(
+            daemon.cancels.lock().await.as_slice(),
+            &["sess-1".to_string()],
+            "daemon.cancel must still have been attempted"
+        );
+    }
+
+    /// The onboarding probe itself erroring (daemon up but RPC failing) maps
+    /// to -32603 with a probe-specific detail — distinct from the -32001
+    /// "not onboarded" gate.
+    #[tokio::test]
+    async fn onboarding_probe_failure_maps_to_internal_error() {
+        let mut daemon = fake_daemon();
+        daemon.onboarding_err = true;
+        let input = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+            tempfile::tempdir().unwrap().path().display()
+        );
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            daemon,
+            BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let frame = lines.iter().find(|l| l["id"] == json!(1)).expect("frame");
+        assert_eq!(frame["error"]["code"], json!(-32603));
+        assert!(
+            frame["error"]["data"]
+                .as_str()
+                .is_some_and(|s| s.contains("onboarding probe failed")),
+            "probe failure needs its own detail: {frame}"
+        );
+    }
+
+    /// The dispatcher caps concurrently in-flight requests. Requests past
+    /// the cap get a structured busy error; notifications past the cap are
+    /// dropped. Releasing the blockage drains the queued work normally.
+    #[tokio::test]
+    async fn inflight_cap_rejects_excess_requests_with_busy_error() {
+        use tokio::io::AsyncWriteExt;
+        let mut daemon = fake_daemon();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        daemon.open_gate = Some(gate.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (mut input, input_reader) = tokio::io::duplex(1 << 20);
+        let (writer, output) = CaptureWriter::new();
+        let transport = tokio::spawn(run_transport(daemon, BufReader::new(input_reader), writer));
+        // 64 session/new requests block on the open gate and fill every
+        // dispatcher slot; the 65th must bounce with too_many_inflight.
+        let mut bytes = String::new();
+        for id in 1..=65 {
+            bytes.push_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"session/new\",\"params\":{{\"cwd\":\"{cwd}\"}}}}\n"
+            ));
+        }
+        // A notification arriving at the cap is dropped (logged, no frame).
+        bytes.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{\"sessionId\":\"sess-1\"}}\n");
+        input.write_all(bytes.as_bytes()).await.expect("write");
+
+        let busy = wait_for_predicate_frame(&output, |f| {
+            f["error"]["data"]["kind"] == json!("too_many_inflight")
+        })
+        .await;
+        assert_eq!(busy["id"], json!(65), "the 65th request takes the bounce");
+        assert_eq!(busy["error"]["code"], json!(-32000));
+
+        // Unblock the daemon; all 64 queued opens must now complete.
+        gate.add_permits(1000);
+        drop(input);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(10), transport)
+            .await
+            .expect("transport exits")
+            .expect("join")
+            .expect("run_transport");
+        assert_eq!(exit, 0);
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let ok_results = lines
+            .iter()
+            .filter(|l| l["result"]["sessionId"] == json!("sess-1"))
+            .count();
+        assert_eq!(ok_results, 64, "all capped-but-admitted requests drain");
+    }
+
+    /// Poll the captured output until any frame satisfies the predicate.
+    async fn wait_for_predicate_frame(
+        output: &Arc<StdMutex<Vec<u8>>>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let frames = parse_lines(output.lock().unwrap().clone());
+            if let Some(frame) = frames.iter().find(|f| pred(f)) {
+                return frame.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for frame; got: {frames:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Encoded image data larger than twice the remaining budget must be
+    /// rejected BEFORE base64 decode spends memory/CPU on it.
+    #[test]
+    fn oversized_encoded_image_early_rejects_before_decode() {
+        // Deliberately NOT valid base64 — the early reject must fire on
+        // encoded length alone, before any decode attempt (which would
+        // error differently).
+        let encoded = "!".repeat(MAX_PROMPT_BYTES * 2 + 1);
+        let err = parse_prompt_blocks(&[PromptBlock::Image {
+            mime_type: "image/png".into(),
+            data: encoded,
+            filename: None,
+        }])
+        .expect_err("must early-reject");
+        assert!(
+            err.to_string().contains("prompt too large"),
+            "early reject must be the size error, not a decode error: {err}"
+        );
+    }
+
+    /// resource_link rendering counts toward the prompt byte cap.
+    #[test]
+    fn resource_link_over_budget_rejects_as_too_large() {
+        let err = parse_prompt_blocks(&[PromptBlock::ResourceLink {
+            uri: "x".repeat(MAX_PROMPT_BYTES + 1),
+            name: "big".into(),
+            title: None,
+        }])
+        .expect_err("must reject");
+        let mapped = AcpRequestError::from_anyhow(&err);
+        assert_eq!(mapped.code, -32602);
+        assert!(err.to_string().contains("prompt too large"), "got: {err}");
+    }
+
+    /// Absolute-but-unresolvable cwd (nonexistent dir) maps to invalid
+    /// params with a "cannot resolve" detail.
+    #[test]
+    fn validate_workspace_cwd_unresolvable_path_errors() {
+        let err = validate_workspace_cwd("/nonexistent/borg/acp/test/path")
+            .expect_err("nonexistent path must fail");
+        let mapped = AcpRequestError::from_anyhow(&err);
+        assert_eq!(mapped.code, -32602);
+        assert!(
+            err.to_string().contains("cannot resolve"),
+            "detail must say the path was unresolvable: {err}"
+        );
+    }
+
+    /// A writer failure mid-stream (IDE hung up) must fail the turn AND
+    /// reset prompt_in_flight — the historical bug left the session locked.
+    #[tokio::test]
+    async fn stream_write_failure_fails_turn_and_resets_in_flight() {
+        use std::sync::atomic::AtomicU64;
+
+        /// Writer that fails every write — models the IDE side of the pipe
+        /// going away while a turn is streaming.
+        #[derive(Clone)]
+        struct BrokenWriter;
+        impl AsyncWrite for BrokenWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "ide hung up",
+                )))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let daemon = fake_daemon();
+        daemon.events.lock().await.insert(
+            "sess-1".into(),
+            vec![
+                AgentEvent::TextDelta("streamed".into()),
+                AgentEvent::TurnComplete,
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let state = AcpState {
+            daemon,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            client_capabilities: Arc::new(StdMutex::new(ClientCapabilities::default())),
+            onboarding_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            daemon_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        state.sessions.lock().await.insert(
+            "sess-1".into(),
+            SessionRecord {
+                workspace_cwd: workspace.clone(),
+                workspace_root: workspace,
+                runtime: SessionRuntime::default(),
+            },
+        );
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(BrokenWriter)));
+        let callback_client = JsonRpcCallbackClient {
+            writer: writer.clone(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            capabilities: state.client_capabilities.clone(),
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "session/prompt".to_string(),
+            params: Some(json!({
+                "sessionId": "sess-1",
+                "prompt": [{"type": "text", "text": "go"}],
+            })),
+        };
+        let result = handle_request(state.clone(), req, writer, callback_client).await;
+        let err = result.expect_err("broken pipe must fail the turn");
+        assert!(
+            err.to_string().contains("session/update write failed"),
+            "failure must name the write: {err}"
+        );
+        let sessions = state.sessions.lock().await;
+        assert!(
+            !sessions
+                .get("sess-1")
+                .expect("session present")
+                .runtime
+                .prompt_in_flight,
+            "write failure MUST reset prompt_in_flight or the session locks forever"
+        );
+    }
+
+    /// Poll the captured output until a frame with the given method appears.
+    /// Bounded so a regression hangs the assertion, not the whole test run.
+    async fn wait_for_outbound_frame(output: &Arc<StdMutex<Vec<u8>>>, method: &str) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let frames = parse_lines(output.lock().unwrap().clone());
+            if let Some(frame) = frames.iter().find(|f| f["method"] == json!(method)) {
+                return frame.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for outbound {method} frame; got: {frames:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Full fs-callback roundtrip through the live transport: the daemon
+    /// side asks for a buffer read + write, the transport emits spec-shaped
+    /// `fs/*` requests (which MUST carry `sessionId` — spec-required, and
+    /// spec-strict IDEs reject the call without it), and inbound response
+    /// envelopes are routed back to the awaiting caller by id.
+    #[tokio::test]
+    async fn fs_callbacks_roundtrip_with_session_id_over_transport() {
+        use tokio::io::AsyncWriteExt;
+        let mut daemon = fake_daemon();
+        daemon.fs_roundtrip = true;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (mut input, input_reader) = tokio::io::duplex(4096);
+        let (writer, output) = CaptureWriter::new();
+        let transport = tokio::spawn(run_transport(daemon, BufReader::new(input_reader), writer));
+
+        input
+            .write_all(
+                format!(
+                    concat!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"sess-1\",\"prompt\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n",
+                    ),
+                    cwd
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write requests");
+
+        let read_req = wait_for_outbound_frame(&output, "fs/read_text_file").await;
+        assert_eq!(
+            read_req["params"]["sessionId"],
+            json!("sess-1"),
+            "fs/read_text_file MUST carry the sessionId: {read_req}"
+        );
+        assert_eq!(read_req["params"]["path"], json!("buffer.txt"));
+        let read_id = read_req["id"].clone();
+        input
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{read_id},\"result\":{{\"content\":\"BUF\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write read response");
+
+        let write_req = wait_for_outbound_frame(&output, "fs/write_text_file").await;
+        assert_eq!(
+            write_req["params"]["sessionId"],
+            json!("sess-1"),
+            "fs/write_text_file MUST carry the sessionId: {write_req}"
+        );
+        assert_eq!(write_req["params"]["path"], json!("out.txt"));
+        assert_eq!(write_req["params"]["content"], json!("data"));
+        let write_id = write_req["id"].clone();
+        input
+            .write_all(
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{write_id},\"result\":{{}}}}\n").as_bytes(),
+            )
+            .await
+            .expect("write write response");
+
+        // EOF ends the transport once the turn resolves.
+        drop(input);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+            .await
+            .expect("transport must exit after EOF")
+            .expect("join")
+            .expect("run_transport");
+        assert_eq!(exit, 0);
+
+        let frames = parse_lines(output.lock().unwrap().clone());
+        // Match responses only — outbound agent→client fs requests use their
+        // own id counter and can collide numerically with client request ids
+        // (JSON-RPC id spaces are per-direction).
+        let prompt_resp = frames
+            .iter()
+            .find(|f| f["id"] == json!(2) && f.get("method").is_none())
+            .expect("prompt response");
+        assert_eq!(prompt_resp["result"]["stopReason"], json!("end_turn"));
+        assert!(
+            frames.iter().any(|f| {
+                f["params"]["update"]["sessionUpdate"] == json!("agent_message_chunk")
+                    && f["params"]["update"]["content"]["text"] == json!("FS:BUF")
+            }),
+            "the buffer content returned by the IDE must reach the turn: {frames:?}"
+        );
+    }
+
+    /// An fs response carrying neither `result` nor `error` is a protocol
+    /// violation; the awaiting caller must fail with the envelope error
+    /// rather than hanging on a half-answered request.
+    #[tokio::test]
+    async fn fs_callback_response_without_result_or_error_fails_cleanly() {
+        use tokio::io::AsyncWriteExt;
+        let mut daemon = fake_daemon();
+        daemon.fs_roundtrip = true;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (mut input, input_reader) = tokio::io::duplex(4096);
+        let (writer, output) = CaptureWriter::new();
+        let transport = tokio::spawn(run_transport(daemon, BufReader::new(input_reader), writer));
+        input
+            .write_all(
+                format!(
+                    concat!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"sess-1\",\"prompt\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n",
+                    ),
+                    cwd
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write requests");
+        let read_req = wait_for_outbound_frame(&output, "fs/read_text_file").await;
+        let read_id = read_req["id"].clone();
+        input
+            .write_all(format!("{{\"jsonrpc\":\"2.0\",\"id\":{read_id}}}\n").as_bytes())
+            .await
+            .expect("write half-empty response");
+        drop(input);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+            .await
+            .expect("transport must exit")
+            .expect("join");
+        let frames = parse_lines(output.lock().unwrap().clone());
+        let prompt_resp = frames
+            .iter()
+            .find(|f| f["id"] == json!(2) && f.get("method").is_none())
+            .expect("prompt response");
+        assert!(
+            prompt_resp["error"]["data"]
+                .as_str()
+                .is_some_and(|s| s.contains("invalid ACP callback response envelope")),
+            "half-empty envelope must fail with the envelope error: {prompt_resp}"
+        );
+    }
+
+    /// The IDE answering an fs request with an error envelope must fail the
+    /// awaiting caller with that message — never silently fall back or hang.
+    #[tokio::test]
+    async fn fs_callback_error_envelope_fails_the_turn_with_client_message() {
+        use tokio::io::AsyncWriteExt;
+        let mut daemon = fake_daemon();
+        daemon.fs_roundtrip = true;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (mut input, input_reader) = tokio::io::duplex(4096);
+        let (writer, output) = CaptureWriter::new();
+        let transport = tokio::spawn(run_transport(daemon, BufReader::new(input_reader), writer));
+
+        input
+            .write_all(
+                format!(
+                    concat!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"sess-1\",\"prompt\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n",
+                    ),
+                    cwd
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write requests");
+
+        let read_req = wait_for_outbound_frame(&output, "fs/read_text_file").await;
+        let read_id = read_req["id"].clone();
+        input
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{read_id},\"error\":{{\"code\":-32000,\"message\":\"file not open in editor\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write error response");
+
+        drop(input);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+            .await
+            .expect("transport must exit")
+            .expect("join");
+
+        let frames = parse_lines(output.lock().unwrap().clone());
+        let prompt_resp = frames
+            .iter()
+            .find(|f| f["id"] == json!(2) && f.get("method").is_none())
+            .expect("prompt response");
+        assert_eq!(
+            prompt_resp["error"]["code"],
+            json!(-32603),
+            "fs failure must fail the turn: {prompt_resp}"
+        );
+        assert!(
+            prompt_resp["error"]["data"]
+                .as_str()
+                .is_some_and(|s| s.contains("file not open in editor")),
+            "the IDE's error message must round-trip to the turn failure: {prompt_resp}"
         );
     }
 

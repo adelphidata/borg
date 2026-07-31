@@ -141,7 +141,10 @@ async fn tool_lifecycle_preserves_stable_tool_call_id() {
     assert_eq!(tool_calls[0]["update"]["status"], json!("in_progress"));
     assert_eq!(tool_calls[0]["update"]["title"], json!("read_file"));
     assert_eq!(tool_calls[0]["update"]["kind"], json!("read"));
-    assert_eq!(tool_calls[0]["update"]["rawInput"]["path"], json!("foo.txt"));
+    assert_eq!(
+        tool_calls[0]["update"]["rawInput"]["path"],
+        json!("foo.txt")
+    );
 
     assert_eq!(
         tool_updates.len(),

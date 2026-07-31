@@ -293,6 +293,109 @@ async fn daemon_crash_mid_turn_surfaces_error_to_ide() {
     }
 }
 
+#[tokio::test]
+async fn session_load_replays_persisted_history_end_to_end() {
+    // Reconnect flow (plan §"session/load"): the IDE reloads a persisted
+    // session and must receive the full prior conversation as spec-shaped
+    // `session/update` replay frames — user + assistant only, internal tags
+    // stripped, followed by session metadata — and the session must accept
+    // a fresh prompt afterwards. This is the only test that drives the real
+    // DB-backed replay path (`Admin.GetSession` → history translation);
+    // the in-process unit test fakes the daemon.
+    let backend = ScriptedBackend::fixed("load-replay-session", simple_text_turn("post-load"));
+    let fixture = BorgdFixture::with_backend(backend).await;
+    // Seed the shared DB with a persisted session + lineage the daemon will
+    // replay. The fixture holds the serial lock, so this can't race other
+    // tests' DB use.
+    let db = cortex::db::Database::open().await.expect("open shared db");
+    db.upsert_session("load-replay-session", 1, 2, 0, "test-model", "Seeded title")
+        .await
+        .expect("seed session row");
+    for (role, text) in [
+        ("user", "hello there"),
+        ("assistant", "hi <internal>scratch</internal> friend"),
+        ("system", "must never replay"),
+    ] {
+        db.insert_message(
+            "load-replay-session",
+            role,
+            Some(text),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed message");
+    }
+
+    let mut client = AcpClient::spawn(&fixture).await.expect("spawn");
+    let _ = client
+        .request("initialize", initialize_params_with_fs())
+        .await
+        .expect("initialize");
+    let cwd = fixture.workspace_path().display().to_string();
+    let resp = client
+        .request(
+            "session/load",
+            json!({"sessionId": "load-replay-session", "cwd": cwd, "mcpServers": []}),
+        )
+        .await
+        .expect("session/load");
+    assert_eq!(
+        resp["result"]["sessionId"],
+        json!("load-replay-session"),
+        "load must resolve to the persisted session: {resp}"
+    );
+
+    let frames: Vec<Value> = client
+        .raw_stdout_lines()
+        .await
+        .iter()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let replayed: Vec<(&str, &str)> = frames
+        .iter()
+        .filter(|f| f["method"] == "session/update")
+        .filter_map(|f| {
+            let u = &f["params"]["update"];
+            match (u["sessionUpdate"].as_str(), u["content"]["text"].as_str()) {
+                (Some(kind), Some(text)) if kind.ends_with("_message_chunk") => Some((kind, text)),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![
+            ("user_message_chunk", "hello there"),
+            ("agent_message_chunk", "hi  friend"),
+        ],
+        "replay must cover user+assistant in order, strip internal tags, and drop system rows"
+    );
+    let info = frames
+        .iter()
+        .find(|f| f["params"]["update"]["sessionUpdate"] == json!("session_info_update"))
+        .expect("session_info_update after replay");
+    // Title comes from the backend's live snapshot, which the scripted
+    // test backend hardcodes to "" (`scripted.rs` snapshot_state). The
+    // production backend threads `session.meta.title` from the DB; here we
+    // only pin that the metadata notification is emitted with the field
+    // present so IDEs always have something to render.
+    assert!(
+        info["params"]["update"]["title"].is_string(),
+        "session_info_update must carry a title field: {info}"
+    );
+
+    // The loaded session must be live: a fresh prompt streams normally.
+    let outcome = client
+        .run_prompt("load-replay-session", "continue")
+        .await
+        .expect("prompt after load");
+    assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(outcome.agent_message_text(), "post-load");
+}
+
 // Sanity helper: shape-check that ParamsValue is a JSON-RPC error envelope.
 fn assert_is_error_envelope(envelope: &Value, code: i64) {
     let err = envelope

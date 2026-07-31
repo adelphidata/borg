@@ -779,9 +779,7 @@ impl<'a> App<'a> {
             // A pending ShellApproval is resolved in place (via `last_mut`)
             // by the approval key handler; flushing it early would freeze
             // "[y/N]" in scrollback with the resolution never shown.
-            HistoryCell::ShellApproval { status, .. } => {
-                !matches!(status, ApprovalStatus::Pending)
-            }
+            HistoryCell::ShellApproval { status, .. } => !matches!(status, ApprovalStatus::Pending),
             // Thinking placeholders accept further deltas.
             HistoryCell::Thinking { .. } => false,
             // An open ToolStart can still be mutated by a later ToolResult.

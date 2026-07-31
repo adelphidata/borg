@@ -460,6 +460,14 @@ impl AcpClient {
             .env("BORG_DAEMON_UDS", &fixture.uds_path)
             .env("BORG_DATA_DIR", shared_data_dir())
             .env("BORG_ACP_NO_AUTOSPAWN", "1")
+            // Propagate coverage instrumentation env so `cargo llvm-cov`
+            // captures the subprocess side of the transport; without this
+            // the spawned `borg acp` silently drops its profile data and
+            // e2e-only code paths report as uncovered.
+            .envs(std::env::vars_os().filter(|(k, _)| {
+                let k = k.to_string_lossy();
+                k.starts_with("LLVM_PROFILE") || k.starts_with("CARGO_LLVM_COV")
+            }))
             .env(
                 "RUST_LOG",
                 std::env::var("BORG_ACP_TEST_LOG").unwrap_or_else(|_| "off".into()),
@@ -701,7 +709,17 @@ impl AcpClient {
 impl Drop for AcpClient {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
+            // Don't SIGKILL immediately: dropping the client closes the
+            // subprocess's stdin (the writer task's handle goes away), the
+            // transport sees EOF and exits cleanly — which also lets LLVM
+            // flush coverage profiles under `cargo llvm-cov`. A detached
+            // watchdog thread reaps a hung subprocess after a grace period;
+            // detached threads die with the test process, so this never
+            // blocks the suite.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = child.start_kill();
+            });
         }
     }
 }

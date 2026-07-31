@@ -179,6 +179,73 @@ async fn resource_link_prompt_block_reaches_daemon_as_rendered_mention() {
 }
 
 #[tokio::test]
+async fn image_prompt_block_reaches_daemon_as_inline_image() {
+    // Borg advertises `promptCapabilities.image: true`; an image block must
+    // decode and arrive at the daemon as an inline image attachment on the
+    // turn (not silently dropped). The scripted backend reports how many
+    // images it received.
+    let backend = borgd::session::scripted::ScriptedBackend::new(
+        "image-echo",
+        move |_t, images, tx, _cancel, _bridge| {
+            tokio::spawn(async move {
+                let marker = format!(
+                    "IMGS:{}:{}",
+                    images.len(),
+                    images
+                        .first()
+                        .map(|i| i.mime_type.clone())
+                        .unwrap_or_default()
+                );
+                let _ = tx.send(cortex::agent::AgentEvent::TextDelta(marker)).await;
+                let _ = tx.send(cortex::agent::AgentEvent::TurnComplete).await;
+            })
+        },
+    );
+    let fixture = BorgdFixture::with_backend(backend).await;
+    let mut client = AcpClient::spawn(&fixture).await.expect("spawn");
+    let _ = client
+        .request("initialize", initialize_params_with_fs())
+        .await
+        .expect("initialize");
+    let cwd = fixture.workspace_path().display().to_string();
+    let new = client
+        .request("session/new", json!({"cwd": cwd}))
+        .await
+        .expect("session/new");
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
+    let resp = client
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "mimeType": "image/png", "data": "cG5nLWJ5dGVz"},
+                ],
+            }),
+        )
+        .await
+        .expect("session/prompt with image");
+    assert_eq!(resp["result"]["stopReason"], json!("end_turn"));
+    let echoed: String = client
+        .raw_stdout_lines()
+        .await
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|f| f["params"]["update"]["sessionUpdate"] == json!("agent_message_chunk"))
+        .filter_map(|f| {
+            f["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        echoed.contains("IMGS:1:image/png"),
+        "the decoded image must reach the daemon as one inline attachment; got {echoed:?}"
+    );
+}
+
+#[tokio::test]
 async fn audio_prompt_block_rejected_with_invalid_params() {
     // Borg advertises `audio: false`; a client that sends audio anyway must
     // get a clean -32602 rather than a crash or a silent drop.

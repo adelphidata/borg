@@ -1414,7 +1414,11 @@ mod tests {
 
         db.run_migrations().await.unwrap();
 
-        let mut rows = db.conn.query("PRAGMA table_info(messages)", ()).await.unwrap();
+        let mut rows = db
+            .conn
+            .query("PRAGMA table_info(messages)", ())
+            .await
+            .unwrap();
         let mut cols: Vec<String> = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             cols.push(row.get::<String>(1).unwrap());
@@ -1432,7 +1436,9 @@ mod tests {
         );
 
         // The originally-failing operation now succeeds end-to-end.
-        db.upsert_session("s1", 100, 100, 0, "m", "test").await.unwrap();
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         db.insert_message("s1", "user", Some("hello"), None, None, None, None)
             .await
             .unwrap();
