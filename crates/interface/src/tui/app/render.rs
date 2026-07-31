@@ -747,11 +747,17 @@ impl<'a> App<'a> {
         if len == 0 || self.cells_emitted >= len {
             return;
         }
-        let turn_in_flight = matches!(
+        // A `/doctor` run mutates its `⏳ Analyzing …` placeholder in place
+        // (bounded by `cells_emitted`) while the app state stays Idle, so an
+        // in-flight doctor reserves the tail exactly like a streaming turn —
+        // otherwise the placeholder flushes to scrollback and every result
+        // lands as a stranded duplicate. `doctor_rx` is `Some` for precisely
+        // the lifetime of the run.
+        let tail_reserved = matches!(
             self.state,
             AppState::Streaming { .. } | AppState::AwaitingApproval { .. }
-        );
-        let flush_end = if turn_in_flight {
+        ) || self.doctor_rx.is_some();
+        let flush_end = if tail_reserved {
             len.saturating_sub(1)
         } else {
             len
@@ -798,6 +804,16 @@ impl<'a> App<'a> {
             }),
             // Streaming Assistant cells (still receiving deltas) are not stable.
             HistoryCell::Assistant { streaming, .. } => !*streaming,
+            // The live plan is rewritten in place by every `PlanUpdated`
+            // (`handle_event_plan_updated` searches `cells[cells_emitted..]`).
+            // `update_plan` emits PlanUpdated *before* its ToolResult, so a
+            // Plan cell mid-turn is not the reserved tail — flushing it would
+            // strand the old plan in scrollback and duplicate the block on
+            // the next update. Stable again once the turn is over.
+            HistoryCell::Plan { .. } => !matches!(
+                self.state,
+                AppState::Streaming { .. } | AppState::AwaitingApproval { .. }
+            ),
             _ => true,
         }
     }
@@ -1165,6 +1181,54 @@ mod tests {
         assert_eq!(
             app.cells_emitted, 0,
             "pending approval must block the flush walk"
+        );
+    }
+
+    #[test]
+    fn doctor_run_reserves_idle_tail() {
+        // Regression: `/doctor` runs with AppState::Idle and replaces its
+        // `⏳ Analyzing …` System placeholder in place, searching only
+        // `cells[cells_emitted..]`. The idle flush emitted the placeholder
+        // to scrollback, so every doctor step left a stranded spinner line
+        // followed by a duplicate results cell.
+        let mut app = make_app();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<super::super::DoctorEvent>(1);
+        app.doctor_rx = Some(rx);
+        app.cells.push(HistoryCell::System {
+            text: "⏳ Analyzing Configuration...".into(),
+        });
+        app.flush_stable_cells(80);
+        assert_eq!(
+            app.cells_emitted, 0,
+            "the doctor placeholder must stay mutable in the viewport"
+        );
+        // Once the run ends (doctor_rx cleared) the tail flushes normally.
+        app.doctor_rx = None;
+        app.flush_stable_cells(80);
+        assert_eq!(app.cells_emitted, 1, "results flush after the run ends");
+    }
+
+    #[test]
+    fn plan_cell_stays_unflushed_while_turn_in_flight() {
+        // Regression: `update_plan` emits PlanUpdated *before* its
+        // ToolResult, so the Plan cell is not the reserved tail. Flushing
+        // it mid-turn makes the next PlanUpdated (which searches
+        // `cells[cells_emitted..]`) push a duplicate plan block.
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.cells.push(HistoryCell::Plan {
+            steps: vec![cortex::types::PlanStep {
+                title: "step".into(),
+                status: cortex::types::PlanStepStatus::InProgress,
+            }],
+        });
+        app.cells.push(HistoryCell::Heartbeat { text: "hb".into() });
+        app.flush_stable_cells(80);
+        assert_eq!(
+            app.cells_emitted, 0,
+            "the live plan must stay in the viewport for in-place rewrites"
         );
     }
 

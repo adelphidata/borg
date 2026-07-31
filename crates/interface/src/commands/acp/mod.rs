@@ -846,13 +846,14 @@ mod tests {
     /// stripping on `ToolOutputDelta`, this fails.
     #[test]
     fn tool_output_delta_strips_internal_tags_on_wire() {
+        let mut streams = ToolCallStreams::default();
         let event = AgentEvent::ToolOutputDelta {
             tool_call_id: "c1".into(),
             name: "run_shell".into(),
             delta: "before <internal>secret-plan</internal> after".into(),
             is_stderr: false,
         };
-        let update = event_to_update(&event, "sess-1").expect("update");
+        let update = streams.update_for(&event, "sess-1").expect("update");
         assert_eq!(
             update["update"]["content"][0]["content"]["text"],
             "before  after"
@@ -861,17 +862,104 @@ mod tests {
         assert_eq!(update["update"]["_meta"]["borg"]["stream"], "stdout");
 
         let stderr_event = AgentEvent::ToolOutputDelta {
-            tool_call_id: "c1".into(),
+            tool_call_id: "c2".into(),
             name: "run_shell".into(),
             delta: "<internal>x</internal>err".into(),
             is_stderr: true,
         };
-        let stderr_update = event_to_update(&stderr_event, "sess-1").expect("update");
+        let stderr_update = streams.update_for(&stderr_event, "sess-1").expect("update");
         assert_eq!(
             stderr_update["update"]["content"][0]["content"]["text"],
             "err"
         );
         assert_eq!(stderr_update["update"]["_meta"]["borg"]["stream"], "stderr");
+    }
+
+    /// ACP `tool_call_update.content` REPLACES the client's content
+    /// collection ("Replace the content collection." in the schema), so
+    /// each streamed frame must carry the full output so far. A per-delta
+    /// single chunk regresses spec clients to showing only the newest
+    /// fragment of a streaming shell command.
+    #[test]
+    fn tool_output_deltas_accumulate_into_replace_shaped_content() {
+        let mut streams = ToolCallStreams::default();
+        let delta = |text: &str| AgentEvent::ToolOutputDelta {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            delta: text.into(),
+            is_stderr: false,
+        };
+        let first = streams.update_for(&delta("file-a\n"), "s").expect("update");
+        assert_eq!(first["update"]["content"][0]["content"]["text"], "file-a\n");
+        let second = streams.update_for(&delta("file-b\n"), "s").expect("update");
+        assert_eq!(
+            second["update"]["content"][0]["content"]["text"], "file-a\nfile-b\n",
+            "replace-semantics frames must carry the full accumulated output"
+        );
+        // `<internal>` tags split across delta boundaries are stripped once
+        // the accumulation reassembles them.
+        let mut split = ToolCallStreams::default();
+        split.update_for(
+            &AgentEvent::ToolOutputDelta {
+                tool_call_id: "c2".into(),
+                name: "run_shell".into(),
+                delta: "keep <inter".into(),
+                is_stderr: false,
+            },
+            "s",
+        );
+        let rejoined = split
+            .update_for(
+                &AgentEvent::ToolOutputDelta {
+                    tool_call_id: "c2".into(),
+                    name: "run_shell".into(),
+                    delta: "nal>secret</internal> this".into(),
+                    is_stderr: false,
+                },
+                "s",
+            )
+            .expect("update");
+        let text = rejoined["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !text.contains("secret"),
+            "tag split across deltas must still be stripped: {text:?}"
+        );
+    }
+
+    /// A PTY reader that outlives its tool timeout keeps emitting deltas
+    /// after `ToolResult`. Forwarding them would flip the completed card
+    /// back to `in_progress` and wipe its final content (replace
+    /// semantics), leaving a spinner running forever in the IDE.
+    #[test]
+    fn late_tool_output_delta_after_result_is_dropped() {
+        let mut streams = ToolCallStreams::default();
+        let result = AgentEvent::ToolResult {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            result: "final".into(),
+        };
+        let completed = streams.update_for(&result, "s").expect("update");
+        assert_eq!(completed["update"]["status"], "completed");
+        let late = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            delta: "stray pty output".into(),
+            is_stderr: true,
+        };
+        assert!(
+            streams.update_for(&late, "s").is_none(),
+            "a delta for a completed call must not re-open it"
+        );
+        // Other calls are unaffected.
+        let other = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c2".into(),
+            name: "run_shell".into(),
+            delta: "live".into(),
+            is_stderr: false,
+        };
+        assert!(streams.update_for(&other, "s").is_some());
     }
 
     #[tokio::test]
@@ -1148,8 +1236,37 @@ mod tests {
             },
         ])
         .expect("resource_link must be accepted");
-        assert_eq!(prompt.text, "look at\n[main.rs](file:///ws/src/main.rs)");
+        // `file:` URIs are decoded to plain absolute paths: the daemon's
+        // path resolution has no `file://` handling, so the raw URI would
+        // resolve to `<cwd>/file:/ws/...` and fail every tool call the
+        // model copies it into.
+        assert_eq!(prompt.text, "look at\n[main.rs](/ws/src/main.rs)");
         assert!(prompt.images.is_empty());
+    }
+
+    /// Zed percent-encodes `file:` URIs, so a path with a space arrives as
+    /// `%20`. The daemon's file tools look up literal bytes — an undecoded
+    /// `%20` never matches the on-disk name, and unlike the bare-scheme
+    /// case the model can't recover without guessing.
+    #[test]
+    fn resource_link_file_uris_are_percent_decoded() {
+        let prompt = parse_prompt_blocks(&[
+            PromptBlock::ResourceLink {
+                uri: "file:///ws/my%20file.rs".into(),
+                name: "my file.rs".into(),
+                title: None,
+            },
+            PromptBlock::ResourceLink {
+                uri: "https://example.com/a%20b".into(),
+                name: "docs".into(),
+                title: None,
+            },
+        ])
+        .expect("prompt");
+        assert_eq!(
+            prompt.text, "[my file.rs](/ws/my file.rs)\n[docs](https://example.com/a%20b)",
+            "file URIs decode to plain paths; non-file schemes pass through untouched"
+        );
     }
 
     /// `title` (display label) wins over `name` when present.
@@ -1161,7 +1278,7 @@ mod tests {
             title: Some("Project readme".into()),
         }])
         .expect("prompt");
-        assert_eq!(prompt.text, "[Project readme](file:///ws/README.md)");
+        assert_eq!(prompt.text, "[Project readme](/ws/README.md)");
     }
 
     /// Audio and embedded-resource blocks are gated behind prompt
@@ -2182,20 +2299,8 @@ mod tests {
     }
 
     /// Poll the captured output until a frame with the given method appears.
-    /// Bounded so a regression hangs the assertion, not the whole test run.
     async fn wait_for_outbound_frame(output: &Arc<StdMutex<Vec<u8>>>, method: &str) -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let frames = parse_lines(output.lock().unwrap().clone());
-            if let Some(frame) = frames.iter().find(|f| f["method"] == json!(method)) {
-                return frame.clone();
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for outbound {method} frame; got: {frames:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_for_predicate_frame(output, |f| f["method"] == json!(method)).await
     }
 
     /// Full fs-callback roundtrip through the live transport: the daemon

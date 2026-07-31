@@ -268,19 +268,72 @@ impl Database {
         Ok(())
     }
 
+    /// True if `name` exists as a table in the main schema. Used by the
+    /// shape repair: `PRAGMA table_info` on a missing table yields zero rows
+    /// and no error, so an unguarded ALTER-based re-run would attempt every
+    /// ADD COLUMN and abort the whole migration transaction with "no such
+    /// table" — turning a damaged-but-openable DB into one that fails boot.
+    pub(super) async fn table_exists(&self, name: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
     /// Shape repair for stranded DBs. All worktrees share `~/.borg/borg.db`,
     /// so a binary whose migration numbering differed can stamp
-    /// `schema_version` past a column-adding migration without ever running
-    /// it — e.g. a DB at version 10 whose `messages` table still lacks the
-    /// v8 `hmac`/`prev_hmac`/`event_*` columns, making every message persist
-    /// fail with "no such column: hmac". Re-run the idempotent ALTER-based
-    /// migrations; each probes `PRAGMA table_info` first, so on a healthy DB
-    /// this is a no-op.
+    /// `schema_version` past a migration without ever running it — e.g. a
+    /// DB at version 10 whose `messages` table still lacks the v8
+    /// `hmac`/`prev_hmac`/`event_*` columns, making every message persist
+    /// fail with "no such column: hmac". Re-run every idempotent migration:
+    /// the table/index-creating ones are `IF NOT EXISTS` throughout, and the
+    /// ALTER-based ones probe `PRAGMA table_info` first, so on a healthy DB
+    /// this is read-only probing plus no-op DDL.
+    ///
+    /// `run_migrations` also invokes this when `schema_version` is already
+    /// at (or past) `CURRENT_VERSION` — the stamp alone proves nothing on a
+    /// shared DB, and gating the repair on the version number would leave
+    /// the exact stranding class it exists to fix unrepaired.
     pub(super) async fn migrate_v11(&self) -> Result<()> {
-        self.migrate_v5().await?;
-        self.migrate_v6().await?;
-        self.migrate_v8().await?;
-        self.migrate_v9().await?;
+        // Table-creating repairs (v3, v10) are unconditional `IF NOT EXISTS`.
+        self.migrate_v3().await?;
+        self.migrate_v10().await?;
+        // ALTER-based repairs need their base table; a base table can only
+        // be missing on a DB that never ran an equivalent of `migrate_v1`,
+        // which is damage this repair can't fix — warn instead of aborting
+        // the open.
+        let sessions = self.table_exists("sessions").await?;
+        let messages = self.table_exists("messages").await?;
+        let sub_agent_runs = self.table_exists("sub_agent_runs").await?;
+        if sessions {
+            self.migrate_v5().await?;
+            self.migrate_v9().await?;
+        } else {
+            tracing::warn!(
+                "shape repair: `sessions` table missing entirely; skipping column repair"
+            );
+        }
+        if sub_agent_runs {
+            self.migrate_v6().await?;
+        } else {
+            tracing::warn!(
+                "shape repair: `sub_agent_runs` table missing entirely; skipping column repair"
+            );
+        }
+        if messages {
+            self.migrate_v8().await?;
+        } else {
+            tracing::warn!(
+                "shape repair: `messages` table missing entirely; skipping column repair"
+            );
+        }
+        if sessions && messages {
+            self.migrate_v7().await?;
+        }
         Ok(())
     }
 
@@ -1442,5 +1495,78 @@ mod tests {
         db.insert_message("s1", "user", Some("hello"), None, None, None, None)
             .await
             .unwrap();
+    }
+
+    // The stranding mechanism is version-number-based, so a divergent binary
+    // can just as well stamp AT (or past) CURRENT_VERSION. The repair must
+    // not be gated on `current < CURRENT_VERSION` — that would leave the
+    // exact population the fix targets permanently broken.
+    #[tokio::test]
+    async fn shape_repair_runs_even_when_version_already_current() {
+        let db = Database::test_db().await;
+
+        db.conn
+            .execute_batch(
+                "DROP TABLE messages;
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_calls_json TEXT,
+                    tool_call_id TEXT,
+                    timestamp TEXT,
+                    created_at INTEGER NOT NULL,
+                    content_parts_json TEXT
+                 );",
+            )
+            .await
+            .unwrap();
+        db.set_meta("schema_version", &Database::CURRENT_VERSION.to_string())
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query("PRAGMA table_info(messages)", ())
+            .await
+            .unwrap();
+        let mut cols: Vec<String> = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            cols.push(row.get::<String>(1).unwrap());
+        }
+        for required in ["event_kind", "event_json", "hmac", "prev_hmac"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "repair must run on a fully-stamped DB; missing {required}: {cols:?}"
+            );
+        }
+    }
+
+    // A stranded DB can be missing whole tables (v3/v10 are CREATE-based),
+    // not just columns — the repair must recreate them, and must not abort
+    // the open when an ALTER target table is absent entirely.
+    #[tokio::test]
+    async fn shape_repair_recreates_missing_tables_and_survives_absent_alter_targets() {
+        let db = Database::test_db().await;
+
+        db.conn
+            .execute_batch(
+                "DROP TABLE mcp_catalog_cache;
+                 DROP TABLE sub_agent_runs;",
+            )
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "10").await.unwrap();
+
+        // Must not error even though migrate_v6's ALTER target is gone.
+        db.run_migrations().await.unwrap();
+
+        assert!(
+            db.table_exists("mcp_catalog_cache").await.unwrap(),
+            "CREATE-based v10 must be part of the shape repair"
+        );
     }
 }

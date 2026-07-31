@@ -23,17 +23,18 @@ use cortex::types::{PlanStep, PlanStepStatus};
 use serde_json::{json, Value};
 use std::path::Path;
 
-fn schema_root() -> Value {
+/// The vendored schema parsed once — it is ~240 KB, and each test builds
+/// several per-definition validators from the same document.
+static SCHEMA_ROOT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
     serde_json::from_str(include_str!("fixtures/acp_schema_v1.json"))
         .expect("vendored ACP schema parses")
-}
+});
 
 /// Build a validator for one `$defs` entry of the vendored schema.
 fn validator_for_def(def: &str) -> jsonschema::Validator {
-    let root = schema_root();
     let subschema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$defs": root["$defs"],
+        "$defs": &SCHEMA_ROOT["$defs"],
         "$ref": format!("#/$defs/{def}"),
     });
     jsonschema::validator_for(&subschema)

@@ -10,7 +10,7 @@ use cortex::agent::AgentEvent;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::translate::{event_to_update, history_replay_update};
+use super::translate::{history_replay_update, ToolCallStreams};
 use super::transport::{
     send_error, send_notification, send_result, JsonRpcCallbackClient, JsonRpcRequest,
     SessionFsClient, SharedWriter,
@@ -256,6 +256,7 @@ pub(super) async fn handle_request<D: AcpDaemon>(
             };
             let mut stop_reason = "end_turn";
             let mut termination = StreamTermination::Disconnected;
+            let mut tool_streams = ToolCallStreams::default();
             while let Some(event) = events.recv().await {
                 match &event {
                     AgentEvent::TurnComplete => {
@@ -271,7 +272,7 @@ pub(super) async fn handle_request<D: AcpDaemon>(
                         break;
                     }
                     _ => {
-                        if let Some(update) = event_to_update(&event, &params.session_id) {
+                        if let Some(update) = tool_streams.update_for(&event, &params.session_id) {
                             // A writer failure here used to propagate via
                             // `?`, bypassing the cleanup block below and
                             // leaving `prompt_in_flight = true` forever.
@@ -421,6 +422,45 @@ pub(super) fn validate_workspace_cwd(cwd: &str) -> Result<PathBuf> {
 /// fit comfortably).
 pub(super) const MAX_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 
+/// Append one text fragment to the prompt, charging it (plus the `\n`
+/// separator added between non-first fragments) against the remaining
+/// budget. Shared by every text-shaped prompt block so the cap accounting
+/// can't drift between block types.
+fn push_text_part(
+    text_parts: &mut Vec<String>,
+    budget: &mut usize,
+    part: String,
+    label: &str,
+) -> Result<()> {
+    let separator_bytes = if text_parts.is_empty() { 0 } else { 1 };
+    let cost = part.len().saturating_add(separator_bytes);
+    if cost > *budget {
+        return Err(anyhow!(AcpRequestError::invalid_params(format!(
+            "prompt too large: {label} exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
+        ))));
+    }
+    *budget -= cost;
+    text_parts.push(part);
+    Ok(())
+}
+
+/// Resolve a `resource_link` URI to the form the model should see. `file:`
+/// URIs (Zed `@file` mentions) become plain percent-decoded absolute paths —
+/// nothing in the daemon's path resolution understands the `file://` scheme
+/// or `%20` escapes, so passing the raw URI through produces tool calls
+/// that resolve to `<cwd>/file:/...` and fail. Non-file schemes (http,
+/// zed://, ...) pass through untouched.
+fn resource_link_target(uri: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(uri) {
+        if parsed.scheme() == "file" {
+            if let Ok(path) = parsed.to_file_path() {
+                return path.display().to_string();
+            }
+        }
+    }
+    uri.to_string()
+}
+
 /// Convert ACP prompt blocks into the daemon's `(text, images)` shape.
 ///
 /// **Interleaving is not preserved.** Text fragments are concatenated in
@@ -436,17 +476,7 @@ pub(super) fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput>
     for block in blocks {
         match block {
             PromptBlock::Text { text } => {
-                // `\n` separator added between non-first text blocks counts
-                // toward the cap so we don't undercount the final string.
-                let separator_bytes = if text_parts.is_empty() { 0 } else { 1 };
-                let cost = text.len().saturating_add(separator_bytes);
-                if cost > budget {
-                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
-                        "prompt too large: text block exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
-                    ))));
-                }
-                budget -= cost;
-                text_parts.push(text.clone());
+                push_text_part(&mut text_parts, &mut budget, text.clone(), "text block")?;
             }
             PromptBlock::Image {
                 mime_type,
@@ -484,19 +514,11 @@ pub(super) fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput>
             }
             PromptBlock::ResourceLink { uri, name, title } => {
                 // Render the mention as a markdown link so the model sees
-                // both the human label and the resolvable URI. The daemon's
-                // workspace-scoped file tools can follow `file://` paths.
+                // both the human label and a target it can actually pass to
+                // the daemon's file tools (see `resource_link_target`).
                 let label = title.as_deref().unwrap_or(name);
-                let rendered = format!("[{label}]({uri})");
-                let separator_bytes = if text_parts.is_empty() { 0 } else { 1 };
-                let cost = rendered.len().saturating_add(separator_bytes);
-                if cost > budget {
-                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
-                        "prompt too large: resource_link exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
-                    ))));
-                }
-                budget -= cost;
-                text_parts.push(rendered);
+                let rendered = format!("[{label}]({})", resource_link_target(uri));
+                push_text_part(&mut text_parts, &mut budget, rendered, "resource_link")?;
             }
             PromptBlock::Resource { .. } => {
                 return Err(anyhow!(AcpRequestError::invalid_params(

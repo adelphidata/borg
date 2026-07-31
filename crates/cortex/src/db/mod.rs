@@ -736,7 +736,17 @@ impl Database {
 
         let current = self.schema_version().await?;
         if current >= Self::CURRENT_VERSION {
-            return Ok(());
+            // The stamp alone doesn't prove the shape: worktrees share
+            // `~/.borg/borg.db`, and a divergently-numbered binary can
+            // stamp any version — including one at or past ours — without
+            // having run our migrations. Run the probe-first shape repair
+            // on every open; on a healthy DB it is read-only PRAGMA /
+            // sqlite_master probes plus no-op `IF NOT EXISTS` DDL. It runs
+            // outside the writer transaction: writes only happen on a
+            // damaged DB, where each step is individually idempotent, so a
+            // crash or a rare concurrent-repair race just leaves work for
+            // the next open instead of corrupting anything.
+            return self.migrate_v11().await;
         }
 
         // Acquire the writer lock explicitly. libsql's `Transaction` API is

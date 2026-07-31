@@ -9,6 +9,8 @@
 //! `ToolCallContent` array, and plan entries are
 //! `{content, priority, status}`.
 
+use std::collections::{HashMap, HashSet};
+
 use cortex::agent::AgentEvent;
 use cortex::internal_tag_filter::strip_internal_tags;
 use serde_json::{json, Value};
@@ -86,26 +88,12 @@ pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Va
                 "rawInput": raw_input_value(args),
             }
         })),
-        AgentEvent::ToolOutputDelta {
-            tool_call_id,
-            name: _,
-            delta,
-            is_stderr,
-        } => Some(json!({
-            "sessionId": session_id,
-            "update": {
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": tool_call_id,
-                "status": "in_progress",
-                "content": tool_text_content(delta),
-                // `_meta` is ACP's sanctioned extension point; spec content
-                // blocks carry no stdout/stderr distinction, so surface it
-                // there for clients that want to style error output.
-                "_meta": {
-                    "borg": { "stream": if *is_stderr { "stderr" } else { "stdout" } }
-                }
-            }
-        })),
+        // ToolOutputDelta is deliberately absent: per spec,
+        // `tool_call_update.content` REPLACES the client's content
+        // collection, so delta frames must carry the accumulated output —
+        // state this pure function cannot hold. Route tool streams through
+        // [`ToolCallStreams::update_for`], which owns that accumulator and
+        // delegates every other variant back here.
         AgentEvent::ToolResult {
             tool_call_id,
             name: _,
@@ -133,6 +121,84 @@ pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Va
             }
         })),
         _ => None,
+    }
+}
+
+/// Per-turn accumulator turning Borg's incremental tool-output deltas into
+/// spec-shaped `tool_call_update` frames.
+///
+/// The ACP schema documents `ToolCallUpdate.content` as "Replace the
+/// content collection" — a conformant client (Zed, etc.) discards whatever
+/// it was showing and renders exactly the array in the frame. Emitting each
+/// delta as a one-element array therefore made streamed shell output
+/// flicker: the card only ever showed the newest chunk. Accumulate the raw
+/// deltas per `tool_call_id` and send the full output so far on every frame.
+///
+/// The accumulator also guards the completed→in_progress regression: a PTY
+/// reader that outlives its tool timeout keeps emitting `ToolOutputDelta`
+/// after `ToolResult` has reported `completed`. Forwarding those frames
+/// would flip the finished card back to running and replace its final
+/// content with a stray fragment, so late deltas for a completed call are
+/// dropped.
+#[derive(Default)]
+pub(super) struct ToolCallStreams {
+    /// Raw (unstripped) accumulated output per in-flight call. Stripping
+    /// happens at frame-build time so `<internal>` tags split across two
+    /// deltas are still removed once reassembled.
+    output: HashMap<String, String>,
+    /// Calls that already reported `completed`.
+    completed: HashSet<String>,
+}
+
+impl ToolCallStreams {
+    /// Cap on accumulated bytes per call. Streaming frames stop growing
+    /// past this point (the preview freezes); the final `ToolResult` frame
+    /// still carries the daemon-truncated full output, so nothing is lost
+    /// at completion.
+    const MAX_STREAM_BYTES: usize = 256 * 1024;
+
+    /// Stateful counterpart of [`event_to_update`]: identical for every
+    /// event except `ToolOutputDelta` (accumulated, replace-semantics
+    /// content) and `ToolResult` (marks the call completed).
+    pub(super) fn update_for(&mut self, event: &AgentEvent, session_id: &str) -> Option<Value> {
+        match event {
+            AgentEvent::ToolOutputDelta {
+                tool_call_id,
+                name: _,
+                delta,
+                is_stderr,
+            } => {
+                if self.completed.contains(tool_call_id) {
+                    return None;
+                }
+                let acc = self.output.entry(tool_call_id.clone()).or_default();
+                if acc.len() < Self::MAX_STREAM_BYTES {
+                    acc.push_str(delta);
+                }
+                Some(json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_call_id,
+                        "status": "in_progress",
+                        "content": tool_text_content(acc),
+                        // `_meta` is ACP's sanctioned extension point; spec
+                        // content blocks carry no stdout/stderr distinction,
+                        // so surface the latest delta's stream there for
+                        // clients that want to style error output.
+                        "_meta": {
+                            "borg": { "stream": if *is_stderr { "stderr" } else { "stdout" } }
+                        }
+                    }
+                }))
+            }
+            AgentEvent::ToolResult { tool_call_id, .. } => {
+                self.output.remove(tool_call_id);
+                self.completed.insert(tool_call_id.clone());
+                event_to_update(event, session_id)
+            }
+            _ => event_to_update(event, session_id),
+        }
     }
 }
 

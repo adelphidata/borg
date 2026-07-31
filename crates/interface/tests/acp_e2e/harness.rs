@@ -390,7 +390,6 @@ pub struct PromptOutcome {
     pub stop_reason: Option<String>,
     pub error: Option<Value>,
     pub updates: Vec<Value>,
-    pub session_info_updates: Vec<Value>,
 }
 
 impl PromptOutcome {
@@ -670,15 +669,15 @@ impl AcpClient {
         let captured: Vec<&Notification> = nots[nots_before..].iter().collect();
         let mut outcome = PromptOutcome::default();
         for n in captured {
-            if n.method == "session/update" {
-                // Session metadata is a `session_info_update` *variant* of
-                // `session/update` per spec; partition it from the
-                // content/tool/plan stream so tests can assert each shape.
-                if n.params["update"]["sessionUpdate"] == json!("session_info_update") {
-                    outcome.session_info_updates.push(n.params.clone());
-                } else {
-                    outcome.updates.push(n.params.clone());
-                }
+            // Session metadata is a `session_info_update` *variant* of
+            // `session/update` per spec; keep it out of the content/tool/
+            // plan stream so update-counting assertions stay stable.
+            // (Tests that need the metadata frame itself read
+            // `raw_stdout_lines` — see protocol.rs / spec_conformance.rs.)
+            if n.method == "session/update"
+                && n.params["update"]["sessionUpdate"] != json!("session_info_update")
+            {
+                outcome.updates.push(n.params.clone());
             }
         }
         if let Some(result) = envelope.get("result") {
@@ -715,10 +714,24 @@ impl Drop for AcpClient {
             // flush coverage profiles under `cargo llvm-cov`. A detached
             // watchdog thread reaps a hung subprocess after a grace period;
             // detached threads die with the test process, so this never
-            // blocks the suite.
+            // blocks the suite. Poll rather than blind-sleep: the common
+            // case exits within milliseconds, and the fixture's serial lock
+            // is released right after this Drop — a subprocess lingering
+            // for the full grace period would overlap the next test's use
+            // of the shared BORG_DATA_DIR database.
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(3));
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return, // exited cleanly; profiles flushed
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        _ => break,
+                    }
+                }
                 let _ = child.start_kill();
+                let _ = child.try_wait(); // reap so no zombie outlives the grace
             });
         }
     }

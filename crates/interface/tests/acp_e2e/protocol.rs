@@ -173,8 +173,9 @@ async fn resource_link_prompt_block_reaches_daemon_as_rendered_mention() {
         })
         .collect();
     assert!(
-        echoed.contains("explain\n[main.rs](file:///ws/src/main.rs)"),
-        "daemon must receive the rendered mention; echoed prompt: {echoed:?}"
+        echoed.contains("explain\n[main.rs](/ws/src/main.rs)"),
+        "daemon must receive the mention rendered with a plain decoded path \
+         (not the raw file:// URI); echoed prompt: {echoed:?}"
     );
 }
 

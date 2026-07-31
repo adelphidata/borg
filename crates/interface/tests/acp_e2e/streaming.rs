@@ -35,14 +35,6 @@ async fn run_with_events(events: Vec<AgentEvent>) -> PromptOutcome {
     client.run_prompt(&sid, "go").await.expect("session/prompt")
 }
 
-fn updates_with_kind<'a>(outcome: &'a PromptOutcome, kind: &str) -> Vec<&'a Value> {
-    outcome
-        .updates
-        .iter()
-        .filter(|u| u["update"]["sessionUpdate"] == json!(kind))
-        .collect()
-}
-
 /// Extract the text payload of a message-chunk update (spec shape:
 /// `update.content` is a `{type:"text", text}` ContentBlock).
 fn chunk_text(update: &Value) -> Option<&str> {
@@ -59,7 +51,7 @@ async fn text_delta_arrives_as_agent_message_chunk_in_order() {
         AgentEvent::TurnComplete,
     ])
     .await;
-    let chunks = updates_with_kind(&outcome, "agent_message_chunk");
+    let chunks = outcome.updates_of_kind("agent_message_chunk");
     let texts: Vec<&str> = chunks.iter().filter_map(|u| chunk_text(u)).collect();
     assert_eq!(
         texts,
@@ -80,7 +72,7 @@ async fn internal_tags_are_stripped_from_text_deltas() {
         AgentEvent::TurnComplete,
     ])
     .await;
-    let chunks = updates_with_kind(&outcome, "agent_message_chunk");
+    let chunks = outcome.updates_of_kind("agent_message_chunk");
     let combined: String = chunks.iter().filter_map(|u| chunk_text(u)).collect();
     assert!(
         !combined.contains("secret thoughts"),
@@ -122,8 +114,8 @@ async fn tool_lifecycle_preserves_stable_tool_call_id() {
     ])
     .await;
 
-    let tool_calls = updates_with_kind(&outcome, "tool_call");
-    let tool_updates = updates_with_kind(&outcome, "tool_call_update");
+    let tool_calls = outcome.updates_of_kind("tool_call");
+    let tool_updates = outcome.updates_of_kind("tool_call_update");
 
     assert_eq!(
         tool_calls.len(),
@@ -203,7 +195,7 @@ async fn tool_output_delta_marks_stderr_stream_separately() {
     ])
     .await;
 
-    let updates = updates_with_kind(&outcome, "tool_call_update");
+    let updates = outcome.updates_of_kind("tool_call_update");
     // Spec content blocks carry no stdout/stderr distinction; Borg surfaces
     // it via `_meta` (ACP's sanctioned extension point) on output deltas.
     let streams: Vec<&str> = updates
@@ -214,6 +206,14 @@ async fn tool_output_delta_marks_stderr_stream_separately() {
         streams,
         vec!["stdout", "stderr"],
         "_meta stream tag must distinguish stdout vs stderr in order"
+    );
+    // `tool_call_update.content` is replace-semantics per spec, so the
+    // second delta frame must carry the accumulated output — a spec client
+    // renders exactly this array and would otherwise drop the stdout line.
+    assert_eq!(
+        updates[1]["update"]["content"][0]["content"]["text"],
+        json!("out-lineerr-line"),
+        "each streamed frame must carry the full output so far"
     );
 }
 
@@ -244,7 +244,7 @@ async fn plan_updated_emits_full_entries_with_medium_priority() {
     ])
     .await;
 
-    let plans = updates_with_kind(&outcome, "plan");
+    let plans = outcome.updates_of_kind("plan");
     assert_eq!(plans.len(), 1, "one plan notification per PlanUpdated");
     let entries = plans[0]["update"]["entries"]
         .as_array()
