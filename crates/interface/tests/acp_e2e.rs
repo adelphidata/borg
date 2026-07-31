@@ -24,6 +24,8 @@ mod fs_bridge;
 mod lifecycle;
 #[path = "acp_e2e/protocol.rs"]
 mod protocol;
+#[path = "acp_e2e/spec_conformance.rs"]
+mod spec_conformance;
 #[path = "acp_e2e/streaming.rs"]
 mod streaming;
 #[path = "acp_e2e/workspace.rs"]

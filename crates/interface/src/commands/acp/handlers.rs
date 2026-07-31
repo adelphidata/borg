@@ -72,21 +72,13 @@ pub(super) enum PromptBlock {
         title: Option<String>,
     },
     /// Embedded resource context. Gated behind the `embeddedContext`
-    /// prompt capability, which Borg does not advertise — parsed
-    /// structurally so we can reject it with a clean invalid_params
-    /// instead of a serde "unknown variant" catch-all.
-    Resource {
-        #[serde(default)]
-        resource: Value,
-    },
+    /// prompt capability, which Borg does not advertise — matched
+    /// structurally (payload fields ignored) so we can reject it with a
+    /// clean invalid_params instead of a serde "unknown variant" catch-all.
+    Resource {},
     /// Audio content. Gated behind the `audio` prompt capability, which
     /// Borg does not advertise.
-    Audio {
-        #[serde(default, rename = "mimeType")]
-        mime_type: Option<String>,
-        #[serde(default)]
-        data: Option<String>,
-    },
+    Audio {},
 }
 
 #[derive(Debug, Deserialize)]

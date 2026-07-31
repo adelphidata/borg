@@ -1110,11 +1110,8 @@ mod tests {
     /// naming the missing capability — not a serde "unknown variant" blob.
     #[test]
     fn audio_and_resource_blocks_reject_with_capability_error() {
-        let audio_err = parse_prompt_blocks(&[PromptBlock::Audio {
-            mime_type: Some("audio/wav".into()),
-            data: Some("AAAA".into()),
-        }])
-        .expect_err("audio must reject");
+        let audio_err =
+            parse_prompt_blocks(&[PromptBlock::Audio {}]).expect_err("audio must reject");
         let mapped = AcpRequestError::from_anyhow(&audio_err);
         assert_eq!(mapped.code, -32602);
         assert!(
@@ -1122,10 +1119,8 @@ mod tests {
             "error must name the capability: {audio_err}"
         );
 
-        let resource_err = parse_prompt_blocks(&[PromptBlock::Resource {
-            resource: json!({"uri": "file:///x", "text": "embedded"}),
-        }])
-        .expect_err("embedded resource must reject");
+        let resource_err = parse_prompt_blocks(&[PromptBlock::Resource {}])
+            .expect_err("embedded resource must reject");
         let mapped = AcpRequestError::from_anyhow(&resource_err);
         assert_eq!(mapped.code, -32602);
         assert!(
