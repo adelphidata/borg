@@ -539,10 +539,35 @@ impl Database {
         // process WAL means borgd + a second CLI handle can share the DB.
         // Failure here is fatal; we never want to silently fall back to
         // rollback-journal mode and resurrect the locking-error class of
-        // bugs that drove this migration.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .await
-            .context("set journal_mode=WAL")?;
+        // bugs that drove this migration. `journal_mode` is a result-returning
+        // pragma: SQLite reports the mode actually in effect and does NOT
+        // error when the switch is refused (network/FUSE filesystem, read-only
+        // directory), so the result must be read back and verified.
+        // Scoped + fully drained: an un-finalized Rows cursor holds its
+        // statement open, which blocks the migration transaction's COMMIT
+        // ("SQL statements in progress").
+        let journal_mode = {
+            let mut journal_rows = conn
+                .query("PRAGMA journal_mode=WAL;", ())
+                .await
+                .context("set journal_mode=WAL")?;
+            let mode = journal_rows
+                .next()
+                .await
+                .context("read journal_mode result")?
+                .map(|row| row.get::<String>(0))
+                .transpose()
+                .context("decode journal_mode result")?
+                .unwrap_or_default();
+            while journal_rows
+                .next()
+                .await
+                .context("drain journal_mode result")?
+                .is_some()
+            {}
+            mode
+        };
+        Self::verify_journal_mode(&journal_mode)?;
         conn.execute_batch(SYNCHRONOUS_PRAGMA)
             .await
             .with_context(|| format!("set {SYNCHRONOUS_PRAGMA}"))?;
@@ -589,6 +614,23 @@ impl Database {
             db.hmac_salt = db.get_or_create_hmac_salt().await?;
         }
         Ok(db)
+    }
+
+    /// Validate the mode reported back by `PRAGMA journal_mode=WAL`.
+    ///
+    /// Accepts `wal` and `memory` (in-memory databases cannot use WAL and
+    /// always report `memory`). Anything else means the filesystem silently
+    /// refused the switch and we are on a rollback journal — fatal, because
+    /// multi-process sharing of `~/.borg/borg.db` depends on WAL.
+    fn verify_journal_mode(mode: &str) -> Result<()> {
+        if mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("memory") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "journal_mode=WAL did not take effect: database reports '{mode}'. \
+             The filesystem likely does not support WAL (network mount, FUSE, \
+             or a read-only directory); move the data dir to a local filesystem."
+        )
     }
 
     /// Inject a keystore for the evolution signing path. Intended for
@@ -996,6 +1038,47 @@ mod macos_durability_tests {
             row.get::<i64>(0).expect("int"),
             1,
             "checkpoint_fullfsync must be ON for the F_FULLFSYNC barrier"
+        );
+    }
+
+    /// `PRAGMA journal_mode=WAL` reports the effective mode without erroring
+    /// when the switch is refused; init must reject a silent fallback to a
+    /// rollback journal.
+    #[test]
+    fn verify_journal_mode_rejects_rollback_journal_fallback() {
+        for accepted in ["wal", "WAL", "memory", "Memory"] {
+            assert!(
+                Database::verify_journal_mode(accepted).is_ok(),
+                "mode {accepted:?} must be accepted"
+            );
+        }
+        for refused in ["delete", "truncate", "persist", "off", ""] {
+            let err = Database::verify_journal_mode(refused)
+                .expect_err("silent journal fallback must be fatal");
+            assert!(
+                err.to_string().contains("did not take effect"),
+                "error must name the failure, got: {err}"
+            );
+        }
+    }
+
+    /// End-to-end: a file-backed connection actually lands in WAL and init
+    /// succeeds (the verification reads the pragma result, not the SQL).
+    #[tokio::test]
+    async fn file_backed_db_lands_in_wal_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_at(&dir.path().join("wal-check.db"))
+            .await
+            .expect("open file-backed db");
+        let mut rows = db
+            .conn()
+            .query("PRAGMA journal_mode", ())
+            .await
+            .expect("query journal_mode");
+        let row = rows.next().await.expect("row").expect("one row");
+        assert_eq!(
+            row.get::<String>(0).expect("string").to_ascii_lowercase(),
+            "wal"
         );
     }
 }
