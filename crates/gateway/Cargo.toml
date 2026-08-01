@@ -61,6 +61,7 @@ discord-voice-channels = ["dep:songbird", "dep:hound"]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+wiremock = "0.6"
 
 [lints]
 workspace = true

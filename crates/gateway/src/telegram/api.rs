@@ -21,6 +21,7 @@ use crate::message_processing::chunker;
 
 const TELEGRAM_API_BASE: &str = crate::constants::TELEGRAM_API_BASE;
 const HTTP_CONNECT_TIMEOUT: Duration = crate::constants::TELEGRAM_HTTP_CONNECT_TIMEOUT;
+const MEDIA_SEND_TIMEOUT: Duration = crate::constants::TELEGRAM_MEDIA_SEND_TIMEOUT;
 
 // Telegram returns retry_after in JSON body, not Retry-After header, so we use custom retry logic instead of http_retry.
 const MAX_SEND_RETRIES: u32 = crate::constants::TELEGRAM_MAX_SEND_RETRIES;
@@ -31,11 +32,18 @@ const MAX_RETRY_AFTER_SECS: u64 = crate::constants::TELEGRAM_MAX_RETRY_AFTER_SEC
 pub struct TelegramClient {
     client: Client,
     token: String,
+    base_url: String,
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl TelegramClient {
     pub fn new(token: &str) -> Result<Self> {
+        Self::with_base(token, TELEGRAM_API_BASE)
+    }
+
+    /// Construct against a non-default API base. Production always uses
+    /// [`TELEGRAM_API_BASE`]; tests point this at a local mock server.
+    pub(crate) fn with_base(token: &str, base_url: &str) -> Result<Self> {
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Telegram",
@@ -43,16 +51,17 @@ impl TelegramClient {
                 Some(HTTP_CONNECT_TIMEOUT),
             )?,
             token: token.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
         })
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("{TELEGRAM_API_BASE}/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.base_url, self.token)
     }
 
     fn file_url(&self, file_path: &str) -> String {
-        format!("{TELEGRAM_API_BASE}/file/bot{}/{file_path}", self.token)
+        format!("{}/file/bot{}/{file_path}", self.base_url, self.token)
     }
 
     /// Scrub the bot token out of arbitrary error text.
@@ -182,7 +191,10 @@ impl TelegramClient {
                     self.circuit_breaker.record_failure(429);
                     bail!("sendMessage rate limited after {MAX_SEND_RETRIES} retries");
                 }
-                let retry_secs = resp_body.retry_after.unwrap_or(5).min(MAX_RETRY_AFTER_SECS);
+                let retry_secs = resp_body
+                    .retry_after_secs()
+                    .unwrap_or(5)
+                    .min(MAX_RETRY_AFTER_SECS);
                 let jitter_ms = (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -253,46 +265,27 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let file_part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
-            .file_name("voice.ogg")
-            .mime_str("audio/ogg")?;
+        self.send_media("sendVoice", || {
+            let file_part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+                .file_name("voice.ogg")
+                .mime_str("audio/ogg")?;
 
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("voice", file_part);
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part("voice", file_part);
 
-        if let Some(cap) = caption {
-            form = form.text("caption", cap.to_string());
-        }
-        if let Some(tid) = message_thread_id {
-            form = form.text("message_thread_id", tid.to_string());
-        }
-        if let Some(rid) = reply_to_message_id {
-            form = form.text("reply_to_message_id", rid.to_string());
-        }
-
-        let resp = self
-            .client
-            .post(self.api_url("sendVoice"))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| self.scrub_err(e, "Failed to send voice message"))?;
-
-        let resp_body: ApiResponse<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| self.scrub_err(e, "Failed to parse sendVoice response"))?;
-
-        if !resp_body.ok {
-            bail!(
-                "sendVoice failed: {}",
-                resp_body
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            );
-        }
-        Ok(())
+            if let Some(cap) = caption {
+                form = form.text("caption", cap.to_string());
+            }
+            if let Some(tid) = message_thread_id {
+                form = form.text("message_thread_id", tid.to_string());
+            }
+            if let Some(rid) = reply_to_message_id {
+                form = form.text("reply_to_message_id", rid.to_string());
+            }
+            Ok(form)
+        })
+        .await
     }
 
     /// Edit the text of an existing message via `editMessageText`.
@@ -427,29 +420,94 @@ impl TelegramClient {
     }
 
     /// Internal: POST a multipart form to a Telegram media endpoint.
-    async fn send_media(&self, method: &str, form: reqwest::multipart::Form) -> Result<()> {
-        let resp = self
-            .client
-            .post(self.api_url(method))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| self.scrub_err(e, &format!("Failed to call {method}")))?;
+    ///
+    /// Media uploads get their own per-request deadline (`MEDIA_SEND_TIMEOUT`):
+    /// the client-wide 30s whole-request timeout aborts large uploads on slow
+    /// uplinks. Retries mirror `send_single_message` — connection errors back
+    /// off, 429 honors the body's `retry_after`, and the circuit breaker
+    /// records outcomes. Multipart bodies are single-use, so `build_form`
+    /// rebuilds the form for each attempt.
+    async fn send_media(
+        &self,
+        method: &str,
+        build_form: impl Fn() -> Result<reqwest::multipart::Form>,
+    ) -> Result<()> {
+        if self.circuit_breaker.is_open() {
+            bail!("Telegram circuit breaker open, skipping {method}");
+        }
 
-        let resp_body: ApiResponse<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| self.scrub_err(e, &format!("Failed to parse {method} response")))?;
+        let mut attempts = 0u32;
+        loop {
+            let send_result = self
+                .client
+                .post(self.api_url(method))
+                .timeout(MEDIA_SEND_TIMEOUT)
+                .multipart(build_form()?)
+                .send()
+                .await;
 
-        if !resp_body.ok {
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Media transport retries are CONNECT-only, unlike the
+                    // text lane's is_safe_to_retry: a timeout on a large
+                    // multipart POST often fires after Telegram has already
+                    // processed the upload (only the response was pending),
+                    // and retrying would deliver the file twice. A connect
+                    // failure provably never reached the server.
+                    if e.is_connect() {
+                        attempts += 1;
+                        let scrubbed = self.scrub(&e.to_string());
+                        if attempts > MAX_SEND_RETRIES {
+                            // No breaker update: the circuit breaker is
+                            // 401-scoped by design (auth-loop protection),
+                            // not a network-outage detector.
+                            bail!("{method} failed after {MAX_SEND_RETRIES} retries: {scrubbed}");
+                        }
+                        let backoff = Duration::from_millis(500 * 2u64.pow(attempts - 1));
+                        warn!("{method} connection error, retrying in {backoff:?} (attempt {attempts}/{MAX_SEND_RETRIES}): {scrubbed}");
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(self.scrub_err(e, &format!("Failed to call {method}")));
+                }
+            };
+
+            let status = resp.status();
+            let resp_body: ApiResponse<serde_json::Value> = resp
+                .json()
+                .await
+                .map_err(|e| self.scrub_err(e, &format!("Failed to parse {method} response")))?;
+
+            if resp_body.ok {
+                self.circuit_breaker.record_success();
+                return Ok(());
+            }
+
+            if status.as_u16() == 429 {
+                attempts += 1;
+                if attempts > MAX_SEND_RETRIES {
+                    self.circuit_breaker.record_failure(429);
+                    bail!("{method} rate limited after {MAX_SEND_RETRIES} retries");
+                }
+                let retry_secs = resp_body
+                    .retry_after_secs()
+                    .unwrap_or(5)
+                    .min(MAX_RETRY_AFTER_SECS);
+                warn!("Telegram rate limited on {method}, retry after {retry_secs}s (attempt {attempts}/{MAX_SEND_RETRIES})");
+                tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                continue;
+            }
+
+            self.circuit_breaker.record_failure(status.as_u16());
             bail!(
-                "{method} failed: {}",
+                "{method} failed ({}): {}",
+                status.as_u16(),
                 resp_body
                     .description
                     .unwrap_or_else(|| "unknown error".into())
             );
         }
-        Ok(())
     }
 
     /// Send a photo via `sendPhoto`. Caption max 1024 chars.
@@ -461,15 +519,17 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let form = Self::build_media_form(
-            chat_id,
-            "photo",
-            &photo,
-            caption,
-            message_thread_id,
-            reply_to_message_id,
-        )?;
-        self.send_media("sendPhoto", form).await
+        self.send_media("sendPhoto", || {
+            Self::build_media_form(
+                chat_id,
+                "photo",
+                &photo,
+                caption,
+                message_thread_id,
+                reply_to_message_id,
+            )
+        })
+        .await
     }
 
     /// Send a video via `sendVideo`.
@@ -481,15 +541,17 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let form = Self::build_media_form(
-            chat_id,
-            "video",
-            &video,
-            caption,
-            message_thread_id,
-            reply_to_message_id,
-        )?;
-        self.send_media("sendVideo", form).await
+        self.send_media("sendVideo", || {
+            Self::build_media_form(
+                chat_id,
+                "video",
+                &video,
+                caption,
+                message_thread_id,
+                reply_to_message_id,
+            )
+        })
+        .await
     }
 
     /// Send a document (any file type) via `sendDocument`.
@@ -501,15 +563,17 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let form = Self::build_media_form(
-            chat_id,
-            "document",
-            &document,
-            caption,
-            message_thread_id,
-            reply_to_message_id,
-        )?;
-        self.send_media("sendDocument", form).await
+        self.send_media("sendDocument", || {
+            Self::build_media_form(
+                chat_id,
+                "document",
+                &document,
+                caption,
+                message_thread_id,
+                reply_to_message_id,
+            )
+        })
+        .await
     }
 
     /// Send an animation (GIF/short video) via `sendAnimation`.
@@ -521,15 +585,17 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let form = Self::build_media_form(
-            chat_id,
-            "animation",
-            &animation,
-            caption,
-            message_thread_id,
-            reply_to_message_id,
-        )?;
-        self.send_media("sendAnimation", form).await
+        self.send_media("sendAnimation", || {
+            Self::build_media_form(
+                chat_id,
+                "animation",
+                &animation,
+                caption,
+                message_thread_id,
+                reply_to_message_id,
+            )
+        })
+        .await
     }
 
     /// Send a sticker via `sendSticker`. Stickers do not accept captions.
@@ -540,15 +606,17 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let form = Self::build_media_form(
-            chat_id,
-            "sticker",
-            &sticker,
-            None,
-            message_thread_id,
-            reply_to_message_id,
-        )?;
-        self.send_media("sendSticker", form).await
+        self.send_media("sendSticker", || {
+            Self::build_media_form(
+                chat_id,
+                "sticker",
+                &sticker,
+                None,
+                message_thread_id,
+                reply_to_message_id,
+            )
+        })
+        .await
     }
 
     /// Register a webhook URL with Telegram.
@@ -968,6 +1036,92 @@ mod tests {
         assert_eq!(
             client.api_url("sendVoice"),
             "https://api.telegram.org/bot123:ABC/sendVoice"
+        );
+    }
+
+    /// Regression: media sends used to bypass the 429-retry path entirely —
+    /// a single rate-limit response failed the upload outright. The media
+    /// lane must honor the body's `retry_after` and succeed on the retry,
+    /// rebuilding the (single-use) multipart form for the second attempt.
+    #[tokio::test]
+    async fn media_send_retries_after_rate_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendPhoto"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Too Many Requests",
+                "parameters": { "retry_after": 0 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        client
+            .send_photo(
+                7,
+                MediaSource::Bytes {
+                    bytes: b"jpeg-bytes",
+                    filename: "pic.jpg",
+                    mime: Some("image/jpeg"),
+                },
+                Some("caption"),
+                None,
+                None,
+            )
+            .await
+            .expect("photo send must succeed after the rate-limit retry");
+    }
+
+    /// A non-retryable API error must fail without exhausting retries.
+    #[tokio::test]
+    async fn media_send_surfaces_hard_api_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendDocument"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: file must be non-empty"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client
+            .send_document(
+                7,
+                MediaSource::Bytes {
+                    bytes: b"",
+                    filename: "empty.bin",
+                    mime: None,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("400 must fail immediately");
+        assert!(
+            err.to_string().contains("file must be non-empty"),
+            "API description must surface, got: {err}"
         );
     }
 

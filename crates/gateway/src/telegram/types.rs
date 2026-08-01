@@ -216,6 +216,31 @@ pub struct ApiResponse<T> {
     pub description: Option<String>,
     /// HTTP-like error code on failure.
     pub error_code: Option<u16>,
+    /// Seconds to wait before retrying (rate limit) — top-level form.
+    /// The real Bot API nests this under `parameters`; kept for tolerance.
+    #[serde(default)]
+    pub retry_after: Option<u64>,
+    /// Error metadata object; where the Bot API actually puts `retry_after`
+    /// on a 429. Without reading this, every real rate limit fell back to
+    /// the 5s default.
+    #[serde(default)]
+    pub parameters: Option<ResponseParameters>,
+}
+
+impl<T> ApiResponse<T> {
+    /// The effective retry-after: nested `parameters.retry_after` (the real
+    /// Bot API location) with the top-level form as fallback.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        self.parameters
+            .as_ref()
+            .and_then(|p| p.retry_after)
+            .or(self.retry_after)
+    }
+}
+
+/// `parameters` object attached to Bot API error responses.
+#[derive(Debug, Deserialize)]
+pub struct ResponseParameters {
     /// Seconds to wait before retrying (rate limit).
     #[serde(default)]
     pub retry_after: Option<u64>,

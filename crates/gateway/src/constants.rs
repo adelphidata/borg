@@ -39,6 +39,21 @@ pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 /// Telegram HTTP connect timeout.
 pub const TELEGRAM_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Chunk budget applied to the *markdown source* before per-chunk HTML
+/// rendering on the Telegram delivery path. Smaller than
+/// [`DEFAULT_MESSAGE_CHUNK_SIZE`] to leave headroom for HTML expansion
+/// (entity escaping, `<pre>`/`<a>` tags) so a rendered chunk still fits
+/// Telegram's 4096-char message cap without a second, markup-blind split.
+pub const TELEGRAM_MARKDOWN_CHUNK_SIZE: usize = 3500;
+
+/// Per-request deadline for Telegram media uploads (photo/video/document/
+/// voice/animation). These POST multipart bodies up to
+/// [`TELEGRAM_MAX_FILE_SIZE_BYTES`] and then wait for server-side
+/// processing before the response arrives — the client-wide
+/// [`GATEWAY_HTTP_TIMEOUT`] (30s whole-request) routinely aborts a large
+/// upload on a slow uplink. Applied as a reqwest per-request override.
+pub const TELEGRAM_MEDIA_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Signal HTTP connect timeout for the signal-cli JSON-RPC daemon.
 pub const SIGNAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
