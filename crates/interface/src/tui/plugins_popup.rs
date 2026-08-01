@@ -155,7 +155,6 @@ impl PluginsPopup {
 
         let mut items = Vec::new();
 
-        // Load channel plugins from catalog
         for def in CATALOG {
             let installed = plugins::installer::is_installed(def, data_dir);
             items.push(PluginItem {
@@ -334,7 +333,6 @@ impl PluginsPopup {
                 }
                 KeyCode::Char(' ') => {
                     if let Some(item) = self.items.get_mut(self.cursor) {
-                        // Check platform availability for channels
                         if let ItemKind::Channel { def } = &item.kind {
                             if !def.platform.is_available() {
                                 self.status_message = Some((
@@ -514,7 +512,6 @@ impl PluginsPopup {
                             }
                         }
 
-                        // Add channel uninstall actions
                         for item in &self.items {
                             if matches!(item.kind, ItemKind::Channel { .. })
                                 && !item.toggled
@@ -667,7 +664,6 @@ impl PluginsPopup {
             lines.push(Line::from(Span::styled(label, style)));
         }
 
-        // Scroll to keep cursor visible
         let selected_line = row_indices.get(self.cursor).copied().unwrap_or(0);
         let scroll_offset = if selected_line >= content_height {
             selected_line - content_height + 1
@@ -684,10 +680,8 @@ impl PluginsPopup {
         let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
-        // Status line
         popup_utils::render_status_message(frame, inner, self.status_message.as_ref(), 2);
 
-        // Credential input overlay
         if let PluginPhase::CredentialInput {
             ref action_queue,
             current_def_idx,
@@ -724,7 +718,6 @@ impl PluginsPopup {
             }
         }
 
-        // Footer hint
         let hint = if matches!(self.phase, PluginPhase::CredentialInput { .. }) {
             " Enter: submit  Esc: cancel"
         } else {

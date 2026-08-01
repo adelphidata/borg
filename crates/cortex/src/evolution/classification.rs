@@ -550,7 +550,6 @@ const TINKERER_KEYWORDS: &[&str] = &[
 
 /// Deterministic tool-name → archetype mapping.
 pub fn classify_tool_archetype(tool_name: &str, metadata: Option<&str>) -> Option<Archetype> {
-    // Direct tool name mapping
     let archetype = match tool_name {
         "apply_patch" | "apply_skill_patch" | "create_channel" => Some(Archetype::Builder),
         "browser" | "search" | "memory_search" => Some(Archetype::Analyst),
@@ -567,7 +566,6 @@ pub fn classify_tool_archetype(tool_name: &str, metadata: Option<&str>) -> Optio
         return archetype;
     }
 
-    // Check if tool name matches a known channel/integration
     let name_lower = tool_name.to_lowercase();
     if name_lower.contains("telegram")
         || name_lower.contains("slack")

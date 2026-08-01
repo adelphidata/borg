@@ -43,7 +43,6 @@ use crate::commands::tunnel::TunnelCliAction;
 mod api_key_store;
 mod async_bridge;
 mod commands;
-mod credentials;
 // Daemon client lib lives in this crate to keep dev workflow tight; many of
 // its methods are consumed only by call sites that haven't been migrated yet
 // (TUI / REPL / popups). Allow dead_code on the module until those callers
@@ -603,6 +602,7 @@ async fn async_main() -> Result<()> {
             }
             #[cfg(not(unix))]
             {
+                // Non-Unix has no SIGTERM to race; a broken ctrl_c handler still ends in shutdown.
                 let _ = ctrl_c.await;
             }
             shutdown.cancel();

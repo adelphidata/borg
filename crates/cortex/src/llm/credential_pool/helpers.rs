@@ -80,13 +80,7 @@ pub(super) fn random_id() -> String {
     let mut rng = rand::rng();
     let mut buf = [0u8; 4];
     rng.fill_bytes(&mut buf);
-    const TBL: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(8);
-    for b in buf {
-        out.push(TBL[(b >> 4) as usize] as char);
-        out.push(TBL[(b & 0xf) as usize] as char);
-    }
-    out
+    crate::util::hex::hex_encode(&buf)
 }
 
 /// Redact secrets out of an upstream error body then clamp to
@@ -97,14 +91,7 @@ pub(super) fn truncate_error_msg(s: &str) -> String {
     // token tail back, and `last_error_message` ends up on operator
     // terminals via `borg auth list` (and into shell history).
     let redacted = crate::security::secrets::redact_secrets(s);
-    if redacted.len() <= ERROR_MESSAGE_MAX_LEN {
-        return redacted;
-    }
-    let mut end = ERROR_MESSAGE_MAX_LEN;
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[truncated]", &redacted[..end])
+    crate::util::truncate::truncate_bytes(&redacted, ERROR_MESSAGE_MAX_LEN, "…[truncated]")
 }
 
 #[cfg(test)]

@@ -102,7 +102,6 @@ pub async fn list_all_roles() -> Vec<AgentRole> {
         }
     }
 
-    // Add any built-in roles not already in DB
     for (name, ..) in BUILTIN_ROLES {
         if !seen.contains(*name) {
             if let Some(role) = builtin_role(name) {

@@ -30,7 +30,7 @@ pub fn markdown_to_mrkdwn(text: &str) -> String {
             continue;
         }
 
-        // Convert headers: `# Header` → `*Header*`
+        // mrkdwn has no heading syntax, so headings degrade to bold (`*`).
         if let Some(header_text) = strip_header(line) {
             result.push('*');
             result.push_str(header_text.trim());

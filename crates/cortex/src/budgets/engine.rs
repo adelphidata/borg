@@ -216,7 +216,6 @@ impl BudgetEngine {
             .await
             .context("failed to begin post_flight transaction")?;
         let res: Result<()> = async {
-            // Bump default; bump principal if it exists.
             Self::bump_spent(db, "default", actual, now).await?;
             if let Some(scope) = principal_scope {
                 if scope != "default" {

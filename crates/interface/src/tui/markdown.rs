@@ -223,7 +223,6 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
     }
     flush_line(&mut current_spans, &mut lines);
 
-    // Remove trailing empty lines
     while lines.last().is_some_and(|l| l.spans.is_empty()) {
         lines.pop();
     }

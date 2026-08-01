@@ -169,7 +169,6 @@ struct Inner {
 }
 
 impl ShellSessionRegistry {
-    /// Construct an empty registry.
     pub fn new() -> Self {
         Self::default()
     }

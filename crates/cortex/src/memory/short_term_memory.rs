@@ -86,7 +86,8 @@ impl ShortTermMemory {
         });
         self.facts_tokens += tokens;
 
-        // Evict oldest facts if over budget
+        // `len() > 1` keeps the just-added fact even when it alone blows the
+        // budget — dropping it would silently discard the newest observation.
         while self.facts_tokens > self.max_tokens && self.facts.len() > 1 {
             let removed = self.facts.remove(0);
             self.facts_tokens = self.facts_tokens.saturating_sub(removed.tokens);

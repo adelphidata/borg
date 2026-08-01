@@ -389,7 +389,6 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
             let update_line_number = i + 1; // 1-based, for error messages
             i += 1;
 
-            // Check for optional *** Move to: line
             let move_to = if i < lines.len() {
                 let next = lines[i].trim();
                 if let Some(dest) = next.strip_prefix(MOVE_TO_MARKER) {
@@ -408,7 +407,6 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
             while i < lines.len() && !lines[i].starts_with("***") {
                 let hunk_line = lines[i].trim();
 
-                // Skip blank lines between chunks
                 if hunk_line.is_empty() {
                     i += 1;
                     continue;
@@ -668,7 +666,6 @@ pub fn parse_unified_diff(input: &str) -> Result<Patch, ParseError> {
             diff_new.clone()
         };
 
-        // Collect hunks for this file.
         let mut hunks: Vec<Hunk> = Vec::new();
         let mut add_content_lines: Vec<&str> = Vec::new();
         while i < lines.len() && lines[i].starts_with("@@") {

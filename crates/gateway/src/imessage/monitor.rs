@@ -76,7 +76,6 @@ async fn monitor_loop(
 
     let db_path_str = db_path.to_string_lossy().into_owned();
 
-    // Load persisted state (last_rowid)
     let state_path = channel_dir.join(STATE_FILE);
     let mut last_rowid = load_last_rowid(&state_path).await;
 

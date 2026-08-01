@@ -116,7 +116,6 @@ pub fn mmr_rerank(results: &[(usize, f32, &str)], lambda: f32, max_results: usiz
         }
     }
 
-    // Map back to original indices
     selected.iter().map(|&i| results[i].0).collect()
 }
 

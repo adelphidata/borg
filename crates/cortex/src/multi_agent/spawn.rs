@@ -447,7 +447,6 @@ fn run_sub_agent(
         // rather than re-scoping at every level.
         agent.set_prompt_cache_scope(prompt_cache_scope);
 
-        // Inject fork context if provided
         if let Some(context_msgs) = fork_context {
             for msg in context_msgs {
                 agent.inject_history_message(msg);
@@ -478,7 +477,6 @@ fn run_sub_agent(
             mpsc::channel::<AgentEvent>(crate::constants::AGENT_EVENT_CHANNEL_CAPACITY);
         let cancel_clone = cancel.clone();
 
-        // Send initial message in a spawned task
         let mut send_handle = {
             let event_tx_clone = event_tx.clone();
             let cancel = cancel_clone.clone();
@@ -530,7 +528,6 @@ fn run_sub_agent(
         let mut info = info;
         info.status = SubAgentStatus::Running;
 
-        // Collect the final text response
         let mut final_text = String::new();
         loop {
             // Pause gate: park here while the operator has flipped the flag.

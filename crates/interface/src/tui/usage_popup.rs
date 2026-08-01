@@ -161,7 +161,6 @@ impl UsagePopup {
         let paragraph = Paragraph::new(self.lines.clone()).scroll((offset as u16, 0));
         frame.render_widget(paragraph, inner);
 
-        // Footer hint
         let footer_y = popup_area.y + popup_area.height.saturating_sub(1);
         if popup_area.width > 40 {
             let hint = " Esc/q: close  \u{2191}\u{2193}: scroll ";

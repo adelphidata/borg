@@ -273,7 +273,6 @@ async fn run_voice_manager(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow!("HELLO missing heartbeat_interval"))?;
 
-    // IDENTIFY.
     let identify = serde_json::json!({
         "op": 2,
         "d": {
@@ -291,7 +290,8 @@ async fn run_voice_manager(
         .await
         .context("send IDENTIFY")?;
 
-    // Spawn heartbeat task.
+    // Heartbeats go through a channel rather than straight to `ws_tx`: the
+    // sink is single-owner, so the timer task must not hold it.
     let (hb_tx, mut hb_rx) = mpsc::channel::<Message>(4);
     let hb_tx_clone = hb_tx.clone();
     let last_seq: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -368,6 +368,9 @@ where
     None
 }
 
+/// Every `reply.send(..)` below is discarded on purpose: the requester is a
+/// `/voice` command that may have timed out and dropped its oneshot, and the
+/// gateway loop must keep servicing the socket regardless.
 async fn handle_command<W>(
     cmd: VoiceCommand,
     ws_tx: &mut W,

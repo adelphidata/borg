@@ -55,7 +55,6 @@ fn parse_config(root: &Path, data: &mut SourceData, extract_channel_tokens: bool
     }
 
     let content = std::fs::read_to_string(&config_path)?;
-    // Strip comments for JSON5 compatibility (single-line // comments)
     let cleaned = strip_json_comments(&content);
     let json: serde_json::Value = serde_json::from_str(&cleaned)?;
 
@@ -247,7 +246,6 @@ fn strip_json_comments(input: &str) -> String {
         i += 1;
     }
 
-    // Strip trailing commas before } or ] (handles spaces, tabs, newlines)
     strip_trailing_commas(&out)
 }
 
@@ -284,7 +282,6 @@ fn parse_credentials(root: &Path, data: &mut SourceData) -> Result<()> {
         super::hermes::parse_env_content(&content, data);
     }
 
-    // Parse auth-profiles.json
     let auth_path = root.join("auth-profiles.json");
     if auth_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&auth_path) {

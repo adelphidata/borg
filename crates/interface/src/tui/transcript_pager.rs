@@ -101,12 +101,10 @@ impl TranscriptPager {
 
         // ── Regular pager navigation. ──
         match (key.code, key.modifiers) {
-            // Dismiss
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Esc, _)
             | (KeyCode::Char('t'), KeyModifiers::CONTROL) => PagerAction::Dismiss,
 
-            // Vertical scroll
             (KeyCode::Up, _) => {
                 self.scroll_up_by(1);
                 PagerAction::None
@@ -132,7 +130,6 @@ impl TranscriptPager {
                 PagerAction::None
             }
 
-            // Search
             (KeyCode::Char('/'), KeyModifiers::NONE) => {
                 self.search = Some(SearchState {
                     editing: true,
@@ -221,7 +218,6 @@ impl TranscriptPager {
             return;
         }
 
-        // Full-screen overlay.
         frame.render_widget(Clear, area);
 
         let block = Block::default()

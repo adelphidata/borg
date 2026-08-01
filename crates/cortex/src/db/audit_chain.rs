@@ -40,6 +40,8 @@ use libsql::params;
 
 use super::Database;
 
+/// blake3 digest width — the chain's link size; changing it invalidates
+/// every persisted `prev_hash` and forces a re-chain migration.
 const HASH_LEN: usize = 32;
 
 pub const GENESIS_PREV_HASH: [u8; HASH_LEN] = [0u8; HASH_LEN];

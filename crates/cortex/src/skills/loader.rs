@@ -95,7 +95,6 @@ pub fn load_all_skills(
         }
     }
 
-    // Load user skills from ~/.borg/skills/*/SKILL.md
     let user_dir = skills_dir()?;
     if user_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&user_dir) {

@@ -898,7 +898,6 @@ const GATEWAY_SAFE_SETTING_KEYS: &[&str] = &[
 
 async fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     if args.is_empty() {
-        // Show key settings
         let provider = config.llm.provider.as_deref().unwrap_or("(auto-detect)");
         let lines = [
             "Current settings:".to_string(),
@@ -917,7 +916,6 @@ async fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     }
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
     if parts.len() == 1 {
-        // Show single setting value
         let key = parts[0];
         if let Ok(Some(val)) = db.get_setting(key).await {
             return format!("{key} = {val} (DB override)");

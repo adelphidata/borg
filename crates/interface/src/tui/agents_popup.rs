@@ -282,7 +282,6 @@ impl AgentsPopup {
 
         indices.retain(|&i| self.filter.keep(&self.snapshot.agents[i]));
 
-        // Sort.
         match self.sort {
             AgentSort::DepthFirst => {
                 indices.sort_by_key(|&i| {

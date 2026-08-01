@@ -76,7 +76,6 @@ pub fn load_skills_context(
         return Ok((String::new(), report));
     }
 
-    // Exclude disabled skills from context injection entirely
     let skills: Vec<Skill> = skills.into_iter().filter(|s| !s.disabled).collect();
 
     // Shadow-mode selection: record what each relevance-gated selector WOULD

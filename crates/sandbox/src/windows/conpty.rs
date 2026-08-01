@@ -246,6 +246,7 @@ impl PtyPump {
     /// so the drain thread sees EOF and returns.
     pub fn join(mut self) {
         if let Some(h) = self.output.take() {
+            // A panicked drain thread must not poison teardown — the child has already exited.
             let _ = h.join();
         }
     }

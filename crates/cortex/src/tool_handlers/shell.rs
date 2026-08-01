@@ -56,7 +56,6 @@ impl HeadTailBuffer {
     fn push_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         self.total += rest.len();
-        // Fill the head first.
         if self.head.len() < self.head_budget {
             let take = (self.head_budget - self.head.len()).min(rest.len());
             self.head.extend_from_slice(&rest[..take]);

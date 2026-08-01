@@ -712,7 +712,6 @@ fn normalize_patch_paths(patch_text: &str, cwd: &std::path::Path) -> String {
             output.push_str(line);
         }
     }
-    // Preserve trailing newline if present
     if patch_text.ends_with('\n') {
         output.push('\n');
     }

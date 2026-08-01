@@ -296,7 +296,6 @@ impl OnboardingState {
 
         let default_name = random_borg_name();
 
-        // Load channel plugins from catalog
         let channel_items: Vec<ChannelItem> = plugins::catalog::CATALOG
             .iter()
             .filter(|def| def.kind == plugins::PluginKind::Channel)
@@ -841,7 +840,6 @@ impl OnboardingState {
                             return;
                         }
                         if item.selected {
-                            // Deselect
                             item.selected = false;
                             item.credentials.clear();
                         } else {
@@ -1084,7 +1082,6 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     lines.push(Line::default());
     lines.push(Line::default());
 
-    // User name field
     let user_name_focused = state.welcome_focus == WelcomeFocus::UserName;
     let user_label_style = if user_name_focused {
         Style::default()
@@ -1112,7 +1109,6 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     lines.push(Line::default());
     lines.push(Line::default());
 
-    // Agent name field
     let agent_name_focused = state.welcome_focus == WelcomeFocus::AgentName;
     let agent_label_style = if agent_name_focused {
         Style::default()
@@ -1151,7 +1147,6 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
 fn render_security(frame: &mut ratatui::Frame, area: Rect, _state: &OnboardingState) {
     let mut lines: Vec<Line> = Vec::new();
 
-    // Title in bold white
     lines.push(Line::from(Span::styled(
         format!("  {SECURITY_TITLE}"),
         Style::default()
@@ -1160,7 +1155,6 @@ fn render_security(frame: &mut ratatui::Frame, area: Rect, _state: &OnboardingSt
     )));
     lines.push(Line::default());
 
-    // Body in yellow
     for line in SECURITY_BODY.lines() {
         lines.push(Line::from(Span::styled(
             format!("  {line}"),

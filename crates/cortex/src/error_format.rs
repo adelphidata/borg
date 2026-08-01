@@ -260,11 +260,9 @@ pub fn format_error_with_context(raw: &str, context: ErrorContext) -> String {
 fn extract_retry_hint(raw: &str) -> Option<String> {
     let lower = raw.to_lowercase();
 
-    // Look for "retry after X seconds" patterns
     for pattern in &["retry after", "retry_after", "retry in"] {
         if let Some(pos) = lower.find(pattern) {
             let after = &raw[pos..];
-            // Extract a reasonable snippet (up to 60 chars)
             let snippet: String = after.chars().take(60).collect();
             // Only use if it contains a number (likely a time indicator)
             if snippet.chars().any(|c| c.is_ascii_digit()) {

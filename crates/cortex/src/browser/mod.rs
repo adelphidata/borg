@@ -310,7 +310,6 @@ impl BrowserSession {
     pub async fn try_recover(&mut self) -> Result<()> {
         tracing::info!("Attempting browser recovery...");
 
-        // Try opening a fresh page on the existing browser
         match self.browser.new_page("about:blank").await {
             Ok(page) => {
                 let new_handles = console::spawn_event_listeners(&page, &self.event_buffers).await;

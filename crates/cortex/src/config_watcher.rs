@@ -80,6 +80,8 @@ async fn load_config_from(db: &Database) -> Result<Config> {
 
 /// Send a new config through the watch channel if it differs from the current value.
 fn send_if_changed(config_tx: &watch::Sender<Config>, new_config: Config) {
+    // The bool is only "did receivers get notified"; a config that did not
+    // change needs no action either way.
     let _ = config_tx.send_if_modified(|current| {
         let new_json = serde_json::to_string(&new_config).unwrap_or_default();
         let cur_json = serde_json::to_string(current).unwrap_or_default();

@@ -221,6 +221,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Drop can't propagate, and the process is on its way out — best-effort.
         let _ = tui_lifecycle::restore();
     }
 }
@@ -498,6 +499,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // Install panic hook that restores terminal before printing panic
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        // If restore fails we still want the panic message printed, not swallowed.
         let _ = tui_lifecycle::restore();
         original_hook(info);
     }));
@@ -1912,7 +1914,6 @@ async fn run_event_loop(
                     }
                 }
 
-                // Fullscreen ASCII art goodbye
                 goodbye::render(tui)?;
                 // Hold the farewell frame long enough to be read before the
                 // process exits and the terminal is restored.

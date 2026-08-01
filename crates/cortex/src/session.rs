@@ -727,7 +727,6 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
         }
     }
 
-    // Sort by updated_at descending
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(sessions)
 }

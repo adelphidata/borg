@@ -17,7 +17,6 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         return parse_message_reaction(activity);
     }
 
-    // Handle message and invoke activities
     if activity.activity_type != "message" && activity.activity_type != "invoke" {
         return None;
     }
@@ -29,7 +28,6 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         }
     }
 
-    // Extract text based on activity type
     let raw_text = if activity.activity_type == "invoke" {
         activity
             .value
@@ -196,7 +194,6 @@ fn resolve_mention_tags(
         None => return re.replace_all(text, "").to_string(),
     };
 
-    // Collect bot mention names from entities
     let bot_names: Vec<&str> = entities
         .iter()
         .filter(|e| e.entity_type == "mention")

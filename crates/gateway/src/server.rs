@@ -273,7 +273,9 @@ impl GatewayServer {
         })
         .await?;
 
-        // Wait for poll tasks to finish after server shutdown
+        // Drain poll tasks after the server stops so long-poll HTTP requests
+        // finish before the process exits. A JoinError just means the task
+        // already died, which shutdown makes moot.
         for handle in poll_handles {
             let _ = handle.await;
         }
@@ -1129,6 +1131,8 @@ async fn poke_handler(
     }
     match &state.poke_tx {
         Some(tx) => {
+            // Fire-and-forget: a poke is a hint, and a closed receiver means the
+            // heartbeat runtime is already gone — still a 200 for the caller.
             let _ = tx.send(()).await;
             (
                 StatusCode::OK,
@@ -1332,7 +1336,8 @@ async fn webhook_handler_inner(
         }
     };
 
-    // Rate limiting
+    // Rate-limit before signature verification: HMAC over an attacker-sized
+    // body is the expensive part we're protecting.
     if let Some(ref limiter) = state.rate_limiter {
         let client_ip_str = extract_client_ip(&headers, &ConnectInfo(addr));
         let is_loopback = client_ip_str

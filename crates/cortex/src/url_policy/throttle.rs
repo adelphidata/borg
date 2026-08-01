@@ -20,6 +20,8 @@ use crate::config::ThrottleRule;
 
 use super::rules::{matches_rule, normalize_rule};
 
+// Bounds the unbounded per-key map. Well above any sane `min_interval_ms`,
+// so evicting an entry can never resurrect a still-active throttle window.
 const PRUNE_OLDER_THAN: Duration = Duration::from_secs(3600);
 
 static LAST_SEEN: LazyLock<Mutex<HashMap<String, Instant>>> =

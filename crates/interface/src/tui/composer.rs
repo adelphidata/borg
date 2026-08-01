@@ -409,7 +409,6 @@ impl<'a> Composer<'a> {
                     return None;
                 }
                 self.history.push_persistent(&trimmed);
-                // Clear the textarea
                 self.textarea.select_all();
                 self.textarea.cut();
                 Some(trimmed)

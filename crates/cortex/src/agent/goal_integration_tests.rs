@@ -356,12 +356,10 @@ async fn on_goal_updated_via_tool_noop_when_status_still_active() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Self-continuation ("stop hook") + accounting: the agent-loop wiring that
 // turns an `EndTurn` on an Active goal into a `NudgeAndContinue`. These drive
 // the real `maybe_inject_goal_continuation` / `account_goal_at_turn_end` /
 // `user_input_is_pending` code, not mocks.
-// ---------------------------------------------------------------------------
 
 /// Seed an Active goal row for the agent's session and adopt it into the
 /// runtime, mirroring what `sync_goal_runtime_for_turn` does at turn start.

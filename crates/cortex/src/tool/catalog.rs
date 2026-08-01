@@ -203,7 +203,8 @@ pub fn filter_tools_by_relevance(
 ) -> Vec<ToolDefinition> {
     let msg_lower = user_message.to_lowercase();
 
-    // Determine which conditional groups are relevant
+    // Groups marked `is_core()` are seeded regardless of profile, so keyword
+    // matching below may only widen the set — never drop a core tool.
     let mut active_groups: HashSet<ToolGroup> =
         ALL_GROUPS.iter().filter(|g| g.is_core()).copied().collect();
 
@@ -211,7 +212,6 @@ pub fn filter_tools_by_relevance(
         if group.is_core() || !profile_groups.contains(group) {
             continue;
         }
-        // Check keyword hints
         let keyword_matched = group
             .keyword_hints()
             .iter()
@@ -220,7 +220,6 @@ pub fn filter_tools_by_relevance(
             active_groups.insert(*group);
             continue;
         }
-        // Check if any tool from this group was recently used
         let group_tools: Vec<&str> = group.tool_names();
         if group_tools
             .iter()

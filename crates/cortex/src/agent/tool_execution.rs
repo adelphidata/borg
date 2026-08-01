@@ -308,7 +308,11 @@ impl Agent {
                 continue;
             }
 
-            // Rate limiting
+            // Rate limits are a security boundary (not an approval prompt), so
+            // they key off the action class the tool performs rather than its
+            // name. `classify_action` is an explicit tool-name match with a
+            // generic `ToolCall` fallback, so a new mutating tool lands in the
+            // loosest bucket until it is added there.
             let action_type = classify_action(name);
             match self.rate_guard.record(action_type) {
                 RateDecision::Block(reason) => {

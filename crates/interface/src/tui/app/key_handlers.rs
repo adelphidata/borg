@@ -288,7 +288,6 @@ impl<'a> App<'a> {
         if key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
-            // Cancel the in-flight agent task via token
             if let Some(token) = self.cancel_token.take() {
                 token.cancel();
             }

@@ -1218,7 +1218,8 @@ impl LlmClient {
         let provider = Provider::from_str(&fb.provider)?;
         let mut slot_keys = Vec::new();
 
-        // Try api_keys first
+        // Precedence is explicit-list > single ref > env var > credential store:
+        // the more specific the operator was, the earlier it wins.
         for sr in &fb.api_keys {
             if let Ok(key) = sr.resolve() {
                 if !key.is_empty() {
@@ -1227,7 +1228,6 @@ impl LlmClient {
             }
         }
 
-        // Try api_key SecretRef
         if slot_keys.is_empty() {
             if let Some(ref sr) = fb.api_key {
                 if let Ok(key) = sr.resolve() {
@@ -1238,7 +1238,6 @@ impl LlmClient {
             }
         }
 
-        // Try api_key_env
         if slot_keys.is_empty() {
             let env_var = fb
                 .api_key_env
@@ -1249,7 +1248,6 @@ impl LlmClient {
                     slot_keys.push(key);
                 }
             }
-            // Also try credential store
             if slot_keys.is_empty() {
                 if let Some(key) = config.resolve_credential_or_env(env_var) {
                     slot_keys.push(key);
@@ -1977,7 +1975,6 @@ impl LlmClient {
             if !should_failover {
                 break;
             }
-            // Continue outer loop with new provider
         }
 
         let msg =

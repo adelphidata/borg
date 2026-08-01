@@ -379,7 +379,6 @@ impl Agent {
             return;
         }
 
-        // Cap transcript
         let transcript: String = transcript
             .chars()
             .take(constants::FLUSH_TRANSCRIPT_CAP_CHARS)

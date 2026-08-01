@@ -292,7 +292,6 @@ async fn search_scope(
         })
         .collect();
 
-    // Vector search across chunks
     let chunks = match db.get_all_chunks(scope, None).await {
         Ok(c) => c,
         Err(e) => {
@@ -329,7 +328,6 @@ async fn search_scope(
         })
         .collect();
 
-    // Merge hybrid scores
     let fts_refs: Vec<(&str, i64, f32)> = fts_owned
         .iter()
         .map(|(f, ci, s)| (f.as_str(), *ci, *s))

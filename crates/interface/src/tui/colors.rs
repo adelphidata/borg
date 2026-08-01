@@ -14,6 +14,7 @@ struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        // Drop can't propagate; a stuck raw mode is corrected by the TUI's own restore path.
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -79,6 +80,8 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
     };
 
     let mut stdout = std::io::stdout();
+    // If the OSC query can't be written the read below just times out and we fall
+    // back to the default palette — nothing actionable to report here.
     let _ = stdout.write_all(query);
     let _ = stdout.flush();
 

@@ -44,14 +44,12 @@ fn parse_markdown_blocks(text: &str) -> Vec<Block> {
         let line_num = i + 1; // 1-indexed
         let trimmed = line.trim();
 
-        // Check for code fence boundaries
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             let marker = &trimmed[..3];
             if in_fence {
                 // Closing fence — must match opening marker
                 if fence_marker == Some(marker) {
                     current_lines.push(line);
-                    // Emit the code fence block
                     blocks.push(Block {
                         kind: BlockKind::CodeFence,
                         content: current_lines.join("\n"),
@@ -210,7 +208,6 @@ pub fn chunk_content(text: &str, chunk_size_tokens: usize, overlap_tokens: usize
                 end_line: current_end,
             });
 
-            // Start new chunk with overlap
             if overlap_tokens > 0 {
                 let overlap_content = extract_trailing_tokens(&current_content, overlap_tokens);
                 current_content = overlap_content;

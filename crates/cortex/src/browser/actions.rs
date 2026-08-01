@@ -130,7 +130,6 @@ pub async fn drag(
             DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
         };
 
-        // Mouse down at source
         let mouse_down = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MousePressed)
             .x(sx)
@@ -143,7 +142,6 @@ pub async fn drag(
             .await
             .context("Mouse down failed")?;
 
-        // Mouse move to target
         let mouse_move = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MouseMoved)
             .x(tx)

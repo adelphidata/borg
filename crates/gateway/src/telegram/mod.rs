@@ -138,7 +138,6 @@ pub async fn handle_telegram_webhook(
     secret: Option<&str>,
     dedup: &Mutex<UpdateDeduplicator>,
 ) -> Result<Option<TelegramParsed>> {
-    // Validate and parse the update JSON
     let update = verify::validate_update(body)?;
 
     if let Some(secret) = secret {

@@ -63,13 +63,8 @@ pub fn parse_event(event: &ChatEvent) -> Option<InboundMessage> {
         return None;
     }
 
-    // Map space.name to channel_id
     let channel_id = event.space.as_ref().and_then(|s| s.name.clone());
-
-    // Map thread.name to thread_id
     let thread_id = message.thread.as_ref().and_then(|t| t.name.clone());
-
-    // Map message.name to message_id
     let message_id = message.name.clone();
 
     Some(InboundMessage {

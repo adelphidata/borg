@@ -26,7 +26,6 @@ pub async fn index_session(config: &Config, session_id: &str) -> Result<usize> {
         return Ok(0);
     }
 
-    // Build transcript from user + assistant messages (skip tool role)
     let transcript = build_transcript(&messages);
 
     if transcript.trim().is_empty() {

@@ -563,16 +563,12 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Bounds SigV4 diagnostic text, independent of the provider response-body cap
+/// so retuning one does not silently retune the other.
+const DIAGNOSTIC_MAX_BYTES: usize = 512;
+
 fn truncate(s: &str) -> String {
-    const MAX: usize = 512;
-    if s.len() <= MAX {
-        return s.to_string();
-    }
-    let mut end = MAX;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...[truncated]", &s[..end])
+    crate::util::truncate::truncate_bytes(s, DIAGNOSTIC_MAX_BYTES, "...[truncated]")
 }
 
 pub(crate) fn signed_request(

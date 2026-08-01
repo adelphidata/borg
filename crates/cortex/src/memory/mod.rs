@@ -421,7 +421,6 @@ pub async fn load_memory_context_db_ranked_with(
         );
     }
 
-    // Load ranked entries in order
     for (name, _score) in ranked {
         if loaded.contains(name) {
             continue;

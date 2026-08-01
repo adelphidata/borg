@@ -124,7 +124,6 @@ impl PairingPopup {
             }
         }
 
-        // Clamp cursor
         if !self.items.is_empty() && self.cursor >= self.items.len() {
             self.cursor = self.items.len() - 1;
         }
@@ -175,7 +174,6 @@ impl PairingPopup {
                 None
             }
             KeyCode::Char('a') => {
-                // Approve the selected pending item
                 if let Some(PairingItem::Pending { request }) = self.items.get(self.cursor) {
                     let actions = vec![PairingAction::Approve {
                         channel: request.channel_name.clone(),
@@ -206,7 +204,6 @@ impl PairingPopup {
                     return None;
                 }
 
-                // Collect all pending revokes
                 let actions: Vec<PairingAction> = self
                     .items
                     .iter()

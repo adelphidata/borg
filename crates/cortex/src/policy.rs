@@ -852,7 +852,6 @@ impl ExecutionPolicy {
             }
         }
 
-        // Check auto-approve patterns
         for pattern in &self.auto_approve {
             if glob_match(pattern, &normalized) {
                 return PolicyDecision::AutoApprove;

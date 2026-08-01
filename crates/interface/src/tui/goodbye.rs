@@ -120,7 +120,6 @@ pub fn render(tui: &mut Tui) -> Result<()> {
         let art_width = art.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
         let total_height = art_height + 2;
 
-        // Center vertically
         let v_pad = area.height.saturating_sub(total_height) / 2;
         let chunks = Layout::vertical([
             Constraint::Length(v_pad),
@@ -131,7 +130,6 @@ pub fn render(tui: &mut Tui) -> Result<()> {
         ])
         .split(area);
 
-        // Center art horizontally
         let h_pad = area.width.saturating_sub(art_width) / 2;
         let h_chunks = Layout::horizontal([
             Constraint::Length(h_pad),

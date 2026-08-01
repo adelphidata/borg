@@ -1099,7 +1099,6 @@ impl Agent {
 
             self.drain_sub_agent_completions().await;
 
-            // Budget enforcement
             match self.check_budget().await {
                 BudgetCheck::Exceeded(msg) => {
                     let _ = event_tx.send(AgentEvent::Error(msg)).await;

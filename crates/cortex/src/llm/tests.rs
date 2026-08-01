@@ -2029,8 +2029,6 @@ fn apply_message_cache_control_upgrades_string_content() {
     }
 }
 
-// ── New prompt caching tests ──
-
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[tokio::test]
 async fn anthropic_request_marks_last_tool_with_cache_control() {

@@ -82,7 +82,6 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         return None;
     };
 
-    // Build text from message content
     let mut text = data_msg.message.clone().unwrap_or_default();
 
     // Resolve mention placeholders (U+FFFC -> @name)
@@ -132,7 +131,6 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         }
     });
 
-    // If no text and no reaction, skip
     if text.is_empty() && reaction.is_none() {
         return None;
     }
@@ -149,10 +147,10 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         }
     }
 
-    // Map group_info -> channel_id
     let channel_id = data_msg.group_info.as_ref().map(|g| g.group_id.clone());
 
-    // Use the data message timestamp as message_id
+    // Signal has no server-side message id; the sender-chosen timestamp is the
+    // only stable per-message key, and is what quote/reaction targets carry.
     let message_id = if data_msg.timestamp != 0 {
         Some(data_msg.timestamp.to_string())
     } else {

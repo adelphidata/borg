@@ -380,7 +380,6 @@ async fn summarize_chunked(
         return Ok(only.clone());
     }
 
-    // Merge chunk summaries
     let combined = chunk_summaries
         .iter()
         .enumerate()

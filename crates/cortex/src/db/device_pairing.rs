@@ -15,6 +15,8 @@ pub enum ConsumeOutcome {
     RateLimited,
 }
 
+/// Brute-force ceiling per pairing code: codes are short and human-typed, so
+/// the guess budget must stay far below the code's entropy.
 const MAX_ATTEMPTS_PER_CODE: i64 = 5;
 
 pub fn hash_pairing_code(code: &str) -> String {

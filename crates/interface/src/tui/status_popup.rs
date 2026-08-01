@@ -167,7 +167,6 @@ impl StatusPopup {
         let version = env!("CARGO_PKG_VERSION");
         let name = config.user.agent_name.as_deref().unwrap_or("Borg");
 
-        // Banner
         self.lines.push(Line::from(vec![
             Span::styled(
                 "BORG",
@@ -310,11 +309,9 @@ impl StatusPopup {
             return;
         }
 
-        // Tab bar along the top row of the inner area.
         let tab_bar = Rect::new(inner.x, inner.y, inner.width, 1);
         frame.render_widget(self.render_tab_bar(), tab_bar);
 
-        // Content area below the tab bar.
         let content = Rect::new(
             inner.x,
             inner.y + 1,
@@ -355,7 +352,6 @@ impl StatusPopup {
 
         frame.render_widget(paragraph, content);
 
-        // Footer hint
         let footer_y = popup_area.y + popup_area.height.saturating_sub(1);
         if popup_area.width > 40 {
             let hint = " Esc: close  \u{2190}\u{2192}: tabs  \u{2191}\u{2193}: scroll ";

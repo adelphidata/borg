@@ -107,7 +107,8 @@ impl InternalTagFilter {
         }
     }
 
-    /// Return the full cleaned text.
+    /// Strips tags over the whole buffer, ignoring any streaming hold-back —
+    /// use only once the stream is complete.
     pub fn full_clean(&self) -> String {
         strip_internal_tags(&self.raw)
     }

@@ -103,6 +103,18 @@ pub fn pad_or_truncate(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(pad))
 }
 
+/// Byte-bounded truncate on a UTF-8 boundary, appending `marker` when clamped.
+///
+/// Byte-based (not char-based) because callers are bounding what lands in
+/// `daemon.log` / persisted error columns, where the cost is bytes written.
+pub fn truncate_bytes(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let end = floor_char_boundary(s, max_bytes);
+    format!("{}{marker}", &s[..end])
+}
+
 /// Find the largest byte index <= `index` that is a char boundary.
 pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
@@ -130,6 +142,43 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_bytes_clamps_on_char_boundaries() {
+        // Table drives the contract shared by all four call sites: bounded byte
+        // length, marker only when clamped, and never a panic mid-codepoint.
+        // "é" is 2 bytes, so a max of 5 splits the third one.
+        let cases: &[(&str, usize, &str, &str)] = &[
+            ("short", 100, "..", "short"),    // under budget: unchanged
+            ("exact", 5, "..", "exact"),      // at budget: no marker
+            ("ééé", 5, "..", "éé.."),         // split mid-codepoint
+            ("ascii", 0, "..", ".."),         // zero budget
+            ("ascii", 2, "[cut]", "as[cut]"), // marker may exceed budget
+        ];
+        for (input, max, marker, expected) in cases {
+            assert_eq!(
+                truncate_bytes(input, *max, marker),
+                *expected,
+                "truncate_bytes({input:?}, {max}, {marker:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_bytes_never_splits_a_utf8_codepoint() {
+        // Every budget from 0..len must yield valid UTF-8 whose retained prefix
+        // is a prefix of the input — this is what keeps redacted error bodies
+        // from panicking on multi-byte provider payloads.
+        let text = "αβγδε日本語";
+        for max in 0..=text.len() {
+            let out = truncate_bytes(text, max, "");
+            assert!(
+                text.starts_with(&out),
+                "budget {max} produced non-prefix {out:?}"
+            );
+            assert!(out.len() <= max, "budget {max} overflowed: {out:?}");
+        }
+    }
 
     #[test]
     fn no_truncation_when_under_budget() {

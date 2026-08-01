@@ -148,7 +148,6 @@ impl BtwPopup {
             frame.render_widget(paragraph, body_area);
         }
 
-        // Footer hint — bottom border row.
         if area.width > footer_hint.len() as u16 + 4 {
             let footer_y = area.y + area.height.saturating_sub(1);
             let footer_area = Rect::new(area.x + 2, footer_y, footer_hint.len() as u16, 1);

@@ -151,6 +151,8 @@ impl TypingHandle {
 
     /// Send the stop signal and wait for the typing task to finish.
     pub async fn stop(mut self) {
+        // Both discards mean "the typing task already ended" — a send error or
+        // a JoinError here is the success case, not a failure to report.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -416,7 +418,9 @@ pub async fn dispatch_webhook(
                             }
                         }
 
-                        // Attempt immediate delivery
+                        // The delivery row is enqueued first so a crash between
+                        // here and `mark_delivered` leaves work the drain loop
+                        // can retry rather than a silently dropped reply.
                         match channel
                             .send_response(&response_text, &response_context, &health)
                             .await

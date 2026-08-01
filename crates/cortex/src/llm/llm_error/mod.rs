@@ -26,18 +26,11 @@ const ERROR_BODY_MAX_LEN: usize = 512;
 /// Sanitize a provider error response body before it is embedded in an
 /// `anyhow!` chain (which subsequently flows to `tracing::warn!`). Runs
 /// `redact_secrets` (catches sk-…, ghp_…, AKIA…, JWTs, KEY=value, DB URIs,
-/// private keys) and truncates to `ERROR_BODY_MAX_LEN` chars.
+/// private keys) and truncates to `ERROR_BODY_MAX_LEN` bytes.
 fn sanitize_body(body: &str) -> String {
+    // Redact before clamping: truncation must not be what hides a secret.
     let redacted = redact_secrets(body);
-    if redacted.len() <= ERROR_BODY_MAX_LEN {
-        redacted
-    } else {
-        let mut end = ERROR_BODY_MAX_LEN;
-        while !redacted.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…[truncated]", &redacted[..end])
-    }
+    crate::util::truncate::truncate_bytes(&redacted, ERROR_BODY_MAX_LEN, "…[truncated]")
 }
 
 /// Why a provider failed — drives cooldown duration, key rotation, failover,

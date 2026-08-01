@@ -214,7 +214,6 @@ async fn check_pairing(
     sender_id: &str,
     agent_name: Option<&str>,
 ) -> Result<AccessCheckResult> {
-    // Check if sender is already approved
     if db.is_sender_approved(channel_name, sender_id).await? {
         return Ok(AccessCheckResult::Allowed);
     }
@@ -252,7 +251,6 @@ async fn check_pairing(
             .await?;
     }
 
-    // Generate new pairing code and create request
     let code = generate_code(channel_name);
     db.create_pairing_request(channel_name, sender_id, &code, None, ttl)
         .await?;

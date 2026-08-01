@@ -456,7 +456,6 @@ pub async fn delete_script(db: &Database, name: &str) -> Result<String> {
     Ok(format!("Script '{name}' deleted."))
 }
 
-/// Get script details from DB.
 pub async fn get_script(db: &Database, name: &str) -> Result<String> {
     validate_script_name(name)?;
     let script = db

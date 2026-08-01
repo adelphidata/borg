@@ -86,7 +86,6 @@ pub(crate) async fn init_telegram(
                         }
                     }
 
-                    // Register bot command menu
                     {
                         use crate::commands::{NativeCommandRegistration, GATEWAY_COMMANDS};
                         if let Err(e) = client.register_commands(GATEWAY_COMMANDS).await {
@@ -212,7 +211,6 @@ pub(crate) async fn init_discord(config: &Config) -> (Option<Arc<DiscordClient>>
                     info!("Discord native integration active (bot: {})", user.username);
                     client.set_application_id(user.id.clone());
 
-                    // Register global slash commands
                     {
                         use crate::commands::{NativeCommandRegistration, GATEWAY_COMMANDS};
                         if let Err(e) = client.register_commands(GATEWAY_COMMANDS).await {

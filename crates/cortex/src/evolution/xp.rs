@@ -57,7 +57,6 @@ pub fn level_from_xp(stage: &Stage, xp: u32) -> (u8, u32) {
     match stage {
         Stage::Base | Stage::Evolved => (99, 0),
         Stage::Final => {
-            // Each level past 99 costs FINAL_POST_99_LEVEL_COST.
             let extra_levels = remaining / FINAL_POST_99_LEVEL_COST;
             let level = 99u32.saturating_add(extra_levels).min(u8::MAX as u32) as u8;
             let consumed = extra_levels * FINAL_POST_99_LEVEL_COST;

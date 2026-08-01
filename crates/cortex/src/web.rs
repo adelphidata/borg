@@ -514,12 +514,13 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
 fn html_to_text(html: &str) -> String {
     let document = Html::parse_document(html);
 
-    // Try content-rich selectors first
     let content_selectors = ["main", "article", "#content", ".content", "body"];
     for sel_str in &content_selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
             if let Some(el) = document.select(&sel).next() {
                 let text = extract_text(&el);
+                // Under ~100 chars the container is almost certainly chrome (nav,
+                // cookie banner) rather than the article body — keep searching.
                 if text.len() > 100 {
                     return text;
                 }
@@ -527,7 +528,6 @@ fn html_to_text(html: &str) -> String {
         }
     }
 
-    // Fallback: all text from root
     let text: String = document.root_element().text().collect::<Vec<_>>().join(" ");
     collapse_whitespace(&text)
 }

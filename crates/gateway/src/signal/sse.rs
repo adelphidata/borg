@@ -56,7 +56,8 @@ pub async fn run_sse_loop(
             break;
         }
 
-        // Apply backoff on errors
+        // Backoff happens at the top of the loop, not at the error site, so
+        // every `continue` path above is guaranteed to be throttled.
         if consecutive_errors > 0 {
             let backoff = calculate_backoff(consecutive_errors);
             info!("Signal SSE reconnecting in {backoff:?} (attempt {consecutive_errors})");
@@ -74,9 +75,10 @@ pub async fn run_sse_loop(
             encoded_account
         );
 
-        // Connect to SSE stream using the client's configured HTTP client
         let response = tokio::select! {
             _ = shutdown.cancelled() => break,
+            // Bounds connect through response headers only — the stream body
+            // is long-lived and is policed by the STALL_TIMEOUT watchdog below.
             result = tokio::time::timeout(
                 Duration::from_secs(30),
                 client.get_sse(&url)
@@ -100,7 +102,6 @@ pub async fn run_sse_loop(
         info!("Signal SSE stream connected");
         consecutive_errors = 0;
 
-        // Process the byte stream as SSE frames
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut data_lines: Vec<String> = Vec::new();

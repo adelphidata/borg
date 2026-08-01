@@ -86,6 +86,8 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process:
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Best-effort reap: the child may have exited between the
+                    // try_wait and here, and we fail the verification anyway.
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!("timed out after {timeout:?}"));

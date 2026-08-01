@@ -377,6 +377,7 @@ impl Drop for StdioTransport {
             let child = self.child.clone();
             handle.spawn(async move {
                 if let Some(mut c) = child.lock().await.take() {
+                    // Reap so the SIGTERM'd server doesn't linger as a zombie; it may already be gone.
                     let _ = c.wait().await;
                 }
             });

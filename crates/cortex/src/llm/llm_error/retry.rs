@@ -7,6 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::LlmError;
 
+/// Ceiling for every retry-after shape: a degenerate provider hint
+/// (`retry_after: 999999999`) must not park a credential for a month.
+const MAX_RETRY_SECS: u64 = 24 * 60 * 60;
+
 /// Parse an HTTP `Retry-After` header value. RFC 7231 allows two forms:
 /// a delta in seconds (e.g. `"300"`) or an HTTP-date. We accept the seconds
 /// form (provider servers we talk to use it exclusively) and clamp to a
@@ -17,8 +21,7 @@ pub fn parse_retry_after_header(value: &str) -> Option<Duration> {
     if !secs.is_finite() || secs <= 0.0 {
         return None;
     }
-    const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
-    Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+    Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)))
 }
 
 /// Replace the `retry_after` field on a `Retryable` error with the supplied
@@ -67,8 +70,7 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
                 .and_then(valid)
         })
         .or_else(|| parse_google_retry_delay(&v).and_then(valid))?;
-    const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
-    Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+    Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)))
 }
 
 /// Walk `error.details[]` for the first `retryDelay` string in Google's
@@ -194,7 +196,7 @@ pub fn parse_retry_hint_from_body(body: &str) -> Option<Duration> {
 }
 
 fn clamp_retry(d: Duration) -> Duration {
-    let secs = d.as_secs().clamp(1, 24 * 60 * 60);
+    let secs = d.as_secs().clamp(1, MAX_RETRY_SECS);
     Duration::from_secs(secs)
 }
 

@@ -393,7 +393,6 @@ pub async fn embed_memory_file(
 
     let hash = content_hash(content);
 
-    // Check if embedding already exists with same hash
     let db = Database::open().await?;
     if let Some(existing) = db.get_embedding(scope, filename).await? {
         if existing.content_hash == hash {
@@ -477,6 +476,8 @@ pub async fn rank_embeddings_by_similarity_scoped(
         .iter()
         .map(|row| {
             let stored_emb = match bytes_to_embedding(&row.embedding) {
+                // A corrupt/dimension-mismatched row scores 0.0 and sinks to
+                // the bottom rather than failing the whole search.
                 Ok(emb) => emb,
                 Err(_) => return (row.scope.clone(), row.filename.clone(), 0.0),
             };
@@ -484,6 +485,8 @@ pub async fn rank_embeddings_by_similarity_scoped(
             let recency_score = if time_range > 0.0 {
                 (row.created_at - min_time) as f32 / time_range
             } else {
+                // All rows share a timestamp: recency carries no signal, so
+                // give everyone the max and let similarity decide the order.
                 1.0
             };
             let score = blended_score(similarity, recency_score, recency_weight);
@@ -637,7 +640,6 @@ pub fn merge_search_scores(
         (false, false) => (vector_weight, bm25_weight),
     };
 
-    // Merge into a map keyed by (filename, chunk_index)
     let mut scores: HashMap<(String, i64), (f32, f32)> = HashMap::new();
 
     for (f, ci, s) in &norm_vec {

@@ -200,7 +200,6 @@ impl Agent {
         // filtered array the model receives, so the two can never disagree.
         system.push_str(&Self::build_tooling_section(tools));
 
-        // Tool call style guidance
         system.push_str(Self::build_tool_call_style_section());
         system.push_str(Self::build_skill_usage_section());
 

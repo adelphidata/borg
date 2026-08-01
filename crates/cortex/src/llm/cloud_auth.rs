@@ -280,16 +280,12 @@ fn first_pkcs8_key(private_key_pem: &str) -> Result<Vec<u8>> {
     Ok(key.secret_pkcs8_der().to_vec())
 }
 
+/// Bounds GCP auth diagnostic text, independent of the provider response-body
+/// cap so retuning one does not silently retune the other.
+const DIAGNOSTIC_MAX_BYTES: usize = 512;
+
 fn truncate(s: &str) -> String {
-    const MAX: usize = 512;
-    if s.len() <= MAX {
-        return s.to_string();
-    }
-    let mut end = MAX;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...[truncated]", &s[..end])
+    crate::util::truncate::truncate_bytes(s, DIAGNOSTIC_MAX_BYTES, "...[truncated]")
 }
 
 #[cfg(test)]

@@ -812,7 +812,6 @@ impl EvolutionHook {
             tracing::warn!("evolution: failed to record XP event: {e}");
             return;
         }
-        // Check if we should attempt an evolution after this XP gain
         self.attempt_evolution(&db).await;
 
         // Detect sub-evolution milestones against the post-state. Runs after
@@ -912,7 +911,6 @@ impl EvolutionHook {
             return;
         }
 
-        // Already at final stage
         if evo_state.stage == Stage::Final {
             return;
         }
@@ -928,7 +926,6 @@ impl EvolutionHook {
         let bond_key = db.derive_hmac_key(crate::bond::BOND_HMAC_DOMAIN);
         let bond_state = crate::bond::replay_events_with_key(&bond_key, &bond_events);
 
-        // Get vitals state for gate checks
         let vitals_state = match db.get_vitals_state().await {
             Ok(s) => s,
             Err(e) => {
@@ -1176,7 +1173,6 @@ impl Hook for EvolutionHook {
         }
         match &ctx.data {
             HookData::SessionStart { .. } => {
-                // Record interaction XP
                 self.record_xp("session_start", None, BASE_XP_INTERACTION, 0)
                     .await;
             }

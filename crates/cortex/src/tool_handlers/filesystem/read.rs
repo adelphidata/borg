@@ -104,7 +104,6 @@ pub fn handle_read_file_with_context(
         )));
     }
 
-    // Dispatch by extension
     let ext = canonical
         .extension()
         .and_then(|e| e.to_str())
@@ -128,7 +127,6 @@ pub fn handle_read_file_with_context(
             }
         }
 
-        // Read image bytes, compress, return as multimodal
         let raw_bytes = match std::fs::read(&canonical) {
             Ok(b) => b,
             Err(e) => {

@@ -30,6 +30,8 @@ impl SlidingWindowLimiter {
 
     pub fn check(&mut self, key: &str) -> bool {
         self.check_count += 1;
+        // Amortized sweep: pruning every call would be O(keys) per request, and
+        // never pruning leaks a window per distinct client IP.
         if self.check_count % 50 == 0 {
             self.prune_stale();
         }
@@ -44,7 +46,6 @@ impl SlidingWindowLimiter {
 
         let window = self.windows.entry(key.to_string()).or_default();
 
-        // Remove expired entries
         while window.front().is_some_and(|&t| t < cutoff) {
             window.pop_front();
         }

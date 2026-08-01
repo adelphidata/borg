@@ -442,7 +442,6 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_steer_received(&mut self, text: String) {
-        // Remove matching steer from pending
         if let Some(pos) = self.pending_steers.iter().position(|s| *s == text) {
             self.pending_steers.remove(pos);
         }
@@ -839,6 +838,7 @@ impl<'a> App<'a> {
                 if let Err(e) = cortex::media::playback::play_audio_file(&path).await {
                     tracing::warn!(chunk = i, error = %e, "voice auto-tts playback failed");
                 }
+                // Playback is done with the temp chunk; a leftover file in tmp is harmless.
                 let _ = tokio::fs::remove_file(&path).await;
             }
             if let Some(vl) = &voice_loop {

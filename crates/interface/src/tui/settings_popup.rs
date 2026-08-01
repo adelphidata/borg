@@ -796,7 +796,6 @@ impl SettingsPopup {
                 ]));
             }
 
-            // Scroll to keep selected visible
             let adj_scroll = if *selected >= *scroll_offset + content_height {
                 *selected - content_height + 1
             } else if *selected < *scroll_offset {
@@ -912,7 +911,6 @@ impl SettingsPopup {
             lines.push(Line::from(spans));
         }
 
-        // Scroll to keep selected visible
         let selected_line = row_indices.get(self.selected).copied().unwrap_or(0);
         let scroll_offset = if selected_line >= content_height {
             selected_line - content_height + 1
@@ -931,7 +929,6 @@ impl SettingsPopup {
 
         popup_utils::render_status_message(frame, inner, self.status_message.as_ref(), 3);
 
-        // CLI hint
         let cli_hint_y = inner.y + inner.height - 2;
         let cli_hint_area = Rect::new(inner.x, cli_hint_y, inner.width, 1);
         frame.render_widget(
@@ -942,7 +939,6 @@ impl SettingsPopup {
             cli_hint_area,
         );
 
-        // Footer hint (context-sensitive)
         let hint = match self.mode {
             EditMode::Browsing => {
                 let entry = &self.entries[self.selected];

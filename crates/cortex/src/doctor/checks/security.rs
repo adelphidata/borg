@@ -128,7 +128,6 @@ pub(in crate::doctor) fn check_keychain(config: &Config, checks: &mut Vec<Diagno
 pub(in crate::doctor) fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     use crate::pairing::DmPolicy;
 
-    // DM policy (three-way match — not table-driven)
     match config.gateway.dm_policy {
         DmPolicy::Open => checks.push(DiagnosticCheck::warn(
             "Security",
@@ -238,7 +237,6 @@ pub(in crate::doctor) fn check_config_security(config: &Config, checks: &mut Vec
         }
     }
 
-    // Browser no-sandbox (conditional on browser being enabled)
     if config.browser.enabled && config.browser.no_sandbox {
         checks.push(DiagnosticCheck::warn(
             "Security",

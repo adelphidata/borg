@@ -117,6 +117,7 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, full_path) {
+        // Rename failed, so the temp file is orphaned; the rename error is what matters.
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
