@@ -247,6 +247,32 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         .collect()
 });
 
+/// One-pass prefilter over the full pattern list. Redaction runs on every
+/// TUI transcript insert, log line, and outbound channel message; without
+/// the prefilter each call walked all patterns sequentially, producing a
+/// fresh full copy of the text per pattern. The set is built from the SAME
+/// surviving `SECRET_PATTERNS` entries (via `Regex::as_str`), so set index
+/// == pattern index by construction and the two cannot drift. `None` (set
+/// compile failure — unreachable when every member compiled individually)
+/// degrades to running every pattern, never to skipping one.
+static SECRET_PATTERN_SET: LazyLock<Option<regex::RegexSet>> = LazyLock::new(|| {
+    match regex::RegexSet::new(SECRET_PATTERNS.iter().map(|p| p.regex.as_str())) {
+        Ok(set) => Some(set),
+        Err(e) => {
+            tracing::error!("Failed to compile secret pattern set: {e} — prefilter disabled");
+            None
+        }
+    }
+});
+
+/// Indices of patterns that match `text`, in evaluation order.
+fn matching_pattern_indices(text: &str) -> Vec<usize> {
+    match SECRET_PATTERN_SET.as_ref() {
+        Some(set) => set.matches(text).into_iter().collect(),
+        None => (0..SECRET_PATTERNS.len()).collect(),
+    }
+}
+
 /// A single per-pattern audit record produced by [`redact_with_audit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionHit {
@@ -277,9 +303,22 @@ pub fn redact_secrets(text: &str) -> String {
 /// preserves pattern evaluation order so callers writing audit rows get a
 /// deterministic ordering.
 pub fn redact_with_audit(text: &str) -> RedactionOutcome {
+    // Prefilter against the original text: only patterns the set saw run
+    // their replace pass. Earlier passes only ever substitute "[REDACTED …]"
+    // markers, which cannot form a new secret for a later pattern (and the
+    // capture-only branch skips already-redacted values explicitly), so a
+    // pattern the set didn't match can never become relevant mid-loop.
+    let matched = matching_pattern_indices(text);
+    if matched.is_empty() {
+        return RedactionOutcome {
+            text: text.to_string(),
+            hits: Vec::new(),
+        };
+    }
+
     let mut result = text.to_string();
     let mut hits: Vec<RedactionHit> = Vec::new();
-    for pattern in SECRET_PATTERNS.iter() {
+    for pattern in matched.into_iter().map(|i| &SECRET_PATTERNS[i]) {
         let label = pattern.label;
         let mut count: usize = 0;
         if pattern.capture_only {
@@ -325,10 +364,13 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
 /// validators so a match `redact_with_audit` would leave unredacted doesn't
 /// count as a secret here either.
 pub fn contains_secrets(text: &str) -> bool {
-    SECRET_PATTERNS.iter().any(|p| match p.validator {
-        None => p.regex.is_match(text),
-        Some(v) => p.regex.find_iter(text).any(|m| v(m.as_str())),
-    })
+    matching_pattern_indices(text)
+        .into_iter()
+        .map(|i| &SECRET_PATTERNS[i])
+        .any(|p| match p.validator {
+            None => p.regex.is_match(text),
+            Some(v) => p.regex.find_iter(text).any(|m| v(m.as_str())),
+        })
 }
 
 /// One representative sample per secret pattern. Used by cross-module tests
@@ -722,5 +764,39 @@ mod tests {
             !result.contains("my_database_secret_key_here"),
             "raw exported credential value must not survive redaction: {result}"
         );
+    }
+
+    /// Guard against prefilter/pattern-list drift: the RegexSet indices must
+    /// line up with `SECRET_PATTERNS` so the prefilter never routes a match
+    /// to the wrong pattern or silently skips one. Every representative
+    /// sample must still be detected and rewritten with the prefilter on.
+    #[test]
+    fn prefilter_preserves_detection_of_every_pattern() {
+        for sample in SECRET_PATTERNS_FOR_TEST {
+            let outcome = redact_with_audit(sample);
+            assert!(
+                !outcome.hits.is_empty(),
+                "sample slipped through the prefilter: {sample}"
+            );
+            assert_ne!(outcome.text, *sample, "sample not rewritten: {sample}");
+        }
+    }
+
+    /// A single input carrying several different secret kinds must produce a
+    /// hit per pattern in one call — the prefilter selects a set, not just
+    /// the first match.
+    #[test]
+    fn multi_secret_input_hits_multiple_patterns() {
+        let input = "aws AKIAIOSFODNN7EXAMPLE and header Authorization: Bearer abcd1234efgh5678 \
+                     plus export DB_SECRET=my_database_secret_key_here";
+        let outcome = redact_with_audit(input);
+        assert!(
+            outcome.hits.len() >= 2,
+            "expected multiple distinct pattern hits, got {:?}",
+            outcome.hits
+        );
+        assert!(!outcome.text.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!outcome.text.contains("abcd1234efgh5678"));
+        assert!(!outcome.text.contains("my_database_secret_key_here"));
     }
 }
