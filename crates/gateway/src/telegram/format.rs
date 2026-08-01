@@ -111,14 +111,38 @@ pub const TELEGRAM_CAPTION_LIMIT: usize = 1024;
 /// Returns `(caption, follow_up)` where:
 /// - `caption` is at most `TELEGRAM_CAPTION_LIMIT` characters long;
 /// - `follow_up` is the remaining text, or `None` if the input fit.
+///
+/// When a split is needed it prefers the last whitespace inside the limit
+/// (searching back at most `CAPTION_SPLIT_LOOKBACK` characters) so the cut
+/// doesn't land mid-word; with no nearby whitespace it falls back to the
+/// hard character cut.
 pub fn split_caption(text: &str) -> (String, Option<String>) {
-    let mut chars = text.chars();
-    let head: String = chars.by_ref().take(TELEGRAM_CAPTION_LIMIT).collect();
-    let rest: String = chars.collect();
+    /// How far back from the hard limit to look for a whitespace boundary.
+    /// Bounded so a caption that is one long unbroken token still splits
+    /// near the limit instead of collapsing to a tiny head.
+    const CAPTION_SPLIT_LOOKBACK: usize = 120;
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= TELEGRAM_CAPTION_LIMIT {
+        return (text.to_string(), None);
+    }
+
+    let cut = (1..=CAPTION_SPLIT_LOOKBACK)
+        .map(|back| TELEGRAM_CAPTION_LIMIT - back)
+        .find(|&i| chars[i].is_whitespace())
+        // Split *after* the whitespace so the follow-up starts clean.
+        .map(|i| i + 1)
+        .unwrap_or(TELEGRAM_CAPTION_LIMIT);
+
+    let head: String = chars[..cut].iter().collect();
+    let rest: String = chars[cut..].iter().collect();
+    let rest = rest.trim_start();
+    // An all-whitespace remainder is no remainder — an empty follow-up
+    // message would be rejected by the Bot API.
     if rest.is_empty() {
-        (head, None)
+        (head.trim_end().to_string(), None)
     } else {
-        (head, Some(rest))
+        (head.trim_end().to_string(), Some(rest.to_string()))
     }
 }
 
@@ -242,6 +266,30 @@ mod tests {
         assert_eq!(cap.chars().count(), TELEGRAM_CAPTION_LIMIT);
         let rest = rest.expect("over-limit text must produce a follow-up");
         assert_eq!(rest.chars().count(), 2000 - TELEGRAM_CAPTION_LIMIT);
+    }
+
+    #[test]
+    fn split_caption_prefers_word_boundary() {
+        // Words of 9 chars + space; the hard limit would land mid-word, the
+        // split must back up to the preceding space instead.
+        let word = "abcdefghi ";
+        let text = word.repeat(200); // 2000 chars
+        let (cap, rest) = split_caption(&text);
+        let rest = rest.expect("over-limit caption must split");
+        assert!(
+            cap.chars().count() <= TELEGRAM_CAPTION_LIMIT,
+            "caption must fit the limit"
+        );
+        assert!(
+            cap.ends_with("abcdefghi"),
+            "cut must not land mid-word: ...{:?}",
+            cap.chars().rev().take(12).collect::<String>()
+        );
+        assert!(
+            rest.starts_with("abcdefghi"),
+            "follow-up must start at a word: {:?}",
+            rest.chars().take(12).collect::<String>()
+        );
     }
 
     #[test]

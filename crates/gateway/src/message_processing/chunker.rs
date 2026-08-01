@@ -76,6 +76,156 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Split markdown into chunks without ever leaving a code fence open.
+///
+/// [`chunk_text`] is markup-blind: a boundary that lands inside a ``` fence
+/// leaves one chunk with an unterminated block and the next starting with
+/// orphaned code body — after per-chunk rendering, the platform rejects the
+/// malformed markup (Telegram: "can't parse entities"). This variant walks
+/// lines and tracks fence state:
+///
+/// - boundaries between chunks land only outside fences when possible;
+/// - a fence block too large for one chunk is split by closing the fence at
+///   the chunk end and reopening it (with its info string) at the start of
+///   the next chunk, so every chunk renders standalone;
+/// - a single overlong line falls back to [`chunk_text`]'s hard split.
+pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![];
+    }
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    const FENCE: &str = "```";
+    // Room reserved for "\n```" so an open fence can always be closed within
+    // the budget.
+    let close_reserve = FENCE.len() + 1;
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    // `Some(info)` while inside a fence; `info` is the opening line's info
+    // string (e.g. "rust") used to reopen the fence in the next chunk.
+    let mut open_fence: Option<String> = None;
+
+    let flush = |chunks: &mut Vec<String>,
+                 current: &mut String,
+                 current_chars: &mut usize,
+                 open_fence: &Option<String>| {
+        if let Some(info) = open_fence {
+            current.push('\n');
+            current.push_str(FENCE);
+            chunks.push(std::mem::take(current));
+            current.push_str(FENCE);
+            current.push_str(info);
+            *current_chars = current.chars().count();
+        } else {
+            let flushed = std::mem::take(current);
+            let trimmed = flushed.trim_end();
+            if !trimmed.is_empty() {
+                chunks.push(trimmed.to_string());
+            }
+            *current_chars = 0;
+        }
+    };
+
+    // A chunk holding only the reopened-fence scaffold ("```info") must not
+    // be flushed: it would emit a degenerate empty code block as its own
+    // message.
+    let is_bare_scaffold = |current: &str, open_fence: &Option<String>| {
+        open_fence
+            .as_ref()
+            .is_some_and(|info| current == format!("{FENCE}{info}"))
+    };
+
+    for line in text.split('\n') {
+        let is_fence_line = line.trim_start().starts_with(FENCE);
+        let line_chars = line.chars().count();
+        // +1 for the joining newline when the chunk already has content.
+        let sep = usize::from(!current.is_empty());
+        // While inside a fence, reserve room for BOTH bracketing sides: the
+        // "\n```" close appended to this chunk and the "```info" reopen the
+        // next chunk starts with (already counted in current_chars once
+        // present, so subtracting it here keeps scaffold + line + close
+        // within max_chars even for a line at exactly the budget).
+        let reopen_reserve = open_fence
+            .as_ref()
+            .map(|info| FENCE.len() + info.chars().count() + 1)
+            .unwrap_or(0);
+        let budget = if open_fence.is_some() || is_fence_line {
+            max_chars.saturating_sub(close_reserve + reopen_reserve)
+        } else {
+            max_chars
+        };
+
+        if current_chars + sep + line_chars > budget
+            && !current.is_empty()
+            && !is_bare_scaffold(&current, &open_fence)
+        {
+            flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
+        }
+
+        // A single line that alone exceeds the budget: hard-split it via
+        // chunk_text; the flush's close/reopen bracketing keeps every piece
+        // well-formed when this happens inside a fence.
+        if line_chars > budget.max(1) {
+            if !current.trim().is_empty() && !is_bare_scaffold(&current, &open_fence) {
+                flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
+            }
+            for piece in chunk_text(line, budget.max(1)) {
+                if !current.is_empty() {
+                    current.push('\n');
+                    current_chars += 1;
+                }
+                current.push_str(&piece);
+                current_chars += piece.chars().count();
+                flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
+            }
+            if is_fence_line {
+                // Pathological (an overlong fence marker line); treat as a
+                // toggle so state stays consistent.
+                open_fence = toggle_fence(open_fence, line);
+            }
+            continue;
+        }
+
+        if !current.is_empty() {
+            current.push('\n');
+            current_chars += 1;
+        }
+        current.push_str(line);
+        current_chars += line_chars;
+
+        if is_fence_line {
+            open_fence = toggle_fence(open_fence, line);
+        }
+    }
+
+    if !current.trim().is_empty() {
+        // Drop a bare reopened-fence scaffold left when a fence split landed
+        // exactly at the end of input — it would render as an empty block.
+        let bare_reopen = open_fence
+            .as_ref()
+            .is_some_and(|info| current.trim() == format!("{FENCE}{info}").trim_end());
+        if !bare_reopen {
+            chunks.push(current.trim_end().to_string());
+        }
+    }
+    if chunks.is_empty() && !text.is_empty() {
+        return vec![text.to_string()];
+    }
+    chunks
+}
+
+/// Fence state transition for a line starting with ```.
+fn toggle_fence(open: Option<String>, line: &str) -> Option<String> {
+    match open {
+        Some(_) => None,
+        None => Some(line.trim_start().trim_start_matches('`').trim().to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +340,141 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], "Hello world. Nice day.");
         assert_eq!(chunks[1], "Second paragraph.");
+    }
+
+    // ── chunk_markdown_fenced ──
+    //
+    // Contract: every chunk must be standalone-renderable markdown — an even
+    // number of ``` fence markers per chunk, so no chunk opens a block the
+    // next chunk is expected to close.
+
+    fn fence_count(s: &str) -> usize {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count()
+    }
+
+    #[test]
+    fn fenced_short_text_untouched() {
+        let text = "hello\n```rust\nlet x = 1;\n```\nworld";
+        assert_eq!(chunk_markdown_fenced(text, 100), vec![text]);
+    }
+
+    #[test]
+    fn fenced_never_splits_inside_small_fence() {
+        // Prose forces a split; the fence block fits in one chunk and must
+        // arrive intact rather than being cut mid-block.
+        let text = "aaaa aaaa aaaa aaaa\n\n```py\nprint(1)\nprint(2)\n```\n\nbbbb";
+        let chunks = chunk_markdown_fenced(text, 30);
+        assert!(chunks.len() >= 2, "expected a split, got {chunks:?}");
+        for chunk in &chunks {
+            assert_eq!(
+                fence_count(chunk) % 2,
+                0,
+                "chunk leaves a fence open: {chunk:?}"
+            );
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.contains("print(1)") && c.contains("print(2)")),
+            "small fence must stay whole: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_large_fence_closed_and_reopened_with_info_string() {
+        let body: Vec<String> = (0..30).map(|i| format!("line number {i:02}")).collect();
+        let text = format!("```rust\n{}\n```", body.join("\n"));
+        let chunks = chunk_markdown_fenced(&text, 120);
+        assert!(chunks.len() > 1, "expected multi-chunk, got {chunks:?}");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                fence_count(chunk) % 2,
+                0,
+                "chunk {i} leaves a fence open: {chunk:?}"
+            );
+            assert!(
+                chunk.chars().count() <= 120,
+                "chunk {i} exceeds budget: {} chars",
+                chunk.chars().count()
+            );
+        }
+        // Continuation chunks reopen with the original info string.
+        for chunk in &chunks[1..] {
+            assert!(
+                chunk.starts_with("```rust"),
+                "continuation must reopen the fence with its info string: {chunk:?}"
+            );
+        }
+        // No content lost.
+        let rejoined: String = chunks.join("\n");
+        for line in &body {
+            assert!(rejoined.contains(line), "lost line {line:?}");
+        }
+    }
+
+    #[test]
+    fn fenced_plain_prose_matches_no_fence_semantics() {
+        let text = "para one is here.\n\npara two is here.\n\npara three.";
+        let chunks = chunk_markdown_fenced(text, 20);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| !c.contains("```")));
+        let rejoined = chunks.join("\n");
+        for word in ["para one", "para two", "para three"] {
+            assert!(rejoined.contains(word), "lost {word:?} in {chunks:?}");
+        }
+    }
+
+    #[test]
+    fn fenced_empty_and_zero_budget() {
+        assert!(chunk_markdown_fenced("", 100).is_empty());
+        assert_eq!(chunk_markdown_fenced("abc", 0), vec!["abc"]);
+    }
+
+    /// Boundary regression: fence body lines near the budget, combined with a
+    /// long info string, must neither push a chunk past `max_chars` (the
+    /// reopen scaffold + close fence both count) nor emit a degenerate
+    /// "```info\n```" empty-block chunk.
+    #[test]
+    fn fenced_boundary_lines_with_long_info_string_stay_within_budget() {
+        let max = 80;
+        let info = "rust,ignore,no_run";
+        // Lines sized to crowd the budget from every offset.
+        let mut body = String::new();
+        for len in [60usize, 70, 55, 68, 40, 72] {
+            body.push_str(&"x".repeat(len));
+            body.push('\n');
+        }
+        let text = format!("```{info}\n{body}```");
+        let chunks = chunk_markdown_fenced(&text, max);
+        assert!(chunks.len() > 1, "expected a split: {chunks:?}");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.chars().count() <= max,
+                "chunk {i} exceeds max ({} chars): {chunk:?}",
+                chunk.chars().count()
+            );
+            assert_eq!(
+                fence_count(chunk) % 2,
+                0,
+                "chunk {i} leaves a fence open: {chunk:?}"
+            );
+            let stripped: String = chunk
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("```"))
+                .collect();
+            assert!(
+                !stripped.trim().is_empty(),
+                "degenerate empty-fence chunk {i}: {chunk:?}"
+            );
+        }
+        // No body content lost.
+        let rejoined = chunks.join("\n");
+        assert_eq!(
+            rejoined.matches('x').count(),
+            60 + 70 + 55 + 68 + 40 + 72,
+            "fence body content lost across the split"
+        );
     }
 }

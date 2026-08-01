@@ -377,22 +377,31 @@ pub async fn send_response(
         return Ok(());
     }
 
-    let html = crate::telegram::format::markdown_to_telegram_html(response_text);
-
-    if let Err(e) = client
-        .send_message(chat_id, &html, Some("HTML"), thread_id, reply_to)
-        .await
-    {
-        warn!("HTML send failed, retrying as plain text: {e}");
-        if let Err(e2) = client
-            .send_message(chat_id, response_text, None, thread_id, reply_to)
+    // Chunk the markdown SOURCE at fence-aware boundaries, then render each
+    // chunk to HTML independently. Chunking the rendered HTML (the old
+    // order) could cut inside a <pre>/<a> tag — Telegram rejects the chunk
+    // with "can't parse entities" — and the recovery then re-sent the whole
+    // message as plain text, duplicating every chunk already delivered.
+    // Fallback is now per-chunk: only the failing chunk degrades to plain
+    // text; delivered chunks are never re-sent.
+    for (i, (chunk, html)) in plan_render_chunks(response_text).into_iter().enumerate() {
+        // Only reply to the original message on the first chunk.
+        let reply_id = if i == 0 { reply_to } else { None };
+        if let Err(e) = client
+            .send_message(chat_id, &html, Some("HTML"), thread_id, reply_id)
             .await
         {
-            health
-                .write()
+            warn!("HTML send failed for chunk {i}, retrying that chunk as plain text: {e}");
+            if let Err(e2) = client
+                .send_message(chat_id, &chunk, None, thread_id, reply_id)
                 .await
-                .record_error("telegram", &e2.to_string());
-            return Err(e2);
+            {
+                health
+                    .write()
+                    .await
+                    .record_error("telegram", &e2.to_string());
+                return Err(e2);
+            }
         }
     }
     health.write().await.record_outbound("telegram");
@@ -450,4 +459,149 @@ pub(crate) fn should_attempt_voice_send(
         return false;
     };
     should_send_voice_reply(mode, response_text, input_was_voice)
+}
+
+/// Plan the outbound chunks for a markdown response: fence-aware markdown
+/// chunks paired with their rendered HTML.
+///
+/// The markdown budget leaves headroom for HTML expansion, but entity
+/// escaping is up to 5× (`&` → `&amp;`), so escape-heavy content (code
+/// fences full of `<`/`&`) can still render past Telegram's 4096-char cap —
+/// and `send_message`'s safety-net splitter is markup-blind, which would
+/// reintroduce the mid-tag split this path exists to eliminate. Any chunk
+/// whose rendering exceeds the wire cap is re-split at half its size and
+/// re-rendered; halving terminates because the budget shrinks every round.
+fn plan_render_chunks(response_text: &str) -> Vec<(String, String)> {
+    use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, TELEGRAM_MARKDOWN_CHUNK_SIZE};
+
+    let mut queue: std::collections::VecDeque<String> =
+        crate::message_processing::chunker::chunk_markdown_fenced(
+            response_text,
+            TELEGRAM_MARKDOWN_CHUNK_SIZE,
+        )
+        .into();
+    let mut out = Vec::new();
+    while let Some(chunk) = queue.pop_front() {
+        let html = crate::telegram::format::markdown_to_telegram_html(&chunk);
+        if html.chars().count() > DEFAULT_MESSAGE_CHUNK_SIZE {
+            let smaller = chunk.chars().count() / 2;
+            if smaller >= 64 {
+                let sub =
+                    crate::message_processing::chunker::chunk_markdown_fenced(&chunk, smaller);
+                if sub.len() > 1 {
+                    for s in sub.into_iter().rev() {
+                        queue.push_front(s);
+                    }
+                    continue;
+                }
+            }
+            // Unsplittable below the cap (pathological single token):
+            // send_message's own splitter bounds it as a last resort.
+        }
+        out.push((chunk, html));
+    }
+    out
+}
+
+#[cfg(test)]
+mod chunked_send_tests {
+    use super::*;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Escape-heavy markdown (dense `&`/`<`) can render to >4096 chars from a
+    /// within-budget markdown chunk. The planner must re-split so every
+    /// rendered chunk fits the wire cap — otherwise the markup-blind
+    /// safety-net splitter cuts inside tags/entities and formatting is lost.
+    #[test]
+    fn escape_heavy_chunks_are_resplit_until_rendered_html_fits() {
+        // ~3300 markdown chars, nearly all requiring entity escaping.
+        let mut text = String::from("```xml\n");
+        for _ in 0..100 {
+            text.push_str("<a>&<b>&<c>&<d>&<e>&<f>&<g>&\n");
+        }
+        text.push_str("```");
+        let planned = plan_render_chunks(&text);
+        assert!(!planned.is_empty());
+        for (chunk, html) in &planned {
+            assert!(
+                html.chars().count() <= crate::constants::DEFAULT_MESSAGE_CHUNK_SIZE,
+                "rendered chunk exceeds wire cap ({} chars) for markdown chunk of {} chars",
+                html.chars().count(),
+                chunk.chars().count()
+            );
+        }
+        // Content preserved across the re-splits.
+        let total_amps: usize = planned.iter().map(|(c, _)| c.matches('&').count()).sum();
+        assert_eq!(total_amps, 700, "escaped content lost in re-split");
+    }
+
+    /// Regression: recovery from a rejected chunk used to re-send the ENTIRE
+    /// message as plain text even though earlier chunks were already
+    /// delivered. Fallback must be per-chunk — the first chunk goes out
+    /// exactly once, only the failing chunk degrades to plain text.
+    #[tokio::test]
+    async fn failed_chunk_does_not_resend_delivered_chunks() {
+        let server = MockServer::start().await;
+
+        // The HTML attempt of the chunk carrying the marker is rejected the
+        // way Telegram rejects malformed markup.
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .and(body_string_contains("SECONDCHUNKMARKER"))
+            .and(body_string_contains("\"parse_mode\":\"HTML\""))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Everything else (first chunk HTML, second chunk plain-text retry)
+        // succeeds.
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .mount(&server)
+            .await;
+
+        // Enough distinct lines to force a split ahead of the marker chunk.
+        let mut text = String::new();
+        for i in 0..250 {
+            text.push_str(&format!("FIRSTBLOCK filler line {i:03}\n"));
+        }
+        text.push_str("\nSECONDCHUNKMARKER tail");
+
+        let client =
+            super::super::api::TelegramClient::with_base("123:ABC", &server.uri()).expect("client");
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+
+        send_response(&client, 7, &text, None, None, false, None, &health, None)
+            .await
+            .expect("send must succeed via per-chunk plain-text fallback");
+
+        let requests = server.received_requests().await.expect("recorded");
+        let first_chunk_sends = requests
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("FIRSTBLOCK filler line 000"))
+            .count();
+        assert_eq!(
+            first_chunk_sends, 1,
+            "already-delivered first chunk must not be re-sent on a later chunk's failure"
+        );
+        let marker_plain_sends = requests
+            .iter()
+            .filter(|r| {
+                let body = String::from_utf8_lossy(&r.body);
+                body.contains("SECONDCHUNKMARKER") && !body.contains("\"parse_mode\":\"HTML\"")
+            })
+            .count();
+        assert_eq!(
+            marker_plain_sends, 1,
+            "failing chunk must be retried as plain text exactly once"
+        );
+    }
 }
