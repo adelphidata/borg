@@ -54,6 +54,7 @@ fn activation_matrix() {
         raw_text: &'static str,
         peer_kind: Option<&'static str>,
         activation: Option<ActivationMode>,
+        pre_addressed: bool,
         expect_active: bool,
         expect_text: &'static str,
     }
@@ -64,6 +65,7 @@ fn activation_matrix() {
             raw_text: "hello bot",
             peer_kind: None,
             activation: None,
+            pre_addressed: false,
             expect_active: true,
             expect_text: "hello bot",
         },
@@ -72,6 +74,7 @@ fn activation_matrix() {
             raw_text: "hello",
             peer_kind: Some("direct"),
             activation: None,
+            pre_addressed: false,
             expect_active: true,
             expect_text: "hello",
         },
@@ -80,6 +83,7 @@ fn activation_matrix() {
             raw_text: "@BorgBot what's the weather?",
             peer_kind: Some("group"),
             activation: Some(ActivationMode::Mention),
+            pre_addressed: false,
             expect_active: true,
             expect_text: "what's the weather?",
         },
@@ -88,6 +92,7 @@ fn activation_matrix() {
             raw_text: "@borgbot do something",
             peer_kind: Some("group"),
             activation: Some(ActivationMode::Mention),
+            pre_addressed: false,
             expect_active: true,
             expect_text: "do something",
         },
@@ -96,6 +101,7 @@ fn activation_matrix() {
             raw_text: "hey everyone, who's around?",
             peer_kind: Some("group"),
             activation: Some(ActivationMode::Mention),
+            pre_addressed: false,
             expect_active: false,
             expect_text: "hey everyone, who's around?",
         },
@@ -104,8 +110,30 @@ fn activation_matrix() {
             raw_text: "random message",
             peer_kind: Some("group"),
             activation: Some(ActivationMode::Always),
+            pre_addressed: false,
             expect_active: true,
             expect_text: "random message",
+        },
+        // Regression: an adapter that strips the mention token during parsing
+        // (Slack strips `<@U0BOT>`) leaves nothing for the substring search to
+        // find — the pre_addressed flag must activate Mention mode anyway.
+        Case {
+            name: "group_mention_pre_addressed_activates_without_token",
+            raw_text: "what's the weather?",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Mention),
+            pre_addressed: true,
+            expect_active: true,
+            expect_text: "what's the weather?",
+        },
+        Case {
+            name: "group_mention_pre_addressed_false_still_drops",
+            raw_text: "hey everyone",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Mention),
+            pre_addressed: false,
+            expect_active: false,
+            expect_text: "hey everyone",
         },
     ];
 
@@ -118,6 +146,7 @@ fn activation_matrix() {
             &route,
             &config,
             Some("@BorgBot"),
+            case.pre_addressed,
         );
         assert_eq!(
             active, case.expect_active,

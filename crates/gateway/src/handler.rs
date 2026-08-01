@@ -178,12 +178,18 @@ fn build_retry_policy(channel: &RegisteredChannel) -> RetryPolicy {
 ///
 /// Returns `(should_respond, cleaned_text)` where `cleaned_text` has the @mention stripped
 /// if the bot was mentioned in a group with mention-only activation.
+///
+/// `pre_addressed` means the channel adapter already established the message
+/// addressed the bot (e.g. it stripped the bot's mention token during parsing,
+/// or the platform delivered a dedicated mention event) — the token is no
+/// longer present in `text`, so a substring search here cannot find it.
 pub fn check_activation(
     text: &str,
     peer_kind: Option<&str>,
     route: &crate::channel::routing::ResolvedRoute,
     config: &Config,
     bot_identifier: Option<&str>,
+    pre_addressed: bool,
 ) -> (bool, String) {
     let is_group = peer_kind == Some(PEER_KIND_GROUP);
 
@@ -200,6 +206,9 @@ pub fn check_activation(
 
     match activation {
         cortex::config::ActivationMode::Mention => {
+            if pre_addressed {
+                return (true, text.to_string());
+            }
             if let Some(bot_id) = bot_identifier {
                 // Case-insensitive search for the bot mention
                 let lower_text = text.to_lowercase();
@@ -874,12 +883,18 @@ async fn invoke_agent_inner(
     );
     let config = &route.config;
 
+    let pre_addressed = inbound
+        .metadata
+        .get("addressed_to_bot")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let (should_respond, cleaned_text) = check_activation(
         &inbound.text,
         inbound.peer_kind.as_deref(),
         &route,
         config,
         bot_identifier,
+        pre_addressed,
     );
     if !should_respond {
         return Ok((String::new(), String::new()));
@@ -1479,8 +1494,14 @@ mod tests {
     fn dm_always_activates() {
         let route = default_route();
         let config = Config::default();
-        let (activate, text) =
-            check_activation("hello", Some("direct"), &route, &config, Some("@bot"));
+        let (activate, text) = check_activation(
+            "hello",
+            Some("direct"),
+            &route,
+            &config,
+            Some("@bot"),
+            false,
+        );
         assert!(activate);
         assert_eq!(text, "hello");
     }
@@ -1490,8 +1511,14 @@ mod tests {
         let mut route = default_route();
         route.activation = Some(cortex::config::ActivationMode::Mention);
         let config = Config::default();
-        let (activate, _) =
-            check_activation("hello", Some("direct"), &route, &config, Some("@bot"));
+        let (activate, _) = check_activation(
+            "hello",
+            Some("direct"),
+            &route,
+            &config,
+            Some("@bot"),
+            false,
+        );
         assert!(activate);
     }
 
@@ -1506,6 +1533,7 @@ mod tests {
             &route,
             &config,
             Some("@mybot"),
+            false,
         );
         assert!(activate);
         assert_eq!(text, "help me");
@@ -1522,6 +1550,7 @@ mod tests {
             &route,
             &config,
             Some("@mybot"),
+            false,
         );
         assert!(!activate);
     }
@@ -1532,7 +1561,7 @@ mod tests {
         let mut config = Config::default();
         config.gateway.group_activation = cortex::config::ActivationMode::Always;
         let (activate, text) =
-            check_activation("hello", Some("group"), &route, &config, Some("@bot"));
+            check_activation("hello", Some("group"), &route, &config, Some("@bot"), false);
         assert!(activate);
         assert_eq!(text, "hello");
     }
@@ -1542,7 +1571,7 @@ mod tests {
         let route = default_route();
         let mut config = Config::default();
         config.gateway.group_activation = cortex::config::ActivationMode::Mention;
-        let (activate, _) = check_activation("hello", Some("group"), &route, &config, None);
+        let (activate, _) = check_activation("hello", Some("group"), &route, &config, None, false);
         assert!(activate);
     }
 
@@ -1552,7 +1581,8 @@ mod tests {
         route.activation = Some(cortex::config::ActivationMode::Always);
         let mut config = Config::default();
         config.gateway.group_activation = cortex::config::ActivationMode::Mention;
-        let (activate, _) = check_activation("hello", Some("group"), &route, &config, Some("@bot"));
+        let (activate, _) =
+            check_activation("hello", Some("group"), &route, &config, Some("@bot"), false);
         assert!(activate);
     }
 
@@ -1569,8 +1599,14 @@ mod tests {
         let bot = "@+15555550101";
 
         // Group message without mention → dropped.
-        let (activate, _) =
-            check_activation("hey channel", Some("group"), &route, &config, Some(bot));
+        let (activate, _) = check_activation(
+            "hey channel",
+            Some("group"),
+            &route,
+            &config,
+            Some(bot),
+            false,
+        );
         assert!(!activate);
 
         // Group message with mention → activates, strips the @bot.
@@ -1580,12 +1616,14 @@ mod tests {
             &route,
             &config,
             Some(bot),
+            false,
         );
         assert!(activate);
         assert_eq!(cleaned, "ping");
 
         // DM still always activates regardless of mention.
-        let (activate, _) = check_activation("ping", Some("direct"), &route, &config, Some(bot));
+        let (activate, _) =
+            check_activation("ping", Some("direct"), &route, &config, Some(bot), false);
         assert!(activate);
     }
 
@@ -1594,8 +1632,14 @@ mod tests {
         let route = default_route();
         let mut config = Config::default();
         config.gateway.group_activation = cortex::config::ActivationMode::Mention;
-        let (activate, text) =
-            check_activation("@mybot", Some("group"), &route, &config, Some("@mybot"));
+        let (activate, text) = check_activation(
+            "@mybot",
+            Some("group"),
+            &route,
+            &config,
+            Some("@mybot"),
+            false,
+        );
         assert!(activate);
         // When only the mention remains, we return original text
         assert_eq!(text, "@mybot");
@@ -1729,8 +1773,14 @@ mod tests {
         let route = default_route();
         let config = Config::default(); // default dm_policy = Pairing
 
-        let (should_respond, _cleaned) =
-            check_activation("/start", Some("direct"), &route, &config, Some("@bot"));
+        let (should_respond, _cleaned) = check_activation(
+            "/start",
+            Some("direct"),
+            &route,
+            &config,
+            Some("@bot"),
+            false,
+        );
         assert!(should_respond, "DMs must always activate");
 
         let db = cortex::db::Database::test_db().await;

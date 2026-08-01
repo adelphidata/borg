@@ -12,14 +12,19 @@ use crate::handler::{InboundAttachment, InboundMessage};
 /// pollutes the agent's prompt. This strips every occurrence of the bot's own
 /// mention (including the optional `|name` display form) and trims surrounding
 /// whitespace. Mentions of other users are left intact.
-pub(super) fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
+///
+/// Returns the cleaned text and whether at least one bot mention was removed —
+/// downstream activation checks need that signal because the mention token no
+/// longer exists in the cleaned text.
+pub(super) fn strip_bot_mention(text: &str, bot_user_id: &str) -> (String, bool) {
     if bot_user_id.is_empty() || text.is_empty() {
-        return text.trim().to_string();
+        return (text.trim().to_string(), false);
     }
 
     let prefix = format!("<@{bot_user_id}");
     let mut out = String::with_capacity(text.len());
     let mut remaining = text;
+    let mut stripped = false;
 
     while let Some(idx) = remaining.find(&prefix) {
         out.push_str(&remaining[..idx]);
@@ -29,15 +34,17 @@ pub(super) fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
         match after_prefix.chars().next() {
             Some('>') => {
                 remaining = &after_prefix[1..];
+                stripped = true;
             }
             Some('|') => {
                 // Skip through the closing `>`
                 if let Some(end) = after_prefix.find('>') {
                     remaining = &after_prefix[end + 1..];
+                    stripped = true;
                 } else {
                     // Malformed — no closing `>`. Keep the rest verbatim and stop.
                     out.push_str(&remaining[idx..]);
-                    return out.trim().to_string();
+                    return (out.trim().to_string(), stripped);
                 }
             }
             _ => {
@@ -51,7 +58,7 @@ pub(super) fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
     out.push_str(remaining);
     // Collapse any runs of whitespace created by the removal, then trim.
     let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed
+    (collapsed, stripped)
 }
 
 /// Parse a Slack `EventCallback` into an `InboundMessage`.
@@ -198,10 +205,14 @@ pub async fn parse_event(
     // so they don't pollute the agent's prompt. An @mention-only message with no
     // remaining content is still valid if attachments are present.
     let raw_text = event.text.as_deref().unwrap_or("");
-    let text = match bot_user_id {
+    let (text, mention_stripped) = match bot_user_id {
         Some(bot_id) => strip_bot_mention(raw_text, bot_id),
-        None => raw_text.to_string(),
+        None => (raw_text.to_string(), false),
     };
+    // The mention token is gone from `text`, so downstream mention-mode
+    // activation can no longer find it — record that this message addressed
+    // the bot. `app_mention` events are addressed by definition.
+    let addressed_to_bot = mention_stripped || event.event_type == "app_mention";
 
     // A message is valid if it has either non-empty text OR at least one attachment.
     // This allows pure file uploads (file_share with empty text) to flow through
@@ -240,6 +251,7 @@ pub async fn parse_event(
         reaction: None,
         metadata: serde_json::json!({
             "event_type": event.event_type,
+            "addressed_to_bot": addressed_to_bot,
         }),
         peer_kind,
     })
@@ -643,42 +655,57 @@ mod tests {
 
     #[test]
     fn strip_bot_mention_no_mention() {
-        assert_eq!(strip_bot_mention("hello world", "U0BOT"), "hello world");
+        assert_eq!(
+            strip_bot_mention("hello world", "U0BOT"),
+            ("hello world".to_string(), false)
+        );
     }
 
     #[test]
     fn strip_bot_mention_simple() {
-        assert_eq!(strip_bot_mention("<@U0BOT> hello", "U0BOT"), "hello");
+        assert_eq!(
+            strip_bot_mention("<@U0BOT> hello", "U0BOT"),
+            ("hello".to_string(), true)
+        );
     }
 
     #[test]
     fn strip_bot_mention_display_form() {
-        assert_eq!(strip_bot_mention("<@U0BOT|borg> hello", "U0BOT"), "hello");
+        assert_eq!(
+            strip_bot_mention("<@U0BOT|borg> hello", "U0BOT"),
+            ("hello".to_string(), true)
+        );
     }
 
     #[test]
     fn strip_bot_mention_at_end() {
-        assert_eq!(strip_bot_mention("hey <@U0BOT>", "U0BOT"), "hey");
+        assert_eq!(
+            strip_bot_mention("hey <@U0BOT>", "U0BOT"),
+            ("hey".to_string(), true)
+        );
     }
 
     #[test]
     fn strip_bot_mention_multiple() {
         assert_eq!(
             strip_bot_mention("<@U0BOT> and <@U0BOT>!", "U0BOT"),
-            "and !"
+            ("and !".to_string(), true)
         );
     }
 
     #[test]
     fn strip_bot_mention_mention_only() {
-        assert_eq!(strip_bot_mention("<@U0BOT>", "U0BOT"), "");
+        assert_eq!(
+            strip_bot_mention("<@U0BOT>", "U0BOT"),
+            (String::new(), true)
+        );
     }
 
     #[test]
     fn strip_bot_mention_leaves_other_users_intact() {
         assert_eq!(
             strip_bot_mention("<@U0BOT> ping <@U0OTHER>", "U0BOT"),
-            "ping <@U0OTHER>"
+            ("ping <@U0OTHER>".to_string(), true)
         );
     }
 
@@ -687,13 +714,16 @@ mod tests {
         // `<@U0BOTX>` must NOT be stripped when the bot id is `U0BOT`.
         assert_eq!(
             strip_bot_mention("hello <@U0BOTX>", "U0BOT"),
-            "hello <@U0BOTX>"
+            ("hello <@U0BOTX>".to_string(), false)
         );
     }
 
     #[test]
     fn strip_bot_mention_empty_bot_id_noop() {
-        assert_eq!(strip_bot_mention("  hello  ", ""), "hello");
+        assert_eq!(
+            strip_bot_mention("  hello  ", ""),
+            ("hello".to_string(), false)
+        );
     }
 
     #[tokio::test]
@@ -703,6 +733,51 @@ mod tests {
         let cb = make_event(event);
         let msg = parse_event(&cb, Some("U0BOT"), None).await.unwrap();
         assert_eq!(msg.text, "summarize this");
+    }
+
+    /// Regression: the mention is stripped from `text` during parsing, so the
+    /// downstream Mention-mode activation check can never find it there — the
+    /// parser must record the addressing decision in metadata or channel
+    /// mentions are silently ignored.
+    #[tokio::test]
+    async fn parse_records_addressed_to_bot_when_mention_stripped() {
+        let mut event = make_slack_event("message");
+        event.text = Some("<@U0BOT> summarize this".to_string());
+        event.channel_type = Some("channel".to_string());
+        let cb = make_event(event);
+        let msg = parse_event(&cb, Some("U0BOT"), None).await.unwrap();
+        assert_eq!(msg.text, "summarize this");
+        assert_eq!(
+            msg.metadata.get("addressed_to_bot"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_records_addressed_to_bot_for_app_mention_without_token() {
+        // Slack can deliver `app_mention` with the token already absent from
+        // our normalized text; the event type alone means "addressed".
+        let mut event = make_slack_event("app_mention");
+        event.text = Some("summarize this".to_string());
+        let cb = make_event(event);
+        let msg = parse_event(&cb, Some("U0BOT"), None).await.unwrap();
+        assert_eq!(
+            msg.metadata.get("addressed_to_bot"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_unaddressed_channel_message_not_marked() {
+        let mut event = make_slack_event("message");
+        event.text = Some("hey everyone".to_string());
+        event.channel_type = Some("channel".to_string());
+        let cb = make_event(event);
+        let msg = parse_event(&cb, Some("U0BOT"), None).await.unwrap();
+        assert_eq!(
+            msg.metadata.get("addressed_to_bot"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     #[tokio::test]
