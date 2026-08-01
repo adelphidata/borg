@@ -145,22 +145,44 @@ pub async fn spawn_task_execution(
             // Supervisor restarts the task on next tick; downgrade ERROR→WARN
             // (recoverable) and surface task_name as a structured field.
             tracing::warn!(task = %task_name, panic = %panic_msg, "task panicked");
+            let panic_error = format!("panic: {panic_msg}");
             match cortex::db::Database::open().await {
                 Ok(db) => {
                     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
                     if let Err(e) = db
-                        .complete_task_run(
-                            run_id,
-                            duration_ms,
-                            None,
-                            Some(&format!("panic: {panic_msg}")),
-                        )
+                        .complete_task_run(run_id, duration_ms, None, Some(&panic_error))
                         .await
                     {
                         tracing::warn!("Task '{task_name}': failed to record panic: {e}");
                     }
+                    // A panic must be as visible as an ordinary failure:
+                    // land it on the schedule row too, or the task never
+                    // shows up in `borg tasks` / tasks_with_last_error().
+                    // Note this resets retry_count, so a panic-every-run
+                    // task retries at full cadence rather than escalating —
+                    // unchanged from prior behavior (panics never consumed
+                    // retries), now just explicit.
+                    if let Err(e) = db
+                        .record_task_failure(&exec_ctx.task_id, &panic_error)
+                        .await
+                    {
+                        tracing::warn!("Task '{task_name}': failed to record panic on task: {e}");
+                    }
                 }
                 Err(e) => tracing::warn!("Task '{task_name}': panic DB open failed: {e}"),
+            }
+            // Match the normal failure path's delivery contract: the operator
+            // asked to hear about this task's outcome.
+            if let (Some(ch), Some(tgt)) = (&exec_ctx.delivery_channel, &exec_ctx.delivery_target) {
+                deliver_task_result(
+                    ch,
+                    tgt,
+                    &format!("{task_name} [FAILED]"),
+                    &format!("Error: {panic_error}"),
+                    &exec_ctx.config,
+                    None,
+                )
+                .await;
             }
         }
     });
@@ -1322,8 +1344,11 @@ async fn handle_task_failure(
                 );
                 return;
             }
-            if let Err(e) = db.clear_task_retry(task_id).await {
-                tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+            // Reset retry state but keep the diagnostic: nulling last_error
+            // here (the old clear_task_retry call) made a permanently failed
+            // task invisible to `borg tasks` and tasks_with_last_error().
+            if let Err(e) = db.record_task_failure(task_id, error).await {
+                tracing::warn!("Task '{task_name}': failed to record failure: {e}");
             }
             if schedule_type == "once" {
                 if let Err(e) = db.update_task_status(task_id, "completed").await {

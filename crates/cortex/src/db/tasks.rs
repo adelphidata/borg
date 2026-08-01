@@ -215,6 +215,21 @@ impl Database {
         Ok(())
     }
 
+    /// Record a permanent (non-retryable) failure on the schedule row.
+    ///
+    /// Resets retry state like [`Self::clear_task_retry`] but preserves the
+    /// diagnostic: the final error lands in `last_error` so the failure stays
+    /// visible to the `borg tasks` listing and `tasks_with_last_error()`.
+    /// Nulling the error here would make a task whose last run failed for
+    /// good indistinguishable from a healthy one.
+    pub async fn record_task_failure(&self, task_id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_tasks SET retry_count = 0, retry_after = NULL, last_error = ?2 WHERE id = ?1",
+            params!(task_id, error),
+        ).await?;
+        Ok(())
+    }
+
     /// Fetch tasks whose retry_after time has elapsed.
     pub async fn get_tasks_pending_retry(&self, now: i64) -> Result<Vec<ScheduledTaskRow>> {
         let sql = format!(
@@ -565,7 +580,7 @@ impl Database {
             // Re-check status in the UPDATE: the run may have finished
             // between the candidate SELECT and now, and a completed row
             // must not be clobbered back to failed.
-            updated += self
+            let flipped = self
                 .conn
                 .execute(
                     "UPDATE task_runs SET status = ?1, error = ?2 \
@@ -578,6 +593,23 @@ impl Database {
                     ),
                 )
                 .await?;
+            updated += flipped;
+            // Propagate to the parent schedule row (NULL-guarded, matching
+            // recover_stale_runs) so the wedge is visible to `borg tasks` and
+            // tasks_with_last_error(). This is the only trace a one-shot
+            // leaves: claim_due_tasks already flipped it to 'completed', so
+            // without last_error a run that died mid-execution reads as a
+            // clean success.
+            if flipped > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE scheduled_tasks SET last_error = ?1 \
+                         WHERE (last_error IS NULL OR last_error = '') \
+                           AND id = (SELECT task_id FROM task_runs WHERE id = ?2)",
+                        params!(error_msg.as_str(), run_id),
+                    )
+                    .await?;
+            }
         }
         Ok(updated)
     }

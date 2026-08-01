@@ -913,6 +913,92 @@ mod tests {
             .expect("status column")
     }
 
+    /// The wedge diagnostic must land on the parent schedule row (NULL-
+    /// guarded), or the failure only exists in `task_runs` and the task
+    /// looks healthy to `borg tasks` / `tasks_with_last_error()`. For a
+    /// one-shot — flipped to 'completed' at claim time — `last_error` is
+    /// the only trace that the run died mid-execution.
+    #[tokio::test]
+    async fn wedged_sweep_propagates_diagnostic_to_schedule_row() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_wedged_fixture(&db, "wedge-diag-task", 930_001, now - 3_600).await;
+        // Simulate the claimed one-shot shape: schedule row already terminal.
+        db.update_task_status("wedge-diag-task", "completed")
+            .await
+            .expect("mark completed");
+
+        let n = recover_wedged_runs(&db, now, 3_600).await.expect("sweep");
+        assert_eq!(n, 1);
+
+        let task = db
+            .get_task_by_id("wedge-diag-task")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(
+            task.last_error.as_deref().unwrap_or("").contains("wedged"),
+            "schedule row must carry the wedge diagnostic, got: {:?}",
+            task.last_error
+        );
+    }
+
+    /// A more specific error already on the schedule row (e.g. a transient
+    /// retry reason) must not be clobbered by the generic wedge message.
+    #[tokio::test]
+    async fn wedged_sweep_does_not_overwrite_existing_last_error() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_wedged_fixture(&db, "wedge-keep-task", 940_001, now - 3_600).await;
+        db.set_task_retry("wedge-keep-task", 1, "provider 429", now + 60)
+            .await
+            .expect("set retry");
+
+        recover_wedged_runs(&db, now, 3_600).await.expect("sweep");
+
+        let task = db
+            .get_task_by_id("wedge-keep-task")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(task.last_error.as_deref(), Some("provider 429"));
+    }
+
+    /// Permanent failures must reset retry state while KEEPING the
+    /// diagnostic — the old path cleared `last_error`, hiding the task
+    /// from `tasks_with_last_error()` after retries were exhausted.
+    #[tokio::test]
+    async fn record_task_failure_resets_retry_but_keeps_diagnostic() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_wedged_fixture(&db, "perm-fail-task", 950_001, now - 3_600).await;
+        db.set_task_retry("perm-fail-task", 3, "transient blip", now + 60)
+            .await
+            .expect("set retry");
+
+        db.record_task_failure("perm-fail-task", "invalid config: bad prompt")
+            .await
+            .expect("record failure");
+
+        let task = db
+            .get_task_by_id("perm-fail-task")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(task.retry_count, 0, "retry state must reset");
+        assert!(task.retry_after.is_none(), "retry_after must clear");
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("invalid config: bad prompt"),
+            "final failure must stay visible on the schedule row"
+        );
+        let failing = db.tasks_with_last_error().await.expect("query");
+        assert!(
+            failing.iter().any(|t| t.id == "perm-fail-task"),
+            "permanently failed task must appear in tasks_with_last_error()"
+        );
+    }
+
     /// A run past its timeout but registered live in-process must be
     /// deferred, while a genuinely dead run in the same sweep is still
     /// reclaimed — the escape hatch must not blunt real recovery.
