@@ -484,6 +484,9 @@ pub mod methods {
     pub const LOGGING_MESSAGE: &str = "notifications/message";
     /// `ping` request (either direction; receiver must respond promptly).
     pub const PING: &str = "ping";
+    /// `notifications/cancelled` (either direction; tells the peer to stop
+    /// working on an in-flight request it will never get an answer for).
+    pub const CANCELLED_NOTIFICATION: &str = "notifications/cancelled";
 }
 
 /// Decode a single inbound JSON line into a [`Message`]. Returns a typed

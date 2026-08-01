@@ -398,6 +398,56 @@ impl SessionActor {
         serde_json::from_value::<R>(raw).map_err(McpError::Json)
     }
 
+    /// Best-effort `notifications/cancelled` for a request this client is
+    /// abandoning (spec: the receiver SHOULD stop processing it).
+    ///
+    /// Without this, a timed-out `tools/call` keeps the server computing a
+    /// result nobody will read — and, because sessions are single-request,
+    /// every queued call behind it waits on that dead work. The eventual
+    /// stale reply is still swallowed by the non-current-id branch of the
+    /// recv loop, which stays as the backstop for servers that ignore
+    /// cancellation. Send failures are logged, never surfaced: the caller
+    /// is already unwinding with the real (timeout) error.
+    ///
+    /// The write itself is deadline-bounded: the very scenario that triggers
+    /// cancellation — a hung server — is also the one where the child may
+    /// have stopped draining stdin, and an unbounded `write_all` against a
+    /// full pipe buffer would wedge this session (and every queued call)
+    /// forever.
+    async fn notify_cancelled(&mut self, request_id: u64, reason: &str) {
+        const CANCEL_SEND_DEADLINE: Duration = Duration::from_secs(2);
+        let note = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "method": methods::CANCELLED_NOTIFICATION,
+            "params": {
+                "requestId": request_id,
+                "reason": reason,
+            },
+        });
+        let send_result = tokio::time::timeout(CANCEL_SEND_DEADLINE, self.transport.send(note))
+            .await
+            .map_err(|_| McpError::Timeout {
+                ms: CANCEL_SEND_DEADLINE.as_millis() as u64,
+            })
+            .and_then(|r| r);
+        if let Err(e) = send_result {
+            tracing::warn!(
+                server = %self.server_name,
+                request_id,
+                reason,
+                error = %e,
+                "failed to send cancellation notification for abandoned request",
+            );
+        } else {
+            tracing::debug!(
+                server = %self.server_name,
+                request_id,
+                reason,
+                "sent cancellation notification for abandoned request",
+            );
+        }
+    }
+
     async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let id = self.next_id;
         // wrapping_add: at 1M calls/sec, u64 wrap takes ~580k years; the
@@ -412,6 +462,7 @@ impl SessionActor {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                self.notify_cancelled(id, "timeout").await;
                 return Err(McpError::Timeout {
                     ms: self.call_timeout.as_millis() as u64,
                 });
@@ -428,6 +479,7 @@ impl SessionActor {
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
+                    self.notify_cancelled(id, "timeout").await;
                     return Err(McpError::Timeout {
                         ms: self.call_timeout.as_millis() as u64,
                     });
@@ -1167,5 +1219,128 @@ mod tests {
             assert!(s.starts_with(t));
         }
         assert_eq!(bounded("short", 2048), "short");
+    }
+
+    /// Transport whose `send` blocks forever after the first N sends —
+    /// models a hung server that stopped draining stdin (full pipe buffer).
+    struct HangAfterTransport {
+        inner: ScriptedTransport,
+        hang_after: usize,
+        sends: usize,
+    }
+
+    #[async_trait]
+    impl Transport for HangAfterTransport {
+        async fn send(&mut self, msg: Value) -> Result<()> {
+            self.sends += 1;
+            if self.sends > self.hang_after {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            self.inner.send(msg).await
+        }
+        async fn recv(&mut self) -> Result<Option<Message>> {
+            self.inner.recv().await
+        }
+        async fn close(&mut self) -> Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// The cancellation notification is written to the same stdin that a
+    /// hung server may no longer be draining. That write must be
+    /// deadline-bounded — otherwise the timeout path itself wedges the
+    /// session forever, which is worse than never cancelling.
+    #[tokio::test]
+    async fn cancel_send_to_wedged_stdin_cannot_hang_the_session() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            })),
+            error: None,
+            params: None,
+        });
+        // Sends: initialize, initialized, tools/call — then the cancel
+        // notification (4th send) hangs forever.
+        let transport = Box::new(HangAfterTransport {
+            inner: ScriptedTransport::new(sent, inbound),
+            hang_after: 3,
+            sends: 0,
+        });
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), session.call_tool("t", json!({})))
+            .await
+            .expect("call_tool must return despite the wedged cancel write")
+            .expect_err("silent peer must time out");
+        assert!(matches!(err, McpError::Timeout { .. }), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "timeout must surface within call_timeout + cancel deadline, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_call_sends_cancelled_notification() {
+        // Spec: a client that stops waiting for a request SHOULD send
+        // `notifications/cancelled` so the server stops working on it.
+        // Without it, a timed-out tools/call leaves the server computing a
+        // result nobody will read while queued calls stall behind it.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        // Script only the initialize reply; the tools/call gets silence.
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            })),
+            error: None,
+            params: None,
+        });
+
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let err = session
+            .call_tool("slow_tool", json!({}))
+            .await
+            .expect_err("silent peer must time out");
+        assert!(matches!(err, McpError::Timeout { .. }), "got {err:?}");
+
+        let sent = sent.lock().unwrap();
+        let call = sent
+            .iter()
+            .find(|v| v.get("method").and_then(Value::as_str) == Some("tools/call"))
+            .expect("tools/call frame must have been sent");
+        let call_id = call.get("id").and_then(Value::as_u64).expect("call id");
+
+        let cancel = sent
+            .iter()
+            .find(|v| v.get("method").and_then(Value::as_str) == Some("notifications/cancelled"))
+            .expect("abandoning a call must emit notifications/cancelled");
+        assert!(
+            cancel.get("id").is_none(),
+            "cancelled must be a notification (no id): {cancel}"
+        );
+        assert_eq!(
+            cancel.pointer("/params/requestId").and_then(Value::as_u64),
+            Some(call_id),
+            "cancellation must reference the abandoned request id: {cancel}"
+        );
     }
 }
