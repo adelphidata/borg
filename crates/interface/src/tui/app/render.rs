@@ -197,7 +197,12 @@ impl<'a> App<'a> {
         // immediately and never recovers after autocompaction, which
         // misleadingly looks like compaction never ran. See
         // crates/interface/src/tui/app/mod.rs `last_prompt_tokens`.
-        let max = self.config.conversation.max_history_tokens;
+        //
+        // The denominator is the EFFECTIVE budget (configured cap clamped by
+        // the model's usable window) — the same threshold the agent compacts
+        // against. Dividing by the raw configured cap understates occupancy
+        // whenever the model's window is the binding constraint.
+        let max = cortex::conversation::effective_history_budget_for(&self.config);
         if max == 0 {
             return 0;
         }

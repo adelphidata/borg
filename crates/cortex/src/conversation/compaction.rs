@@ -77,6 +77,22 @@ pub fn reserve_output_budget(
     configured_history_budget.min(usable)
 }
 
+/// Effective history budget for a config: the configured cap clamped by the
+/// active model's usable window (context window minus the output
+/// reservation).
+///
+/// Single source for the agent loop's compaction threshold and any surface
+/// that displays context occupancy — a percentage computed against the raw
+/// configured cap overstates headroom whenever the model's window is the
+/// binding constraint (e.g. a 32k-window model under a 100k configured cap).
+pub fn effective_history_budget_for(config: &crate::config::Config) -> usize {
+    reserve_output_budget(
+        config.conversation.max_history_tokens,
+        crate::llm::model_registry::context_window_for(&config.llm.model) as usize,
+        config.llm.max_tokens as usize,
+    )
+}
+
 /// Decay head protection across repeated compactions.
 ///
 /// `protect_first_n` keeps the original user request and early framing verbatim
@@ -707,6 +723,30 @@ mod tests {
         // A history budget that already fits under the usable window is returned
         // unchanged — no behavior change in the common case.
         assert_eq!(reserve_output_budget(100_000, 200_000, 16_000), 100_000);
+    }
+
+    #[test]
+    fn effective_history_budget_clamps_by_model_window() {
+        // Unknown model → registry default window (200k). A configured cap
+        // beyond the usable window must clamp to window − output reservation;
+        // a small cap must pass through untouched.
+        let mut config = crate::config::Config::default();
+        config.llm.model = "definitely-not-a-real-model".into();
+        config.llm.max_tokens = 64_000;
+
+        config.conversation.max_history_tokens = 1_000_000;
+        assert_eq!(
+            effective_history_budget_for(&config),
+            200_000 - 64_000,
+            "oversized cap must clamp to the model's usable window"
+        );
+
+        config.conversation.max_history_tokens = 10_000;
+        assert_eq!(
+            effective_history_budget_for(&config),
+            10_000,
+            "cap under the usable window binds directly"
+        );
     }
 
     #[test]

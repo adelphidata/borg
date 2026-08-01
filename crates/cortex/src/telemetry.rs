@@ -31,6 +31,12 @@ pub mod names {
     /// Counter for context-window pressure events that triggered history
     /// compaction (labelled by `trigger`: proactive | reactive).
     pub const MEMORY_PRESSURE: &str = "borg.memory.pressure";
+    /// Counter of history tokens reclaimed by compaction passes.
+    pub const COMPACTION_TOKENS_SAVED: &str = "borg.compaction.tokens_saved";
+    /// Histogram of post-compaction context occupancy as a percentage of the
+    /// effective history budget — the number that says how much headroom a
+    /// session has left, which "tokens saved" alone does not.
+    pub const CONTEXT_OCCUPANCY: &str = "borg.context.occupancy_pct";
     /// Counter incremented once per harness boot (labelled by `harness`).
     pub const LIFECYCLE_STARTS: &str = "borg.lifecycle.starts";
     /// Counter incremented once per graceful harness shutdown (labelled by `harness`).
@@ -275,6 +281,10 @@ pub struct BorgMetrics {
     pub cost_events_dropped: Counter<u64>,
     /// Context-window pressure events that triggered history compaction.
     pub memory_pressure: Counter<u64>,
+    /// History tokens reclaimed by compaction passes.
+    pub compaction_tokens_saved: Counter<u64>,
+    /// Post-compaction occupancy (percent of the effective history budget).
+    pub context_occupancy: Histogram<f64>,
     /// Harness boots (REPL/TUI/daemon).
     pub lifecycle_starts: Counter<u64>,
     /// Graceful harness shutdowns.
@@ -372,6 +382,14 @@ impl BorgMetrics {
                 .u64_counter(names::MEMORY_PRESSURE)
                 .with_description("Context-window pressure events that triggered compaction")
                 .build(),
+            compaction_tokens_saved: meter
+                .u64_counter(names::COMPACTION_TOKENS_SAVED)
+                .with_description("History tokens reclaimed by compaction passes")
+                .build(),
+            context_occupancy: meter
+                .f64_histogram(names::CONTEXT_OCCUPANCY)
+                .with_description("Post-compaction occupancy as % of the effective history budget")
+                .build(),
             lifecycle_starts: meter
                 .u64_counter(names::LIFECYCLE_STARTS)
                 .with_description("Harness boots")
@@ -388,6 +406,25 @@ impl BorgMetrics {
     pub fn record_memory_pressure(&self, trigger: &'static str) {
         self.memory_pressure
             .add(1, &[KeyValue::new("trigger", trigger)]);
+    }
+
+    /// Record a completed compaction pass: tokens reclaimed plus the
+    /// occupancy (%) the session settled at against its effective budget.
+    /// Occupancy is the headline — a pass can save few tokens and still
+    /// leave the session with plenty of headroom (or none), which the
+    /// savings counter alone cannot show.
+    pub fn record_compaction_result(
+        &self,
+        before_tokens: usize,
+        after_tokens: usize,
+        budget: usize,
+    ) {
+        self.compaction_tokens_saved
+            .add(before_tokens.saturating_sub(after_tokens) as u64, &[]);
+        if budget > 0 {
+            let pct = (after_tokens as f64 / budget as f64) * 100.0;
+            self.context_occupancy.record(pct.min(100.0), &[]);
+        }
     }
 
     /// Record a harness boot. `harness` is e.g. `"borgd"` or `"tui"`.
@@ -699,6 +736,18 @@ mod tests {
         total
     }
 
+    fn f64_hist_sum_for(rms: &[ResourceMetrics], name: &str) -> f64 {
+        let mut total = 0f64;
+        let hits = with_metric(rms, name, |data| match data {
+            AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                total += h.data_points().map(|dp| dp.sum()).sum::<f64>();
+            }
+            other => panic!("{name}: expected f64 histogram, got {other:?}"),
+        });
+        assert!(hits > 0, "missing histogram: {name}");
+        total
+    }
+
     fn attr_value(attrs: &[KeyValue], key: &str) -> Option<String> {
         attrs
             .iter()
@@ -794,6 +843,7 @@ mod tests {
         m.record_memory_pressure("proactive");
         m.record_lifecycle_start("borgd");
         m.record_lifecycle_shutdown("borgd");
+        m.record_compaction_result(10_000, 4_000, 8_000);
 
         let rms = collect(&provider, &exporter);
 
@@ -804,6 +854,16 @@ mod tests {
         );
         assert_eq!(u64_sum_for(&rms, names::LIFECYCLE_STARTS), 1);
         assert_eq!(u64_sum_for(&rms, names::LIFECYCLE_SHUTDOWNS), 1);
+
+        // Compaction pass: 6k tokens reclaimed, settled at 4k/8k = 50%
+        // occupancy of the effective budget.
+        assert_eq!(u64_sum_for(&rms, names::COMPACTION_TOKENS_SAVED), 6_000);
+        assert_eq!(f64_hist_count_for(&rms, names::CONTEXT_OCCUPANCY), 1);
+        let occupancy = f64_hist_sum_for(&rms, names::CONTEXT_OCCUPANCY);
+        assert!(
+            (occupancy - 50.0).abs() < f64::EPSILON,
+            "expected 50% occupancy, got {occupancy}"
+        );
 
         // The single-datapoint lifecycle counters carry the harness label.
         let start_attrs = sole_sum_attrs(&rms, names::LIFECYCLE_STARTS);

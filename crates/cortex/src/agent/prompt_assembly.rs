@@ -708,6 +708,11 @@ Rules:
 
             if dropped_count > 0 {
                 let after_tokens = history_tokens(&self.history);
+                self.metrics.record_compaction_result(
+                    before_tokens,
+                    after_tokens,
+                    self.effective_history_budget(),
+                );
                 let _ = event_tx
                     .send(AgentEvent::HistoryCompacted {
                         dropped: dropped_count,
@@ -1037,11 +1042,7 @@ Rules:
     /// provider rejects the request for lack of response room. See
     /// [`crate::conversation::reserve_output_budget`].
     pub(super) fn effective_history_budget(&self) -> usize {
-        crate::conversation::reserve_output_budget(
-            self.config.conversation.max_history_tokens,
-            self.active_context_window() as usize,
-            self.config.llm.max_tokens as usize,
-        )
+        crate::conversation::effective_history_budget_for(&self.config)
     }
 
     /// Usable *real* prompt budget: the context window minus the output
