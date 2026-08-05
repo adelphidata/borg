@@ -134,7 +134,31 @@ pub(super) async fn summarize_with_llm(
     messages: &[Message],
     llm: &mut LlmClient,
 ) -> Result<String, SummarizeFailure> {
-    // Build a transcript of dropped messages for the LLM to summarize
+    let transcript = build_summary_transcript(messages);
+
+    // Use chunked summarization if transcript exceeds single-chunk limit
+    let summary_text = if transcript.chars().count() > MAX_TRANSCRIPT_CHARS {
+        summarize_chunked(&transcript, llm).await
+    } else {
+        summarize_single_chunk(&transcript, llm).await
+    }?;
+
+    Ok(format!(
+        "[Earlier conversation was summarized to fit context limits.]\n\n{}",
+        redact_summary_text(&summary_text)
+    ))
+}
+
+/// Render the messages being compacted into the transcript fed to the
+/// summarizer LLM, skipping trivial tool results and truncating long
+/// messages. Shared by the v1 and v2 summarizers so the two cannot drift.
+///
+/// The transcript is secret-redacted unconditionally — NOT gated on
+/// `security.secret_detection`. Summaries persist in the session log and
+/// re-enter every later prompt (and survive session forks), so a secret that
+/// launders through a summary outlives every live-output control. Redacting
+/// the input also keeps the secret out of the summarizer call itself.
+fn build_summary_transcript(messages: &[Message]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         // Skip trivial tool results to focus on meaningful content
@@ -179,17 +203,15 @@ pub(super) async fn summarize_with_llm(
             }
         }
     }
+    crate::security::secrets::redact_secrets(&transcript)
+}
 
-    // Use chunked summarization if transcript exceeds single-chunk limit
-    let summary_text = if transcript.chars().count() > MAX_TRANSCRIPT_CHARS {
-        summarize_chunked(&transcript, llm).await
-    } else {
-        summarize_single_chunk(&transcript, llm).await
-    }?;
-
-    Ok(format!(
-        "[Earlier conversation was summarized to fit context limits.]\n\n{summary_text}"
-    ))
+/// Redact the summarizer's OUTPUT before it is persisted. The transcript
+/// input is already redacted, but a prior summary folded in iteratively (or
+/// a model echoing partial context) can still carry a legacy secret — this
+/// is the last boundary before the text lands in the durable log.
+fn redact_summary_text(summary: &str) -> String {
+    crate::security::secrets::redact_secrets(summary)
 }
 
 /// Summarize the middle region of a conversation, optionally iterating on a
@@ -203,48 +225,9 @@ pub(super) async fn summarize_with_llm_v2(
     llm: &mut LlmClient,
 ) -> Result<String, SummarizeFailure> {
     // Build a transcript of the middle region. Reuses the same trivial-result
-    // skipping and truncation as the legacy summarizer.
-    let mut transcript = String::new();
-    for msg in messages {
-        if is_trivial_tool_result(msg) {
-            continue;
-        }
-        let role_label = match msg.role {
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-            Role::Tool => "Tool Result",
-            Role::System => "System",
-        };
-        let ts = msg
-            .timestamp
-            .as_deref()
-            .map(|t| format!(" [{t}]"))
-            .unwrap_or_default();
-        match &msg.content {
-            Some(MessageContent::Parts(parts)) => {
-                let full = summarize_parts(parts);
-                let truncated: String = full
-                    .chars()
-                    .take(constants::FLUSH_MESSAGE_TRUNCATE_CHARS)
-                    .collect();
-                transcript.push_str(&format!("{role_label}{ts}: {truncated}\n"));
-            }
-            _ => {
-                if let Some(content) = msg.text_content() {
-                    let truncated: String = content
-                        .chars()
-                        .take(constants::FLUSH_MESSAGE_TRUNCATE_CHARS)
-                        .collect();
-                    transcript.push_str(&format!("{role_label}{ts}: {truncated}\n"));
-                }
-            }
-        }
-        if let Some(tcs) = &msg.tool_calls {
-            for tc in tcs {
-                transcript.push_str(&format!("  [called {}]\n", tc.function.name));
-            }
-        }
-    }
+    // skipping and truncation as the legacy summarizer. The transcript is
+    // secret-redacted inside the shared builder.
+    let transcript = build_summary_transcript(messages);
 
     let capped: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
 
@@ -269,7 +252,9 @@ pub(super) async fn summarize_with_llm_v2(
             if text.is_empty() {
                 Err(SummarizeFailure::Transient)
             } else {
-                Ok(text)
+                // Last boundary before the summary lands in the durable log —
+                // see `redact_summary_text`.
+                Ok(redact_summary_text(&text))
             }
         }
         Err(e) => {
@@ -470,6 +455,39 @@ mod failure_classification_tests {
 mod tests {
     use super::*;
     use crate::types::{ContentPart, Message};
+
+    #[test]
+    fn summary_transcript_is_secret_redacted_unconditionally() {
+        // Compaction summaries persist in the durable log and re-enter every
+        // later prompt, so a secret in the compacted region must be redacted
+        // at the transcript boundary — regardless of any live-output toggle.
+        let messages = vec![
+            make_user("here are my creds: AKIAIOSFODNN7EXAMPLE, keep them handy"),
+            make_assistant("stored. token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk noted"),
+        ];
+        let transcript = build_summary_transcript(&messages);
+        assert!(
+            !transcript.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key must not survive into the summarizer transcript"
+        );
+        assert!(
+            !transcript.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+            "GitHub token must not survive into the summarizer transcript"
+        );
+        // The surrounding prose still flows through.
+        assert!(transcript.contains("here are my creds"));
+    }
+
+    #[test]
+    fn summary_output_boundary_redacts_before_persistence() {
+        // Iterative compaction folds a PRIOR summary into the new one; a
+        // legacy secret in that prior summary re-emerges in model output and
+        // must be caught at the output boundary before landing in the log.
+        let echoed = "The user stored key AKIAIOSFODNN7EXAMPLE for deployment.";
+        let redacted = redact_summary_text(echoed);
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(redacted.contains("for deployment"));
+    }
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
