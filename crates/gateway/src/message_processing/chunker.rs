@@ -139,9 +139,59 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
             .is_some_and(|info| current == format!("{FENCE}{info}"))
     };
 
-    for line in text.split('\n') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
         let is_fence_line = line.trim_start().starts_with(FENCE);
         let line_chars = line.chars().count();
+
+        // A whole fence block that fits inside one chunk is appended intact —
+        // never split by the per-line close/reopen reserves below. If it
+        // doesn't fit beside the current content but would fit a fresh
+        // chunk, flush the prose first and place it there.
+        if is_fence_line && open_fence.is_none() {
+            if let Some((total, close_off)) = whole_fence_chars(&lines[i..]) {
+                let sep = usize::from(!current.is_empty());
+                if current_chars + sep + total > max_chars
+                    && total <= max_chars
+                    && !current.is_empty()
+                {
+                    flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
+                }
+                let sep = usize::from(!current.is_empty());
+                if current_chars + sep + total <= max_chars {
+                    for fence_line in &lines[i..=i + close_off] {
+                        if !current.is_empty() {
+                            current.push('\n');
+                            current_chars += 1;
+                        }
+                        current.push_str(fence_line);
+                        current_chars += fence_line.chars().count();
+                    }
+                    i += close_off + 1;
+                    continue;
+                }
+                // Too large to fit whole anywhere — fall through to the
+                // close/reopen splitting below.
+            }
+        }
+
+        // Closing fence arriving while the chunk holds only the reopened
+        // scaffold: emitting "```info\n```" would be a degenerate empty
+        // block (the body already shipped, properly closed, in earlier
+        // chunks). Drop the scaffold and the close together.
+        if is_fence_line
+            && open_fence.is_some()
+            && is_bare_scaffold(&current, &open_fence)
+            && !current.is_empty()
+        {
+            current.clear();
+            current_chars = 0;
+            open_fence = None;
+            i += 1;
+            continue;
+        }
         // +1 for the joining newline when the chunk already has content.
         let sep = usize::from(!current.is_empty());
         // While inside a fence, reserve room for BOTH bracketing sides: the
@@ -187,6 +237,7 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
                 // toggle so state stays consistent.
                 open_fence = toggle_fence(open_fence, line);
             }
+            i += 1;
             continue;
         }
 
@@ -200,6 +251,7 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
         if is_fence_line {
             open_fence = toggle_fence(open_fence, line);
         }
+        i += 1;
     }
 
     if !current.trim().is_empty() {
@@ -216,6 +268,24 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
         return vec![text.to_string()];
     }
     chunks
+}
+
+/// `(total_chars, close_offset)` of the fence block opening at `lines[0]`:
+/// total chars of the block joined with `\n` through its closing ``` line,
+/// and that closing line's offset from the opening. `None` when the fence
+/// never closes — the caller then falls back to close/reopen splitting.
+fn whole_fence_chars(lines: &[&str]) -> Option<(usize, usize)> {
+    let close_idx = lines
+        .iter()
+        .skip(1)
+        .position(|l| l.trim_start().starts_with("```"))?
+        + 1;
+    let chars: usize = lines[..=close_idx]
+        .iter()
+        .map(|l| l.chars().count())
+        .sum::<usize>()
+        + close_idx; // joining newlines
+    Some((chars, close_idx))
 }
 
 /// Fence state transition for a line starting with ```.
