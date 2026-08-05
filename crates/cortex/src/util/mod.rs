@@ -7,7 +7,7 @@ pub mod hex;
 /// Shared helpers for panic-isolated supervised loops.
 pub mod panic_utils;
 /// Process-group spawn/kill helpers so abandoned children don't orphan trees.
-pub mod process_tree;
+pub(crate) mod process_tree;
 /// Retry utilities with exponential backoff.
 pub mod retry;
 /// Wall-clock helpers.

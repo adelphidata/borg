@@ -8,16 +8,13 @@
 /// Spawn `cmd`'s child as the leader of a fresh process group so
 /// [`kill_process_group`] can reach its descendants.
 ///
-/// Establishes the PGID == PID invariant that every `killpg` in this crate
-/// relies on: without it, the pid we later pass to `killpg` names some
-/// *unrelated* group, so the signal is at best a no-op.
+/// Establishes the PGID == PID invariant every `killpg` here relies on; without
+/// it the pid we later signal names some *unrelated* group.
 ///
 /// Tradeoff: a child in its own group is no longer in the terminal's
 /// foreground group, so a terminal-generated SIGINT (Ctrl-C) no longer reaches
 /// it. That is acceptable for the commands we apply this to — they are driven
 /// by our own timeout/cancellation, not by the operator's terminal.
-///
-/// No-op off Unix, where process groups don't exist in this form.
 pub(crate) fn spawn_in_own_group(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -42,15 +39,39 @@ pub(crate) fn signal_group(pgid: i32, sig: i32) {
 /// SIGKILL the process group led by `pid`, for the abandon path where there is
 /// no one left to wait on the tree (a timed-out command whose future we drop).
 ///
-/// Requires the child to have been spawned via [`spawn_in_own_group`]; `None`
-/// (the child already exited, so its pid is gone) is a no-op.
+/// Requires the child to have been spawned via [`spawn_in_own_group`].
 pub(crate) fn kill_process_group(pid: Option<u32>) {
-    #[cfg(unix)]
     if let Some(pid) = pid {
+        #[cfg(unix)]
         signal_group(pid as i32, libc::SIGKILL);
+        #[cfg(not(unix))]
+        let _ = pid;
     }
-    #[cfg(not(unix))]
-    let _ = pid;
+}
+
+/// Whether `pid` still exists. Signal 0 performs the permission and existence
+/// checks without delivering anything.
+///
+/// Note a killed-but-unreaped child is a zombie and still "alive" here, so
+/// prefer probing a *grandchild* when asserting that a group kill worked.
+#[cfg(all(test, unix))]
+pub(crate) fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: FFI call to `kill` with signal 0 — an existence probe that never
+    // delivers a signal and cannot affect the target.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Poll until `pid` disappears, up to ~2s. SIGKILL delivery is asynchronous, so
+/// tests must not race it with a bare probe.
+#[cfg(all(test, unix))]
+pub(crate) async fn wait_for_pid_exit(pid: i32) -> bool {
+    for _ in 0..100 {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
 }
 
 #[cfg(all(test, unix))]
@@ -86,26 +107,17 @@ mod tests {
             String::from_utf8_lossy(&buf).trim().parse().expect("pid")
         };
 
-        // SAFETY: signal 0 only probes for existence; it never delivers.
-        assert_eq!(
-            unsafe { libc::kill(grandchild, 0) },
-            0,
+        assert!(
+            pid_is_alive(grandchild),
             "precondition: grandchild {grandchild} should be alive"
         );
 
         kill_process_group(pid);
         drop(child);
 
-        // SIGKILL delivery is asynchronous; poll briefly rather than racing it.
-        let mut gone = false;
-        for _ in 0..100 {
-            // SAFETY: existence probe only, as above.
-            if unsafe { libc::kill(grandchild, 0) } != 0 {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(gone, "grandchild {grandchild} survived the group kill");
+        assert!(
+            wait_for_pid_exit(grandchild).await,
+            "grandchild {grandchild} survived the group kill"
+        );
     }
 }

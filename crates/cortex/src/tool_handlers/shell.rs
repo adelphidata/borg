@@ -456,10 +456,12 @@ pub async fn handle_run_shell_with_context(
             ))
         }
         Err(e) => {
+            // `child` is dropped on the way out of either branch, which kills
+            // the shell but not its descendants — signal the group before
+            // letting go. A pipe/wait failure abandons the tree just as a
+            // timeout does, so both paths need it.
+            crate::util::process_tree::kill_process_group(child.id());
             if e.to_string().contains("timed out") {
-                // `child` is dropped on the way out, which kills the shell but
-                // not its descendants — signal the group before letting go.
-                crate::util::process_tree::kill_process_group(child.id());
                 if let Some(g) = _guard {
                     g.timed_out();
                 }
@@ -738,6 +740,11 @@ async fn run_in_pty(
         combined.into_output()
     });
 
+    // Keep the pid before the child moves into the wait task: on timeout that
+    // task is abandoned mid-`wait`, and nothing else holds a handle to kill
+    // with. `portable_pty` gives the child its own session (PGID == PID), so
+    // the group signal reaches whatever it spawned too.
+    let pty_pid = child.process_id();
     let wait_task = tokio::task::spawn_blocking(move || child.wait());
 
     let combined_result = tokio::time::timeout(timeout, async {
@@ -761,6 +768,10 @@ async fn run_in_pty(
         }
         Ok(Err(e)) => Err(e),
         Err(_) => {
+            // Nothing else kills the PTY child: it lives in the abandoned wait
+            // task, so without this it runs on past the tool call (and past
+            // the registry entry we're about to mark timed out).
+            crate::util::process_tree::kill_process_group(pty_pid);
             if let Some(g) = _guard {
                 g.timed_out();
             }
@@ -1237,17 +1248,49 @@ mod tests {
             .trim()
             .parse()
             .expect("pid");
-        // SIGKILL delivery is asynchronous; poll rather than racing it.
-        let mut gone = false;
-        for _ in 0..100 {
-            // SAFETY: signal 0 only probes for existence; it never delivers.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(gone, "backgrounded descendant {pid} survived the timeout");
+        assert!(
+            crate::util::process_tree::wait_for_pid_exit(pid).await,
+            "backgrounded descendant {pid} survived the timeout"
+        );
+    }
+
+    /// Same contract on the PTY branch: the child there lives inside an
+    /// abandoned blocking wait task, so a timeout that doesn't signal its
+    /// session leaves the whole tree running past the tool call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_tty_timeout_kills_the_pty_process_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid_file = tmp.path().join("child.pid");
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let args = serde_json::json!({
+            "command": format!(
+                "sleep 120 & echo $! > {}; sleep 120",
+                pid_file.to_string_lossy()
+            ),
+            "tty": true,
+            "timeout_ms": 500,
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("timeout path returns Ok with explanation");
+        assert!(
+            result.contains("timed out") && result.contains("(tty)"),
+            "expected the tty timeout branch: {result}"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("shell should have recorded its background job's pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            crate::util::process_tree::wait_for_pid_exit(pid).await,
+            "pty descendant {pid} survived the timeout"
+        );
     }
 
     #[cfg(unix)]

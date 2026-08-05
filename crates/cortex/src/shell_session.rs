@@ -400,14 +400,13 @@ mod tests {
     /// Mirrors the production spawn contract documented on [`register`]:
     /// `process_group(0)` so `kill`'s group signal reaches the child.
     fn spawn_cat(reg: &ShellSessionRegistry) -> String {
-        let child = Command::new("cat")
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-            .expect("spawn cat");
+            .kill_on_drop(true);
+        crate::util::process_tree::spawn_in_own_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn cat");
         reg.register(child, None, TEST_CAP)
     }
 
@@ -624,16 +623,16 @@ mod tests {
         // the session must take down the whole process group, not just the
         // direct child — otherwise the `sleep` leaks.
         let reg = ShellSessionRegistry::new();
-        let child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg("sleep 300 & echo $!; wait")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0) // mirror the production spawn: child leads its group
-            .spawn()
-            .expect("spawn sh");
+            .kill_on_drop(true);
+        // Mirror the production spawn: the child must lead its own group.
+        crate::util::process_tree::spawn_in_own_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sh");
         let id = reg.register(child, None, TEST_CAP);
 
         // The shell echoes the backgrounded grandchild's PID.
@@ -643,26 +642,16 @@ mod tests {
             .next()
             .and_then(|l| l.trim().parse().ok())
             .unwrap_or_else(|| panic!("expected a grandchild pid, got {out:?}"));
-        // SAFETY: signal 0 only probes for existence; no signal is delivered.
-        assert_eq!(
-            unsafe { libc::kill(gpid, 0) },
-            0,
+        assert!(
+            crate::util::process_tree::pid_is_alive(gpid),
             "descendant should be alive before kill"
         );
 
         reg.kill(&id).await.expect("kill");
 
         // The descendant must be reaped shortly after the session is killed.
-        let mut dead = false;
-        for _ in 0..100 {
-            if unsafe { libc::kill(gpid, 0) } != 0 {
-                dead = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert!(
-            dead,
+            crate::util::process_tree::wait_for_pid_exit(gpid).await,
             "descendant pid {gpid} survived session kill — process group leaked"
         );
     }

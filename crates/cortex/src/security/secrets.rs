@@ -92,18 +92,18 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     type Validator = Option<fn(&str) -> bool>;
     let patterns: Vec<(&str, &str, bool, Validator)> = vec![
         // Bearer tokens wherever they appear — a `curl -H "Bearer …"`, a proxy
-        // log line, a copied request — not just behind an `Authorization:`
-        // header, which the narrower pattern further down requires.
+        // log line, a copied request — not just behind the `Authorization:`
+        // header the narrower pattern further down requires.
         //
-        // Order matters, and this must stay FIRST: the vendor-prefix patterns
-        // below match a *prefix* of a token rather than the whole thing, so
-        // running them first on `Bearer sk-<48>+tail` masks the `sk-…` part and
-        // leaves `+tail` in the clear. Broadest-first keeps the token intact as
-        // one match. The charset covers base64 and URL-safe base64 (`+ / ~ =`)
-        // for the same reason; the separator is `[ \t]` only, so a bare
-        // "Bearer" at the end of a line can't swallow the next line.
-        // `capture_only` keeps the scheme word visible, matching how the
-        // Authorization Header pattern renders.
+        // Must stay FIRST: the vendor-prefix patterns below match a *prefix* of
+        // a token rather than the whole thing, so running them first on
+        // `Bearer sk-<48>+tail` masks the `sk-…` part and leaves `+tail` in the
+        // clear.
+        //
+        // `(?i:)` rather than spelling out casings: the case-insensitive literal
+        // does cost the RegexSet prefilter's fast path, but only in isolation —
+        // the `(?i)` header and credential-assignment patterns below already
+        // defeat it, so narrowing here buys nothing and only loses `BeArEr`.
         (
             r"(?i:\bBearer)[ \t]+([A-Za-z0-9._~+/-]{16,}=*)",
             "Bearer Token",
@@ -419,7 +419,12 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     // A userinfo token NOT matched by any earlier pattern (not a ghp_/AWS/etc.
     // shape) so this sample exercises the URL Credential pattern itself.
     "https://AbCdEf0123456789GhIjKlMnOpQr@example.com/org/repo",
-    "Authorization: Bearer abcDEF123456ghiJKL789",
+    // `Basic`, not `Bearer`: the broad Bearer pattern above consumes any
+    // `Bearer` token first, so a bearer sample here would reach that pattern
+    // rather than this one. (Today's consumers only assert *that* something was
+    // redacted, not which pattern did it, so this keeps the sample honest
+    // rather than fixing a live gap.)
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
     "x-api-key: AbCdEf0123456789TokenValue",
     "API_KEY=AbCdEf0123456789TokenValue",
 ];
@@ -488,42 +493,50 @@ mod tests {
         }
     }
 
+    /// A bearer token must be masked whether or not a header name precedes it —
+    /// the `Authorization:`-anchored pattern misses `curl -H "Bearer …"` and
+    /// proxy log lines entirely — and in every casing an HTTP scheme uses.
+    ///
+    /// The label assertion pins the "Bearer pattern must stay FIRST" invariant:
+    /// the Authorization Header pattern is also `capture_only` and also keeps
+    /// the scheme word, so on the header case "token gone" and "redacted once"
+    /// both still hold if the ordering regressed. Only the label distinguishes
+    /// which pattern actually won.
     #[test]
-    fn redacts_authorization_bearer_keeps_scheme() {
-        let input = "Authorization: Bearer abcDEF123456ghiJKL789";
-        let result = redact_secrets(input);
-        assert!(
-            !result.contains("abcDEF123456ghiJKL789"),
-            "raw bearer token must not survive: {result}"
-        );
+    fn redacts_bearer_tokens_with_and_without_a_header_name() {
+        const TOKEN: &str = "AbCdEf0123456789OpaqueToken";
+        for (label, input) in [
+            ("header", format!("Authorization: Bearer {TOKEN}")),
+            ("bare", format!("curl -H 'Bearer {TOKEN}' https://api.x")),
+            ("lowercase", format!("bearer {TOKEN}")),
+            ("uppercase", format!("BEARER {TOKEN}")),
+            ("mixed case", format!("BeArEr {TOKEN}")),
+        ] {
+            let result = redact_secrets(&input);
+            assert!(
+                !result.contains(TOKEN),
+                "{label}: raw token must not survive: {result}"
+            );
+            assert!(
+                result.contains("[REDACTED Bearer Token]"),
+                "{label}: the Bearer pattern must be the one that matched: {result}"
+            );
+            assert_eq!(
+                result.matches("[REDACTED").count(),
+                1,
+                "{label}: must be redacted exactly once: {result}"
+            );
+        }
+    }
+
+    /// The scheme word stays visible so a redacted transcript still shows which
+    /// auth mechanism was in play.
+    #[test]
+    fn bearer_redaction_keeps_the_scheme_word() {
+        let result = redact_secrets("Authorization: Bearer abcDEF123456ghiJKL789");
         assert!(
             result.contains("Authorization: Bearer "),
             "scheme word must stay visible for debuggability: {result}"
-        );
-        // The broad Bearer pattern runs first and consumes the token, so the
-        // narrower Authorization Header pattern sees an already-masked value
-        // and must leave it alone — one marker, not a nested double-redaction.
-        assert_eq!(
-            result.matches("[REDACTED").count(),
-            1,
-            "header must be redacted exactly once: {result}"
-        );
-    }
-
-    /// The gap the Authorization Header pattern leaves: a bearer token with no
-    /// header name in front of it — `curl -H "Bearer …"`, a proxy log line — is
-    /// just as much of a leak and must be masked too.
-    #[test]
-    fn redacts_bare_bearer_token_without_header_name() {
-        let input = "curl -H 'Bearer AbCdEf0123456789OpaqueToken' https://api.example.com";
-        let result = redact_secrets(input);
-        assert!(
-            !result.contains("AbCdEf0123456789OpaqueToken"),
-            "bare bearer token must not survive: {result}"
-        );
-        assert!(
-            result.contains("Bearer [REDACTED Bearer Token]"),
-            "scheme word must stay visible: {result}"
         );
     }
 

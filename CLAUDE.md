@@ -34,6 +34,8 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 80% via `cargo llvm-cov --fail-under-lines 80`.
 
+**Autofixing lints.** Prefer `cargo fixit` over `cargo clippy --fix` — it's a drop-in replacement and dramatically faster (up to ~120x on large workspaces). Install with `cargo install cargo-fixit`; it's a local convenience, not wired into CI or the `justfile`. The maintainer is a contributor to it, so bug reports and rough edges are worth surfacing rather than working around.
+
 **Live-LLM/live-MCP lanes (real network) are opt-in** — see `crates/cortex/tests/live_network_integration.rs` and `crates/mcp/tests/live_mcp.rs`. Default `cargo test` stays hermetic.
 
 LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude Code CLI.

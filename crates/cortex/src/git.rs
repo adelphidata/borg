@@ -40,8 +40,11 @@ const SAFE_BARE_REPOSITORY: &str = "safe.bareRepository=explicit";
 
 /// Config `-c` overrides prepended to every git invocation so a repository's
 /// own configuration can't execute code while we operate inside its tree.
-pub(crate) fn hardened_prelude() -> [&'static str; 6] {
-    [
+/// Returned as a slice, not a fixed-size array: the arity is an implementation
+/// detail, and baking it into every caller's type means the next `-c` pair
+/// touches signatures and test indices that have nothing to do with it.
+pub(crate) fn hardened_prelude() -> &'static [&'static str] {
+    &[
         "-c",
         FSMONITOR_OVERRIDE,
         "-c",
@@ -56,15 +59,17 @@ pub(crate) fn hardened_prelude() -> [&'static str; 6] {
 /// Every git command we run is local plumbing, so nothing should ever prompt.
 /// Two independent channels have to be closed:
 ///
-/// * **stdin** — `.output()` nulls it implicitly, but stating it keeps a future
-///   `.status()`/`.spawn()` refactor from silently handing git the operator's
-///   input stream.
+/// * **stdin** — `spawn` (unlike `.output()`) *inherits* stdin, so git would
+///   otherwise get the operator's input stream. [`run_with_budget`] nulls it
+///   too; this is the second belt, so a caller that spawns git by some other
+///   route still can't hand it a live stdin.
 /// * **the controlling terminal** — git opens `/dev/tty` *directly* for
 ///   credential prompts, so nulling stdin alone does not stop it.
 ///   `GIT_TERMINAL_PROMPT=0` turns a would-be prompt into an immediate error.
 fn make_git_non_interactive(cmd: &mut tokio::process::Command) {
-    cmd.stdin(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+    // Delegates rather than repeating the body: this is a security contract, and
+    // the next hardening env var added to one copy would silently miss the other.
+    make_git_non_interactive_sync(cmd.as_std_mut());
 }
 
 /// [`make_git_non_interactive`] for the blocking `std::process` git runners in
@@ -84,12 +89,23 @@ pub(crate) fn make_git_non_interactive_sync(cmd: &mut std::process::Command) {
 /// Spawning explicitly gives us the pid, so `kill_on_drop` can end git itself
 /// and `killpg` can end anything it spawned.
 async fn run_with_timeout(
+    cmd: tokio::process::Command,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    run_with_budget(cmd, GIT_COMMAND_TIMEOUT).await
+}
+
+/// [`run_with_timeout`] with an explicit budget so tests can drive the
+/// abandon path without burning a full `GIT_COMMAND_TIMEOUT` of wall clock.
+async fn run_with_budget(
     mut cmd: tokio::process::Command,
+    budget: Duration,
 ) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
     crate::util::process_tree::spawn_in_own_group(&mut cmd);
-    // `Command::output` pipes these implicitly; `spawn` inherits instead, so
-    // they must be stated or `wait_with_output` returns empty streams.
-    cmd.stdout(std::process::Stdio::piped())
+    // `Command::output` sets these implicitly; `spawn` inherits instead, so
+    // they must be stated or `wait_with_output` returns empty streams and git
+    // gets the operator's stdin.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = match cmd.kill_on_drop(true).spawn() {
         Ok(child) => child,
@@ -97,7 +113,12 @@ async fn run_with_timeout(
     };
     // Read the pid before `wait_with_output` consumes the handle.
     let pid = child.id();
-    match tokio::time::timeout(GIT_COMMAND_TIMEOUT, child.wait_with_output()).await {
+    // Pinned (not moved into `timeout`) so the `Child` is still owned when the
+    // budget expires: dropping it first would let `kill_on_drop` reap the pid,
+    // and the `killpg` below could then land on a recycled, unrelated group.
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    match tokio::time::timeout(budget, &mut wait).await {
         Ok(result) => Ok(result),
         Err(elapsed) => {
             crate::util::process_tree::kill_process_group(pid);
@@ -941,24 +962,32 @@ mod tests {
 
     #[test]
     fn hardened_prelude_disables_fsmonitor_and_hooks() {
-        // These exact flags are the security invariant: fsmonitor and hooks are
-        // the two repo-config code-execution vectors on the plumbing we run.
+        // These exact flags are the security invariant: fsmonitor, hooks, and
+        // bare-repo discovery are the repo-config code-execution vectors on the
+        // plumbing we run. Read as `-c`/value pairs so adding another override
+        // doesn't shuffle a pile of hardcoded indices.
         let prelude = hardened_prelude();
-        assert_eq!(prelude[0], "-c");
-        assert_eq!(prelude[1], "core.fsmonitor=false");
-        assert_eq!(prelude[2], "-c");
-        assert!(
-            prelude[3].starts_with("core.hooksPath="),
-            "hooks must be routed to a null path, got {:?}",
-            prelude[3]
+        assert_eq!(
+            prelude.len() % 2,
+            0,
+            "prelude must be whole -c/value pairs: {prelude:?}"
         );
+        let overrides: Vec<&str> = prelude
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-c", "every override must carry its own -c");
+                pair[1]
+            })
+            .collect();
+
+        assert!(overrides.contains(&"core.fsmonitor=false"));
+        assert!(overrides.contains(&"safe.bareRepository=explicit"));
         // Null target must not point back at a usable directory.
-        assert!(prelude[3] == "core.hooksPath=/dev/null" || prelude[3] == "core.hooksPath=NUL");
-        // A tracked subdirectory shaped like a bare repo would otherwise be
-        // picked up by git's discovery walk, and its `config` read — which is
-        // exactly the file the two overrides above exist to neutralize.
-        assert_eq!(prelude[4], "-c");
-        assert_eq!(prelude[5], "safe.bareRepository=explicit");
+        let hooks = overrides
+            .iter()
+            .find(|o| o.starts_with("core.hooksPath="))
+            .expect("hooks must be routed to a null path");
+        assert!(*hooks == "core.hooksPath=/dev/null" || *hooks == "core.hooksPath=NUL");
     }
 
     /// Every git invocation in the crate must carry the full prelude — the
@@ -971,7 +1000,7 @@ mod tests {
         let prelude = hardened_prelude();
         assert_eq!(
             &argv[..prelude.len()],
-            &prelude[..],
+            prelude,
             "filter discovery must run under the hardening prelude: {argv:?}"
         );
         assert_eq!(argv[prelude.len()], "config");
@@ -982,13 +1011,15 @@ mod tests {
     /// the child with no signal at all; here the descendant git would spawn
     /// (a credential helper, fsmonitor) stands in for that leak.
     ///
-    /// Exercises `run_with_timeout` directly rather than `run_git`: the leak is
+    /// Exercises `run_with_budget` directly rather than `run_git`: the leak is
     /// in the timeout wrapper, and driving it needs a program that blocks
     /// deterministically without a real repo, network, or `PATH` mutation
-    /// (which is process-global and would race sibling tests).
+    /// (which is process-global and would race sibling tests). The budget is
+    /// injected so the test doesn't spend a full `GIT_COMMAND_TIMEOUT` idling.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_with_timeout_kills_the_whole_process_tree() {
+        const BUDGET: Duration = Duration::from_millis(500);
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("child.pid");
 
@@ -1001,13 +1032,13 @@ mod tests {
             .stdout(std::process::Stdio::piped());
 
         let started = std::time::Instant::now();
-        let result = run_with_timeout(cmd).await;
+        let result = run_with_budget(cmd, BUDGET).await;
         assert!(
             result.is_err(),
             "a command that outlives the budget must report the timeout"
         );
         assert!(
-            started.elapsed() >= GIT_COMMAND_TIMEOUT,
+            started.elapsed() >= BUDGET,
             "must not have returned before the budget elapsed"
         );
 
@@ -1016,16 +1047,7 @@ mod tests {
             .trim()
             .parse()
             .expect("pid");
-        // SIGKILL delivery is asynchronous; poll rather than racing it.
-        let mut gone = false;
-        for _ in 0..100 {
-            // SAFETY: signal 0 only probes for existence; it never delivers.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let gone = crate::util::process_tree::wait_for_pid_exit(pid).await;
         assert!(gone, "descendant {pid} outlived the timed-out command");
     }
 
