@@ -39,6 +39,8 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::process_registry::ProcessGuard;
+#[cfg(unix)]
+use crate::util::process_tree::signal_group;
 
 /// Grace period between SIGTERM and SIGKILL when terminating a session, giving
 /// the process tree a chance to run its own cleanup before the hard kill.
@@ -329,18 +331,6 @@ async fn terminate_child(child: &mut Child, pid: Option<u32>) {
     // Non-Unix, or PID unavailable: best-effort direct kill + reap.
     let _ = child.start_kill();
     let _ = child.wait().await;
-}
-
-/// Send `sig` to every process in `pgid`. Best-effort: `ESRCH` (group already
-/// gone) and other failures are ignored — the caller's `wait` reaps the child.
-#[cfg(unix)]
-fn signal_group(pgid: i32, sig: i32) {
-    // SAFETY: FFI call to `killpg`. `pgid` is our own child's process group
-    // (the child leads its group via `process_group(0)` at spawn), so we never
-    // signal an unrelated group. A non-zero return (e.g. ESRCH) is ignored.
-    unsafe {
-        libc::killpg(pgid, sig);
-    }
 }
 
 /// Spawn the detached task that reads both pipes into the shared buffer until

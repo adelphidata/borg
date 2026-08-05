@@ -91,6 +91,25 @@ fn credential_assignment_key_is_real(full_match: &str) -> bool {
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     type Validator = Option<fn(&str) -> bool>;
     let patterns: Vec<(&str, &str, bool, Validator)> = vec![
+        // Bearer tokens wherever they appear — a `curl -H "Bearer …"`, a proxy
+        // log line, a copied request — not just behind an `Authorization:`
+        // header, which the narrower pattern further down requires.
+        //
+        // Order matters, and this must stay FIRST: the vendor-prefix patterns
+        // below match a *prefix* of a token rather than the whole thing, so
+        // running them first on `Bearer sk-<48>+tail` masks the `sk-…` part and
+        // leaves `+tail` in the clear. Broadest-first keeps the token intact as
+        // one match. The charset covers base64 and URL-safe base64 (`+ / ~ =`)
+        // for the same reason; the separator is `[ \t]` only, so a bare
+        // "Bearer" at the end of a line can't swallow the next line.
+        // `capture_only` keeps the scheme word visible, matching how the
+        // Authorization Header pattern renders.
+        (
+            r"(?i:\bBearer)[ \t]+([A-Za-z0-9._~+/-]{16,}=*)",
+            "Bearer Token",
+            true,
+            None,
+        ),
         // AWS key IDs share a 4-letter prefix + 16 base32 chars. Beyond the
         // long-lived `AKIA` access key, cover temporary/STS creds (`ASIA`) and
         // the unique-ID prefixes for users/roles/groups (`AIDA`/`AROA`/`AGPA`)
@@ -379,6 +398,9 @@ pub fn contains_secrets(text: &str) -> bool {
 /// duplicating the pattern list. The order matches `SECRET_PATTERNS`.
 #[cfg(test)]
 pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
+    // Opaque (no vendor prefix) so this sample exercises the Bearer pattern
+    // itself rather than a narrower one that happens to match first.
+    "Bearer AbCdEf0123456789OpaqueToken",
     "AKIAIOSFODNN7EXAMPLE",
     "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
     "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
@@ -471,10 +493,6 @@ mod tests {
         let input = "Authorization: Bearer abcDEF123456ghiJKL789";
         let result = redact_secrets(input);
         assert!(
-            result.contains("[REDACTED Authorization Header]"),
-            "token must be redacted: {result}"
-        );
-        assert!(
             !result.contains("abcDEF123456ghiJKL789"),
             "raw bearer token must not survive: {result}"
         );
@@ -482,6 +500,57 @@ mod tests {
             result.contains("Authorization: Bearer "),
             "scheme word must stay visible for debuggability: {result}"
         );
+        // The broad Bearer pattern runs first and consumes the token, so the
+        // narrower Authorization Header pattern sees an already-masked value
+        // and must leave it alone — one marker, not a nested double-redaction.
+        assert_eq!(
+            result.matches("[REDACTED").count(),
+            1,
+            "header must be redacted exactly once: {result}"
+        );
+    }
+
+    /// The gap the Authorization Header pattern leaves: a bearer token with no
+    /// header name in front of it — `curl -H "Bearer …"`, a proxy log line — is
+    /// just as much of a leak and must be masked too.
+    #[test]
+    fn redacts_bare_bearer_token_without_header_name() {
+        let input = "curl -H 'Bearer AbCdEf0123456789OpaqueToken' https://api.example.com";
+        let result = redact_secrets(input);
+        assert!(
+            !result.contains("AbCdEf0123456789OpaqueToken"),
+            "bare bearer token must not survive: {result}"
+        );
+        assert!(
+            result.contains("Bearer [REDACTED Bearer Token]"),
+            "scheme word must stay visible: {result}"
+        );
+    }
+
+    /// Ordering regression: the vendor-prefix patterns match a *prefix* of a
+    /// token, so if one of them ran before the Bearer pattern it would mask
+    /// `sk-…` and leave the base64 tail after it in the clear.
+    #[test]
+    fn bearer_pattern_masks_whole_token_not_just_its_vendor_prefix() {
+        let token = "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678aBcDeFgHiJkLm+t/ail=";
+        let input = format!("Bearer {token}");
+        let result = redact_secrets(&input);
+        assert!(
+            !result.contains("+t/ail="),
+            "base64 tail leaked past the vendor-prefix match: {result}"
+        );
+        assert!(
+            !result.contains(token),
+            "raw token must not survive: {result}"
+        );
+    }
+
+    /// No over-blocking: `Bearer` is an ordinary English word, and the token
+    /// class must not run past the end of the line to find 16 characters.
+    #[test]
+    fn bearer_redaction_does_not_touch_prose() {
+        let input = "The bearer of this note is\nauthorized to collect the parcel.";
+        assert_eq!(redact_secrets(input), input);
     }
 
     #[test]
@@ -536,8 +605,12 @@ mod tests {
 
     #[test]
     fn redacts_jwt() {
+        // Bare, with no `Bearer` prefix: a JWT leaks just as readily out of a
+        // cookie, a query string, or a log line, and this asserts the JWT
+        // pattern itself rather than the broader Bearer one that would match
+        // first if the prefix were present.
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        let input = format!("Bearer {jwt}");
+        let input = format!("token={jwt}");
         let result = redact_secrets(&input);
         assert!(result.contains("[REDACTED JWT]"));
         assert!(

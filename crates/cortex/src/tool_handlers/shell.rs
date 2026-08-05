@@ -411,6 +411,10 @@ pub async fn handle_run_shell_with_context(
     // provider keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ...) would
     // be visible to any `env` / `printenv` in the agent's shell.
     crate::security::env_allowlist::apply_filtered_env(&mut cmd, &filtered_creds);
+    // Lead a new process group so a timeout can signal the whole tree. Without
+    // it `kill_on_drop` reaps only the shell, and anything it backgrounded
+    // keeps running past the command that spawned it.
+    crate::util::process_tree::spawn_in_own_group(&mut cmd);
 
     let mut child = cmd
         .kill_on_drop(true)
@@ -453,6 +457,9 @@ pub async fn handle_run_shell_with_context(
         }
         Err(e) => {
             if e.to_string().contains("timed out") {
+                // `child` is dropped on the way out, which kills the shell but
+                // not its descendants — signal the group before letting go.
+                crate::util::process_tree::kill_process_group(child.id());
                 if let Some(g) = _guard {
                     g.timed_out();
                 }
@@ -506,8 +513,7 @@ async fn start_session(
     // Lead a new process group so `kill` can signal the whole tree (the shell
     // plus anything it spawned), not just the direct child — otherwise an
     // interrupted session can leak descendants and their sandbox bookkeeping.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    crate::util::process_tree::spawn_in_own_group(&mut cmd);
 
     let child = cmd
         .kill_on_drop(true)
@@ -1194,6 +1200,54 @@ mod tests {
             result.contains("--- stderr ---"),
             "non-tty must keep separate stderr: {result}"
         );
+    }
+
+    /// A timed-out command must not leave its background jobs running.
+    /// `kill_on_drop` reaps only the shell we spawned; without
+    /// `process_group(0)` at spawn time everything that shell backgrounded
+    /// outlives the tool call and is reparented to init.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_timeout_kills_backgrounded_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid_file = tmp.path().join("child.pid");
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        // The shell records its background job's pid, then blocks past the
+        // timeout so the descendant is still alive when we give up on it.
+        let args = serde_json::json!({
+            "command": format!(
+                "sleep 120 & echo $! > {}; sleep 120",
+                pid_file.to_string_lossy()
+            ),
+            "timeout_ms": 500,
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("timeout path returns Ok with explanation");
+        assert!(
+            result.contains("timed out"),
+            "expected the timeout branch: {result}"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("shell should have recorded its background job's pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        // SIGKILL delivery is asynchronous; poll rather than racing it.
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only probes for existence; it never delivers.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "backgrounded descendant {pid} survived the timeout");
     }
 
     #[cfg(unix)]

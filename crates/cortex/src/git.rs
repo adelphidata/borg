@@ -31,10 +31,24 @@ const HOOKS_OVERRIDE: &str = "core.hooksPath=/dev/null";
 /// them rather than letting them fire.
 pub(crate) const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|smudge|process)$";
 
+/// Refuse to treat an *implicitly discovered* directory as a bare repository.
+/// A tracked subdirectory can be shaped to look like one, and git's discovery
+/// walk would then read that directory's `config` — handing an untrusted tree
+/// the very config keys the overrides above exist to deny. Explicit
+/// `--git-dir`/`GIT_DIR` use is unaffected.
+const SAFE_BARE_REPOSITORY: &str = "safe.bareRepository=explicit";
+
 /// Config `-c` overrides prepended to every git invocation so a repository's
 /// own configuration can't execute code while we operate inside its tree.
-pub(crate) fn hardened_prelude() -> [&'static str; 4] {
-    ["-c", FSMONITOR_OVERRIDE, "-c", HOOKS_OVERRIDE]
+pub(crate) fn hardened_prelude() -> [&'static str; 6] {
+    [
+        "-c",
+        FSMONITOR_OVERRIDE,
+        "-c",
+        HOOKS_OVERRIDE,
+        "-c",
+        SAFE_BARE_REPOSITORY,
+    ]
 }
 
 /// Make a `git` invocation non-interactive.
@@ -51,6 +65,45 @@ pub(crate) fn hardened_prelude() -> [&'static str; 4] {
 fn make_git_non_interactive(cmd: &mut tokio::process::Command) {
     cmd.stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// [`make_git_non_interactive`] for the blocking `std::process` git runners in
+/// the patch applicator. Those have no timeout at all, so a credential prompt
+/// there hangs the tool call outright rather than merely delaying it.
+pub(crate) fn make_git_non_interactive_sync(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// Run `cmd` under [`GIT_COMMAND_TIMEOUT`], killing the whole process tree if
+/// the budget expires.
+///
+/// The obvious spelling — `timeout(.., cmd.output())` — leaks: dropping that
+/// future abandons the child with no signal at all, so a git that hangs on a
+/// network remote or a credential helper survives for the life of the machine.
+/// Spawning explicitly gives us the pid, so `kill_on_drop` can end git itself
+/// and `killpg` can end anything it spawned.
+async fn run_with_timeout(
+    mut cmd: tokio::process::Command,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    crate::util::process_tree::spawn_in_own_group(&mut cmd);
+    // `Command::output` pipes these implicitly; `spawn` inherits instead, so
+    // they must be stated or `wait_with_output` returns empty streams.
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = match cmd.kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(Err(e)),
+    };
+    // Read the pid before `wait_with_output` consumes the handle.
+    let pid = child.id();
+    match tokio::time::timeout(GIT_COMMAND_TIMEOUT, child.wait_with_output()).await {
+        Ok(result) => Ok(result),
+        Err(elapsed) => {
+            crate::util::process_tree::kill_process_group(pid);
+            Err(elapsed)
+        }
+    }
 }
 
 /// Parse `git config --null --name-only --get-regexp` output (NUL-separated
@@ -112,7 +165,7 @@ async fn filter_neutralizing_env(cwd: &Path) -> Vec<(String, String)> {
     let mut discovery = tokio::process::Command::new("git");
     discovery.args(filter_discovery_argv()).current_dir(cwd);
     make_git_non_interactive(&mut discovery);
-    let result = tokio::time::timeout(GIT_COMMAND_TIMEOUT, discovery.output()).await;
+    let result = run_with_timeout(discovery).await;
     let stdout = match result {
         // `--get-regexp` exits 1 when nothing matches — that's the common case.
         Ok(Ok(o)) if o.status.success() || o.status.code() == Some(1) => o.stdout,
@@ -325,7 +378,7 @@ async fn run_git_inner(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = tokio::time::timeout(GIT_COMMAND_TIMEOUT, cmd.output())
+    let output = run_with_timeout(cmd)
         .await
         .context("git command timed out")?
         .context("failed to execute git")?;
@@ -901,6 +954,79 @@ mod tests {
         );
         // Null target must not point back at a usable directory.
         assert!(prelude[3] == "core.hooksPath=/dev/null" || prelude[3] == "core.hooksPath=NUL");
+        // A tracked subdirectory shaped like a bare repo would otherwise be
+        // picked up by git's discovery walk, and its `config` read — which is
+        // exactly the file the two overrides above exist to neutralize.
+        assert_eq!(prelude[4], "-c");
+        assert_eq!(prelude[5], "safe.bareRepository=explicit");
+    }
+
+    /// Every git invocation in the crate must carry the full prelude — the
+    /// hardening is worthless on the one call site that forgot it. `-c` pairs
+    /// are positional, so this also catches a prelude whose arity changed
+    /// without its `-c` separators.
+    #[test]
+    fn discovery_argv_carries_the_whole_prelude() {
+        let argv = filter_discovery_argv();
+        let prelude = hardened_prelude();
+        assert_eq!(
+            &argv[..prelude.len()],
+            &prelude[..],
+            "filter discovery must run under the hardening prelude: {argv:?}"
+        );
+        assert_eq!(argv[prelude.len()], "config");
+    }
+
+    /// A command that outlives [`GIT_COMMAND_TIMEOUT`] must not leave orphans
+    /// behind. The natural spelling — `timeout(.., cmd.output())` — abandons
+    /// the child with no signal at all; here the descendant git would spawn
+    /// (a credential helper, fsmonitor) stands in for that leak.
+    ///
+    /// Exercises `run_with_timeout` directly rather than `run_git`: the leak is
+    /// in the timeout wrapper, and driving it needs a program that blocks
+    /// deterministically without a real repo, network, or `PATH` mutation
+    /// (which is process-global and would race sibling tests).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_with_timeout_kills_the_whole_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("child.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 120 & echo $! > {}; sleep 120",
+                pid_file.to_string_lossy()
+            ))
+            .stdout(std::process::Stdio::piped());
+
+        let started = std::time::Instant::now();
+        let result = run_with_timeout(cmd).await;
+        assert!(
+            result.is_err(),
+            "a command that outlives the budget must report the timeout"
+        );
+        assert!(
+            started.elapsed() >= GIT_COMMAND_TIMEOUT,
+            "must not have returned before the budget elapsed"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("shell should have recorded its background job's pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        // SIGKILL delivery is asynchronous; poll rather than racing it.
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only probes for existence; it never delivers.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "descendant {pid} outlived the timed-out command");
     }
 
     #[test]

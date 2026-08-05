@@ -334,10 +334,12 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
 /// `GIT_CONFIG_*` env that neutralizes them. Best-effort: discovery failures
 /// yield no overrides (the hardening prelude still applies).
 fn filter_neutralizing_env_sync(repo_root: &std::path::Path) -> Vec<(String, String)> {
-    let output = std::process::Command::new("git")
+    let mut discovery = std::process::Command::new("git");
+    discovery
         .args(crate::git::filter_discovery_argv())
-        .current_dir(repo_root)
-        .output();
+        .current_dir(repo_root);
+    crate::git::make_git_non_interactive_sync(&mut discovery);
+    let output = discovery.output();
     match output {
         // `--get-regexp` exits 1 when nothing matches — the common case.
         Ok(o) if o.status.success() || o.status.code() == Some(1) => {
@@ -364,6 +366,9 @@ fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: &[(String, String)]) 
     argv.extend_from_slice(args);
     let mut cmd = std::process::Command::new("git");
     cmd.args(&argv).current_dir(cwd);
+    // This path blocks with no timeout, so an interactive prompt would wedge
+    // the tool call outright rather than merely delaying it.
+    crate::git::make_git_non_interactive_sync(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
