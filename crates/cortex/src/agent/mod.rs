@@ -1062,6 +1062,7 @@ impl Agent {
         // One-shot reactive compaction per run — prevents a broken provider
         // (always returns context_overflow) from looping forever.
         let mut reactive_compacted_this_turn = false;
+        let mut output_cap_retried_this_turn = false;
 
         // Reset per-turn loop guards at the start of each user turn so a
         // fresh request starting with a previously-blocked call or a
@@ -1311,6 +1312,38 @@ impl Agent {
                     // Discard partial stream state (stream_error, tool_calls,
                     // tag_filter are re-bound at the top of the outer loop).
                     continue;
+                }
+            }
+
+            // Output-cap recovery: the response hit max_tokens. Compact once
+            // and re-issue the iteration instead of persisting a `[stream
+            // interrupted]` marker and discarding the turn's tool calls — a
+            // smaller input both frees combined-window budget and reins in
+            // degenerate long output. Only when compaction actually reclaims
+            // tokens: retrying against an unchanged input would just truncate
+            // again. One retry per turn; a second truncation falls through to
+            // the marker path in `finish_iteration`.
+            if truncated_due_to_length && stream_error.is_none() && !output_cap_retried_this_turn {
+                output_cap_retried_this_turn = true;
+                let before_tokens = history_tokens(&self.history);
+                warn!("Response truncated at max_tokens; compacting history and retrying");
+                // Unlike the input-overflow path above, a truncated response
+                // is still deliverable — so a compaction failure (e.g. the
+                // summarizer client can't be built) degrades to the marker
+                // path instead of erroring the whole turn.
+                match self.reactive_compact_history(&event_tx).await {
+                    Ok(()) => {
+                        if history_tokens(&self.history) < before_tokens {
+                            // Discard the truncated partial (tag_filter,
+                            // tool_calls re-bind at the top of the outer
+                            // loop) and retry.
+                            continue;
+                        }
+                        // Nothing reclaimed — surface the truncation as before.
+                    }
+                    Err(e) => {
+                        warn!("output-cap compaction failed ({e:#}); surfacing truncation marker");
+                    }
                 }
             }
 
