@@ -297,13 +297,12 @@ impl Agent {
 
         let query = self.latest_user_query();
 
-        // Short/trivial queries (acks like "ok", "next", "yes") won't produce
-        // meaningful semantic rankings — skip the embedding round-trip and fall
-        // back to recency ordering. Threshold picked to cover typical one-word
-        // affirmatives without suppressing real questions.
-        const MIN_QUERY_CHARS_FOR_RANKING: usize = 10;
-        let trimmed = query.trim();
-        if trimmed.len() < MIN_QUERY_CHARS_FOR_RANKING {
+        // Trivial queries (acks like "ok", greetings like "hey how are you
+        // doing") won't produce meaningful semantic rankings — skip the
+        // embedding round-trip and fall back to recency ordering. Shared
+        // classifier with `build_active_memory_section` so the two gates
+        // cannot drift.
+        if crate::memory::trivial::is_trivial_prompt(&query) {
             return self.load_memory(max_tokens, LoadStrategy::Recency).await;
         }
 

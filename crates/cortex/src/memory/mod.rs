@@ -27,6 +27,8 @@ pub mod mmr;
 pub mod short_term_memory;
 /// Token estimation via tiktoken (cl100k_base BPE).
 pub mod tokenizer;
+/// Trivial-prompt classifier gating per-turn memory prefetch.
+pub mod trivial;
 
 /// How to write to a memory file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
