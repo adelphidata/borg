@@ -459,6 +459,22 @@ struct ProviderSlot {
     cooldown: ProviderCooldown,
 }
 
+/// Identity of the primary provider head, snapshotted the first time the
+/// client fails over away from it so the primary can be restored once its
+/// cooldown expires. Without this, `try_failover_provider` overwrites the
+/// client's active identity in place and the primary is unreachable for the
+/// rest of the client's life even after a transient rate-limit window resets.
+struct PrimaryIdentity {
+    provider: Provider,
+    model: String,
+    api_key: String,
+    fallback_keys: Vec<String>,
+    pool: Option<Arc<credential_pool::CredentialPool>>,
+    temperature: f32,
+    max_tokens: u32,
+    base_url: Option<String>,
+}
+
 /// Multi-provider streaming LLM client with failover and key rotation.
 pub struct LlmClient {
     client: Client,
@@ -484,6 +500,13 @@ pub struct LlmClient {
     provider_slots: Vec<ProviderSlot>,
     /// Index of the currently active provider slot (usize::MAX = primary).
     active_slot_index: usize,
+    /// Cooldown state for the primary head — the counterpart of each
+    /// fallback slot's `ProviderSlot::cooldown`. Gates when a failed-over
+    /// client probes the primary again.
+    primary_cooldown: ProviderCooldown,
+    /// The primary head's identity, captured when failover first leaves it.
+    /// `Some` only while the client is running on a fallback slot.
+    primary_snapshot: Option<PrimaryIdentity>,
     debug_logging: bool,
     /// Optional stable cache key (typically the session / conversation id).
     /// Sent as `prompt_cache_key` on OpenAI-family requests to bias the
@@ -1044,6 +1067,8 @@ impl LlmClient {
             active_credential_base_url: None,
             provider_slots,
             active_slot_index: usize::MAX,
+            primary_cooldown: ProviderCooldown::default(),
+            primary_snapshot: None,
             debug_logging,
             prompt_cache_key: None,
             system_stable_prefix: None,
@@ -1308,6 +1333,21 @@ impl LlmClient {
                 );
                 continue;
             }
+            // Leaving the primary head: snapshot its identity so it can be
+            // restored once its cooldown expires. Fallback→fallback switches
+            // keep the existing snapshot.
+            if self.active_slot_index == usize::MAX {
+                self.primary_snapshot = Some(PrimaryIdentity {
+                    provider: self.provider,
+                    model: self.llm_config.model.clone(),
+                    api_key: self.api_key.clone(),
+                    fallback_keys: std::mem::take(&mut self.fallback_keys),
+                    pool: self.primary_pool.clone(),
+                    temperature: self.llm_config.temperature,
+                    max_tokens: self.llm_config.max_tokens,
+                    base_url: self.llm_config.base_url.clone(),
+                });
+            }
             // Found a usable slot — switch to it
             self.provider = slot.provider;
             self.api_key = slot.keys[0].clone();
@@ -1333,8 +1373,11 @@ impl LlmClient {
             self.provider_slots[self.active_slot_index]
                 .cooldown
                 .record_failure(reason);
+        } else {
+            // Primary head. Its cooldown gates when a failed-over client
+            // probes it again (see `maybe_restore_primary`).
+            self.primary_cooldown.record_failure(reason);
         }
-        // If active_slot_index == usize::MAX, it's the primary provider — no cooldown tracking
     }
 
     /// Record success on the currently active provider slot.
@@ -1343,7 +1386,73 @@ impl LlmClient {
             self.provider_slots[self.active_slot_index]
                 .cooldown
                 .record_success();
+        } else {
+            self.primary_cooldown.record_success();
         }
+    }
+
+    /// Restore the primary head if the client is running on a fallback slot
+    /// and the primary's cooldown has expired. Returns true when restored.
+    ///
+    /// Auth-class failures (`Auth`, `AuthPermanent`) and `ModelNotFound`
+    /// never restore — retrying them wastes a request and re-degrades the
+    /// turn. For rate-limit/billing failures the credential pool's own
+    /// recovery clock is honored too: if every key is still cooling, the
+    /// probe is deferred even after the provider-level cooldown expires.
+    /// A failed probe re-records into `primary_cooldown`, so the next probe
+    /// waits a fresh window.
+    fn maybe_restore_primary(&mut self) -> bool {
+        if self.active_slot_index == usize::MAX || self.primary_snapshot.is_none() {
+            return false;
+        }
+        if matches!(
+            self.primary_cooldown.reason,
+            Some(
+                FailoverReason::Auth
+                    | FailoverReason::AuthPermanent
+                    | FailoverReason::ModelNotFound
+            )
+        ) {
+            return false;
+        }
+        if self.primary_cooldown.is_active() {
+            return false;
+        }
+        if matches!(
+            self.primary_cooldown.reason,
+            Some(FailoverReason::RateLimit | FailoverReason::Billing)
+        ) {
+            let pool_still_cooling = self
+                .primary_snapshot
+                .as_ref()
+                .and_then(|p| p.pool.as_ref())
+                .is_some_and(|pool| {
+                    !pool.has_available()
+                        && pool
+                            .next_recovery_at_ms()
+                            .is_some_and(|at| at > chrono::Utc::now().timestamp_millis())
+                });
+            if pool_still_cooling {
+                return false;
+            }
+        }
+        let Some(p) = self.primary_snapshot.take() else {
+            return false;
+        };
+        self.provider = p.provider;
+        self.api_key = p.api_key;
+        self.fallback_keys = p.fallback_keys;
+        self.primary_pool = p.pool;
+        self.llm_config.model = p.model;
+        self.llm_config.temperature = p.temperature;
+        self.llm_config.max_tokens = p.max_tokens;
+        self.llm_config.base_url = p.base_url;
+        self.active_slot_index = usize::MAX;
+        info!(
+            "Primary provider {} (model: {}) cooldown expired — restoring from fallback",
+            self.provider, self.llm_config.model
+        );
+        true
     }
 
     /// Switch to the next usable provider slot AND announce the switch on the
@@ -1766,6 +1875,14 @@ impl LlmClient {
             }
             anyhow::bail!("{msg}");
         }
+
+        // Probe the primary again once its cooldown window has passed —
+        // otherwise a single transient rate limit strands the client on the
+        // (usually degraded) fallback chain for its whole lifetime. No
+        // Failover event is emitted: the agent resets its reported identity
+        // at the start of every stream, so an event-free stream already
+        // reports the primary.
+        self.maybe_restore_primary();
 
         let max_provider_attempts = 1 + self.provider_slots.len();
 

@@ -3274,3 +3274,99 @@ async fn azure_openai_construction_respects_base_url_override() {
         "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21"
     );
 }
+
+/// Build a client with an OpenAI primary and one Anthropic fallback slot,
+/// for exercising the failover/restore state machine without any network.
+async fn make_failover_restore_client(env_var: &str) -> LlmClient {
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".to_string());
+    config.llm.model = "gpt-primary".to_string();
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.fallback.push(crate::config::LlmFallback {
+        provider: "anthropic".to_string(),
+        model: "claude-fallback".to_string(),
+        api_key: None,
+        api_key_env: Some(env_var.to_string()),
+        api_keys: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        base_url: None,
+    });
+    LlmClient::new(&config).await.expect("client must build")
+}
+
+#[tokio::test]
+async fn rate_limited_primary_restores_after_cooldown_expires() {
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_RL").await;
+
+    client.record_provider_failure(FailoverReason::RateLimit);
+    assert!(client.try_failover_provider(), "failover must switch slots");
+    assert_eq!(client.active_slot_index, 0);
+    assert_eq!(client.provider, Provider::Anthropic);
+    assert_eq!(client.llm_config.model, "claude-fallback");
+    assert!(
+        client.primary_snapshot.is_some(),
+        "leaving the primary must snapshot its identity"
+    );
+
+    // Cooldown still active: no restore.
+    assert!(
+        !client.maybe_restore_primary(),
+        "primary must stay parked while its cooldown is active"
+    );
+    assert_eq!(client.active_slot_index, 0);
+
+    // Expire the cooldown and restore.
+    client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
+    assert!(
+        client.maybe_restore_primary(),
+        "primary must be restored once its cooldown expires"
+    );
+    assert_eq!(client.active_slot_index, usize::MAX);
+    assert_eq!(client.provider, Provider::OpenAi);
+    assert_eq!(client.llm_config.model, "gpt-primary");
+    assert!(
+        client.primary_snapshot.is_none(),
+        "restore must consume the snapshot"
+    );
+}
+
+#[tokio::test]
+async fn auth_failed_primary_is_never_restored() {
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_AUTH").await;
+
+    client.record_provider_failure(FailoverReason::AuthPermanent);
+    assert!(client.try_failover_provider());
+
+    // Even with the cooldown long expired, an auth-dead primary stays parked.
+    client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
+    assert!(
+        !client.maybe_restore_primary(),
+        "auth-class primary failures must not be probed again"
+    );
+    assert_eq!(client.active_slot_index, 0);
+    assert_eq!(client.provider, Provider::Anthropic);
+}
+
+#[tokio::test]
+async fn restored_primary_refailure_reparks_with_fresh_cooldown() {
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_REFAIL").await;
+
+    client.record_provider_failure(FailoverReason::RateLimit);
+    assert!(client.try_failover_provider());
+    client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
+    assert!(client.maybe_restore_primary());
+
+    // The probe fails again: the primary re-parks and the snapshot is
+    // re-captured for the next restore cycle.
+    client.record_provider_failure(FailoverReason::RateLimit);
+    assert!(client.try_failover_provider());
+    assert_eq!(client.active_slot_index, 0);
+    assert!(client.primary_snapshot.is_some());
+    assert!(
+        client.primary_cooldown.is_active(),
+        "a failed probe must re-arm the primary cooldown"
+    );
+    assert!(!client.maybe_restore_primary());
+}
