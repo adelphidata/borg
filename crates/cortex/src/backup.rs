@@ -151,11 +151,20 @@ pub async fn create_backup(
     // Final tar.zst contains:
     //   metadata.json
     //   body.tar      (the inner tar containing borg_home/...)
-    let final_file = fs::File::create(&dest)
-        .with_context(|| format!("create backup tarball at {}", dest.display()))?;
+    //
+    // Streamed into a same-directory temp file and renamed into place only
+    // after a successful fsync — a crash or ENOSPC mid-stream must not leave
+    // a truncated archive under the final name, where it would read as a
+    // valid backup until restore day. Same pattern as
+    // `coding::fs_atomic::atomic_write`.
+    let staging = tempfile::Builder::new()
+        .prefix(".borg-backup-")
+        .suffix(".tar.zst.tmp")
+        .tempfile_in(out_dir)
+        .with_context(|| format!("create backup staging file in {}", out_dir.display()))?;
     // Level 3 (zstd default): favors backup speed over ratio for local snapshots.
-    let zstd_writer =
-        zstd::Encoder::new(BufWriter::new(final_file), 3).context("init zstd encoder")?;
+    let zstd_writer = zstd::Encoder::new(BufWriter::new(staging.as_file().try_clone()?), 3)
+        .context("init zstd encoder")?;
     let mut outer = tar::Builder::new(zstd_writer);
 
     let manifest_json = serde_json::to_vec_pretty(&manifest).context("serialize manifest")?;
@@ -175,6 +184,15 @@ pub async fn create_backup(
     inner_writer
         .into_inner()
         .map_err(|e| anyhow!("flush backup tarball: {e}"))?;
+    staging
+        .as_file()
+        .sync_all()
+        .context("fsync backup staging file")?;
+    // Backups must be readable by the operator's tooling; NamedTempFile
+    // creates 0600, which is the right permission for a full borg_home dump.
+    staging
+        .persist(&dest)
+        .map_err(|e| anyhow!("publish backup tarball at {}: {}", dest.display(), e.error))?;
 
     Ok(dest)
 }
@@ -848,6 +866,44 @@ mod tests {
         assert!(
             format!("{err:#}").contains("snapshot"),
             "error should name the snapshot step: {err:#}"
+        );
+        // A failed backup must publish nothing: no final-named artifact and
+        // no stray staging file left in the output dir.
+        let leftovers: Vec<_> = fs::read_dir(&out)
+            .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "failed backup left artifacts: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_backup_publishes_atomically_with_no_staging_residue() {
+        // The archive is streamed into a same-directory temp file and renamed
+        // into place — a completed backup dir must contain exactly the final
+        // artifact, never a `.tmp` staging file.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        let out = tmp.path().join("backups");
+        fs::create_dir_all(&home).unwrap();
+        populate_borg_home(&home);
+        Database::open_at(&home.join("borg.db")).await.unwrap();
+
+        let published = create_backup(&home, &out, 47).await.expect("create");
+        let entries: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![published.clone()],
+            "backup dir must contain exactly the published artifact"
+        );
+        assert!(
+            published.extension().is_some_and(|e| e == "zst"),
+            "published artifact keeps the .tar.zst name: {published:?}"
         );
     }
 }
