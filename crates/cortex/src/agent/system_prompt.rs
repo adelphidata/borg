@@ -165,8 +165,8 @@ impl Agent {
     /// Build the full system prompt for this turn.
     ///
     /// Ordering matters: the stable prefix (identity, tooling, security
-    /// policy, skills, long-term memory, knowledge, project docs) MUST
-    /// come before the dynamic suffix (active memory, goal context,
+    /// policy, long-term memory, knowledge, project docs) MUST come
+    /// before the dynamic suffix (skills, active memory, goal context,
     /// working memory, collaboration mode, environment, scheduled tasks).
     /// Anything that changes turn-to-turn lives in the suffix so the
     /// prefix-cache stays warm on providers that hash the prompt.
@@ -209,35 +209,6 @@ impl Agent {
             system,
             "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
         );
-
-        if self.config.skills.enabled {
-            let user_request = self.latest_user_message_text().to_string();
-            let skills = if let Some(cached) = self.caches.skills_for_request(&user_request) {
-                cached.to_string()
-            } else {
-                self.ensure_credentials_cached();
-                let budget = crate::skills::effective_skill_budget(
-                    &self.config.skills,
-                    Some(self.active_context_window()),
-                );
-                let (rendered, report) = load_skills_context(
-                    budget,
-                    self.credentials_cached(),
-                    &self.config.skills,
-                    &user_request,
-                )?;
-                self.warn_skill_budget_loss(&report);
-                self.caches.set_skills(user_request, rendered.clone());
-                rendered
-            };
-            if !skills.is_empty() {
-                system.push_str(
-                    &SKILLS_TEMPLATE
-                        .render([("skills", skills.as_str())])
-                        .context("skills template render failed")?,
-                );
-            }
-        }
 
         if !memory.is_empty() {
             system.push_str(
@@ -297,6 +268,39 @@ impl Agent {
         // `<project_instructions>` above embeds user AGENTS.md/CLAUDE.md content,
         // which can name any section header we might search for.)
         let stable_prefix_len = system.len();
+
+        // Skills index: ranked against the latest user message, so its
+        // ordering (and byte content) can change on every turn. It must live
+        // in the dynamic suffix — placing it in the stable prefix would
+        // invalidate the entire cached prefix whenever the ranking reshuffles.
+        if self.config.skills.enabled {
+            let user_request = self.latest_user_message_text().to_string();
+            let skills = if let Some(cached) = self.caches.skills_for_request(&user_request) {
+                cached.to_string()
+            } else {
+                self.ensure_credentials_cached();
+                let budget = crate::skills::effective_skill_budget(
+                    &self.config.skills,
+                    Some(self.active_context_window()),
+                );
+                let (rendered, report) = load_skills_context(
+                    budget,
+                    self.credentials_cached(),
+                    &self.config.skills,
+                    &user_request,
+                )?;
+                self.warn_skill_budget_loss(&report);
+                self.caches.set_skills(user_request, rendered.clone());
+                rendered
+            };
+            if !skills.is_empty() {
+                system.push_str(
+                    &SKILLS_TEMPLATE
+                        .render([("skills", skills.as_str())])
+                        .context("skills template render failed")?,
+                );
+            }
+        }
 
         // Active memory: per-turn hybrid search of memory + past sessions
         // keyed off the latest user message. Placed at the start of the
@@ -866,9 +870,10 @@ impl Agent {
             .unwrap_or("")
             .trim()
             .to_string();
-        // Match `load_memory_with_ranking`'s threshold: short acks ("ok", "yes")
-        // produce noisy rankings.
-        if query.len() < 10 {
+        // Shared gate with `load_memory_with_ranking`: acks and greetings
+        // ("ok", "hey how are you doing") produce noisy rankings and waste a
+        // hybrid search on every pleasantry.
+        if crate::memory::trivial::is_trivial_prompt(&query) {
             return String::new();
         }
         let args = serde_json::json!({
@@ -1260,6 +1265,28 @@ mod build_system_prompt_tests {
             "active_memory must be pushed AFTER the DYNAMIC SUFFIX marker \
              so it does not invalidate the prefix cache \
              (active_idx={active_idx}, suffix_marker={suffix_marker})",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_skills_in_dynamic_suffix() {
+        // Cache-stability invariant: the <skills> block is ranked against the
+        // latest user message, so its bytes can change on every turn. It MUST
+        // be pushed AFTER the stable_prefix_len capture — in the stable
+        // prefix, a ranking reshuffle silently invalidates the entire cached
+        // prefix and re-bills the full system prompt.
+        let body = extract_build_system_prompt_body();
+        let capture_idx = body
+            .find("let stable_prefix_len = system.len();")
+            .expect("stable_prefix_len capture must exist");
+        let skills_idx = body
+            .find("skills_for_request")
+            .expect("skills render path must exist in build_system_prompt");
+        assert!(
+            skills_idx > capture_idx,
+            "the skills section must be rendered AFTER the stable_prefix_len \
+             capture so per-request skill ranking cannot invalidate the \
+             prompt-cache prefix (skills_idx={skills_idx}, capture_idx={capture_idx})",
         );
     }
 
