@@ -161,8 +161,9 @@ impl Agent {
             timestamp: Some(chrono::Local::now().to_rfc3339()),
             seq: None,
         };
-        self.log_and_persist(assistant_msg).await;
-
+        // The assistant message and its invalid-call results are adjacent
+        // rows: flush them as one batch (one transaction) instead of N+1.
+        let mut head_batch = vec![assistant_msg];
         for inv in invalid {
             let body = format_invalid_tool_result(inv);
             // Hooks intentionally NOT fired here: the tool never dispatched,
@@ -183,9 +184,9 @@ impl Agent {
                     result: body.clone(),
                 })
                 .await;
-            self.log_and_persist(Message::tool_result(&inv.id, &body))
-                .await;
+            head_batch.push(Message::tool_result(&inv.id, &body));
         }
+        self.log_and_persist_batch(head_batch).await;
 
         // Plan concurrent tool groups. The planner guarantees every group
         // either (a) contains a single Unknown-effect tool or (b) contains
@@ -352,22 +353,26 @@ impl Agent {
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(tool_elapsed, &[]);
 
-            self.finalize_tool_output(&tool_call.id, name, tool_output, event_tx)
+            let msg = self
+                .finalize_tool_output(&tool_call.id, name, tool_output, event_tx)
                 .await;
+            self.log_and_persist(msg).await;
         }
     }
 
     /// Post-process a completed tool call: redact + sanitize the output, wrap
-    /// it in a `<tool_output>` element, fire the after-tool hook, emit the
-    /// `ToolResult` event, and persist the resulting message. Shared verbatim
-    /// by the sequential and parallel execution paths so the two cannot drift.
+    /// it in a `<tool_output>` element, fire the after-tool hook, and emit the
+    /// `ToolResult` event. Returns the tool-result message for the caller to
+    /// persist — the sequential path persists per call, the parallel merge
+    /// collects its group into one batched flush. Shared verbatim by both
+    /// paths so the two cannot drift.
     async fn finalize_tool_output(
         &mut self,
         tool_call_id: &str,
         name: &str,
         tool_output: ToolOutput,
         event_tx: &mpsc::Sender<AgentEvent>,
-    ) {
+    ) -> Message {
         // Sanitize tool name for XML embedding to prevent injection
         let safe_name = crate::security::sanitize::escape_xml_attr(name);
         let (raw_text, extra_parts) = match tool_output {
@@ -394,7 +399,7 @@ impl Agent {
                 result: redacted,
             })
             .await;
-        let msg = if let Some(parts) = extra_parts {
+        if let Some(parts) = extra_parts {
             let mut msg_parts = vec![ContentPart::Text(xml)];
             msg_parts.extend(
                 parts
@@ -404,8 +409,7 @@ impl Agent {
             Message::tool_result_multimodal(tool_call_id, msg_parts)
         } else {
             Message::tool_result(tool_call_id, &xml)
-        };
-        self.log_and_persist(msg).await;
+        }
     }
 
     /// Execute a batch of parallel-safe tool calls concurrently, preserving
@@ -574,14 +578,18 @@ impl Agent {
             }
         }
 
-        // Single in-order pass: emit ToolExecuting, fire hooks, and persist
-        // results in the LLM's original call order. Skip slots and completed
-        // slots are interleaved at their original positions.
+        // Single in-order pass: emit ToolExecuting, fire hooks, and build the
+        // result messages in the LLM's original call order. Skip slots and
+        // completed slots are interleaved at their original positions. Every
+        // result already exists in memory at this point, so persistence is
+        // deferred to one batched flush after the loop — same rows, one
+        // transaction instead of one per result.
+        let mut result_batch: Vec<Message> = Vec::with_capacity(tool_calls.len());
         for (idx, slot) in slots.into_iter().enumerate() {
             let tool_call = tool_calls[idx];
             let (name, elapsed, result, args_for_event) = match slot {
                 Slot::Skipped { reason } => {
-                    self.skip_tool_call(&tool_call.id, &reason).await;
+                    result_batch.push(Message::tool_result(&tool_call.id, &reason));
                     continue;
                 }
                 Slot::Approved { name: _, args } => match results[idx].take() {
@@ -589,8 +597,10 @@ impl Agent {
                     None => {
                         // Worker panicked — surface a placeholder error so the
                         // LLM still sees a tool_result for this call.
-                        self.skip_tool_call(&tool_call.id, "[tool call failed — worker panicked]")
-                            .await;
+                        result_batch.push(Message::tool_result(
+                            &tool_call.id,
+                            "[tool call failed — worker panicked]",
+                        ));
                         continue;
                     }
                 },
@@ -612,9 +622,12 @@ impl Agent {
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(elapsed, &[]);
 
-            self.finalize_tool_output(&tool_call.id, &name, tool_output, event_tx)
+            let msg = self
+                .finalize_tool_output(&tool_call.id, &name, tool_output, event_tx)
                 .await;
+            result_batch.push(msg);
         }
+        self.log_and_persist_batch(result_batch).await;
     }
 
     #[instrument(skip_all, fields(tool.name = %name))]

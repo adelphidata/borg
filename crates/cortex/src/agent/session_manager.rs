@@ -162,6 +162,15 @@ impl Agent {
         self.persist_message(msg).await;
     }
 
+    /// Log a batch of messages and push them to history + SQLite as one
+    /// transaction (see [`Self::persist_messages`]).
+    pub(super) async fn log_and_persist_batch(&mut self, msgs: Vec<Message>) {
+        for msg in &msgs {
+            log_message(msg);
+        }
+        self.persist_messages(msgs).await;
+    }
+
     /// Record a skipped/cancelled tool call as a tool_result message.
     pub(super) async fn skip_tool_call(&mut self, tool_call_id: &str, reason: &str) {
         self.log_and_persist(Message::tool_result(tool_call_id, reason))
@@ -205,52 +214,74 @@ impl Agent {
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.
-    pub(super) async fn persist_message(&mut self, mut msg: Message) {
+    pub(super) async fn persist_message(&mut self, msg: Message) {
+        self.persist_messages(vec![msg]).await;
+    }
+
+    /// Push a batch of messages to history and persist them in ONE SQLite
+    /// transaction, in order. The single-transaction flush matters on tool
+    /// turns: an assistant message plus N tool results through the one-row
+    /// path costs N+1 `BEGIN IMMEDIATE` transactions and N+1 HMAC chain-head
+    /// reads; batched it is one of each, with byte-identical rows.
+    pub(super) async fn persist_messages(&mut self, mut msgs: Vec<Message>) {
+        if msgs.is_empty() {
+            return;
+        }
         let session_id = self.session.meta.id.clone();
-        let role = match msg.role {
-            crate::types::Role::System => "system",
-            crate::types::Role::User => "user",
-            crate::types::Role::Assistant => "assistant",
-            crate::types::Role::Tool => "tool",
-        };
-        let tool_calls_json = msg
-            .tool_calls
-            .as_ref()
-            .and_then(|tc| serde_json::to_string(tc).ok());
-        let (content_text, content_parts_json) = match &msg.content {
-            Some(crate::types::MessageContent::Parts(parts)) => {
-                let full = msg
-                    .content
-                    .as_ref()
-                    .map(crate::types::MessageContent::full_text);
-                let parts_json = serde_json::to_string(parts).ok();
-                (full, parts_json)
-            }
-            _ => (msg.text_content().map(str::to_string), None),
-        };
+        let drafts: Vec<crate::db::SessionEventDraft> =
+            msgs.iter().map(draft_from_message).collect();
         {
             let guard = self.db_guard().await;
             if let Some(ref db) = *guard {
-                match db
-                    .insert_message(
-                        &session_id,
-                        role,
-                        content_text.as_deref(),
-                        tool_calls_json.as_deref(),
-                        msg.tool_call_id.as_deref(),
-                        msg.timestamp.as_deref(),
-                        content_parts_json.as_deref(),
-                    )
-                    .await
-                {
-                    // Stamp the durable log position onto the in-memory copy so
-                    // the working set stays mappable to the log (compaction
+                match db.append_session_events(&session_id, &drafts).await {
+                    // Stamp the durable log positions onto the in-memory copies
+                    // so the working set stays mappable to the log (compaction
                     // boundaries, fork offsets) without a re-read.
-                    Ok(seq) => msg.seq = Some(seq),
-                    Err(e) => warn!("Failed to persist message to SQLite: {e}"),
+                    Ok(seqs) => {
+                        for (msg, seq) in msgs.iter_mut().zip(seqs) {
+                            msg.seq = Some(seq);
+                        }
+                    }
+                    Err(e) => warn!("Failed to persist message batch to SQLite: {e}"),
                 }
             }
         }
-        self.history.push(msg);
+        self.history.extend(msgs);
+    }
+}
+
+/// Project a [`Message`] onto the durable-log row shape. Shared by the
+/// single and batched persist paths so the two cannot drift.
+fn draft_from_message(msg: &Message) -> crate::db::SessionEventDraft {
+    let role = match msg.role {
+        crate::types::Role::System => "system",
+        crate::types::Role::User => "user",
+        crate::types::Role::Assistant => "assistant",
+        crate::types::Role::Tool => "tool",
+    };
+    let tool_calls_json = msg
+        .tool_calls
+        .as_ref()
+        .and_then(|tc| serde_json::to_string(tc).ok());
+    let (content_text, content_parts_json) = match &msg.content {
+        Some(crate::types::MessageContent::Parts(parts)) => {
+            let full = msg
+                .content
+                .as_ref()
+                .map(crate::types::MessageContent::full_text);
+            let parts_json = serde_json::to_string(parts).ok();
+            (full, parts_json)
+        }
+        _ => (msg.text_content().map(str::to_string), None),
+    };
+    crate::db::SessionEventDraft {
+        role: role.to_string(),
+        event_kind: None,
+        content: content_text,
+        tool_calls_json,
+        tool_call_id: msg.tool_call_id.clone(),
+        timestamp: msg.timestamp.clone(),
+        content_parts_json,
+        event_json: None,
     }
 }

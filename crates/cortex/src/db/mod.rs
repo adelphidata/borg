@@ -42,7 +42,7 @@ pub use issue_state::IssueStateRow;
 pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use redaction_audit::RedactionAuditRow;
-pub use sessions::MessageFtsHit;
+pub use sessions::{MessageFtsHit, SessionEventDraft};
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
 pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};

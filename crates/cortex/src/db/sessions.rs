@@ -12,6 +12,29 @@ use super::Database;
 /// silently truncated; if a deployment hits this we have a separate problem.
 const SESSIONS_SINCE_HARD_CAP: i64 = 10_000;
 
+/// One event for [`Database::append_session_events`]. Field-for-field the
+/// parameters of [`Database::append_session_event`], owned so a batch can be
+/// assembled before the transaction opens.
+#[derive(Debug, Clone, Default)]
+pub struct SessionEventDraft {
+    /// Message role (`"user"`, `"assistant"`, `"tool"`, `"system"`).
+    pub role: String,
+    /// Fine-grained lifecycle tag; `None` for conversational messages.
+    pub event_kind: Option<String>,
+    /// Message text content.
+    pub content: Option<String>,
+    /// Serialized tool calls, when the event is an assistant tool-call turn.
+    pub tool_calls_json: Option<String>,
+    /// The tool call this event answers, for `role = "tool"` rows.
+    pub tool_call_id: Option<String>,
+    /// Caller-supplied wall-clock timestamp (RFC 3339).
+    pub timestamp: Option<String>,
+    /// Serialized multimodal content parts.
+    pub content_parts_json: Option<String>,
+    /// Lifecycle event payload, present iff `event_kind` is.
+    pub event_json: Option<String>,
+}
+
 impl Database {
     pub async fn upsert_session(
         &self,
@@ -145,12 +168,10 @@ impl Database {
     /// Append one event to a session's append-only log, extending the
     /// per-session HMAC chain.
     ///
-    /// This is the single durable-append primitive: conversational messages
-    /// (`event_kind = None`) and fine-grained lifecycle events
-    /// (`event_kind = Some(tag)`, payload in `event_json`) both flow through
-    /// here. Mirrors `record_vitals_event`: `BEGIN IMMEDIATE` serializes the
-    /// read-prev-then-write so two appenders can't fork the chain. Returns the
-    /// new row's `id` (the event's `seq`).
+    /// This is the single-event form of [`Database::append_session_events`]:
+    /// conversational messages (`event_kind = None`) and fine-grained
+    /// lifecycle events (`event_kind = Some(tag)`, payload in `event_json`)
+    /// both flow through here. Returns the new row's `id` (the event's `seq`).
     #[instrument(skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub async fn append_session_event(
@@ -165,15 +186,51 @@ impl Database {
         content_parts_json: Option<&str>,
         event_json: Option<&str>,
     ) -> Result<i64> {
+        let draft = SessionEventDraft {
+            role: role.to_string(),
+            event_kind: event_kind.map(str::to_string),
+            content: content.map(str::to_string),
+            tool_calls_json: tool_calls_json.map(str::to_string),
+            tool_call_id: tool_call_id.map(str::to_string),
+            timestamp: timestamp.map(str::to_string),
+            content_parts_json: content_parts_json.map(str::to_string),
+            event_json: event_json.map(str::to_string),
+        };
+        let ids = self.append_session_events(session_id, &[draft]).await?;
+        ids.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("append_session_events returned no id for a one-event batch")
+        })
+    }
+
+    /// Append a batch of events to a session's append-only log in ONE
+    /// transaction, extending the per-session HMAC chain link-by-link.
+    ///
+    /// This is the durable-append primitive. A turn that flushes an
+    /// assistant message plus N tool results through the single-event form
+    /// pays N+1 `BEGIN IMMEDIATE` transactions and N+1 chain-head reads;
+    /// this reads the chain head once and computes the links in order, so
+    /// the resulting rows are byte-identical to N+1 sequential appends.
+    /// Mirrors `record_vitals_event`: `BEGIN IMMEDIATE` serializes the
+    /// read-prev-then-write so two appenders can't fork the chain. Returns
+    /// the new rows' `id`s (each event's `seq`) in input order.
+    #[instrument(skip_all, fields(batch = drafts.len()))]
+    pub async fn append_session_events(
+        &self,
+        session_id: &str,
+        drafts: &[SessionEventDraft],
+    ) -> Result<Vec<i64>> {
+        if drafts.is_empty() {
+            return Ok(Vec::new());
+        }
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
-        let result: Result<i64> = async {
+        let result: Result<Vec<i64>> = async {
             let now = chrono::Utc::now().timestamp();
             // Per-session chain: link from the last event in THIS session, so
             // each session's log is its own chain and a fork starts fresh.
             // Last chained hmac in THIS session, or "0" for the first event —
             // whether there's no prior row at all or the prior row is an
             // unchained legacy row (NULL hmac).
-            let prev_hmac: String = {
+            let mut prev_hmac: String = {
                 let mut rows = self
                     .conn
                     .query(
@@ -187,43 +244,51 @@ impl Database {
                 };
                 last.unwrap_or_else(|| "0".to_string())
             };
-            let hmac = crate::conversation::compute_session_event_hmac(
-                &self.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN),
-                &prev_hmac,
-                &crate::conversation::SessionEventHashInput {
-                    session_id,
-                    role,
-                    event_kind,
-                    content,
-                    tool_calls_json,
-                    tool_call_id,
-                    timestamp,
-                    content_parts_json,
-                    event_json,
-                    created_at: now,
-                },
-            );
-            self.conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls_json, tool_call_id,
-                    timestamp, created_at, content_parts_json, event_kind, event_json, hmac, prev_hmac)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params!(
-                    session_id, role, content, tool_calls_json, tool_call_id, timestamp, now,
-                    content_parts_json, event_kind, event_json, hmac, prev_hmac
-                ),
-            ).await?;
-            Ok(self.conn.last_insert_rowid())
+            let key = self.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN);
+            let mut ids = Vec::with_capacity(drafts.len());
+            for d in drafts {
+                let hmac = crate::conversation::compute_session_event_hmac(
+                    &key,
+                    &prev_hmac,
+                    &crate::conversation::SessionEventHashInput {
+                        session_id,
+                        role: &d.role,
+                        event_kind: d.event_kind.as_deref(),
+                        content: d.content.as_deref(),
+                        tool_calls_json: d.tool_calls_json.as_deref(),
+                        tool_call_id: d.tool_call_id.as_deref(),
+                        timestamp: d.timestamp.as_deref(),
+                        content_parts_json: d.content_parts_json.as_deref(),
+                        event_json: d.event_json.as_deref(),
+                        created_at: now,
+                    },
+                );
+                self.conn.execute(
+                    "INSERT INTO messages (session_id, role, content, tool_calls_json, tool_call_id,
+                        timestamp, created_at, content_parts_json, event_kind, event_json, hmac, prev_hmac)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params!(
+                        session_id, d.role.as_str(), d.content.as_deref(), d.tool_calls_json.as_deref(),
+                        d.tool_call_id.as_deref(), d.timestamp.as_deref(), now,
+                        d.content_parts_json.as_deref(), d.event_kind.as_deref(),
+                        d.event_json.as_deref(), hmac.as_str(), prev_hmac.as_str()
+                    ),
+                ).await?;
+                ids.push(self.conn.last_insert_rowid());
+                prev_hmac = hmac;
+            }
+            Ok(ids)
         }
         .await;
 
         match result {
-            Ok(id) => {
+            Ok(ids) => {
                 self.conn.execute_batch("COMMIT").await?;
-                Ok(id)
+                Ok(ids)
             }
             Err(e) => {
                 if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("sessions: rollback after append_session_event failed: {re}");
+                    tracing::warn!("sessions: rollback after append_session_events failed: {re}");
                 }
                 Err(e)
             }
@@ -1740,6 +1805,95 @@ mod tests {
         assert!(rows.iter().all(|r| r.hmac.is_some()));
         let key = db.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN);
         assert!(crate::conversation::verify_session_chain(&key, &rows));
+    }
+
+    #[tokio::test]
+    async fn batched_append_chain_is_identical_to_sequential_appends() {
+        // The batched flush must be a pure transaction-boundary optimization:
+        // the HMAC chain it produces has to be byte-identical to the same
+        // events appended one at a time, or chain verification would depend
+        // on which code path wrote the rows.
+        let db = test_db().await;
+        db.upsert_session("seq", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
+        db.upsert_session("bat", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
+
+        // Same timestamp for every row so created_at (an HMAC input) cannot
+        // differ between the two paths across a second boundary.
+        let ts = "2026-08-04T12:00:00Z";
+        let events: Vec<SessionEventDraft> = vec![
+            SessionEventDraft {
+                role: "assistant".into(),
+                content: Some("running tools".into()),
+                tool_calls_json: Some(r#"[{"id":"c1"},{"id":"c2"}]"#.into()),
+                timestamp: Some(ts.into()),
+                ..Default::default()
+            },
+            SessionEventDraft {
+                role: "tool".into(),
+                content: Some("result one".into()),
+                tool_call_id: Some("c1".into()),
+                timestamp: Some(ts.into()),
+                ..Default::default()
+            },
+            SessionEventDraft {
+                role: "tool".into(),
+                content: Some("result two".into()),
+                tool_call_id: Some("c2".into()),
+                timestamp: Some(ts.into()),
+                ..Default::default()
+            },
+        ];
+
+        for e in &events {
+            db.append_session_event(
+                "seq",
+                &e.role,
+                e.event_kind.as_deref(),
+                e.content.as_deref(),
+                e.tool_calls_json.as_deref(),
+                e.tool_call_id.as_deref(),
+                e.timestamp.as_deref(),
+                e.content_parts_json.as_deref(),
+                e.event_json.as_deref(),
+            )
+            .await
+            .unwrap();
+        }
+        let ids = db.append_session_events("bat", &events).await.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[1] > w[0]), "ids ascend in order");
+
+        let key = db.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN);
+        let seq_rows = db.load_session_messages("seq").await.unwrap();
+        let bat_rows = db.load_session_messages("bat").await.unwrap();
+        assert!(crate::conversation::verify_session_chain(&key, &seq_rows));
+        assert!(crate::conversation::verify_session_chain(&key, &bat_rows));
+
+        // Chains only differ through the session id (an HMAC input); link
+        // structure must match: same prev-linking, same row payloads.
+        assert_eq!(seq_rows.len(), bat_rows.len());
+        for (s, b) in seq_rows.iter().zip(&bat_rows) {
+            assert_eq!(s.role, b.role);
+            assert_eq!(s.content, b.content);
+            assert_eq!(s.tool_call_id, b.tool_call_id);
+        }
+        assert_eq!(
+            bat_rows[0].prev_hmac.as_deref(),
+            Some("0"),
+            "batch chain starts from the genesis link"
+        );
+        assert_eq!(
+            bat_rows[1].prev_hmac, bat_rows[0].hmac,
+            "second batched row links to the first"
+        );
+        assert_eq!(
+            bat_rows[2].prev_hmac, bat_rows[1].hmac,
+            "third batched row links to the second"
+        );
     }
 
     #[tokio::test]
