@@ -617,6 +617,7 @@ impl Transport for OpenAiCompatTransport {
     ) -> Result<TransportResponse> {
         #[derive(serde::Deserialize)]
         struct ChatResponse {
+            #[serde(default)]
             choices: Vec<ChatChoice>,
             #[serde(default)]
             usage: Option<StreamUsage>,
