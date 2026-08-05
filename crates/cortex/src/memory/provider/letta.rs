@@ -96,6 +96,7 @@ impl LettaProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        super::endpoint_guard::validate_endpoint_syntax(&base_url, PROVIDER_NAME)?;
         let core_scope = settings
             .core_scope
             .clone()

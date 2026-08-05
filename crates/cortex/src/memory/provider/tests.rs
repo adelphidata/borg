@@ -280,6 +280,46 @@ async fn mem0_write_posts_auth_header_and_metadata_key() {
 }
 
 #[tokio::test]
+async fn provider_requests_never_follow_redirects() {
+    // The endpoint guard validates only the INITIAL request URL, so a
+    // followed redirect would let a malicious endpoint bounce the request
+    // (Authorization header and all) to a metadata service or downgrade
+    // https→http. The shared client must therefore surface a 3xx as a
+    // non-success status instead of following it.
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"leaked": true})))
+        .expect(0)
+        .mount(&target)
+        .await;
+
+    let origin = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/steal", target.uri()).as_str()),
+        )
+        .expect(1)
+        .mount(&origin)
+        .await;
+
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = mem0::Mem0Provider::for_tests(origin.uri());
+    let err = prov
+        .write(&ctx, "s", "n", "secret", WriteMode::Overwrite)
+        .await
+        .expect_err("a redirect response must be an error, not followed");
+    assert!(
+        err.to_string().contains("302"),
+        "error must carry the redirect status: {err}"
+    );
+    // `expect(0)` on the target mock verifies on Drop that the redirect
+    // destination was never contacted.
+}
+
+#[tokio::test]
 async fn mem0_append_concatenates_with_existing_content() {
     // Regression: Mem0's REST API has no native append — `POST
     // /v1/memories/` always creates a new memory. The provider must

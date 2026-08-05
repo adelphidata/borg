@@ -40,6 +40,7 @@ use crate::memory::WriteMode;
 /// verbose provider cannot flood the transcript with attacker-chosen text.
 const ERROR_BODY_PREVIEW_CHARS: usize = 400;
 
+pub(crate) mod endpoint_guard;
 pub mod honcho;
 pub mod letta;
 pub mod mem0;
@@ -305,12 +306,58 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
 /// `Client::new()` on the (effectively impossible) builder failure path —
 /// `reqwest::Client::new()` itself uses the same defaults, so the worst
 /// case is "no custom user-agent" rather than a panic.
+///
+/// Redirects are DISABLED: the [`endpoint_guard`] request gate validates
+/// only the initial URL, so a followed redirect would let a malicious
+/// endpoint bounce the request (with its Authorization header) to a
+/// metadata service or downgrade https→http. These JSON APIs never need
+/// redirects; a 3xx surfaces as a non-success status from `send_json`/
+/// `send_ok`. The fallback arm builds with the same policy — never
+/// `Client::new()`, which would silently re-enable following.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("borg/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "memory provider http client builder failed ({e}); using minimal fallback"
+            );
+            // Fail closed rather than fall back to `Client::new()`: a default
+            // client follows redirects, silently dropping the security policy
+            // above. A bare builder with only the redirect policy cannot fail
+            // in practice (no TLS/proxy/resolver options involved).
+            #[allow(clippy::expect_used)]
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("bare reqwest client with redirect policy must build")
+        })
+}
+
+/// Build and send a request after passing the [`endpoint_guard`] request
+/// gate. Every external-provider request MUST go through here (directly or
+/// via [`send_json`]/[`send_ok`]) — it is the chokepoint that keeps a
+/// credential from being sent to a metadata endpoint or a cleartext public
+/// host, no matter what the configured base_url resolves to at request time.
+pub(crate) async fn guarded_send(
+    req: reqwest::RequestBuilder,
+    provider: &'static str,
+) -> Result<reqwest::Response, MemoryError> {
+    let (client, request) = req.build_split();
+    let request = request.map_err(|e| MemoryError::Transport {
+        provider,
+        detail: format!("request build failed: {e}"),
+    })?;
+    endpoint_guard::check_request_url(request.url(), provider).await?;
+    client
+        .execute(request)
+        .await
+        .map_err(|e| MemoryError::Transport {
+            provider,
+            detail: e.to_string(),
+        })
 }
 
 /// Send an authenticated JSON request and decode the response. Shared by
@@ -326,15 +373,12 @@ pub(crate) async fn send_json<T: for<'de> Deserialize<'de>>(
     auth_header: &str,
     api_key: &str,
 ) -> Result<T, MemoryError> {
-    let resp = req
-        .header("Authorization", auth_header)
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .map_err(|e| MemoryError::Transport {
-            provider,
-            detail: e.to_string(),
-        })?;
+    let resp = guarded_send(
+        req.header("Authorization", auth_header)
+            .header("Content-Type", "application/json"),
+        provider,
+    )
+    .await?;
     let status = resp.status();
     let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
         provider,
@@ -372,15 +416,12 @@ pub(crate) async fn send_ok(
     auth_header: &str,
     api_key: &str,
 ) -> Result<(), MemoryError> {
-    let resp = req
-        .header("Authorization", auth_header)
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .map_err(|e| MemoryError::Transport {
-            provider,
-            detail: e.to_string(),
-        })?;
+    let resp = guarded_send(
+        req.header("Authorization", auth_header)
+            .header("Content-Type", "application/json"),
+        provider,
+    )
+    .await?;
     let status = resp.status();
     let bytes = resp.bytes().await.map_err(|e| MemoryError::Transport {
         provider,

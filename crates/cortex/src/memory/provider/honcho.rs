@@ -67,6 +67,7 @@ impl HonchoProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        super::endpoint_guard::validate_endpoint_syntax(&base_url, PROVIDER_NAME)?;
         Ok(Self {
             client: super::http_client(),
             base_url,
@@ -187,14 +188,15 @@ impl MemoryProvider for HonchoProvider {
             self.app_id,
             self.peer_id
         );
-        match self
-            .client
-            .post(&create_url)
-            .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/json")
-            .json(&json!({ "id": session_id(scope) }))
-            .send()
-            .await
+        match super::guarded_send(
+            self.client
+                .post(&create_url)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .json(&json!({ "id": session_id(scope) })),
+            PROVIDER_NAME,
+        )
+        .await
         {
             Ok(resp) => {
                 let status = resp.status();

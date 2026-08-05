@@ -47,6 +47,7 @@ impl OpenVikingProvider {
                 provider: PROVIDER_NAME,
                 detail: "set memory.openviking.endpoint to your service URL".to_string(),
             })?;
+        super::endpoint_guard::validate_endpoint_syntax(&endpoint, PROVIDER_NAME)?;
         let api_key = settings
             .api_key
             .as_ref()
@@ -133,13 +134,11 @@ impl OpenVikingProvider {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, MemoryError> {
-        req.header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(|e| MemoryError::Transport {
-                provider: PROVIDER_NAME,
-                detail: e.to_string(),
-            })
+        super::guarded_send(
+            req.header("Authorization", self.auth_header()),
+            PROVIDER_NAME,
+        )
+        .await
     }
 }
 

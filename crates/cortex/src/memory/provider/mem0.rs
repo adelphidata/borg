@@ -66,6 +66,7 @@ impl Mem0Provider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        super::endpoint_guard::validate_endpoint_syntax(&base_url, PROVIDER_NAME)?;
         let user_id = settings
             .user_id
             .clone()

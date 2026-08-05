@@ -70,6 +70,7 @@ impl ZepProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        super::endpoint_guard::validate_endpoint_syntax(&base_url, PROVIDER_NAME)?;
         let user_id = settings
             .user_id
             .clone()
@@ -122,14 +123,15 @@ impl ZepProvider {
     async fn ensure_session(&self, scope: &str) {
         let url = self.url("/api/v2/sessions");
         let body = json!({ "session_id": Self::session_id(scope), "user_id": self.user_id });
-        match self
-            .client
-            .post(url)
-            .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
+        match super::guarded_send(
+            self.client
+                .post(url)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .json(&body),
+            PROVIDER_NAME,
+        )
+        .await
         {
             Ok(resp) => {
                 let status = resp.status();
