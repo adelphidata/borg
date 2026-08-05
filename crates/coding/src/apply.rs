@@ -26,6 +26,11 @@ pub struct AffectedPaths {
     pub deleted: Vec<String>,
     /// Files that were moved (from, to).
     pub moved: Vec<(String, String)>,
+    /// Files whose update op was a no-op because every hunk's post-patch
+    /// text was already present — the #1 real-world patch-failure class is
+    /// re-sending an applied patch, and success-as-no-op breaks the
+    /// re-read/re-patch loop that an error here would cause.
+    pub already_applied: Vec<String>,
 }
 
 impl AffectedPaths {
@@ -43,6 +48,9 @@ impl AffectedPaths {
         }
         for (from, to) in &self.moved {
             lines.push(format!("R {from} \u{2192} {to}"));
+        }
+        for p in &self.already_applied {
+            lines.push(format!("= {p} (already applied — no changes made)"));
         }
         lines.join("\n")
     }
@@ -245,13 +253,22 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                 let (had_bom, original_body) = crate::fs_atomic::split_bom(&original_raw);
                 let original = original_body.to_string();
 
-                let updated = match apply_hunks(&original, hunks, path) {
-                    Ok(content) => content,
+                let (updated, op_already_applied) = match apply_hunks(&original, hunks, path) {
+                    Ok(outcome) => outcome,
                     Err(err) => {
                         errors.push(format!("{err:#}"));
                         continue;
                     }
                 };
+
+                // Whole op already applied and no move requested: success as
+                // a no-op — nothing to write, nothing to diff. (With a
+                // `move_to`, the rename itself is still pending work, so the
+                // op proceeds below with unchanged content.)
+                if op_already_applied && move_to.is_none() {
+                    affected.already_applied.push(path.clone());
+                    continue;
+                }
 
                 if updated.len() > MAX_PATCH_FILE_SIZE {
                     errors.push(format!(
@@ -504,13 +521,19 @@ struct Replacement {
     new_lines: Vec<String>,
 }
 
-fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String> {
+/// Apply `hunks` to `content`. The `bool` in the success tuple is true when
+/// the WHOLE op was a no-op because every hunk's post-patch text was already
+/// present (content is returned unchanged). A mix of already-applied and
+/// still-pending hunks is an error: silently applying half a patch on top of
+/// a half-applied file is how wrong edits persist as success.
+fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String, bool)> {
     if hunks.is_empty() {
-        return Ok(content.to_string());
+        return Ok((content.to_string(), false));
     }
 
     let content_lines: Vec<String> = content.lines().map(String::from).collect();
     let mut replacements: Vec<Replacement> = Vec::new();
+    let mut already_applied_at: Vec<usize> = Vec::new();
     let mut cursor = 0usize;
 
     for hunk in hunks {
@@ -524,6 +547,17 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
             };
 
             let new_lines: Vec<String> = hunk.replace.lines().map(String::from).collect();
+            // Insertion already present at the insertion point → re-applying
+            // would duplicate it. Count as already applied instead.
+            if !new_lines.is_empty()
+                && content_lines
+                    .get(insertion_idx..insertion_idx + new_lines.len())
+                    .is_some_and(|slice| slice == new_lines.as_slice())
+            {
+                already_applied_at.push(hunk.source_line);
+                cursor = insertion_idx + new_lines.len();
+                continue;
+            }
             cursor = insertion_idx;
             replacements.push(Replacement {
                 start_idx: insertion_idx,
@@ -557,6 +591,26 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
         ) {
             Ok(found) => found,
             Err(err) => {
+                // Search text absent — check whether the hunk's POST-patch
+                // text is already in place before erroring. Re-sending an
+                // applied patch is the single most common patch failure in
+                // practice, and "success, no-op" ends the retry loop that a
+                // hard error would start. Pure deletions (empty replace) and
+                // no-op hunks (search == replace) never qualify. The probe is
+                // EXACT line equality only — the fuzzy strategies the search
+                // path uses (whitespace/unicode/indentation tolerance) would
+                // declare a whitespace-fixing patch "already applied" when the
+                // file merely matches modulo whitespace, reporting success for
+                // an edit that never happened.
+                if !new_lines_vec.is_empty() && new_lines_vec != search_lines {
+                    if let Some(idx) =
+                        find_exact_window(&content_lines, &new_lines_vec, search_start)
+                    {
+                        already_applied_at.push(hunk.source_line);
+                        cursor = idx + new_lines_vec.len();
+                        continue;
+                    }
+                }
                 return Err(err).with_context(|| {
                     format!("In file '{file_path}' (patch line {})", hunk.source_line)
                 });
@@ -569,6 +623,20 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
             old_line_count: matched_search.len(),
             new_lines: matched_replace.to_vec(),
         });
+    }
+
+    if !already_applied_at.is_empty() {
+        if replacements.is_empty() {
+            return Ok((content.to_string(), true));
+        }
+        let lines: Vec<String> = already_applied_at.iter().map(usize::to_string).collect();
+        bail!(
+            "Patch for '{file_path}' is PARTIALLY applied: hunk(s) at patch line(s) {} \
+             are already present in the file while other hunks are not. Nothing was \
+             written. Re-read the file and send a fresh patch containing only the \
+             changes that are still missing.",
+            lines.join(", ")
+        );
     }
 
     replacements.sort_by(|a, b| b.start_idx.cmp(&a.start_idx));
@@ -597,7 +665,17 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
     if content.ends_with('\n') && !result.ends_with('\n') {
         result.push('\n');
     }
-    Ok(result)
+    Ok((result, false))
+}
+
+/// First index at or after `start` where `pattern` matches `lines` with
+/// EXACT (byte-for-byte) line equality. Used by the already-applied probe,
+/// which must never borrow the search path's fuzzy tolerance.
+fn find_exact_window(lines: &[String], pattern: &[String], start: usize) -> Option<usize> {
+    if pattern.is_empty() || pattern.len() > lines.len() {
+        return None;
+    }
+    (start..=lines.len() - pattern.len()).find(|&i| lines[i..i + pattern.len()] == *pattern)
 }
 
 fn locate_hunk_match<'a>(
@@ -633,10 +711,18 @@ fn locate_hunk_match<'a>(
 
     match outcome {
         MatchOutcome::Unique(idx) => Ok((idx, effective_search, effective_replace)),
-        MatchOutcome::Ambiguous { count, strategy } => bail!(
-            "Search text matched {count} locations via {strategy}; provide more surrounding context:\n---\n{}\n---",
-            hunk.search
-        ),
+        MatchOutcome::Ambiguous {
+            count,
+            strategy,
+            positions,
+        } => {
+            let candidates = format_ambiguous_candidates(content_lines, &positions, count);
+            bail!(
+                "Search text matched {count} locations via {strategy}; provide more \
+                 surrounding context or anchor the hunk with `@@ <enclosing symbol>`:\n{candidates}---\n{}\n---",
+                hunk.search
+            )
+        }
         MatchOutcome::NotFound => {
             let hint = format_nearest_context_hint(content_lines, effective_search);
             bail!(
@@ -645,6 +731,32 @@ fn locate_hunk_match<'a>(
             )
         }
     }
+}
+
+/// Render ambiguous-match candidates as `  L<line>: <snippet>` lines so the
+/// model can anchor its retry instead of re-reading the file. `positions` are
+/// 0-based match starts (already capped by the seeker); `count` is the full
+/// match count.
+fn format_ambiguous_candidates(
+    content_lines: &[String],
+    positions: &[usize],
+    count: usize,
+) -> String {
+    if positions.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("candidates:\n");
+    for &idx in positions {
+        let snippet: String = content_lines
+            .get(idx)
+            .map(|l| l.trim_end().chars().take(80).collect())
+            .unwrap_or_default();
+        out.push_str(&format!("  L{}: {snippet}\n", idx + 1));
+    }
+    if count > positions.len() {
+        out.push_str(&format!("  … and {} more\n", count - positions.len()));
+    }
+    out
 }
 
 fn format_nearest_context_hint(content_lines: &[String], search_lines: &[String]) -> String {
@@ -804,6 +916,133 @@ mod tests {
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(content.contains("new();"));
         assert!(!content.contains("old();"));
+    }
+
+    #[test]
+    fn reapplying_an_applied_patch_is_a_success_noop() {
+        // The #1 real-world patch failure class: the model re-sends a patch
+        // that already landed. Second apply must succeed as a no-op — not
+        // error and trigger a re-read/re-patch loop — and must not modify
+        // the file again.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("main.rs");
+        std::fs::write(&file_path, "fn main() {\n    old();\n}\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "main.rs".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("    old();", "    new();")],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        let after_first = std::fs::read_to_string(&file_path).unwrap();
+
+        let second = apply_patch(&patch, dir.path()).expect("re-apply must be a success no-op");
+        assert_eq!(second.affected.already_applied, vec!["main.rs"]);
+        assert!(second.affected.modified.is_empty());
+        assert!(
+            second.format_summary().contains("already applied"),
+            "summary must state the no-op: {}",
+            second.format_summary()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            after_first,
+            "no-op re-apply must not touch the file"
+        );
+    }
+
+    #[test]
+    fn already_applied_probe_requires_exact_match_not_fuzzy() {
+        // A whitespace-fixing patch whose search context is stale must HARD
+        // ERROR, not report "already applied": the file matches the replace
+        // text only modulo indentation, i.e. the fix the patch exists to
+        // make has NOT been made. Fuzzy tolerance here would report success
+        // for an edit that never happened.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("indent.rs");
+        // File has the 2-space variant; patch wants 4-space.
+        std::fs::write(&file_path, "fn main() {\n  new();\n}\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "indent.rs".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("  old();", "    new();")],
+        }]);
+        let err = apply_patch(&patch, dir.path())
+            .expect_err("indentation-differing content must not count as already applied");
+        assert!(
+            format!("{err:#}").contains("Could not find search text"),
+            "must surface the not-found error: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn main() {\n  new();\n}\n",
+            "file must be untouched"
+        );
+    }
+
+    #[test]
+    fn partially_applied_patch_errors_naming_the_applied_hunks() {
+        // One hunk already landed, the other did not: writing the pending
+        // half on top of a half-applied file is how wrong edits persist, so
+        // this must be a hard error that names the already-applied hunk.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("mixed.rs");
+        // First hunk's post-state ("    new();") is already present; the
+        // second hunk's search text is still pending.
+        std::fs::write(
+            &file_path,
+            "fn a() {\n    new();\n}\nfn b() {\n    stale();\n}\n",
+        )
+        .unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "mixed.rs".to_string(),
+            move_to: None,
+            hunks: vec![
+                simple_hunk("    old();", "    new();"),
+                simple_hunk("    stale();", "    fresh();"),
+            ],
+        }]);
+        let err = apply_patch(&patch, dir.path()).expect_err("mixed state must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("PARTIALLY applied"),
+            "error must name the mixed state: {msg}"
+        );
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("stale();"),
+            "nothing may be written on the mixed-state error path"
+        );
+    }
+
+    #[test]
+    fn ambiguous_search_error_lists_candidate_line_numbers() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("dup.rs");
+        std::fs::write(
+            &file_path,
+            "fn alpha() {\n    x = 1;\n}\nfn beta() {\n    x = 1;\n}\n",
+        )
+        .unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "dup.rs".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("    x = 1;", "    x = 2;")],
+        }]);
+        let err = apply_patch(&patch, dir.path()).expect_err("ambiguous search must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("L2:") && msg.contains("L5:"),
+            "error must list candidate locations as L<line>: {msg}"
+        );
+        assert!(
+            msg.contains("@@"),
+            "error must point at the @@ anchor remedy: {msg}"
+        );
     }
 
     #[test]
@@ -1186,6 +1425,7 @@ mod tests {
             modified: vec!["b.txt".to_string()],
             deleted: vec!["c.txt".to_string()],
             moved: vec![("d.txt".to_string(), "e.txt".to_string())],
+            already_applied: vec!["f.txt".to_string()],
         };
         let summary = paths.format_summary();
         assert!(summary.contains("A a.txt"));

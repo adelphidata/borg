@@ -296,16 +296,16 @@ fn path_traversal_error_mentions_traversal() {
     assert!(!dir.parent().unwrap().join("escape.txt").exists());
 }
 
-// ── Test: rerunning an Update patch is not silently idempotent ──
+// ── Test: rerunning an Update patch is an explicit, non-mutating no-op ──
 //
-// Catches a class of bug where an LLM retries a successful apply and the
-// second application either silently no-ops (allowing stale callers to think
-// the file changed twice) or partially mutates state. The contract is: the
-// second apply must error because the search text is no longer present, and
-// the file content must equal the post-first-apply content (no torn write).
+// Re-sending an already-applied patch is the most common real-world patch
+// failure class. The contract: the second apply SUCCEEDS as a no-op, reports
+// the file under `already_applied` (so callers are told nothing changed —
+// never misled into thinking the file changed twice), and the content equals
+// the post-first-apply content byte-for-byte.
 
 #[test]
-fn rerunning_update_patch_errors_without_partial_mutation() {
+fn rerunning_update_patch_is_reported_noop_without_mutation() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let dir = tmp.path();
 
@@ -323,15 +323,17 @@ fn rerunning_update_patch_errors_without_partial_mutation() {
     let after_first = fs::read_to_string(dir.join("f.txt")).expect("read");
     assert_eq!(after_first, "alpha\nBETA\ngamma\n");
 
-    let second = apply_patch_to_dir(patch, dir);
-    assert!(
-        second.is_err(),
-        "second apply must fail — search text 'beta' no longer exists"
+    let second = apply_patch_to_dir(patch, dir).expect("re-apply must be a success no-op");
+    assert_eq!(
+        second.affected.already_applied,
+        vec!["f.txt"],
+        "re-apply must be reported as already applied, not as a modification"
     );
+    assert!(second.affected.modified.is_empty());
     let after_second = fs::read_to_string(dir.join("f.txt")).expect("read");
     assert_eq!(
         after_second, after_first,
-        "failed re-apply must not mutate the file"
+        "no-op re-apply must not mutate the file"
     );
 }
 

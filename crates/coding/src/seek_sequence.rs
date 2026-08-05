@@ -9,6 +9,9 @@ pub(crate) enum MatchOutcome {
         count: usize,
         /// Matching strategy that produced the ambiguous candidates.
         strategy: &'static str,
+        /// Line indices (0-based) of the first candidates, capped at
+        /// [`MAX_AMBIGUOUS_CANDIDATES`] so error messages stay bounded.
+        positions: Vec<usize>,
     },
     /// No match was found.
     NotFound,
@@ -96,6 +99,11 @@ fn seek_sequence_in_range(
     positions_to_outcome("block_anchor", &block_anchor_matches)
 }
 
+/// Cap on candidate positions carried by [`MatchOutcome::Ambiguous`] — enough
+/// for the model to pick an anchor, bounded so a pathological pattern can't
+/// balloon the error message.
+pub(crate) const MAX_AMBIGUOUS_CANDIDATES: usize = 5;
+
 fn positions_to_outcome(strategy: &'static str, matches: &[usize]) -> MatchOutcome {
     match matches {
         [] => MatchOutcome::NotFound,
@@ -103,6 +111,11 @@ fn positions_to_outcome(strategy: &'static str, matches: &[usize]) -> MatchOutco
         many => MatchOutcome::Ambiguous {
             count: many.len(),
             strategy,
+            positions: many
+                .iter()
+                .copied()
+                .take(MAX_AMBIGUOUS_CANDIDATES)
+                .collect(),
         },
     }
 }
@@ -271,6 +284,7 @@ mod tests {
             MatchOutcome::Ambiguous {
                 count: 2,
                 strategy: "exact",
+                positions: vec![0, 2],
             }
         );
     }

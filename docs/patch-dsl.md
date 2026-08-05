@@ -122,3 +122,18 @@ The parser validates:
 - Heredoc wrapping is tolerated and automatically stripped
 
 If any operation fails, the error is returned to the agent with details about what went wrong.
+
+Recovery-oriented behaviors:
+
+- **Already applied → success no-op.** If every hunk of an update op finds its
+  *post-patch* text already in place, the op succeeds without writing and is
+  reported as `= path (already applied — no changes made)`. Re-sending an
+  applied patch therefore does not error. A *mix* of already-applied and
+  pending hunks is a hard error (nothing is written) that names the applied
+  hunks — re-read the file and patch only what's missing.
+- **Ambiguous context → candidate list.** When search text matches multiple
+  locations, the error lists up to 5 candidates as `L<line>: <snippet>` and
+  suggests anchoring the hunk with `@@ <enclosing symbol>`.
+- **No match → nearest-context hint.** The error shows the closest matching
+  file lines with line numbers so the retry can be corrected without a
+  re-read.
