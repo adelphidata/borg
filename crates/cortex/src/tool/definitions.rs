@@ -622,6 +622,26 @@ mod tests {
         assert!(names.contains(&"request_user_input"));
     }
 
+    /// A scheduled task's model pin is user-owned: it exists so the operator
+    /// can keep the scheduled fleet on a cheap model independent of the chat
+    /// model. Exposing it in the agent-facing schema would let a model
+    /// re-point its own recurring work — silently changing what the fleet
+    /// costs and how it behaves, on a surface nobody is watching in real time.
+    #[test]
+    fn schedule_tool_cannot_set_the_model_pin() {
+        let def = build_schedule_tool_def();
+        let properties = def.function.parameters["properties"]
+            .as_object()
+            .expect("schedule tool exposes an object schema");
+        for forbidden in ["model", "model_provider", "provider", "base_url"] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "`{forbidden}` must stay out of the agent-facing schedule schema — \
+                 the pin is set by the user via settings/CLI"
+            );
+        }
+    }
+
     /// Guard against drift between the system-prompt summary table and the
     /// actual tool definitions. Adding a new core tool definition without a
     /// matching `TOOL_SUMMARIES` entry would silently produce a `- name:`

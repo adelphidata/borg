@@ -6,7 +6,7 @@ use anyhow::Result;
 use libsql::params;
 
 /// Column list shared by all scheduled-task SELECT queries.
-const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash";
+const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider";
 
 /// Returns true if `pid` is alive on this host. `kill(pid, 0)` only probes —
 /// 0 means alive; ESRCH means dead; any other errno (e.g. EPERM) is treated
@@ -60,6 +60,8 @@ fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
         bypass_quiet_hours_once: row.get::<Option<i64>>(21)?.unwrap_or(0) != 0,
         min_interval_secs: row.get::<Option<i64>>(22)?,
         last_response_hash: row.get::<Option<String>>(23)?,
+        model: row.get::<Option<String>>(24)?,
+        model_provider: row.get::<Option<String>>(25)?,
     })
 }
 
@@ -884,6 +886,28 @@ impl Database {
         Ok(true)
     }
 
+    /// Set (or clear, with `None`) a task's model pin. Returns false when no
+    /// such task exists.
+    ///
+    /// Deliberately its own setter rather than a field on [`UpdateTask`]: the
+    /// pin is user-owned and is never written from the agent-facing `schedule`
+    /// tool path, which is what `update_task` serves.
+    pub async fn set_task_model_pin(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET model = ?1, model_provider = ?2 WHERE id = ?3",
+                params!(model, provider, id),
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
     /// Get the most recent run for a task, if any.
     pub async fn last_task_run(&self, task_id: &str) -> Result<Option<TaskRunRow>> {
         let runs = self.task_run_history(task_id, 1).await?;
@@ -943,6 +967,63 @@ mod tests {
         let pid = child.id();
         let _ = child.wait().expect("wait on /usr/bin/true");
         pid
+    }
+
+    /// The pin has to survive a write/read round trip through the schema —
+    /// a column added to `SCHEMA_SQL` but missed in `TASK_COLUMNS` or
+    /// `map_task_row` reads back as `None` on every run, silently sending the
+    /// whole fleet back to the global model.
+    #[tokio::test]
+    async fn model_pin_round_trips_and_clears() {
+        let db = test_db().await;
+        db.create_task(&NewTask {
+            id: "pin-task",
+            name: "nightly",
+            prompt: "do the thing",
+            schedule_type: "cron",
+            schedule_expr: "0 3 * * *",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create task");
+
+        // A fresh task carries no pin, so it follows the fleet/global model.
+        let fresh = db.get_task_by_id("pin-task").await.unwrap().unwrap();
+        assert_eq!(fresh.model, None);
+        assert_eq!(fresh.model_provider, None);
+
+        assert!(db
+            .set_task_model_pin("pin-task", Some("z-ai/glm-4.7"), Some("openrouter"))
+            .await
+            .unwrap());
+        let pinned = db.get_task_by_id("pin-task").await.unwrap().unwrap();
+        assert_eq!(pinned.model.as_deref(), Some("z-ai/glm-4.7"));
+        assert_eq!(pinned.model_provider.as_deref(), Some("openrouter"));
+
+        // Clearing must null both halves — a stranded provider with no model
+        // would point the fleet default at the wrong endpoint.
+        assert!(db.set_task_model_pin("pin-task", None, None).await.unwrap());
+        let cleared = db.get_task_by_id("pin-task").await.unwrap().unwrap();
+        assert_eq!(cleared.model, None);
+        assert_eq!(cleared.model_provider, None);
+
+        assert!(
+            !db.set_task_model_pin("no-such-task", Some("x"), None)
+                .await
+                .unwrap(),
+            "pinning a nonexistent task must report that it did nothing"
+        );
     }
 
     #[test]

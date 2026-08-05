@@ -70,6 +70,24 @@ pub(crate) enum TasksAction {
         /// Task ID (or prefix)
         id: String,
     },
+    /// Pin the model a task runs on (or clear the pin)
+    ///
+    /// Scheduled runs otherwise follow `tasks.model`, and failing that the
+    /// global `llm.model` — so changing the model you chat with also changes
+    /// what your scheduled fleet costs. This is user-owned: the agent cannot
+    /// set it.
+    Model {
+        /// Task ID (or prefix)
+        id: String,
+        /// Model id to pin. Omit with --clear to remove the pin.
+        model: Option<String>,
+        /// Provider for the pinned model (defaults to the configured provider)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Remove the pin so the task follows tasks.model / llm.model again
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -159,6 +177,76 @@ pub(crate) fn dispatch_tasks(action: Option<TasksAction>) -> Result<()> {
         Some(TasksAction::Run { id }) => run_tasks_run(&id),
         Some(TasksAction::Runs { id, count }) => run_tasks_runs(&id, count),
         Some(TasksAction::Status { id }) => run_tasks_status(&id),
+        Some(TasksAction::Model {
+            id,
+            model,
+            provider,
+            clear,
+        }) => run_tasks_model(&id, model.as_deref(), provider.as_deref(), clear),
+    }
+}
+
+/// `borg tasks model <id> [<model>] [--provider P] [--clear]`.
+pub(crate) fn run_tasks_model(
+    id: &str,
+    model: Option<&str>,
+    provider: Option<&str>,
+    clear: bool,
+) -> Result<()> {
+    if clear && model.is_some() {
+        anyhow::bail!("pass either a model id or --clear, not both");
+    }
+    if !clear && model.is_none() {
+        anyhow::bail!("provide a model id to pin, or --clear to remove the pin");
+    }
+
+    block_on(async {
+        let db = cortex::db::Database::open().await?;
+        // Accept an id prefix like every other `borg tasks` subcommand.
+        let full_id = match resolve_task_id_prefix(&db, id).await? {
+            Some(full) => full,
+            None => {
+                println!("Task not found: {id}");
+                return Ok(());
+            }
+        };
+        let (model, provider) = if clear {
+            (None, None)
+        } else {
+            (model, provider)
+        };
+        db.set_task_model_pin(&full_id, model, provider).await?;
+        match model {
+            Some(m) => {
+                let via = provider.map(|p| format!(" via {p}")).unwrap_or_default();
+                println!("Task {} pinned to {m}{via}", short_id(&full_id));
+            }
+            None => println!(
+                "Task {} pin cleared — it now follows tasks.model / llm.model",
+                short_id(&full_id)
+            ),
+        }
+        Ok(())
+    })
+}
+
+/// Resolve a task id prefix to the full id, or `None` when nothing matches.
+///
+/// Refuses an ambiguous prefix rather than picking one: pinning the wrong
+/// task's model is silent — it only shows up as an unexpected bill.
+async fn resolve_task_id_prefix(db: &cortex::db::Database, prefix: &str) -> Result<Option<String>> {
+    // `list_tasks` is unpaged, so filtering it can't miss a match.
+    let matches: Vec<String> = db
+        .list_tasks()
+        .await?
+        .into_iter()
+        .map(|t| t.id)
+        .filter(|id| id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        n => anyhow::bail!("'{prefix}' matches {n} tasks — use a longer id prefix"),
     }
 }
 

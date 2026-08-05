@@ -589,6 +589,82 @@ impl Database {
         Ok(updated == 1)
     }
 
+    /// Every session id starting with `prefix`.
+    ///
+    /// Its own query rather than filtering a `list_sessions` page: the CLI
+    /// resolves short id prefixes, and a paged listing would silently miss a
+    /// match that fell past the limit — resolving to "not found", or worse to
+    /// the wrong session because the real one wasn't in the page.
+    pub async fn session_ids_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        // Escape LIKE wildcards so a literal `%` or `_` in the prefix matches
+        // itself instead of acting as a pattern.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM sessions WHERE id LIKE ?1 ESCAPE '\\' ORDER BY updated_at DESC",
+                params!(format!("{escaped}%")),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// Pin (or unpin) a session. Returns false when no such session exists.
+    ///
+    /// A pinned session is exempt from the retention purge and from the stale
+    /// auto-archive sweep — the per-session counterpart to the daemon-wide
+    /// `data.purge_policy = Never`.
+    pub async fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE sessions SET pinned = ?1 WHERE id = ?2",
+                params!(pinned as i64, id),
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Soft-hide sessions with no activity since `cutoff`. Returns how many
+    /// were archived.
+    ///
+    /// Ages on `updated_at`, not `created_at`: a conversation started a year
+    /// ago and used yesterday is active, and archiving it by birthday would be
+    /// the wrong answer. Never deletes — archiving only sets a timestamp, so
+    /// it is always reversible — and never touches a pinned or
+    /// already-archived session.
+    pub async fn archive_stale_sessions(&self, cutoff: i64, now: i64) -> Result<usize> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE sessions SET archived_at = ?1 \
+                 WHERE updated_at < ?2 AND pinned = 0 AND archived_at IS NULL",
+                params!(now, cutoff),
+            )
+            .await?;
+        Ok(updated as usize)
+    }
+
+    /// Clear a session's archived flag, bringing it back into listings.
+    /// Returns false when no such session exists.
+    pub async fn unarchive_session(&self, id: &str) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
+                params!(id),
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
     /// Free every lease whose deadline has passed, relative to `now`. This is
     /// the TTL-based runtime reclaim: a live worker can take over a session
     /// whose previous holder died more than one TTL ago. Returns the number of
@@ -994,6 +1070,107 @@ mod tests {
 
     async fn test_db() -> Database {
         Database::test_db().await
+    }
+
+    /// The sweep ages on last activity, not creation. A conversation started
+    /// long ago but used recently is active — archiving it by birthday is the
+    /// failure this ordering exists to prevent.
+    #[tokio::test]
+    async fn auto_archive_ages_on_activity_and_spares_pinned_sessions() {
+        let db = test_db().await;
+        let day = 86_400i64;
+        let now = 100 * day;
+        let cutoff = now - 30 * day;
+
+        // created long ago, used long ago → archive
+        db.upsert_session("stale", day, now - 60 * day, 0, "m", "Stale")
+            .await
+            .unwrap();
+        // created long ago, used yesterday → keep
+        db.upsert_session("old-but-active", day, now - day, 0, "m", "Active")
+            .await
+            .unwrap();
+        // stale but pinned → keep
+        db.upsert_session("pinned", day, now - 60 * day, 0, "m", "Pinned")
+            .await
+            .unwrap();
+        assert!(db.set_session_pinned("pinned", true).await.unwrap());
+
+        let archived = db.archive_stale_sessions(cutoff, now).await.unwrap();
+        assert_eq!(archived, 1, "only the genuinely stale session archives");
+
+        let listed = db.list_sessions(100).await.unwrap();
+        let by_id = |id: &str| {
+            listed
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("session {id} missing from listing"))
+        };
+        assert!(by_id("stale").archived_at.is_some());
+        assert!(by_id("old-but-active").archived_at.is_none());
+        assert!(by_id("pinned").archived_at.is_none());
+        assert!(by_id("pinned").pinned);
+
+        // Archiving is idempotent — a second sweep must not re-stamp or
+        // re-count an already-archived session.
+        assert_eq!(db.archive_stale_sessions(cutoff, now).await.unwrap(), 0);
+
+        // And it is reversible: nothing was deleted.
+        assert!(db.unarchive_session("stale").await.unwrap());
+        let after = db.list_sessions(100).await.unwrap();
+        assert!(after
+            .iter()
+            .find(|s| s.id == "stale")
+            .unwrap()
+            .archived_at
+            .is_none());
+    }
+
+    /// A pin is the per-session escape hatch from daemon-wide retention. If
+    /// the purge ignored it, the only way to keep one conversation would be to
+    /// keep every conversation.
+    #[tokio::test]
+    async fn retention_purge_spares_pinned_sessions() {
+        let db = test_db().await;
+        db.upsert_session("keep", 0, 0, 0, "m", "Keep")
+            .await
+            .unwrap();
+        db.upsert_session("drop", 0, 0, 0, "m", "Drop")
+            .await
+            .unwrap();
+        assert!(db.set_session_pinned("keep", true).await.unwrap());
+
+        for session in ["keep", "drop"] {
+            db.conn
+                .execute(
+                    "INSERT INTO messages (session_id, role, content, created_at) \
+                     VALUES (?1, 'user', 'ancient', 100)",
+                    params!(session),
+                )
+                .await
+                .unwrap();
+        }
+
+        let purged = db.purge_messages_before(1_000).await.unwrap();
+        assert_eq!(purged, 1, "only the unpinned session's message is purged");
+
+        async fn remaining(db: &Database, session: &str) -> i64 {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                    params!(session),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        }
+        assert_eq!(
+            remaining(&db, "keep").await,
+            1,
+            "pinned session keeps its history"
+        );
+        assert_eq!(remaining(&db, "drop").await, 0);
     }
 
     #[tokio::test]

@@ -61,6 +61,10 @@ pub struct MaintenanceReport {
     /// `data.retention_days` is `None` or `data.purge_policy != Auto`.
     #[serde(default)]
     pub messages_purged: usize,
+    /// Sessions soft-hidden by the stale-session sweep. `0` when
+    /// `data.session_auto_archive_days` is unset. Archived, never deleted.
+    #[serde(default)]
+    pub sessions_archived: usize,
     /// `audit_log_chain` rows tombstoned by the retention purge.
     /// Tombstones preserve hash-chain linkage; the row count is the
     /// observable side of the daily retention behavior.
@@ -411,6 +415,22 @@ pub async fn run_daily_maintenance_with_registry(
                     }
                     Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
                 }
+            }
+        }
+    }
+
+    // 4c. Archive sessions with no recent activity. Opt-in
+    //     (`data.session_auto_archive_days`), a soft hide rather than a
+    //     delete, and skips pinned sessions. Independent of the purge policy:
+    //     a litigation hold stops deletion, not tidying.
+    if !budget.is_blown() {
+        if let Some(cutoff) = config.data.session_archive_cutoff(now) {
+            match db.archive_stale_sessions(cutoff, now).await {
+                Ok(n) => {
+                    report.sessions_archived = n;
+                    budget.try_spend(n);
+                }
+                Err(e) => tracing::warn!("maintenance: stale-session archive failed: {e}"),
             }
         }
     }

@@ -762,7 +762,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 11;
+    const CURRENT_VERSION: u32 = 12;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -788,7 +788,7 @@ impl Database {
             // damaged DB, where each step is individually idempotent, so a
             // crash or a rare concurrent-repair race just leaves work for
             // the next open instead of corrupting anything.
-            return self.migrate_v11().await;
+            return self.migrate_v12().await;
         }
 
         // Acquire the writer lock explicitly. libsql's `Transaction` API is
@@ -867,8 +867,11 @@ impl Database {
         if current < 11 {
             self.migrate_v11().await?;
         }
+        if current < 12 {
+            self.migrate_v12().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 11,
+            Database::CURRENT_VERSION == 12,
             "add the new migrate_vN call above and bump this constant",
         );
 

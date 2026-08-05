@@ -145,6 +145,12 @@ pub struct Skill {
 /// pushes later skills out of the catalog entirely. Only the *catalog* view is
 /// capped — `Summary` and `Full` still render the manifest verbatim.
 const MAX_CATALOG_DESCRIPTION_CHARS: usize = 320;
+
+/// Authoring limit for a skill's `description:`, enforced when a skill is
+/// written. Deliberately the same number as the catalog cap: a description
+/// longer than what the catalog renders is text no model ever reads.
+pub const MAX_SKILL_DESCRIPTION_CHARS: usize = MAX_CATALOG_DESCRIPTION_CHARS;
+
 const MAX_CATALOG_TRIGGERS: usize = 8;
 const TRUNCATION_SUFFIX: &str = "…";
 

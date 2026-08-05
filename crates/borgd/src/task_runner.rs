@@ -29,6 +29,34 @@ pub use cortex::agent::silence::SILENT_SENTINEL;
 /// first or last non-empty line suppresses, even with an appended explanation).
 pub(crate) use cortex::agent::silence::is_silent_autonomous as is_silent_response;
 
+/// Apply the model this scheduled run should use: per-task pin, else the
+/// scheduler-fleet default, else the global `llm.model` (left untouched).
+///
+/// Model and provider resolve as a *unit*. Mixing a task's pinned model with
+/// the fleet's provider would send an id to an endpoint that doesn't serve it —
+/// so a task pin takes its own provider (falling back to the global one), and
+/// the fleet pair is only consulted when the task pins nothing.
+///
+/// The pin is user-owned by design: it is not in the agent-facing `schedule`
+/// tool schema, so a model can't re-point its own scheduled work.
+fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskRow) -> Config {
+    let (model, provider) = match task.model.as_ref() {
+        Some(pinned) => (Some(pinned.clone()), task.model_provider.clone()),
+        None => (
+            config.tasks.model.clone(),
+            config.tasks.model_provider.clone(),
+        ),
+    };
+    let Some(model) = model else {
+        return config;
+    };
+    config.llm.model = model;
+    if let Some(provider) = provider {
+        config.llm.provider = Some(provider);
+    }
+    config
+}
+
 /// Spawn a single scheduled-task execution.
 pub async fn spawn_task_execution(
     task: cortex::db::ScheduledTaskRow,
@@ -39,6 +67,11 @@ pub async fn spawn_task_execution(
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
     executor: Option<Arc<DaemonSessionExecutor>>,
 ) {
+    // Resolve the model this run uses before anything reads `config.llm`:
+    // every downstream client (prompt, heartbeat, consolidation) builds from
+    // this config, so overriding here covers all of them at one seam.
+    let config = resolve_scheduled_model(config, &task);
+
     // Acquire the permit *inside* the spawned task, not on the caller's
     // dispatcher loop. If we awaited here while all permits were claimed, the
     // scheduler dispatcher would stall and the watchdog would kill the daemon.
@@ -1556,6 +1589,102 @@ pub async fn deliver_celebration_to_channels(
         return true;
     }
     any_delivered
+}
+
+#[cfg(test)]
+mod scheduled_model_tests {
+    use super::*;
+
+    fn task_with_pin(model: Option<&str>, provider: Option<&str>) -> cortex::db::ScheduledTaskRow {
+        cortex::db::ScheduledTaskRow {
+            id: "task-1".to_string(),
+            name: "nightly".to_string(),
+            prompt: "do the thing".to_string(),
+            schedule_type: "cron".to_string(),
+            schedule_expr: "0 3 * * *".to_string(),
+            timezone: "local".to_string(),
+            status: "active".to_string(),
+            next_run: None,
+            created_at: 0,
+            max_retries: 3,
+            retry_count: 0,
+            retry_after: None,
+            last_error: None,
+            timeout_ms: 300_000,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt".to_string(),
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: 60_000,
+            bypass_quiet_hours_once: false,
+            min_interval_secs: None,
+            last_response_hash: None,
+            model: model.map(str::to_string),
+            model_provider: provider.map(str::to_string),
+        }
+    }
+
+    fn config_with(model: &str, fleet: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.llm.model = model.to_string();
+        config.llm.provider = Some("openrouter".to_string());
+        config.tasks.model = fleet.map(str::to_string);
+        config
+    }
+
+    /// Resolution order is pin > fleet default > global. Without the fleet
+    /// leg, switching the chat model silently re-prices every scheduled run.
+    #[test]
+    fn model_resolves_pin_then_fleet_then_global() {
+        let base = config_with("chat-model", Some("fleet-model"));
+
+        assert_eq!(
+            resolve_scheduled_model(base.clone(), &task_with_pin(Some("pinned-model"), None))
+                .llm
+                .model,
+            "pinned-model"
+        );
+        assert_eq!(
+            resolve_scheduled_model(base, &task_with_pin(None, None))
+                .llm
+                .model,
+            "fleet-model"
+        );
+        assert_eq!(
+            resolve_scheduled_model(config_with("chat-model", None), &task_with_pin(None, None))
+                .llm
+                .model,
+            "chat-model",
+            "with nothing pinned the run must follow the global model"
+        );
+    }
+
+    /// Model and provider resolve together. A task pin must never inherit the
+    /// fleet's provider — that would send a pinned id to an endpoint that
+    /// doesn't serve it, turning a working pin into a 404 on every run.
+    #[test]
+    fn a_task_pin_does_not_inherit_the_fleet_provider() {
+        let mut base = config_with("chat-model", Some("fleet-model"));
+        base.tasks.model_provider = Some("groq".to_string());
+
+        let pinned = resolve_scheduled_model(base.clone(), &task_with_pin(Some("pinned"), None));
+        assert_eq!(pinned.llm.model, "pinned");
+        assert_eq!(
+            pinned.llm.provider.as_deref(),
+            Some("openrouter"),
+            "a task pin without its own provider falls back to the global one"
+        );
+
+        let fleet = resolve_scheduled_model(base, &task_with_pin(None, None));
+        assert_eq!(fleet.llm.model, "fleet-model");
+        assert_eq!(
+            fleet.llm.provider.as_deref(),
+            Some("groq"),
+            "the fleet pair applies as a unit when the task pins nothing"
+        );
+    }
 }
 
 #[cfg(test)]

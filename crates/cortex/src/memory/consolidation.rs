@@ -723,6 +723,8 @@ mod backfill_tests {
             title: "t".to_string(),
             parent_session_id: None,
             forked_from_message_id: None,
+            pinned: false,
+            archived_at: None,
         }
     }
 

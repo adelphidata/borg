@@ -122,6 +122,7 @@ const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 mod anthropic;
 pub mod aux_model_picker;
 pub(crate) mod bedrock;
+mod blackhole;
 pub(crate) mod cloud_auth;
 mod cost;
 pub mod credential_pool;
@@ -1007,8 +1008,12 @@ impl LlmClient {
         let debug_logging = config.debug.llm_logging;
         // Credential-bearing client: refuse cross-host redirects so provider
         // API-key headers / OAuth bodies can't leak to a redirect target.
+        // `connect_timeout` bounds only the TCP/TLS handshake — without it a
+        // host that blackholes SYNs consumes the whole request timeout, which
+        // is sized for a model that may think for minutes.
         let client = Client::builder()
             .redirect(cross_host_safe_redirect_policy())
+            .connect_timeout(blackhole::CONNECT_TIMEOUT)
             .build()
             .context("build credentialed LLM http client")?;
         let mut keys_remaining = keys.clone();
@@ -2164,6 +2169,26 @@ impl LlmClient {
         let timeout = Duration::from_millis(self.llm_config.request_timeout_ms);
 
         let request_url = url.to_string();
+        // Own copy for the reachability checks below: the Bedrock branch moves
+        // `request_url` into its signing future. Bedrock rebuilds the URL
+        // against the resolved region inside that future, so its key is the
+        // pre-rebuild endpoint — same host in every non-pathological config.
+        let endpoint_url = request_url.clone();
+        // A host we just watched swallow a connect is almost certainly still
+        // swallowing them. Fail now so the fallback chain gets its turn,
+        // instead of spending another connect timeout finding that out.
+        if blackhole::is_blackholed(&endpoint_url, std::time::Instant::now()) {
+            return Err(LlmError::Retryable {
+                source: anyhow::anyhow!(
+                    "Skipping {}: its endpoint refused to answer a TCP connect moments ago \
+                     (retrying it costs a full connect timeout). Will retry once the \
+                     endpoint is reachable.",
+                    self.provider
+                ),
+                retry_after: None,
+                reason: FailoverReason::Timeout,
+            });
+        }
         let body_bytes = serde_json::to_vec(body).map_err(|e| LlmError::Fatal {
             source: anyhow::anyhow!("serialize request body: {e}"),
             reason: FailoverReason::Format,
@@ -2232,7 +2257,7 @@ impl LlmClient {
             let headers = self.request_headers().await?;
             let builder = self
                 .client
-                .post(request_url)
+                .post(request_url.as_str())
                 .headers(headers)
                 .body(body_bytes);
             async move { builder.send().await.map_err(anyhow::Error::from) }.boxed()
@@ -2246,13 +2271,23 @@ impl LlmClient {
                 match result {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
+                        let is_connect_failure = e
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_connect);
+                        // Only connect failures mark the endpoint. A read
+                        // timeout means the socket was accepted and the server
+                        // is merely slow — blackholing that abandons a live
+                        // endpoint mid-conversation.
+                        if is_connect_failure {
+                            blackhole::record_connect_failure(
+                                &endpoint_url,
+                                std::time::Instant::now(),
+                            );
+                        }
                         // A refused connection to a local Ollama almost always
                         // means the server isn't running — say so instead of
                         // leaving the operator to decode a transport error.
-                        let hint = if self.provider == Provider::Ollama
-                            && e.downcast_ref::<reqwest::Error>()
-                                .is_some_and(reqwest::Error::is_connect)
-                        {
+                        let hint = if self.provider == Provider::Ollama && is_connect_failure {
                             format!(
                                 " — is the Ollama server running at {}? Start it with `ollama serve`.",
                                 self.effective_base_url()
@@ -2278,6 +2313,12 @@ impl LlmClient {
                 }
             }
         };
+
+        // The endpoint answered, so whatever we recorded about it is stale —
+        // a host that recovers early shouldn't stay marked dead for the rest
+        // of the TTL. Status doesn't matter here: a 500 is still proof the
+        // socket connects.
+        blackhole::clear(&endpoint_url);
 
         // Capture rate-limit headers (success or failure — providers emit
         // them on both, and the 429 itself carries the freshest bucket state
@@ -2310,7 +2351,8 @@ impl LlmClient {
                     String::new()
                 }
             };
-            let err = classify_status(status, &body, self.provider);
+            let err =
+                self.explain_missing_vendor_prefix(classify_status(status, &body, self.provider));
             return Err(crate::llm::llm_error::override_retry_after(
                 err,
                 header_retry_after,
@@ -2318,6 +2360,37 @@ impl LlmClient {
         }
 
         Ok(response)
+    }
+
+    /// Name a missing vendor prefix as the cause of a model-not-found error.
+    ///
+    /// On a prefix-routed provider a bare model id answers with a plain 404,
+    /// which reads as an outage or an auth failure — the generic
+    /// "unexpected error" it renders as sends the user looking at the wrong
+    /// thing. `normalize_model` repairs ids whose family we recognise, so
+    /// anything reaching here is one we can't repair; say what is wrong rather
+    /// than pass the 404 through unexplained.
+    ///
+    /// Only rewrites the message. The `FailoverReason` is untouched, so
+    /// fast-fail and failover behave exactly as before.
+    fn explain_missing_vendor_prefix(&self, err: LlmError) -> LlmError {
+        if !matches!(err.reason(), FailoverReason::ModelNotFound)
+            || !self.provider.requires_vendor_prefix()
+            || self.llm_config.model.contains('/')
+        {
+            return err;
+        }
+        let model = &self.llm_config.model;
+        let provider = self.provider;
+        LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} model ids are `vendor/model` paths, but `llm.model` is set to \
+                 '{model}' with no vendor — that is why this 404s. Set the full id (for \
+                 example `anthropic/{model}` or `openai/{model}`, whichever vendor serves \
+                 it) via `borg settings set llm.model <vendor>/{model}`. Original error: {err}"
+            ),
+            reason: FailoverReason::ModelNotFound,
+        }
     }
 
     /// Parse provider rate-limit headers from `headers` and report the

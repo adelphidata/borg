@@ -324,11 +324,18 @@ impl Database {
     /// Delete `messages` rows older than `cutoff`. Hard delete — `messages`
     /// is not hash-chained, so retention can free disk directly. Returns
     /// the row count deleted.
+    /// Delete `messages` rows older than `cutoff`, except those belonging to a
+    /// pinned session.
+    ///
+    /// A pin is the per-session escape hatch from daemon-wide retention: the
+    /// global `purge_policy = Never` is all-or-nothing, so without this the
+    /// only way to keep one conversation is to keep every conversation.
     pub async fn purge_messages_before(&self, cutoff: i64) -> Result<usize> {
         let n = self
             .conn
             .execute(
-                "DELETE FROM messages WHERE created_at < ?1",
+                "DELETE FROM messages WHERE created_at < ?1
+                 AND session_id NOT IN (SELECT id FROM sessions WHERE pinned = 1)",
                 params!(cutoff),
             )
             .await?;

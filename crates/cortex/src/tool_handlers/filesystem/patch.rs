@@ -105,6 +105,47 @@ fn deny_skill_patch(
             ));
         }
     }
+    if let Some(rejection) = reject_overlong_skill_description(patch_text) {
+        return Some(rejection);
+    }
+    None
+}
+
+/// Refuse a skill patch whose frontmatter `description:` exceeds the catalog
+/// cap.
+///
+/// The catalog renders every skill's description through a truncating budget,
+/// so anything past the cap is never seen by the model — it costs authoring
+/// effort, and the routing signal that decides whether the skill gets picked
+/// silently ends mid-sentence. Rejecting at the write path makes that visible
+/// while the author can still fix it.
+///
+/// Scans added lines only: an unchanged over-length description in surrounding
+/// context is somebody else's problem, and rejecting it would make an unrelated
+/// edit to an old skill impossible.
+fn reject_overlong_skill_description(patch_text: &str) -> Option<String> {
+    for line in patch_text.lines() {
+        let Some(added) = line.strip_prefix('+') else {
+            continue;
+        };
+        let Some(value) = added.trim_start().strip_prefix("description:") else {
+            continue;
+        };
+        // YAML scalars may be bare or quoted; the quotes aren't part of the
+        // description the catalog renders.
+        let value = value.trim().trim_matches(['"', '\''].as_ref());
+        let length = value.chars().count();
+        if length > crate::skills::MAX_SKILL_DESCRIPTION_CHARS {
+            return Some(format!(
+                "Rejected: skill description is {length} characters, over the \
+                 {} character limit. Descriptions past the limit are truncated \
+                 out of the skill catalog, so the routing signal is lost — \
+                 shorten it to one line naming what the skill does and when to \
+                 use it.",
+                crate::skills::MAX_SKILL_DESCRIPTION_CHARS
+            ));
+        }
+    }
     None
 }
 
@@ -1286,6 +1327,56 @@ mod tests {
         assert!(
             denial.is_some_and(|d| d.contains("blocked path")),
             "blocked-path component must be refused"
+        );
+    }
+
+    /// A description past the catalog cap is truncated away before any model
+    /// reads it, so writing one produces a skill whose routing signal ends
+    /// mid-sentence. Refuse it while the author can still fix it.
+    #[test]
+    fn deny_skill_patch_refuses_description_past_the_catalog_cap() {
+        let config = Config::default();
+        let overlong = "x".repeat(crate::skills::MAX_SKILL_DESCRIPTION_CHARS + 1);
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: my-skill/SKILL.md\n+---\n+name: my-skill\n\
+             +description: {overlong}\n+---\n+body\n*** End Patch"
+        );
+        let denial = deny_skill_patch(&patch, std::path::Path::new("/tmp/skills"), &config);
+        assert!(
+            denial.is_some_and(|d| d.contains("over the")
+                && d.contains(&crate::skills::MAX_SKILL_DESCRIPTION_CHARS.to_string())),
+            "over-length description must be refused with the limit named"
+        );
+    }
+
+    /// The guard reads added lines only. Quoted scalars are unwrapped before
+    /// measuring (the quotes aren't part of what the catalog renders), and a
+    /// description exactly at the cap is legal — an off-by-one here would
+    /// reject valid skills.
+    #[test]
+    fn deny_skill_patch_allows_description_at_the_cap_and_ignores_context() {
+        let config = Config::default();
+        let exact = "x".repeat(crate::skills::MAX_SKILL_DESCRIPTION_CHARS);
+        let at_cap = format!(
+            "*** Begin Patch\n*** Add File: my-skill/SKILL.md\n+description: \"{exact}\"\n\
+             *** End Patch"
+        );
+        assert!(
+            deny_skill_patch(&at_cap, std::path::Path::new("/tmp/skills"), &config).is_none(),
+            "a description exactly at the cap must be allowed"
+        );
+
+        // An untouched over-length description in surrounding context belongs
+        // to an earlier edit; rejecting it would make unrelated fixes to old
+        // skills impossible.
+        let overlong = "x".repeat(crate::skills::MAX_SKILL_DESCRIPTION_CHARS + 1);
+        let context_only = format!(
+            "*** Begin Patch\n*** Update File: my-skill/SKILL.md\n@@\n description: {overlong}\n\
+             +new body line\n*** End Patch"
+        );
+        assert!(
+            deny_skill_patch(&context_only, std::path::Path::new("/tmp/skills"), &config).is_none(),
+            "an unchanged over-length description must not block an unrelated edit"
         );
     }
 

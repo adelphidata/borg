@@ -6,7 +6,7 @@
 //! settings row (with `${SECRET:NAME}` placeholders) to an
 //! `mcp::manifest::ServerManifest`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -403,6 +403,7 @@ impl McpServerConfig {
                 client_identity: resolve_client_identity(client_cert, client_key)?,
             },
         };
+        warn_on_hidden_whitespace(name, &transport);
         Ok(mcp::manifest::ServerManifest {
             name: name.to_string(),
             transport,
@@ -412,6 +413,90 @@ impl McpServerConfig {
             rate_limit_burst: self.rate_limit_burst,
             tools: self.tools.clone(),
         })
+    }
+}
+
+/// Warn when a resolved transport value carries leading or trailing
+/// whitespace.
+///
+/// A token pasted with a trailing newline, or a URL with a leading space, is
+/// invisible in the config and surfaces much later as an opaque auth or
+/// connect failure that looks like the server's fault. Checked *after* secret
+/// interpolation, so whitespace living inside a referenced credential is caught
+/// too.
+///
+/// Advisory only, and deliberately so: the value is never mutated (trimming an
+/// operator's credential for them is its own class of bug) and never logged —
+/// these are secrets, so only the server and the field path are named. Deduped
+/// to once per process per (server, field) to keep a reconnect loop from
+/// filling the log.
+fn warn_on_hidden_whitespace(server: &str, transport: &mcp::manifest::Transport) {
+    for field in hidden_whitespace_fields(transport) {
+        if !claim_whitespace_warning(server, &field) {
+            continue;
+        }
+        tracing::warn!(
+            "mcp server '{server}': value at `{field}` has leading or trailing whitespace \
+             (often a pasted credential that carried a newline). It is sent as-is, which \
+             usually surfaces later as an opaque auth or connect error — re-enter the value \
+             without the surrounding whitespace."
+        );
+    }
+}
+
+/// Dotted field paths whose resolved value has leading/trailing whitespace.
+///
+/// Returns paths, never values — the caller logs what this returns, and these
+/// fields hold credentials.
+fn hidden_whitespace_fields(transport: &mcp::manifest::Transport) -> Vec<String> {
+    let mut checked: Vec<(String, &str)> = Vec::new();
+    match transport {
+        mcp::manifest::Transport::Stdio { command, env, .. } => {
+            checked.push(("command".to_string(), command.as_str()));
+            for (k, v) in env {
+                checked.push((format!("env[{k}]"), v.as_str()));
+            }
+        }
+        mcp::manifest::Transport::Http {
+            url, headers, auth, ..
+        }
+        | mcp::manifest::Transport::Sse {
+            url, headers, auth, ..
+        } => {
+            checked.push(("url".to_string(), url.as_str()));
+            for (k, v) in headers {
+                checked.push((format!("headers[{k}]"), v.as_str()));
+            }
+            if let mcp::manifest::HttpAuth::Bearer { token } = auth {
+                checked.push(("auth.bearer.token".to_string(), token.as_str()));
+            }
+        }
+    }
+
+    let mut flagged: Vec<String> = checked
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty() && value.trim() != *value)
+        .map(|(field, _)| field)
+        .collect();
+    // Map iteration order is arbitrary; sort so the warning stream (and the
+    // tests) are stable across runs.
+    flagged.sort();
+    flagged
+}
+
+/// Record a (server, field) pair as warned. Returns `false` when it was already
+/// warned about in this process.
+fn claim_whitespace_warning(server: &str, field: &str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    match warned.lock() {
+        Ok(mut set) => set.insert((server.to_string(), field.to_string())),
+        // A poisoned mutex must not silence a config warning; the worst case
+        // is a repeated log line.
+        Err(poisoned) => poisoned
+            .into_inner()
+            .insert((server.to_string(), field.to_string())),
     }
 }
 
@@ -555,6 +640,82 @@ mod tests {
         c.credentials
             .insert(name.to_string(), CredentialValue::EnvVar(name.to_string()));
         c
+    }
+
+    /// A pasted credential that carried a newline is invisible in the config
+    /// and fails much later as an opaque auth error. Every transport value the
+    /// operator can paste into gets checked — and the detector yields field
+    /// paths only, never values, because these fields hold secrets.
+    #[test]
+    fn hidden_whitespace_is_flagged_by_field_path_across_transports() {
+        let stdio = mcp::manifest::Transport::Stdio {
+            command: "server-bin\n".to_string(),
+            args: vec![],
+            env: HashMap::from([
+                ("API_KEY".to_string(), "sk-live-abc123\n".to_string()),
+                ("CLEAN".to_string(), "fine".to_string()),
+            ]),
+        };
+        let flagged = hidden_whitespace_fields(&stdio);
+        assert_eq!(flagged, vec!["command", "env[API_KEY]"]);
+        assert!(
+            !flagged.iter().any(|f| f.contains("sk-live-abc123")),
+            "the credential value must never reach the log line"
+        );
+
+        let http = mcp::manifest::Transport::Http {
+            url: " https://example.com/mcp".to_string(),
+            headers: HashMap::from([("X-Api-Key".to_string(), "  padded".to_string())]),
+            auth: mcp::manifest::HttpAuth::Bearer {
+                token: "tok\t".to_string(),
+            },
+            client_identity: None,
+        };
+        assert_eq!(
+            hidden_whitespace_fields(&http),
+            vec!["auth.bearer.token", "headers[X-Api-Key]", "url"]
+        );
+    }
+
+    /// Clean config must stay silent, and an empty value is a different
+    /// problem (unset credential) that this check must not claim as its own.
+    #[test]
+    fn clean_and_empty_transport_values_are_not_flagged() {
+        let clean = mcp::manifest::Transport::Stdio {
+            command: "server-bin".to_string(),
+            args: vec![],
+            env: HashMap::from([
+                ("API_KEY".to_string(), "sk-live-abc123".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]),
+        };
+        assert!(hidden_whitespace_fields(&clean).is_empty());
+    }
+
+    /// The whole point is catching whitespace the operator can't see, so a
+    /// value that only becomes padded after `${SECRET:…}` interpolation must
+    /// be caught too — the check has to run on resolved values, not raw config.
+    #[test]
+    fn whitespace_inside_a_resolved_secret_is_caught() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("PADDED_TOKEN", "sk-live-abc123\n");
+        let cfg = cfg_with("PADDED_TOKEN");
+
+        let json = serde_json::json!({
+            "transport": {
+                "type": "stdio",
+                "command": "true",
+                "env": { "API_KEY": "${SECRET:PADDED_TOKEN}" }
+            }
+        });
+        let server: McpServerConfig = serde_json::from_value(json).unwrap();
+        let manifest = server.resolve_to_manifest("padded", &cfg).unwrap();
+
+        assert_eq!(
+            hidden_whitespace_fields(&manifest.transport),
+            vec!["env[API_KEY]"],
+            "whitespace living inside the credential must be caught after interpolation"
+        );
     }
 
     #[test]

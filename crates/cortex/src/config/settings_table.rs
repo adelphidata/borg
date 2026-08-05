@@ -220,6 +220,12 @@ define_settings! {
 
         // ── Tasks ──
         "tasks.max_concurrent" => tasks.max_concurrent, parsed(usize);
+        "tasks.model" => tasks.model, opt_string;
+        "tasks.model_provider" => tasks.model_provider, opt_string;
+
+        // ── Data retention ──
+        "data.retention_days" => data.retention_days, opt_parsed(u32);
+        "data.session_auto_archive_days" => data.session_auto_archive_days, opt_parsed(u32);
 
         // ── Gateway ──
         "gateway.host" => gateway.host, string;

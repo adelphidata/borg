@@ -220,6 +220,43 @@ async fn stream_child_output(
     ))
 }
 
+/// Read the caller's `timeout_ms`, rejecting values that can't mean a deadline.
+///
+/// `Ok(None)` means "not supplied, use the configured default". A zero or
+/// negative deadline is rejected rather than coerced: zero built a
+/// `Duration::from_millis(0)` that fired before the command could run, and the
+/// resulting "timed out after 0ms" read as the command's fault.
+fn parse_timeout_ms(raw: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    // Models emit the deadline as an integer, a whole float, or a numeric
+    // string depending on provider; accept all three, reject the rest loudly
+    // rather than silently falling back to the default.
+    let millis = match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+
+    match millis {
+        Some(ms) if ms >= 1.0 && ms.is_finite() => Ok(Some(ms as u64)),
+        Some(_) => Err(
+            "Error: timeout_ms must be a positive number of milliseconds (got a value below 1ms). \
+             Omit it to use the configured default."
+                .to_string(),
+        ),
+        None => Err(format!(
+            "Error: timeout_ms must be a positive number of milliseconds, got {value}. \
+             Omit it to use the configured default."
+        )),
+    }
+}
+
 #[instrument(skip_all, fields(tool.name = "run_shell"))]
 pub async fn handle_run_shell(
     args: &serde_json::Value,
@@ -267,10 +304,11 @@ pub async fn handle_run_shell_with_context(
     }
 
     let command = args["command"].as_str().context("Missing 'command'")?;
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config.tools.default_timeout_ms);
+    let timeout_ms = match parse_timeout_ms(args.get("timeout_ms")) {
+        Ok(Some(ms)) => ms,
+        Ok(None) => config.tools.default_timeout_ms,
+        Err(message) => return Ok(message),
+    };
     let timeout_dur = Duration::from_millis(timeout_ms);
     let workdir = args
         .get("workdir")
@@ -827,13 +865,56 @@ fn redact_command_for_audit(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_run_shell, redact_command_for_audit, wrap_run_shell_for_sandbox, HeadTailBuffer,
+        handle_run_shell, parse_timeout_ms, redact_command_for_audit, wrap_run_shell_for_sandbox,
+        HeadTailBuffer,
     };
     use crate::agent::AgentEvent;
     use crate::config::Config;
     use crate::execution_context::ExecutionContext;
     use crate::policy::{ExecutionPolicy, PolicyDecision};
     use tokio::sync::mpsc;
+
+    /// A deadline the command cannot possibly meet must be refused, not run.
+    /// `timeout_ms: 0` used to build a zero `Duration`, so the timeout fired
+    /// before the process was spawned and the model was told its command
+    /// "timed out after 0ms" — a self-inflicted failure that reads like the
+    /// command's.
+    #[test]
+    fn timeout_ms_rejects_deadlines_a_command_cannot_meet() {
+        for rejected in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+            serde_json::json!("0"),
+            serde_json::json!("not-a-number"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                parse_timeout_ms(Some(&rejected)).is_err(),
+                "expected {rejected} to be refused as a deadline"
+            );
+        }
+    }
+
+    /// Absent means "use the configured default"; the accepted spellings all
+    /// resolve to the same deadline so a provider that stringifies or floats
+    /// its numbers is not silently downgraded to the default.
+    #[test]
+    fn timeout_ms_accepts_absent_and_every_positive_spelling() {
+        assert_eq!(parse_timeout_ms(None), Ok(None));
+        assert_eq!(parse_timeout_ms(Some(&serde_json::Value::Null)), Ok(None));
+        for supplied in [
+            serde_json::json!(5000),
+            serde_json::json!(5000.0),
+            serde_json::json!("5000"),
+        ] {
+            assert_eq!(
+                parse_timeout_ms(Some(&supplied)),
+                Ok(Some(5000)),
+                "expected {supplied} to parse as a 5000ms deadline"
+            );
+        }
+    }
 
     /// A sub-agent derived from a workspace-confined parent must still be
     /// sandbox-wrapped. Regression guard: children are granted

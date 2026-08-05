@@ -16,6 +16,21 @@ pub(crate) enum SessionsAction {
         /// Session ID (full UUID or unique prefix)
         id: String,
     },
+    /// Protect a session from retention purging and stale auto-archiving
+    Pin {
+        /// Session ID (full UUID or unique prefix)
+        id: String,
+    },
+    /// Remove a session's pin
+    Unpin {
+        /// Session ID (full UUID or unique prefix)
+        id: String,
+    },
+    /// Bring an auto-archived session back into listings
+    Unarchive {
+        /// Session ID (full UUID or unique prefix)
+        id: String,
+    },
 }
 
 pub(crate) async fn dispatch_sessions(action: Option<SessionsAction>) -> Result<()> {
@@ -23,6 +38,59 @@ pub(crate) async fn dispatch_sessions(action: Option<SessionsAction>) -> Result<
         None => run_list(DEFAULT_LIMIT).await,
         Some(SessionsAction::List { limit }) => run_list(limit).await,
         Some(SessionsAction::Show { id }) => run_show(&id).await,
+        Some(SessionsAction::Pin { id }) => run_set_pinned(&id, true).await,
+        Some(SessionsAction::Unpin { id }) => run_set_pinned(&id, false).await,
+        Some(SessionsAction::Unarchive { id }) => run_unarchive(&id).await,
+    }
+}
+
+/// `borg sessions pin|unpin <id>`.
+///
+/// Goes straight to the DB rather than through the daemon: this is operator
+/// state about which conversations survive retention, and it must work whether
+/// or not borgd is up.
+async fn run_set_pinned(id: &str, pinned: bool) -> Result<()> {
+    let db = cortex::db::Database::open().await?;
+    let Some(full_id) = resolve_session_id_prefix(&db, id).await? else {
+        println!("Session not found: {id}");
+        return Ok(());
+    };
+    db.set_session_pinned(&full_id, pinned).await?;
+    let short: String = full_id.chars().take(8).collect();
+    if pinned {
+        println!("Session {short} pinned — exempt from retention purge and auto-archive");
+    } else {
+        println!("Session {short} unpinned");
+    }
+    Ok(())
+}
+
+/// `borg sessions unarchive <id>`.
+async fn run_unarchive(id: &str) -> Result<()> {
+    let db = cortex::db::Database::open().await?;
+    let Some(full_id) = resolve_session_id_prefix(&db, id).await? else {
+        println!("Session not found: {id}");
+        return Ok(());
+    };
+    db.unarchive_session(&full_id).await?;
+    let short: String = full_id.chars().take(8).collect();
+    println!("Session {short} unarchived");
+    Ok(())
+}
+
+/// Resolve a session id prefix to the full id, or `None` when nothing matches.
+///
+/// An ambiguous prefix is an error rather than a pick: pinning or unpinning
+/// the wrong session is invisible until the right one has already been purged.
+async fn resolve_session_id_prefix(
+    db: &cortex::db::Database,
+    prefix: &str,
+) -> Result<Option<String>> {
+    let matches = db.session_ids_with_prefix(prefix).await?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        n => anyhow::bail!("'{prefix}' matches {n} sessions — use a longer id prefix"),
     }
 }
 

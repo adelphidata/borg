@@ -1831,6 +1831,39 @@ EOF";
         assert!(!content.contains("OMEGA"));
     }
 
+    /// A hunk whose only context is a blank line carries no search text: the
+    /// parser yields an addition-only hunk, which appends at EOF rather than
+    /// matching the first blank line it can find. Pinned because the
+    /// alternative — treating a blank line as a searchable anchor — would let
+    /// a model that dropped its real context lines land the edit at an
+    /// arbitrary blank line instead of a predictable place.
+    #[test]
+    fn blank_context_line_appends_at_eof_rather_than_matching_any_blank_line() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("blanks.txt"), "alpha\n\nbeta\n\ngamma\n").unwrap();
+
+        // A single space is a context line whose content is empty.
+        let patch_text = "\
+*** Begin Patch
+*** Update File: blanks.txt
+@@
+
++INSERTED
+*** End Patch";
+
+        crate::apply_patch_to_dir(patch_text, dir.path()).expect("addition-only hunk applies");
+        let content = std::fs::read_to_string(dir.path().join("blanks.txt")).unwrap();
+        assert!(
+            content.ends_with("INSERTED\n") || content.ends_with("INSERTED"),
+            "addition must land at EOF, got: {content:?}"
+        );
+        assert_eq!(
+            content.matches("INSERTED").count(),
+            1,
+            "must not fan out across every blank line, got: {content:?}"
+        );
+    }
+
     #[test]
     fn not_found_error_includes_nearest_context_snippet() {
         // Regression guard: when a hunk fails because the file content has

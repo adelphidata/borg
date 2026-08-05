@@ -132,6 +132,25 @@ pub fn load_all_skills(
                                         continue;
                                     }
 
+                                    // Everything downstream keys off the
+                                    // frontmatter name — including the
+                                    // built-in-shadow check just above, which
+                                    // compares the two. A directory that
+                                    // disagrees loads fine but behaves as the
+                                    // name it declares, so an author editing
+                                    // `foo/` and seeing `bar` in the catalog
+                                    // has no way to connect the two. Warn, do
+                                    // not reject: existing skills must keep
+                                    // loading.
+                                    if dir_name != name {
+                                        warn!(
+                                            "Skill directory '{dir_name}' declares name '{name}' \
+                                             in its frontmatter; '{name}' is what the catalog, \
+                                             invocation, and built-in shadowing all use. Rename \
+                                             the directory to match."
+                                        );
+                                    }
+
                                     // Load references from references/*.md
                                     let mut references = Vec::new();
                                     let refs_dir = skill_dir.join("references");

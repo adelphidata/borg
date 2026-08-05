@@ -1100,11 +1100,25 @@ impl Default for WebConfig {
 pub struct TasksConfig {
     /// Maximum number of tasks that can run concurrently.
     pub max_concurrent: usize,
+    /// Default model for scheduled runs, independent of the chat model.
+    ///
+    /// Without this, every scheduled task follows `llm.model`, so changing the
+    /// model you chat with silently re-prices and re-routes the whole
+    /// scheduled fleet. `None` keeps the old behavior (follow `llm.model`).
+    /// A per-task pin overrides this.
+    pub model: Option<String>,
+    /// Provider for [`Self::model`]. `None` uses the globally configured
+    /// provider.
+    pub model_provider: Option<String>,
 }
 
 impl Default for TasksConfig {
     fn default() -> Self {
-        Self { max_concurrent: 3 }
+        Self {
+            max_concurrent: 3,
+            model: None,
+            model_provider: None,
+        }
     }
 }
 

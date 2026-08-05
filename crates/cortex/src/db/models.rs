@@ -36,6 +36,12 @@ pub struct SessionRow {
     /// Anchor message rowid copied as the last message of this fork.
     /// `None` for top-level sessions.
     pub forked_from_message_id: Option<i64>,
+    /// Whether the user pinned this session. Pinned sessions are exempt from
+    /// the retention purge and the stale auto-archive sweep.
+    pub pinned: bool,
+    /// When the stale-session sweep archived this session, if it did.
+    /// Archiving is a soft hide and is always reversible.
+    pub archived_at: Option<i64>,
 }
 
 impl SessionRow {
@@ -43,7 +49,7 @@ impl SessionRow {
     /// `SELECT ... FROM sessions` that maps into a `SessionRow` interpolates
     /// this so the column order and the field decoding never drift apart.
     pub const COLUMNS: &'static str = "id, created_at, updated_at, total_tokens, \
-         model, title, parent_session_id, forked_from_message_id";
+         model, title, parent_session_id, forked_from_message_id, pinned, archived_at";
 
     /// Decode a row produced by a `SELECT {COLUMNS} FROM sessions` query.
     pub fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
@@ -56,6 +62,8 @@ impl SessionRow {
             title: row.get::<String>(5)?,
             parent_session_id: row.get::<Option<String>>(6)?,
             forked_from_message_id: row.get::<Option<i64>>(7)?,
+            pinned: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
+            archived_at: row.get::<Option<i64>>(9)?,
         })
     }
 }
@@ -140,6 +148,16 @@ pub struct ScheduledTaskRow {
     /// (model said the same thing twice). `[SILENT]` runs do NOT update
     /// this — only successful deliveries do.
     pub last_response_hash: Option<String>,
+    /// User-set model pin for this task. `None` falls back to the
+    /// scheduler-fleet default, then the global `llm.model`.
+    ///
+    /// Deliberately not settable through the agent-facing `schedule` tool: a
+    /// model that could re-point its own scheduled work would silently change
+    /// what the fleet costs and how it behaves. Set it via settings/CLI.
+    pub model: Option<String>,
+    /// Provider for [`Self::model`], when the pinned id needs a provider that
+    /// differs from the global one. `None` uses the configured provider.
+    pub model_provider: Option<String>,
 }
 
 /// Task run log row from SQLite.

@@ -413,14 +413,82 @@ impl Provider {
     /// Strip vendor prefixes for direct providers (e.g., "anthropic/claude-sonnet-4" → "claude-sonnet-4").
     ///
     /// Tries each of the provider's `model_prefixes` in order and strips the
-    /// first match; otherwise the model id passes through unchanged.
+    /// first match; otherwise the model id passes through unchanged. For
+    /// providers that *require* a vendor prefix this also runs the inverse
+    /// repair, so a config that lost its prefix self-heals on the next request
+    /// instead of 404ing forever.
     pub fn normalize_model(&self, model: &str) -> String {
         for prefix in self.meta().model_prefixes {
             if let Some(stripped) = model.strip_prefix(prefix) {
                 return stripped.to_string();
             }
         }
+        if let Some(repaired) = self.repair_missing_vendor_prefix(model) {
+            tracing::info!(
+                "model id '{model}' is missing its vendor prefix for {self}; using '{repaired}'"
+            );
+            return repaired;
+        }
         model.to_string()
+    }
+
+    /// Whether every model id this provider serves is a `vendor/model` path.
+    ///
+    /// Only OpenRouter: it is a router, so the vendor half is what selects the
+    /// upstream. Providers with an empty `model_prefixes` are not equivalent —
+    /// Ollama, Bedrock, Vertex and custom endpoints all serve bare ids.
+    pub fn requires_vendor_prefix(self) -> bool {
+        matches!(self, Provider::OpenRouter)
+    }
+
+    /// Restore the vendor prefix on a bare model id, when the id's family
+    /// identifies exactly one vendor.
+    ///
+    /// A bare id on a prefix-routed provider produces a plain HTTP 404, which
+    /// reads like an outage or an auth failure — the one thing it doesn't look
+    /// like is a typo in the model id. This is a lookup against the same vendor
+    /// list [`Self::normalize_model`] strips with, not a guess: a family we
+    /// don't recognise is left alone for the error path to explain.
+    pub fn repair_missing_vendor_prefix(self, model: &str) -> Option<String> {
+        if !self.requires_vendor_prefix() || model.contains('/') || model.is_empty() {
+            return None;
+        }
+        Self::vendor_for_model_family(model).map(|vendor| format!("{vendor}/{model}"))
+    }
+
+    /// Map a bare model id to its vendor, by family.
+    ///
+    /// The inverse of the vendor prefixes stripped elsewhere in this module.
+    /// Each arm is a family stem, not a fuzzy match, so an unrecognised id
+    /// yields `None` rather than a wrong vendor.
+    fn vendor_for_model_family(model: &str) -> Option<&'static str> {
+        let lowered = model.to_lowercase();
+        const FAMILIES: &[(&str, &str)] = &[
+            ("claude-", "anthropic"),
+            ("gpt-", "openai"),
+            ("o1", "openai"),
+            ("o3", "openai"),
+            ("o4-", "openai"),
+            ("codex-", "openai"),
+            ("gemini-", "google"),
+            ("gemma-", "google"),
+            ("grok-", "x-ai"),
+            ("qwen", "qwen"),
+            ("deepseek-", "deepseek"),
+            ("glm-", "z-ai"),
+            ("kimi-", "moonshotai"),
+            ("minimax", "minimax"),
+            ("mistral", "mistralai"),
+            ("ministral", "mistralai"),
+            ("magistral", "mistralai"),
+            ("devstral", "mistralai"),
+            ("llama-", "meta-llama"),
+            ("phi-", "microsoft"),
+        ];
+        FAMILIES
+            .iter()
+            .find(|(stem, _)| lowered.starts_with(stem))
+            .map(|(_, vendor)| *vendor)
     }
 
     /// Whether a model supports tool/function calling.
@@ -720,6 +788,70 @@ mod tests {
             let parsed = Provider::from_str(s).unwrap();
             assert_eq!(parsed, *provider);
         }
+    }
+
+    /// A config that lost its vendor prefix must self-heal on the next
+    /// request. Without this, a bare id 404s on every attempt and the failure
+    /// names neither the model nor the missing prefix.
+    #[test]
+    fn openrouter_repairs_a_bare_model_id_from_its_family() {
+        for (bare, expected) in [
+            ("claude-sonnet-4.6", "anthropic/claude-sonnet-4.6"),
+            ("gpt-5.5", "openai/gpt-5.5"),
+            ("o3", "openai/o3"),
+            ("gemini-3-flash", "google/gemini-3-flash"),
+            ("grok-4", "x-ai/grok-4"),
+            ("glm-5.1", "z-ai/glm-5.1"),
+            ("kimi-k3", "moonshotai/kimi-k3"),
+            ("devstral-2512", "mistralai/devstral-2512"),
+        ] {
+            assert_eq!(
+                Provider::OpenRouter.normalize_model(bare),
+                expected,
+                "{bare} must be repaired to its vendor path"
+            );
+        }
+    }
+
+    /// The repair is a lookup, not a guess. An id whose family we don't know
+    /// passes through untouched so the error path can explain it, and an id
+    /// that already carries a prefix is never rewritten.
+    #[test]
+    fn vendor_prefix_repair_leaves_unknown_and_already_prefixed_ids_alone() {
+        assert_eq!(
+            Provider::OpenRouter.normalize_model("some-unknown-model-v9"),
+            "some-unknown-model-v9"
+        );
+        assert_eq!(
+            Provider::OpenRouter.normalize_model("anthropic/claude-sonnet-4.6"),
+            "anthropic/claude-sonnet-4.6"
+        );
+        assert!(Provider::OpenRouter
+            .repair_missing_vendor_prefix("some-unknown-model-v9")
+            .is_none());
+    }
+
+    /// Only OpenRouter routes on the vendor half. Providers that serve bare
+    /// ids — Ollama, Bedrock, custom endpoints — must never have a prefix
+    /// invented for them, which would turn a working config into a 404.
+    #[test]
+    fn only_prefix_routed_providers_repair_bare_ids() {
+        for provider in Provider::ALL {
+            let repaired = provider.repair_missing_vendor_prefix("claude-sonnet-4.6");
+            assert_eq!(
+                repaired.is_some(),
+                provider.requires_vendor_prefix(),
+                "{provider} repair must follow requires_vendor_prefix"
+            );
+        }
+        assert_eq!(
+            Provider::Ollama.normalize_model("llama-3.3-70b"),
+            "llama-3.3-70b"
+        );
+        assert_eq!(
+            Provider::Groq.normalize_model("llama-3.3-70b-versatile"),
+            "llama-3.3-70b-versatile"
+        );
     }
 
     #[test]

@@ -181,6 +181,104 @@ async fn air_gap_skips_public_cloud_fallback_slot() {
     );
 }
 
+/// A host that blackholes SYNs must cost one connect timeout, not one per
+/// attempt. Once recorded, the request path has to bail before dialing so the
+/// fallback chain gets its turn immediately — and the error must stay
+/// retryable, since the endpoint is expected to come back.
+#[tokio::test]
+async fn a_blackholed_endpoint_is_skipped_without_dialing() {
+    let env_var = "BORG_TEST_BLACKHOLE_LLM";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    // Reserved TEST-NET-1 (RFC 5737): routable-looking, never answers. If the
+    // short-circuit fails to fire, this test hangs on a real connect instead of
+    // silently passing.
+    let dead_url = "http://192.0.2.1:9443/v1/chat/completions";
+    config.llm.base_url = Some(dead_url.to_string());
+    let client = LlmClient::new(&config).await.unwrap();
+
+    crate::llm::blackhole::record_connect_failure(dead_url, std::time::Instant::now());
+
+    let started = std::time::Instant::now();
+    let err = client
+        .send_request(
+            dead_url,
+            &serde_json::json!({}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("a blackholed endpoint must not be dialed");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "must short-circuit rather than wait out a connect timeout"
+    );
+    assert!(
+        err.to_string().contains("TCP connect"),
+        "error must explain why the endpoint was skipped, got: {err}"
+    );
+    assert!(
+        matches!(err.reason(), FailoverReason::Timeout),
+        "a blackholed host is expected to recover — the error must stay retryable"
+    );
+
+    crate::llm::blackhole::clear(dead_url);
+}
+
+/// A bare model id on a prefix-routed provider 404s, and the raw
+/// "model not found" reads like an outage — users chase the provider's status
+/// page instead of their own config. The error has to name the missing prefix.
+/// Only the message changes: the reason stays `ModelNotFound` so fast-fail and
+/// failover are untouched.
+#[tokio::test]
+async fn model_not_found_names_the_missing_vendor_prefix() {
+    let env_var = "BORG_TEST_OPENROUTER_BARE_MODEL";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("openrouter".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    // A family the repair doesn't recognise, so it survives normalization and
+    // actually reaches the wire bare.
+    config.llm.model = "some-unknown-model-v9".to_string();
+    let client = LlmClient::new(&config).await.unwrap();
+
+    let raw = crate::llm::llm_error::classify_status(
+        reqwest::StatusCode::NOT_FOUND,
+        "{\"error\":\"model not found\"}",
+        crate::llm::Provider::OpenRouter,
+    );
+    let explained = client.explain_missing_vendor_prefix(raw);
+
+    let message = explained.to_string();
+    assert!(
+        message.contains("some-unknown-model-v9") && message.contains("vendor"),
+        "error must name the model and the missing vendor prefix, got: {message}"
+    );
+    assert!(
+        matches!(explained.reason(), FailoverReason::ModelNotFound),
+        "rewriting the message must not change failover behavior"
+    );
+}
+
+/// The rewrite must not fire on an id that already carries its vendor — that
+/// 404 means something else, and blaming the prefix would misdirect.
+#[tokio::test]
+async fn model_not_found_is_left_alone_when_the_prefix_is_present() {
+    let client = make_test_openrouter_client(false).await;
+    let raw = crate::llm::llm_error::classify_status(
+        reqwest::StatusCode::NOT_FOUND,
+        "{\"error\":\"model not found\"}",
+        crate::llm::Provider::OpenRouter,
+    );
+    let passed_through = client.explain_missing_vendor_prefix(raw);
+    assert!(
+        !passed_through.to_string().contains("vendor/model"),
+        "a fully-qualified id must not be blamed on a missing prefix"
+    );
+}
+
 #[tokio::test]
 async fn openrouter_cost_event_uses_usage_cost_verbatim() {
     let sink = Arc::new(CollectingSink::default());

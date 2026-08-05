@@ -337,6 +337,81 @@ impl Database {
         Ok(())
     }
 
+    /// Per-task model pins on `scheduled_tasks`, and pin/archive state on
+    /// `sessions`.
+    ///
+    /// Wraps the v11 shape repair so the newest repair entry point is a single
+    /// call: `run_migrations` invokes this both on upgrade and on every open of
+    /// an already-stamped DB, for the shared-`borg.db` stranding reason
+    /// documented on [`Self::migrate_v11`].
+    ///
+    /// Idempotent: each ALTER is guarded by a `PRAGMA table_info` probe, so a
+    /// fresh install (which gets the final shape from `SCHEMA_SQL`) does
+    /// read-only probing.
+    pub(super) async fn migrate_v12(&self) -> Result<()> {
+        self.migrate_v11().await?;
+        if self.table_exists("scheduled_tasks").await? {
+            self.add_missing_columns(
+                "scheduled_tasks",
+                &[
+                    ("model", "ALTER TABLE scheduled_tasks ADD COLUMN model TEXT"),
+                    (
+                        "model_provider",
+                        "ALTER TABLE scheduled_tasks ADD COLUMN model_provider TEXT",
+                    ),
+                ],
+            )
+            .await?;
+        } else {
+            tracing::warn!(
+                "shape repair: `scheduled_tasks` table missing entirely; skipping column repair"
+            );
+        }
+        if self.table_exists("sessions").await? {
+            self.add_missing_columns(
+                "sessions",
+                &[
+                    (
+                        "pinned",
+                        "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+                    ),
+                    (
+                        "archived_at",
+                        "ALTER TABLE sessions ADD COLUMN archived_at INTEGER",
+                    ),
+                ],
+            )
+            .await?;
+        } else {
+            tracing::warn!(
+                "shape repair: `sessions` table missing entirely; skipping column repair"
+            );
+        }
+        Ok(())
+    }
+
+    /// Run each `(column, ddl)` whose column is absent from `table`.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and re-running an ALTER for an
+    /// existing column is a hard error — so every column-adding migration has
+    /// to probe first to stay idempotent.
+    async fn add_missing_columns(&self, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await?;
+        let mut existing = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            existing.insert(row.get::<String>(1)?);
+        }
+        for (col, ddl) in columns {
+            if !existing.contains(*col) {
+                self.conn.execute_batch(ddl).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn migrate_v4(&self) -> Result<()> {
         // Fresh installs already emit the final shape via `SCHEMA_SQL`
         // (which defines `code_hash`). Only DBs that ran through the v3
@@ -587,7 +662,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- lease that has since been reclaimed. NULL owner = free.
     lease_owner TEXT,
     lease_expiry INTEGER,
-    lease_epoch INTEGER NOT NULL DEFAULT 0
+    lease_epoch INTEGER NOT NULL DEFAULT 0,
+    -- `pinned` exempts a session from retention purging and from the stale
+    -- auto-archive sweep. `archived_at` soft-hides a session from listings; it
+    -- is never a delete, so archiving is always reversible.
+    pinned INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
@@ -690,7 +770,9 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     pre_run_timeout_ms INTEGER NOT NULL DEFAULT {PRE_RUN_DEFAULT_TIMEOUT_MS},
     bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0,
     min_interval_secs INTEGER,
-    last_response_hash TEXT
+    last_response_hash TEXT,
+    model TEXT,
+    model_provider TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run);
 CREATE INDEX IF NOT EXISTS idx_tasks_retry ON scheduled_tasks(status, retry_after);

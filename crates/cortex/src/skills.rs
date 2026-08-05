@@ -10,7 +10,7 @@ mod types;
 use types::{check_os_requirements, check_requirements};
 pub use types::{
     parse_skill_md, InstallSpec, PrerequisitesLegacy, Skill, SkillLoadLevel, SkillManifest,
-    SkillRequires, SkillSource,
+    SkillRequires, SkillSource, MAX_SKILL_DESCRIPTION_CHARS,
 };
 
 mod loader;
