@@ -1043,12 +1043,24 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
         match message.role {
             Role::System => {
                 if let Some(text) = message.text_content() {
-                    system_blocks.push(serde_json::json!({ "text": text }));
+                    // Converse rejects a blank system block just as it does a
+                    // blank message block.
+                    if !text.trim().is_empty() {
+                        system_blocks.push(serde_json::json!({ "text": text }));
+                    }
                 }
             }
             Role::User => {
                 let mut content = Vec::new();
                 append_bedrock_content(&mut content, message);
+                // Converse rejects a message whose content array is empty.
+                // The assistant arm below has always guarded this; the user
+                // arm reaches it too once blank text is filtered out.
+                if content.is_empty() {
+                    content.push(serde_json::json!({
+                        "text": crate::llm::anthropic::EMPTY_ASSISTANT_PLACEHOLDER,
+                    }));
+                }
                 bedrock_messages.push(serde_json::json!({
                     "role": "user",
                     "content": content,
@@ -1058,7 +1070,9 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
                 let mut content = Vec::new();
                 append_bedrock_content(&mut content, message);
                 if content.is_empty() {
-                    content.push(serde_json::json!({ "text": "" }));
+                    content.push(serde_json::json!({
+                        "text": crate::llm::anthropic::EMPTY_ASSISTANT_PLACEHOLDER,
+                    }));
                 }
                 bedrock_messages.push(serde_json::json!({
                     "role": "assistant",
@@ -1123,13 +1137,16 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
                         }
                     }
                     _ => {
-                        tool_result_content.push(serde_json::json!({
-                            "text": message.text_content().unwrap_or(""),
-                        }));
+                        let text = message.text_content().unwrap_or("");
+                        if !text.trim().is_empty() {
+                            tool_result_content.push(serde_json::json!({ "text": text }));
+                        }
                     }
                 }
                 if tool_result_content.is_empty() {
-                    tool_result_content.push(serde_json::json!({ "text": "" }));
+                    tool_result_content.push(serde_json::json!({
+                        "text": crate::llm::anthropic::EMPTY_ASSISTANT_PLACEHOLDER,
+                    }));
                 }
                 bedrock_messages.push(serde_json::json!({
                     "role": "user",
@@ -1194,7 +1211,7 @@ fn build_vertex_anthropic_request(
 fn append_bedrock_content(content: &mut Vec<serde_json::Value>, message: &Message) {
     match &message.content {
         Some(crate::types::MessageContent::Text(text)) => {
-            if !text.is_empty() {
+            if !text.trim().is_empty() {
                 content.push(serde_json::json!({ "text": text }));
             }
         }
@@ -1202,7 +1219,7 @@ fn append_bedrock_content(content: &mut Vec<serde_json::Value>, message: &Messag
             for part in parts {
                 match part {
                     crate::types::ContentPart::Text(text) => {
-                        if !text.is_empty() {
+                        if !text.trim().is_empty() {
                             content.push(serde_json::json!({ "text": text }));
                         }
                     }
@@ -1667,6 +1684,128 @@ mod tests {
             assert_eq!(blocks[0]["text"], system);
             assert!(blocks[0].get("cache_control").is_some());
         }
+    }
+
+    /// Collect every `{"text": …}` string value anywhere in the body, so the
+    /// assertion can't miss a blank block by only checking the shapes the
+    /// test author happened to think of.
+    fn collect_text_values(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "text" {
+                        if let Some(s) = val.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                    collect_text_values(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    collect_text_values(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every `content` array in the body, so "message with zero content
+    /// blocks" — the other shape Converse rejects — is also covered.
+    fn collect_content_arrays<'a>(
+        v: &'a serde_json::Value,
+        out: &mut Vec<&'a Vec<serde_json::Value>>,
+    ) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "content" {
+                        if let Some(arr) = val.as_array() {
+                            out.push(arr);
+                        }
+                    }
+                    collect_content_arrays(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    collect_content_arrays(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn bedrock_request_never_emits_blank_text_block() {
+        // Converse rejects a text block that is present but whitespace-only,
+        // and rejects a message whose content array is empty. Both shapes
+        // were reachable here: blank user/assistant/tool text passed the
+        // `is_empty` guard, and the empty-content repair pushed a literal "".
+        let mut assistant_with_calls = Message::assistant("   ");
+        assistant_with_calls.tool_calls = Some(vec![crate::types::ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::types::FunctionCall {
+                name: "run_shell".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+
+        let messages = vec![
+            Message::system("  \n "),
+            Message::user("   "),
+            Message::assistant("\t\n"),
+            assistant_with_calls,
+            Message::tool_result("call_1", "  "),
+        ];
+        let body = build_bedrock_request(&bedrock_request(&messages));
+
+        let mut texts = Vec::new();
+        collect_text_values(&body, &mut texts);
+        for t in &texts {
+            assert!(
+                !t.trim().is_empty(),
+                "blank text block would 400 at Converse; body: {body}"
+            );
+        }
+
+        let mut arrays = Vec::new();
+        collect_content_arrays(&body, &mut arrays);
+        for arr in arrays {
+            assert!(
+                !arr.is_empty(),
+                "empty content array would 400 at Converse; body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_assistant_with_blank_text_still_carries_tool_use() {
+        // The blank text is dropped, but the tool call must survive — and no
+        // placeholder should be injected, because the tool block already
+        // makes the content array non-empty.
+        let mut msg = Message::assistant("   ");
+        msg.tool_calls = Some(vec![crate::types::ToolCall {
+            id: "call_7".to_string(),
+            call_type: "function".to_string(),
+            function: crate::types::FunctionCall {
+                name: "run_shell".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            },
+        }]);
+        let messages = vec![Message::user("go"), msg];
+        let body = build_bedrock_request(&bedrock_request(&messages));
+
+        let content = body["messages"][1]["content"]
+            .as_array()
+            .expect("assistant content array");
+        assert_eq!(
+            content.len(),
+            1,
+            "expected only the toolUse block, got: {content:?}"
+        );
+        assert_eq!(content[0]["toolUse"]["name"], "run_shell");
     }
 
     #[test]

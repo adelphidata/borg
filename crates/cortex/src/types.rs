@@ -248,6 +248,27 @@ impl MessageContent {
         }
     }
 
+    /// True when this content carries no *non-whitespace* text and no
+    /// non-text parts.
+    ///
+    /// Distinct from [`Self::is_empty`] on purpose. Anthropic and Bedrock
+    /// Converse both reject a text block that is present but whitespace-only
+    /// ("text content blocks must contain non-whitespace text"), so provider
+    /// seams gate on this. `is_empty` stays byte-exact — a predicate named
+    /// `is_empty` that returns true for `"   "` is a lie to every future
+    /// caller.
+    pub fn is_blank(&self) -> bool {
+        match self {
+            MessageContent::Text(s) => s.trim().is_empty(),
+            MessageContent::Parts(parts) => {
+                parts.is_empty()
+                    || parts
+                        .iter()
+                        .all(|p| matches!(p, ContentPart::Text(t) if t.trim().is_empty()))
+            }
+        }
+    }
+
     /// Returns true if the content is empty or contains only empty text parts.
     pub fn is_empty(&self) -> bool {
         match self {
@@ -554,6 +575,47 @@ impl ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_blank_is_trim_aware_but_is_empty_is_not() {
+        // The two predicates deliberately diverge: `is_blank` gates the
+        // provider seams (Anthropic/Bedrock reject whitespace-only text),
+        // `is_empty` stays byte-exact. Asserting the *pair* per row means the
+        // test fails if either one drifts toward the other.
+        let cases: &[(MessageContent, bool, bool)] = &[
+            // (content, is_empty, is_blank)
+            (MessageContent::Text(String::new()), true, true),
+            (MessageContent::Text("   ".to_string()), false, true),
+            (MessageContent::Text("\n\t ".to_string()), false, true),
+            (MessageContent::Text("x".to_string()), false, false),
+            (MessageContent::Parts(vec![]), true, true),
+            (
+                MessageContent::Parts(vec![ContentPart::Text("  ".to_string())]),
+                false,
+                true,
+            ),
+            (
+                MessageContent::Parts(vec![
+                    ContentPart::Text("  ".to_string()),
+                    ContentPart::Text("x".to_string()),
+                ]),
+                false,
+                false,
+            ),
+        ];
+        for (content, want_empty, want_blank) in cases {
+            assert_eq!(
+                content.is_empty(),
+                *want_empty,
+                "is_empty wrong for {content:?}"
+            );
+            assert_eq!(
+                content.is_blank(),
+                *want_blank,
+                "is_blank wrong for {content:?}"
+            );
+        }
+    }
 
     /// Collapsed constructor check. Each row exercises the constructor's
     /// `Into<String>` plumbing AND the `text_content()` extractor (which

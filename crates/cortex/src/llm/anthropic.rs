@@ -24,7 +24,7 @@ pub(super) fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
             let content_empty = m
                 .content
                 .as_ref()
-                .map(crate::types::MessageContent::is_empty)
+                .map(crate::types::MessageContent::is_blank)
                 .unwrap_or(true);
 
             if m.content.is_none() && m.tool_calls.is_some() {
@@ -144,7 +144,7 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
                 let content_empty = m
                     .content
                     .as_ref()
-                    .is_none_or(crate::types::MessageContent::is_empty);
+                    .is_none_or(crate::types::MessageContent::is_blank);
                 if kept.is_empty() && content_empty {
                     // Assistant reduced to nothing (all calls were duplicates,
                     // no text) — drop it entirely rather than send an empty turn.
@@ -175,16 +175,16 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
 
 /// Convert one message's `Parts` content into Anthropic content blocks.
 /// Shared by the user-turn and tool-result paths below, which differ only in
-/// whether an empty text part is worth keeping (`skip_empty_text`).
+/// whether a blank text part is worth keeping (`skip_blank_text`).
 fn content_parts_to_anthropic_blocks(
     parts: &[crate::types::ContentPart],
-    skip_empty_text: bool,
+    skip_blank_text: bool,
 ) -> Vec<serde_json::Value> {
     let mut blocks: Vec<serde_json::Value> = Vec::new();
     for part in parts {
         match part {
             crate::types::ContentPart::Text(t) => {
-                if !skip_empty_text || !t.is_empty() {
+                if !skip_blank_text || !t.trim().is_empty() {
                     blocks.push(serde_json::json!({
                         "type": "text",
                         "text": t,
@@ -227,6 +227,17 @@ fn content_parts_to_anthropic_blocks(
     blocks
 }
 
+/// Text pushed when a message would otherwise serialize to no content at all.
+///
+/// Anthropic and Bedrock Converse both reject an empty *and* a whitespace-only
+/// text block, and also reject a message whose content array is empty — so
+/// neither `""` nor omission is a legal repair. A short inert token is the only
+/// shape both accept. Dropping the message instead is not an option here:
+/// `build_anthropic_messages` is a positional mapper, and removing an element
+/// mid-array strands a following `tool_result` that merges into
+/// `result.last_mut()`.
+pub(super) const EMPTY_ASSISTANT_PLACEHOLDER: &str = "(no content)";
+
 /// Convert internal Messages to Anthropic format.
 pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut result: Vec<serde_json::Value> = Vec::new();
@@ -239,16 +250,28 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
         match msg.role {
             Role::User => match &msg.content {
                 Some(crate::types::MessageContent::Parts(parts)) => {
-                    let content_blocks = content_parts_to_anthropic_blocks(parts, false);
+                    let mut content_blocks = content_parts_to_anthropic_blocks(parts, true);
+                    if content_blocks.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": EMPTY_ASSISTANT_PLACEHOLDER,
+                        }));
+                    }
                     result.push(serde_json::json!({
                         "role": "user",
                         "content": content_blocks,
                     }));
                 }
                 _ => {
+                    let text = msg.text_content().unwrap_or("");
+                    let text = if text.trim().is_empty() {
+                        EMPTY_ASSISTANT_PLACEHOLDER
+                    } else {
+                        text
+                    };
                     result.push(serde_json::json!({
                         "role": "user",
-                        "content": msg.text_content().unwrap_or(""),
+                        "content": text,
                     }));
                 }
             },
@@ -256,7 +279,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
 
                 if let Some(text) = msg.text_content() {
-                    if !text.is_empty() {
+                    if !text.trim().is_empty() {
                         content_blocks.push(serde_json::json!({
                             "type": "text",
                             "text": text,
@@ -280,7 +303,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                 if content_blocks.is_empty() {
                     content_blocks.push(serde_json::json!({
                         "type": "text",
-                        "text": "",
+                        "text": EMPTY_ASSISTANT_PLACEHOLDER,
                     }));
                 }
 
@@ -298,12 +321,19 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                     Some(crate::types::MessageContent::Parts(parts)) => {
                         let blocks = content_parts_to_anthropic_blocks(parts, true);
                         if blocks.is_empty() {
-                            serde_json::json!("")
+                            serde_json::json!(EMPTY_ASSISTANT_PLACEHOLDER)
                         } else {
                             serde_json::Value::Array(blocks)
                         }
                     }
-                    _ => serde_json::json!(msg.text_content().unwrap_or("")),
+                    _ => {
+                        let text = msg.text_content().unwrap_or("");
+                        if text.trim().is_empty() {
+                            serde_json::json!(EMPTY_ASSISTANT_PLACEHOLDER)
+                        } else {
+                            serde_json::json!(text)
+                        }
+                    }
                 };
 
                 let tool_result_block = serde_json::json!({

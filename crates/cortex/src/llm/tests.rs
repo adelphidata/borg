@@ -3508,3 +3508,116 @@ async fn restored_primary_refailure_reparks_with_fresh_cooldown() {
     );
     assert!(!client.maybe_restore_primary());
 }
+
+/// Collect every `{"type":"text","text":…}` value anywhere in the Anthropic
+/// message array — the shape Anthropic rejects when it is whitespace-only.
+fn collect_anthropic_text_blocks(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(s) = map.get("text").and_then(|t| t.as_str()) {
+                    out.push(s.to_string());
+                }
+            }
+            for val in map.values() {
+                collect_anthropic_text_blocks(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_anthropic_text_blocks(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn anthropic_messages_never_emit_blank_text_block() {
+    // "text content blocks must contain non-whitespace text" — the 400 this
+    // guards. Blank user/assistant/tool text and the empty-content repair
+    // (which used to push a literal "") were all reachable.
+    let mut assistant_with_calls = Message::assistant("  ");
+    assistant_with_calls.tool_calls = Some(vec![ToolCall {
+        id: "call_1".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "run_shell".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+
+    let messages = vec![
+        Message::user("   "),
+        Message::assistant("\n\t"),
+        assistant_with_calls,
+        Message::tool_result("call_1", "  "),
+    ];
+    let built = crate::llm::anthropic::build_anthropic_messages(&messages);
+    let body = serde_json::Value::Array(built);
+
+    let mut texts = Vec::new();
+    collect_anthropic_text_blocks(&body, &mut texts);
+    for t in &texts {
+        assert!(
+            !t.trim().is_empty(),
+            "blank text block would 400 at Anthropic; body: {body}"
+        );
+    }
+
+    // A message whose content array is empty is rejected too.
+    for msg in body.as_array().unwrap() {
+        if let Some(arr) = msg["content"].as_array() {
+            assert!(!arr.is_empty(), "empty content array; body: {body}");
+        }
+    }
+}
+
+#[test]
+fn sanitize_drops_whitespace_only_user_message() {
+    // Whitespace-only content used to pass the `is_empty` guard and reach
+    // the wire as a real (rejected) turn.
+    let messages = vec![
+        Message::user("real question"),
+        Message::user("   \n "),
+        Message::assistant("answer"),
+    ];
+    let sanitized = sanitize_openai_messages(&messages);
+    assert_eq!(
+        sanitized.len(),
+        2,
+        "the blank user turn must be dropped: {sanitized:?}"
+    );
+    assert!(sanitized
+        .iter()
+        .all(|m| m.text_content() != Some("   \n ")));
+}
+
+#[test]
+fn sanitize_keeps_whitespace_only_assistant_that_has_tool_calls() {
+    // Over-drop guard: blank text alongside a real tool call must keep the
+    // turn — dropping it strands the following tool_result.
+    let mut assistant = Message::assistant("  ");
+    assistant.tool_calls = Some(vec![ToolCall {
+        id: "call_9".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_memory".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+    let messages = vec![
+        Message::user("go"),
+        assistant,
+        Message::tool_result("call_9", "ok"),
+    ];
+    let sanitized = sanitize_openai_messages(&messages);
+    assert_eq!(sanitized.len(), 3, "got: {sanitized:?}");
+    assert_eq!(
+        sanitized[1]
+            .tool_calls
+            .as_ref()
+            .map(|c| c[0].id.as_str()),
+        Some("call_9")
+    );
+}
