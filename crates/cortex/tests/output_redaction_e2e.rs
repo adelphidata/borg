@@ -1,5 +1,4 @@
-#![cfg(feature = "phase9-tests-disabled")]
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::await_holding_lock, clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end coverage for the output-redaction policy: install the
 //! process-global policy with a real SQLite-backed audit sink, drive it
 //! through the same call shape that the gateway dispatch uses
@@ -46,10 +45,27 @@ impl Drop for PolicyGuard {
     }
 }
 
-#[test]
-fn gateway_call_shape_redacts_and_audits() {
+/// Wait until the redaction-audit table holds at least `want` rows.
+///
+/// The audit write is `tokio::spawn`'d fire-and-forget inside
+/// `RedactionPolicy::from_db`, so it is not observable the instant `apply`
+/// returns. Poll rather than sleep a fixed amount: fast when the write lands
+/// immediately, and it still fails (rather than hangs) if it never happens.
+async fn await_redaction_rows(db: &Arc<Mutex<cortex::db::Database>>, want: i64) -> i64 {
+    for _ in 0..200 {
+        let n = db.lock().unwrap().count_redactions().await.unwrap();
+        if n >= want {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    db.lock().unwrap().count_redactions().await.unwrap()
+}
+
+#[tokio::test]
+async fn gateway_call_shape_redacts_and_audits() {
     // Build a fresh test DB and install a policy backed by it.
-    let db = Arc::new(Mutex::new(common::test_db()));
+    let db = Arc::new(Mutex::new(common::test_db().await));
     let guard = PolicyGuard::install(RedactionPolicy::from_db(true, db.clone()));
 
     // This is the exact call shape `gateway::dispatch_webhook` uses today.
@@ -75,10 +91,12 @@ fn gateway_call_shape_redacts_and_audits() {
 
     // Audit row was written into the same DB the policy was constructed
     // against. Cross-process operators reading the table see the row.
+    await_redaction_rows(&db, 1).await;
     let rows = db
         .lock()
         .unwrap()
         .recent_redactions(10)
+        .await
         .expect("read audit");
     assert_eq!(rows.len(), 1, "expected one audit row, got {rows:?}");
     assert_eq!(rows[0].sink, "channel:telegram");
@@ -101,12 +119,12 @@ fn gateway_call_shape_redacts_and_audits() {
     drop(guard);
 }
 
-#[test]
-fn live_toggle_disables_redaction_immediately() {
+#[tokio::test]
+async fn live_toggle_disables_redaction_immediately() {
     // Operator-toggle contract: flipping `security.output_redaction` from
     // true to false reinstalls the global policy. The very next message
     // must pass through unchanged, and no audit row may be written.
-    let db = Arc::new(Mutex::new(common::test_db()));
+    let db = Arc::new(Mutex::new(common::test_db().await));
     let guard = PolicyGuard::install(RedactionPolicy::from_db(true, db.clone()));
 
     // First call with policy ON — produces an audit row.
@@ -117,7 +135,7 @@ fn live_toggle_disables_redaction_immediately() {
             "k=AKIAIOSFODNN7EXAMPLE",
         )
         .into_owned();
-    let before = db.lock().unwrap().count_redactions().unwrap();
+    let before = await_redaction_rows(&db, 1).await;
     assert_eq!(before, 1);
 
     // Re-install with policy OFF — emulates `/settings` toggling
@@ -129,7 +147,7 @@ fn live_toggle_disables_redaction_immediately() {
         .apply(OutputSink::Channel("slack"), Some("u:t"), raw)
         .into_owned();
     assert_eq!(out, raw, "disabled policy must pass through verbatim");
-    let after = db.lock().unwrap().count_redactions().unwrap();
+    let after = db.lock().unwrap().count_redactions().await.unwrap();
     assert_eq!(after, before, "no new audit row after live disable");
 
     drop(guard);
