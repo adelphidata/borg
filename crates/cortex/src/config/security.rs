@@ -251,6 +251,20 @@ pub struct SecurityConfig {
     /// Pre-flight gate for outbound URLs (`web_fetch`, `browser.navigate`).
     #[serde(default)]
     pub url_policy: UrlPolicyConfig,
+    /// Additionally confine scheduled `type=command` tasks (and their
+    /// `pre_run_command`) in the platform sandbox — macOS Seatbelt, Linux
+    /// bubblewrap — scoped to `$HOME` with `blocked_paths` denied.
+    ///
+    /// Default off, deliberately. `run_shell` itself only sandbox-wraps inside
+    /// workspace-rooted sessions, so leaving this off is *parity* with the
+    /// interactive path, not a weaker posture; turning it on retroactively
+    /// confines automations that have been writing outside `$HOME` for months.
+    ///
+    /// The `ExecutionPolicy` and control-plane denials are NOT gated by this
+    /// key. Those are the security boundary and always apply — an off-switch
+    /// there would be an approval prompt by another name.
+    #[serde(default)]
+    pub scheduled_command_sandbox: bool,
     /// Base64-encoded Ed25519 public keys trusted to sign WASM plugin
     /// manifests. `borg plugin install` rejects any package whose publisher
     /// key is not in this list. Empty by default — operators must opt in.
@@ -329,6 +343,7 @@ impl Default for SecurityConfig {
             kek_backend: KekBackend::Auto,
             max_shell_output_bytes: default_max_shell_output_bytes(),
             url_policy: UrlPolicyConfig::default(),
+            scheduled_command_sandbox: false,
             trusted_publisher_keys: Vec::new(),
             deprecated_publisher_keys: Vec::new(),
         }

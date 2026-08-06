@@ -9,6 +9,7 @@ use crate::agent::AgentEvent;
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 use crate::policy::ExecutionPolicy;
+use crate::security::redact_command_for_audit;
 
 /// Bounded accumulator for a single output stream: retains the first half of
 /// the byte budget from the head and the last half from the tail, eliding the
@@ -841,28 +842,6 @@ async fn deny_control_plane_write(command: &str) -> String {
     "Shell command denied: writing Borg control-plane files (config DB, secrets, hooks.json) \
      or changing settings via `borg settings set` is not permitted."
         .to_string()
-}
-
-/// Bound the size of the command string we put in the audit chain. Keeps the
-/// hash-chained payload from ballooning if the model emits a multi-kilobyte
-/// shell command, and replaces control bytes so the JSON stays well-formed.
-///
-/// `MAX_CHARS` is a *char* count, not a byte count. Worst-case byte size of the
-/// truncated body is `MAX_CHARS × 4` (pure 4-byte UTF-8) plus the `…<truncated>`
-/// suffix — well within JSON-payload sanity.
-fn redact_command_for_audit(command: &str) -> String {
-    const MAX_CHARS: usize = 256;
-    let cleaned: String = command
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if cleaned.chars().count() <= MAX_CHARS {
-        cleaned
-    } else {
-        let mut s = cleaned.chars().take(MAX_CHARS).collect::<String>();
-        s.push_str("…<truncated>");
-        s
-    }
 }
 
 #[cfg(test)]

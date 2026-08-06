@@ -387,10 +387,10 @@ async fn manage_tasks_run_now(args: &serde_json::Value) -> Result<String> {
     .await
 }
 
-pub async fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> Result<String> {
+pub async fn handle_manage_cron(args: &serde_json::Value, config: &Config) -> Result<String> {
     let action = require_str_param(args, "action")?.to_string();
     match action.as_str() {
-        "create" => manage_cron_create(args).await,
+        "create" => manage_cron_create(args, config).await,
         "list" => manage_cron_list().await,
         "get" => {
             let job_id = require_str_param(args, "job_id")?.to_string();
@@ -531,7 +531,7 @@ pub async fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> R
     }
 }
 
-async fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
+async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result<String> {
     let schedule = require_str_param(args, "schedule")?.to_string();
     let command = require_str_param(args, "command")?.to_string();
     let name = args["name"]
@@ -541,6 +541,15 @@ async fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
             let short: String = command.chars().take(30).collect();
             format!("cron: {short}")
         });
+
+    // Refuse at create time what the runner would refuse at fire time. The
+    // runner remains the boundary (rows are mutable afterwards, and tasks
+    // already on disk predate this check) — this exists so the model learns
+    // immediately instead of persisting a task that fails unattended later.
+    if let Err(denial) = tasks::check_scheduled_command(&command, &config.policy) {
+        tasks::audit_scheduled_denial(&command, denial).await;
+        return Ok(format!("Error: {}", denial.message()));
+    }
 
     let cron_7 = tasks::convert_5_to_7_field(&schedule);
     if let Err(e) = tasks::validate_schedule("cron", &cron_7) {
@@ -631,4 +640,47 @@ pub async fn update_task_status(task_id: &str, status: &str, verb: &str) -> Resu
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused command must be rejected *before* `with_db`, so this test
+    /// needs no database — and the absence of a DB is itself the assertion
+    /// that no row was created.
+    #[tokio::test]
+    async fn manage_cron_create_refuses_policy_denied_command() {
+        let config = Config::default();
+        for command in ["rm -rf /", "echo pwned > ~/.borg/hooks.json"] {
+            let args = serde_json::json!({
+                "schedule": "0 3 * * *",
+                "command": command,
+            });
+            let out = manage_cron_create(&args, &config)
+                .await
+                .expect("handler returns Ok with an error string");
+            assert!(
+                out.starts_with("Error: Scheduled command refused"),
+                "expected a refusal for {command:?}, got: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_cron_create_rejects_bad_schedule_for_allowed_command() {
+        // Guards the ordering: an ordinary command must reach the schedule
+        // validation rather than being swallowed by the policy gate.
+        let args = serde_json::json!({
+            "schedule": "not a cron expression",
+            "command": "echo hello",
+        });
+        let out = manage_cron_create(&args, &Config::default())
+            .await
+            .expect("handler returns Ok with an error string");
+        assert!(
+            out.contains("Invalid schedule"),
+            "allowed command must fall through to schedule validation, got: {out}"
+        );
+    }
 }

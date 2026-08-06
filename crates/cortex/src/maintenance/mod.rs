@@ -292,6 +292,32 @@ pub async fn apply_remediation_key(
 ///
 /// The daemon's task dispatcher and `Admin.Heal` RPC call the registry
 /// variant so subprocess reap/auto-kill actually runs in production.
+/// Log every active `type=command` scheduled task whose command the
+/// execution-policy gate would now refuse.
+///
+/// Purely advisory: the task rows are left alone, because silently rewriting
+/// or disabling an operator's automation would be worse than the refusal it
+/// is about to hit. Returns the number of tasks flagged so callers (and tests)
+/// can assert on it.
+async fn warn_denied_command_tasks(db: &Database, config: &Config) -> Result<usize> {
+    let mut flagged = 0;
+    for task in db.list_tasks().await? {
+        if task.task_type != "command" || task.status != crate::tasks::TASK_STATUS_ACTIVE {
+            continue;
+        }
+        if let Err(denial) = crate::tasks::check_scheduled_command(&task.prompt, &config.policy) {
+            flagged += 1;
+            tracing::warn!(
+                task_id = %task.id,
+                task_name = %task.name,
+                "scheduled command will be refused on its next run: {}",
+                denial.message()
+            );
+        }
+    }
+    Ok(flagged)
+}
+
 pub async fn run_daily_maintenance(db: &Database, config: &Config) -> Result<MaintenanceReport> {
     run_daily_maintenance_with_registry(db, config, None).await
 }
@@ -460,6 +486,14 @@ pub async fn run_daily_maintenance_with_registry(
             }
             Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
         }
+    }
+
+    // 5_gate. Warn about scheduled `type=command` tasks the execution-policy
+    //    gate would now refuse. Read-only and unbudgeted: it mutates nothing,
+    //    it just gives the operator notice *before* the next fire rather than
+    //    letting a long-standing automation start failing unannounced.
+    if let Err(e) = warn_denied_command_tasks(db, config).await {
+        tracing::warn!("maintenance: scheduled-command policy scan failed: {e}");
     }
 
     // 5_subproc. Subprocess registry sweep. Three sub-steps:
@@ -1401,5 +1435,83 @@ mod tests {
         let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
         assert_eq!(report.subprocess_dead_reaped, 0);
         assert_eq!(report.subprocess_auto_killed, 0);
+    }
+}
+
+/// Live tests for the scheduled-command policy scan. Separate from the
+/// feature-gated `tests` module above, which is a disabled lane.
+#[cfg(test)]
+mod command_gate_scan_tests {
+    use super::*;
+
+    async fn seed(db: &Database, id: &str, command: &str, task_type: &str) {
+        db.create_task(&crate::db::NewTask {
+            id,
+            name: id,
+            prompt: command,
+            schedule_type: "cron",
+            schedule_expr: "0 0 3 * * * *",
+            timezone: "local",
+            next_run: Some(chrono::Utc::now().timestamp() + 3600),
+            max_retries: Some(0),
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type,
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("seed task");
+    }
+
+    #[tokio::test]
+    async fn scan_flags_only_command_tasks_the_gate_would_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open_at(&tmp.path().join("borg.db")).await.expect("open db");
+
+        seed(&db, "denied-policy", "rm -rf /", "command").await;
+        seed(
+            &db,
+            "denied-control-plane",
+            "echo x > ~/.borg/hooks.json",
+            "command",
+        )
+        .await;
+        seed(&db, "allowed", "rsync -a ~/notes/ ~/backup/", "command").await;
+        // A prompt task whose *text* mentions a refused command is not a
+        // shell command and must not be flagged — the scan is about the
+        // execution surface, not about prose.
+        seed(&db, "prompt-task", "explain why rm -rf / is bad", "prompt").await;
+
+        let flagged = warn_denied_command_tasks(&db, &Config::default())
+            .await
+            .expect("scan");
+        assert_eq!(
+            flagged, 2,
+            "expected exactly the two refused command tasks to be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_ignores_paused_and_cancelled_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open_at(&tmp.path().join("borg.db")).await.expect("open db");
+
+        seed(&db, "paused-denied", "rm -rf /", "command").await;
+        db.update_task_status("paused-denied", crate::tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+
+        let flagged = warn_denied_command_tasks(&db, &Config::default())
+            .await
+            .expect("scan");
+        assert_eq!(
+            flagged, 0,
+            "a paused task is not going to fire, so warning about it is noise"
+        );
     }
 }
