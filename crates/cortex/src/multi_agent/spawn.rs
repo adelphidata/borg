@@ -24,7 +24,7 @@ use super::{
 /// that produces real progress inside the window recovers and finalizes
 /// normally; one that stays frozen is cancelled with a structured stall
 /// error so the parent hears a terminal outcome instead of waiting forever.
-const STALL_GRACE_CYCLES: u32 = 4;
+pub(super) const STALL_GRACE_CYCLES: u32 = 4;
 
 /// Prefixed to every parent-supplied `<context>` block so the child reads the
 /// handoff as a snapshot taken when it was spawned, not guaranteed-current
@@ -506,8 +506,7 @@ fn run_sub_agent(
         // before the first heartbeat fires, not race the spawn.
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat_tick.tick().await;
-        let mut idle_cycles: u32 = 0;
-        let mut stalled_emitted = false;
+        let mut watchdog = super::stall::StallWatchdog::new(stale_threshold);
         let mut stall_error: Option<String> = None;
 
         // Track apply_patch calls that have NOT yet had a ToolResult: the
@@ -561,18 +560,16 @@ fn run_sub_agent(
                     break;
                 }
                 event = event_rx.recv() => {
-                    // Reset the idle counter only on real progress
-                    // signals — TextDelta (LLM produced text) and
-                    // ToolResult (a tool finished). Chatty noise like
-                    // ToolOutputDelta from a hung shell's stdout MUST
-                    // NOT reset, or a hung child that keeps streaming
-                    // stdout never trips the `Stalled` watchdog the
-                    // operator relies on.
+                    // Which events count as forward progress — and, just as
+                    // importantly, which deliberately do not — is documented
+                    // on `StallWatchdog::on_event`.
+                    if let Some(ref ev) = event {
+                        if watchdog.on_event(ev) {
+                            live.touch();
+                        }
+                    }
                     match event {
                         Some(AgentEvent::TextDelta(delta)) => {
-                            idle_cycles = 0;
-                            stalled_emitted = false;
-                            live.touch();
                             final_text.push_str(&delta);
                         }
                         Some(AgentEvent::TurnComplete) | None => {
@@ -597,12 +594,6 @@ fn run_sub_agent(
                             }
                         }
                         Some(AgentEvent::ToolResult { tool_call_id, name, result }) => {
-                            // ToolResult is a real progress signal — reset
-                            // idle counter even on failure (a failed tool
-                            // is still observable forward progress).
-                            idle_cycles = 0;
-                            stalled_emitted = false;
-                            live.touch();
                             // Display-only: under parallel tool fan-out the
                             // first result clears the field while a sibling
                             // is still running; the next ToolExecuting
@@ -629,23 +620,21 @@ fn run_sub_agent(
                     if let Some(ref b) = bus {
                         b.publish(AgentTreeEventKind::Heartbeat, &info);
                     }
-                    idle_cycles = idle_cycles.saturating_add(1);
-                    if !stalled_emitted && idle_cycles >= stale_threshold {
-                        stalled_emitted = true;
-                        if let Some(ref b) = bus {
-                            b.publish(AgentTreeEventKind::Stalled, &info);
+                    match watchdog.on_tick() {
+                        super::stall::TickOutcome::Quiet => {}
+                        super::stall::TickOutcome::EmitStalled => {
+                            if let Some(ref b) = bus {
+                                b.publish(AgentTreeEventKind::Stalled, &info);
+                            }
                         }
-                    }
-                    if stalled_emitted
-                        && idle_cycles >= stale_threshold.saturating_add(STALL_GRACE_CYCLES)
-                    {
+                        super::stall::TickOutcome::Cancel => {
                         // Grace exhausted with zero progress: cancel the
                         // wedged child and surface a structured stall error.
                         // The cancel unwinds cancel-aware await points in the
                         // send task; the bounded join below covers the rest.
                         let (_, in_tool) = live.snapshot();
                         let phase = if in_tool.is_some() { "in_tool" } else { "idle" };
-                        let quiet_secs = u64::from(idle_cycles) * heartbeat_interval_secs;
+                        let quiet_secs = u64::from(watchdog.idle_cycles()) * heartbeat_interval_secs;
                         let threshold_secs =
                             u64::from(stale_threshold) * heartbeat_interval_secs;
                         let grace_secs =
@@ -664,6 +653,7 @@ fn run_sub_agent(
                         ));
                         cancel.cancel();
                         break;
+                        }
                     }
                 }
                 msg = input_rx.recv() => {
