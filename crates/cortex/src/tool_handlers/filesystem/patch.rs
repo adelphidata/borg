@@ -55,10 +55,10 @@ fn deny_skill_patch(
     skills_dir: &std::path::Path,
     config: &Config,
 ) -> Option<String> {
-    let paths = extract_patch_paths(patch_text);
+    let paths = guarded_patch_paths(patch_text).unwrap_or_default();
     if paths.is_empty() {
-        // No extractable file markers: nothing legitimate to write. Refuse
-        // rather than hand an unvetted patch body to the applicator.
+        // No determinable targets: nothing legitimate to write. Refuse rather
+        // than hand an unvetted patch body to the applicator.
         return Some(
             "Access denied: could not determine target paths from the skill patch".to_string(),
         );
@@ -235,7 +235,7 @@ pub fn handle_apply_patch_with_context(
         }
     }
 
-    let paths = extract_patch_paths(patch_text);
+    let paths = guarded_patch_paths(patch_text).unwrap_or_default();
     for raw_path in &paths {
         let resolved = ctx.resolve_path_for_write(raw_path)?;
         if is_blocked_path(
@@ -471,7 +471,7 @@ fn handle_apply_patch_via_text_bridge(
     bridge: &dyn crate::execution_context::TextFileBridge,
 ) -> Result<String> {
     let mut resolved_paths = HashMap::new();
-    for raw_path in extract_patch_paths(patch_text) {
+    for raw_path in guarded_patch_paths(patch_text).unwrap_or_default() {
         let resolved = ctx.resolve_path_for_write(&raw_path)?;
         if is_blocked_path(
             &resolved,
@@ -704,15 +704,19 @@ fn patch_has_absolute_paths(patch_text: &str) -> bool {
     false
 }
 
-/// Extract all file paths referenced in a patch text.
-fn extract_patch_paths(patch_text: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in patch_text.lines() {
-        for path in extract_paths_from_line(line) {
-            paths.push(path.to_string());
-        }
-    }
-    paths
+/// Paths a patch would write, for the pre-write security guard.
+///
+/// Derived from the parser rather than by scanning the text for DSL markers:
+/// the applicator also accepts unified diffs (`parse_patch_with_mode` routes
+/// them to `parse_unified_diff`), whose headers carry no DSL marker. A marker
+/// scan therefore reports "touches nothing" for such a patch and waves it past
+/// `is_blocked_path` / `is_control_plane_write_denied` entirely.
+///
+/// `None` means the patch does not parse — it writes nothing, so callers hand
+/// it to the applicator for the real diagnostic rather than reporting a
+/// security denial. Guarding is never skipped for a patch that can write.
+fn guarded_patch_paths(patch_text: &str) -> Option<Vec<String>> {
+    coding::patch_target_paths(patch_text).ok()
 }
 
 /// Patch DSL marker prefixes (each ends with a single trailing space before the path).
@@ -1242,6 +1246,59 @@ mod tests {
     }
 
     #[test]
+    fn unified_diff_cannot_write_a_blocked_path() {
+        // End-to-end regression for the guard bypass: the handler must deny a
+        // unified diff targeting a blocked path, and must not create the file.
+        // Before the fix this returned "Patch applied successfully" and wrote
+        // `.env` — inside $HOME that reaches `.ssh/`, `.aws/`, and hooks.json.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch = "\
+diff --git a/.env b/.env
+--- /dev/null
++++ b/.env
+@@ -0,0 +1 @@
++SECRET=leaked
+";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Access denied") && result.contains("blocked path"),
+            "unified diff to a blocked path must be denied; got: {result}"
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "denied patch must not have written the file"
+        );
+    }
+
+    #[test]
+    fn unified_diff_to_an_ordinary_path_still_applies() {
+        // The guard must not turn into a blanket refusal of unified diffs —
+        // this is the half that fails if the fix is written too broadly.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch = "\
+diff --git a/notes.txt b/notes.txt
+--- /dev/null
++++ b/notes.txt
+@@ -0,0 +1 @@
++hello
+";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Patch applied successfully"),
+            "ordinary unified diff must still apply; got: {result}"
+        );
+        assert!(root.join("notes.txt").exists());
+    }
+
+    #[test]
     fn apply_patch_unified_unknown_target() {
         let config = Config::default();
         let args = json!({"patch": "*** Begin Patch\n*** End Patch", "target": "invalid"});
@@ -1634,15 +1691,41 @@ mod tests {
     }
 
     #[test]
-    fn extract_patch_paths_includes_move_destination() {
-        let paths = extract_patch_paths("*** Move File: src.txt -> /tmp/dest.txt");
-        assert_eq!(
-            paths,
-            vec!["src.txt".to_string(), "/tmp/dest.txt".to_string()]
-        );
+    fn patch_has_absolute_paths_sees_move_destination() {
         assert!(patch_has_absolute_paths(
             "*** Move File: src.txt -> /tmp/dest.txt"
         ));
+    }
+
+    #[test]
+    fn guarded_paths_cover_unified_diff_so_blocked_paths_cannot_be_bypassed() {
+        // Regression: the guard used to scan for `*** Update File:` markers,
+        // but the applicator also accepts unified diffs. A diff carrying no
+        // DSL marker yielded an empty path list, so the `for` loop that calls
+        // is_blocked_path / is_control_plane_write_denied never ran and a
+        // patch could write `.env`, `.ssh/authorized_keys`, or
+        // `~/.borg/hooks.json` (arbitrary shell at every hook point).
+        let patch = "\
+diff --git a/.env b/.env
+--- a/.env
++++ b/.env
+@@ -1 +1 @@
+-FOO=1
++FOO=2
+";
+        let paths = guarded_patch_paths(patch).expect("unified diff must parse");
+        assert_eq!(
+            paths,
+            vec![".env".to_string()],
+            "the guard must see the path the applicator will write"
+        );
+    }
+
+    #[test]
+    fn guarded_paths_are_none_for_an_unparseable_patch() {
+        // Such a patch writes nothing, so it is handed to the applicator for
+        // the real parse diagnostic rather than a misleading security denial.
+        assert!(guarded_patch_paths("this is not a patch").is_none());
     }
 
     // ── normalize_patch_paths unit tests ──
@@ -1697,9 +1780,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_patch_paths_finds_all() {
+    fn guarded_paths_find_every_dsl_target() {
         let input = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n@@\n-y\n+z\n*** Delete File: c.txt\n*** End Patch";
-        let paths = extract_patch_paths(input);
+        let paths = guarded_patch_paths(input).expect("DSL patch must parse");
         assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
     }
 

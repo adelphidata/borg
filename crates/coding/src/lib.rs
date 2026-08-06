@@ -66,9 +66,92 @@ pub fn apply_patch_to_dir_with_mode(
     apply::apply_patch(&patch, base_dir)
 }
 
+/// Every filesystem path a patch would touch, in the order the applicator
+/// would touch them, including the destination of a move.
+///
+/// This is the authority for pre-write security checks (blocked paths,
+/// control-plane deny). Callers must derive the guarded set from here rather
+/// than scanning the patch text for DSL markers: `parse_patch_with_mode` also
+/// accepts unified diffs, whose headers carry no DSL marker, so a text scan
+/// silently returns "touches nothing" for a patch that writes anywhere.
+///
+/// Returns `Err` when the patch does not parse — such a patch writes nothing,
+/// so callers may forward it to the applicator for the real diagnostic instead
+/// of reporting it as a security denial.
+pub fn patch_target_paths(patch_text: &str) -> Result<Vec<String>, parser::ParseError> {
+    let patch = parser::parse_patch_with_mode(patch_text, ParseMode::Lenient)?;
+    let mut paths = Vec::new();
+    for op in &patch.operations {
+        match op {
+            parser::PatchOperation::AddFile { path, .. }
+            | parser::PatchOperation::DeleteFile { path } => paths.push(path.clone()),
+            parser::PatchOperation::UpdateFile {
+                path, move_to: to, ..
+            } => {
+                paths.push(path.clone());
+                if let Some(to) = to {
+                    paths.push(to.clone());
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_target_paths_covers_unified_diff_headers() {
+        // The security guard reads this list. A unified diff carries no DSL
+        // marker, so a marker text-scan reports "no paths" and every
+        // pre-write check is skipped for a patch that does write.
+        let patch = "\
+diff --git a/.env b/.env
+--- a/.env
++++ b/.env
+@@ -1 +1 @@
+-FOO=1
++FOO=2
+";
+        assert_eq!(patch_target_paths(patch).unwrap(), vec![".env".to_string()]);
+    }
+
+    #[test]
+    fn patch_target_paths_includes_move_destination() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src.txt
+*** Move to: dest.txt
+@@
+-a
++b
+*** End Patch";
+        assert_eq!(
+            patch_target_paths(patch).unwrap(),
+            vec!["src.txt".to_string(), "dest.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn patch_target_paths_reports_add_and_delete() {
+        let patch = "\
+*** Begin Patch
+*** Add File: a.txt
++x
+*** Delete File: c.txt
+*** End Patch";
+        assert_eq!(
+            patch_target_paths(patch).unwrap(),
+            vec!["a.txt".to_string(), "c.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn patch_target_paths_errors_on_unparseable_patch() {
+        assert!(patch_target_paths("not a patch at all").is_err());
+    }
 
     #[test]
     fn apply_patch_to_dir_add_file() {
