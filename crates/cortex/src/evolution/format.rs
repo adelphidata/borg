@@ -142,7 +142,7 @@ pub fn format_archetype_scores(state: &EvolutionState) -> String {
         .iter()
         .map(|a| (*a, *state.archetype_scores.get(a).unwrap_or(&0)))
         .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     let max_score = sorted.first().map(|(_, s)| *s).unwrap_or(1).max(1);
 
@@ -273,7 +273,7 @@ pub fn format_xp_summary(summary: &XpSummary) -> String {
             .iter()
             .filter_map(|a| summary.archetype_breakdown.get(a).map(|xp| (*a, *xp)))
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
 
         out.push('\n');
         out.push_str("  Archetypes (7d)\n");
@@ -360,7 +360,7 @@ pub fn format_archetype_scores_with_momentum(state: &EvolutionState) -> String {
         .iter()
         .map(|a| (*a, *state.archetype_scores.get(a).unwrap_or(&0)))
         .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     let max_score = sorted.first().map(|(_, s)| *s).unwrap_or(1).max(1);
 

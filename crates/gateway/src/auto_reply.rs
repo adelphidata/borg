@@ -5,18 +5,13 @@ use tokio::sync::RwLock;
 use cortex::config::AutoReplyConfig;
 
 /// Current auto-reply state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum AutoReplyState {
     /// Agent is available and processing messages normally.
+    #[default]
     Available,
     /// Agent is away with a custom or default message.
     Away(String),
-}
-
-impl Default for AutoReplyState {
-    fn default() -> Self {
-        Self::Available
-    }
 }
 
 /// Shared auto-reply state handle.

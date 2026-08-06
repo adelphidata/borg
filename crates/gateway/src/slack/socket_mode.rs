@@ -306,14 +306,14 @@ where
                 match handler(env) {
                     Dispatch::Ack => {
                         let ack = build_ack(&envelope_id, false, None);
-                        if let Err(e) = sink.send(Message::Text(ack.to_string())).await {
+                        if let Err(e) = sink.send(Message::Text(ack.to_string().into())).await {
                             warn!("Slack Socket Mode: ack send failed for envelope {envelope_id} ({e}); reconnecting");
                             return Ok(SessionEnd::Reconnect);
                         }
                     }
                     Dispatch::AckWith(p) => {
                         let ack = build_ack(&envelope_id, accepts_payload, Some(p));
-                        if let Err(e) = sink.send(Message::Text(ack.to_string())).await {
+                        if let Err(e) = sink.send(Message::Text(ack.to_string().into())).await {
                             warn!("Slack Socket Mode: ack send failed for envelope {envelope_id} ({e}); reconnecting");
                             return Ok(SessionEnd::Reconnect);
                         }

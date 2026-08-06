@@ -32,7 +32,7 @@ impl SlidingWindowLimiter {
         self.check_count += 1;
         // Amortized sweep: pruning every call would be O(keys) per request, and
         // never pruning leaks a window per distinct client IP.
-        if self.check_count % 50 == 0 {
+        if self.check_count.is_multiple_of(50) {
             self.prune_stale();
         }
 

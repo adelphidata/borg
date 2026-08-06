@@ -224,7 +224,7 @@ impl IngressGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.check_count += 1;
-        if inner.check_count % 50 == 0 {
+        if inner.check_count.is_multiple_of(50) {
             inner.prune_stale(self.window);
         }
 

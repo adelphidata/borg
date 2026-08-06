@@ -18,6 +18,9 @@
 //! in history — which only happens after the dispatcher runs the tool —
 //! proving the gate is what's stopping execution in the Plan-mode case.
 
+// Drives the whole agent loop, whose future type nests deep enough that layout
+// computation exceeds the default query depth.
+#![recursion_limit = "256"]
 #![allow(
     clippy::expect_used,
     clippy::field_reassign_with_default,

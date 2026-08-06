@@ -589,7 +589,7 @@ async fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>
         }
     }
     let mut sorted: Vec<(String, u32)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
     sorted.truncate(5);
     Ok(sorted)
 }
@@ -1184,37 +1184,35 @@ impl Hook for EvolutionHook {
                 is_error,
                 result,
                 ..
-            } => {
-                if !*is_error {
-                    let archetype = classify_tool_archetype(name, Some(result.as_str()));
-                    let is_creation = matches!(
-                        name.as_str(),
-                        "apply_patch" | "apply_skill_patch" | "create_channel" | "write_memory"
-                    );
-                    let (base, align_bonus) = if is_creation {
-                        let bonus = if archetype.is_some() {
-                            BONUS_XP_CREATION_ALIGNED
-                        } else {
-                            0
-                        };
-                        (BASE_XP_CREATION, bonus)
+            } if !*is_error => {
+                let archetype = classify_tool_archetype(name, Some(result.as_str()));
+                let is_creation = matches!(
+                    name.as_str(),
+                    "apply_patch" | "apply_skill_patch" | "create_channel" | "write_memory"
+                );
+                let (base, align_bonus) = if is_creation {
+                    let bonus = if archetype.is_some() {
+                        BONUS_XP_CREATION_ALIGNED
                     } else {
-                        let bonus = if archetype.is_some() {
-                            BONUS_XP_ALIGNED
-                        } else {
-                            0
-                        };
-                        (BASE_XP_TOOL_SUCCESS, bonus)
+                        0
                     };
+                    (BASE_XP_CREATION, bonus)
+                } else {
+                    let bonus = if archetype.is_some() {
+                        BONUS_XP_ALIGNED
+                    } else {
+                        0
+                    };
+                    (BASE_XP_TOOL_SUCCESS, bonus)
+                };
 
-                    let mood_before = self.snapshot_mood().await;
-                    self.record_xp(name, archetype, base, align_bonus).await;
+                let mood_before = self.snapshot_mood().await;
+                self.record_xp(name, archetype, base, align_bonus).await;
 
-                    if let Some(before) = mood_before {
-                        if let Some(after) = self.snapshot_mood().await {
-                            if before != after {
-                                self.emit_mood_changed(before, after, name).await;
-                            }
+                if let Some(before) = mood_before {
+                    if let Some(after) = self.snapshot_mood().await {
+                        if before != after {
+                            self.emit_mood_changed(before, after, name).await;
                         }
                     }
                 }

@@ -262,15 +262,11 @@ fn resolve_local_link(dest: &str) -> Option<String> {
     // Split off optional `#Lnnn` line anchor. A bare fragment (`#install`)
     // means an in-document anchor reference, not a file link — skip.
     let (path_part, anchor) = if let Some((p, rest)) = raw.rsplit_once('#') {
-        if let Some(n) = rest.strip_prefix('L') {
-            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
-                (p, Some(format!(":L{n}")))
-            } else {
-                return None;
-            }
-        } else {
+        let n = rest.strip_prefix('L')?;
+        if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
+        (p, Some(format!(":L{n}")))
     } else {
         (raw, None)
     };

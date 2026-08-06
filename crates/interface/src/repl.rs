@@ -153,11 +153,9 @@ pub async fn one_shot(message: &str, json_output: bool, _mode: Option<&str>) -> 
             }
             AgentEvent::ToolOutputDelta {
                 delta, is_stderr, ..
-            } => {
-                if !json_output {
-                    let prefix = if is_stderr { "! " } else { "" };
-                    eprintln!("  {prefix}{delta}");
-                }
+            } if !json_output => {
+                let prefix = if is_stderr { "! " } else { "" };
+                eprintln!("  {prefix}{delta}");
             }
             _ => {}
         }

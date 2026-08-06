@@ -339,10 +339,10 @@ fn process_agent_event(
         crate::agent::AgentEvent::Usage(usage) => {
             *tokens_used = tokens_used.saturating_add(usage.total_tokens);
         }
-        crate::agent::AgentEvent::ToolResult { name, result, .. } => {
-            if name == "write_memory" && result.starts_with("Written to memory: ") {
-                *successful_writes = successful_writes.saturating_add(1);
-            }
+        crate::agent::AgentEvent::ToolResult { name, result, .. }
+            if name == "write_memory" && result.starts_with("Written to memory: ") =>
+        {
+            *successful_writes = successful_writes.saturating_add(1);
         }
         _ => {}
     }

@@ -2,19 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Operating mode for a channel integration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelMode {
     /// Channel receives messages via HTTP webhooks.
+    #[default]
     Webhook,
     /// Channel actively polls for new messages.
     Poll,
-}
-
-impl Default for ChannelMode {
-    fn default() -> Self {
-        Self::Webhook
-    }
 }
 
 /// Parsed representation of a `channel.toml` manifest file.

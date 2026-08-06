@@ -228,7 +228,7 @@ pub fn replay_events_with_keys_at(
         .filter(|e| e.event_type == "level_up" || e.event_type == "milestone_unlocked")
         .cloned()
         .collect();
-    level_up_events_recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    level_up_events_recent.sort_by_key(|e| std::cmp::Reverse(e.created_at));
     level_up_events_recent.truncate(20);
 
     EvolutionState {

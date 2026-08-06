@@ -52,9 +52,14 @@ fn coerce_json_string_args(args: &Value) -> Option<Value> {
 /// level of stringification, not nested re-encoding.
 fn coerce_in_place(v: &mut Value) -> bool {
     match v {
+        // `fold`, not `any`: every child must be visited for its side effect.
+        // `any` short-circuits on the first coercion and would leave the rest
+        // of the arguments un-coerced.
+        #[allow(clippy::unnecessary_fold)]
         Value::Object(map) => map
             .values_mut()
             .fold(false, |acc, val| coerce_in_place(val) || acc),
+        #[allow(clippy::unnecessary_fold)]
         Value::Array(arr) => arr
             .iter_mut()
             .fold(false, |acc, item| coerce_in_place(item) || acc),

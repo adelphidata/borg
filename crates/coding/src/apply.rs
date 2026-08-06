@@ -639,7 +639,8 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
         );
     }
 
-    replacements.sort_by(|a, b| b.start_idx.cmp(&a.start_idx));
+    // Descending: applying from the bottom up keeps earlier indices valid.
+    replacements.sort_by_key(|r| std::cmp::Reverse(r.start_idx));
     for window in replacements.windows(2) {
         let earlier = &window[1];
         let later = &window[0];

@@ -1,5 +1,8 @@
 //! Webhook gateway for messaging channel integrations.
 
+// The webhook handlers nest deep async stacks (axum → reqwest → hyper), and
+// auto-trait solving for those future types exceeds the default limit.
+#![recursion_limit = "256"]
 #![cfg_attr(
     test,
     allow(

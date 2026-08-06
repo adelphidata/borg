@@ -243,7 +243,7 @@ pub async fn augment_with_links(
 
     let results = futures::future::join_all(futures).await;
 
-    for (url, result) in urls.iter().zip(results.into_iter()) {
+    for (url, result) in urls.iter().zip(results) {
         match result {
             Ok(content) if !content.trim().is_empty() => {
                 augmented.push_str(&format!(

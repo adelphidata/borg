@@ -14,6 +14,9 @@
 //! pre-send proactive pass leaves it alone while the truncation retry has
 //! real tokens to reclaim.
 
+// Drives the whole agent loop, whose future type nests deep enough that layout
+// computation exceeds the default query depth.
+#![recursion_limit = "256"]
 #![allow(
     clippy::expect_used,
     clippy::field_reassign_with_default,

@@ -298,7 +298,7 @@ pub fn bytes_to_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         anyhow::bail!(
             "Corrupted embedding data: length {} not aligned to 4 bytes",
             bytes.len()

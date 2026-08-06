@@ -6,7 +6,7 @@ repository = "https://github.com/adelphidata/borg"
 homepage = "https://github.com/adelphidata/borg"
 readme = "README.md"
 authors = ["Borg Contributors"]
-rust-version = "1.88"
+rust-version = "1.97"
 keywords = ["ai", "assistant", "agent", "llm", "cli"]
 categories = ["command-line-utilities"]
 
@@ -69,11 +69,9 @@ unicode-normalization = "0.1"
 unicode-width = "0.2"
 regex = "1"
 libsql = { version = "0.9", default-features = false, features = ["core", "encryption"] }
-# Pinned to keep MSRV at 1.88 — roaring 0.11.3+ requires rustc 1.90.
-# Revisit when the workspace rust-toolchain bumps past 1.90.
-roaring = "=0.11.2"
+roaring = "0.11"
 scraper = "0.22"
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 shellexpand = "3"
 sha2 = "0.10"
 hmac = "0.12"

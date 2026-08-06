@@ -273,7 +273,7 @@ impl Status for StatusSvc {
             })
             .collect();
         // Newest first.
-        recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        recent.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         // Per `level_from_xp` semantics, `xp_to_next_level` is `0` only at
         // a saturated stage cap; pass it through verbatim so the client
         // can decide how to render.

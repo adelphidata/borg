@@ -67,10 +67,8 @@ impl McpPopup {
                     };
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.rows.is_empty() {
-                    self.cursor = (self.cursor + 1) % self.rows.len();
-                }
+            KeyCode::Down | KeyCode::Char('j') if !self.rows.is_empty() => {
+                self.cursor = (self.cursor + 1) % self.rows.len();
             }
             _ => {}
         }

@@ -16,7 +16,7 @@ fn resolve_mentions(text: &str, mentions: &[Mention]) -> String {
     let mut result: Vec<char> = text.chars().collect();
     let mut sorted: Vec<&Mention> = mentions.iter().collect();
     // Process in reverse order so earlier indices stay valid after replacement.
-    sorted.sort_by(|a, b| b.start.unwrap_or(0).cmp(&a.start.unwrap_or(0)));
+    sorted.sort_by_key(|m| std::cmp::Reverse(m.start.unwrap_or(0)));
 
     for mention in sorted {
         let start = mention.start.unwrap_or(0) as usize;
@@ -75,11 +75,10 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
     let data_msg = if let Some(ref dm) = env.data_message {
         is_edit = false;
         dm
-    } else if let Some(ref edit) = env.edit_message {
+    } else {
+        let edit = env.edit_message.as_ref()?;
         is_edit = true;
         edit.data_message.as_ref()?
-    } else {
-        return None;
     };
 
     let mut text = data_msg.message.clone().unwrap_or_default();

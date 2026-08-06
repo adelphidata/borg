@@ -20,6 +20,11 @@ pub struct Principal {
 }
 
 /// Build the tonic interceptor that authenticates peers via mTLS + verifier.
+///
+/// The large `Err` variant is `tonic::Status`, whose size is fixed by tonic's
+/// own interceptor signature — boxing it here would no longer satisfy the
+/// trait bound tonic requires.
+#[allow(clippy::result_large_err)]
 pub fn auth_interceptor(
     verifier: Arc<dyn Verifier>,
     audit: AuditWriter,

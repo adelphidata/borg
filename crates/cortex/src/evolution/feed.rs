@@ -129,7 +129,7 @@ pub fn recent_xp_feed(events: &[EvolutionEvent], limit: usize) -> Vec<FeedEntry>
         });
     }
 
-    entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.ts));
     entries.truncate(limit);
     entries
 }

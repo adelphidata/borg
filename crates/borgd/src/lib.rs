@@ -5,6 +5,9 @@
 //! against a temp `BORG_HOME` without going through the binary entry point.
 
 #![warn(missing_docs)]
+// The task/gRPC spawn sites nest deep async stacks (tonic → hyper → tokio),
+// and auto-trait solving for those future types exceeds the default limit.
+#![recursion_limit = "256"]
 // Tests intentionally use `.expect()` for setup that, if it fails, means the
 // test environment itself is broken — the workspace-level lint is for
 // production code.

@@ -159,8 +159,10 @@ mod unix {
         // SIGKILL is deliberately NOT used by the parent for watchdog children
         // precisely so this catchable path can reap the server group.
         unsafe {
-            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+            // Cast through a pointer: a direct fn-item-to-integer cast is
+            // lint-worthy and not guaranteed to produce the fn's address.
+            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         }
 
         // Spawn the real server in its own process group so we can signal the

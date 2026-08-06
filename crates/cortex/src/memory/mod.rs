@@ -690,7 +690,7 @@ pub async fn list_memory_files() -> Result<Vec<MemoryFileInfo>> {
                 .map(|dt| dt.with_timezone(&chrono::Local)),
         })
         .collect();
-    files.sort_by(|a, b| a.modified_at.cmp(&b.modified_at));
+    files.sort_by_key(|f| f.modified_at);
     Ok(files)
 }
 

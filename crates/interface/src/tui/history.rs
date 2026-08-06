@@ -733,7 +733,7 @@ fn render_shell_result(
                 line_utils::truncate_line_with_ellipsis(parsed, hard_cap)
             })
             .collect();
-        let total_rows: usize = body_lines.iter().map(|l| row_cost(l)).sum();
+        let total_rows: usize = body_lines.iter().map(&row_cost).sum();
 
         let (taken, rows_used) = if collapsed && total_rows > SHELL_PREVIEW_LINES {
             let mut used = 0usize;
@@ -1181,7 +1181,7 @@ impl HistoryCell {
                         w.div_ceil(content_width)
                     }
                 };
-                let total_rows: usize = body_lines.iter().map(|l| row_cost(l)).sum();
+                let total_rows: usize = body_lines.iter().map(&row_cost).sum();
                 let should_collapse = *collapsed && total_rows > COLLAPSE_THRESHOLD;
 
                 let (taken, rows_used) = if should_collapse {
