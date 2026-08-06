@@ -226,6 +226,19 @@ pub struct LlmConfig {
     /// Provider-supplied hints still win.
     #[serde(default = "default_billing_cooldown_secs")]
     pub billing_cooldown_secs: u64,
+    /// Max concurrent in-flight *auxiliary* LLM requests, process-wide:
+    /// memory consolidation, title generation, scheduled-task preambles,
+    /// heartbeat reasoning.
+    ///
+    /// Background work is unattended and bursty — a nightly consolidation
+    /// pass plus a scheduled-task fan-out can otherwise open dozens of
+    /// simultaneous requests against one key, earning 429s that then bench
+    /// the credential for the interactive turn the user is waiting on.
+    /// Primary/interactive turns are never gated by this.
+    ///
+    /// Read once per process: changing it takes effect on the next restart.
+    #[serde(default = "default_aux_max_concurrent")]
+    pub aux_max_concurrent: u32,
     /// Soft cap on concurrent leases per credential. Above this, leases
     /// fan out across other keys; once every key is at the cap, the
     /// least-leased key wins ties.
@@ -251,6 +264,10 @@ fn default_credential_cooldown_secs() -> u64 {
 
 fn default_billing_cooldown_secs() -> u64 {
     3600
+}
+
+fn default_aux_max_concurrent() -> u32 {
+    2
 }
 
 fn default_max_concurrent_per_credential() -> u32 {
@@ -433,6 +450,7 @@ impl Default for LlmConfig {
             credential_strategy: crate::llm::credential_pool::CredentialStrategy::default(),
             credential_cooldown_secs: default_credential_cooldown_secs(),
             billing_cooldown_secs: default_billing_cooldown_secs(),
+            aux_max_concurrent: default_aux_max_concurrent(),
             max_concurrent_per_credential: default_max_concurrent_per_credential(),
             proactive_rate_limit_threshold_pct: default_proactive_rate_limit_threshold_pct(),
             proactive_rate_limit_min_window_secs: default_proactive_rate_limit_min_window_secs(),

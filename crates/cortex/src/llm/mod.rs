@@ -120,7 +120,8 @@ use crate::util::retry::{backoff_with_config, BackoffConfig};
 const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 
 mod anthropic;
-pub mod aux_model_picker;
+mod aux_admission;
+mod aux_model_picker;
 pub(crate) mod bedrock;
 mod blackhole;
 pub(crate) mod cloud_auth;
@@ -528,6 +529,10 @@ pub struct LlmClient {
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
     /// Per-call metadata supplied by borgd.
     cost_event_context: Option<CostEventContext>,
+    /// Admission limit for auxiliary work. `Some` only on clients built by
+    /// [`Self::for_auxiliary`]; primary/interactive clients are `None` and are
+    /// never gated.
+    aux_concurrency: Option<u32>,
 }
 
 /// Normalize a Gemini OpenAI-compat base URL by ensuring it resolves to the
@@ -1080,6 +1085,7 @@ impl LlmClient {
             system_stable_prefix: None,
             cost_event_sink: None,
             cost_event_context: None,
+            aux_concurrency: None,
         })
     }
 
@@ -1103,6 +1109,15 @@ impl LlmClient {
     /// Both fall-throughs are silent — auxiliary failover must never block
     /// the daemon at boot.
     pub async fn for_auxiliary(config: &Config) -> Result<Self> {
+        // Set on the wrapper, not inside, because the body has four
+        // `Self::new(config)` fall-through paths — tagging each one is exactly
+        // the kind of thing a later edit silently forgets.
+        let mut client = Self::for_auxiliary_inner(config).await?;
+        client.aux_concurrency = Some(config.llm.aux_max_concurrent);
+        Ok(client)
+    }
+
+    async fn for_auxiliary_inner(config: &Config) -> Result<Self> {
         let Some(aux) = config.llm.aux.as_ref() else {
             return Self::new(config).await;
         };
@@ -1863,6 +1878,8 @@ impl LlmClient {
         tx: mpsc::Sender<StreamEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        let _aux_slot = self.acquire_aux_slot().await;
+
         // Strip images for non-vision models (safety net)
         let messages = if !self.provider.supports_vision(&self.llm_config.model) {
             strip_images(messages)
@@ -2156,7 +2173,25 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
+        let _aux_slot = self.acquire_aux_slot().await;
         self.chat_http_transport_inner(messages, tools).await
+    }
+
+    /// Take an auxiliary admission slot, if this client is an aux client.
+    ///
+    /// Held for the whole call — including every fallback-slot attempt inside
+    /// it — and dropped on every exit path because it is a guard binding.
+    ///
+    /// Deliberately NOT taken in `chat_http_transport_inner`: that sits below
+    /// the fallback-chain loop, so acquiring there would re-enter the gate
+    /// while already holding a permit and self-deadlock at a limit of 1.
+    /// `chat_streamed` doesn't take one either — it delegates to `chat` or
+    /// `stream_chat_with_cancel`, both of which do.
+    async fn acquire_aux_slot(&self) -> Option<tokio::sync::SemaphorePermit<'static>> {
+        match self.aux_concurrency {
+            Some(limit) => Some(aux_admission::acquire(limit).await),
+            None => None,
+        }
     }
 
     // ── Shared HTTP request path ──
