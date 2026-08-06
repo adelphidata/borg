@@ -2434,22 +2434,83 @@ mod tests {
     /// document WHY the modes are forbidden, and tests must reference them
     /// to assert their absence.
     ///
-    /// Intentionally simple: the line-comment stripper does not handle block
-    /// comments or string literals containing `//`, and the test-module cut
-    /// is a naive "everything from the first `#[cfg(test)]` onward" slice.
-    /// Both are sufficient for the two files we guard.
+    /// The cut is anchored to a *module-level* `#[cfg(test)] mod tests`
+    /// declaration at column 0. Cutting at the first `#[cfg(test)]` anywhere
+    /// silently gutted these guards: `transcript_pager.rs` carries
+    /// `#[cfg(test)]` on two inline helper methods near the top, which
+    /// truncated the scan to the first ~11% of that file.
+    ///
+    /// Still intentionally simple: the line-comment stripper does not handle
+    /// block comments or string literals containing `//`.
     fn strip_tests_and_comments(src: &str) -> String {
-        let code = match src.find("#[cfg(test)]") {
-            Some(idx) => &src[..idx],
-            None => src,
-        };
-        code.lines()
+        let cut = src
+            .find("\n#[cfg(test)]\nmod tests")
+            .map(|idx| idx + 1)
+            .unwrap_or(src.len());
+        src[..cut]
+            .lines()
             .map(|line| match line.find("//") {
                 Some(idx) => &line[..idx],
                 None => line,
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Strip each source independently, then join.
+    ///
+    /// Guards that scan several files must not `concat!` first: the stripper
+    /// stops at the first file's test module, so every later file drops out of
+    /// the scan entirely. `app/mod.rs` ends with `#[cfg(test)] mod tests;`,
+    /// which is what excluded `app/render.rs` and `app/events.rs` — 70% of the
+    /// guarded source — from the forbidden-mode checks.
+    fn strip_each(sources: &[&str]) -> String {
+        sources
+            .iter()
+            .map(|src| strip_tests_and_comments(src))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every non-test source file under `tui/app/`, plus the pager. These are
+    /// the surfaces that could reintroduce mouse capture.
+    fn guarded_app_sources() -> Vec<&'static str> {
+        vec![
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+            include_str!("app/key_handlers.rs"),
+        ]
+    }
+
+    #[test]
+    fn strip_tests_and_comments_keeps_code_after_an_inline_cfg_test() {
+        // The stripper's own regression: an inline `#[cfg(test)]` on a helper
+        // must not truncate the file, or the guards below scan almost nothing.
+        let src = "fn a() {}\n#[cfg(test)]\nfn helper() {}\nfn sentinel() {}\n\
+                   #[cfg(test)]\nmod tests {\nfn in_tests() {}\n}\n";
+        let code = strip_tests_and_comments(src);
+        assert!(
+            code.contains("fn sentinel()"),
+            "code after an inline #[cfg(test)] must still be scanned"
+        );
+        assert!(
+            !code.contains("fn in_tests()"),
+            "the module-level test block must still be cut"
+        );
+    }
+
+    #[test]
+    fn strip_each_scans_every_file_not_just_the_first() {
+        // Regression for the concat-then-strip bug.
+        let first = "fn first() {}\n#[cfg(test)]\nmod tests {\n}\n";
+        let second = "fn second() {}\n";
+        let joined = strip_each(&[first, second]);
+        assert!(joined.contains("fn first()"));
+        assert!(
+            joined.contains("fn second()"),
+            "a file after one containing a test module must still be scanned"
+        );
     }
 
     #[test]
@@ -2521,12 +2582,7 @@ mod tests {
 
     #[test]
     fn app_rs_code_contains_no_forbidden_mouse_modes() {
-        let src = concat!(
-            include_str!("app/mod.rs"),
-            include_str!("app/render.rs"),
-            include_str!("app/events.rs"),
-        );
-        let code = strip_tests_and_comments(src);
+        let code = strip_each(&guarded_app_sources());
         for mode in FORBIDDEN_MODES {
             assert!(
                 !code.contains(mode),
@@ -2556,12 +2612,7 @@ mod tests {
 
     #[test]
     fn app_rs_has_no_event_mouse_match_arm() {
-        let src = concat!(
-            include_str!("app/mod.rs"),
-            include_str!("app/render.rs"),
-            include_str!("app/events.rs"),
-        );
-        let code = strip_tests_and_comments(src);
+        let code = strip_each(&guarded_app_sources());
         assert!(
             !code.contains("Event::Mouse("),
             "app/ must not match Event::Mouse — we do not enable mouse \
@@ -2605,12 +2656,7 @@ mod tests {
 
     #[test]
     fn app_rs_has_no_mouse_event_kind_references() {
-        let src = concat!(
-            include_str!("app/mod.rs"),
-            include_str!("app/render.rs"),
-            include_str!("app/events.rs"),
-        );
-        let code = strip_tests_and_comments(src);
+        let code = strip_each(&guarded_app_sources());
         assert!(
             !code.contains("MouseEventKind"),
             "app/ must not reference crossterm::event::MouseEventKind — \

@@ -315,11 +315,28 @@ pub(crate) fn write_enter_alt_screen_sequence(out: &mut impl std::io::Write) -> 
     Ok(())
 }
 
-fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
+/// Write the teardown escape sequence. Split out from [`restore_common`] so the
+/// byte-level guard in tests can assert what the terminal actually receives
+/// without needing a tty.
+pub(crate) fn write_restore_sequence(out: &mut impl std::io::Write) -> Result<()> {
+    // Undo the alt-screen surface unconditionally. `Tui::leave_alt_screen` only
+    // runs on the normal reconciliation path, so a panic (or `/uninstall`,
+    // which enters the alt screen and returns without leaving it) exited with
+    // the alt screen still active and `?1007h` still set — the user's wheel
+    // then types arrow keys at their shell prompt. Both are harmless no-ops
+    // when the alt screen was never entered, which is why they can be
+    // unconditional here.
+    let _ = execute!(out, DisableAlternateScroll);
+    let _ = execute!(out, LeaveAlternateScreen);
     // Pop may fail on platforms that did not accept the push; ignore errors.
-    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    execute!(stdout(), DisableBracketedPaste)?;
-    let _ = execute!(stdout(), DisableFocusChange);
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    execute!(out, DisableBracketedPaste)?;
+    let _ = execute!(out, DisableFocusChange);
+    Ok(())
+}
+
+fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
+    write_restore_sequence(&mut stdout())?;
     if should_disable_raw_mode {
         disable_raw_mode()?;
     }
@@ -721,6 +738,42 @@ mod tests {
             "alt-screen entry must enable xterm Alternate Scroll Mode \
              (?1007h); captured bytes: {s:?}"
         );
+    }
+
+    #[test]
+    fn restore_sequence_leaves_alt_screen_and_disables_alternate_scroll() {
+        // Regression: `restore()` is the ONLY teardown the panic hook and
+        // `TerminalGuard::drop` run. It never emitted `?1007l` or
+        // `LeaveAlternateScreen`, so panicking with a popup or the transcript
+        // pager open — and every successful `/uninstall` — exited leaving the
+        // terminal on the alt screen with Alternate Scroll Mode still set.
+        // The wheel then types arrow keys at the user's shell prompt.
+        let mut buf: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut buf).expect("restore sequence writes to buffer");
+        let s = String::from_utf8_lossy(&buf);
+
+        assert!(
+            s.contains("?1007l"),
+            "teardown must disable Alternate Scroll Mode; captured: {s:?}"
+        );
+        assert!(
+            s.contains("?1049l"),
+            "teardown must leave the alternate screen; captured: {s:?}"
+        );
+    }
+
+    #[test]
+    fn restore_sequence_enables_no_mouse_tracking_mode() {
+        // Teardown must never turn a tracking mode *on*.
+        let mut buf: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut buf).expect("restore sequence writes to buffer");
+        let s = String::from_utf8_lossy(&buf);
+        for forbidden in ["?1000h", "?1002h", "?1003h", "?1006h", "?1007h"] {
+            assert!(
+                !s.contains(forbidden),
+                "teardown emitted mouse-tracking SET `{forbidden}`; captured: {s:?}"
+            );
+        }
     }
 
     #[test]
