@@ -107,6 +107,12 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     GOOGLE_CALENDAR,
     NOTION,
     LINEAR,
+    VISION_ANALYZE,
+    VIDEO_ANALYZE,
+    COMPUTER_USE,
+    GET_GOAL,
+    CREATE_GOAL,
+    UPDATE_GOAL,
 ];
 
 /// Helper macro for action-based tool dispatch.

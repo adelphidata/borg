@@ -647,6 +647,14 @@ impl BorgHostServices {
         // wasmtime thread for the full `timeout_ms` budget.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // The manifest endpoint allowlist is enforced pre-flight, so a
+            // followed redirect escapes it entirely: an allowlisted host that
+            // is compromised (or has an open redirect) could send the plugin
+            // to link-local metadata endpoints or plain HTTP, replaying any
+            // custom header — including one populated from
+            // `borg:credentials.get` — to the new host. The plugin sees the
+            // 3xx and must have the target allowlisted to follow it itself.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build WASM plugin HTTP client")?;
         Ok(Self {

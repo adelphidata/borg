@@ -129,6 +129,43 @@ mod tests {
         assert_eq!(require_str_param(&args, "name").unwrap(), "");
     }
 
+    /// Every tool schema Borg sends must also be listed in
+    /// `BUILTIN_TOOL_NAMES`, which is what stops an MCP server or WASM plugin
+    /// from registering the same name.
+    ///
+    /// Regression: six real dispatchable tools (`vision_analyze`,
+    /// `video_analyze`, `computer_use`, `get_goal`, `create_goal`,
+    /// `update_goal`) were missing. A plugin advertising one of those names
+    /// passed the dedup filter, so the request carried two tool definitions
+    /// with the same name — which Anthropic and OpenAI both reject with a 400,
+    /// breaking every turn while the plugin is installed.
+    ///
+    /// Enumerated from the definitions rather than a hand-written list so a
+    /// newly added tool cannot silently reintroduce the gap.
+    #[tokio::test]
+    async fn every_emitted_tool_name_is_registered_as_a_builtin() {
+        // Enable the config-gated tools so their schemas are emitted here.
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.web.enabled = true;
+        config.tts.enabled = true;
+
+        let defs = core_tool_definitions(&config).await;
+        let missing: Vec<String> = defs
+            .iter()
+            .map(|d| d.function.name.clone())
+            .filter(|name| {
+                !crate::tool::names::BUILTIN_TOOL_NAMES.contains(&name.as_str())
+            })
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these emitted tools are absent from BUILTIN_TOOL_NAMES, so a plugin \
+             or MCP server could register the same name: {missing:?}"
+        );
+    }
+
     // -- core_tool_definitions --
 
     #[tokio::test]

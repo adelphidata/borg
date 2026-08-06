@@ -178,12 +178,16 @@ pub fn generate_profile(
     // though file-read* is broadly allowed. Emitted AFTER the fs_read allows so
     // that under last-match-wins these denies still hold when a policy grants a
     // broad read root (e.g. the `trusted` profile's `/`).
+    //
+    // Routed through `push_subpath_rule` so an unrepresentable path is a hard
+    // error, like every other deny. Skipping it silently was the wrong
+    // failure: on a `$HOME` the validator rejects (e.g. a non-ASCII username),
+    // these denies vanished while the broad `(allow file-read*)` above stayed,
+    // leaving `~/.ssh` and `~/.aws` readable from inside the sandbox.
     if let Ok(home_str) = std::env::var("HOME") {
         for sensitive in SENSITIVE_HOME_PATHS {
             let path = format!("{home_str}/{sensitive}");
-            if validate_seatbelt_path(&path).is_ok() {
-                profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));
-            }
+            push_subpath_rule(&mut profile, "deny", "file-read*", &path)?;
         }
     }
 

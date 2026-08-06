@@ -90,12 +90,30 @@ fn is_path_blocked(path: &str, blocked_paths: &[String]) -> bool {
 
     for blocked in blocked_paths {
         for component in &components {
-            if *component == blocked.as_str() || component.starts_with(&format!("{blocked}/")) {
+            if component_matches_family(component, blocked) {
                 return true;
             }
         }
     }
     false
+}
+
+/// Component-level match with dotted-family coverage: `.env` also matches
+/// `.env.local`, `private_key` also matches `private_key.pem`.
+///
+/// Deliberately a suffix-after-a-dot rule, not a substring one, so
+/// `.environment` and `.sshrc` are not over-blocked.
+///
+/// This duplicates `component_matches_family` in
+/// `cortex::tool_handlers::filesystem::blocked` — `sandbox` sits below
+/// `cortex` in the dependency graph, so the rule cannot be shared. Keep the
+/// two in step: a policy entry the tool-side blocklist rejects must not be
+/// handed to the sandbox as an allowed bind.
+fn component_matches_family(component: &str, entry: &str) -> bool {
+    component == entry
+        || component
+            .strip_prefix(entry)
+            .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1)
 }
 
 /// Filter out paths that match the security blocklist.
@@ -391,6 +409,68 @@ impl SandboxPolicy {
         _tool_dir: &std::path::Path,
     ) -> SandboxCommand {
         SandboxCommand::passthrough(program, args)
+    }
+}
+
+#[cfg(test)]
+mod blocked_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_dotted_family_member_is_blocked_like_the_entry() {
+        // Regression: the sandbox matcher was exact-component-equality only
+        // (its second branch, `starts_with("{blocked}/")`, could never fire —
+        // a `Component::Normal` contains no '/'). So a policy `fs_read` of
+        // `~/work/.env.production` survived the filter and was emitted as an
+        // `(allow file-read* …)` / `--ro-bind`, granting the sandboxed tool
+        // exactly the file the blocklist names.
+        let blocked = vec![".env".to_string(), "private_key".to_string()];
+        for path in [
+            "/home/u/work/.env",
+            "/home/u/work/.env.local",
+            "/home/u/work/.env.production",
+            "/home/u/keys/private_key.pem",
+        ] {
+            assert!(
+                is_path_blocked(path, &blocked),
+                "{path} must be blocked by the dotted-family rule"
+            );
+        }
+    }
+
+    #[test]
+    fn a_similarly_named_path_is_not_over_blocked() {
+        // The other half: the rule is suffix-after-a-dot, not substring, so
+        // ordinary files that merely start with a blocked name stay usable.
+        let blocked = vec![".env".to_string(), ".ssh".to_string()];
+        for path in [
+            "/home/u/.environment",
+            "/home/u/.sshrc",
+            "/home/u/env",
+            "/home/u/.env_backup",
+        ] {
+            assert!(
+                !is_path_blocked(path, &blocked),
+                "{path} must not be blocked — the rule is not a substring match"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_blocked_drops_only_the_blocked_entries() {
+        let blocked = vec![".aws".to_string()];
+        let paths = vec![
+            "/home/u/project".to_string(),
+            "/home/u/.aws/credentials".to_string(),
+            "/home/u/.aws_notes".to_string(),
+        ];
+        assert_eq!(
+            filter_blocked(&paths, &blocked),
+            vec![
+                "/home/u/project".to_string(),
+                "/home/u/.aws_notes".to_string()
+            ]
+        );
     }
 }
 
