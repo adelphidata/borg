@@ -1146,6 +1146,64 @@ mod scheduled_tasks_snapshot_tests {
 }
 
 #[cfg(test)]
+mod plan_mode_prompt_tests {
+    //! The Plan-mode prompt lists the tools the model may call. If it names a
+    //! tool that does not exist, the model calls it, parsing returns
+    //! `UnknownTool`, and `UnknownToolTracker` burns two iterations before a
+    //! terminal refusal — right when the user is waiting for a plan.
+    //!
+    //! Regression: the prompt advertised `update_plan`, `security_audit`, and
+    //! `read_pdf`, and its Finalization section told the model to call
+    //! `update_plan` unconditionally. None are dispatchable tools — the first
+    //! two have handlers with no dispatch site, and PDFs are read through
+    //! `read_file`.
+    use super::COLLAB_MODE_PLAN;
+
+    /// The tool names listed on the prompt's "available tools" line.
+    fn advertised_tool_names() -> Vec<String> {
+        let line = COLLAB_MODE_PLAN
+            .lines()
+            .find(|l| l.contains("Only read-only tools are available:"))
+            .expect("plan.md must state which tools are available");
+        let list = line.split_once(':').expect("tool list follows a colon").1;
+        list.split(',')
+            .map(|s| s.trim().trim_end_matches('.').trim_matches('`').trim().to_string())
+            .filter(|s| {
+                // Keep bare identifiers; drop prose fragments such as
+                // "and the read-only actions of computer_use".
+                !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_tool_the_plan_prompt_advertises_is_allowed_in_plan_mode() {
+        let advertised = advertised_tool_names();
+        assert!(
+            advertised.len() > 5,
+            "parser found too few names ({advertised:?}) — it has drifted from the prompt"
+        );
+        for name in &advertised {
+            assert!(
+                crate::tool::allowed_in_plan_mode_name(name),
+                "plan.md advertises `{name}`, which is not a Plan-mode-allowed tool; \
+                 calling it costs two wasted iterations and a visible failure"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_prompt_does_not_reference_a_nonexistent_tool() {
+        for phantom in ["update_plan", "security_audit", "read_pdf"] {
+            assert!(
+                !COLLAB_MODE_PLAN.contains(phantom),
+                "plan.md references `{phantom}`, which is not a dispatchable tool"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod build_system_prompt_tests {
     //! Source-level guards over `build_system_prompt`. The function ships in
     //! every turn's system prompt, so reordering bugs (dynamic content before

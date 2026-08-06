@@ -356,6 +356,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn every_settable_key_is_also_readable_and_unsettable() {
+        // The registry is assembled from `registry_and_apply` + `registry_only`
+        // + `custom_extract`. A key with only a `custom_apply` arm therefore
+        // applies on `set` but is absent from the registry, so `get` and
+        // `unset` both fail with "Unknown setting key" and `list` omits it.
+        //
+        // Regression: `memory.provider` and the five `memory.*.api_key` keys
+        // were in that state — an operator could switch memory backend and
+        // then neither see which was active nor revert to native.
+        let resolver = test_resolver().await;
+        let known: Vec<String> = resolver
+            .list_all()
+            .await
+            .expect("list settings")
+            .into_iter()
+            .map(|row| row.key)
+            .collect();
+
+        for key in [
+            "memory.provider",
+            "memory.mem0.api_key",
+            "memory.honcho.api_key",
+            "memory.openviking.api_key",
+            "memory.letta.api_key",
+            "memory.zep.api_key",
+            "data.purge_policy",
+        ] {
+            assert!(
+                known.iter().any(|k| k == key),
+                "`{key}` can be set but is not in the settings registry, so \
+                 `get`/`unset` fail and it never appears in `settings list`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_policy_round_trips_through_the_settings_table() {
+        // `data.purge_policy = never` is the litigation-hold escape hatch. It
+        // had no key at all, so an operator with `retention_days` set could
+        // not suspend deletion — the daily sweep kept purging.
+        let resolver = test_resolver().await;
+        resolver
+            .set("data.purge_policy", "never")
+            .await
+            .expect("purge policy must be settable");
+        let (value, _) = resolver
+            .get_with_source("data.purge_policy")
+            .await
+            .expect("purge policy must be readable");
+        assert_eq!(value, "never");
+
+        resolver
+            .set("data.purge_policy", "not_a_policy")
+            .await
+            .expect_err("an invalid policy must be rejected, not silently stored");
+    }
+
     #[test]
     fn truncate_setting_value_for_audit_marks_overflows() {
         let short = "abc";

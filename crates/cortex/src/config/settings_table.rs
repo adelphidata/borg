@@ -747,6 +747,15 @@ define_settings! {
             }
         };
 
+        // data.purge_policy: FromStr-validated enum. Registered because it is
+        // the litigation-hold escape hatch — without a key, `retention_days`
+        // could be set but never suspended, and the daily sweep kept purging.
+        "data.purge_policy" => |s, key, value| {
+            use std::str::FromStr as _;
+            s.data.purge_policy = crate::config::PurgePolicy::from_str(value)?;
+            Ok(format!("{key} = {value}"))
+        };
+
         // tunnel.provider: FromStr-validated enum. Empty maps to None so an
         // unset row clears any prior selection rather than silently
         // persisting a stale provider.
@@ -783,6 +792,29 @@ define_settings! {
                 .unwrap_or_default()
         };
         "sandbox.mode" => |c| c.sandbox.mode.clone();
+        "data.purge_policy" => |c| format!("{}", c.data.purge_policy);
+        // The registry is built from `registry_and_apply` + `registry_only` +
+        // `custom_extract`, so a key with only a `custom_apply` arm is
+        // settable but invisible: `get`/`unset` fail with "Unknown setting
+        // key" and `settings list` omits the row. These six were in exactly
+        // that state — an operator could switch memory backend but never see
+        // which one was active, nor revert to native with `unset`.
+        "memory.provider" => |c| format!("{}", c.memory.provider);
+        "memory.mem0.api_key" => |c| c.memory.mem0.api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "memory.honcho.api_key" => |c| c.memory.honcho.api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "memory.openviking.api_key" => |c| c.memory.openviking.api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "memory.letta.api_key" => |c| c.memory.letta.api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
+        "memory.zep.api_key" => |c| c.memory.zep.api_key.as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default();
         "memory.extra_paths" => |c| c.memory.extra_paths.join(", ");
         "conversation.collaboration_mode" => |c| format!("{}", c.conversation.collaboration_mode);
         // browser backend / engine: FromStr-validated enums, round-trip via Display.

@@ -46,6 +46,34 @@ pub enum PurgePolicy {
     Never,
 }
 
+impl std::fmt::Display for PurgePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::OnDemandOnly => "on_demand_only",
+            Self::Never => "never",
+        })
+    }
+}
+
+impl std::str::FromStr for PurgePolicy {
+    type Err = anyhow::Error;
+
+    /// Parses the same spellings [`Display`] emits, so a value round-trips
+    /// through the settings table. Hyphens are accepted as a convenience —
+    /// `on-demand-only` is the natural thing to type on a CLI.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "auto" => Ok(Self::Auto),
+            "on_demand_only" => Ok(Self::OnDemandOnly),
+            "never" => Ok(Self::Never),
+            other => anyhow::bail!(
+                "invalid purge policy '{other}' (expected auto, on_demand_only, or never)"
+            ),
+        }
+    }
+}
+
 impl Default for DataConfig {
     fn default() -> Self {
         Self {
