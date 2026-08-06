@@ -1167,7 +1167,13 @@ mod plan_mode_prompt_tests {
             .expect("plan.md must state which tools are available");
         let list = line.split_once(':').expect("tool list follows a colon").1;
         list.split(',')
-            .map(|s| s.trim().trim_end_matches('.').trim_matches('`').trim().to_string())
+            .map(|s| {
+                s.trim()
+                    .trim_end_matches('.')
+                    .trim_matches('`')
+                    .trim()
+                    .to_string()
+            })
             .filter(|s| {
                 // Keep bare identifiers; drop prose fragments such as
                 // "and the read-only actions of computer_use".

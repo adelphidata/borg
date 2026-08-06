@@ -176,8 +176,7 @@ async fn chat_survives_429_then_succeeds_on_second_key() {
         .and(path("/v1/chat/completions"))
         .and(header("authorization", format!("Bearer {key_b}").as_str()))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(chat_completion("ok"), "application/json"),
+            ResponseTemplate::new(200).set_body_raw(chat_completion("ok"), "application/json"),
         )
         .mount(&server)
         .await;
@@ -187,7 +186,7 @@ async fn chat_survives_429_then_succeeds_on_second_key() {
         .chat(&user_message("hi"), None)
         .await
         .expect("chat should rotate off the 429'd key and succeed via key B");
-    assert_eq!(reply.text_content().as_deref(), Some("ok"));
+    assert_eq!(reply.text_content(), Some("ok"));
 
     let pool = client
         .primary_pool()
@@ -242,7 +241,7 @@ async fn chat_falls_back_to_the_next_provider_when_the_pool_is_exhausted() {
         .chat(&user_message("hi"), None)
         .await
         .expect("chat should reach the fallback provider");
-    assert_eq!(reply.text_content().as_deref(), Some("fallback-ok"));
+    assert_eq!(reply.text_content(), Some("fallback-ok"));
 }
 
 // ── Test 83: stream survives 429 on first key, succeeds on second ────────

@@ -2716,7 +2716,9 @@ impl LlmClient {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
         let request_url = if self.transport_composes_url() {
-            transport.endpoint(&request, false).map_err(LlmError::fatal)?
+            transport
+                .endpoint(&request, false)
+                .map_err(LlmError::fatal)?
         } else {
             self.effective_base_url().into_owned()
         };

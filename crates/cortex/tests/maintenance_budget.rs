@@ -10,7 +10,14 @@
 //! `maintenance.heal_action_budget`; once exhausted, remaining mutating steps
 //! short-circuit and `report.budget_exhausted` is true.
 
-#![allow(clippy::expect_used, clippy::field_reassign_with_default)]
+// The `SERIAL` guard is deliberately held across awaits: it serializes the
+// process-global `BORG_DATA_DIR` for the whole test body, which is exactly
+// what an async-aware mutex would not give us across the env mutation.
+#![allow(
+    clippy::await_holding_lock,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 
 use std::sync::Mutex;
 

@@ -542,7 +542,8 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
                 // Outer anchors narrow the search; the innermost must resolve
                 // to exactly one line, since it decides where content lands.
                 Some((innermost, outer)) => {
-                    let from = resolve_anchor_stack(&content_lines, outer, cursor)?.unwrap_or(cursor);
+                    let from =
+                        resolve_anchor_stack(&content_lines, outer, cursor)?.unwrap_or(cursor);
                     find_context_anchor(&content_lines, innermost, from).with_context(|| {
                         format!("In file '{file_path}' (patch line {})", hunk.source_line)
                     })? + 1

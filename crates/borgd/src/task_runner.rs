@@ -2454,7 +2454,10 @@ mod pre_run_tests {
         assert!(out.ends_with("[truncated]"));
         // The straddling char is dropped whole rather than split.
         assert!(!out.contains('☃'));
-        assert_eq!(out, format!("{}\n[truncated]", "a".repeat(PRE_RUN_OUTPUT_CAP - 1)));
+        assert_eq!(
+            out,
+            format!("{}\n[truncated]", "a".repeat(PRE_RUN_OUTPUT_CAP - 1))
+        );
     }
 
     #[tokio::test]

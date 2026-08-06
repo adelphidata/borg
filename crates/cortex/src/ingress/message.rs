@@ -188,7 +188,10 @@ mod tests {
         // session — the second arrival would otherwise be routed into the
         // first's session row and inherit its conversation history.
         assert_ne!(session_key("u1:t1", None), session_key("u1", Some("t1")));
-        assert_ne!(session_key("u1", Some("t1:x")), session_key("u1:t1", Some("x")));
+        assert_ne!(
+            session_key("u1", Some("t1:x")),
+            session_key("u1:t1", Some("x"))
+        );
     }
 
     #[test]

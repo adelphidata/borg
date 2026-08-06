@@ -320,10 +320,7 @@ fn a_bundled_skill_name_is_never_served_from_disk() {
 
     let skills =
         load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();
-    let git: Vec<_> = skills
-        .iter()
-        .filter(|s| s.manifest.name == "git")
-        .collect();
+    let git: Vec<_> = skills.iter().filter(|s| s.manifest.name == "git").collect();
 
     assert_eq!(git.len(), 1, "the shadow must not add a second 'git' entry");
     assert!(

@@ -154,9 +154,7 @@ mod tests {
         let missing: Vec<String> = defs
             .iter()
             .map(|d| d.function.name.clone())
-            .filter(|name| {
-                !crate::tool::names::BUILTIN_TOOL_NAMES.contains(&name.as_str())
-            })
+            .filter(|name| !crate::tool::names::BUILTIN_TOOL_NAMES.contains(&name.as_str()))
             .collect();
 
         assert!(
