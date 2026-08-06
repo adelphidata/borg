@@ -129,6 +129,30 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // GitHub fine-grained personal access tokens (`github_pat_...`) — a
         // distinct shape from the classic `ghp_` prefix above.
         (r"github_pat_[0-9A-Za-z_]{20,}", "GitHub Token", false, None),
+        // GitLab token families. All share a `gl<family>-` literal prefix, so
+        // one alternation keeps the RegexSet prefilter's literal-prefix fast
+        // path intact and adds a single set member instead of thirteen.
+        //
+        // Longest prefix first (`glrtr` before `glrt`, `glffct` before `glft`):
+        // the regex crate's alternation is leftmost-first, so a shorter branch
+        // listed earlier would match and leave a stray character behind.
+        //
+        // `{20,}` is the real floor — classic `glpat-` bodies are 20 chars —
+        // and it keeps short placeholders like `glpat-REPLACEME` unredacted.
+        (
+            r"(?:glpat|glrtr|glagent|glsoat|glffct|glcbt|glptt|gloas|glimt|glrt|gldt|glft|glwt)-[0-9A-Za-z_-]{20,}",
+            "GitLab Token",
+            false,
+            None,
+        ),
+        // Legacy GitLab runner registration/auth tokens: a fixed `GR1348941`
+        // prefix immediately followed by the token body, no separator.
+        (
+            r"\bGR1348941[0-9A-Za-z_-]{20,}",
+            "GitLab Runner Token",
+            false,
+            None,
+        ),
         // Google API keys are `AIza` + 35 url-safe base64 chars. The prefix is
         // distinctive enough that a 30+ char lower bound won't false-positive.
         (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
@@ -404,6 +428,8 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "AKIAIOSFODNN7EXAMPLE",
     "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
     "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
+    "glpat-ABCDEFGHIJKLMNOPQRSTUV",
+    "GR1348941abcdefghijklmnopqrst",
     "AIzaSyA1234567890abcdefghijklmnopqrstuvwx",
     "sk_live_0123456789abcdefABCDEFghijkl",
     "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
@@ -807,6 +833,8 @@ mod tests {
                 "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
                 "GitHub fine-grained PAT",
             ),
+            ("glpat-ABCDEFGHIJKLMNOPQRSTUV", "GitLab PAT"),
+            ("GR1348941abcdefghijklmnopqrst", "GitLab runner token"),
             (
                 "AIzaSyA1234567890abcdefghijklmnopqrstuvwx",
                 "Google API key",
@@ -884,5 +912,69 @@ mod tests {
         assert!(!outcome.text.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!outcome.text.contains("abcd1234efgh5678"));
         assert!(!outcome.text.contains("my_database_secret_key_here"));
+    }
+}
+
+#[cfg(test)]
+mod gitlab_pattern_tests {
+    use super::redact_secrets;
+
+    #[test]
+    fn redacts_every_gitlab_token_family() {
+        // One row per prefix: a typo'd or omitted branch in the alternation
+        // fails its own row rather than hiding behind a sibling.
+        let cases: &[(&str, &str)] = &[
+            ("glpat-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("gloas-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("gldt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glrt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glrtr-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glcbt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glptt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glft-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glimt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glagent-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glsoat-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glffct-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("glwt-ABCDEFGHIJKLMNOPQRSTUV", "GitLab Token"),
+            ("GR1348941abcdefghijklmnopqrst", "GitLab Runner Token"),
+        ];
+        for (token, label) in cases {
+            let out = redact_secrets(&format!("token is {token} ok"));
+            assert!(
+                out.contains(&format!("[REDACTED {label}]")),
+                "{token} should be labeled {label}, got: {out}"
+            );
+            assert!(!out.contains(token), "{token} survived redaction: {out}");
+        }
+    }
+
+    #[test]
+    fn gitlab_lookalikes_are_not_redacted() {
+        // Over-match guard. The `gl…-` prefixes are short enough that a sloppy
+        // `gl[a-z]+-` pattern would swallow ordinary prose like `global-` on
+        // every redaction sink in the process.
+        let cases = [
+            "glpat-short",
+            "global-configuration-identifier-here",
+            "glassdoor-1234567890abcdefghij",
+            "GROUP1348941abcdefghijklmnopqrst",
+            "GR1348941",
+        ];
+        for input in cases {
+            let out = redact_secrets(&format!("value {input} end"));
+            assert!(
+                out.contains(input),
+                "{input:?} must not be redacted, got: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn glrtr_token_is_not_truncated_to_the_glrt_branch() {
+        // Encodes the longest-prefix-first ordering decision: leftmost-first
+        // alternation would otherwise match `glrt` and leave a stray `r-`.
+        let out = redact_secrets("glrtr-ABCDEFGHIJKLMNOPQRSTUV");
+        assert_eq!(out, "[REDACTED GitLab Token]", "got: {out}");
     }
 }
