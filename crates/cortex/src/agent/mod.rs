@@ -42,8 +42,8 @@ mod system_prompt;
 pub(crate) mod system_prompt_cache;
 mod title_generator;
 mod tool_classification;
-mod tool_markers;
 mod tool_execution;
+mod tool_markers;
 mod tool_validation;
 
 use stream_handler::{StreamEventOutcome, TextOnlyOutcome};

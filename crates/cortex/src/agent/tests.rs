@@ -1974,6 +1974,9 @@ async fn healthy_storage_records_no_fault_and_extends_history() {
         .persist_messages(vec![Message::assistant("a reply")])
         .await;
 
-    assert!(agent.storage_fault.is_none(), "healthy write must not fault");
+    assert!(
+        agent.storage_fault.is_none(),
+        "healthy write must not fault"
+    );
     assert_eq!(agent.history.len(), 1);
 }

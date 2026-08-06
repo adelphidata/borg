@@ -13,12 +13,12 @@ use protocols::session::{
     session_server::Session, AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsRequest,
     AcpFsResponse, AcpReadTextFileRequest, AcpReadTextFileResponse, AcpServerMessage,
     AcpWriteTextFileRequest, AcpWriteTextFileResponse, AgentEvent, AppendAssistantMessageRequest,
-    ExecShellRequest, ExecShellResponse,
     AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
-    CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ForkRequest,
-    ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest,
-    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ExecShellRequest,
+    ExecShellResponse, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PromptResponse,
+    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
+    StreamRequest, UndoRequest, UndoResponse,
 };
 use std::future::Future;
 use std::pin::Pin;

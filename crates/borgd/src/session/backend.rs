@@ -201,7 +201,11 @@ pub trait SessionBackend: Send + Sync + 'static {
     }
 
     /// Execute a shell command in the session's context, spending no LLM turn.
-    async fn exec_shell(&self, _command: &str, _timeout_ms: u64) -> anyhow::Result<ExecShellOutcome> {
+    async fn exec_shell(
+        &self,
+        _command: &str,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<ExecShellOutcome> {
         Err(anyhow::anyhow!("exec_shell not supported by this backend"))
     }
 
@@ -606,8 +610,7 @@ impl SessionBackend for AgentBackend {
         // enforced only client-side is not enforced at all.
         if !config.ui.shell_mode_enabled {
             return Ok(ExecShellOutcome {
-                output: "Shell mode is disabled (set `ui.shell_mode_enabled` to true)."
-                    .to_string(),
+                output: "Shell mode is disabled (set `ui.shell_mode_enabled` to true).".to_string(),
                 exit_code: -1,
                 denied: true,
             });

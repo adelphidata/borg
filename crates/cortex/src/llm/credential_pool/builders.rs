@@ -90,15 +90,14 @@ pub fn pool_load_config_for_provider_with_proactive(
 /// `Config::resolve_api_keys`). Best-effort: returns `None` if the DB path
 /// can't be resolved or the load fails. Logs at WARN on failure so prod
 /// regressions are observable.
+/// Takes the whole `LlmConfig` rather than the six tuning knobs individually:
+/// every caller was unpacking the same fields from it, and threading a seventh
+/// knob through by position is how the two cooldowns ended up conflated in the
+/// first place.
 pub async fn try_build_from_keys(
     provider: Provider,
     plaintext_keys: Vec<String>,
-    strategy: CredentialStrategy,
-    cooldown_secs: u64,
-    max_concurrent_per_credential: u32,
-    proactive_rate_limit_threshold_pct: u8,
-    proactive_rate_limit_min_window_secs: u64,
-    billing_cooldown_secs: u64,
+    llm: &crate::config::LlmConfig,
 ) -> Option<Arc<CredentialPool>> {
     let db_path = match crate::config::Config::db_path() {
         Ok(p) => p,
@@ -133,14 +132,14 @@ pub async fn try_build_from_keys(
         .collect();
     let mut cfg = pool_load_config_for_provider_with_proactive(
         provider,
-        strategy,
-        cooldown_secs,
-        max_concurrent_per_credential,
-        proactive_rate_limit_threshold_pct,
-        proactive_rate_limit_min_window_secs,
+        llm.credential_strategy,
+        llm.credential_cooldown_secs,
+        llm.max_concurrent_per_credential,
+        llm.proactive_rate_limit_threshold_pct,
+        llm.proactive_rate_limit_min_window_secs,
         config_entries,
     );
-    cfg.billing_cooldown_secs = billing_cooldown_secs;
+    cfg.billing_cooldown_secs = llm.billing_cooldown_secs;
     match CredentialPool::load(&db, &db_path, provider, cfg).await {
         Ok(pool) => Some(pool),
         Err(e) => {

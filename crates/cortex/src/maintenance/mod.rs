@@ -1471,7 +1471,9 @@ mod command_gate_scan_tests {
     #[tokio::test]
     async fn scan_flags_only_command_tasks_the_gate_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open_at(&tmp.path().join("borg.db")).await.expect("open db");
+        let db = Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("open db");
 
         seed(&db, "denied-policy", "rm -rf /", "command").await;
         seed(
@@ -1499,7 +1501,9 @@ mod command_gate_scan_tests {
     #[tokio::test]
     async fn scan_ignores_paused_and_cancelled_tasks() {
         let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open_at(&tmp.path().join("borg.db")).await.expect("open db");
+        let db = Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("open db");
 
         seed(&db, "paused-denied", "rm -rf /", "command").await;
         db.update_task_status("paused-denied", crate::tasks::TASK_STATUS_PAUSED)

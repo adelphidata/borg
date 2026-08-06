@@ -369,11 +369,7 @@ fn orphan_lock_check(idle_secs: i64) -> DiagnosticCheck {
 /// retires it — and only inside
 /// [`DAEMON_UNCLEAN_EXIT_WARN_WINDOW_SECS`]. An implementation that merely
 /// checks "the meta key exists" would warn forever.
-fn unclean_exit_check(
-    unclean_at: i64,
-    clean_at: Option<i64>,
-    now: i64,
-) -> Option<DiagnosticCheck> {
+fn unclean_exit_check(unclean_at: i64, clean_at: Option<i64>, now: i64) -> Option<DiagnosticCheck> {
     if clean_at.is_some_and(|c| c >= unclean_at) {
         return None;
     }

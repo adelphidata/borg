@@ -54,11 +54,10 @@ use protocols::session::{
     AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsResponse, AcpReadTextFileResponse,
     AcpServerMessage, AcpStartTurn, AcpWriteTextFileResponse, AgentEvent,
     AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
-    ExecShellRequest, ExecShellResponse,
-    CompactRequest, CompactResponse, ContextBreakdown, ForkRequest, ForkResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
-    PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
-    SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    CompactRequest, CompactResponse, ContextBreakdown, ExecShellRequest, ExecShellResponse,
+    ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
+    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::{

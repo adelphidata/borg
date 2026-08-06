@@ -1401,11 +1401,7 @@ mod storage_exhaustion_tests {
             ),
         ];
         for (label, err, want) in cases {
-            assert_eq!(
-                is_storage_exhausted(&err),
-                want,
-                "{label} classified wrong"
-            );
+            assert_eq!(is_storage_exhausted(&err), want, "{label} classified wrong");
         }
     }
 

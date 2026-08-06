@@ -1275,7 +1275,6 @@ mod delivery_failure_tests {
         .expect("create task");
     }
 
-
     /// Read one run's `(status, error)` directly — there is no typed accessor for
     /// a single run, and the assertion is about exactly these two columns.
     async fn run_state(db: &Database, run_id: i64) -> (String, Option<String>) {
@@ -1288,7 +1287,10 @@ mod delivery_failure_tests {
             .await
             .expect("query run");
         let row = rows.next().await.expect("row").expect("run exists");
-        (row.get::<String>(0).unwrap(), row.get::<Option<String>>(1).unwrap())
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<Option<String>>(1).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -1354,7 +1356,9 @@ mod delivery_failure_tests {
         let db = Database::test_db().await;
         seed(&db, "d3").await;
         let run_id = db.start_task_run("d3", 1_000).await.expect("start run");
-        db.set_task_retry("d3", 1, "boom", 9_999).await.expect("set retry");
+        db.set_task_retry("d3", 1, "boom", 9_999)
+            .await
+            .expect("set retry");
 
         db.record_delivery_failure("d3", run_id, "delivery to slack failed: 503")
             .await
@@ -1372,5 +1376,4 @@ mod delivery_failure_tests {
             "the scheduled retry must not be cancelled"
         );
     }
-
 }

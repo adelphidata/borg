@@ -3588,9 +3588,7 @@ fn sanitize_drops_whitespace_only_user_message() {
         2,
         "the blank user turn must be dropped: {sanitized:?}"
     );
-    assert!(sanitized
-        .iter()
-        .all(|m| m.text_content() != Some("   \n ")));
+    assert!(sanitized.iter().all(|m| m.text_content() != Some("   \n ")));
 }
 
 #[test]
@@ -3614,10 +3612,7 @@ fn sanitize_keeps_whitespace_only_assistant_that_has_tool_calls() {
     let sanitized = sanitize_openai_messages(&messages);
     assert_eq!(sanitized.len(), 3, "got: {sanitized:?}");
     assert_eq!(
-        sanitized[1]
-            .tool_calls
-            .as_ref()
-            .map(|c| c[0].id.as_str()),
+        sanitized[1].tool_calls.as_ref().map(|c| c[0].id.as_str()),
         Some("call_9")
     );
 }

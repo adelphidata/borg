@@ -1029,17 +1029,7 @@ impl LlmClient {
         // embedded usage, first-boot before borgd has stamped a DB file).
         let primary_pool =
             if provider.supports_credential_pool() && keys.iter().any(|k| !k.is_empty()) {
-                credential_pool::try_build_from_keys(
-                    provider,
-                    keys.clone(),
-                    config.llm.credential_strategy,
-                    config.llm.credential_cooldown_secs,
-                    config.llm.max_concurrent_per_credential,
-                    config.llm.proactive_rate_limit_threshold_pct,
-                    config.llm.proactive_rate_limit_min_window_secs,
-                    config.llm.billing_cooldown_secs,
-                )
-                .await
+                credential_pool::try_build_from_keys(provider, keys.clone(), &config.llm).await
             } else {
                 None
             };
@@ -1314,17 +1304,7 @@ impl LlmClient {
 
         let pool = if provider.supports_credential_pool() && slot_keys.iter().any(|k| !k.is_empty())
         {
-            credential_pool::try_build_from_keys(
-                provider,
-                slot_keys.clone(),
-                config.llm.credential_strategy,
-                config.llm.credential_cooldown_secs,
-                config.llm.max_concurrent_per_credential,
-                config.llm.proactive_rate_limit_threshold_pct,
-                config.llm.proactive_rate_limit_min_window_secs,
-                config.llm.billing_cooldown_secs,
-            )
-            .await
+            credential_pool::try_build_from_keys(provider, slot_keys.clone(), &config.llm).await
         } else {
             None
         };

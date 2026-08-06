@@ -32,20 +32,18 @@ async fn delayed_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(DELAY)
-                .set_body_json(serde_json::json!({
-                    "id": "c1",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_delay(DELAY).set_body_json(
+            serde_json::json!({
+                "id": "c1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ))
         .mount(&server)
         .await;
     server
@@ -128,7 +126,11 @@ async fn primary_clients_are_not_gated_by_the_aux_limit() {
 
     let elapsed = elapsed_for(move || {
         let config = config.clone();
-        async move { LlmClient::new(&config).await.expect("primary client builds") }
+        async move {
+            LlmClient::new(&config)
+                .await
+                .expect("primary client builds")
+        }
     })
     .await;
 

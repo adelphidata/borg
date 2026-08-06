@@ -772,7 +772,7 @@ impl CredentialPool {
                         extra_json: row.extra_json.clone(),
                         rate_limit: None,
                         auth_refresh_grace_used: false,
-            consecutive_rate_limits: 0,
+                        consecutive_rate_limits: 0,
                     });
                 }
             }

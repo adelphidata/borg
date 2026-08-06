@@ -492,12 +492,7 @@ pub(super) async fn build_primary_pool(
     let pool = cortex::llm::credential_pool::try_build_from_keys(
         provider,
         keys,
-        config.llm.credential_strategy,
-        config.llm.credential_cooldown_secs,
-        config.llm.max_concurrent_per_credential,
-        config.llm.proactive_rate_limit_threshold_pct,
-        config.llm.proactive_rate_limit_min_window_secs,
-        config.llm.billing_cooldown_secs,
+                    &config.llm,
     )
     .await
     .ok_or_else(|| {

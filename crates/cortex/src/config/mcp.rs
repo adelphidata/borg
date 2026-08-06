@@ -392,11 +392,7 @@ impl McpServerConfig {
                     warn_if_padded(&format!("mcp.servers.{name}.url"), url);
                     url.clone()
                 },
-                headers: resolve_secret_map(
-                    headers,
-                    cfg,
-                    &format!("mcp.servers.{name}.headers"),
-                )?,
+                headers: resolve_secret_map(headers, cfg, &format!("mcp.servers.{name}.headers"))?,
                 auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
             },
@@ -414,11 +410,7 @@ impl McpServerConfig {
                     warn_if_padded(&format!("mcp.servers.{name}.url"), url);
                     url.clone()
                 },
-                headers: resolve_secret_map(
-                    headers,
-                    cfg,
-                    &format!("mcp.servers.{name}.headers"),
-                )?,
+                headers: resolve_secret_map(headers, cfg, &format!("mcp.servers.{name}.headers"))?,
                 auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
             },
@@ -546,11 +538,7 @@ fn resolve_client_identity(
     }
 }
 
-fn resolve_auth(
-    spec: &HttpAuthSpec,
-    cfg: &Config,
-    name: &str,
-) -> Result<mcp::manifest::HttpAuth> {
+fn resolve_auth(spec: &HttpAuthSpec, cfg: &Config, name: &str) -> Result<mcp::manifest::HttpAuth> {
     match spec {
         HttpAuthSpec::None => Ok(mcp::manifest::HttpAuth::None),
         HttpAuthSpec::Bearer { token } => Ok(mcp::manifest::HttpAuth::Bearer {
@@ -611,17 +599,15 @@ pub(crate) fn padding_report(value: &str) -> Option<PaddingReport> {
         .chain(value.chars().rev().take(trailing))
         .collect();
     let mut classes = Vec::new();
-    for (ch, label) in [
-        (' ', "space"),
-        ('\t', "tab"),
-        ('\r', "CR"),
-        ('\n', "LF"),
-    ] {
+    for (ch, label) in [(' ', "space"), ('\t', "tab"), ('\r', "CR"), ('\n', "LF")] {
         if edges.contains(ch) {
             classes.push(label);
         }
     }
-    if edges.chars().any(|c| c.is_whitespace() && !" \t\r\n".contains(c)) {
+    if edges
+        .chars()
+        .any(|c| c.is_whitespace() && !" \t\r\n".contains(c))
+    {
         classes.push("other");
     }
     Some(PaddingReport {
@@ -1097,7 +1083,10 @@ mod tests {
         let secret = "sk-live-super-secret-token";
         let r = padding_report(&format!("{secret}\n")).expect("padded");
         let rendered = format!("{r:?}");
-        assert!(!rendered.contains(secret), "report leaked the value: {rendered}");
+        assert!(
+            !rendered.contains(secret),
+            "report leaked the value: {rendered}"
+        );
         assert!(
             !rendered.contains("secret"),
             "report leaked a fragment: {rendered}"

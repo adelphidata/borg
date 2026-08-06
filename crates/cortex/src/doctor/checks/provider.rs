@@ -190,17 +190,7 @@ pub(in crate::doctor) async fn check_llm_credentials(
     if keys.iter().all(String::is_empty) {
         return; // nothing resolvable — the Provider check already reports this
     }
-    let pool = crate::llm::credential_pool::try_build_from_keys(
-        provider,
-        keys,
-        config.llm.credential_strategy,
-        config.llm.credential_cooldown_secs,
-        config.llm.max_concurrent_per_credential,
-        config.llm.proactive_rate_limit_threshold_pct,
-        config.llm.proactive_rate_limit_min_window_secs,
-        config.llm.billing_cooldown_secs,
-    )
-    .await;
+    let pool = crate::llm::credential_pool::try_build_from_keys(provider, keys, &config.llm).await;
     match pool {
         Some(pool) => checks.push(classify_credential_pool(
             provider.as_str(),

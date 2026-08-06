@@ -102,28 +102,16 @@ async fn exec_shell_is_refused_when_shell_mode_is_disabled() {
     let tmp = isolated_home();
     let mut config = Config::default();
     config.ui.shell_mode_enabled = false;
-    let backend = AgentBackend::new(
-        config,
-        BorgMetrics::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("backend builds");
+    let backend = AgentBackend::new(config, BorgMetrics::default(), None, None, None, None, None)
+        .await
+        .expect("backend builds");
 
     let out = backend
         .exec_shell("printf nope", 10_000)
         .await
         .expect("returns a refusal");
     assert!(out.denied);
-    assert!(
-        out.output.contains("disabled"),
-        "got: {:?}",
-        out.output
-    );
+    assert!(out.output.contains("disabled"), "got: {:?}", out.output);
     assert!(
         !out.output.contains("nope"),
         "the command must not have run: {:?}",
