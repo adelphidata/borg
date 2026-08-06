@@ -37,6 +37,7 @@ pub(crate) fn override_retry_after(err: LlmError, override_value: Option<Duratio
             source,
             retry_after: Some(ra),
             reason,
+            status: None,
         },
         other => other,
     }

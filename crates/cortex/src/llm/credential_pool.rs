@@ -859,6 +859,17 @@ impl CredentialPool {
         self.provider
     }
 
+    /// Number of retained per-credential OAuth refresh locks.
+    ///
+    /// Exposed so the bounded-growth property is testable: the map is swept on
+    /// each use and should only retain entries with a refresh in flight.
+    pub fn refresh_lock_count(&self) -> usize {
+        self.refresh_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// True when the pool has any non-removed credential (regardless of cooling).
     pub fn has_credentials(&self) -> bool {
         let g = self
@@ -1847,6 +1858,14 @@ impl CredentialPool {
                 .refresh_locks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Opportunistic sweep: an entry whose only strong reference is the
+            // map itself has no in-flight refresh holding it, so dropping it
+            // cannot break mutual exclusion — a concurrent caller has already
+            // cloned the `Arc` (count > 1) before it can await the lock. Left
+            // unswept the map grew one entry per credential ever leased and
+            // never shrank, including for credentials later tombstoned by a
+            // 401/403.
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
             locks
                 .entry(snapshot.id.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))

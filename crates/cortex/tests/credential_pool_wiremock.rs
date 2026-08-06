@@ -204,6 +204,58 @@ async fn chat_survives_429_then_succeeds_on_second_key() {
 }
 
 #[tokio::test]
+async fn a_benched_credential_records_the_http_status_that_benched_it() {
+    // `borg auth list` shows `last_error_code` so an operator can see *why* a
+    // key is cooling. Production always passed `None`, so the column was
+    // always blank — the status was known in `send_request` but dropped on the
+    // way to `report_failure`. `LlmError` now carries it.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (config, key_a, key_b) = two_key_config(&server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_b}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(chat_completion("ok"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    client
+        .chat(&user_message("hi"), None)
+        .await
+        .expect("second key serves the request");
+
+    let pool = client.primary_pool().cloned().expect("primary pool");
+    let benched: Vec<_> = pool
+        .entries()
+        .into_iter()
+        .filter(|e| e.last_error_reset_at_ms.is_some())
+        .collect();
+    assert_eq!(
+        benched.len(),
+        1,
+        "the 429 must bench exactly one credential"
+    );
+    assert_eq!(
+        benched[0].last_error_code,
+        Some(429),
+        "the benched credential must record the status that benched it"
+    );
+}
+
+#[tokio::test]
 async fn chat_falls_back_to_the_next_provider_when_the_pool_is_exhausted() {
     let _guard = SERIAL
         .lock()
@@ -790,6 +842,41 @@ async fn auth_failure_on_refreshable_oauth_forces_refresh_instead_of_removal() {
         "refreshed-access",
         "401 grace must lead to a refreshed access token"
     );
+}
+
+#[tokio::test]
+async fn oauth_refresh_locks_do_not_accumulate() {
+    // The per-credential refresh-lock map inserted an entry per credential and
+    // never removed one — including for credentials later tombstoned by a
+    // 401/403. Unbounded in principle on a long-lived daemon. It is now swept
+    // on each use, retaining only entries with a refresh actually in flight.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"access_token":"fresh","refresh_token":"r2","expires_in":3600}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    // Already-expired access token, so each lease drives the refresh path.
+    let (pool, _home, _db) = oauth_pool("stale", "r", 1_000).await;
+    pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+
+    for _ in 0..5 {
+        let lease = pool
+            .acquire_lease_refreshing(None)
+            .await
+            .expect("a credential is available");
+        drop(lease);
+        assert!(
+            pool.refresh_lock_count() <= 1,
+            "refresh-lock map must stay bounded across repeated refreshes; got {}",
+            pool.refresh_lock_count()
+        );
+    }
 }
 
 #[tokio::test]

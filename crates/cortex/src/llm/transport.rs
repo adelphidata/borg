@@ -522,11 +522,16 @@ pub(crate) fn parse_anthropic_sse_line(
                 | FailoverReason::Billing
                 | FailoverReason::ModelNotFound
                 | FailoverReason::PayloadTooLarge
-                | FailoverReason::Format => LlmError::Fatal { source, reason },
+                | FailoverReason::Format => LlmError::Fatal {
+                    source,
+                    reason,
+                    status: None,
+                },
                 _ => LlmError::Retryable {
                     source,
                     retry_after: None,
                     reason,
+                    status: None,
                 },
             };
             SseAction::Error(llm_err)
@@ -587,6 +592,7 @@ impl Transport for OpenAiCompatTransport {
         build_openai_request(request, true).map_err(|e| LlmError::Fatal {
             source: anyhow::anyhow!("serialize OpenAI ChatRequest for cache injection: {e}"),
             reason: FailoverReason::Unknown,
+            status: None,
         })
     }
 
@@ -1389,11 +1395,16 @@ fn parse_bedrock_event_error(event: &serde_json::Value) -> Option<LlmError> {
         | FailoverReason::Billing
         | FailoverReason::ModelNotFound
         | FailoverReason::PayloadTooLarge
-        | FailoverReason::Format => LlmError::Fatal { source, reason },
+        | FailoverReason::Format => LlmError::Fatal {
+            source,
+            reason,
+            status: None,
+        },
         _ => LlmError::Retryable {
             source,
             retry_after: None,
             reason,
+            status: None,
         },
     })
 }

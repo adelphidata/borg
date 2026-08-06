@@ -3258,9 +3258,17 @@ fn anthropic_sse_permission_error_is_fatal_auth_permanent() {
     // is denied. Must NOT trigger should_rotate_credential.
     let action = parse_anthropic_error_sse("permission_error", "organization disabled");
     match action {
-        crate::sse::SseAction::Error(LlmError::Fatal { reason, source }) => {
+        crate::sse::SseAction::Error(LlmError::Fatal {
+            reason,
+            source,
+            status,
+        }) => {
             assert_eq!(reason, FailoverReason::AuthPermanent);
-            let err = LlmError::Fatal { source, reason };
+            let err = LlmError::Fatal {
+                source,
+                reason,
+                status,
+            };
             assert!(
                 !err.should_rotate_credential(),
                 "AuthPermanent must not rotate credentials",

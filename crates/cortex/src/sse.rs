@@ -76,6 +76,7 @@ where
                             source: anyhow::anyhow!("Stream read error: {e}"),
                             retry_after: None,
                             reason: FailoverReason::Timeout,
+                            status: None,
                         });
                     }
                     Ok(None) => {
@@ -108,6 +109,7 @@ where
                             source: anyhow::anyhow!("No data received for {chunk_timeout_secs}s"),
                             retry_after: None,
                             reason: FailoverReason::Timeout,
+                            status: None,
                         });
                     }
                 }
@@ -121,6 +123,7 @@ where
                 source: anyhow::anyhow!("SSE buffer exceeded {max_buffer} bytes"),
                 retry_after: None,
                 reason: FailoverReason::Overloaded,
+                status: None,
             });
         }
 
@@ -319,6 +322,7 @@ mod tests {
                 source: anyhow::anyhow!("parse error"),
                 retry_after: None,
                 reason: FailoverReason::Overloaded,
+                status: None,
             })
         })
         .await;
@@ -390,6 +394,7 @@ mod tests {
                 source: anyhow::anyhow!("bad final line"),
                 retry_after: None,
                 reason: FailoverReason::Overloaded,
+                status: None,
             })
         })
         .await;

@@ -353,6 +353,7 @@ pub async fn stream_claude_cli(
         return Err(LlmError::Fatal {
             source: anyhow::anyhow!("empty prompt for Claude CLI"),
             reason: FailoverReason::Format,
+            status: None,
         });
     }
 
@@ -395,6 +396,7 @@ pub async fn stream_claude_cli(
     let mut child = cmd.spawn().map_err(|e| LlmError::Fatal {
         source: anyhow::anyhow!("failed to spawn claude CLI: {e}"),
         reason: FailoverReason::Unknown,
+        status: None,
     })?;
 
     // Write user prompt to stdin
@@ -414,6 +416,7 @@ pub async fn stream_claude_cli(
     let stdout = child.stdout.take().ok_or_else(|| LlmError::Fatal {
         source: anyhow::anyhow!("failed to capture claude CLI stdout"),
         reason: FailoverReason::Unknown,
+        status: None,
     })?;
 
     let mut reader = BufReader::new(stdout).lines();
@@ -464,6 +467,7 @@ pub async fn stream_claude_cli(
         source: anyhow::anyhow!("claude CLI wait error: {e}"),
         retry_after: None,
         reason: FailoverReason::Timeout,
+        status: None,
     })?;
 
     if !status.success() {

@@ -95,6 +95,11 @@ pub enum LlmError {
         retry_after: Option<Duration>,
         /// Classification of the failure.
         reason: FailoverReason,
+        /// HTTP status that produced this error, when it came from a provider
+        /// response. `None` for locally-raised errors (serialization, network,
+        /// parse). Recorded on the credential so `borg auth list` can show
+        /// *why* a key is benched, not just that it is.
+        status: Option<u16>,
     },
     /// Permanent error that will not succeed on retry.
     Fatal {
@@ -102,6 +107,9 @@ pub enum LlmError {
         source: anyhow::Error,
         /// Classification of the failure.
         reason: FailoverReason,
+        /// HTTP status that produced this error, when it came from a provider
+        /// response. See [`Self::Retryable::status`].
+        status: Option<u16>,
     },
     /// Request was cancelled via cancellation token.
     Interrupted,
@@ -140,6 +148,7 @@ impl LlmError {
         Self::Fatal {
             source: source.into(),
             reason: FailoverReason::Format,
+            status: None,
         }
     }
 
@@ -149,15 +158,31 @@ impl LlmError {
             source: source.into(),
             retry_after: None,
             reason: FailoverReason::Unknown,
+            status: None,
         }
     }
 
     /// The server-supplied `Retry-After` delay, when the provider sent one.
+    ///
+    /// `Fatal` deliberately has none. The overloaded case is 402: a transient
+    /// usage-limit window is classified `Retryable` by `classify_402` and does
+    /// carry the hint, while a `Fatal { Billing }` means hard credit
+    /// exhaustion — honoring a short `Retry-After` there would re-probe a
+    /// spent account every minute, which is exactly what the long
+    /// `billing_cooldown` exists to prevent.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Retryable { retry_after, .. } => *retry_after,
-            // `Fatal` carries no delay today; a billing 402 that names a
-            // window is still classified retryable by `classify_402`.
+            _ => None,
+        }
+    }
+
+    /// HTTP status that produced this error, when it came from a provider
+    /// response. Threaded into `CredentialPool::report_failure` so a benched
+    /// key records the status that benched it.
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Retryable { status, .. } | Self::Fatal { status, .. } => *status,
             _ => None,
         }
     }
@@ -238,6 +263,7 @@ pub(crate) fn classify_status(
             source: anyhow::anyhow!("{provider} returned 429 (rate limited): {safe}"),
             retry_after,
             reason: FailoverReason::RateLimit,
+            status: Some(status.as_u16()),
         },
         // 408 Request Timeout is a transient timing failure the server itself
         // flags as safe to retry (RFC 9110 §15.5.9) — commonly a reverse proxy
@@ -247,16 +273,19 @@ pub(crate) fn classify_status(
             source: anyhow::anyhow!("{provider} returned 408 (request timeout): {safe}"),
             retry_after: None,
             reason: FailoverReason::Timeout,
+            status: Some(status.as_u16()),
         },
         500 | 502 | 504 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
+            status: Some(status.as_u16()),
         },
         503 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned {status} (overloaded): {safe}"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
+            status: Some(status.as_u16()),
         },
         401 if matches!(provider, Provider::Bedrock)
             && body_indicates_expired_credential(body) =>
@@ -275,6 +304,7 @@ pub(crate) fn classify_status(
                     "{provider} returned 401 (AWS credentials expired — refresh your AWS credentials, or replace/remove AWS_BEARER_TOKEN_BEDROCK, then restart borg): {safe}"
                 ),
                 reason: FailoverReason::Auth,
+                status: Some(status.as_u16()),
             }
         }
         401 => {
@@ -290,6 +320,7 @@ pub(crate) fn classify_status(
             LlmError::Fatal {
                 source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
                 reason,
+                status: Some(status.as_u16()),
             }
         }
         403 if body_indicates_cloudflare_block(body) => {
@@ -304,11 +335,13 @@ pub(crate) fn classify_status(
                     "{provider} returned 403 (request blocked by Cloudflare — usually a restricted region or a flagged VPN/proxy; try a different network or region): {safe}"
                 ),
                 reason: FailoverReason::AuthPermanent,
+                status: Some(status.as_u16()),
             }
         }
         403 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
+            status: Some(status.as_u16()),
         },
         402 => {
             // 402 is overloaded — some providers return it for transient
@@ -325,11 +358,13 @@ pub(crate) fn classify_status(
                     source: anyhow::anyhow!("{provider} returned {status} ({label}): {safe}"),
                     retry_after,
                     reason,
+                    status: Some(status.as_u16()),
                 }
             } else {
                 LlmError::Fatal {
                     source: anyhow::anyhow!("{provider} returned {status} ({label}): {safe}"),
                     reason,
+                    status: Some(status.as_u16()),
                 }
             }
         }
@@ -338,26 +373,32 @@ pub(crate) fn classify_status(
                 "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {safe}"
             ),
             reason: FailoverReason::AuthPermanent,
+            status: Some(status.as_u16()),
         },
         404 if body_mentions_model(body) => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 404 (model not found): {safe}"),
             reason: FailoverReason::ModelNotFound,
+            status: Some(status.as_u16()),
         },
         413 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 413 (payload too large): {safe}"),
             reason: FailoverReason::PayloadTooLarge,
+            status: Some(status.as_u16()),
         },
         400 if body_indicates_context_overflow(body) => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 400 (context overflow): {safe}"),
             reason: FailoverReason::ContextOverflow,
+            status: Some(status.as_u16()),
         },
         400 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned {status} (bad request): {safe}"),
             reason: FailoverReason::Format,
+            status: Some(status.as_u16()),
         },
         _ => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             reason: FailoverReason::Unknown,
+            status: Some(status.as_u16()),
         },
     }
 }
@@ -388,6 +429,7 @@ mod tests {
             source: anyhow::anyhow!("rate limited"),
             retry_after: Some(Duration::from_secs(5)),
             reason: FailoverReason::RateLimit,
+            status: None,
         };
         assert!(err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::RateLimit);
@@ -398,6 +440,7 @@ mod tests {
         let err = LlmError::Fatal {
             source: anyhow::anyhow!("auth failed"),
             reason: FailoverReason::Auth,
+            status: None,
         };
         assert!(!err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::Auth);
@@ -416,12 +459,14 @@ mod tests {
             source: anyhow::anyhow!("overloaded"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
+            status: None,
         };
         assert_eq!(retryable.to_string(), "overloaded");
 
         let fatal = LlmError::Fatal {
             source: anyhow::anyhow!("bad request"),
             reason: FailoverReason::Format,
+            status: None,
         };
         assert_eq!(fatal.to_string(), "bad request");
 
@@ -762,6 +807,7 @@ mod tests {
             source: anyhow::anyhow!("rate limited"),
             retry_after: Some(Duration::from_secs(5)),
             reason: FailoverReason::RateLimit,
+            status: None,
         };
         let overridden = override_retry_after(err, Some(Duration::from_secs(300)));
         if let LlmError::Retryable { retry_after, .. } = overridden {
@@ -777,6 +823,7 @@ mod tests {
             source: anyhow::anyhow!("rate limited"),
             retry_after: Some(Duration::from_secs(5)),
             reason: FailoverReason::RateLimit,
+            status: None,
         };
         let kept = override_retry_after(err, None);
         if let LlmError::Retryable { retry_after, .. } = kept {
@@ -791,6 +838,7 @@ mod tests {
         let err = LlmError::Fatal {
             source: anyhow::anyhow!("auth"),
             reason: FailoverReason::Auth,
+            status: None,
         };
         // Fatal variants don't carry retry_after — override should be a no-op.
         let kept = override_retry_after(err, Some(Duration::from_secs(300)));
@@ -896,6 +944,7 @@ mod tests {
             let err = LlmError::Fatal {
                 source: anyhow::anyhow!("test"),
                 reason: *reason,
+                status: None,
             };
             let expected = *reason == FailoverReason::ContextOverflow;
             assert_eq!(
@@ -913,10 +962,12 @@ mod tests {
         let auth = LlmError::Fatal {
             source: anyhow::anyhow!("401"),
             reason: FailoverReason::Auth,
+            status: None,
         };
         let perm = LlmError::Fatal {
             source: anyhow::anyhow!("403"),
             reason: FailoverReason::AuthPermanent,
+            status: None,
         };
         assert!(auth.should_rotate_credential());
         assert!(!perm.should_rotate_credential());
@@ -931,6 +982,7 @@ mod tests {
             let err = LlmError::Fatal {
                 source: anyhow::anyhow!("test"),
                 reason: *reason,
+                status: None,
             };
             let expected = !matches!(reason, FailoverReason::AuthPermanent);
             assert_eq!(
@@ -1155,11 +1207,13 @@ mod tests {
                 | FailoverReason::Format => LlmError::Fatal {
                     source: anyhow::anyhow!("{input}"),
                     reason: *reason,
+                    status: None,
                 },
                 _ => LlmError::Retryable {
                     source: anyhow::anyhow!("{input}"),
                     retry_after: None,
                     reason: *reason,
+                    status: None,
                 },
             };
             // Compaction only fires for ContextOverflow.

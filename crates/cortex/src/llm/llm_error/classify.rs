@@ -315,6 +315,7 @@ pub(crate) fn classify_network_error(err: anyhow::Error) -> LlmError {
         source: err,
         retry_after: None,
         reason: FailoverReason::Timeout,
+        status: None,
     }
 }
 

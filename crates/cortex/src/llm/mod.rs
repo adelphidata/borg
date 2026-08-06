@@ -571,6 +571,7 @@ fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap
     let value = reqwest::header::HeaderValue::from_str(&bearer).map_err(|e| LlmError::Fatal {
         source: anyhow::anyhow!("cloud access token contains invalid header characters: {e}"),
         reason: FailoverReason::Auth,
+        status: None,
     })?;
     headers.insert(reqwest::header::AUTHORIZATION, value);
     Ok(headers)
@@ -1587,6 +1588,7 @@ impl LlmClient {
                                 source: anyhow::anyhow!("Bedrock stream read error: {e}"),
                                 retry_after: None,
                                 reason: FailoverReason::Timeout,
+                                status: None,
                             });
                         }
                         Ok(None) => {
@@ -1598,6 +1600,7 @@ impl LlmClient {
                                 source: anyhow::anyhow!("No Bedrock stream data received for {chunk_timeout_secs}s"),
                                 retry_after: None,
                                 reason: FailoverReason::Timeout,
+                                status: None,
                             });
                         }
                     }
@@ -1610,6 +1613,7 @@ impl LlmClient {
                     source: anyhow::anyhow!("Bedrock stream buffer exceeded {max_buffer} bytes"),
                     retry_after: None,
                     reason: FailoverReason::Overloaded,
+                    status: None,
                 });
             }
 
@@ -2028,7 +2032,7 @@ impl LlmClient {
                             pool.report_failure(
                                 id,
                                 reason,
-                                None,
+                                e.status_code(),
                                 retry_after,
                                 Some(&e.to_string()),
                             );
@@ -2230,11 +2234,13 @@ impl LlmClient {
                 ),
                 retry_after: None,
                 reason: FailoverReason::Timeout,
+                status: None,
             });
         }
         let body_bytes = serde_json::to_vec(body).map_err(|e| LlmError::Fatal {
             source: anyhow::anyhow!("serialize request body: {e}"),
             reason: FailoverReason::Format,
+            status: None,
         })?;
         let fut = if self.provider == Provider::Bedrock {
             let client = self.client.clone();
@@ -2354,6 +2360,7 @@ impl LlmClient {
                             ),
                             retry_after: None,
                             reason: FailoverReason::Timeout,
+                            status: None,
                         });
                     }
                 }
@@ -2444,6 +2451,7 @@ impl LlmClient {
                  it) via `borg settings set llm.model <vendor>/{model}`. Original error: {err}"
             ),
             reason: FailoverReason::ModelNotFound,
+            status: None,
         }
     }
 
@@ -2494,6 +2502,7 @@ impl LlmClient {
                 .map_err(|e| LlmError::Fatal {
                     source: e,
                     reason: FailoverReason::Auth,
+                    status: None,
                 })?;
             return bearer_headers(&token.access_token);
         }
@@ -2503,6 +2512,7 @@ impl LlmClient {
                 .map_err(|e| LlmError::Fatal {
                     source: e,
                     reason: FailoverReason::Auth,
+                    status: None,
                 })?;
             return bearer_headers(&token.access_token);
         }
@@ -2512,6 +2522,7 @@ impl LlmClient {
                 .map_err(|e| LlmError::Fatal {
                     source: e,
                     reason: FailoverReason::Unknown,
+                    status: None,
                 })?;
         // xAI cache-affinity: `x-grok-conv-id` pins consecutive requests for
         // the same conversation to the same cache shard. Model-gated to the
@@ -2546,6 +2557,7 @@ impl LlmClient {
                 .map_err(|e| LlmError::Fatal {
                     source: anyhow::anyhow!("build {} endpoint: {e}", transport.protocol_name()),
                     reason: FailoverReason::Format,
+                    status: None,
                 })?
         } else {
             self.effective_base_url().into_owned()
@@ -2852,7 +2864,7 @@ impl LlmClient {
                             pool.report_failure(
                                 id,
                                 reason,
-                                None,
+                                e.status_code(),
                                 e.retry_after(),
                                 Some(&e.to_string()),
                             );
@@ -2940,6 +2952,7 @@ impl LlmClient {
                     "Claude CLI binary not found. Install Claude Code or set CLAUDE_CLI_PATH."
                 ),
                 reason: FailoverReason::Unknown,
+                status: None,
             })?;
 
         let model = self.provider.normalize_model(&self.llm_config.model);

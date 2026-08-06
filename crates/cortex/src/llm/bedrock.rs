@@ -642,6 +642,7 @@ pub(crate) fn try_take_eventstream_payload(
         return Err(LlmError::Fatal {
             source: anyhow::anyhow!("Bedrock eventstream frame too short: {total_len} bytes"),
             reason: FailoverReason::Format,
+            status: None,
         });
     }
     if buffer.len() < total_len {
@@ -654,6 +655,7 @@ pub(crate) fn try_take_eventstream_payload(
         return Err(LlmError::Fatal {
             source: anyhow::anyhow!("Malformed Bedrock eventstream frame"),
             reason: FailoverReason::Format,
+            status: None,
         });
     }
 
