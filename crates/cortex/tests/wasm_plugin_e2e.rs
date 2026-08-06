@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::await_holding_lock, clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end integration test for the WASM plugin lifecycle.
 //!
 //! Covers the seam where `plugins` install-gauntlet primitives meet cortex's

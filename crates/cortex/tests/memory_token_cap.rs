@@ -31,7 +31,7 @@
 //! and `over_20k_rejected_and_not_persisted` will fail (the entry will
 //! land in the DB instead of erroring). Restore and re-run.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::await_holding_lock, clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Mutex;
 

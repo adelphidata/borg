@@ -62,7 +62,7 @@ async fn start_harness() -> Harness {
     }
     // Force the DB to materialize NOW so seeding code in the test body
     // sees the same file the handlers will reopen.
-    let _ = Database::open().expect("seed DB open");
+    let _ = Database::open().await.expect("seed DB open");
 
     let socket = tmp.path().join("borgd.sock");
     let listener = bind_uds(&socket).expect("bind_uds");
@@ -130,14 +130,14 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
         .into_inner();
     assert!(warnings.warnings.is_empty(), "no doctor_runs → empty list");
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         let report = cortex::maintenance::MaintenanceReport {
             ran_at: 1,
             persistent_warnings: vec!["A:check".into(), "B:check".into()],
             current_issues: vec!["other:thing".into()],
             ..Default::default()
         };
-        db.record_doctor_run(&report).expect("record run");
+        db.record_doctor_run(&report).await.expect("record run");
     }
     let warnings = admin
         .get_persistent_warnings(AdminEmpty {})
@@ -156,7 +156,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
     // to map them across the gRPC boundary, so the TUI silently renders
     // zeros despite the daemon having done real work.
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         db.create_task(&NewTask {
             id: "wedged-task",
             name: "wedged",
@@ -176,6 +176,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create wedged task");
         let started_at = chrono::Utc::now().timestamp() - 3600;
         db.conn()
@@ -184,6 +185,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
                  VALUES ('wedged-task', ?1, 0, 'running')",
                 [started_at],
             )
+            .await
             .expect("insert wedged run");
     }
     let heal = admin.heal(AdminEmpty {}).await.expect("heal").into_inner();
@@ -202,7 +204,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
     // fail validation instead of being a no-op (regressed historically:
     // the popup edits one field at a time, so an empty body MUST succeed).
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         db.create_task(&NewTask {
             id: "t1",
             name: "orig",
@@ -222,15 +224,17 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_timeout_ms: None,
             min_interval_secs: None,
         })
+        .await
         .expect("create t1");
     }
 
     // All-empty optionals → leave row unchanged. Confirms the
     // `Option<&str>` -> "leave alone" semantics survive at the DB layer.
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         let baseline = db
             .list_tasks()
+            .await
             .expect("list")
             .into_iter()
             .find(|t| t.id == "t1")
@@ -245,9 +249,11 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
                 timezone: None,
             },
         )
+        .await
         .expect("noop update");
         let after = db
             .list_tasks()
+            .await
             .expect("list")
             .into_iter()
             .find(|t| t.id == "t1")
@@ -437,10 +443,12 @@ async fn status_rpcs_round_trip_evolution_bond_vitals_and_xp() {
     // Seed bond + vitals + evolution events through the canonical writers
     // so HMAC chains match what the readers will replay.
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         db.record_bond_event_chained("tool_success", 1, "did a thing")
+            .await
             .expect("bond 1");
         db.record_bond_event_chained("creation", 1, "made a thing")
+            .await
             .expect("bond 2");
         db.record_vitals_event(
             "interaction",
@@ -450,10 +458,13 @@ async fn status_rpcs_round_trip_evolution_bond_vitals_and_xp() {
             &cortex::vitals::deltas_for(cortex::vitals::EventCategory::Interaction),
             None,
         )
+        .await
         .expect("vitals 1");
         db.record_evolution_event("xp_gain", 2, Some("builder"), "tool:apply_patch", None)
+            .await
             .expect("evo 1");
         db.record_evolution_event("xp_gain", 1, Some("builder"), "tool:read_file", None)
+            .await
             .expect("evo 2");
     }
 
@@ -607,9 +618,9 @@ async fn onboarding_state_round_trips_through_settings_table() {
     // Cross-check the actual settings-table key — guards against a refactor
     // that quietly renames the sentinel and breaks main.rs's probe path.
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         assert_eq!(
-            db.get_setting("onboarded").expect("get").as_deref(),
+            db.get_setting("onboarded").await.expect("get").as_deref(),
             Some("true"),
             "settings.onboarded must be persisted as the literal string \"true\""
         );
@@ -620,8 +631,10 @@ async fn onboarding_state_round_trips_through_settings_table() {
     // handler that caches the flag in-memory and ignores subsequent DB
     // state changes (e.g. a future "reset onboarding" maintenance task).
     {
-        let db = Database::open().expect("db");
-        db.set_setting("onboarded", "false").expect("flip false");
+        let db = Database::open().await.expect("db");
+        db.set_setting("onboarded", "false")
+            .await
+            .expect("flip false");
     }
     let state = admin
         .get_onboarding_state(AdminEmpty {})
@@ -672,10 +685,12 @@ async fn monthly_aggregates_distinguish_no_rows_from_zero_cost() {
 
     // Seed: two rows, totals 100 + 250 = 350; costs 0.10 + 0.25 = 0.35.
     {
-        let db = Database::open().expect("db");
+        let db = Database::open().await.expect("db");
         db.log_token_usage(40, 60, 100, "openrouter", "model-a", Some(0.10))
+            .await
             .expect("seed row 1");
         db.log_token_usage(50, 200, 250, "openrouter", "model-a", Some(0.25))
+            .await
             .expect("seed row 2");
     }
 

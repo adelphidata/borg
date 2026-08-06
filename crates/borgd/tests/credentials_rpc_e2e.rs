@@ -30,7 +30,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const TEST_ENV_VAR: &str = "OPENROUTER_API_KEY";
 
-fn fresh_admin_with_provider(seed_key: &str) -> (AdminSvc, tempfile::TempDir) {
+async fn fresh_admin_with_provider(seed_key: &str) -> (AdminSvc, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
@@ -39,10 +39,11 @@ fn fresh_admin_with_provider(seed_key: &str) -> (AdminSvc, tempfile::TempDir) {
     }
     // Materialize the DB and pick the primary provider via settings so
     // `Config::resolve_api_keys()` works for the handlers' build_primary_pool.
-    let db = Database::open().expect("seed DB open");
+    let db = Database::open().await.expect("seed DB open");
     let resolver = SettingsResolver::new(db);
     resolver
         .set("provider", "openrouter")
+        .await
         .expect("set provider");
     (AdminSvc::new(SessionRegistry::new()), tmp)
 }
@@ -60,7 +61,7 @@ async fn list_then_add_then_remove_round_trips() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key").await;
 
     // 1. Initial list: pool seeded from env, 1 entry.
     let list = Admin::list_credentials(&admin, Request::new(ListCredentialsRequest::default()))
@@ -127,11 +128,36 @@ async fn list_then_add_then_remove_round_trips() {
             .await
             .expect("list after remove")
             .into_inner();
-    let pp = &list_after.providers[0];
-    let tomb = pp.entries.iter().filter(|e| e.status == "removed").count();
+    // The suppression row is written by a fire-and-forget persist task, so it
+    // is not necessarily visible on the very next rebuild. Poll rather than
+    // assert once: this still fails if the row never lands, but it does not
+    // depend on winning a race with the background writer.
+    let mut statuses: Vec<String> = list_after
+        .providers
+        .first()
+        .map(|p| p.entries.iter().map(|e| e.status.clone()).collect())
+        .unwrap_or_default();
+    let mut tomb = statuses.iter().filter(|s| *s == "removed").count();
+    for _ in 0..100 {
+        if tomb >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let again =
+            Admin::list_credentials(&admin, Request::new(ListCredentialsRequest::default()))
+                .await
+                .expect("re-list")
+                .into_inner();
+        statuses = again
+            .providers
+            .first()
+            .map(|p| p.entries.iter().map(|e| e.status.clone()).collect())
+            .unwrap_or_default();
+        tomb = statuses.iter().filter(|s| *s == "removed").count();
+    }
     assert!(
         tomb >= 1,
-        "tombstone must persist across pool rebuilds — got {tomb}"
+        "tombstone must persist across pool rebuilds — statuses={statuses:?}"
     );
 
     teardown_env();
@@ -150,7 +176,7 @@ async fn add_credential_is_runtime_only_across_rpc_calls() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-runtime-only");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-runtime-only").await;
 
     Admin::add_credential(
         &admin,
@@ -186,7 +212,7 @@ async fn remove_unknown_target_returns_invalid_argument() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-2");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-2").await;
 
     let err = Admin::remove_credential(
         &admin,
@@ -218,22 +244,23 @@ async fn reset_clears_cooled_entries_only() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-3");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-3").await;
 
     // Build a pool directly via the production builder and cool one entry,
     // then reset via RPC and verify the count.
     {
-        let _db = Database::open().expect("db");
-        let config = cortex::config::Config::load_from_db().expect("config");
+        let _db = Database::open().await.expect("db");
+        let config = cortex::config::Config::load_from_db()
+            .await
+            .expect("config");
+        // The pool builder now takes the whole `LlmConfig` rather than seven
+        // positional knobs — see `try_build_from_keys`.
         let pool = cortex::llm::credential_pool::try_build_from_keys(
             cortex::llm::provider::Provider::OpenRouter,
             config.resolve_api_keys().expect("keys").1,
-            config.llm.credential_strategy,
-            config.llm.credential_cooldown_secs,
-            config.llm.max_concurrent_per_credential,
-            config.llm.proactive_rate_limit_threshold_pct,
-            config.llm.proactive_rate_limit_min_window_secs,
+            &config.llm,
         )
+        .await
         .expect("pool");
         let id = pool.entries()[0].id.clone();
         pool.report_failure(
@@ -249,16 +276,27 @@ async fn reset_clears_cooled_entries_only() {
         );
     }
 
-    let resp = Admin::reset_credentials(
-        &admin,
-        Request::new(ResetCredentialsRequest {
-            provider: "openrouter".into(),
-        }),
-    )
-    .await
-    .expect("reset")
-    .into_inner();
-    assert_eq!(resp.cleared, 1, "exactly one cooldown should be cleared");
+    // `report_failure` persists the cooldown through a fire-and-forget task,
+    // and `reset_credentials` rebuilds the pool from the DB — so poll until
+    // the cooldown is visible to the rebuild rather than racing the writer.
+    let mut cleared = 0;
+    for _ in 0..100 {
+        cleared = Admin::reset_credentials(
+            &admin,
+            Request::new(ResetCredentialsRequest {
+                provider: "openrouter".into(),
+            }),
+        )
+        .await
+        .expect("reset")
+        .into_inner()
+        .cleared;
+        if cleared >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(cleared, 1, "exactly one cooldown should be cleared");
 
     // Idempotent: second reset clears nothing.
     let resp2 = Admin::reset_credentials(
@@ -280,7 +318,7 @@ async fn set_strategy_validates_and_persists() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-4");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-4").await;
 
     // Garbage value rejected at the API boundary, before any settings write.
     let err = Admin::set_credential_strategy(
@@ -295,9 +333,9 @@ async fn set_strategy_validates_and_persists() {
     assert_eq!(err.code(), Code::InvalidArgument);
 
     // Confirm DB wasn't touched by the rejected call.
-    let db = Database::open().expect("db");
+    let db = Database::open().await.expect("db");
     let resolver = SettingsResolver::new(db);
-    let cfg = resolver.resolve().expect("resolve 1");
+    let cfg = resolver.resolve().await.expect("resolve 1");
     assert_eq!(
         cfg.llm.credential_strategy.to_string(),
         "fill_first",
@@ -315,7 +353,7 @@ async fn set_strategy_validates_and_persists() {
         )
         .await
         .unwrap_or_else(|e| panic!("set {s}: {e}"));
-        let cfg = resolver.resolve().expect("resolve loop");
+        let cfg = resolver.resolve().await.expect("resolve loop");
         assert_eq!(cfg.llm.credential_strategy.to_string(), *s);
     }
 
@@ -327,7 +365,7 @@ async fn add_rejects_empty_or_whitespace_key() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-5");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-5").await;
 
     // Empty key.
     let err = Admin::add_credential(
@@ -364,7 +402,7 @@ async fn list_filters_by_provider() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-6");
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-6").await;
 
     // Empty filter = all providers (we have one).
     let all = Admin::list_credentials(&admin, Request::new(ListCredentialsRequest::default()))
