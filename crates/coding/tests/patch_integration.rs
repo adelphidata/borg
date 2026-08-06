@@ -405,15 +405,20 @@ fn beta(value: i32) -> i32 {
     );
 }
 
-// ── Test: CRLF input file is normalized to LF after patching ──
+// ── Test: a CRLF file keeps CRLF after patching ──
 //
-// `apply_hunks` splits on `content.lines()` which silently strips `\r\n`. The
-// file written back uses `\n` joins. This locks down that observable behavior
-// so a future change that introduces line-ending preservation (or breaks
-// CRLF input entirely) is caught.
+// `apply_hunks` splits on `content.lines()`, which strips `\r`. Joining back
+// with a bare `\n` rewrote every line of a CRLF file on a one-line edit: the
+// whole file shows as changed in `git diff`, the ghost-commit diff is
+// unreadable, and the actual change is invisible. The applicator now rejoins
+// with the file's own dominant terminator.
+//
+// (This test previously asserted the normalize-to-LF behavior, with a comment
+// saying it existed to catch a future change introducing line-ending
+// preservation. This is that change.)
 
 #[test]
-fn crlf_input_is_normalized_to_lf_on_update() {
+fn crlf_input_keeps_crlf_on_update() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let dir = tmp.path();
 
@@ -429,12 +434,10 @@ fn crlf_input_is_normalized_to_lf_on_update() {
 
     apply_patch_to_dir(patch, dir).expect("apply against CRLF file");
     let after = fs::read_to_string(dir.join("crlf.txt")).expect("read");
-    assert!(
-        !after.contains('\r'),
-        "CRLF must be normalized to LF after patch: {after:?}"
+    assert_eq!(
+        after, "alpha\r\nBETA\r\ngamma\r\n",
+        "untouched lines must keep their CRLF endings"
     );
-    assert!(after.contains("BETA"), "replacement applied: {after:?}");
-    assert!(!after.contains("beta\n"), "old text removed: {after:?}");
 }
 
 // ── Test: move chain (A→B and C→A in one patch) ──
