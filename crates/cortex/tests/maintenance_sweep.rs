@@ -1,4 +1,3 @@
-#![cfg(feature = "phase9-tests-disabled")]
 //! Integration tests: daily self-healing maintenance sweep end-to-end.
 //!
 //! Spec invariants (CLAUDE.md → "Self-Healing"):
@@ -9,10 +8,15 @@
 //!     short-circuit and `report.budget_exhausted = true`.
 //!   - When `maintenance.enabled = false`, the sweep returns a `skipped`
 //!     report with no DB mutations.
+//!   - The sweep never calls an LLM.
 //!
 //! These drive `cortex::maintenance::run_daily_maintenance` against a real
 //! SQLite DB rooted under `BORG_DATA_DIR=<tempdir>` and assert on the
 //! returned `MaintenanceReport` counters plus the post-sweep DB state.
+//!
+//! Previously gated behind `phase9-tests-disabled` (never enabled), so the
+//! whole self-healing subsystem had zero coverage that actually ran. Ported to
+//! the async libsql API and un-gated.
 //!
 //! ── Mutation verification ──
 //!
@@ -24,12 +28,16 @@
 //! • Remove the `if !config.maintenance.enabled { skipped = true; ... return }`
 //!   early return: `disabled_returns_skipped_report_no_mutations` fails
 //!   because the sweep runs and starts pruning rows.
+//! • Drop the per-key `budget.is_blown()` break in the remediation loop:
+//!   `budget_exhausted_short_circuits_remaining_steps` fails on
+//!   `auto_fixed_issues`.
 
 #![allow(
+    clippy::await_holding_lock,
     clippy::expect_used,
     clippy::field_reassign_with_default,
-    clippy::unwrap_used,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    clippy::unwrap_used
 )]
 
 use std::fs;
@@ -49,9 +57,7 @@ fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: env mutation under multi-threaded test runners can race FFI
     // `getenv`. SERIAL above guarantees no other test in this binary reads
-    // or writes BORG_DATA_DIR concurrently. Background threads in this
-    // binary do not consult the env. See the same pattern in
-    // `tests/memory_token_cap.rs`.
+    // or writes BORG_DATA_DIR concurrently.
     unsafe {
         std::env::set_var("BORG_DATA_DIR", tmp.path());
     }
@@ -60,26 +66,40 @@ fn isolated_data_dir() -> tempfile::TempDir {
 
 /// Force-insert an embedding-cache row whose `last_accessed_at` is `age_secs`
 /// in the past — older than the 30-day TTL the sweep prunes against.
-fn seed_expired_embedding(db: &Database, hash: &str, age_secs: i64) {
+async fn seed_expired_embedding(db: &Database, hash: &str, age_secs: i64) {
     let now = chrono::Utc::now().timestamp();
     db.cache_embedding("openai", "text-embedding-3-small", hash, &[1u8, 2, 3, 4], 4)
+        .await
         .expect("cache embedding");
-    let stale = now - age_secs;
     db.conn()
         .execute(
             "UPDATE embedding_cache SET last_accessed_at = ?1 WHERE content_hash = ?2",
-            rusqlite::params![stale, hash],
+            libsql::params![now - age_secs, hash],
         )
+        .await
         .expect("backdate last_accessed_at");
 }
 
-fn embedding_cache_row_count(db: &Database) -> i64 {
-    db.conn()
-        .query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get(0))
-        .expect("count embedding_cache rows")
+/// Single-column `i64` scalar query.
+async fn scalar_i64(db: &Database, sql: &str) -> i64 {
+    let mut rows = db
+        .conn()
+        .query(sql, libsql::params![])
+        .await
+        .expect("query");
+    rows.next()
+        .await
+        .expect("row result")
+        .expect("one row")
+        .get::<i64>(0)
+        .expect("i64 column")
 }
 
-fn seed_stalled_cron_task(db: &Database, id: &str, overdue_secs: i64) {
+async fn embedding_cache_row_count(db: &Database) -> i64 {
+    scalar_i64(db, "SELECT COUNT(*) FROM embedding_cache").await
+}
+
+async fn seed_stalled_cron_task(db: &Database, id: &str, overdue_secs: i64) {
     let now = chrono::Utc::now().timestamp();
     db.create_task(&NewTask {
         id,
@@ -104,6 +124,7 @@ fn seed_stalled_cron_task(db: &Database, id: &str, overdue_secs: i64) {
         pre_run_timeout_ms: None,
         min_interval_secs: None,
     })
+    .await
     .expect("create stalled task");
 }
 
@@ -130,22 +151,22 @@ fn seed_oversized_daemon_log(logs_dir: &std::path::Path) -> u64 {
 // Test cases
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn happy_path_drains_seeded_state() {
+#[tokio::test]
+async fn happy_path_drains_seeded_state() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
 
     // Seed: 3 expired cache entries (older than 30-day TTL).
     let ttl_secs = 30 * SECS_PER_DAY;
     for i in 0..3 {
-        seed_expired_embedding(&db, &format!("expired_{i}"), ttl_secs + 86_400);
+        seed_expired_embedding(&db, &format!("expired_{i}"), ttl_secs + 86_400).await;
     }
     // Seed: 1 stalled cron task (next_run 2h in the past — > 1h grace).
-    seed_stalled_cron_task(&db, "stalled-task-001", 7_200);
+    seed_stalled_cron_task(&db, "stalled-task-001", 7_200).await;
     // Seed: oversized daemon.log under the test's logs_dir.
     let logs_dir = Config::logs_dir().expect("logs_dir");
     let initial_log_size = seed_oversized_daemon_log(&logs_dir);
@@ -156,7 +177,7 @@ fn happy_path_drains_seeded_state() {
         "default config must have maintenance enabled — test relies on this"
     );
 
-    let report = run_daily_maintenance(&db, &config).expect("sweep ok");
+    let report = run_daily_maintenance(&db, &config).await.expect("sweep ok");
 
     assert!(!report.skipped, "sweep must run when enabled");
     assert!(
@@ -176,14 +197,11 @@ fn happy_path_drains_seeded_state() {
     );
 
     // DB state: the seeded expired rows must be gone.
-    let remaining_expired: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM embedding_cache WHERE content_hash LIKE 'expired_%'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count remaining expired rows");
+    let remaining_expired = scalar_i64(
+        &db,
+        "SELECT COUNT(*) FROM embedding_cache WHERE content_hash LIKE 'expired_%'",
+    )
+    .await;
     assert_eq!(
         remaining_expired, 0,
         "expired embedding_cache rows must be deleted by the sweep"
@@ -206,30 +224,60 @@ fn happy_path_drains_seeded_state() {
     );
 }
 
-#[test]
-fn budget_exhausted_short_circuits_remaining_steps() {
+#[tokio::test]
+async fn vacuum_is_conditional_and_does_not_run_on_a_clean_db() {
+    // Documented invariant: the WAL checkpoint runs on *every* sweep, but
+    // VACUUM is conditional (fragmentation > 15% AND
+    // `maintenance.vacuum_interval_days` elapsed). A fresh DB satisfies
+    // neither, so an unconditional VACUUM — which rewrites the whole file and
+    // holds a write lock — would show up here.
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let db = Database::open().await.expect("open db");
+
+    let report = run_daily_maintenance(&db, &Config::default())
+        .await
+        .expect("sweep ok");
+
+    assert!(!report.skipped);
+    assert!(
+        !report.vacuum_ran,
+        "a fresh, unfragmented DB must not trigger the conditional VACUUM"
+    );
+    assert_eq!(
+        report.vacuum_bytes_reclaimed, 0,
+        "a skipped VACUUM must not report reclaimed bytes"
+    );
+}
+
+#[tokio::test]
+async fn budget_exhausted_short_circuits_remaining_steps() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
 
     // Seed enough work to overflow a tiny budget. 5 expired cache rows are
     // pruned in a single SQL statement that charges 5 actions at once —
-    // budget=1 must trip on the first try_spend(5).
+    // budget=1 must trip on the first try_spend(5). The gate is checked
+    // *between* steps, so the pruning step itself still completes; the
+    // contract is that everything after it does not.
     let ttl_secs = 30 * SECS_PER_DAY;
     for i in 0..5 {
-        seed_expired_embedding(&db, &format!("budget_{i}"), ttl_secs + 86_400);
+        seed_expired_embedding(&db, &format!("budget_{i}"), ttl_secs + 86_400).await;
     }
     // Also seed a stalled task — when the budget is blown, this step must
     // be skipped entirely (`stalled_tasks_healed` must stay 0).
-    seed_stalled_cron_task(&db, "budget-stalled", 7_200);
+    seed_stalled_cron_task(&db, "budget-stalled", 7_200).await;
 
     let mut config = Config::default();
     config.maintenance.heal_action_budget = 1;
 
-    let report = run_daily_maintenance(&db, &config).expect("sweep ok");
+    let report = run_daily_maintenance(&db, &config).await.expect("sweep ok");
 
     assert!(
         report.budget_exhausted,
@@ -242,27 +290,61 @@ fn budget_exhausted_short_circuits_remaining_steps() {
          got {} (production code reached the stalled-task step despite blown budget)",
         report.stalled_tasks_healed
     );
+    assert!(
+        report.auto_fixed_issues.is_empty(),
+        "the remediation loop must not run on a blown budget; report: {:?}",
+        report
+    );
 }
 
-#[test]
-fn disabled_returns_skipped_report_no_mutations() {
+#[tokio::test]
+async fn a_generous_budget_is_not_blown_by_a_healthy_sweep() {
+    // The other half of the budget contract: the per-key charge in the
+    // remediation loop must not make an ordinary sweep look runaway.
+    // Without this, tightening the accounting could silently disable
+    // self-healing entirely.
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let db = Database::open().await.expect("open db");
+
+    let config = Config::default();
+    assert_eq!(
+        config.maintenance.heal_action_budget, 1000,
+        "documented default; the assertion below assumes ample room"
+    );
+
+    let report = run_daily_maintenance(&db, &config).await.expect("sweep ok");
+
+    assert!(
+        !report.budget_exhausted,
+        "a clean database must not exhaust the default budget; report: {:?}",
+        report
+    );
+}
+
+#[tokio::test]
+async fn disabled_returns_skipped_report_no_mutations() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
 
     // Seed an expired row that the sweep WOULD prune if it ran.
     let ttl_secs = 30 * SECS_PER_DAY;
-    seed_expired_embedding(&db, "disabled_seed", ttl_secs + 86_400);
-    let before = embedding_cache_row_count(&db);
+    seed_expired_embedding(&db, "disabled_seed", ttl_secs + 86_400).await;
+    let before = embedding_cache_row_count(&db).await;
     assert!(before >= 1, "fixture must persist");
 
     let mut config = Config::default();
     config.maintenance.enabled = false;
 
-    let report = run_daily_maintenance(&db, &config).expect("disabled sweep returns Ok");
+    let report = run_daily_maintenance(&db, &config)
+        .await
+        .expect("disabled sweep returns Ok");
 
     assert!(
         report.skipped,
@@ -284,7 +366,7 @@ fn disabled_returns_skipped_report_no_mutations() {
     // DB state: the seeded row must still be there — the disable flag must
     // be a real short-circuit, not a "skip the report counters but still
     // do the work" mistake.
-    let after = embedding_cache_row_count(&db);
+    let after = embedding_cache_row_count(&db).await;
     assert_eq!(
         after, before,
         "disabled sweep must not mutate embedding_cache (before={}, after={})",
