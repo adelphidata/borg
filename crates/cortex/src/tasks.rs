@@ -101,20 +101,25 @@ pub fn sandbox_wrap_scheduled_command(
     let bare_args = vec!["-c".to_string(), command.to_string()];
     let root = dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
     let root_str = root.to_string_lossy().into_owned();
+    // A task's `pre_run_cwd` can point outside `$HOME`. Scoping to `$HOME`
+    // alone would leave such a job failing on its own working directory, with
+    // an opaque sandbox error rather than a useful one.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let mut roots = vec![root_str.clone()];
+    if !cwd_str.starts_with(&root_str) {
+        roots.push(cwd_str);
+    }
     let policy = sandbox::policy::SandboxPolicy {
         // Scheduled jobs routinely fetch and post; the boundary here is
         // filesystem-scoped, matching the ACP `run_shell` profile.
         network: true,
-        fs_read: vec![root_str.clone()],
-        fs_write: vec![root_str.clone()],
+        fs_read: roots.clone(),
+        fs_write: roots.clone(),
         deny_read: Vec::new(),
         deny_write: Vec::new(),
         allowed_domains: Vec::new(),
     }
-    .with_blocked_paths_denied(
-        &config.security.blocked_paths,
-        std::slice::from_ref(&root_str),
-    )
+    .with_blocked_paths_denied(&config.security.blocked_paths, &roots)
     .configured(&config.security.blocked_paths);
     let wrapped = policy.wrap_command("sh", &bare_args, cwd);
     (wrapped.program, wrapped.args)

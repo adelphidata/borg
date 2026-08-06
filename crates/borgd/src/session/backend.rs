@@ -216,6 +216,21 @@ pub trait SessionBackend: Send + Sync + 'static {
     }
 }
 
+/// Recover the process exit status from a `run_shell` result string.
+///
+/// The handler renders `Exit code: N` as the first line for both the piped
+/// and PTY paths. Returns `0` when no such line is present — session-control
+/// verbs and the apply-patch reroute produce output without one, and treating
+/// those as failures would be worse than treating them as success.
+fn parse_exit_code(output: &str) -> i32 {
+    output
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("Exit code: "))
+        .and_then(|n| n.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
 /// Result of a `!cmd` shell-mode execution.
 #[derive(Debug, Clone)]
 pub struct ExecShellOutcome {
@@ -642,6 +657,15 @@ impl SessionBackend for AgentBackend {
         )
         .await?;
 
+        let raw_for_status = raw.clone();
+
+        // The handler reports refusals as ordinary output text rather than an
+        // `Err`, so the denial has to be recognized here. Checked against the
+        // *pre-redaction* text and against a constant exported by the handler,
+        // so neither redaction nor a reworded message can silently turn a
+        // refusal into an apparent success.
+        let denied = raw.starts_with(cortex::tool_handlers::SHELL_DENIED_PREFIX);
+
         // `!cat .env` must not land in the transcript in the clear. The tool
         // path redacts what it streams; this covers what we persist.
         let output = if config.security.output_redaction {
@@ -649,10 +673,6 @@ impl SessionBackend for AgentBackend {
         } else {
             raw
         };
-
-        // The handler reports refusals as ordinary output text rather than an
-        // `Err`, so the denial has to be recognized here to be surfaced.
-        let denied = output.starts_with("Shell command denied");
 
         // Reuses `append_assistant_message`, which already refuses to inject
         // when the last assistant turn has unresolved tool calls — exactly the
@@ -665,7 +685,15 @@ impl SessionBackend for AgentBackend {
 
         Ok(ExecShellOutcome {
             output,
-            exit_code: if denied { -1 } else { 0 },
+            // `-1` means "never ran". Otherwise recover the real status from
+            // the handler's `Exit code: N` line rather than hardcoding 0 —
+            // a hardcoded success made `is_error` unreachable for genuinely
+            // failing commands, i.e. a lie in the wire contract.
+            exit_code: if denied {
+                -1
+            } else {
+                parse_exit_code(&raw_for_status)
+            },
             denied,
         })
     }

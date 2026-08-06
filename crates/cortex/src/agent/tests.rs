@@ -1980,3 +1980,64 @@ async fn healthy_storage_records_no_fault_and_extends_history() {
     );
     assert_eq!(agent.history.len(), 1);
 }
+
+#[tokio::test]
+async fn storage_fault_mid_turn_leaves_history_well_formed() {
+    // A turn persists the assistant message carrying `tool_calls` in one
+    // batch and its `tool_result`s in a later one. If the first faulted and a
+    // later one squeezed through, history would hold tool results with no
+    // preceding tool use — a shape Anthropic and OpenAI both reject, and one
+    // that would outlive the aborted turn and poison every subsequent one.
+    let (mut agent, _tmp) = agent_with_full_db().await;
+
+    let mut assistant = Message::assistant("x".repeat(200_000));
+    assistant.tool_calls = Some(vec![crate::types::ToolCall {
+        id: "call_1".to_string(),
+        call_type: "function".to_string(),
+        function: crate::types::FunctionCall {
+            name: "run_shell".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+
+    // Head batch faults on the full disk...
+    agent.persist_messages(vec![assistant]).await;
+    assert!(agent.storage_fault.is_some(), "head batch must fault");
+
+    // ...and the follow-up tool result must NOT slip in behind it, even
+    // though it is small enough to fit.
+    agent
+        .persist_messages(vec![Message::tool_result("call_1", "ok")])
+        .await;
+
+    assert!(
+        agent.history.is_empty(),
+        "no partial turn may survive: {:?}",
+        agent.history
+    );
+    assert!(
+        !agent
+            .history
+            .iter()
+            .any(|m| m.role == crate::types::Role::Tool),
+        "a tool result must never be persisted without its tool call"
+    );
+}
+
+#[tokio::test]
+async fn a_new_turn_clears_a_stale_storage_fault() {
+    // A fault raised between turns (a failed auto_save) must not kill a turn
+    // that would succeed on a since-freed disk; if the disk is still full,
+    // that turn's first persist re-raises it immediately.
+    let (mut agent, _tmp) = agent_with_full_db().await;
+    agent
+        .persist_messages(vec![Message::assistant("x".repeat(200_000))])
+        .await;
+    assert!(agent.storage_fault.is_some());
+
+    agent.prepare_loop().await;
+    assert!(
+        agent.storage_fault.is_none(),
+        "a fresh turn starts from a clean slate"
+    );
+}

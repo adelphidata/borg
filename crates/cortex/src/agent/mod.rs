@@ -941,6 +941,13 @@ impl Agent {
     /// One-time setup before entering the agent loop: ghost commit, project doc caching,
     /// and background indexing of extra memory paths and past sessions.
     async fn prepare_loop(&mut self) {
+        // A storage fault only aborts the turn it occurred in. Clearing it
+        // here means a fault from *between* turns (a failed `auto_save`)
+        // doesn't spuriously kill a turn that would have succeeded on a
+        // since-freed disk — and if the disk is still full, this turn's first
+        // persist re-raises it immediately.
+        self.storage_fault = None;
+
         // Create ghost commit for coding safety (lazy, one-time)
         if self.ghost_commit.is_none() {
             if let Some(ref root) = self.git_repo_root {
@@ -1594,8 +1601,13 @@ impl Agent {
         // template-driven backends can leak a bare scaffolding token (e.g.
         // `[TOOL_CALLS]`) as *content* alongside a real call; persisting it
         // pollutes the transcript, replays as fallback text, and survives
-        // compaction until the model starts imitating it. Shadowing here
-        // covers both the discarded-calls path and normal execution.
+        // compaction until the model starts imitating it.
+        //
+        // Scope is deliberately narrow: only turns that carry parsed tool
+        // calls. A marker that arrives as the model's *entire* reply (no
+        // calls, or a stream error) returns above and is left alone — there
+        // it is the whole response, and swallowing it would show the user
+        // nothing at all instead of something obviously wrong.
         let text_content = if tool_markers::is_bare_tool_call_marker(&text_content) {
             tracing::debug!(
                 dropped = %text_content,

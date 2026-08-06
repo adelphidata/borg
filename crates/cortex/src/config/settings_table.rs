@@ -110,7 +110,7 @@ define_settings! {
         "conversation.concurrent_tools.max_workers" => conversation.concurrent_tools.max_workers, parsed(usize);
         "conversation.context_window_guidance" => conversation.context_window_guidance, string;
 
-        // ── Security ──
+        // ── Interface ──
         "ui.shell_mode_enabled" => ui.shell_mode_enabled, parsed(bool);
 
         // ── Security ──

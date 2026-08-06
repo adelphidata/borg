@@ -285,13 +285,6 @@ pub async fn apply_remediation_key(
     }
 }
 
-/// Run the full daily maintenance sweep without a process registry —
-/// preserved for call sites (CLI standalone runs, tests) that don't
-/// have access to the daemon's live registry. Equivalent to
-/// [`run_daily_maintenance_with_registry`] with `None`.
-///
-/// The daemon's task dispatcher and `Admin.Heal` RPC call the registry
-/// variant so subprocess reap/auto-kill actually runs in production.
 /// Log every active `type=command` scheduled task whose command the
 /// execution-policy gate would now refuse.
 ///
@@ -318,6 +311,13 @@ async fn warn_denied_command_tasks(db: &Database, config: &Config) -> Result<usi
     Ok(flagged)
 }
 
+/// Run the full daily maintenance sweep without a process registry —
+/// preserved for call sites (CLI standalone runs, tests) that don't
+/// have access to the daemon's live registry. Equivalent to
+/// [`run_daily_maintenance_with_registry`] with `None`.
+///
+/// The daemon's task dispatcher and `Admin.Heal` RPC call the registry
+/// variant so subprocess reap/auto-kill actually runs in production.
 pub async fn run_daily_maintenance(db: &Database, config: &Config) -> Result<MaintenanceReport> {
     run_daily_maintenance_with_registry(db, config, None).await
 }

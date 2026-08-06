@@ -11,6 +11,14 @@ use crate::execution_context::ExecutionContext;
 use crate::policy::ExecutionPolicy;
 use crate::security::redact_command_for_audit;
 
+/// Prefix every `run_shell` refusal message starts with.
+///
+/// Exported so out-of-crate callers that need to distinguish "refused" from
+/// "ran and produced this output" — notably `!cmd` shell mode in `borgd` —
+/// can key off a shared constant instead of duplicating the literal. There is
+/// a test pinning both refusal paths to it.
+pub const SHELL_DENIED_PREFIX: &str = "Shell command denied";
+
 /// Bounded accumulator for a single output stream: retains the first half of
 /// the byte budget from the head and the last half from the tail, eliding the
 /// middle. A runaway command (`yes`, `cat` of a huge file, a chatty build) is
@@ -359,7 +367,7 @@ pub async fn handle_run_shell_with_context(
                 }),
             )
             .await;
-            return Ok("Shell command denied by policy.".to_string());
+            return Ok(format!("{SHELL_DENIED_PREFIX} by policy."));
         }
         crate::policy::PolicyDecision::AutoApprove => {}
     }
@@ -839,9 +847,10 @@ async fn deny_control_plane_write(command: &str) -> String {
         }),
     )
     .await;
-    "Shell command denied: writing Borg control-plane files (config DB, secrets, hooks.json) \
-     or changing settings via `borg settings set` is not permitted."
-        .to_string()
+    format!(
+        "{SHELL_DENIED_PREFIX}: writing Borg control-plane files (config DB, secrets, \
+         hooks.json) or changing settings via `borg settings set` is not permitted."
+    )
 }
 
 #[cfg(test)]
@@ -1654,5 +1663,40 @@ mod tests {
             .await
             .expect("unknown action returns Ok with a message");
         assert!(result.contains("Unknown run_shell action"), "got: {result}");
+    }
+}
+
+#[cfg(test)]
+mod denial_prefix_tests {
+    use super::*;
+
+    /// `borgd`'s `!cmd` shell mode distinguishes "refused" from "ran and
+    /// produced output" by matching `SHELL_DENIED_PREFIX` against the handler
+    /// result. If either refusal path is reworded away from the constant, a
+    /// refusal starts reading as a successful run — silently.
+    #[tokio::test]
+    async fn both_refusal_paths_start_with_the_exported_prefix() {
+        let config = Config::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = ExecutionContext::unrestricted(std::path::PathBuf::from("."));
+
+        for command in ["rm -rf /", "echo pwned > ~/.borg/hooks.json"] {
+            let args = serde_json::json!({ "action": "run", "command": command });
+            let out = handle_run_shell_with_context(
+                &args,
+                &config,
+                &config.policy,
+                &tx,
+                "test-call",
+                None,
+                &ctx,
+            )
+            .await
+            .expect("handler returns Ok with a refusal string");
+            assert!(
+                out.starts_with(SHELL_DENIED_PREFIX),
+                "refusal for {command:?} must start with the exported prefix, got: {out}"
+            );
+        }
     }
 }

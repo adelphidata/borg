@@ -989,8 +989,7 @@ pub(crate) fn is_quiet_hours(config: &Config) -> bool {
     }
 }
 
-/// Send `text` to every channel listed in `config.heartbeat.channels`.
-/// Fan a message out to every configured heartbeat channel.
+/// Fan `text` out to every channel listed in `config.heartbeat.channels`.
 ///
 /// Returns `(attempted, failed)` channel counts so a caller that owes the user
 /// an outcome (a broadcast scheduled task) can tell "nobody heard this" from

@@ -462,8 +462,13 @@ pub(crate) fn run_tasks_status(id: &str) -> Result<()> {
     // failure leaves `retry_count` at 0, and nesting this made those errors
     // invisible in `borg tasks status` — the one place an operator looks.
     if !detail.last_error.is_empty() {
-        let err = &detail.last_error;
-        println!("    Last error: {}", &err[..err.len().min(100)]);
+        // Char-aware: a raw byte slice panics mid-codepoint, and this now runs
+        // for every task carrying an error — including delivery failures that
+        // embed provider/channel text, where non-ASCII is routine.
+        println!(
+            "    Last error: {}",
+            cortex::util::truncate::truncate_with_ellipsis(&detail.last_error, 100, "...")
+        );
     }
     if detail.retry_count > 0 {
         println!(

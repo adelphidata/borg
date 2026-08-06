@@ -22,13 +22,13 @@ use crate::llm::Provider;
 
 use super::{ConfigEntry, CredentialPool, CredentialStrategy, PoolLoadConfig};
 
-/// Build a [`PoolLoadConfig`] from the primary `LlmConfig` plus the resolved
-/// provider. `api_keys` is resolved by the caller (which has the `SecretRef`
-/// chain) and passed in as already-plaintext entries.
 /// Fallback bench for a billing failure when the caller does not thread
 /// `llm.billing_cooldown_secs` through. Mirrors the config default.
 pub const DEFAULT_BILLING_COOLDOWN_SECS: u64 = 3600;
 
+/// Build a [`PoolLoadConfig`] from the primary `LlmConfig` plus the resolved
+/// provider. `api_keys` is resolved by the caller (which has the `SecretRef`
+/// chain) and passed in as already-plaintext entries.
 pub fn pool_load_config_for_provider(
     provider: Provider,
     strategy: CredentialStrategy,

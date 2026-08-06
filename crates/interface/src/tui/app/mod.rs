@@ -215,6 +215,17 @@ pub struct BtwResult {
 }
 
 /// Events sent from the async doctor task to the TUI event loop.
+/// Outcome of one `!cmd` shell-mode run, delivered back to the event loop.
+#[derive(Debug)]
+pub struct ShellRunResult {
+    /// The command as typed (without the leading `!`).
+    pub command: String,
+    /// Rendered output, or the transport error when the RPC itself failed.
+    pub output: String,
+    /// True when the command was refused, failed, or the RPC errored.
+    pub is_error: bool,
+}
+
 pub enum DoctorEvent {
     /// Progress indicator before a check category runs.
     Analyzing { label: String },
@@ -541,6 +552,11 @@ pub struct App<'a> {
     pub btw_result_rx: Option<mpsc::UnboundedReceiver<BtwResult>>,
     pub btw_result_tx: Option<mpsc::UnboundedSender<BtwResult>>,
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
+    /// Completed `!cmd` shell-mode runs. The command executes on a spawned
+    /// task so a long one (`!npm test`) can't freeze rendering, input, or
+    /// Ctrl+C the way an inline `.await` in the event loop would.
+    pub shell_result_rx: Option<mpsc::UnboundedReceiver<ShellRunResult>>,
+    pub shell_result_tx: Option<mpsc::UnboundedSender<ShellRunResult>>,
     /// Transient corner notifications; auto-expire.
     pub toasts: super::toast::ToastStack,
     /// Shared daemon client for admin RPCs from popups + commands.
@@ -654,6 +670,8 @@ impl<'a> App<'a> {
             btw_result_rx: None,
             btw_result_tx: None,
             doctor_rx: None,
+            shell_result_rx: None,
+            shell_result_tx: None,
             toasts: super::toast::ToastStack::new(),
             client,
             goal_status: None,

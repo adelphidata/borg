@@ -63,10 +63,10 @@ pub async fn handle_schedule(args: &serde_json::Value, config: &Config) -> Resul
     }
 }
 
-pub async fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result<String> {
+pub async fn handle_manage_tasks(args: &serde_json::Value, config: &Config) -> Result<String> {
     let action = require_str_param(args, "action")?.to_string();
     match action.as_str() {
-        "create" => manage_tasks_create(args).await,
+        "create" => manage_tasks_create(args, config).await,
         "list" => manage_tasks_list().await,
         "get" => manage_tasks_get(args).await,
         "update" => manage_tasks_update(args).await,
@@ -163,7 +163,7 @@ fn resolve_origin_delivery(
     (Some(origin.channel_name), Some(target_json))
 }
 
-async fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
+async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Result<String> {
     let task_name = require_str_param(args, "name")?.to_string();
     let prompt = require_str_param(args, "prompt")?.to_string();
     let schedule_type = optional_str_param(args, "schedule_type")
@@ -193,6 +193,16 @@ async fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
         optional_str_param(args, "delivery_target").map(str::to_string),
     );
     let pre_run_command = optional_str_param(args, "pre_run_command").map(str::to_string);
+    // A `pre_run_command` is a shell command too, and the runner gates it at
+    // fire time. Refusing here as well means the model finds out now instead
+    // of persisting a task that fails unattended hours later — the same
+    // contract `manage_cron_create` has.
+    if let Some(ref cmd) = pre_run_command {
+        if let Err(denial) = tasks::check_scheduled_command(cmd, &config.policy) {
+            tasks::audit_scheduled_denial(cmd, denial).await;
+            return Ok(format!("Error: pre_run_command — {}", denial.message()));
+        }
+    }
     let pre_run_cwd = optional_str_param(args, "pre_run_cwd").map(str::to_string);
     let pre_run_timeout_ms = optional_i64_param(args, "pre_run_timeout_ms");
     if let Some(t) = pre_run_timeout_ms {
@@ -663,6 +673,30 @@ mod tests {
             assert!(
                 out.starts_with("Error: Scheduled command refused"),
                 "expected a refusal for {command:?}, got: {out}"
+            );
+        }
+    }
+
+    /// The `pre_run_command` on a prompt task is a shell command too. The
+    /// runner gates it at fire time; refusing at create time means the model
+    /// learns now rather than persisting a task that fails unattended later.
+    #[tokio::test]
+    async fn manage_tasks_create_refuses_a_denied_pre_run_command() {
+        let config = Config::default();
+        for cmd in ["rm -rf /", "echo x > ~/.borg/hooks.json"] {
+            let args = serde_json::json!({
+                "name": "brief",
+                "prompt": "summarize",
+                "schedule_type": "cron",
+                "schedule_expr": "0 0 9 * * * *",
+                "pre_run_command": cmd,
+            });
+            let out = manage_tasks_create(&args, &config)
+                .await
+                .expect("handler returns Ok with an error string");
+            assert!(
+                out.starts_with("Error: pre_run_command"),
+                "expected a refusal for {cmd:?}, got: {out}"
             );
         }
     }

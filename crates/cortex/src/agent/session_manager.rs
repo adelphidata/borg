@@ -231,6 +231,18 @@ impl Agent {
         if msgs.is_empty() {
             return;
         }
+        // Once storage is exhausted, stop persisting for the rest of the turn.
+        //
+        // A turn writes the assistant message carrying `tool_calls` in one
+        // batch and its `tool_result`s in a later one. If the first batch
+        // faulted and a later one squeezed through (a freed page, a smaller
+        // payload), history would hold tool results with no preceding tool
+        // use — a shape Anthropic and OpenAI both reject, and one that would
+        // outlive the aborted turn and poison every subsequent one. Dropping
+        // the whole turn's writes keeps history well-formed.
+        if self.storage_fault.is_some() {
+            return;
+        }
         let session_id = self.session.meta.id.clone();
         let drafts: Vec<crate::db::SessionEventDraft> =
             msgs.iter().map(draft_from_message).collect();

@@ -1858,7 +1858,17 @@ impl LlmClient {
         tx: mpsc::Sender<StreamEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let _aux_slot = self.acquire_aux_slot().await;
+        // Cancellation-aware: a cancelled background turn must not sit in the
+        // admission queue waiting for a slot it will never use.
+        let _aux_slot = match self.aux_concurrency {
+            Some(limit) => tokio::select! {
+                permit = aux_admission::acquire(limit) => Some(permit),
+                _ = cancel.cancelled() => {
+                    return Err(anyhow::anyhow!("cancelled while waiting for an auxiliary slot"));
+                }
+            },
+            None => None,
+        };
 
         // Strip images for non-vision models (safety net)
         let messages = if !self.provider.supports_vision(&self.llm_config.model) {

@@ -922,6 +922,30 @@ async fn run_event_loop(
                 AppAction::Continue
             }
 
+            // `!cmd` shell-mode results
+            event = async {
+                if let Some(rx) = &mut app.shell_result_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(res) = event {
+                    app.cells.push(HistoryCell::ToolResult {
+                        output: res.output,
+                        is_error: res.is_error,
+                        duration_ms: None,
+                        display_label: format!("! {}", res.command),
+                        tool_name: "run_shell".to_string(),
+                        args_json: None,
+                        collapsed: false,
+                    });
+                } else {
+                    app.shell_result_rx = None;
+                }
+                AppAction::Continue
+            }
+
             // /btw background task results
             event = async {
                 if let Some(rx) = &mut app.btw_result_rx {
@@ -1942,27 +1966,40 @@ async fn run_event_loop(
                 app.push_system_message(format!("*poked {borg_name}*"));
             }
             AppAction::ExecShell { command } => {
-                // Echo the typed line, then render the result as a normal
-                // tool-result cell so it inherits collapse/Ctrl+E, styling,
-                // and the existing `insert_history_lines` transcript path —
-                // no new transcript machinery, and nothing near mouse mode.
+                // Echo the typed line immediately, then run the command on a
+                // spawned task. Awaiting inline here would freeze rendering,
+                // input, and Ctrl+C for the command's whole duration — every
+                // other long action in this loop uses a channel for the same
+                // reason.
                 app.cells.push(HistoryCell::User {
                     text: format!("!{command}"),
                 });
-                let mut shell_client = client.clone();
-                match shell_client.exec_shell(session_id, &command, 0).await {
-                    Ok(resp) => {
-                        app.cells.push(HistoryCell::ToolResult {
-                            output: resp.output,
-                            is_error: resp.denied || resp.exit_code != 0,
-                            duration_ms: None,
-                            display_label: format!("! {command}"),
-                            tool_name: "run_shell".to_string(),
-                            args_json: None,
-                            collapsed: false,
-                        });
-                    }
-                    Err(e) => app.push_system_message(format!("Shell command failed: {e}")),
+                if app.shell_result_tx.is_none() {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    app.shell_result_tx = Some(tx);
+                    app.shell_result_rx = Some(rx);
+                }
+                // Safe: populated immediately above when absent.
+                if let Some(tx) = app.shell_result_tx.clone() {
+                    let mut shell_client = client.clone();
+                    let sid = session_id.to_string();
+                    tokio::spawn(async move {
+                        let result = match shell_client.exec_shell(&sid, &command, 0).await {
+                            Ok(resp) => app::ShellRunResult {
+                                command,
+                                output: resp.output,
+                                is_error: resp.denied || resp.exit_code != 0,
+                            },
+                            Err(e) => app::ShellRunResult {
+                                command,
+                                output: format!("Shell command failed: {e}"),
+                                is_error: true,
+                            },
+                        };
+                        // Receiver lives as long as the TUI; a send failure
+                        // only means we're already shutting down.
+                        let _ = tx.send(result);
+                    });
                 }
             }
             AppAction::RunDoctor => {

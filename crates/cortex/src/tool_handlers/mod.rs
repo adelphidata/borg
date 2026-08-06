@@ -82,7 +82,7 @@ pub use memory::{
 pub(crate) use memory::{handle_write_memory_batch, native_memory_search};
 pub use schedule::{handle_manage_cron, handle_manage_tasks, handle_schedule, update_task_status};
 pub use scripts::{handle_manage_scripts, handle_run_script, handle_security_audit};
-pub use shell::{handle_run_shell, handle_run_shell_with_context};
+pub use shell::{handle_run_shell, handle_run_shell_with_context, SHELL_DENIED_PREFIX};
 pub use user_input::{handle_request_user_input, handle_update_plan};
 pub use web::{handle_web_fetch, handle_web_search};
 

@@ -257,9 +257,19 @@ impl Database {
                 params!(run_id, note),
             )
             .await?;
+        // Same append-never-mask rule as the run row above, and for the same
+        // reason: on the `[FAILED]`-notice delivery path `record_task_failure`
+        // has already written the real diagnosis here ("refused by execution
+        // policy"), and this is the field `format_task` and `borg tasks
+        // status` surface. Overwriting it would replace the cause with the
+        // symptom.
         self.conn
             .execute(
-                "UPDATE scheduled_tasks SET last_error = ?2 WHERE id = ?1",
+                "UPDATE scheduled_tasks \
+                 SET last_error = CASE \
+                     WHEN last_error IS NULL OR last_error = '' THEN ?2 \
+                     ELSE last_error || ' | ' || ?2 END \
+                 WHERE id = ?1",
                 params!(task_id, note),
             )
             .await?;
@@ -1345,6 +1355,41 @@ mod delivery_failure_tests {
         let error = error.unwrap_or_default();
         assert!(error.contains("exit code 2"), "got: {error}");
         assert!(error.contains("slack"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn record_delivery_failure_preserves_the_tasks_existing_last_error() {
+        // The `[FAILED]`-notice path: `record_task_failure` has already
+        // written the real diagnosis to `scheduled_tasks.last_error`, and the
+        // delivery of that notice then fails. Overwriting would replace the
+        // cause ("refused by execution policy") with the symptom ("delivery
+        // failed"), in the exact field `borg tasks status` surfaces.
+        let db = Database::test_db().await;
+        seed(&db, "d4").await;
+        let run_id = db.start_task_run("d4", 1_000).await.expect("start run");
+        db.record_task_failure("d4", "Scheduled command refused by execution policy")
+            .await
+            .expect("record real failure");
+
+        db.record_delivery_failure("d4", run_id, "delivery to slack failed: 503")
+            .await
+            .expect("record");
+
+        let last = db
+            .get_task_by_id("d4")
+            .await
+            .expect("query")
+            .expect("task exists")
+            .last_error
+            .unwrap_or_default();
+        assert!(
+            last.contains("refused by execution policy"),
+            "the real cause must survive: {last}"
+        );
+        assert!(
+            last.contains("slack"),
+            "the delivery failure is appended: {last}"
+        );
     }
 
     #[tokio::test]

@@ -589,9 +589,19 @@ pub(crate) fn padding_report(value: &str) -> Option<PaddingReport> {
     if value.is_empty() || value.trim() == value {
         return None;
     }
-    let trimmed_start = value.trim_start();
-    let leading = value.len() - trimmed_start.len();
-    let trailing = trimmed_start.len() - trimmed_start.trim_end().len();
+    // Char counts, not byte counts: the field is documented (and rendered) as
+    // a number of whitespace characters, and the `edges` reconstruction below
+    // consumes them as such — a byte count would mis-slice a multi-byte
+    // whitespace character like U+00A0.
+    let leading = value.chars().take_while(|c| c.is_whitespace()).count();
+    // Counted on what's left *after* the leading run, so an all-whitespace
+    // value reports its characters once rather than twice.
+    let trailing = value
+        .trim_start()
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .count();
 
     let edges: String = value
         .chars()
