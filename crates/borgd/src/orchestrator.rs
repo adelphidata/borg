@@ -281,14 +281,21 @@ pub async fn start(
     // The executor lets heartbeat ticks run the full agent loop (tools + the
     // goal/Ralph loop) for remediation; all other scheduled tasks ignore it.
     let scheduler_executor = executor.clone();
+    // Stall detection: the dispatcher bumps this once per loop iteration and
+    // the supervisor arms a watchdog against each incarnation. Replaces the
+    // dispatcher's own watchdog, which called `std::process::exit(1)` — a
+    // wedged dispatcher now restarts instead of taking the daemon down.
+    let scheduler_liveness = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let liveness_for_loop = scheduler_liveness.clone();
     spawn_supervised(
-        SupervisorConfig::new("scheduler-dispatch"),
+        SupervisorConfig::new("scheduler-dispatch").with_liveness(scheduler_liveness),
         scheduler_shutdown.clone(),
         scheduler_db,
         move || {
             let scheduler_config = scheduler_config.clone();
             let scheduler_semaphore = scheduler_semaphore.clone();
             let scheduler_shutdown = scheduler_shutdown.clone();
+            let liveness_for_loop = liveness_for_loop.clone();
             let task_cost_event_sink = task_cost_event_sink.clone();
             let scheduler_executor = scheduler_executor.clone();
             async move {
@@ -322,6 +329,7 @@ pub async fn start(
                     hooks,
                     scheduler_semaphore,
                     scheduler_shutdown,
+                    liveness_for_loop,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("scheduler dispatcher exited: {e}"))
@@ -483,6 +491,7 @@ mod tests {
                     write_gateway_unrecoverable_meta(&cb_db, now).await;
                 });
             })),
+            liveness: None,
         };
 
         let handle = spawn_supervised(cfg, cancel.clone(), db.clone(), move || async move {

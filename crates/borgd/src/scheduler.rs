@@ -11,10 +11,9 @@ use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{
     DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, SLEEP_DRIFT_THRESHOLD,
-    STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL, WATCHDOG_STALL_THRESHOLD,
-    WATCHDOG_TICK_INTERVAL,
+    STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL,
 };
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -113,17 +112,6 @@ pub(crate) async fn report_prior_unclean_exit(
     Some(heartbeat_at)
 }
 
-/// Aborts the wrapped task when dropped, binding a spawned task's lifetime to
-/// the scope that created it. Used for the dispatcher watchdog so a supervised
-/// respawn can't leave a previous watchdog running against a stale timestamp.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Run the dispatcher loop until `shutdown` fires. Returns when shutdown is
 /// observed — caller should drain any remaining permits.
 pub async fn run(
@@ -131,6 +119,7 @@ pub async fn run(
     hooks: DispatcherHooks,
     semaphore: Arc<tokio::sync::Semaphore>,
     shutdown: CancellationToken,
+    liveness: Arc<AtomicU64>,
 ) -> Result<()> {
     let db = cortex::db::Database::open().await?;
 
@@ -167,39 +156,16 @@ pub async fn run(
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
 
-    // Watchdog. Its lifetime is tied to *this* incarnation of `run()`, not to
-    // the daemon-wide `shutdown` token: `spawn_supervised` respawns the
-    // dispatcher on any error or panic, and a watchdog keyed only to
-    // `shutdown` would survive that, keep holding the now-frozen
-    // `watchdog_ts`, and `exit(1)` the whole daemon 180s later — turning a
-    // recoverable blip into a hard kill and defeating the supervisor.
-    let watchdog_ts = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
-    let _watchdog_guard = {
-        let ts = watchdog_ts.clone();
-        let wd_shutdown = shutdown.clone();
-        AbortOnDrop(tokio::spawn(async move {
-            let mut wd_interval = tokio::time::interval(WATCHDOG_TICK_INTERVAL);
-            loop {
-                // Biased so shutdown wins and the watchdog can't false-positive
-                // by racing a tick against the cancellation on the way down.
-                tokio::select! {
-                    biased;
-                    _ = wd_shutdown.cancelled() => return,
-                    _ = wd_interval.tick() => {}
-                }
-                let last = ts.load(Ordering::Relaxed);
-                let now = chrono::Utc::now().timestamp();
-                if now - last > WATCHDOG_STALL_THRESHOLD.as_secs() as i64 {
-                    tracing::error!(
-                        elapsed_secs = now - last,
-                        threshold_secs = WATCHDOG_STALL_THRESHOLD.as_secs(),
-                        "Daemon watchdog: dispatcher loop stale, exiting"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }))
-    };
+    // Stall detection lives in the supervisor now: `liveness` is bumped once
+    // per loop iteration below, and `spawn_supervised(..., liveness)` arms a
+    // watchdog against *this* incarnation that aborts it if the counter stops
+    // advancing. The dispatcher used to run its own watchdog that called
+    // `std::process::exit(1)` — that killed the whole daemon for a stall in
+    // one subsystem, and, because it was keyed to the daemon-wide shutdown
+    // token, a supervised respawn left the old watchdog alive holding a
+    // frozen timestamp, so any transient error became a hard kill 180s later.
+    // Aborting and restarting the one wedged subsystem is both safer and what
+    // the supervisor already knows how to do.
 
     let mut last_tick_wall = std::time::Instant::now();
     let mut last_stalled_scan = std::time::Instant::now();
@@ -231,7 +197,10 @@ pub async fn run(
             _ = interval.tick() => {}
         }
 
-        watchdog_ts.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        // Liveness heartbeat for the supervisor's stall watchdog. Any
+        // monotonic change counts; the watchdog only compares successive
+        // reads.
+        liveness.fetch_add(1, Ordering::Relaxed);
 
         let elapsed = last_tick_wall.elapsed();
         last_tick_wall = std::time::Instant::now();
@@ -384,52 +353,6 @@ pub async fn run(
 
         // `_tick_lock` drops here at end of iteration, before the next
         // `interval.tick().await`.
-    }
-}
-
-#[cfg(test)]
-mod watchdog_lifetime_tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    /// The dispatcher watchdog must not outlive the `run()` call that spawned
-    /// it. `spawn_supervised` respawns the dispatcher on error or panic while
-    /// `shutdown` (the watchdog's only other exit path) stays uncancelled, so
-    /// a watchdog bound solely to that token would survive the restart, keep
-    /// watching a timestamp nothing updates any more, and `std::process::exit`
-    /// the whole daemon once the stall threshold elapsed — turning a
-    /// recoverable blip into a hard kill and defeating the supervisor.
-    #[tokio::test]
-    async fn watchdog_guard_stops_the_task_when_its_scope_returns() {
-        let fired = Arc::new(AtomicBool::new(false));
-        let shutdown = CancellationToken::new();
-
-        {
-            let fired = fired.clone();
-            // Never cancelled — stands in for the daemon-wide token that
-            // stays live across a supervised respawn.
-            let token = shutdown.clone();
-            let _guard = AbortOnDrop(tokio::spawn(async move {
-                tokio::select! {
-                    _ = token.cancelled() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                        fired.store(true, Ordering::SeqCst);
-                    }
-                }
-            }));
-        } // scope exit == `run()` returning into the supervisor
-
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            !fired.load(Ordering::SeqCst),
-            "watchdog outlived its scope; a supervised respawn would leave it \
-             watching a frozen timestamp and eventually kill the daemon"
-        );
-        assert!(
-            !shutdown.is_cancelled(),
-            "the token must still be live — otherwise this test would pass \
-             for the wrong reason"
-        );
     }
 }
 

@@ -88,6 +88,17 @@ pub struct SupervisorConfig {
     /// logged so a panicking callback can't mask the degradation event
     /// itself.
     pub on_degraded: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Optional liveness counter for stall detection. When set, the
+    /// supervisor arms a [`spawn_liveness_watchdog`] against *each*
+    /// incarnation of the subsystem: the loop must bump this counter at least
+    /// once per [`WATCHDOG_POLL_INTERVAL`], or the watchdog aborts it and the
+    /// restart logic below takes over.
+    ///
+    /// Armed per iteration rather than once at start, because the watchdog
+    /// holds an `AbortHandle` for one specific inner task — a single arming
+    /// would protect only the first incarnation and then silently watch a
+    /// task that no longer exists.
+    pub liveness: Option<Arc<AtomicU64>>,
 }
 
 impl std::fmt::Debug for SupervisorConfig {
@@ -114,6 +125,7 @@ impl SupervisorConfig {
             base_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(300),
             on_degraded: None,
+            liveness: None,
         }
     }
 
@@ -121,6 +133,14 @@ impl SupervisorConfig {
     /// degraded state. Replaces any previously set callback.
     pub fn with_on_degraded<F: Fn() + Send + Sync + 'static>(mut self, f: F) -> Self {
         self.on_degraded = Some(Box::new(f));
+        self
+    }
+
+    /// Builder: watch `counter` for stalls. The subsystem must bump it at
+    /// least once per [`WATCHDOG_POLL_INTERVAL`]; a wedged loop is aborted and
+    /// restarted rather than left running.
+    pub fn with_liveness(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.liveness = Some(counter);
         self
     }
 }
@@ -191,6 +211,22 @@ async fn supervised_loop<F, Fut, E>(
         let join = tokio::spawn(AssertUnwindSafe(future).catch_unwind());
         let abort = join.abort_handle();
 
+        // Arm a stall watchdog against this incarnation, if configured. Its
+        // own token is cancelled below so the watchdog never outlives the
+        // task it is watching (an orphan would hold a stale `AbortHandle` and
+        // a counter nothing advances).
+        let watchdog = cfg.liveness.as_ref().map(|liveness| {
+            let wd_cancel = cancel.child_token();
+            let handle = spawn_liveness_watchdog(
+                cfg.name,
+                liveness.clone(),
+                abort.clone(),
+                wd_cancel.clone(),
+                db.clone(),
+            );
+            (wd_cancel, handle)
+        });
+
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -220,6 +256,12 @@ async fn supervised_loop<F, Fut, E>(
                 Err(je) => IterationOutcome::Panicked(je.to_string()),
             }
         };
+
+        // Disarm before the next incarnation is spawned.
+        if let Some((wd_cancel, handle)) = watchdog {
+            wd_cancel.cancel();
+            handle.abort();
+        }
 
         match outcome {
             IterationOutcome::CleanExit => {
@@ -429,6 +471,7 @@ mod tests {
             base_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
             on_degraded: None,
+            liveness: None,
         }
     }
 
@@ -799,6 +842,7 @@ mod tests {
                 callback_fired_inner.fetch_add(1, Ordering::SeqCst);
                 panic!("callback intentionally panicked");
             })),
+            liveness: None,
         };
 
         let handle = spawn_supervised(cfg, cancel.clone(), db.clone(), move || async move {
@@ -849,6 +893,73 @@ mod tests {
             "fail",
             "issue_state row must be promoted to fail status"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_liveness_watchdog_rearms_on_every_incarnation() {
+        // The watchdog holds an `AbortHandle` for one specific inner task, so
+        // arming it once would protect only the first incarnation and then sit
+        // watching a task that no longer exists — a subsystem that wedged
+        // after its first restart would never be caught. The supervisor
+        // therefore arms and disarms per iteration.
+        //
+        // First incarnation stalls (never bumps the counter) and must be
+        // aborted; the second bumps it and must be left alone.
+        let db = test_db().await;
+        let cancel = CancellationToken::new();
+        let liveness = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        let cfg = SupervisorConfig {
+            liveness: Some(liveness.clone()),
+            ..fast_cfg("liveness-rearm", 5)
+        };
+
+        let attempts_for_factory = attempts.clone();
+        let liveness_for_factory = liveness.clone();
+        let handle = spawn_supervised(cfg, cancel.clone(), db.clone(), move || {
+            let n = attempts_for_factory.fetch_add(1, Ordering::SeqCst);
+            let liveness = liveness_for_factory.clone();
+            async move {
+                if n == 0 {
+                    // Wedged: never touches the counter.
+                    tokio::time::sleep(Duration::from_secs(86_400)).await;
+                } else {
+                    // Healthy: advances the counter, then exits cleanly.
+                    liveness.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        // Drive the watchdog one poll at a time — it re-arms a fresh sleep
+        // each iteration, so a single large jump only satisfies the first.
+        for _ in 0..(WATCHDOG_MAX_STALE_POLLS + 2) {
+            tokio::time::advance(WATCHDOG_POLL_INTERVAL).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        // Let the restart backoff elapse so the respawn actually happens.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "the stalled first incarnation must have been aborted and respawned; \
+             attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert!(
+            liveness.load(Ordering::Relaxed) > 0,
+            "the second incarnation must have run — proof the watchdog aborted \
+             the first rather than the supervisor giving up"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     #[tokio::test]

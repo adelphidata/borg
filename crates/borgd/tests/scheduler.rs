@@ -77,8 +77,12 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
     };
     let cfg = Config::default();
     let shutdown_for_run = shutdown.clone();
-    let dispatcher =
-        tokio::spawn(async move { scheduler::run(cfg, hooks, semaphore, shutdown_for_run).await });
+    let dispatcher = tokio::spawn(async move {
+        // In production the supervisor supplies this counter and watches it
+        // for stalls; driving `run` directly, a local one suffices.
+        let liveness = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        scheduler::run(cfg, hooks, semaphore, shutdown_for_run, liveness).await
+    });
 
     // Poll for completion. The DAEMON_LOOP_INTERVAL is 1s in core::constants;
     // give the dispatcher a few ticks to claim + run + record.

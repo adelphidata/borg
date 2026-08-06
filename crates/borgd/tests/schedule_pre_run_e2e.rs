@@ -174,10 +174,13 @@ impl DispatchHarness {
         };
         let cfg = self.config.clone();
         let shutdown_for_run = shutdown.clone();
-        let dispatcher =
-            tokio::spawn(
-                async move { scheduler::run(cfg, hooks, semaphore, shutdown_for_run).await },
-            );
+        let dispatcher = tokio::spawn(async move {
+            // Liveness counter is the supervisor's stall signal in
+            // production; this test drives `run` directly, so a local
+            // counter is all it needs.
+            let liveness = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            scheduler::run(cfg, hooks, semaphore, shutdown_for_run, liveness).await
+        });
 
         let mut recorded = false;
         let started = std::time::Instant::now();

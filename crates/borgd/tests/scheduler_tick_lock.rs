@@ -90,8 +90,11 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
     };
     let cfg = Config::default();
     let shutdown_for_run = shutdown.clone();
-    let dispatcher =
-        tokio::spawn(async move { scheduler::run(cfg, hooks, semaphore, shutdown_for_run).await });
+    let dispatcher = tokio::spawn(async move {
+        // Supervisor-owned in production; a local counter is enough here.
+        let liveness = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        scheduler::run(cfg, hooks, semaphore, shutdown_for_run, liveness).await
+    });
 
     // Give the dispatcher time to spin up, hit its first immediate tick,
     // and run through the lock-collision path. 2s is comfortably more than
