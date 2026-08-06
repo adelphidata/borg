@@ -637,6 +637,7 @@ async fn oauth_pool(
         PoolLoadConfig {
             strategy: CredentialStrategy::FillFirst,
             cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
             max_concurrent_per_credential: 4,
             proactive_rate_limit_threshold_pct: 0,
             proactive_rate_limit_min_window_secs: 0,
@@ -747,4 +748,221 @@ async fn auth_failure_still_tombstones_api_keys_and_permanent_denials() {
         pool2.entries()[0].is_removed(),
         "403 must remove even a refreshable OAuth credential"
     );
+}
+
+// ── cooldown derivation: billing vs. transient throttle ───────────────────
+
+/// Deterministic clock so cooldown arithmetic is exact rather than racing
+/// wall time.
+#[derive(Debug)]
+struct FixedClock(std::sync::atomic::AtomicI64);
+
+use cortex::llm::credential_pool::Clock;
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Pool with two config keys, a 60s base cooldown and a 1h billing bench.
+async fn cooldown_pool() -> (
+    std::sync::Arc<CredentialPool>,
+    std::sync::Arc<FixedClock>,
+    tempfile::TempDir,
+) {
+    let clock = std::sync::Arc::new(FixedClock(std::sync::atomic::AtomicI64::new(
+        1_000_000_000_000,
+    )));
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let pool = CredentialPool::load_with_clock(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![
+                cortex::llm::credential_pool::ConfigEntry {
+                    key: "sk-ant-key-one".to_string(),
+                    label: Some("one".to_string()),
+                    config_name: "llm.api_keys[0]".to_string(),
+                },
+                cortex::llm::credential_pool::ConfigEntry {
+                    key: "sk-ant-key-two".to_string(),
+                    label: Some("two".to_string()),
+                    config_name: "llm.api_keys[1]".to_string(),
+                },
+            ],
+            env_vars: vec![],
+            oauth_home: None,
+        },
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    (pool, clock, db_dir)
+}
+
+/// Cooldown length the pool just applied to `id`, in seconds.
+fn cooldown_len_secs(pool: &CredentialPool, id: &str, now_ms: i64) -> i64 {
+    let e = pool
+        .entries()
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("credential present");
+    (e.last_error_reset_at_ms.expect("benched") - now_ms) / 1000
+}
+
+#[tokio::test]
+async fn billing_failure_benches_credential_far_longer_than_rate_limit() {
+    // A spent account cannot recover without human action. Sharing the 60s
+    // throttle cooldown meant retrying it every minute forever.
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let now = clock.now_ms();
+    let ids: Vec<String> = pool.entries().into_iter().map(|c| c.id).collect();
+
+    pool.report_failure(&ids[0], FailoverReason::Billing, Some(402), None, None);
+    pool.report_failure(&ids[1], FailoverReason::RateLimit, Some(429), None, None);
+
+    assert_eq!(cooldown_len_secs(&pool, &ids[0], now), 3600);
+    assert_eq!(cooldown_len_secs(&pool, &ids[1], now), 60);
+}
+
+#[tokio::test]
+async fn consecutive_rate_limits_escalate_geometrically() {
+    // 60s base doubling per consecutive throttle, capped at 6 shifts.
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let id = pool.entries()[0].id.clone();
+    let expected = [60_i64, 120, 240, 480, 960, 1920, 3840, 3840];
+
+    for (attempt, want) in expected.iter().enumerate() {
+        // Advance past the previous bench so extend-never-shorten doesn't
+        // mask the newly derived duration.
+        let now = clock.now_ms() + (want + 1) * 1000;
+        clock.0.store(now, Ordering::SeqCst);
+        pool.report_failure(&id, FailoverReason::RateLimit, Some(429), None, None);
+        assert_eq!(
+            cooldown_len_secs(&pool, &id, now),
+            *want,
+            "attempt {} should bench for {want}s",
+            attempt + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn success_resets_rate_limit_escalation() {
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let id = pool.entries()[0].id.clone();
+
+    for _ in 0..3 {
+        let now = clock.now_ms() + 10_000_000;
+        clock.0.store(now, Ordering::SeqCst);
+        pool.report_failure(&id, FailoverReason::RateLimit, Some(429), None, None);
+    }
+    pool.report_success(&id);
+
+    let now = clock.now_ms() + 10_000_000;
+    clock.0.store(now, Ordering::SeqCst);
+    pool.report_failure(&id, FailoverReason::RateLimit, Some(429), None, None);
+    assert_eq!(
+        cooldown_len_secs(&pool, &id, now),
+        60,
+        "a completed request must return the key to the base cooldown"
+    );
+}
+
+#[tokio::test]
+async fn provider_retry_after_wins_over_escalated_default() {
+    // The provider knows its own bucket. A hint must override the escalated
+    // default — but must still not *shorten* an existing longer bench.
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let ids: Vec<String> = pool.entries().into_iter().map(|c| c.id).collect();
+
+    // Escalate key one to a 480s default, then hand it a 30s hint on a fresh
+    // window: the hint wins.
+    for _ in 0..4 {
+        let now = clock.now_ms() + 10_000_000;
+        clock.0.store(now, Ordering::SeqCst);
+        pool.report_failure(&ids[0], FailoverReason::RateLimit, Some(429), None, None);
+    }
+    let now = clock.now_ms() + 10_000_000;
+    clock.0.store(now, Ordering::SeqCst);
+    pool.report_failure(
+        &ids[0],
+        FailoverReason::RateLimit,
+        Some(429),
+        Some(std::time::Duration::from_secs(30)),
+        None,
+    );
+    assert_eq!(cooldown_len_secs(&pool, &ids[0], now), 30);
+
+    // Extend-never-shorten still holds: a short hint arriving while a longer
+    // bench is live must not release the credential early.
+    pool.report_failure(
+        &ids[1],
+        FailoverReason::Billing,
+        Some(402),
+        Some(std::time::Duration::from_secs(7200)),
+        None,
+    );
+    let long = cooldown_len_secs(&pool, &ids[1], now);
+    pool.report_failure(
+        &ids[1],
+        FailoverReason::RateLimit,
+        Some(429),
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    );
+    assert_eq!(
+        cooldown_len_secs(&pool, &ids[1], now),
+        long,
+        "a 5s hint must not shorten a live 2h bench"
+    );
+}
+
+#[tokio::test]
+async fn billing_cooldown_is_clamped_by_the_hard_ceiling() {
+    // Guards against an absurd operator value benching a key past the 24h cap.
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let clock = std::sync::Arc::new(FixedClock(std::sync::atomic::AtomicI64::new(
+        1_000_000_000_000,
+    )));
+    let pool = CredentialPool::load_with_clock(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: u64::MAX,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![cortex::llm::credential_pool::ConfigEntry {
+                key: "sk-ant-only".to_string(),
+                label: None,
+                config_name: "llm.api_keys[0]".to_string(),
+            }],
+            env_vars: vec![],
+            oauth_home: None,
+        },
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+
+    let now = clock.now_ms();
+    let id = pool.entries()[0].id.clone();
+    pool.report_failure(&id, FailoverReason::Billing, Some(402), None, None);
+    assert_eq!(cooldown_len_secs(&pool, &id, now), 24 * 60 * 60);
 }

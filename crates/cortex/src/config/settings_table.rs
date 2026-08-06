@@ -40,6 +40,7 @@ define_settings! {
         // ── Credential pool ──
         "llm.credential_strategy" => llm.credential_strategy, json_quoted("Invalid credential strategy");
         "llm.credential_cooldown_secs" => llm.credential_cooldown_secs, parsed(u64);
+        "llm.billing_cooldown_secs" => llm.billing_cooldown_secs, parsed(u64);
         "llm.max_concurrent_per_credential" => llm.max_concurrent_per_credential, nonzero(u32);
         "llm.proactive_rate_limit_threshold_pct" => llm.proactive_rate_limit_threshold_pct, parsed(u8);
         "llm.proactive_rate_limit_min_window_secs" => llm.proactive_rate_limit_min_window_secs, parsed(u64);
@@ -901,6 +902,7 @@ define_settings! {
         "llm.aux.fallback" => "Aux fallback (JSON)", Text, "Resilience";
         "llm.credential_strategy" => "Credential strategy", Select, "Resilience";
         "llm.credential_cooldown_secs" => "Credential cooldown (s)", Uint, "Resilience";
+        "llm.billing_cooldown_secs" => "Billing cooldown (s)", Uint, "Resilience";
         "llm.max_concurrent_per_credential" => "Max concurrent / key", Uint, "Resilience";
         "llm.proactive_rate_limit_threshold_pct" => "Proactive RL threshold (%)", Uint, "Resilience";
         "llm.proactive_rate_limit_min_window_secs" => "Proactive RL min window (s)", Uint, "Resilience";

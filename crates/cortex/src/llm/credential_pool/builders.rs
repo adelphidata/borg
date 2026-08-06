@@ -25,6 +25,10 @@ use super::{ConfigEntry, CredentialPool, CredentialStrategy, PoolLoadConfig};
 /// Build a [`PoolLoadConfig`] from the primary `LlmConfig` plus the resolved
 /// provider. `api_keys` is resolved by the caller (which has the `SecretRef`
 /// chain) and passed in as already-plaintext entries.
+/// Fallback bench for a billing failure when the caller does not thread
+/// `llm.billing_cooldown_secs` through. Mirrors the config default.
+pub const DEFAULT_BILLING_COOLDOWN_SECS: u64 = 3600;
+
 pub fn pool_load_config_for_provider(
     provider: Provider,
     strategy: CredentialStrategy,
@@ -45,6 +49,9 @@ pub fn pool_load_config_for_provider(
     PoolLoadConfig {
         strategy,
         cooldown_secs,
+        // Callers that care override this; the default keeps a spent key off
+        // the rotation for an hour rather than re-probing it every minute.
+        billing_cooldown_secs: DEFAULT_BILLING_COOLDOWN_SECS,
         max_concurrent_per_credential,
         proactive_rate_limit_threshold_pct: 0,
         proactive_rate_limit_min_window_secs: 0,
@@ -91,6 +98,7 @@ pub async fn try_build_from_keys(
     max_concurrent_per_credential: u32,
     proactive_rate_limit_threshold_pct: u8,
     proactive_rate_limit_min_window_secs: u64,
+    billing_cooldown_secs: u64,
 ) -> Option<Arc<CredentialPool>> {
     let db_path = match crate::config::Config::db_path() {
         Ok(p) => p,
@@ -123,7 +131,7 @@ pub async fn try_build_from_keys(
             config_name: format!("llm.api_keys[{i}]"),
         })
         .collect();
-    let cfg = pool_load_config_for_provider_with_proactive(
+    let mut cfg = pool_load_config_for_provider_with_proactive(
         provider,
         strategy,
         cooldown_secs,
@@ -132,6 +140,7 @@ pub async fn try_build_from_keys(
         proactive_rate_limit_min_window_secs,
         config_entries,
     );
+    cfg.billing_cooldown_secs = billing_cooldown_secs;
     match CredentialPool::load(&db, &db_path, provider, cfg).await {
         Ok(pool) => Some(pool),
         Err(e) => {

@@ -198,6 +198,7 @@ pub(in crate::doctor) async fn check_llm_credentials(
         config.llm.max_concurrent_per_credential,
         config.llm.proactive_rate_limit_threshold_pct,
         config.llm.proactive_rate_limit_min_window_secs,
+        config.llm.billing_cooldown_secs,
     )
     .await;
     match pool {

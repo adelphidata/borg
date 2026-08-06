@@ -216,6 +216,16 @@ pub struct LlmConfig {
     /// `Retry-After` hint. Provider-supplied hints always win.
     #[serde(default = "default_credential_cooldown_secs")]
     pub credential_cooldown_secs: u64,
+    /// Cooldown applied when a credential fails for *billing* reasons (402,
+    /// or a 403 that classifies as quota/spend exhaustion) and the provider
+    /// gives no `Retry-After`.
+    ///
+    /// Separate from `credential_cooldown_secs` because a billing failure
+    /// does not clear on its own the way a throttle does — retrying a spent
+    /// account every 60s just burns the rest of the pool's rotation budget.
+    /// Provider-supplied hints still win.
+    #[serde(default = "default_billing_cooldown_secs")]
+    pub billing_cooldown_secs: u64,
     /// Soft cap on concurrent leases per credential. Above this, leases
     /// fan out across other keys; once every key is at the cap, the
     /// least-leased key wins ties.
@@ -237,6 +247,10 @@ pub struct LlmConfig {
 
 fn default_credential_cooldown_secs() -> u64 {
     60
+}
+
+fn default_billing_cooldown_secs() -> u64 {
+    3600
 }
 
 fn default_max_concurrent_per_credential() -> u32 {
@@ -418,6 +432,7 @@ impl Default for LlmConfig {
             cache: PromptCacheConfig::default(),
             credential_strategy: crate::llm::credential_pool::CredentialStrategy::default(),
             credential_cooldown_secs: default_credential_cooldown_secs(),
+            billing_cooldown_secs: default_billing_cooldown_secs(),
             max_concurrent_per_credential: default_max_concurrent_per_credential(),
             proactive_rate_limit_threshold_pct: default_proactive_rate_limit_threshold_pct(),
             proactive_rate_limit_min_window_secs: default_proactive_rate_limit_min_window_secs(),

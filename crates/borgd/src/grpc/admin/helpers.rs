@@ -497,6 +497,7 @@ pub(super) async fn build_primary_pool(
         config.llm.max_concurrent_per_credential,
         config.llm.proactive_rate_limit_threshold_pct,
         config.llm.proactive_rate_limit_min_window_secs,
+        config.llm.billing_cooldown_secs,
     )
     .await
     .ok_or_else(|| {

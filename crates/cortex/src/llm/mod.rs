@@ -1032,6 +1032,7 @@ impl LlmClient {
                     config.llm.max_concurrent_per_credential,
                     config.llm.proactive_rate_limit_threshold_pct,
                     config.llm.proactive_rate_limit_min_window_secs,
+                    config.llm.billing_cooldown_secs,
                 )
                 .await
             } else {
@@ -1306,6 +1307,7 @@ impl LlmClient {
                 config.llm.max_concurrent_per_credential,
                 config.llm.proactive_rate_limit_threshold_pct,
                 config.llm.proactive_rate_limit_min_window_secs,
+                config.llm.billing_cooldown_secs,
             )
             .await
         } else {

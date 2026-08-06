@@ -30,7 +30,10 @@ pub use builders::{
     try_build_from_keys,
 };
 pub use helpers::{fingerprint, is_safe_base_url};
-use helpers::{needs_refresh, random_id, truncate_error_msg, COOLDOWN_MAX_SECS};
+use helpers::{
+    needs_refresh, random_id, truncate_error_msg, COOLDOWN_MAX_SECS,
+    RATE_LIMIT_ESCALATION_MAX_SHIFT,
+};
 
 /// How `pick()` chooses the next credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -216,6 +219,14 @@ pub struct PooledCredential {
     /// failure while this flag is set tombstones as usual. Cleared on
     /// `report_success`. In-memory only.
     pub auth_refresh_grace_used: bool,
+    /// Consecutive `RateLimit` failures with no intervening success.
+    ///
+    /// Drives geometric cooldown escalation so a key stuck behind a hard cap
+    /// stops being re-probed at the base interval indefinitely. In-memory
+    /// only: a restart is a fresh observation window, which is the right
+    /// default for a signal this coarse. Cleared by `report_success` and by
+    /// any non-`RateLimit` failure.
+    pub consecutive_rate_limits: u32,
 }
 
 impl PooledCredential {
@@ -375,6 +386,10 @@ struct PoolInner {
     creds: Vec<PooledCredential>,
     strategy: CredentialStrategy,
     cooldown: Duration,
+    /// Bench applied on a billing failure with no provider `Retry-After`.
+    /// Separate from `cooldown` because billing exhaustion does not clear on
+    /// its own the way a throttle does.
+    billing_cooldown: Duration,
     current_id: Option<String>,
     active_leases: HashMap<String, u32>,
     max_concurrent_per_credential: u32,
@@ -388,6 +403,42 @@ struct PoolInner {
     proactive_threshold_pct: u8,
     /// Minimum seconds-until-reset for proactive avoidance to kick in.
     proactive_min_window_secs: u64,
+}
+
+/// Shared tail of the two cooldown arms: bench the credential until
+/// `now + dur`, extend-never-shorten, and record the diagnosis.
+///
+/// Factored out so `RateLimit` and `Billing` differ *only* in how they derive
+/// `dur` — the state they write must not drift apart.
+fn apply_cooldown(
+    c: &mut PooledCredential,
+    now: i64,
+    dur: u64,
+    reason: FailoverReason,
+    status_code: Option<u16>,
+    truncated: Option<String>,
+) {
+    let new_until = now + (dur as i64) * 1000;
+    // Extend, never shorten — a second failure carrying a longer hint should
+    // win, and a short hint must not release a credential benched for longer.
+    c.last_error_reset_at_ms = Some(match c.last_error_reset_at_ms {
+        Some(existing) if existing > new_until => existing,
+        _ => new_until,
+    });
+    c.last_status = CredentialStatus::Exhausted;
+    c.last_status_at_ms = Some(now);
+    c.last_error_code = status_code;
+    c.last_error_reason = Some(reason.to_string());
+    c.last_error_message = truncated;
+    info!(
+        target: "cortex::llm::credential_pool",
+        id = %c.id,
+        reason = %reason,
+        status_code = ?status_code,
+        cooldown_secs = dur,
+        consecutive_rate_limits = c.consecutive_rate_limits,
+        "credential cooled"
+    );
 }
 
 // ── CredentialPool ────────────────────────────────────────────────────────
@@ -437,6 +488,9 @@ impl std::fmt::Debug for CredentialPool {
 pub struct PoolLoadConfig {
     pub strategy: CredentialStrategy,
     pub cooldown_secs: u64,
+    /// Cooldown applied on a billing failure (402 / hard 403 quota) when the
+    /// provider gives no `Retry-After`.
+    pub billing_cooldown_secs: u64,
     pub max_concurrent_per_credential: u32,
     /// Proactive rate-limit avoidance: skip a credential during `pick()`
     /// when its observed rate-limit headroom drops below this percentage.
@@ -718,6 +772,7 @@ impl CredentialPool {
                         extra_json: row.extra_json.clone(),
                         rate_limit: None,
                         auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
                     });
                 }
             }
@@ -762,6 +817,7 @@ impl CredentialPool {
             creds: live,
             strategy: cfg.strategy,
             cooldown: Duration::from_secs(cfg.cooldown_secs.max(1)),
+            billing_cooldown: Duration::from_secs(cfg.billing_cooldown_secs.max(1)),
             current_id: None,
             active_leases: HashMap::new(),
             max_concurrent_per_credential: cfg.max_concurrent_per_credential.max(1),
@@ -837,6 +893,15 @@ impl CredentialPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.cooldown.as_secs()
+    }
+
+    /// Bench length applied to a billing failure with no provider hint.
+    pub fn billing_cooldown_secs(&self) -> u64 {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.billing_cooldown.as_secs()
     }
 
     /// Soft per-credential concurrency cap.
@@ -1214,6 +1279,9 @@ impl CredentialPool {
         // A completed request re-arms the one-shot 401 refresh grace: the
         // next auth incident is a fresh one, not a continuation.
         c.auth_refresh_grace_used = false;
+        // A completed request also ends the consecutive-throttle streak, so
+        // the next 429 starts from the short base cooldown again.
+        c.consecutive_rate_limits = 0;
         g.emitted_exhausted_warn = false;
         let cred = g.creds.iter().find(|c| c.id == credential_id).cloned();
         drop(g);
@@ -1223,9 +1291,9 @@ impl CredentialPool {
     }
 
     /// Record a failed request. Maps `reason` to the appropriate state
-    /// transition: Auth/AuthPermanent → soft-delete; RateLimit/Billing →
-    /// cooldown (via `retry_after` or configured TTL); everything else is
-    /// a no-op on the pool (transport / payload concerns).
+    /// transition: Auth/AuthPermanent → soft-delete; RateLimit → escalating
+    /// cooldown; Billing → the long `billing_cooldown` bench; everything else
+    /// is a no-op on the pool (transport / payload concerns).
     pub fn report_failure(
         &self,
         credential_id: &str,
@@ -1240,6 +1308,7 @@ impl CredentialPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cooldown = g.cooldown;
+        let billing_cooldown = g.billing_cooldown;
         let Some(c) = g.creds.iter_mut().find(|c| c.id == credential_id) else {
             return;
         };
@@ -1280,6 +1349,7 @@ impl CredentialPool {
                 );
             }
             FailoverReason::Auth | FailoverReason::AuthPermanent => {
+                c.consecutive_rate_limits = 0;
                 c.removed_at_ms = Some(now);
                 c.last_status = CredentialStatus::Exhausted;
                 c.last_status_at_ms = Some(now);
@@ -1297,30 +1367,39 @@ impl CredentialPool {
                     "credential removed (auth failure)"
                 );
             }
-            FailoverReason::RateLimit | FailoverReason::Billing => {
+            FailoverReason::RateLimit => {
+                c.consecutive_rate_limits = c.consecutive_rate_limits.saturating_add(1);
+                // A provider hint is ground truth about its own bucket and
+                // always wins. Absent one, escalate geometrically: a key
+                // sitting behind a hard per-hour cap should not be re-probed
+                // every 60s all night, but a merely bursty key must still
+                // recover fast, so the first hit keeps the short cooldown.
+                let dur = match retry_after {
+                    Some(d) => d.as_secs().clamp(1, COOLDOWN_MAX_SECS),
+                    None => {
+                        let shift = c
+                            .consecutive_rate_limits
+                            .saturating_sub(1)
+                            .min(RATE_LIMIT_ESCALATION_MAX_SHIFT);
+                        cooldown
+                            .as_secs()
+                            .saturating_mul(1u64 << shift)
+                            .clamp(1, COOLDOWN_MAX_SECS)
+                    }
+                };
+                apply_cooldown(c, now, dur, reason, status_code, truncated);
+            }
+            FailoverReason::Billing => {
+                // Billing exhaustion does not clear on its own the way a
+                // throttle does. Sharing the throttle cooldown meant a spent
+                // account was retried every 60s forever, burning the rest of
+                // the pool's rotation budget on a key that cannot recover
+                // without human action.
+                c.consecutive_rate_limits = 0;
                 let dur = retry_after
                     .map(|d| d.as_secs().clamp(1, COOLDOWN_MAX_SECS))
-                    .unwrap_or_else(|| cooldown.as_secs().clamp(1, COOLDOWN_MAX_SECS));
-                let new_until = now + (dur as i64) * 1000;
-                // Extend, never shorten — a second 429 with a longer hint
-                // should win.
-                c.last_error_reset_at_ms = Some(match c.last_error_reset_at_ms {
-                    Some(existing) if existing > new_until => existing,
-                    _ => new_until,
-                });
-                c.last_status = CredentialStatus::Exhausted;
-                c.last_status_at_ms = Some(now);
-                c.last_error_code = status_code;
-                c.last_error_reason = Some(reason.to_string());
-                c.last_error_message = truncated;
-                info!(
-                    target: "cortex::llm::credential_pool",
-                    id = %c.id,
-                    reason = %reason,
-                    status_code = ?status_code,
-                    cooldown_secs = dur,
-                    "credential cooled"
-                );
+                    .unwrap_or_else(|| billing_cooldown.as_secs().clamp(1, COOLDOWN_MAX_SECS));
+                apply_cooldown(c, now, dur, reason, status_code, truncated);
             }
             _ => {
                 // Transport / payload / format / overflow — not a credential concern.
@@ -1493,6 +1572,7 @@ impl CredentialPool {
             extra_json,
             rate_limit: None,
             auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
         };
         g.creds.push(cred.clone());
         g.emitted_exhausted_warn = false;
@@ -1976,6 +2056,7 @@ fn reconcile_or_new(
             extra_json: row.extra_json.clone(),
             rate_limit: None,
             auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
         }
     } else {
         PooledCredential {
@@ -2000,6 +2081,7 @@ fn reconcile_or_new(
             extra_json: None,
             rate_limit: None,
             auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
         }
     }
 }
@@ -2048,6 +2130,7 @@ fn reconcile_or_new_oauth(
             extra_json: disc.extra_json.or_else(|| row.extra_json.clone()),
             rate_limit: None,
             auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
         }
     } else {
         PooledCredential {
@@ -2072,6 +2155,7 @@ fn reconcile_or_new_oauth(
             extra_json: disc.extra_json,
             rate_limit: None,
             auth_refresh_grace_used: false,
+            consecutive_rate_limits: 0,
         }
     }
 }

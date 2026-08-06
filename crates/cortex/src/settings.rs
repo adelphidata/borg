@@ -1078,11 +1078,14 @@ mod tests {
                 .set("llm.credential_cooldown_secs", raw)
                 .await
                 .unwrap();
+            resolver
+                .set("llm.billing_cooldown_secs", raw)
+                .await
+                .unwrap();
             let cfg = resolver.resolve().await.unwrap();
-            assert_eq!(
-                cfg.llm.credential_cooldown_secs,
-                raw.parse::<u64>().unwrap()
-            );
+            let want = raw.parse::<u64>().unwrap();
+            assert_eq!(cfg.llm.credential_cooldown_secs, want);
+            assert_eq!(cfg.llm.billing_cooldown_secs, want);
         }
     }
 

@@ -13,6 +13,12 @@ use rand::RngCore;
 /// hints like `retry_after: 999999999` (yes, it happens).
 pub(super) const COOLDOWN_MAX_SECS: u64 = 24 * 60 * 60;
 
+/// Maximum number of doublings applied to `llm.credential_cooldown_secs` on
+/// consecutive rate limits. At the 60s default this tops out at 64 minutes —
+/// bounded deliberately so a merely bursty key isn't benched for hours by
+/// transient 429s, while a hard-capped key stops being re-probed every minute.
+pub(super) const RATE_LIMIT_ESCALATION_MAX_SHIFT: u32 = 6;
+
 /// Truncate persisted error messages to keep `borg auth list` and daemon.log bounded.
 pub(super) const ERROR_MESSAGE_MAX_LEN: usize = 500;
 
