@@ -3616,3 +3616,70 @@ fn sanitize_keeps_whitespace_only_assistant_that_has_tool_calls() {
         Some("call_9")
     );
 }
+
+// ── auxiliary admission gate wiring ───────────────────────────────────────
+
+/// Every aux client must carry the admission limit, and no primary client may.
+///
+/// Asserted on the field rather than by timing a mock server: the gate's
+/// *bounding* behaviour is covered by the semaphore unit tests in
+/// `llm::aux_admission`, and what can actually regress here is the wiring —
+/// specifically `for_auxiliary`'s four `Self::new(config)` fall-through paths,
+/// which a later edit could easily leave untagged.
+#[tokio::test]
+async fn for_auxiliary_tags_every_return_path_and_new_tags_none() {
+    let env_var = "BORG_TEST_AUX_GATE_TAGGING";
+    std::env::set_var(env_var, "sk-test");
+
+    let mut base = Config::default();
+    base.llm.provider = Some("anthropic".to_string());
+    base.llm.api_key_env = env_var.to_string();
+    base.llm.model = "claude-sonnet-4".to_string();
+    base.llm.aux_max_concurrent = 3;
+
+    // Each row drives a different `for_auxiliary` exit: the no-aux
+    // fall-through, the `"auto"` sentinel resolved via the picker, a concrete
+    // model, and a provider with no aux default (falls through to primary).
+    let mut with_auto = base.clone();
+    with_auto.llm.aux = Some(crate::config::AuxLlmConfig {
+        model: "auto".to_string(),
+        ..Default::default()
+    });
+
+    let mut with_concrete = base.clone();
+    with_concrete.llm.aux = Some(crate::config::AuxLlmConfig {
+        model: "claude-haiku-4-5-20251001".to_string(),
+        ..Default::default()
+    });
+
+    let mut local_provider = base.clone();
+    local_provider.llm.provider = Some("ollama".to_string());
+    local_provider.llm.aux = Some(crate::config::AuxLlmConfig {
+        model: "auto".to_string(),
+        ..Default::default()
+    });
+
+    for (label, config) in [
+        ("aux unset", base.clone()),
+        ("aux auto", with_auto),
+        ("aux concrete", with_concrete),
+        ("aux on local provider", local_provider),
+    ] {
+        let client = LlmClient::for_auxiliary(&config)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: aux client builds: {e}"));
+        assert_eq!(
+            client.aux_concurrency,
+            Some(3),
+            "{label}: this return path lost the admission tag, so its requests \
+             would bypass llm.aux_max_concurrent"
+        );
+    }
+
+    // The counterpart contract: interactive turns must never be gated.
+    let primary = LlmClient::new(&base).await.expect("primary client builds");
+    assert_eq!(
+        primary.aux_concurrency, None,
+        "primary/interactive clients must not be gated by the aux limit"
+    );
+}
