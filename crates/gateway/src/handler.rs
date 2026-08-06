@@ -10,7 +10,7 @@ use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::constants;
 use cortex::db::{Database, NewDelivery};
-use cortex::security::validation::{sanitize_filename, sanitize_thread_id};
+use cortex::security::validation::{escape_key_segment, sanitize_filename, sanitize_thread_id};
 
 use crate::constants::MAX_THREAD_ID_LEN;
 
@@ -408,16 +408,20 @@ async fn command_resolution(
 /// This is the single source of truth for the routing key, shared by session
 /// resolution and by the origin context that proactive deliveries mirror into.
 fn build_session_key(inbound: &InboundMessage, binding_id: &str) -> String {
-    let base_key = match &inbound.thread_id {
-        Some(tid) => format!(
-            "{}:{}",
-            inbound.sender_id,
-            sanitize_thread_id(tid, MAX_THREAD_ID_LEN)
-        ),
-        None => inbound.sender_id.clone(),
-    };
+    // The sender segment is escaped, not filtered: it must keep its exact
+    // identity, but a raw `:` inside it would forge the delimiter and alias
+    // another sender's threaded session. The thread segment is always emitted
+    // (empty when absent) so the threaded and unthreaded forms can never
+    // collide either.
+    let sender = escape_key_segment(&inbound.sender_id);
+    let thread = inbound
+        .thread_id
+        .as_deref()
+        .map(|tid| sanitize_thread_id(tid, MAX_THREAD_ID_LEN))
+        .unwrap_or_default();
+    let base_key = format!("{sender}:{thread}");
     if binding_id != DEFAULT_BINDING_ID {
-        format!("{binding_id}:{base_key}")
+        format!("{}:{base_key}", escape_key_segment(binding_id))
     } else {
         base_key
     }
@@ -1274,6 +1278,60 @@ pub fn format_gateway_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inbound(sender_id: &str, thread_id: Option<&str>) -> InboundMessage {
+        InboundMessage {
+            sender_id: sender_id.to_string(),
+            text: String::new(),
+            channel_id: None,
+            thread_id: thread_id.map(str::to_string),
+            message_id: None,
+            thread_ts: None,
+            attachments: Vec::new(),
+            reaction: None,
+            metadata: serde_json::Value::Null,
+            peer_kind: None,
+        }
+    }
+
+    #[test]
+    fn a_colon_in_the_sender_id_cannot_alias_another_senders_thread() {
+        // Session-hijack regression. The thread segment was sanitized but the
+        // sender segment was not, and the unthreaded form omitted the thread
+        // entirely — so sender "alice:t7" with no thread produced the same key
+        // as sender "alice" in thread "t7". `resolve_channel_session` would
+        // then hand the second arrival the first's live session and its whole
+        // conversation history. On script-backed channels the sender id comes
+        // from the remote webhook body, so it is attacker-controlled.
+        let forged = build_session_key(&inbound("alice:t7", None), DEFAULT_BINDING_ID);
+        let victim = build_session_key(&inbound("alice", Some("t7")), DEFAULT_BINDING_ID);
+        assert_ne!(
+            forged, victim,
+            "a sender id containing ':' must not alias another sender's threaded session"
+        );
+    }
+
+    #[test]
+    fn threaded_and_unthreaded_keys_stay_distinct_per_sender() {
+        let unthreaded = build_session_key(&inbound("alice", None), DEFAULT_BINDING_ID);
+        let threaded = build_session_key(&inbound("alice", Some("t7")), DEFAULT_BINDING_ID);
+        assert_ne!(unthreaded, threaded);
+        // Same sender + same thread must still be one stable session, or every
+        // message would start a fresh agent state.
+        assert_eq!(
+            threaded,
+            build_session_key(&inbound("alice", Some("t7")), DEFAULT_BINDING_ID)
+        );
+    }
+
+    #[test]
+    fn a_binding_id_cannot_be_forged_by_a_sender_id() {
+        // The non-default binding prefixes the key, so an unescaped sender
+        // could impersonate a binding-scoped session.
+        let via_binding = build_session_key(&inbound("bob", Some("t1")), "teamb");
+        let via_sender = build_session_key(&inbound("teamb:bob", Some("t1")), DEFAULT_BINDING_ID);
+        assert_ne!(via_binding, via_sender);
+    }
 
     #[test]
     fn redact_channel_output_scrubs_secrets_for_delivery() {

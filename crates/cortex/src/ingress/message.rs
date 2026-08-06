@@ -146,9 +146,17 @@ pub struct IngressMessage {
 /// route through this function, so the same logical "conversation"
 /// always maps to the same session row regardless of surface.
 pub fn session_key(sender_id: &str, thread_id: Option<&str>) -> String {
+    // Both segments are escaped so neither can forge the `:` delimiter and
+    // alias another conversation's session row.
+    let sender = crate::security::validation::escape_key_segment(sender_id);
     match thread_id {
-        Some(tid) if !tid.is_empty() => format!("{sender_id}:{tid}"),
-        _ => format!("{sender_id}:"),
+        Some(tid) if !tid.is_empty() => {
+            format!(
+                "{sender}:{}",
+                crate::security::validation::escape_key_segment(tid)
+            )
+        }
+        _ => format!("{sender}:"),
     }
 }
 
@@ -172,6 +180,15 @@ mod tests {
              surface that emits empty-string instead of None doesn't \
              create a shadow session"
         );
+    }
+
+    #[test]
+    fn session_key_segments_cannot_forge_the_delimiter() {
+        // A sender id containing ':' must not alias another sender's threaded
+        // session — the second arrival would otherwise be routed into the
+        // first's session row and inherit its conversation history.
+        assert_ne!(session_key("u1:t1", None), session_key("u1", Some("t1")));
+        assert_ne!(session_key("u1", Some("t1:x")), session_key("u1:t1", Some("x")));
     }
 
     #[test]

@@ -36,6 +36,24 @@ pub fn sanitize_thread_id(thread_id: &str, max_len: usize) -> String {
         .collect()
 }
 
+/// Escape one `:`-delimited segment of a session key so it cannot forge the
+/// delimiter.
+///
+/// Thread ids are filtered by [`sanitize_thread_id`], but sender ids must keep
+/// their exact identity (they address a real account), so they are escaped
+/// rather than stripped. Without this, a sender id containing `:` aliases
+/// another sender's threaded session: sender `alice:t7` with no thread built
+/// the same key as sender `alice` in thread `t7`, and the second arrival was
+/// handed the first's live session and full conversation history. On
+/// script-backed channels the sender id is derived from the remote webhook
+/// body, so it is attacker-controlled.
+///
+/// `%` is escaped first, which makes the mapping injective — distinct inputs
+/// can never produce the same output.
+pub fn escape_key_segment(segment: &str) -> String {
+    segment.replace('%', "%25").replace(':', "%3A")
+}
+
 /// Sanitize an attachment filename from an external webhook.
 /// Extracts the basename and rejects path traversal, hidden files, null
 /// bytes, and empty strings; returns `"attachment"` as a safe fallback.

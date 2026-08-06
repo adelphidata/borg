@@ -23,6 +23,15 @@ const MAX_SESSIONS_PER_SENDER: usize = cortex::constants::MAX_SESSIONS_PER_SENDE
 const COALESCE_WINDOW: Duration =
     Duration::from_millis(cortex::constants::SESSION_COALESCE_WINDOW_MS);
 
+/// The sender segment of a session key.
+///
+/// Keys are `channel:sender` or `channel:sender:sub` depending on the channel,
+/// so the sender is always the second `:`-delimited field. Returns `None` for
+/// a key with no second field.
+fn sender_segment(session_key: &str) -> Option<&str> {
+    session_key.split(':').nth(1)
+}
+
 /// A unit of work to be processed sequentially within a session.
 pub type WorkFn = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -102,12 +111,16 @@ impl SessionQueue {
             return false;
         }
 
-        // Enforce per-sender session limit: session keys use format "channel:sender:sub"
-        if let Some(sender_id) = session_key.split(':').nth(1) {
-            let sender_prefix = format!(":{sender_id}:");
+        // Enforce the per-sender session limit by comparing the sender segment
+        // of each key. The previous `contains(":{sender}:")` probe required a
+        // trailing colon, so it silently never matched two-segment keys
+        // (Twilio SMS/WhatsApp emit `channel:sender`) — one SMS sender could
+        // occupy the whole pool. Segment equality is also exact, so
+        // `+15551234` no longer counts against `+915551234`.
+        if let Some(sender_id) = sender_segment(&session_key) {
             let sender_count = senders
                 .keys()
-                .filter(|k| k.contains(&sender_prefix))
+                .filter(|k| sender_segment(k) == Some(sender_id))
                 .count();
             if sender_count >= MAX_SESSIONS_PER_SENDER {
                 warn!(
@@ -182,6 +195,25 @@ async fn session_consumer(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn sender_segment_matches_two_and_three_segment_keys() {
+        // Regression: the per-sender cap probed for the substring
+        // ":{sender}:", which needs a trailing colon. Twilio SMS/WhatsApp emit
+        // the two-segment `channel:sender`, so the probe never matched its own
+        // key, `sender_count` was always 0, and MAX_SESSIONS_PER_SENDER was
+        // never enforced — one SMS sender could starve the whole pool.
+        assert_eq!(sender_segment("sms:+15551234"), Some("+15551234"));
+        assert_eq!(sender_segment("slack:U123:C456"), Some("U123"));
+        assert_eq!(sender_segment("nocolon"), None);
+
+        // Exact segment equality, so one sender is not counted against another
+        // whose id merely contains it.
+        assert_ne!(
+            sender_segment("sms:+15551234"),
+            sender_segment("sms:+915551234")
+        );
+    }
 
     #[tokio::test]
     async fn processes_work_sequentially_per_session() {
