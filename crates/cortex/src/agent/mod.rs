@@ -42,6 +42,7 @@ mod system_prompt;
 pub(crate) mod system_prompt_cache;
 mod title_generator;
 mod tool_classification;
+mod tool_markers;
 mod tool_execution;
 mod tool_validation;
 
@@ -1557,6 +1558,22 @@ impl Agent {
                 TextOnlyOutcome::NudgeAndContinue => IterationOutcome::NudgeAndContinue,
             };
         }
+
+        // Past the text-only return, `tool_calls` is non-empty. Local and
+        // template-driven backends can leak a bare scaffolding token (e.g.
+        // `[TOOL_CALLS]`) as *content* alongside a real call; persisting it
+        // pollutes the transcript, replays as fallback text, and survives
+        // compaction until the model starts imitating it. Shadowing here
+        // covers both the discarded-calls path and normal execution.
+        let text_content = if tool_markers::is_bare_tool_call_marker(&text_content) {
+            tracing::debug!(
+                dropped = %text_content,
+                "dropping bare tool-call marker from assistant content"
+            );
+            String::new()
+        } else {
+            text_content
+        };
 
         let (tc, invalid) = partition_tool_calls(&tool_calls, truncated_due_to_length);
 
