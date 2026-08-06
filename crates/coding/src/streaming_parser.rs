@@ -119,7 +119,7 @@ pub fn to_patch_operations(hunks: &[StreamHunk]) -> Vec<PatchOperation> {
                 hunks: chunks
                     .iter()
                     .map(|c| Hunk {
-                        context_hint: c.change_context.clone(),
+                        context_anchors: c.change_context.clone().into_iter().collect(),
                         search: c.old_lines.join("\n"),
                         replace: c.new_lines.join("\n"),
                         is_end_of_file: c.is_end_of_file,
@@ -716,7 +716,7 @@ mod tests {
                 assert_eq!(hunks.len(), 1);
                 assert_eq!(hunks[0].search, "old");
                 assert_eq!(hunks[0].replace, "new");
-                assert_eq!(hunks[0].context_hint.as_deref(), Some("fn main"));
+                assert_eq!(hunks[0].context_anchors, vec!["fn main".to_string()]);
             }
             other => panic!("expected UpdateFile, got {other:?}"),
         }

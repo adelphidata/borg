@@ -369,7 +369,10 @@ fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSna
 fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
     // Worktree checkout runs `filter.<name>.smudge`/`.process` drivers.
     let filter_env = filter_neutralizing_env_sync(&snapshot.repo_root);
-    run_git_sync(
+    // Not an early return: `git restore` is not transactional, and the
+    // post-snapshot sweep below is the other half of the rollback. Skipping it
+    // on a partial restore would leave every agent-created file behind too.
+    let restored = run_git_sync(
         &snapshot.repo_root,
         &[
             "restore",
@@ -380,7 +383,7 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
             ".",
         ],
         &filter_env,
-    )?;
+    );
     let current = run_git_sync(
         &snapshot.repo_root,
         &["ls-files", "--others", "--exclude-standard"],
@@ -406,6 +409,10 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
             }
         }
     }
+    restored.context(
+        "ghost rollback failed partway: the working tree may hold a mix of \
+         snapshot and post-patch content",
+    )?;
     Ok(())
 }
 

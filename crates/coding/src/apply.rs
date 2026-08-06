@@ -538,12 +538,16 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
 
     for hunk in hunks {
         if hunk.search.is_empty() {
-            let insertion_idx = if let Some(ref hint) = hunk.context_hint {
-                find_context_anchor(&content_lines, hint, cursor).with_context(|| {
-                    format!("In file '{file_path}' (patch line {})", hunk.source_line)
-                })? + 1
-            } else {
-                content_lines.len()
+            let insertion_idx = match hunk.context_anchors.split_last() {
+                // Outer anchors narrow the search; the innermost must resolve
+                // to exactly one line, since it decides where content lands.
+                Some((innermost, outer)) => {
+                    let from = resolve_anchor_stack(&content_lines, outer, cursor)?.unwrap_or(cursor);
+                    find_context_anchor(&content_lines, innermost, from).with_context(|| {
+                        format!("In file '{file_path}' (patch line {})", hunk.source_line)
+                    })? + 1
+                }
+                None => content_lines.len(),
             };
 
             let new_lines: Vec<String> = hunk.replace.lines().map(String::from).collect();
@@ -569,17 +573,17 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
 
         let search_lines: Vec<String> = hunk.search.lines().map(String::from).collect();
         let new_lines_vec: Vec<String> = hunk.replace.lines().map(String::from).collect();
-        let search_start = if let Some(ref hint) = hunk.context_hint {
-            find_optional_context_anchor(&content_lines, hint, cursor)
+        let search_start = if hunk.context_anchors.is_empty() {
+            cursor
+        } else {
+            resolve_anchor_stack(&content_lines, &hunk.context_anchors, cursor)
                 .with_context(|| {
                     format!(
-                        "In file '{file_path}' (patch line {}) while resolving context hint",
+                        "In file '{file_path}' (patch line {}) while resolving context anchors",
                         hunk.source_line
                     )
                 })?
                 .unwrap_or(cursor)
-        } else {
-            cursor
         };
 
         let (matched_idx, matched_search, matched_replace) = match locate_hunk_match(
@@ -662,11 +666,29 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
         result_lines.splice(replacement.start_idx..end, replacement.new_lines);
     }
 
-    let mut result = result_lines.join("\n");
+    // Rejoin with the file's own terminator. `str::lines()` strips `\r`, so
+    // joining unconditionally with "\n" rewrote every line of a CRLF file on
+    // any one-line edit — the whole file shows as changed in `git diff` and
+    // the real edit is invisible.
+    let newline = dominant_line_ending(content);
+    let mut result = result_lines.join(newline);
     if content.ends_with('\n') && !result.ends_with('\n') {
-        result.push('\n');
+        result.push_str(newline);
     }
     Ok((result, false))
+}
+
+/// The line terminator a rewritten file should use: CRLF only when CRLF
+/// endings outnumber bare LF ones, so a mixed file settles on its majority
+/// style and an all-LF file is never given carriage returns.
+fn dominant_line_ending(content: &str) -> &'static str {
+    let crlf = content.matches("\r\n").count();
+    let lf = content.matches('\n').count() - crlf;
+    if crlf > lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// First index at or after `start` where `pattern` matches `lines` with
@@ -771,6 +793,46 @@ fn format_nearest_context_hint(content_lines: &[String], search_lines: &[String]
     out
 }
 
+/// Resolve a stack of `@@` anchors outermost-to-innermost.
+///
+/// The outermost anchor must be unambiguous on its own; each inner anchor is
+/// then matched from where its parent landed, taking the first hit. That is
+/// the whole point of stacking: `fn bar` may occur in several impls, but
+/// `@@ impl Foo` / `@@ fn bar` names the one inside `Foo`. A lone anchor
+/// behaves exactly as an unstacked hint.
+///
+/// `None` means the stack could not be resolved — the caller falls back to a
+/// plain search from the cursor, same as an unmatched single hint.
+fn resolve_anchor_stack(
+    lines: &[String],
+    anchors: &[String],
+    cursor: usize,
+) -> Result<Option<usize>> {
+    let mut at = cursor;
+    let mut resolved = None;
+    for (depth, anchor) in anchors.iter().enumerate() {
+        let found = if depth == 0 {
+            find_optional_context_anchor(lines, anchor, at)?
+        } else {
+            let needle = anchor.trim();
+            lines
+                .iter()
+                .enumerate()
+                .skip(at)
+                .find(|(_, line)| line.trim().contains(needle))
+                .map(|(idx, _)| idx)
+        };
+        match found {
+            Some(idx) => {
+                at = idx;
+                resolved = Some(idx);
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(resolved)
+}
+
 fn find_context_anchor(lines: &[String], hint: &str, cursor: usize) -> Result<usize> {
     let hint_trimmed = hint.trim();
     let mut positions = Vec::new();
@@ -856,7 +918,7 @@ mod tests {
 
     fn simple_hunk(search: &str, replace: &str) -> Hunk {
         Hunk {
-            context_hint: None,
+            context_anchors: Vec::new(),
             search: search.to_string(),
             replace: replace.to_string(),
             is_end_of_file: false,
@@ -1349,6 +1411,92 @@ mod tests {
     }
 
     #[test]
+    fn crlf_file_keeps_crlf_endings_after_a_one_line_edit() {
+        // Regression: `str::lines()` drops `\r` and the rejoin used "\n"
+        // unconditionally, so editing one line of a CRLF file rewrote every
+        // line. `git diff` then shows the whole file changed and the actual
+        // edit is unreadable.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** End Patch";
+        crate::apply_patch_to_dir(patch_text, dir.path()).expect("patch applies");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content, "alpha\r\nBETA\r\ngamma\r\n",
+            "untouched lines must keep their CRLF endings"
+        );
+    }
+
+    #[test]
+    fn lf_file_is_never_given_carriage_returns() {
+        // The other half: the CRLF fix must not leak `\r` into LF files.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** End Patch";
+        crate::apply_patch_to_dir(patch_text, dir.path()).expect("patch applies");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "alpha\nBETA\ngamma\n");
+        assert!(!content.contains('\r'));
+    }
+
+    #[test]
+    fn stacked_anchors_select_the_nested_scope() {
+        // `fn bar` appears in both impls, so a single anchor cannot pick one.
+        // `@@ impl Foo` narrows first, then `@@ fn bar` resolves inside it —
+        // the case the tool description advertises.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("f.rs"),
+            "impl Zed {\n    fn bar() {\n        keep();\n    }\n}\n\
+             impl Foo {\n    fn bar() {\n        keep();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: f.rs
+@@ impl Foo
+@@     fn bar
+         keep();
++        added();
+*** End Patch";
+
+        crate::apply_patch_to_dir(patch_text, dir.path()).expect("stacked anchors must apply");
+        let content = std::fs::read_to_string(dir.path().join("f.rs")).unwrap();
+
+        assert!(
+            content.contains("impl Foo {\n    fn bar() {\n        keep();\n        added();"),
+            "the edit must land inside impl Foo; got:\n{content}"
+        );
+        assert!(
+            content.contains("impl Zed {\n    fn bar() {\n        keep();\n    }\n}"),
+            "impl Zed must be untouched; got:\n{content}"
+        );
+    }
+
+    #[test]
     fn unicode_fuzzy_matching_in_file() {
         let dir = TempDir::new().unwrap();
         // File uses em dash and smart quotes
@@ -1362,7 +1510,7 @@ mod tests {
             path: "f.txt".to_string(),
             move_to: None,
             hunks: vec![Hunk {
-                context_hint: None,
+                context_anchors: Vec::new(),
                 search: "value - \"hello\"".to_string(),
                 replace: "value - \"world\"".to_string(),
                 is_end_of_file: false,
@@ -1400,7 +1548,7 @@ mod tests {
             path: "f.txt".to_string(),
             move_to: None,
             hunks: vec![Hunk {
-                context_hint: None,
+                context_anchors: Vec::new(),
                 search: "nonexistent".to_string(),
                 replace: "x".to_string(),
                 is_end_of_file: false,
@@ -1722,7 +1870,7 @@ mod tests {
             path: "f.txt".to_string(),
             move_to: None,
             hunks: vec![Hunk {
-                context_hint: None,
+                context_anchors: Vec::new(),
                 search: "bbb\n".to_string(), // produces ["bbb", ""] via lines+split
                 replace: "BBB\n".to_string(),
                 is_end_of_file: false,
@@ -1989,7 +2137,7 @@ EOF";
             path: "main.py".to_string(),
             move_to: None,
             hunks: vec![Hunk {
-                context_hint: Some("def main".to_string()),
+                context_anchors: vec!["def main".to_string()],
                 search: "def main_helper():\n    beta()".to_string(),
                 replace: "def main_helper():\n    gamma()".to_string(),
                 is_end_of_file: false,

@@ -47,8 +47,11 @@ pub enum PatchOperation {
 /// A single search-and-replace block within an `UpdateFile` operation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hunk {
-    /// Optional `@@` context hint (e.g., function name) for fuzzy matching.
-    pub context_hint: Option<String>,
+    /// `@@` context anchors, outermost first. Empty when the hunk carries no
+    /// anchor. Consecutive `@@` lines stack to navigate nested scopes — the
+    /// outermost must be unambiguous, and each inner anchor is then resolved
+    /// from where its parent landed (e.g. `@@ impl Foo` then `@@ fn bar`).
+    pub context_anchors: Vec<String>,
     /// Text to search for in the file.
     pub search: String,
     /// Replacement text.
@@ -412,21 +415,26 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                     continue;
                 }
 
-                if let Some(after_at) = hunk_line.strip_prefix("@@") {
+                if hunk_line.starts_with("@@") {
                     let hunk_source_line = i + 1; // 1-based line number
 
-                    // Extract context hint from @@ header (strip trailing @@ if present)
-                    let context_hint = {
-                        let trimmed = after_at.trim();
-                        let trimmed = trimmed.strip_suffix("@@").unwrap_or(trimmed).trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_string())
+                    // Consume the whole run of `@@` lines: stacked anchors
+                    // navigate nested scopes, so `@@ impl Foo` / `@@ fn bar`
+                    // is one hunk with two anchors, not a hunk with no body
+                    // followed by a stray header.
+                    let mut context_anchors = Vec::new();
+                    while i < lines.len() {
+                        let Some(after_at) = lines[i].trim().strip_prefix("@@") else {
+                            break;
+                        };
+                        let hint = after_at.trim();
+                        let hint = hint.strip_suffix("@@").unwrap_or(hint).trim();
+                        if !hint.is_empty() {
+                            context_anchors.push(hint.to_string());
                         }
-                    };
+                        i += 1;
+                    }
 
-                    i += 1;
                     let (search_lines, replace_lines, is_end_of_file) =
                         collect_diff_lines(&lines, &mut i);
 
@@ -442,15 +450,15 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                     }
 
                     hunks.push(Hunk {
-                        context_hint,
+                        context_anchors,
                         search: search_lines.join("\n"),
                         replace: replace_lines.join("\n"),
                         is_end_of_file,
                         source_line: hunk_source_line,
                     });
-                } else if hunks.is_empty() && is_diff_prefix(lines[i]) {
-                    // First chunk without @@ header — allow diff lines directly
-                    // (LLMs sometimes omit the @@ marker on the first chunk)
+                } else if is_diff_prefix(lines[i]) {
+                    // Diff lines with no @@ header — LLMs sometimes omit the
+                    // marker on the first chunk.
                     let hunk_source_line = i + 1;
                     let (search_lines, replace_lines, is_end_of_file) =
                         collect_diff_lines(&lines, &mut i);
@@ -463,15 +471,26 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                     }
 
                     hunks.push(Hunk {
-                        context_hint: None,
+                        context_anchors: Vec::new(),
                         search: search_lines.join("\n"),
                         replace: replace_lines.join("\n"),
                         is_end_of_file,
                         source_line: hunk_source_line,
                     });
                 } else {
-                    // Non-@@ non-blank line — terminates the UpdateFile block
-                    break;
+                    // A non-blank line inside an update block that is neither
+                    // `@@` nor diff-prefixed. This used to `break`, after
+                    // which the top-level loop silently discarded the rest of
+                    // the block — a patch missing one leading space dropped
+                    // its remaining hunks and still reported success. Omitting
+                    // the prefix is the single most common authoring mistake,
+                    // so say exactly that.
+                    return Err(ParseError::InvalidFormat(format!(
+                        "Line {} in the update block for '{path}' has no ' ', '+', or '-' prefix: {:?}. \
+                         Every line inside a hunk needs one — a space for context, '+' to add, '-' to remove.",
+                        i + 1,
+                        lines[i]
+                    )));
                 }
             }
 
@@ -714,7 +733,7 @@ pub fn parse_unified_diff(input: &str) -> Result<Patch, ParseError> {
             // add_content_lines; skip pushing an UpdateFile hunk.
             if old_path.is_some() {
                 hunks.push(Hunk {
-                    context_hint,
+                    context_anchors: context_hint.into_iter().collect(),
                     search: search.join("\n"),
                     replace: replace.join("\n"),
                     is_end_of_file: false,
@@ -1426,7 +1445,41 @@ mod tests {
         let patch = parse_patch(input).unwrap();
         match &patch.operations[0] {
             PatchOperation::UpdateFile { hunks, .. } => {
-                assert_eq!(hunks[0].context_hint.as_deref(), Some("fn hello()"));
+                assert_eq!(hunks[0].context_anchors, vec!["fn hello()".to_string()]);
+            }
+            other => panic!("Expected UpdateFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_stacked_context_anchors() {
+        // The `apply_patch` tool description promises "multiple `@@` anchors
+        // can be stacked to navigate nested scopes". Consecutive `@@` lines
+        // used to make the second one look like a hunk body, failing with
+        // "Update hunk does not contain any lines".
+        let input = "\
+*** Begin Patch
+*** Update File: f.rs
+@@ impl Foo
+@@     fn bar
+ fn bar() {
+-    old();
++    new();
+ }
+*** End Patch";
+        let patch = parse_patch(input).expect("stacked anchors must parse");
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1, "stacked anchors are one hunk");
+                assert_eq!(
+                    hunks[0].context_anchors,
+                    vec!["impl Foo".to_string(), "fn bar".to_string()],
+                    "anchors must be recorded outermost-first"
+                );
+                assert!(
+                    hunks[0].search.contains("old();"),
+                    "the hunk body must survive the anchor run"
+                );
             }
             other => panic!("Expected UpdateFile, got {:?}", other),
         }
@@ -1463,7 +1516,7 @@ mod tests {
         let patch = parse_patch(input).unwrap();
         match &patch.operations[0] {
             PatchOperation::UpdateFile { hunks, .. } => {
-                assert!(hunks[0].context_hint.is_none());
+                assert!(hunks[0].context_anchors.is_empty());
             }
             other => panic!("Expected UpdateFile, got {:?}", other),
         }
@@ -1613,7 +1666,7 @@ EOF";
         match &patch.operations[0] {
             PatchOperation::UpdateFile { hunks, .. } => {
                 assert_eq!(hunks.len(), 1);
-                assert!(hunks[0].context_hint.is_none());
+                assert!(hunks[0].context_anchors.is_empty());
                 assert!(hunks[0].search.contains("import foo"));
                 assert!(hunks[0].replace.contains("import foo"));
                 assert!(hunks[0].replace.contains("bar"));
@@ -1623,8 +1676,12 @@ EOF";
     }
 
     #[test]
-    fn parse_second_chunk_requires_at_header() {
-        // Second chunk without @@ should terminate the UpdateFile, not be parsed as diff
+    fn unprefixed_line_inside_an_update_block_is_rejected() {
+        // A line missing its ' '/'+'/'-' prefix used to end the update block
+        // silently; the top-level loop then discarded everything after it and
+        // the patch reported success having applied only the hunks before the
+        // mistake. Silent partial application is the worst outcome here — the
+        // caller must be told.
         let input = "\
 *** Begin Patch
 *** Update File: file.py
@@ -1633,17 +1690,35 @@ EOF";
 +new
 not_a_diff_line
 *** End Patch";
-        let patch = parse_patch(input).unwrap();
-        match &patch.operations[0] {
-            PatchOperation::UpdateFile { hunks, .. } => {
-                assert_eq!(
-                    hunks.len(),
-                    1,
-                    "second non-@@ block should not create a hunk"
-                );
-            }
-            other => panic!("Expected UpdateFile, got {:?}", other),
-        }
+        let err = parse_patch(input).expect_err("unprefixed line must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not_a_diff_line") && msg.contains("prefix"),
+            "error must name the offending line and the missing prefix; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unprefixed_line_does_not_silently_drop_later_hunks() {
+        // The concrete data-loss shape: a pure-deletion hunk after the bad
+        // line has no '+' line, so the top-level orphan-'+' guard never fired
+        // and the deletion vanished from a "successful" patch.
+        let input = "\
+*** Begin Patch
+*** Update File: a.rs
+@@
+ fn a() {
+-    old
++    new
+ }
+oops_forgot_the_leading_space
+@@
+-    delete_this_line();
+*** End Patch";
+        assert!(
+            parse_patch(input).is_err(),
+            "a patch that would drop its second hunk must not parse as success"
+        );
     }
 
     // ── Empty update rejection ──
@@ -2095,7 +2170,7 @@ rename to new.rs
         let patch = parse_patch(input).unwrap();
         match &patch.operations[0] {
             PatchOperation::UpdateFile { hunks, .. } => {
-                assert_eq!(hunks[0].context_hint.as_deref(), Some("fn main()"));
+                assert_eq!(hunks[0].context_anchors, vec!["fn main()".to_string()]);
             }
             other => panic!("expected UpdateFile, got {other:?}"),
         }

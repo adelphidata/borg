@@ -231,28 +231,6 @@ pub(crate) fn neutralizing_env_from_stdout(stdout: &str) -> Vec<(String, String)
     git_config_env(&build_filter_override_env(&parse_filter_drivers(stdout)))
 }
 
-/// Directories excluded from ghost snapshots (build artifacts, deps, caches).
-const IGNORED_DIR_NAMES: &[&str] = &[
-    "node_modules",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".cache",
-    ".tox",
-    "__pycache__",
-    "target",
-    ".next",
-    ".nuxt",
-];
-
-/// Max untracked file size to include in ghost snapshot (10 MiB). Larger files
-/// are skipped to keep the temp-index snapshot fast and bounded — build
-/// artifacts and media should not bloat undo points.
-const MAX_UNTRACKED_FILE_BYTES: u64 = 10 * 1024 * 1024;
-
 /// A ghost commit that snapshots the entire working tree state.
 ///
 /// Created using a temporary index file and git plumbing commands so that
@@ -462,22 +440,15 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         .await
         .unwrap_or_default();
 
+    // Every untracked file that exists now, unfiltered. This list is the
+    // "do not delete" set for `restore_ghost_commit`, so it must be complete:
+    // anything omitted here is treated at restore time as agent-created and
+    // removed. Filtering it by size or directory name deleted the user's own
+    // untracked files (a 12 MB dataset, a non-ignored `build/`) that the agent
+    // never touched — unrecoverable, since they were in no commit.
     let preexisting_untracked: Vec<PathBuf> = untracked_output
         .lines()
         .filter(|line| !line.is_empty())
-        .filter(|line| {
-            // Exclude ignored directories
-            !IGNORED_DIR_NAMES
-                .iter()
-                .any(|ignored| line.starts_with(ignored) || line.contains(&format!("/{ignored}/")))
-        })
-        .filter(|line| {
-            // Exclude oversized files
-            let full = repo_root.join(line);
-            full.metadata()
-                .map(|m| m.len() <= MAX_UNTRACKED_FILE_BYTES)
-                .unwrap_or(false)
-        })
         .map(PathBuf::from)
         .collect();
 
@@ -520,7 +491,12 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
     // Restore all tracked files from the ghost commit. Worktree checkout runs
     // `filter.<name>.smudge`/`.process` drivers, so neutralize them too.
     let filter_env = filter_neutralizing_env(repo_root).await;
-    run_git_inner(
+    // `git restore` writes file by file with no transaction, so a mid-run
+    // failure leaves the tree part-restored. Do not early-return on it: the
+    // post-snapshot cleanup below is the other half of the undo, and skipping
+    // it would additionally leave every agent-created file in place. Run both
+    // phases, then report.
+    let restored = run_git_inner(
         &[
             "restore",
             "--source",
@@ -532,7 +508,7 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
         repo_root,
         &filter_env,
     )
-    .await?;
+    .await;
 
     // Remove files that were created after the snapshot (not in preexisting_untracked)
     let current_untracked = run_git(&["ls-files", "--others", "--exclude-standard"], repo_root)
@@ -557,6 +533,13 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
             }
         }
     }
+
+    // Surface a part-restored tree explicitly. The caller must not report a
+    // clean undo when some paths are at snapshot state and others are not.
+    restored.context(
+        "ghost undo failed partway: the working tree may hold a mix of \
+         snapshot and post-snapshot content — inspect `git status` before continuing",
+    )?;
 
     Ok(())
 }
@@ -1244,6 +1227,47 @@ mod tests {
         assert!(
             !dir.join("c.txt").exists(),
             "post-snapshot file must be removed on restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn ghost_restore_keeps_preexisting_untracked_files_the_agent_never_touched() {
+        // Regression: `preexisting_untracked` was filtered by file size and by
+        // build-directory name, but the deletion sweep compares the *full*
+        // untracked listing against it. Anything the filter dropped therefore
+        // looked agent-created at restore time and was deleted — the user's own
+        // large or build-dir untracked files, unrecoverable because they had
+        // never been committed.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+
+        // A big untracked file (past the old 10 MiB cap) and one inside a
+        // build-artifact directory that is NOT gitignored here.
+        let big = dir.join("dataset.csv");
+        std::fs::write(&big, vec![b'x'; 11 * 1024 * 1024]).unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        let in_build = dir.join("build/keep.txt");
+        std::fs::write(&in_build, "user's own artifact\n").unwrap();
+
+        let ghost = create_ghost_commit(dir).await.expect("snapshot");
+
+        // The agent then creates a file of its own, which restore *should* remove.
+        std::fs::write(dir.join("agent-made.txt"), "scratch\n").unwrap();
+
+        restore_ghost_commit(dir, &ghost).await.expect("restore");
+
+        assert!(
+            big.exists(),
+            "a large pre-existing untracked file must survive ghost undo"
+        );
+        assert!(
+            in_build.exists(),
+            "a pre-existing untracked file under build/ must survive ghost undo"
+        );
+        assert!(
+            !dir.join("agent-made.txt").exists(),
+            "genuinely post-snapshot files must still be removed"
         );
     }
 
