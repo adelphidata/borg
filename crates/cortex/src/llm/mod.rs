@@ -1141,8 +1141,23 @@ impl LlmClient {
         // `provider_slots` vec is its own (cooldowns can't bleed into
         // the primary instance).
         let mut synthetic = config.llm.clone();
+        // A different aux provider must not inherit the primary's endpoint or
+        // credentials. `Self::new` → `resolve_api_keys` → `correct_provider_from_key`
+        // sniffs the inherited key's prefix and silently reverts the provider,
+        // so `[llm.aux] provider = "anthropic"` over an OpenAI primary routed
+        // straight back to OpenAI — the aux pin looked applied and wasn't.
+        // Same reasoning as `resolve_scheduled_model` in the task runner.
+        if config.llm.provider.as_deref() != Some(provider_str.as_str()) {
+            synthetic.base_url = None;
+            synthetic.api_key = None;
+            synthetic.api_keys.clear();
+            if let Ok(p) = provider::Provider::from_str(&provider_str) {
+                synthetic.api_key_env = p.default_env_var().to_string();
+            }
+        }
         synthetic.provider = Some(provider_str);
         synthetic.model = resolved_model;
+        // Explicit aux credentials still win over the defaults chosen above.
         if !aux.api_key_env.is_empty() {
             synthetic.api_key_env = aux.api_key_env.clone();
         }
@@ -2159,7 +2174,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(llm.provider = %self.provider, llm.model = %self.llm_config.model))]
     /// Non-streaming chat completion, returning assembled tool calls.
     pub async fn chat(
-        &self,
+        &mut self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
@@ -2684,91 +2699,221 @@ impl LlmClient {
         result
     }
 
-    #[instrument(skip_all, fields(llm.wire_path = self.wire_path().transport().protocol_name()))]
-    async fn chat_http_transport_inner(
+    /// One non-streaming round trip against the currently active provider,
+    /// credential, and base URL.
+    ///
+    /// Everything that a credential lease or a provider failover can change —
+    /// the endpoint, the auth header, the model — is resolved here rather than
+    /// hoisted, so each attempt made by [`Self::chat_http_transport_inner`]
+    /// uses the credential it was just handed.
+    async fn chat_once(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
+        req_id: &str,
+    ) -> std::result::Result<Message, LlmError> {
         let transport = self.wire_path().transport();
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
         let request_url = if self.transport_composes_url() {
-            transport.endpoint(&request, false)?
+            transport.endpoint(&request, false).map_err(LlmError::fatal)?
         } else {
             self.effective_base_url().into_owned()
         };
-        let body = transport.build_chat_request(&request)?;
-        let max_retries = self.llm_config.max_retries;
-        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
-        let cancel = CancellationToken::new();
-        let req_id = short_request_id();
+        let body = transport
+            .build_chat_request(&request)
+            .map_err(LlmError::fatal)?;
         let request_model = self.llm_config.model.clone();
+        let cancel = CancellationToken::new();
 
-        for attempt in 0..=max_retries {
-            match self.send_request(&request_url, &body, &cancel).await {
-                Ok(response) => {
-                    // The `send_request` timeout only bounds the wait for
-                    // response *headers* — a provider that returns 200 and
-                    // then stalls the body would otherwise hang this read
-                    // forever. Same budget, applied to the body phase.
-                    let response_json: serde_json::Value = tokio::time::timeout(
-                        Duration::from_millis(self.llm_config.request_timeout_ms),
-                        response.json(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Response body from {} stalled past {}ms",
-                            self.provider,
-                            self.llm_config.request_timeout_ms
-                        )
-                    })??;
-                    let parsed = transport.parse_chat_response(
-                        response_json,
-                        self.provider.as_str(),
-                        &request_model,
-                    )?;
-                    self.emit_cost_event_best_effort(
-                        &req_id,
-                        parsed.usage.as_ref(),
-                        &request_model,
-                    );
-                    return Ok(parsed.message);
-                }
-                Err(e) => {
-                    if !e.is_retryable() || attempt == max_retries {
-                        bail!("{e}");
+        let response = self.send_request(&request_url, &body, &cancel).await?;
+        // The `send_request` timeout only bounds the wait for response
+        // *headers* — a provider that returns 200 and then stalls the body
+        // would otherwise hang this read forever. Same budget, body phase.
+        let response_json: serde_json::Value = tokio::time::timeout(
+            Duration::from_millis(self.llm_config.request_timeout_ms),
+            response.json(),
+        )
+        .await
+        .map_err(|_| {
+            LlmError::retryable(anyhow::anyhow!(
+                "Response body from {} stalled past {}ms",
+                self.provider,
+                self.llm_config.request_timeout_ms
+            ))
+        })?
+        .map_err(|e| LlmError::retryable(anyhow::Error::new(e)))?;
+
+        let parsed = transport
+            .parse_chat_response(response_json, self.provider.as_str(), &request_model)
+            .map_err(LlmError::fatal)?;
+        self.emit_cost_event_best_effort(req_id, parsed.usage.as_ref(), &request_model);
+        Ok(parsed.message)
+    }
+
+    /// Non-streaming chat with the same resilience the streaming path has:
+    /// credential leasing (which is also what refreshes an expired OAuth
+    /// token), per-key cooldown reporting, key rotation, and the
+    /// `llm.fallback` provider chain.
+    ///
+    /// This path carries the autonomous lanes — scheduled prompt tasks, the
+    /// heartbeat turn, and the pre-compaction flush. It used to retry a single
+    /// `self.api_key` in place, so a rate-limited or expired key was retried
+    /// until exhaustion and never cooled, rotated, refreshed, or failed over;
+    /// an expired OAuth token 401'd forever because only the lease path
+    /// refreshes it.
+    #[instrument(skip_all, fields(llm.wire_path = self.wire_path().transport().protocol_name()))]
+    async fn chat_http_transport_inner(
+        &mut self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        self.maybe_restore_primary();
+        let req_id = short_request_id();
+        let max_provider_attempts = 1 + self.provider_slots.len();
+        let mut last_error: Option<String> = None;
+
+        for _provider_attempt in 0..max_provider_attempts {
+            let max_retries = self.llm_config.max_retries;
+            let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
+            let total_keys = 1 + self.fallback_keys.len();
+            let mut keys_tried = 0_usize;
+            let mut should_failover = false;
+
+            for attempt in 0..=max_retries {
+                // Lease a credential per attempt so a cooling key is skipped
+                // and an expired OAuth token gets refreshed before use.
+                let lease_id: Option<String> = if let Some(pool) = self.primary_pool.clone() {
+                    match pool.acquire_lease_refreshing(None).await {
+                        Some(lease) => {
+                            if let Some(k) = lease.key() {
+                                self.api_key = k;
+                            }
+                            self.active_credential_base_url = lease.base_url();
+                            let id = lease.id().to_string();
+                            self._active_lease = Some(lease);
+                            Some(id)
+                        }
+                        None => {
+                            let msg = if pool.has_credentials() {
+                                format!(
+                                    "{} credential pool exhausted (all keys cooling)",
+                                    self.provider
+                                )
+                            } else {
+                                format!(
+                                    "{} credential pool exhausted (all keys removed)",
+                                    self.provider
+                                )
+                            };
+                            warn!(target: "cortex::llm", "{msg}");
+                            let reason = if pool.has_credentials() {
+                                FailoverReason::RateLimit
+                            } else {
+                                FailoverReason::AuthPermanent
+                            };
+                            self.record_provider_failure(reason);
+                            last_error = Some(msg);
+                            if self.try_failover_provider() {
+                                should_failover = true;
+                                break;
+                            }
+                            bail!("{}", last_error.unwrap_or_default());
+                        }
                     }
-                    let delay = if let LlmError::Retryable {
-                        retry_after: Some(ra),
-                        ..
-                    } = &e
-                    {
-                        *ra
-                    } else {
-                        backoff_with_config(
-                            attempt,
-                            &BackoffConfig {
-                                initial: initial_delay,
-                                ..Default::default()
-                            },
-                        )
-                    };
-                    info!(
-                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
-                        attempt + 1,
-                        max_retries,
-                        delay.as_millis()
-                    );
-                    tokio::time::sleep(delay).await;
+                } else {
+                    None
+                };
+
+                let result = self.chat_once(messages, tools, &req_id).await;
+
+                match result {
+                    Ok(message) => {
+                        if let (Some(pool), Some(id)) =
+                            (self.primary_pool.as_ref(), lease_id.as_deref())
+                        {
+                            pool.report_success(id);
+                        }
+                        self._active_lease = None;
+                        self.active_credential_base_url = None;
+                        self.record_provider_success();
+                        return Ok(message);
+                    }
+                    Err(e) => {
+                        let reason = e.reason();
+                        let is_auth_error = matches!(reason, FailoverReason::Auth);
+                        last_error = Some(e.to_string());
+
+                        if let (Some(pool), Some(id)) =
+                            (self.primary_pool.as_ref(), lease_id.as_deref())
+                        {
+                            pool.report_failure(
+                                id,
+                                reason,
+                                None,
+                                e.retry_after(),
+                                Some(&e.to_string()),
+                            );
+                            self._active_lease = None;
+                            self.active_credential_base_url = None;
+                            if e.should_rotate_credential() && pool.has_available() {
+                                info!("{reason} error, pool re-picking next credential");
+                                continue;
+                            }
+                        } else {
+                            self._active_lease = None;
+                            self.active_credential_base_url = None;
+                            // Legacy rotation path (pool unavailable).
+                            if e.should_rotate_credential()
+                                && keys_tried < total_keys
+                                && self.try_rotate_key(!is_auth_error)
+                            {
+                                keys_tried += 1;
+                                continue;
+                            }
+                        }
+
+                        if !e.is_retryable() || attempt == max_retries {
+                            self.record_provider_failure(reason);
+                            if self.try_failover_provider() {
+                                should_failover = true;
+                                break;
+                            }
+                            bail!("{}", last_error.unwrap_or_default());
+                        }
+
+                        let delay = e.retry_after().unwrap_or_else(|| {
+                            backoff_with_config(
+                                attempt,
+                                &BackoffConfig {
+                                    initial: initial_delay,
+                                    ..Default::default()
+                                },
+                            )
+                        });
+                        info!(
+                            "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
+                            attempt + 1,
+                            max_retries,
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
+
+            if should_failover {
+                continue;
+            }
+            break;
         }
 
         bail!(
-            "All retries exhausted for non-streaming {} request",
-            transport.protocol_name()
+            "{}",
+            last_error.unwrap_or_else(|| format!(
+                "All retries exhausted for non-streaming {} request",
+                self.provider
+            ))
         )
     }
 

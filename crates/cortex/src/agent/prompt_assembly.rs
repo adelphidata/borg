@@ -421,7 +421,7 @@ Rules:
         ];
 
         let compaction_config = self.config.with_compaction_overrides();
-        let llm = match self.make_llm_client_from_config(&compaction_config).await {
+        let mut llm = match self.make_llm_client_from_config(&compaction_config).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("Pre-compaction flush LLM init failed: {e}");

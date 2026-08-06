@@ -971,7 +971,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         cortex::types::Message::user(&user_msg),
     ];
 
-    let llm = match LlmClient::for_auxiliary(config).await {
+    let mut llm = match LlmClient::for_auxiliary(config).await {
         // Stable per-task cache/routing key: the same scheduled task sends a
         // near-identical prompt every run, so keying on the task id gives
         // provider stickiness + shard-stable auto-caching across runs.
@@ -1245,7 +1245,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                 cortex::types::Message::system(system),
                 cortex::types::Message::user(&user_msg),
             ];
-            let llm = match LlmClient::for_auxiliary(config).await {
+            let mut llm = match LlmClient::for_auxiliary(config).await {
                 // Heartbeat check-ins share one near-identical prompt shape;
                 // a fixed key keeps them on one provider shard across ticks.
                 Ok(l) => maybe_attach_cost_event_sink(

@@ -140,6 +140,111 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
     events
 }
 
+/// A non-streaming OpenAI-shaped chat completion body.
+fn chat_completion(text: &str) -> String {
+    format!(
+        "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{text}\"}},\
+         \"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1}}}}"
+    )
+}
+
+// ── Non-streaming path must use the credential pool too ──────────────────
+//
+// `chat()` carries the autonomous lanes: scheduled prompt tasks, the heartbeat
+// turn, and the pre-compaction flush. It used to retry a single `self.api_key`
+// in place — never leasing from the pool, so a 429 was retried on the same key
+// until exhaustion and never cooled, rotated, or failed over, and an expired
+// OAuth token was never refreshed (only the lease path refreshes).
+
+#[tokio::test]
+async fn chat_survives_429_then_succeeds_on_second_key() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (config, key_a, key_b) = two_key_config(&server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_b}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(chat_completion("ok"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let reply = client
+        .chat(&user_message("hi"), None)
+        .await
+        .expect("chat should rotate off the 429'd key and succeed via key B");
+    assert_eq!(reply.text_content().as_deref(), Some("ok"));
+
+    let pool = client
+        .primary_pool()
+        .cloned()
+        .expect("primary pool present for multi-key config");
+    let entries = pool.entries();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.last_error_reset_at_ms.is_some())
+            .count(),
+        1,
+        "the 429 must cool exactly one credential — proof the pool saw the failure"
+    );
+}
+
+#[tokio::test]
+async fn chat_falls_back_to_the_next_provider_when_the_pool_is_exhausted() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let (config, key_a) = one_key_with_fallback_config(&primary.uri(), &fallback.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "300")
+                .set_body_string("rate limited"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(chat_completion("fallback-ok"), "application/json"),
+        )
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let reply = client
+        .chat(&user_message("hi"), None)
+        .await
+        .expect("chat should reach the fallback provider");
+    assert_eq!(reply.text_content().as_deref(), Some("fallback-ok"));
+}
+
 // ── Test 83: stream survives 429 on first key, succeeds on second ────────
 
 #[tokio::test]

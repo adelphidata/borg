@@ -1140,7 +1140,7 @@ async fn chat_body_stall_times_out_instead_of_hanging() {
     config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
     config.llm.request_timeout_ms = 400;
     config.llm.max_retries = 0;
-    let client = LlmClient::new(&config).await.expect("client builds");
+    let mut client = LlmClient::new(&config).await.expect("client builds");
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1209,7 +1209,7 @@ async fn ollama_connection_refused_error_says_ollama_serve() {
     config.llm.model = "llama3.3".to_string();
     config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
     config.llm.max_retries = 0;
-    let client = LlmClient::new(&config).await.expect("client builds");
+    let mut client = LlmClient::new(&config).await.expect("client builds");
 
     let err = client
         .chat(&[Message::user("hi")], None)
@@ -2958,6 +2958,56 @@ async fn for_auxiliary_passes_concrete_model_through() {
         .await
         .expect("concrete model must pass through");
     assert_eq!(client.llm_config.model, "claude-haiku-4-5");
+}
+
+#[tokio::test]
+async fn for_auxiliary_switching_provider_does_not_inherit_primary_credentials() {
+    // Regression: the synthetic aux config only overrode credentials when the
+    // aux block set them, so a bare `[llm.aux] provider = "anthropic"` over an
+    // OpenAI primary kept OpenAI's keys and base_url. `resolve_api_keys` then
+    // ran `correct_provider_from_key`, saw the `sk-proj-` prefix, and reverted
+    // the provider to OpenAI — the aux pin looked applied and silently wasn't,
+    // so every background call billed the primary provider.
+    let primary_env = "BORG_TEST_AUX_PRIMARY_OPENAI_KEY";
+    std::env::set_var(primary_env, "sk-proj-primary-openai-key");
+    // The aux block names no key, so resolution must fall to the *aux*
+    // provider's own default env var — not the primary's inherited key.
+    let aux_default_env = Provider::Anthropic.default_env_var();
+    let restore_aux = std::env::var(aux_default_env).ok();
+    std::env::set_var(aux_default_env, "sk-ant-aux-key");
+
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".to_string());
+    config.llm.api_key_env = primary_env.to_string();
+    config.llm.model = "gpt-5".to_string();
+    config.llm.base_url = Some("https://primary.example/v1".to_string());
+    // Aux names a different provider and nothing else — the shape that broke.
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        ..Default::default()
+    });
+
+    let client = LlmClient::for_auxiliary(&config)
+        .await
+        .expect("aux client must build");
+
+    assert_eq!(
+        client.provider,
+        Provider::Anthropic,
+        "the aux provider pin must survive key resolution"
+    );
+    assert_ne!(
+        client.llm_config.base_url.as_deref(),
+        Some("https://primary.example/v1"),
+        "the primary's endpoint must not be reused for a different provider"
+    );
+
+    std::env::remove_var(primary_env);
+    match restore_aux {
+        Some(v) => std::env::set_var(aux_default_env, v),
+        None => std::env::remove_var(aux_default_env),
+    }
 }
 
 #[tokio::test]

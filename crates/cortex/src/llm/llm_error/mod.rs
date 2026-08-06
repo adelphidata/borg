@@ -134,6 +134,34 @@ impl LlmError {
         matches!(self, Self::Retryable { .. })
     }
 
+    /// A non-retryable error from a local failure (serialization, response
+    /// parsing) rather than a provider verdict.
+    pub fn fatal(source: impl Into<anyhow::Error>) -> Self {
+        Self::Fatal {
+            source: source.into(),
+            reason: FailoverReason::Format,
+        }
+    }
+
+    /// A transient error with no server-supplied retry hint.
+    pub fn retryable(source: impl Into<anyhow::Error>) -> Self {
+        Self::Retryable {
+            source: source.into(),
+            retry_after: None,
+            reason: FailoverReason::Unknown,
+        }
+    }
+
+    /// The server-supplied `Retry-After` delay, when the provider sent one.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Retryable { retry_after, .. } => *retry_after,
+            // `Fatal` carries no delay today; a billing 402 that names a
+            // window is still classified retryable by `classify_402`.
+            _ => None,
+        }
+    }
+
     /// Returns the failure classification for this error.
     pub fn reason(&self) -> FailoverReason {
         match self {
