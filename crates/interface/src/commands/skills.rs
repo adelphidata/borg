@@ -54,9 +54,28 @@ async fn run_diff(name: Option<&str>) -> Result<()> {
                 return Ok(());
             }
             println!("{:24} STATUS", "NAME");
+            let mut any_modified = false;
             for o in &overrides {
-                let status = if o.modified { "modified" } else { "unchanged" };
+                let status = if o.modified {
+                    any_modified = true;
+                    "modified (NOT loaded)"
+                } else {
+                    "unchanged"
+                };
                 println!("{:24} {status}", o.name);
+            }
+            if any_modified {
+                // The loader deliberately ignores on-disk SKILL.md shadows of
+                // bundled names — the embedded copy always wins. Saying only
+                // "modified" read as "your edit is live", so users tuned a
+                // bundled skill, saw it listed as modified, and never learned
+                // the agent had not read a byte of it.
+                println!(
+                    "\nNote: edits to a bundled skill's SKILL.md are NOT loaded — the \
+                     built-in copy wins.\n      To customize one, copy it to a new name \
+                     under {}.\n      (Supporting files such as scripts/ DO run from disk.)",
+                    dir.display()
+                );
             }
         }
         Some(name) => {
@@ -72,6 +91,10 @@ async fn run_diff(name: Option<&str>) -> Result<()> {
                 return Ok(());
             }
             print_line_diff(bundled, &user);
+            println!(
+                "\nNote: these changes are NOT loaded — the built-in '{name}' wins. \
+                 Copy it to a new name to customize it."
+            );
         }
     }
     Ok(())

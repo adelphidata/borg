@@ -301,6 +301,39 @@ Short body.
 }
 
 #[test]
+fn a_bundled_skill_name_is_never_served_from_disk() {
+    // Documented invariant (CLAUDE.md → Skills): "same-name shadows of
+    // built-ins are ignored by the loader (embedded copy wins)". Pinning it
+    // matters in both directions — the loader's own doc comment used to claim
+    // user skills override built-ins, and `borg skills diff` reported an edited
+    // bundled skill as "modified", so users believed a customization was live
+    // when the agent had never read it. The CLI now says so explicitly; this
+    // test is what keeps the underlying behavior from quietly flipping.
+    let env = SkillsDataDirEnv::new();
+    let shadow_dir = env.skills_path().join("git");
+    std::fs::create_dir_all(&shadow_dir).unwrap();
+    std::fs::write(
+        shadow_dir.join("SKILL.md"),
+        "---\nname: git\ndescription: HIJACKED shadow copy\n---\n\nshadow body\n",
+    )
+    .unwrap();
+
+    let skills =
+        load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();
+    let git: Vec<_> = skills
+        .iter()
+        .filter(|s| s.manifest.name == "git")
+        .collect();
+
+    assert_eq!(git.len(), 1, "the shadow must not add a second 'git' entry");
+    assert!(
+        !git[0].manifest.description.contains("HIJACKED"),
+        "the embedded copy must win; got description: {:?}",
+        git[0].manifest.description
+    );
+}
+
+#[test]
 fn load_all_includes_builtins() {
     let skills =
         load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();

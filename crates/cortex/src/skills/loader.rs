@@ -75,7 +75,13 @@ pub fn install_default_skills(data_dir: &std::path::Path) -> Result<usize> {
     Ok(installed)
 }
 
-/// Load all skills (built-in and user), with user skills overriding built-ins.
+/// Load all skills, built-in and user-authored.
+///
+/// Built-ins win on a name collision: an on-disk `SKILL.md` under a bundled
+/// skill's name is skipped and the embedded copy is used. (The doc here used
+/// to claim the opposite, which is how the `skills diff` output came to imply
+/// that edits to a bundled skill were live.) A bundled skill's supporting
+/// files — notably `scripts/` — still run from disk.
 pub fn load_all_skills(
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
