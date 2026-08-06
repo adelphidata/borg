@@ -105,6 +105,7 @@ fn event_name_for_point(point: HookPoint) -> &'static str {
 }
 
 /// A hook defined in `~/.borg/hooks.json` that runs a shell command on a lifecycle event.
+#[derive(Clone)]
 pub struct ScriptHook {
     name: String,
     points: Vec<HookPoint>,
@@ -357,7 +358,24 @@ impl Hook for ScriptHook {
     }
 
     async fn execute(&self, ctx: &HookContext) -> HookAction {
-        with_panic_guard(&self.name, || self.execute_inner(ctx))
+        // `execute_inner` is fully synchronous — `std::process`, a stdin
+        // writer thread, blocking pipe reads — and a hook's timeout can be up
+        // to 600s. Running it inline parks a tokio worker thread for that
+        // whole time, which starves the runtime rather than just delaying
+        // this turn. `spawn_blocking` moves it to the blocking pool.
+        //
+        // A panic inside the closure surfaces as `Err(JoinError)`, so this
+        // keeps the "hooks can never break the agent" guarantee that
+        // `with_panic_guard` provided when the body ran inline.
+        let hook = self.clone();
+        let ctx = ctx.clone();
+        match tokio::task::spawn_blocking(move || hook.execute_inner(&ctx)).await {
+            Ok(action) => action,
+            Err(e) => {
+                tracing::warn!("hook {} failed to run ({e}); continuing", self.name);
+                HookAction::Continue
+            }
+        }
     }
 }
 
@@ -377,21 +395,6 @@ fn compile_matcher(raw: Option<&str>) -> Result<Option<Regex>, regex::Error> {
         None => Ok(None),
         Some("*") => Ok(None),
         Some(s) => Regex::new(s).map(Some),
-    }
-}
-
-/// Catch panics inside hook execution and degrade to `Continue`. Defense-in-depth:
-/// a panicking hook never brings down the agent.
-fn with_panic_guard<F>(name: &str, f: F) -> HookAction
-where
-    F: FnOnce() -> HookAction + std::panic::UnwindSafe,
-{
-    match std::panic::catch_unwind(f) {
-        Ok(action) => action,
-        Err(_) => {
-            tracing::warn!("hook {name} panicked; continuing");
-            HookAction::Continue
-        }
     }
 }
 
@@ -1232,23 +1235,31 @@ mod tests {
             assert!(matches!(action, HookAction::Continue));
         }
 
-        #[test]
-        fn panic_guard_catches_panic() {
-            let flag = Arc::new(AtomicBool::new(false));
-            let flag_clone = flag.clone();
-            let action = with_panic_guard("test-panic", move || {
-                flag_clone.store(true, Ordering::SeqCst);
-                panic!("boom");
-            });
-            assert!(matches!(action, HookAction::Continue));
-            assert!(flag.load(Ordering::SeqCst), "closure must have run");
-        }
+        #[tokio::test]
+        async fn a_slow_hook_does_not_block_the_async_runtime() {
+            // "Hooks can never break the agent" includes not wedging the
+            // runtime. `execute_inner` is synchronous and a hook timeout can
+            // be up to 600s, so running it inline parked a tokio worker thread
+            // for the duration instead of just delaying this turn.
+            let hook = make_hook("sleep 1; exit 0", HookPoint::AfterToolCall);
+            let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", true);
 
-        #[test]
-        fn panic_guard_passes_through_non_panicking() {
-            let action =
-                with_panic_guard("test-happy", || HookAction::InjectContext("hi".to_string()));
-            assert!(matches!(action, HookAction::InjectContext(_)));
+            let progressed = Arc::new(AtomicBool::new(false));
+            let flag = progressed.clone();
+            let ticker = tokio::spawn(async move {
+                // Must get scheduled while the hook is still running.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+
+            let action = hook.execute(&ctx).await;
+            ticker.await.expect("concurrent task must complete");
+
+            assert!(matches!(action, HookAction::Continue));
+            assert!(
+                progressed.load(Ordering::SeqCst),
+                "another task must have run while the blocking hook was in flight"
+            );
         }
 
         #[tokio::test]

@@ -410,12 +410,26 @@ impl HeartbeatScheduler {
                     .as_ref()
                     .map(|rx| rx.borrow().heartbeat.clone());
                 if let Some(new_hb) = new_hb {
+                    let old_interval = self.clamped_interval();
                     self.apply_config(new_hb);
                     let new_interval = self.clamped_interval();
-                    info!("Heartbeat: config reload applied (interval: {new_interval:?})");
-                    *ticker = tokio::time::interval(new_interval);
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    ticker.tick().await;
+                    // Only rebuild when the interval actually changed.
+                    // Rebuilding resets the countdown to zero, and the watch
+                    // publishes the whole `Config` — so a settings-heavy
+                    // session (any `borg settings set`) used to postpone the
+                    // pending heartbeat every time, starving it indefinitely
+                    // on a long interval.
+                    if new_interval == old_interval {
+                        debug!(
+                            "Heartbeat: config reload applied, interval unchanged \
+                             ({new_interval:?}); keeping the pending tick"
+                        );
+                    } else {
+                        info!("Heartbeat: config reload applied (interval: {new_interval:?})");
+                        *ticker = tokio::time::interval(new_interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        ticker.tick().await;
+                    }
                 }
                 LoopControl::Continue
             }
@@ -1388,6 +1402,64 @@ mod tests {
         match fire_rx.try_recv() {
             Ok(HeartbeatEvent::Fire) => {}
             other => panic!("expected Fire after 6s with live 5s interval, got: {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    /// Repeated config reloads that don't change the interval must not keep
+    /// postponing the pending tick.
+    ///
+    /// Regression: the reload arm rebuilt the ticker unconditionally and
+    /// consumed its immediate first tick, throwing away all elapsed time. The
+    /// config watch publishes the whole `Config`, so any `borg settings set`
+    /// reset the countdown — a settings-heavy session could starve the
+    /// heartbeat indefinitely on a long interval.
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_config_reloads_do_not_postpone_the_pending_tick() {
+        let hb = hb_config("60s", None, None);
+        let (cfg_tx, cfg_rx) = watch::channel(config_with_heartbeat(hb.clone()));
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let mut scheduler = HeartbeatScheduler::new(hb.clone(), chrono_tz::UTC, poke_rx);
+        scheduler.set_config_rx(cfg_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // Advance most of the way to the fire, then publish config changes
+        // that leave `heartbeat.interval` untouched.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            // Same heartbeat block, new Config value — exactly what an
+            // unrelated `borg settings set` produces.
+            cfg_tx
+                .send(config_with_heartbeat(hb.clone()))
+                .expect("send config");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // 55s of virtual time has passed; cross the 60s boundary.
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            other => panic!(
+                "heartbeat must still fire at its original deadline despite \
+                 interval-preserving reloads, got: {other:?}"
+            ),
         }
         cancel.cancel();
     }

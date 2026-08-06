@@ -631,6 +631,17 @@ pub async fn run_daily_maintenance_with_registry(
         group_issues_by_remediation(&initial_issues)
     };
     for (key, issues) in grouped {
+        // Re-check per key, not just once before the loop. The budget is the
+        // runaway backstop; checking it only at the top let a sweep that blew
+        // it on the first remediation still run every remaining one.
+        if budget.is_blown() {
+            tracing::warn!(
+                spent = budget.spent,
+                budget = budget.budget,
+                "maintenance: action budget exhausted, skipping remaining remediations"
+            );
+            break;
+        }
         let result = apply_remediation_key(db, config, key).await;
         match result {
             Ok(outcome) => {
@@ -639,6 +650,11 @@ pub async fn run_daily_maintenance_with_registry(
                     report.embeddings_repaired_files += r.repaired_files;
                     report.embeddings_repaired_chunks += r.repaired_chunks;
                     budget.try_spend(r.repaired_files);
+                } else if changed {
+                    // Every mutating remediation costs at least one action.
+                    // Only embeddings used to charge, so the other keys were
+                    // effectively unbounded.
+                    budget.try_spend(1);
                 }
                 if let Some(embedding_report) = outcome.embeddings {
                     for issue in embedding_report.fixed_issue_keys {
