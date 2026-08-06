@@ -223,6 +223,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_cert_inside_the_renewal_window_is_reissued() {
+        // The renewal branch is what the daily check in `daemon::run` relies
+        // on. It was previously reachable only at daemon start, so a daemon up
+        // longer than SERVER_VALIDITY_DAYS - RENEWAL_WINDOW_DAYS (~76 days)
+        // never renewed and every mTLS handshake failed on day 90. Pin the
+        // renewal itself so the periodic caller has something real to call.
+        let kek = MemoryKekStore::new();
+        let d = db().await;
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).await.expect("ca");
+        let san = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
+
+        let (_, _, serial1) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("initial issue");
+
+        // Backdate expiry to inside the renewal window.
+        let soon = chrono::Utc::now().timestamp() + (RENEWAL_WINDOW_DAYS as i64 - 1) * 86_400;
+        d.conn()
+            .execute(
+                "UPDATE internal_ca_certs SET not_after = ?1 WHERE serial = ?2",
+                libsql::params![soon, serial1],
+            )
+            .await
+            .expect("backdate expiry");
+
+        let (_, _, serial2) = ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san)
+            .await
+            .expect("renewal");
+
+        assert_ne!(
+            serial1, serial2,
+            "a cert inside the renewal window must be reissued"
+        );
+
+        // And the fresh one is now the active row, so a restart serves it.
+        let active = d
+            .latest_active_cert("server")
+            .await
+            .expect("query")
+            .expect("an active server cert must exist");
+        assert_eq!(active.serial, serial2);
+    }
+
+    #[tokio::test]
     async fn server_cert_minted_once_then_loaded_from_db() {
         let kek = MemoryKekStore::new();
         let d = db().await;

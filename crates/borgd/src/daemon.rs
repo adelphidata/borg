@@ -392,6 +392,90 @@ pub async fn run(cfg: Config) -> Result<()> {
         server_key_pem: server_key_pem.clone(),
         ca_cert_pem: ca_cert_pem.clone(),
     };
+
+    // Keep the stored leaf fresh while the daemon runs.
+    //
+    // `ensure_server_cert` renews inside a 14-day window, but it only ran here
+    // at startup — so a daemon up past ~76 days (leaf validity is 90) never
+    // renewed, and on day 90 every mTLS handshake began failing until someone
+    // restarted it. Long-lived VPS deployments are exactly the target of the
+    // file-KEK/headless path, so "it'll get restarted eventually" is not a
+    // safe assumption.
+    //
+    // Residual limitation, deliberate: the running server serves the TLS
+    // material captured above, so a renewal here does NOT hot-swap the live
+    // listener — tonic's TLS config is fixed at build time and reworking it
+    // would mean touching the guarded mTLS construction path. What this does
+    // guarantee is that the *stored* cert is always current, so any restart
+    // picks up a valid one, and that the operator is told loudly and early
+    // rather than discovering it as handshake failures.
+    {
+        let renew_db = pki_db.clone();
+        let renew_kek = kek.clone();
+        let renew_ca_cert = ca_cert_pem.clone();
+        let renew_ca_key = ca_key_pem.clone();
+        let renew_san = san_dns.clone();
+        let renew_serving_serial = _server_serial;
+        let renew_token = orchestrator_token.clone();
+        match Database::open().await {
+            Ok(db) => {
+                let sup_db: crate::supervisor::DbHandle = Arc::new(db);
+                crate::supervisor::spawn_supervised(
+                    crate::supervisor::SupervisorConfig::new("server-cert-renewal"),
+                    orchestrator_token.clone(),
+                    sup_db,
+                    move || {
+                        let cancel = renew_token.clone();
+                        let pki_db = renew_db.clone();
+                        let kek = renew_kek.clone();
+                        let ca_cert = renew_ca_cert.clone();
+                        let ca_key = renew_ca_key.clone();
+                        let san = renew_san.clone();
+                        async move {
+                            const CHECK_INTERVAL: std::time::Duration =
+                                std::time::Duration::from_secs(24 * 60 * 60);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                                    _ = tokio::time::sleep(CHECK_INTERVAL) => {}
+                                }
+                                let renewed = {
+                                    let g = pki_db.lock().await;
+                                    ensure_server_cert(&g, kek.as_ref(), &ca_cert, &ca_key, &san)
+                                        .await
+                                };
+                                match renewed {
+                                    Ok((_, _, serial)) if serial != renew_serving_serial => {
+                                        tracing::error!(
+                                            new_serial = serial,
+                                            serving_serial = renew_serving_serial,
+                                            "server certificate was renewed, but this process is \
+                                             still serving the previous one — restart borgd to \
+                                             pick it up before the old cert expires"
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        tracing::debug!("server certificate still current");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "server cert renewal check failed");
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "borgd: server-cert renewal check not started (DB unavailable); \
+                     a daemon running past the cert's validity window will fail mTLS handshakes"
+                );
+            }
+        }
+    }
     let audit = AuditWriter::new(pki_db.clone());
     // Install the process-global audit writer so library call sites that
     // can't easily plumb an `AuditWriter` (shell-policy denial path,

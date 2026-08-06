@@ -83,6 +83,13 @@ define_settings! {
 
         // ── Memory embeddings ──
         "memory.embeddings.enabled" => memory.embeddings.enabled, parsed(bool);
+        // Without these you could switch semantic search on but never point it
+        // anywhere — provider, model, dimension, and key env var were all
+        // frozen at their compiled defaults.
+        "memory.embeddings.provider" => memory.embeddings.provider, opt_string;
+        "memory.embeddings.model" => memory.embeddings.model, opt_string;
+        "memory.embeddings.dimension" => memory.embeddings.dimension, opt_parsed(usize);
+        "memory.embeddings.api_key_env" => memory.embeddings.api_key_env, opt_string;
         "memory.embeddings.mmr_enabled" => memory.embeddings.mmr_enabled, parsed(bool);
         "memory.embeddings.mmr_lambda" => memory.embeddings.mmr_lambda, range(f32, 0.0_f32, 1.0);
         "memory.embeddings.recency_weight" => memory.embeddings.recency_weight, range(f32, 0.0_f32, 1.0);
@@ -293,6 +300,9 @@ define_settings! {
 
         // ── Media ──
         "media.max_image_bytes" => media.max_image_bytes, parsed(usize);
+        // The video twin of the image cap; registered so both sides of the
+        // media size limit are tunable.
+        "media.max_video_bytes" => media.max_video_bytes, parsed(usize);
         "media.compression_enabled" => media.compression_enabled, parsed(bool);
         "media.max_dimension_px" => media.max_dimension_px, parsed(u32);
 
@@ -303,6 +313,12 @@ define_settings! {
         // ── Scripts ──
         "scripts.enabled" => scripts.enabled, parsed(bool);
         "scripts.default_timeout_ms" => scripts.default_timeout_ms, parsed(u64);
+        // `default_sandbox_profile` is security-relevant and was unreachable —
+        // an operator could not tighten (or inspect) the profile scripts run
+        // under. The other two bound on-disk script growth.
+        "scripts.default_sandbox_profile" => scripts.default_sandbox_profile, string;
+        "scripts.ephemeral_ttl_secs" => scripts.ephemeral_ttl_secs, parsed(u64);
+        "scripts.max_scripts" => scripts.max_scripts, parsed(usize);
 
         // ── Hooks ──
         "hooks.enabled" => hooks.enabled, parsed(bool);

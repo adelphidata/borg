@@ -383,6 +383,20 @@ mod tests {
             "memory.letta.api_key",
             "memory.zep.api_key",
             "data.purge_policy",
+            // Config is DB-only, so a field with no key here is frozen at its
+            // compiled default forever. These were all consumed at runtime but
+            // unreachable: semantic search could be enabled but never pointed
+            // at a provider/model/dimension/key, the security-relevant script
+            // sandbox profile could not be changed, and only the image half of
+            // the media size cap was tunable.
+            "memory.embeddings.provider",
+            "memory.embeddings.model",
+            "memory.embeddings.dimension",
+            "memory.embeddings.api_key_env",
+            "scripts.default_sandbox_profile",
+            "scripts.ephemeral_ttl_secs",
+            "scripts.max_scripts",
+            "media.max_video_bytes",
         ] {
             assert!(
                 known.iter().any(|k| k == key),
