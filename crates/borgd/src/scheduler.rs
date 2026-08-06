@@ -113,6 +113,17 @@ pub(crate) async fn report_prior_unclean_exit(
     Some(heartbeat_at)
 }
 
+/// Aborts the wrapped task when dropped, binding a spawned task's lifetime to
+/// the scope that created it. Used for the dispatcher watchdog so a supervised
+/// respawn can't leave a previous watchdog running against a stale timestamp.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Run the dispatcher loop until `shutdown` fires. Returns when shutdown is
 /// observed — caller should drain any remaining permits.
 pub async fn run(
@@ -156,12 +167,17 @@ pub async fn run(
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
 
-    // Watchdog
+    // Watchdog. Its lifetime is tied to *this* incarnation of `run()`, not to
+    // the daemon-wide `shutdown` token: `spawn_supervised` respawns the
+    // dispatcher on any error or panic, and a watchdog keyed only to
+    // `shutdown` would survive that, keep holding the now-frozen
+    // `watchdog_ts`, and `exit(1)` the whole daemon 180s later — turning a
+    // recoverable blip into a hard kill and defeating the supervisor.
     let watchdog_ts = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
-    {
+    let _watchdog_guard = {
         let ts = watchdog_ts.clone();
         let wd_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             let mut wd_interval = tokio::time::interval(WATCHDOG_TICK_INTERVAL);
             loop {
                 // Biased so shutdown wins and the watchdog can't false-positive
@@ -182,8 +198,8 @@ pub async fn run(
                     std::process::exit(1);
                 }
             }
-        });
-    }
+        }))
+    };
 
     let mut last_tick_wall = std::time::Instant::now();
     let mut last_stalled_scan = std::time::Instant::now();
@@ -368,6 +384,52 @@ pub async fn run(
 
         // `_tick_lock` drops here at end of iteration, before the next
         // `interval.tick().await`.
+    }
+}
+
+#[cfg(test)]
+mod watchdog_lifetime_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// The dispatcher watchdog must not outlive the `run()` call that spawned
+    /// it. `spawn_supervised` respawns the dispatcher on error or panic while
+    /// `shutdown` (the watchdog's only other exit path) stays uncancelled, so
+    /// a watchdog bound solely to that token would survive the restart, keep
+    /// watching a timestamp nothing updates any more, and `std::process::exit`
+    /// the whole daemon once the stall threshold elapsed — turning a
+    /// recoverable blip into a hard kill and defeating the supervisor.
+    #[tokio::test]
+    async fn watchdog_guard_stops_the_task_when_its_scope_returns() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+
+        {
+            let fired = fired.clone();
+            // Never cancelled — stands in for the daemon-wide token that
+            // stays live across a supervised respawn.
+            let token = shutdown.clone();
+            let _guard = AbortOnDrop(tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        fired.store(true, Ordering::SeqCst);
+                    }
+                }
+            }));
+        } // scope exit == `run()` returning into the supervisor
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "watchdog outlived its scope; a supervised respawn would leave it \
+             watching a frozen timestamp and eventually kill the daemon"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "the token must still be live — otherwise this test would pass \
+             for the wrong reason"
+        );
     }
 }
 

@@ -349,6 +349,10 @@ pub(crate) async fn build_filtered_sh_command(
     // `.output()` callers get this implicitly, but the guarantee belongs
     // here so a future `.spawn()`/`.status()` caller can't lose it.
     cmd.stdin(std::process::Stdio::null());
+    // Callers wrap these in `tokio::time::timeout`, which only drops the
+    // future — without this the timed-out `sh` (and its whole tree) keeps
+    // running, so a hanging pre_run_command leaks one orphan per tick.
+    cmd.kill_on_drop(true);
     cortex::security::env_allowlist::apply_filtered_env(
         &mut cmd,
         &std::collections::HashMap::new(),
@@ -430,7 +434,15 @@ fn truncate_capture(s: &str) -> String {
     if s.len() <= PRE_RUN_OUTPUT_CAP {
         return s.to_string();
     }
-    let mut out = s[..PRE_RUN_OUTPUT_CAP].to_string();
+    // Walk back to a UTF-8 boundary: the cap is a byte count, but output from
+    // a real command (JSON with emoji, `git log` with non-ASCII authors) can
+    // straddle it. Slicing mid-sequence panics, and the per-task
+    // `catch_unwind` would turn that into a task that silently never runs.
+    let end = (0..=PRE_RUN_OUTPUT_CAP)
+        .rev()
+        .find(|i| s.is_char_boundary(*i))
+        .unwrap_or(0);
+    let mut out = s[..end].to_string();
     out.push_str("\n[truncated]");
     out
 }
@@ -2418,6 +2430,53 @@ mod pre_run_tests {
             outcome.stdout.len() <= PRE_RUN_OUTPUT_CAP + 16,
             "stdout exceeded cap: {} bytes",
             outcome.stdout.len()
+        );
+    }
+
+    #[test]
+    fn truncate_capture_splits_on_a_char_boundary() {
+        // Regression: the cap is a byte count but output is UTF-8. Slicing at
+        // a raw byte offset that lands mid-sequence panics; the per-task
+        // catch_unwind then records "not a char boundary" and the scheduled
+        // task silently never produces output. A `pre_run_command` emitting
+        // JSON with emoji or non-ASCII author names hits this routinely.
+        //
+        // Build a string whose byte PRE_RUN_OUTPUT_CAP is inside a 3-byte
+        // char: filler of cap-1 ASCII bytes, then a multi-byte char that
+        // straddles the cap, then enough tail to exceed it.
+        let mut s = "a".repeat(PRE_RUN_OUTPUT_CAP - 1);
+        s.push('☃'); // 3 bytes: occupies cap-1, cap, cap+1
+        s.push_str(&"b".repeat(100));
+        assert!(!s.is_char_boundary(PRE_RUN_OUTPUT_CAP));
+
+        let out = truncate_capture(&s);
+
+        assert!(out.ends_with("[truncated]"));
+        // The straddling char is dropped whole rather than split.
+        assert!(!out.contains('☃'));
+        assert_eq!(out, format!("{}\n[truncated]", "a".repeat(PRE_RUN_OUTPUT_CAP - 1)));
+    }
+
+    #[tokio::test]
+    async fn timed_out_pre_run_child_is_killed_not_orphaned() {
+        // Regression: `tokio::time::timeout` only drops the future. Without
+        // kill_on_drop the `sh` child survives the timeout, so a scheduled
+        // task with a hanging command leaks one orphan process per tick.
+        // The child writes a sentinel file after sleeping; if it was really
+        // killed the file never appears.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("survived");
+        let cmd = format!("sleep 3; touch {}", sentinel.display());
+
+        let outcome = run_pre_run_command(&cmd, None, 300, &gate_test_config()).await;
+        assert!(outcome.timed_out, "precondition: the command must time out");
+
+        // Well past the child's sleep had it kept running.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(
+            !sentinel.exists(),
+            "timed-out child kept running and touched {}",
+            sentinel.display()
         );
     }
 
