@@ -148,18 +148,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let _lifecycle = cortex::telemetry::LifecycleGuard::new(metrics.clone(), "borgd");
     let cost_event_bus = CostEventBus::new(&initial_core_config, metrics.clone());
     let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(cost_event_bus.clone());
-    {
-        let mut rx = config_watcher.subscribe();
-        let bus = cost_event_bus.clone();
-        tokio::spawn(async move {
-            loop {
-                if rx.changed().await.is_err() {
-                    return;
-                }
-                bus.sync_from_config(&rx.borrow().clone());
-            }
-        });
-    }
+    // The config→cost-bus sync bridge is started further down, once the
+    // shutdown token exists, so it can run supervised — see below.
 
     let registry = SessionRegistry::new();
     // Daemon-wide subprocess registry — one handle, cloned everywhere
@@ -213,10 +203,59 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    // Hourly budget reset tick — advances any budget whose period expired
-    // and writes a `budget_reset` event. Failures stay isolated in the
-    // task; daemon health is unaffected.
-    crate::budget_tick::spawn(shutdown_tx.subscribe());
+    // The hourly budget reset tick is started by `orchestrator::start`, which
+    // owns the supervisor's DB handle — see `budget_tick::run`.
+
+    // Keep the cost bus in step with live config edits. Supervised rather than
+    // bare-spawned: it is a daemon-lifetime loop, and a swallowed panic here
+    // would silently pin cost accounting to boot-time config — every later
+    // `borg settings set` for pricing or budgets would appear to apply and
+    // quietly not.
+    match Database::open().await {
+        Ok(db) => {
+            let db: crate::supervisor::DbHandle = Arc::new(db);
+            let bridge_token = orchestrator_token.clone();
+            // Subscribe once; the receiver is cloned per (re)spawn so a
+            // restarted bridge still observes later edits.
+            let bridge_rx = config_watcher.subscribe();
+            let bridge_bus = cost_event_bus.clone();
+            crate::supervisor::spawn_supervised(
+                crate::supervisor::SupervisorConfig::new("cost-bus-config-sync"),
+                orchestrator_token.clone(),
+                db,
+                move || {
+                    let cancel = bridge_token.clone();
+                    let mut rx = bridge_rx.clone();
+                    let bus = bridge_bus.clone();
+                    async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                                changed = rx.changed() => {
+                                    if changed.is_err() {
+                                        // Watcher dropped: the daemon is tearing
+                                        // down, nothing left to sync.
+                                        return Ok(());
+                                    }
+                                    bus.sync_from_config(&rx.borrow().clone());
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        }
+        Err(e) => {
+            // Non-fatal: cost accounting keeps working against boot-time
+            // config. Loud because live pricing edits will not take effect.
+            tracing::warn!(
+                error = %e,
+                "borgd: cost-bus config sync not started (DB unavailable); \
+                 live pricing/budget edits will not reach the cost bus until restart"
+            );
+        }
+    }
 
     // Migration for pre-existing installs: if `user.timezone` was never set
     // (onboarding ran before host-timezone auto-detection landed), detect it

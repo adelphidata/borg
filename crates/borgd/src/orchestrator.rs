@@ -133,17 +133,13 @@ pub async fn start(
         Some(cost_event_sink.clone()),
         Some(goal_bus.clone()),
     ));
-    let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
-        config.clone(),
-        executor.clone(),
-        shutdown.clone(),
-        config_rx,
-    );
-
     // Open one shared `Database` handle for supervisor activity-log
     // writes. Supervisor uses `std::sync::Mutex` because rusqlite is
     // !Sync; we accept the mutex contention for the rare error-path
     // writes (panic, restart, degraded — none of which are hot).
+    //
+    // Opened before any subsystem starts: every supervised spawn below
+    // needs it, including the heartbeat runner.
     //
     // Failure here means the daemon DB is unavailable — every other
     // subsystem will fail too. Panicking loud at orchestrator start
@@ -155,6 +151,27 @@ pub async fn start(
             "orchestrator: cortex::db::Database::open() failed: {e}; daemon cannot supervise without DB"
         ),
     };
+
+    let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
+        config.clone(),
+        executor.clone(),
+        shutdown.clone(),
+        config_rx,
+        supervisor_db.clone(),
+    );
+
+    // Hourly budget reset. Supervised for the same reason as everything
+    // else here: a swallowed panic would freeze budgets and leave the agent
+    // paused past its reset with no signal anywhere.
+    {
+        let tick_shutdown = shutdown.clone();
+        spawn_supervised(
+            SupervisorConfig::new("budget-tick"),
+            shutdown.clone(),
+            supervisor_db.clone(),
+            move || crate::budget_tick::run(tick_shutdown.clone()),
+        );
+    }
 
     // Gateway with respawn supervisor. Uses the same numeric config the
     // pre-supervisor ad-hoc loop did so behavior is unchanged: max 5

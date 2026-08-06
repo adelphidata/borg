@@ -10,6 +10,7 @@
 
 use crate::session::convert::{PROMPT_REQUEST_SHELL, PROMPT_REQUEST_USER_INPUT};
 use crate::session::DaemonSessionExecutor;
+use crate::supervisor::{spawn_supervised, SupervisorConfig};
 use anyhow::Result;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
@@ -244,6 +245,7 @@ pub fn spawn(
     executor: Arc<DaemonSessionExecutor>,
     shutdown: CancellationToken,
     config_rx: watch::Receiver<Config>,
+    db: crate::supervisor::DbHandle,
 ) -> (
     HeartbeatBus,
     mpsc::Sender<HeartbeatTrigger>,
@@ -255,7 +257,7 @@ pub fn spawn(
     // trigger-channel loop below is preserved so TUI-initiated SessionStart
     // greetings (which still need executor context) work.
     let _ = config;
-    let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
+    let (trigger_tx, trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
     let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
 
     let bus = HeartbeatBus::default();
@@ -269,38 +271,67 @@ pub fn spawn(
     // Hold the watch receiver and re-borrow the latest `Config` per iteration
     // so quiet-hours suppression on `Admin.Trigger`, dedup-window sizing, and
     // channel delivery all see edits made via `Admin.SetSetting` immediately.
-    let mut runner_config_rx = config_rx;
-    tokio::spawn(async move {
-        loop {
-            let runner_config = runner_config_rx.borrow_and_update().clone();
-            tokio::select! {
-                biased;
-                _ = runner_cancel.cancelled() => return,
-                trigger = trigger_rx.recv() => {
-                    let Some(trigger) = trigger else { return };
-                    if should_skip_explicit_trigger(trigger, &runner_config) {
-                        publish_scheduler_result(
-                            &bus_for_runner,
-                            trigger.source,
-                            HeartbeatResult::Skipped {
-                                reason: SkipReason::QuietHours,
-                            },
-                        );
-                        continue;
+    // The trigger receiver and the config watcher are shared across restarts:
+    // `spawn_supervised` calls the factory again on each respawn, and an
+    // `mpsc::Receiver` cannot be cloned. Parking them behind a mutex means a
+    // respawned runner resumes on the same channel instead of one that nothing
+    // sends to (which would silently drop every later `Admin.Trigger`).
+    let runner_state = Arc::new(tokio::sync::Mutex::new((trigger_rx, config_rx)));
+
+    // Supervised: this loop drives every `Admin.Trigger` and SessionStart
+    // greeting for the daemon's lifetime. Under a bare `tokio::spawn` a panic
+    // is swallowed by tokio and the subsystem is silently dead until restart
+    // — no activity-log row, no `maintenance_issue_state` entry, no doctor
+    // `Fail`. See `docs/daemon-supervision.md`.
+    spawn_supervised(
+        SupervisorConfig::new("heartbeat-runner"),
+        runner_cancel.clone(),
+        db,
+        move || {
+            let cancel = runner_cancel.clone();
+            let bus = bus_for_runner.clone();
+            let executor = runner_executor.clone();
+            let state = runner_state.clone();
+            // The loop only ever exits cleanly — a panic is what the
+            // supervisor is here for — but the factory's future still has to
+            // name an error type, hence the annotated returns below.
+            async move {
+                let mut guard = state.lock().await;
+                let (trigger_rx, runner_config_rx) = &mut *guard;
+                loop {
+                    let runner_config = runner_config_rx.borrow_and_update().clone();
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                        trigger = trigger_rx.recv() => {
+                            // Sender dropped: nothing can trigger us again, so
+                            // return Ok rather than churning the supervisor.
+                            let Some(trigger) = trigger else { return Ok(()) };
+                            if should_skip_explicit_trigger(trigger, &runner_config) {
+                                publish_scheduler_result(
+                                    &bus,
+                                    trigger.source,
+                                    HeartbeatResult::Skipped {
+                                        reason: SkipReason::QuietHours,
+                                    },
+                                );
+                                continue;
+                            }
+                            run_and_broadcast(
+                                executor.as_ref(),
+                                &runner_config,
+                                trigger,
+                                &bus,
+                            ).await;
+                        }
+                        _ = runner_config_rx.changed() => {
+                            // Loop back so the next iteration re-borrows the fresh config.
+                        }
                     }
-                    run_and_broadcast(
-                        runner_executor.as_ref(),
-                        &runner_config,
-                        trigger,
-                        &bus_for_runner,
-                    ).await;
-                }
-                _ = runner_config_rx.changed() => {
-                    // Loop back so the next iteration re-borrows the fresh config.
                 }
             }
-        }
-    });
+        },
+    );
 
     (bus, trigger_tx, poke_tx)
 }
@@ -1176,6 +1207,52 @@ mod tests {
             !scan.contains(&scheduler_new),
             "heartbeat::spawn must not construct the legacy scheduler — the \
              seeded heartbeat row owns the schedule"
+        );
+    }
+
+    /// The trigger runner is a daemon-lifetime loop and MUST be supervised.
+    ///
+    /// Documented hard invariant (CLAUDE.md → "Subsystem Supervision",
+    /// `docs/daemon-supervision.md`): bare `tokio::spawn` for a long-running
+    /// daemon subsystem is forbidden. Under a bare spawn a panic here is
+    /// swallowed by tokio and the runner is silently dead — every later
+    /// `Admin.Trigger` and SessionStart greeting is dropped with no
+    /// activity-log row, no `maintenance_issue_state` entry, and no doctor
+    /// `Fail`. Source-grep because "which spawn call owns this loop" is not
+    /// something the type system expresses; same rationale and shape as the
+    /// legacy-scheduler guard above.
+    #[test]
+    fn heartbeat_runner_is_supervised_not_bare_spawned() {
+        let supervised = ["spawn", "supervised("].join("_");
+        let src = include_str!("heartbeat.rs");
+        let marker = "fn heartbeat_runner_is_supervised_not_bare_spawned";
+        let scan = match src.find(marker) {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(
+            scan.contains(&supervised),
+            "the heartbeat trigger runner must be registered through \
+             spawn_supervised — a bare tokio::spawn loses the panic silently"
+        );
+
+        // The receiver must be created OUTSIDE the factory. `spawn_supervised`
+        // re-invokes the factory on every respawn, and an `mpsc::Receiver`
+        // cannot be cloned — rebuilding the channel inside would leave the
+        // respawned runner listening on a channel nothing sends to, silently
+        // dropping every subsequent trigger.
+        let channel_ctor = ["mpsc", "channel::<HeartbeatTrigger>"].join("::");
+        let ctor_at = scan
+            .find(&channel_ctor)
+            .expect("trigger channel construction not found");
+        let supervised_at = scan
+            .find(&supervised)
+            .expect("supervised spawn not found (checked above)");
+        assert!(
+            ctor_at < supervised_at,
+            "the trigger channel must be constructed before the supervised \
+             factory, so the receiver survives a respawn instead of being \
+             rebuilt per attempt"
         );
     }
 
