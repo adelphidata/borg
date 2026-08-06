@@ -678,6 +678,16 @@ pub const DAEMON_LOCK_MAX_REFRESH_FAILURES: u32 = 3;
 /// detection grace and the takeover grace so the two can never drift.
 pub const DAEMON_LOCK_STALE_SECS: i64 = 300;
 
+/// How long an unclean daemon exit stays worth reporting in `borg doctor`.
+/// Past this the information is archaeology, not a diagnosis, and a warning
+/// nobody can act on is a warning people learn to ignore.
+pub const DAEMON_UNCLEAN_EXIT_WARN_WINDOW_SECS: i64 = 7 * SECS_PER_DAY;
+
+/// `meta` key holding the unix timestamp of the last detected unclean exit.
+pub const META_LAST_UNCLEAN_SHUTDOWN_AT: &str = "last_unclean_shutdown_at";
+/// `meta` key holding the unix timestamp of the last graceful shutdown.
+pub const META_LAST_CLEAN_SHUTDOWN_AT: &str = "last_clean_shutdown_at";
+
 /// launchd service label (macOS): the daemon's reverse-DNS identifier; the
 /// installed plist is `<label>.plist`. Shared by the service installer
 /// (`borgd_launcher`) and the `borg doctor` service-install check so neither

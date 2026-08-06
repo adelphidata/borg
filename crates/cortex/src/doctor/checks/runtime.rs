@@ -361,9 +361,49 @@ fn orphan_lock_check(idle_secs: i64) -> DiagnosticCheck {
     )
 }
 
+/// Build the previous-unclean-exit finding, or `None` when there is nothing
+/// worth saying.
+///
+/// Pure so the "when do we warn" decision is testable without a DB. Warns only
+/// while the unclean stop is the *most recent* shutdown — a later clean stop
+/// retires it — and only inside
+/// [`DAEMON_UNCLEAN_EXIT_WARN_WINDOW_SECS`]. An implementation that merely
+/// checks "the meta key exists" would warn forever.
+fn unclean_exit_check(
+    unclean_at: i64,
+    clean_at: Option<i64>,
+    now: i64,
+) -> Option<DiagnosticCheck> {
+    if clean_at.is_some_and(|c| c >= unclean_at) {
+        return None;
+    }
+    let age = now.saturating_sub(unclean_at);
+    if age > crate::constants::DAEMON_UNCLEAN_EXIT_WARN_WINDOW_SECS {
+        return None;
+    }
+    Some(
+        DiagnosticCheck::warn(
+            "Locks",
+            "previous shutdown",
+            format!(
+                "borgd exited uncleanly ~{}h ago (OOM kill, SIGKILL, or host reset) — \
+                 in-flight task runs may have been lost",
+                age / crate::constants::SECS_PER_HOUR
+            ),
+        )
+        .with_remediation(
+            RemediationKind::Manual,
+            "daemon.unclean_exit",
+            "check `journalctl -u borgd` / `dmesg` for an OOM record around that time",
+        ),
+    )
+}
+
 /// Orphan daemon-lock detection. Emits a finding only when the lock is held by
 /// a dead PID past the staleness grace — a running daemon (live PID or fresh
 /// heartbeat) is never flagged. Suppressed when healthy/absent.
+///
+/// Also reports a previous unclean exit, which the daemon records at boot.
 pub(in crate::doctor) async fn check_daemon_lock(checks: &mut Vec<DiagnosticCheck>) {
     let Ok(db) = Database::open().await else {
         return;
@@ -371,6 +411,23 @@ pub(in crate::doctor) async fn check_daemon_lock(checks: &mut Vec<DiagnosticChec
     let now = chrono::Utc::now().timestamp();
     if let Ok(Some(age)) = db.daemon_lock_orphan_age(now, DAEMON_LOCK_STALE_SECS).await {
         checks.push(orphan_lock_check(age));
+    }
+
+    let parse = |v: Option<String>| v.and_then(|s| s.parse::<i64>().ok());
+    let unclean = parse(
+        db.get_meta(crate::constants::META_LAST_UNCLEAN_SHUTDOWN_AT)
+            .await
+            .unwrap_or(None),
+    );
+    if let Some(unclean_at) = unclean {
+        let clean_at = parse(
+            db.get_meta(crate::constants::META_LAST_CLEAN_SHUTDOWN_AT)
+                .await
+                .unwrap_or(None),
+        );
+        if let Some(check) = unclean_exit_check(unclean_at, clean_at, now) {
+            checks.push(check);
+        }
     }
 }
 
@@ -545,5 +602,50 @@ mod tests {
             msg.contains("flaky job"),
             "warning names the offending task: {msg}"
         );
+    }
+
+    #[test]
+    fn unclean_exit_check_only_warns_for_the_most_recent_unclean_stop() {
+        const HOUR: i64 = 3600;
+        let now = 1_000_000_i64;
+        // (unclean_at, clean_at, should_warn)
+        let cases: &[(i64, Option<i64>, bool)] = &[
+            // Crashed, never cleanly stopped since.
+            (now - HOUR, None, true),
+            // Crashed, then stopped cleanly — retired, no warning.
+            (now - 2 * HOUR, Some(now - HOUR), false),
+            // Cleanly stopped, then crashed later — warn about the crash.
+            (now - HOUR, Some(now - 2 * HOUR), true),
+            // Same instant counts as retired (clean wins ties).
+            (now - HOUR, Some(now - HOUR), false),
+            // Ancient crash: past the window, nothing actionable remains.
+            (now - 30 * 24 * HOUR, None, false),
+        ];
+        for (unclean_at, clean_at, want) in cases {
+            let got = unclean_exit_check(*unclean_at, *clean_at, now).is_some();
+            assert_eq!(
+                got, *want,
+                "unclean_at={unclean_at} clean_at={clean_at:?} should_warn={want}"
+            );
+        }
+    }
+
+    #[test]
+    fn unclean_exit_check_points_at_the_os_log() {
+        let now = 1_000_000_i64;
+        let check = unclean_exit_check(now - 3600, None, now).expect("warns");
+        assert_eq!(check.category, "Locks");
+        let msg = match &check.status {
+            crate::doctor::types::CheckStatus::Warn(m) => m.clone(),
+            other => panic!("expected a Warn, got {other:?}"),
+        };
+        assert!(msg.contains("uncleanly"), "got: {msg}");
+        // The hint is what makes this actionable rather than trivia.
+        let hint = check.user_hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("journalctl") || hint.contains("dmesg"),
+            "got: {hint}"
+        );
+        assert_eq!(check.remediation_kind, RemediationKind::Manual);
     }
 }

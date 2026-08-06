@@ -38,6 +38,10 @@ pub async fn try_emit_global<T: Serialize>(event_type: &str, principal_id: &str,
 pub mod audit_events {
     pub const DAEMON_START: &str = "daemon_start";
     pub const DAEMON_STOP: &str = "daemon_stop";
+    /// A previous daemon's `daemon_lock` row was still present at boot,
+    /// meaning it never reached its shutdown arm — OOM kill, SIGKILL, or
+    /// host reset.
+    pub const DAEMON_UNCLEAN_EXIT: &str = "daemon_unclean_exit";
     pub const PAIRING_REQUESTED: &str = "pairing_requested";
     pub const PAIRING_APPROVED: &str = "pairing_approved";
     pub const PAIRING_DENIED: &str = "pairing_denied";

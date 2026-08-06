@@ -51,6 +51,68 @@ pub struct DispatcherHooks {
     pub deliver_celebration: CelebrationDeliver,
 }
 
+/// Notice, and record, that the previous daemon never released its lock.
+///
+/// `daemon_lock` already encodes this for free: the graceful shutdown arm
+/// DELETEs the row, so a surviving row at boot means the last process died
+/// without reaching it — OOM kill, SIGKILL, or host reset. The pidlock file
+/// cannot substitute: it is deliberately not unlinked on drop and is
+/// unconditionally rewritten on acquire, so a clean exit and a SIGKILL leave
+/// it byte-identical.
+///
+/// Returns the dead process's last heartbeat timestamp when an unclean exit
+/// was detected. Best-effort: a DB hiccup here must not block boot.
+pub(crate) async fn report_prior_unclean_exit(
+    db: &cortex::db::Database,
+    daemon_pid: u32,
+    now: i64,
+) -> Option<i64> {
+    let prior = match db.daemon_lock_snapshot().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read daemon lock for unclean-exit check");
+            return None;
+        }
+    };
+    // Same PID is a re-exec, which `acquire_daemon_lock_inner` already treats
+    // as a restart; PID reuse makes it indistinguishable from a real crash.
+    let (pid, heartbeat_at) = prior.filter(|(pid, _)| *pid != daemon_pid)?;
+
+    tracing::warn!(
+        prior_pid = pid,
+        last_heartbeat_unix = heartbeat_at,
+        downtime_secs = now.saturating_sub(heartbeat_at),
+        "previous borgd exited uncleanly (daemon lock was never released) — \
+         in-flight task runs and unflushed session state may have been lost"
+    );
+
+    // The lock row is overwritten microseconds from now by
+    // `acquire_daemon_lock`, so the finding has to be durable somewhere a
+    // later `borg doctor` process can read it.
+    if let Err(e) = db
+        .set_meta(
+            cortex::constants::META_LAST_UNCLEAN_SHUTDOWN_AT,
+            &heartbeat_at.to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "recording unclean shutdown timestamp failed");
+    }
+
+    cortex::db::try_emit_global(
+        cortex::db::audit_events::DAEMON_UNCLEAN_EXIT,
+        "system",
+        &serde_json::json!({
+            "prior_pid": pid,
+            "last_heartbeat_unix": heartbeat_at,
+            "downtime_secs": now.saturating_sub(heartbeat_at),
+        }),
+    )
+    .await;
+
+    Some(heartbeat_at)
+}
+
 /// Run the dispatcher loop until `shutdown` fires. Returns when shutdown is
 /// observed — caller should drain any remaining permits.
 pub async fn run(
@@ -63,6 +125,11 @@ pub async fn run(
 
     let daemon_pid = std::process::id();
     let now = chrono::Utc::now().timestamp();
+
+    // MUST run before `acquire_daemon_lock` — acquiring overwrites the very
+    // row this reads.
+    report_prior_unclean_exit(&db, daemon_pid, now).await;
+
     if !db.acquire_daemon_lock(daemon_pid, now).await? {
         anyhow::bail!(
             "Another daemon instance is already running. Only one daemon can run at a time."
@@ -130,6 +197,18 @@ pub async fn run(
             _ = shutdown.cancelled() => {
                 if let Err(e) = db.release_daemon_lock(daemon_pid).await {
                     tracing::warn!(error = %e, "release daemon lock on shutdown failed");
+                }
+                // Stamp the clean stop so the doctor's unclean-exit warning
+                // clears itself on the next graceful shutdown rather than
+                // needing a squelch.
+                if let Err(e) = db
+                    .set_meta(
+                        cortex::constants::META_LAST_CLEAN_SHUTDOWN_AT,
+                        &chrono::Utc::now().timestamp().to_string(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "recording clean shutdown timestamp failed");
                 }
                 return Ok(());
             }
@@ -289,5 +368,86 @@ pub async fn run(
 
         // `_tick_lock` drops here at end of iteration, before the next
         // `interval.tick().await`.
+    }
+}
+
+#[cfg(test)]
+mod unclean_exit_tests {
+    use super::*;
+
+    /// Encodes the contract the boot-time check depends on: the lock row is
+    /// the crash signal. Fails if `acquire_daemon_lock` ever starts clearing
+    /// on conflict, or if shutdown stops releasing.
+    #[tokio::test]
+    async fn daemon_lock_row_survives_unclean_exit_but_not_a_clean_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = cortex::db::Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("open db");
+
+        assert!(db.acquire_daemon_lock(100, 1_000).await.expect("acquire"));
+        assert!(
+            db.daemon_lock_snapshot().await.expect("snapshot").is_some(),
+            "a held lock must be visible"
+        );
+
+        db.release_daemon_lock(100).await.expect("release");
+        assert!(
+            db.daemon_lock_snapshot().await.expect("snapshot").is_none(),
+            "a clean shutdown must leave no lock row"
+        );
+
+        // Acquire again and "die" without releasing.
+        assert!(db.acquire_daemon_lock(100, 2_000).await.expect("acquire"));
+        assert_eq!(
+            db.daemon_lock_snapshot().await.expect("snapshot"),
+            Some((100, 2_000)),
+            "an unclean exit must leave the row behind for the next boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_prior_unclean_exit_records_the_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = cortex::db::Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("open db");
+
+        // Nothing to report on a first-ever boot.
+        assert_eq!(report_prior_unclean_exit(&db, 200, 5_000).await, None);
+        assert_eq!(
+            db.get_meta(cortex::constants::META_LAST_UNCLEAN_SHUTDOWN_AT)
+                .await
+                .expect("get_meta"),
+            None,
+            "a clean first boot must not write the meta key"
+        );
+
+        // A dead predecessor's row is still there.
+        db.acquire_daemon_lock(100, 2_000).await.expect("acquire");
+        assert_eq!(
+            report_prior_unclean_exit(&db, 200, 5_000).await,
+            Some(2_000)
+        );
+        assert_eq!(
+            db.get_meta(cortex::constants::META_LAST_UNCLEAN_SHUTDOWN_AT)
+                .await
+                .expect("get_meta")
+                .as_deref(),
+            Some("2000"),
+            "the finding must outlive the lock row that acquire is about to overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_pid_restart_is_not_reported_as_unclean() {
+        // `acquire_daemon_lock_inner` already treats a same-PID row as a
+        // re-exec, and PID reuse makes it indistinguishable from a crash.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = cortex::db::Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("open db");
+        db.acquire_daemon_lock(100, 2_000).await.expect("acquire");
+        assert_eq!(report_prior_unclean_exit(&db, 100, 5_000).await, None);
     }
 }
