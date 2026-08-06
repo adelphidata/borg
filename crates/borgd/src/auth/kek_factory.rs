@@ -65,7 +65,16 @@ pub async fn build_kek_store(
         KekBackend::Auto => {
             if probe_keychain() {
                 tracing::info!("KEK backend: os_keychain (auto-detected)");
-                persist_resolved_backend(settings_db, KekBackend::OsKeychain).await;
+                // Deliberately NOT persisted. Latching `auto` to
+                // `os_keychain` removed the fallback from every later boot:
+                // the explicit arm returns a bare `KeychainStore` with no
+                // probe, so a host whose keyring is merely *transiently*
+                // unavailable — a systemd user unit starting before the login
+                // keyring is unlocked — hard-fails `ensure_root_ca` and
+                // restart-loops the daemon. Staying `auto` costs one cheap
+                // probe per start and preserves the always-boots guarantee.
+                // The `File` resolution below IS persisted: that probe is the
+                // expensive one, and it is the headless case worth caching.
                 Ok(Arc::new(KeychainStore::new()))
             } else {
                 tracing::warn!(
@@ -364,6 +373,37 @@ mod tests {
         persist_resolved_backend(&db, KekBackend::File).await;
         let stored = db.get_setting("security.kek_backend").await.unwrap();
         assert_eq!(stored.as_deref(), Some("file"));
+    }
+
+    /// `auto` must not latch to `os_keychain`.
+    ///
+    /// The explicit `OsKeychain` arm has no probe and no fallback, so once the
+    /// setting is rewritten to it, a host whose keyring is only *transiently*
+    /// unavailable (a systemd user unit starting before the login keyring is
+    /// unlocked) hard-fails `ensure_root_ca` and restart-loops the daemon.
+    /// Only the `File` resolution is worth caching — that probe is the
+    /// expensive one, and it is the headless case.
+    #[tokio::test]
+    async fn auto_is_not_latched_to_os_keychain_after_a_successful_probe() {
+        let _g = ENV_LOCK.lock().await;
+        let (home, db) = fresh_db_and_home().await;
+        db.set_setting("security.kek_backend", "auto")
+            .await
+            .unwrap();
+
+        let mut cfg = cortex::config::Config::default();
+        cfg.security.kek_backend = KekBackend::Auto;
+        // Whichever branch this host takes, the setting must never come back
+        // as `os_keychain` — that is the value that removes the fallback.
+        let _ = build_kek_store(home.path(), &cfg, &db).await;
+
+        let stored = db.get_setting("security.kek_backend").await.unwrap();
+        assert_ne!(
+            stored.as_deref(),
+            Some("os_keychain"),
+            "auto must not latch to os_keychain — doing so strips the fallback \
+             from every later boot and turns a locked keyring into a restart loop"
+        );
     }
 
     #[tokio::test]

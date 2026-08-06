@@ -1748,15 +1748,55 @@ impl CredentialPool {
         } else {
             &below_cap
         };
-        let pool_idx = candidates
+        // In-flight load comes first — piling a second concurrent request onto
+        // a credential while a sibling sits idle wastes the pool regardless of
+        // strategy. Among equally-loaded candidates, `llm.credential_strategy`
+        // decides.
+        //
+        // The strategy used to be consulted only by `pick()`, which has no
+        // production call site, so every strategy behaved identically
+        // (fill-first) and the setting was inert.
+        let leases_of = |g: &PoolInner, i: usize| -> u32 {
+            g.active_leases.get(&g.creds[i].id).copied().unwrap_or(0)
+        };
+        let min_leases = candidates.iter().map(|&i| leases_of(&g, i)).min()?;
+        let tied: Vec<usize> = candidates
             .iter()
-            .min_by(|&&a, &&b| {
-                let la = g.active_leases.get(&g.creds[a].id).copied().unwrap_or(0);
-                let lb = g.active_leases.get(&g.creds[b].id).copied().unwrap_or(0);
-                la.cmp(&lb)
+            .copied()
+            .filter(|&i| leases_of(&g, i) == min_leases)
+            .collect();
+
+        let pool_idx = match g.strategy {
+            CredentialStrategy::FillFirst => *tied.iter().min_by_key(|&&i| g.creds[i].priority)?,
+            CredentialStrategy::RoundRobin => {
+                // First candidate ranked after the current one by priority,
+                // wrapping to the lowest priority at the end of the cycle.
+                let current_priority = g
+                    .current_id
+                    .as_ref()
+                    .and_then(|id| g.creds.iter().find(|c| &c.id == id))
+                    .map(|c| c.priority);
+                match current_priority {
+                    Some(cur) => tied
+                        .iter()
+                        .filter(|&&i| g.creds[i].priority > cur)
+                        .min_by_key(|&&i| g.creds[i].priority)
+                        .or_else(|| tied.iter().min_by_key(|&&i| g.creds[i].priority))
+                        .copied()?,
+                    None => *tied.iter().min_by_key(|&&i| g.creds[i].priority)?,
+                }
+            }
+            CredentialStrategy::LeastUsed => *tied.iter().min_by(|&&a, &&b| {
+                g.creds[a]
+                    .use_count
+                    .cmp(&g.creds[b].use_count)
                     .then(g.creds[a].priority.cmp(&g.creds[b].priority))
-            })
-            .copied()?;
+            })?,
+            CredentialStrategy::Random => {
+                let mut rng = rand::rng();
+                *tied.choose(&mut rng)?
+            }
+        };
 
         g.creds[pool_idx].use_count += 1;
         let snapshot = g.creds[pool_idx].clone();

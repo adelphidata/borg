@@ -1071,3 +1071,94 @@ async fn billing_cooldown_is_clamped_by_the_hard_ceiling() {
     pool.report_failure(&id, FailoverReason::Billing, Some(402), None, None);
     assert_eq!(cooldown_len_secs(&pool, &id, now), 24 * 60 * 60);
 }
+
+// ── `llm.credential_strategy` must actually influence lease selection ─────
+//
+// The strategy was read only by `pick()`, which has no production call site.
+// The request path uses `acquire_lease`, which selected purely by
+// (active_leases, priority) — so `round_robin`, `least_used`, and `random`
+// all behaved as `fill_first` and the setting was inert config.
+
+/// A three-key pool under the given strategy.
+async fn strategy_pool(
+    strategy: CredentialStrategy,
+) -> (std::sync::Arc<CredentialPool>, tempfile::TempDir) {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let entries = (0..3)
+        .map(|i| cortex::llm::credential_pool::ConfigEntry {
+            key: format!("sk-ant-key-{i}"),
+            label: Some(format!("k{i}")),
+            config_name: format!("llm.api_keys[{i}]"),
+        })
+        .collect();
+    let pool = CredentialPool::load(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: entries,
+            env_vars: vec![],
+            oauth_home: None,
+        },
+    )
+    .await
+    .unwrap();
+    (pool, db_dir)
+}
+
+/// Ids handed out by `n` sequential acquire-then-drop cycles.
+fn sequential_lease_ids(pool: &CredentialPool, n: usize) -> Vec<String> {
+    (0..n)
+        .map(|_| {
+            let lease = pool.acquire_lease(None).expect("a credential is available");
+            lease.id().to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn fill_first_keeps_using_the_same_credential() {
+    let (pool, _dir) = strategy_pool(CredentialStrategy::FillFirst).await;
+    let ids = sequential_lease_ids(&pool, 6);
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "fill_first must stay on one credential while it is healthy; got {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn round_robin_cycles_across_every_credential() {
+    let (pool, _dir) = strategy_pool(CredentialStrategy::RoundRobin).await;
+    let ids = sequential_lease_ids(&pool, 6);
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "round_robin must reach all three credentials; got {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn least_used_spreads_load_evenly() {
+    let (pool, _dir) = strategy_pool(CredentialStrategy::LeastUsed).await;
+    let ids = sequential_lease_ids(&pool, 6);
+    let mut counts: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+    for id in &ids {
+        *counts.entry(id).or_default() += 1;
+    }
+    assert_eq!(counts.len(), 3, "all three must be used; got {ids:?}");
+    assert!(
+        counts.values().all(|&c| c == 2),
+        "least_used must balance 6 leases evenly over 3 keys; got {counts:?}"
+    );
+}
