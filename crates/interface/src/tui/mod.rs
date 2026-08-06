@@ -1941,6 +1941,30 @@ async fn run_event_loop(
                     .unwrap_or_else(|| "Borg".to_string());
                 app.push_system_message(format!("*poked {borg_name}*"));
             }
+            AppAction::ExecShell { command } => {
+                // Echo the typed line, then render the result as a normal
+                // tool-result cell so it inherits collapse/Ctrl+E, styling,
+                // and the existing `insert_history_lines` transcript path —
+                // no new transcript machinery, and nothing near mouse mode.
+                app.cells.push(HistoryCell::User {
+                    text: format!("!{command}"),
+                });
+                let mut shell_client = client.clone();
+                match shell_client.exec_shell(session_id, &command, 0).await {
+                    Ok(resp) => {
+                        app.cells.push(HistoryCell::ToolResult {
+                            output: resp.output,
+                            is_error: resp.denied || resp.exit_code != 0,
+                            duration_ms: None,
+                            display_label: format!("! {command}"),
+                            tool_name: "run_shell".to_string(),
+                            args_json: None,
+                            collapsed: false,
+                        });
+                    }
+                    Err(e) => app.push_system_message(format!("Shell command failed: {e}")),
+                }
+            }
             AppAction::RunDoctor => {
                 app.push_system_message("Borg Doctor\n───────────".to_string());
                 let (tx, rx) = tokio::sync::mpsc::channel(32);

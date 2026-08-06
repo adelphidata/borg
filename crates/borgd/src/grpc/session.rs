@@ -13,6 +13,7 @@ use protocols::session::{
     session_server::Session, AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsRequest,
     AcpFsResponse, AcpReadTextFileRequest, AcpReadTextFileResponse, AcpServerMessage,
     AcpWriteTextFileRequest, AcpWriteTextFileResponse, AgentEvent, AppendAssistantMessageRequest,
+    ExecShellRequest, ExecShellResponse,
     AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
     CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ForkRequest,
     ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
@@ -689,6 +690,40 @@ impl Session for SessionSvc {
         host.steer(&req.text)
             .map_err(|e| TStatus::failed_precondition(format!("steer: {e}")))?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn exec_shell(
+        &self,
+        req: Request<ExecShellRequest>,
+    ) -> Result<Response<ExecShellResponse>, TStatus> {
+        let req = req.into_inner();
+        let command = req.command.trim();
+        if command.is_empty() {
+            return Err(TStatus::invalid_argument("command must not be empty"));
+        }
+        // Same bound as the assistant-message mirror: a shell command past
+        // this is a runaway caller, not a command.
+        const MAX_COMMAND_BYTES: usize = 64 * 1024;
+        if command.len() > MAX_COMMAND_BYTES {
+            return Err(TStatus::invalid_argument(format!(
+                "command is {} bytes; cap is {MAX_COMMAND_BYTES}",
+                command.len()
+            )));
+        }
+        // `ui.shell_mode_enabled` and the default timeout are enforced in the
+        // backend, which is where the session's resolved `Config` lives —
+        // gating there rather than here keeps the RPC from being a way around
+        // the client-side toggle.
+        let host = self.host_or_err(&req.session_id)?;
+        let outcome = host
+            .exec_shell(command, req.timeout_ms)
+            .await
+            .map_err(|e| TStatus::internal(format!("exec_shell: {e}")))?;
+        Ok(Response::new(ExecShellResponse {
+            output: outcome.output,
+            exit_code: outcome.exit_code,
+            denied: outcome.denied,
+        }))
     }
 
     async fn append_assistant_message(

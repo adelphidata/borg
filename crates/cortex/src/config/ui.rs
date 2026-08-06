@@ -12,6 +12,15 @@ fn default_theme() -> String {
 /// UI presentation settings. Currently just the active TUI theme name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Enable `!cmd` shell mode in the TUI: a line starting with `!` runs as a
+    /// shell command with no LLM turn, and its output is folded into session
+    /// context.
+    ///
+    /// Runs through the same policy + sandbox path as the `run_shell` tool, so
+    /// this is a UX toggle rather than a security boundary. Enforced at both
+    /// the TUI dispatcher and the daemon RPC so the RPC isn't a bypass.
+    #[serde(default = "default_shell_mode_enabled")]
+    pub shell_mode_enabled: bool,
     /// Active theme name. Resolved against the user themes dir first
     /// (`~/.borg/themes/<name>.toml`), then the builtin registry. Unknown
     /// names fall back to `"default"` with a warning rather than failing
@@ -24,6 +33,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            shell_mode_enabled: default_shell_mode_enabled(),
         }
     }
 }
@@ -96,4 +106,8 @@ model = "claude-sonnet-4""#;
         let cfg: Config = toml::from_str(toml_str).expect("must parse legacy config");
         assert_eq!(cfg.ui.theme, "default");
     }
+}
+
+fn default_shell_mode_enabled() -> bool {
+    true
 }

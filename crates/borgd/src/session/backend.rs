@@ -200,11 +200,27 @@ pub trait SessionBackend: Send + Sync + 'static {
         ))
     }
 
+    /// Execute a shell command in the session's context, spending no LLM turn.
+    async fn exec_shell(&self, _command: &str, _timeout_ms: u64) -> anyhow::Result<ExecShellOutcome> {
+        Err(anyhow::anyhow!("exec_shell not supported by this backend"))
+    }
+
     /// Fork the active agent session at its last message. Daemon owns the
     /// single SQLite writer, so this MUST run here rather than in the client.
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {
         Err(anyhow::anyhow!("fork not supported by this backend"))
     }
+}
+
+/// Result of a `!cmd` shell-mode execution.
+#[derive(Debug, Clone)]
+pub struct ExecShellOutcome {
+    /// Combined, redacted command output.
+    pub output: String,
+    /// Process exit code, or `-1` when the command never ran.
+    pub exit_code: i32,
+    /// True when policy refused the command instead of executing it.
+    pub denied: bool,
 }
 
 /// Production backend: owns one `cortex::Agent`. Hooks (vitals, activity,
@@ -572,6 +588,83 @@ impl SessionBackend for AgentBackend {
         let mut agent = self.agent.lock().await;
         agent.append_assistant_message(text).await;
         Ok(())
+    }
+
+    /// `!cmd` shell mode.
+    ///
+    /// Routed through `handle_run_shell_with_context` rather than a fresh
+    /// `Command`, which is the whole point: it inherits the control-plane
+    /// deny, the `ExecutionPolicy` check, `env_clear` + the credential
+    /// allowlist, sandbox wrapping, the process registry, the output cap, and
+    /// the timeout + process-group kill — with zero duplicated logic and no
+    /// second path to keep in sync.
+    async fn exec_shell(&self, command: &str, timeout_ms: u64) -> anyhow::Result<ExecShellOutcome> {
+        let mut agent = self.agent.lock().await;
+        let config = agent.config().clone();
+
+        // Second gate. The TUI dispatcher checks this too, but a toggle
+        // enforced only client-side is not enforced at all.
+        if !config.ui.shell_mode_enabled {
+            return Ok(ExecShellOutcome {
+                output: "Shell mode is disabled (set `ui.shell_mode_enabled` to true)."
+                    .to_string(),
+                exit_code: -1,
+                denied: true,
+            });
+        }
+
+        let timeout_ms = if timeout_ms == 0 {
+            config.tools.default_timeout_ms
+        } else {
+            timeout_ms
+        };
+        let ctx = agent.execution_context();
+        // The output is captured for history rather than streamed; a live
+        // receiver isn't required, so a local channel keeps the handler happy.
+        let (tx, _rx) = mpsc::channel(64);
+
+        let args = serde_json::json!({
+            "action": "run",
+            "command": command,
+            "timeout_ms": timeout_ms,
+        });
+        let raw = cortex::tool_handlers::handle_run_shell_with_context(
+            &args,
+            &config,
+            &config.policy,
+            &tx,
+            &format!("shell-mode-{}", uuid::Uuid::new_v4()),
+            None,
+            &ctx,
+        )
+        .await?;
+
+        // `!cat .env` must not land in the transcript in the clear. The tool
+        // path redacts what it streams; this covers what we persist.
+        let output = if config.security.output_redaction {
+            cortex::security::secrets::redact_secrets(&raw)
+        } else {
+            raw
+        };
+
+        // The handler reports refusals as ordinary output text rather than an
+        // `Err`, so the denial has to be recognized here to be surfaced.
+        let denied = output.starts_with("Shell command denied");
+
+        // Reuses `append_assistant_message`, which already refuses to inject
+        // when the last assistant turn has unresolved tool calls — exactly the
+        // history corruption `!cmd` could otherwise cause if typed mid-stream.
+        agent
+            .append_assistant_message(&format!(
+                "<shell_command>{command}</shell_command>\n<shell_output>\n{output}\n</shell_output>"
+            ))
+            .await;
+
+        Ok(ExecShellOutcome {
+            output,
+            exit_code: if denied { -1 } else { 0 },
+            denied,
+        })
     }
 
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {

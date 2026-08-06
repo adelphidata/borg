@@ -54,6 +54,7 @@ use protocols::session::{
     AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsResponse, AcpReadTextFileResponse,
     AcpServerMessage, AcpStartTurn, AcpWriteTextFileResponse, AgentEvent,
     AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
+    ExecShellRequest, ExecShellResponse,
     CompactRequest, CompactResponse, ContextBreakdown, ForkRequest, ForkResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
     PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
@@ -836,6 +837,16 @@ rpc_wrappers! {
         append_assistant_message("Session.AppendAssistantMessage", AppendAssistantMessageRequest {
             session_id: session_id.to_string(),
             content: content.to_string(),
+        });
+
+    /// Run a `!cmd` shell-mode command in the session. Executed daemon-side
+    /// so it inherits the same policy + sandbox + env-scrubbing path as the
+    /// `run_shell` tool rather than spawning a bare process in the TUI.
+    session fn exec_shell(session_id: &str, command: &str, timeout_ms: u64) -> ExecShellResponse =
+        exec_shell("Session.ExecShell", ExecShellRequest {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            timeout_ms,
         });
 
     /// Fork the active agent session at its last message. Daemon-side

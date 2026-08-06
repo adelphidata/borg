@@ -15,6 +15,22 @@ impl App<'_> {
     /// Try to handle `input` as a slash command. Returns `Some(action)` if it was a command,
     /// `None` if it should be treated as a user message.
     pub(super) fn try_handle_command(&mut self, trimmed: &str) -> Option<Result<AppAction>> {
+        // `!cmd` shell mode, checked before the slash table because `!` can
+        // never begin a slash command. Only a leading `!` counts — "tell me
+        // about !important" is an ordinary message.
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            if !self.config.ui.shell_mode_enabled {
+                return None;
+            }
+            let command = rest.trim();
+            if command.is_empty() {
+                return Some(self.cmd_help());
+            }
+            return Some(Ok(AppAction::ExecShell {
+                command: command.to_string(),
+            }));
+        }
+
         // Exact matches
         match trimmed {
             "quit" | "exit" | "/exit" => return Some(Ok(AppAction::Quit)),
@@ -364,6 +380,7 @@ impl App<'_> {
              /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n  \
              /think [lvl] - Show or set thinking level (off|minimal|low|medium|high|xhigh|adaptive|max)\n\
              \n  \
+             !<cmd>     - Run a shell command directly, no LLM turn (e.g. `!git status`)\n  \
              /btw <q>   - Ask a side question (ephemeral, not persisted)\n  \
              /compact   - Compact conversation history\n  \
              /clear     - Clear conversation\n  \

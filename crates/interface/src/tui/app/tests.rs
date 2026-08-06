@@ -2420,3 +2420,86 @@ fn at_query_terminates_on_any_whitespace_not_punctuation() {
         );
     }
 }
+
+// --- `!cmd` shell mode ---
+
+#[test]
+fn bang_prefix_dispatches_exec_shell_with_the_command_stripped() {
+    let mut app = make_app();
+    let action = app
+        .try_handle_command("!ls -la")
+        .expect("bang input is a command, not a message")
+        .expect("dispatch succeeds");
+    // Destructured, not `matches!` — the point is that the `!` is stripped
+    // and the rest survives intact, which a variant check wouldn't catch.
+    match action {
+        AppAction::ExecShell { command } => assert_eq!(command, "ls -la"),
+        _ => panic!("expected an ExecShell action"),
+    }
+}
+
+#[test]
+fn bang_prefix_trims_surrounding_whitespace() {
+    let mut app = make_app();
+    let action = app
+        .try_handle_command("!  echo hi  ")
+        .expect("is a command")
+        .expect("dispatch succeeds");
+    match action {
+        AppAction::ExecShell { command } => assert_eq!(command, "echo hi"),
+        _ => panic!("expected an ExecShell action"),
+    }
+}
+
+#[test]
+fn bare_bang_shows_help_instead_of_executing() {
+    let mut app = make_app();
+    let action = app
+        .try_handle_command("!")
+        .expect("is a command")
+        .expect("dispatch succeeds");
+    assert!(
+        !matches!(action, AppAction::ExecShell { .. }),
+        "a lone `!` must not run anything"
+    );
+}
+
+#[test]
+fn bang_mid_message_is_a_normal_user_message() {
+    // A `contains('!')` implementation fails this — and would silently turn
+    // ordinary prose into shell commands.
+    let mut app = make_app();
+    for input in [
+        "tell me about !important",
+        "what does foo!() do?",
+        "wow!",
+        " !leading-space-first",
+    ] {
+        assert!(
+            app.try_handle_command(input).is_none(),
+            "{input:?} must reach the LLM as a message"
+        );
+    }
+}
+
+#[test]
+fn slash_commands_still_dispatch_alongside_bang_handling() {
+    let mut app = make_app();
+    let action = app
+        .try_handle_command("/poke")
+        .expect("is a command")
+        .expect("dispatch succeeds");
+    assert!(matches!(action, AppAction::Poke));
+}
+
+#[test]
+fn bang_is_inert_when_shell_mode_is_disabled() {
+    let mut config = Config::default();
+    config.ui.shell_mode_enabled = false;
+    let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+    let mut app = App::new(config, None, None, None, client, None);
+    assert!(
+        app.try_handle_command("!ls").is_none(),
+        "with shell mode off, `!ls` is just text for the model"
+    );
+}

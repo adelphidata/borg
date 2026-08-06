@@ -399,6 +399,11 @@ pub enum AppAction {
     Uninstall,
     RunDoctor,
     Poke,
+    /// `!cmd` shell mode: run `command` in the daemon with no LLM turn.
+    ExecShell {
+        /// The command text, with the leading `!` already stripped.
+        command: String,
+    },
     /// Spawn a background `/btw` side-question agent. Event loop handles the
     /// actual `tokio::spawn`; the TUI has already set the popup to Loading.
     StartBtw {

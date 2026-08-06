@@ -111,6 +111,9 @@ define_settings! {
         "conversation.context_window_guidance" => conversation.context_window_guidance, string;
 
         // ── Security ──
+        "ui.shell_mode_enabled" => ui.shell_mode_enabled, parsed(bool);
+
+        // ── Security ──
         "security.secret_detection" => security.secret_detection, parsed(bool);
         "security.host_audit" => security.host_audit, parsed(bool);
         "security.startup_audit" => security.startup_audit, parsed(bool);
@@ -938,6 +941,7 @@ define_settings! {
         // — Security —
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
+        "ui.shell_mode_enabled" => "! shell mode", Bool, "Interface";
         "security.secret_detection" => "Secret detection", Bool, "Security";
         "security.startup_audit" => "Startup posture audit", Bool, "Security";
         "security.output_redaction" => "Output redaction", Bool, "Security";

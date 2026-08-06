@@ -61,6 +61,14 @@ service Session {
   // streamed to the TUI) into the active session so the agent has them
   // in context when the user replies.
   rpc AppendAssistantMessage(AppendAssistantMessageRequest) returns (Empty);
+
+  // Execute a shell command in the session's context with no LLM turn.
+  //
+  // Runs the same ExecutionPolicy + control-plane + sandboxed-spawn path as
+  // the `run_shell` tool — the daemon is where that machinery lives, so this
+  // inherits it by construction rather than by duplicating it client-side.
+  // The result is appended to session history so the next turn has it.
+  rpc ExecShell(ExecShellRequest) returns (ExecShellResponse);
 }
 
 message Empty {}
@@ -326,6 +334,19 @@ message SteerRequest { string session_id = 1; string text = 2; }
 message AppendAssistantMessageRequest {
   string session_id = 1;
   string content = 2;
+}
+
+message ExecShellRequest {
+  string session_id = 1;
+  string command = 2;
+  uint64 timeout_ms = 3;
+}
+
+message ExecShellResponse {
+  string output = 1;
+  int32 exit_code = 2;
+  // True when the command was refused by policy rather than executed.
+  bool denied = 3;
 }
 
 message ForkRequest { string session_id = 1; }

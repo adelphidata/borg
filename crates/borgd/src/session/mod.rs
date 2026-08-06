@@ -218,6 +218,16 @@ impl SessionHost {
         self.inner.backend.append_assistant_message(text).await
     }
 
+    /// Run a `!cmd` shell-mode command in this session. Forwards to the
+    /// backend, which routes it through the sandboxed `run_shell` path.
+    pub async fn exec_shell(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+    ) -> Result<backend::ExecShellOutcome> {
+        self.inner.backend.exec_shell(command, timeout_ms).await
+    }
+
     /// Fork the active agent session at its last message. Forwards to the
     /// backend; daemon-side execution is required because SQLite has a single
     /// writer (the daemon) and the TUI cannot open a writer handle without
