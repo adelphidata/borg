@@ -567,7 +567,7 @@ const REGISTRY: &[ModelMetadata] = &[
 
 /// Strip a known vendor prefix (e.g. `anthropic/`, `openai/`) before matching.
 /// OpenRouter-style slashed names embed the provider; the tail is what models.json-style entries describe.
-fn strip_vendor_prefix(model: &str) -> &str {
+pub(crate) fn strip_vendor_prefix(model: &str) -> &str {
     for prefix in [
         "anthropic/",
         "openai/",
@@ -586,6 +586,7 @@ fn strip_vendor_prefix(model: &str) -> &str {
         "z-ai/",
         "minimax/",
         "moonshotai/",
+        "microsoft/",
     ] {
         if let Some(rest) = model.strip_prefix(prefix) {
             return rest;

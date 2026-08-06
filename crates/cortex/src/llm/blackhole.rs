@@ -56,9 +56,12 @@ fn endpoint_key(url: &str) -> Option<String> {
 
 /// Record that a connect attempt to `url`'s endpoint went unanswered.
 ///
-/// Call this only for *connect* failures. A read timeout means the connection
-/// was accepted and the server is merely slow — blackholing it would abandon a
-/// live endpoint mid-request.
+/// Call this only for a connect that *timed out*. A read timeout means the
+/// connection was accepted and the server is merely slow — blackholing it would
+/// abandon a live endpoint mid-request. A refusal or a DNS failure is not a
+/// blackhole either: it fails instantly, so there is no timeout to save, and
+/// suppressing it for the TTL would hide the accurate error (and the retry that
+/// succeeds the moment the server comes up).
 pub(crate) fn record_connect_failure(url: &str, now: Instant) {
     let Some(key) = endpoint_key(url) else {
         return;
@@ -94,10 +97,15 @@ pub(crate) fn is_blackholed(url: &str, now: Instant) -> bool {
 /// Forget `url`'s endpoint. Called when a request to it succeeds, so a host
 /// that recovers early isn't held down for the rest of the TTL.
 pub(crate) fn clear(url: &str) {
-    let Some(key) = endpoint_key(url) else {
+    let Ok(mut map) = registry().lock() else {
         return;
     };
-    if let Ok(mut map) = registry().lock() {
+    // Called after every successful response, where the map is almost always
+    // empty — skip parsing the URL when there is nothing to forget.
+    if map.is_empty() {
+        return;
+    }
+    if let Some(key) = endpoint_key(url) {
         map.remove(&key);
     }
 }

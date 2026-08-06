@@ -226,6 +226,10 @@ async fn stream_child_output(
 /// negative deadline is rejected rather than coerced: zero built a
 /// `Duration::from_millis(0)` that fired before the command could run, and the
 /// resulting "timed out after 0ms" read as the command's fault.
+///
+/// The upper bound is rejected for the mirror-image reason: `1e30` saturates
+/// through `as u64` into a deadline centuries away, which is a hang, not a
+/// timeout.
 fn parse_timeout_ms(raw: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
     let Some(value) = raw else {
         return Ok(None);
@@ -243,16 +247,15 @@ fn parse_timeout_ms(raw: Option<&serde_json::Value>) -> Result<Option<u64>, Stri
         _ => None,
     };
 
+    // A day is already far past any plausible tool call; beyond it the
+    // "deadline" stops being one.
+    const MAX_TIMEOUT_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
     match millis {
-        Some(ms) if ms >= 1.0 && ms.is_finite() => Ok(Some(ms as u64)),
-        Some(_) => Err(
-            "Error: timeout_ms must be a positive number of milliseconds (got a value below 1ms). \
-             Omit it to use the configured default."
-                .to_string(),
-        ),
-        None => Err(format!(
-            "Error: timeout_ms must be a positive number of milliseconds, got {value}. \
-             Omit it to use the configured default."
+        Some(ms) if (1.0..=MAX_TIMEOUT_MS).contains(&ms) => Ok(Some(ms as u64)),
+        _ => Err(format!(
+            "Error: timeout_ms must be a number of milliseconds between 1 and \
+             {MAX_TIMEOUT_MS:.0} (24h), got {value}. Omit it to use the configured default."
         )),
     }
 }
@@ -888,6 +891,10 @@ mod tests {
             serde_json::json!("0"),
             serde_json::json!("not-a-number"),
             serde_json::json!(true),
+            // Saturates through `as u64` into a deadline centuries out — a
+            // hang wearing a timeout's clothes.
+            serde_json::json!(1e30),
+            serde_json::json!(86_400_001u64),
         ] {
             assert!(
                 parse_timeout_ms(Some(&rejected)).is_err(),

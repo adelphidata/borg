@@ -10,6 +10,9 @@ pub(crate) enum SessionsAction {
         /// Maximum entries to show
         #[arg(long, default_value_t = DEFAULT_LIMIT)]
         limit: usize,
+        /// Show auto-archived sessions instead of active ones
+        #[arg(long)]
+        archived: bool,
     },
     /// Print a session's transcript (role + text)
     Show {
@@ -36,7 +39,10 @@ pub(crate) enum SessionsAction {
 pub(crate) async fn dispatch_sessions(action: Option<SessionsAction>) -> Result<()> {
     match action {
         None => run_list(DEFAULT_LIMIT).await,
-        Some(SessionsAction::List { limit }) => run_list(limit).await,
+        Some(SessionsAction::List { limit, archived }) if archived => {
+            run_list_archived(limit).await
+        }
+        Some(SessionsAction::List { limit, .. }) => run_list(limit).await,
         Some(SessionsAction::Show { id }) => run_show(&id).await,
         Some(SessionsAction::Pin { id }) => run_set_pinned(&id, true).await,
         Some(SessionsAction::Unpin { id }) => run_set_pinned(&id, false).await,
@@ -55,8 +61,11 @@ async fn run_set_pinned(id: &str, pinned: bool) -> Result<()> {
         println!("Session not found: {id}");
         return Ok(());
     };
-    db.set_session_pinned(&full_id, pinned).await?;
-    let short: String = full_id.chars().take(8).collect();
+    if !db.set_session_pinned(&full_id, pinned).await? {
+        println!("Session not found: {id}");
+        return Ok(());
+    }
+    let short = super::short_id(&full_id);
     if pinned {
         println!("Session {short} pinned — exempt from retention purge and auto-archive");
     } else {
@@ -72,26 +81,62 @@ async fn run_unarchive(id: &str) -> Result<()> {
         println!("Session not found: {id}");
         return Ok(());
     };
-    db.unarchive_session(&full_id).await?;
-    let short: String = full_id.chars().take(8).collect();
-    println!("Session {short} unarchived");
+    // Resolution found the row, so a miss here means it was deleted in
+    // between — report that rather than claiming a write that didn't land.
+    if !db.unarchive_session(&full_id).await? {
+        println!("Session not found: {id}");
+        return Ok(());
+    }
+    println!("Session {} unarchived", super::short_id(&full_id));
+    Ok(())
+}
+
+/// `borg sessions list --archived`.
+///
+/// The counterpart to the archived filter on the normal listing: without a way
+/// to see what was archived, `sessions unarchive` would need an id the user has
+/// no way to discover. Direct-to-DB for the same reason as pin/unpin.
+async fn run_list_archived(limit: usize) -> Result<()> {
+    let db = cortex::db::Database::open().await?;
+    let archived: Vec<_> = db
+        .list_sessions(1000)
+        .await?
+        .into_iter()
+        .filter(|s| s.archived_at.is_some())
+        .take(limit)
+        .collect();
+    if archived.is_empty() {
+        println!("No archived sessions.");
+        return Ok(());
+    }
+    println!("{:10} {:16}  {:16}  TITLE", "ID", "ARCHIVED", "UPDATED");
+    for s in &archived {
+        let archived_at = s
+            .archived_at
+            .map(|ts| super::format_ts(ts, super::TS_FMT))
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{:10} {:16}  {:16}  {}",
+            super::short_id(&s.id),
+            archived_at,
+            super::format_ts(s.updated_at, super::TS_FMT),
+            s.title
+        );
+    }
+    println!("\nRestore one with `borg sessions unarchive <id>`.");
     Ok(())
 }
 
 /// Resolve a session id prefix to the full id, or `None` when nothing matches.
-///
-/// An ambiguous prefix is an error rather than a pick: pinning or unpinning
-/// the wrong session is invisible until the right one has already been purged.
 async fn resolve_session_id_prefix(
     db: &cortex::db::Database,
     prefix: &str,
 ) -> Result<Option<String>> {
-    let matches = db.session_ids_with_prefix(prefix).await?;
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(matches.into_iter().next()),
-        n => anyhow::bail!("'{prefix}' matches {n} sessions — use a longer id prefix"),
-    }
+    super::resolve_unique_prefix(
+        "sessions",
+        prefix,
+        db.session_ids_with_prefix(prefix).await?,
+    )
 }
 
 async fn run_list(limit: usize) -> Result<()> {
@@ -109,7 +154,7 @@ async fn run_list(limit: usize) -> Result<()> {
         let updated = chrono::DateTime::from_timestamp(s.updated_unix_ts as i64, 0)
             .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
-        let short: String = s.id.chars().take(8).collect();
+        let short = super::short_id(&s.id);
         println!(
             "{:10} {:>6}  {:16}  {}",
             short, s.message_count, updated, s.title

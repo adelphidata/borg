@@ -449,12 +449,20 @@ fn warn_on_hidden_whitespace(server: &str, transport: &mcp::manifest::Transport)
 /// Returns paths, never values — the caller logs what this returns, and these
 /// fields hold credentials.
 fn hidden_whitespace_fields(transport: &mcp::manifest::Transport) -> Vec<String> {
-    let mut checked: Vec<(String, &str)> = Vec::new();
+    // The common case is that nothing is padded, so test the value first and
+    // only build a field path for the rare hit.
+    fn is_padded(value: &str) -> bool {
+        !value.is_empty() && value.trim() != value
+    }
+
+    let mut flagged: Vec<String> = Vec::new();
     match transport {
         mcp::manifest::Transport::Stdio { command, env, .. } => {
-            checked.push(("command".to_string(), command.as_str()));
-            for (k, v) in env {
-                checked.push((format!("env[{k}]"), v.as_str()));
+            if is_padded(command) {
+                flagged.push("command".to_string());
+            }
+            for (k, _) in env.iter().filter(|(_, v)| is_padded(v)) {
+                flagged.push(format!("env[{k}]"));
             }
         }
         mcp::manifest::Transport::Http {
@@ -463,21 +471,18 @@ fn hidden_whitespace_fields(transport: &mcp::manifest::Transport) -> Vec<String>
         | mcp::manifest::Transport::Sse {
             url, headers, auth, ..
         } => {
-            checked.push(("url".to_string(), url.as_str()));
-            for (k, v) in headers {
-                checked.push((format!("headers[{k}]"), v.as_str()));
+            if is_padded(url) {
+                flagged.push("url".to_string());
             }
-            if let mcp::manifest::HttpAuth::Bearer { token } = auth {
-                checked.push(("auth.bearer.token".to_string(), token.as_str()));
+            for (k, _) in headers.iter().filter(|(_, v)| is_padded(v)) {
+                flagged.push(format!("headers[{k}]"));
+            }
+            if matches!(auth, mcp::manifest::HttpAuth::Bearer { token } if is_padded(token)) {
+                flagged.push("auth.bearer.token".to_string());
             }
         }
     }
 
-    let mut flagged: Vec<String> = checked
-        .into_iter()
-        .filter(|(_, value)| !value.is_empty() && value.trim() != *value)
-        .map(|(field, _)| field)
-        .collect();
     // Map iteration order is arbitrary; sort so the warning stream (and the
     // tests) are stable across runs.
     flagged.sort();
@@ -487,17 +492,15 @@ fn hidden_whitespace_fields(transport: &mcp::manifest::Transport) -> Vec<String>
 /// Record a (server, field) pair as warned. Returns `false` when it was already
 /// warned about in this process.
 fn claim_whitespace_warning(server: &str, field: &str) -> bool {
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
         std::sync::OnceLock::new();
     let warned = WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
-    match warned.lock() {
-        Ok(mut set) => set.insert((server.to_string(), field.to_string())),
-        // A poisoned mutex must not silence a config warning; the worst case
-        // is a repeated log line.
-        Err(poisoned) => poisoned
-            .into_inner()
-            .insert((server.to_string(), field.to_string())),
-    }
+    // A poisoned mutex must not silence a config warning; the worst case is a
+    // repeated log line.
+    let mut set = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set.insert(format!("{server}\0{field}"))
 }
 
 /// Build the wire-level [`mcp::manifest::ClientIdentity`] from the operator's

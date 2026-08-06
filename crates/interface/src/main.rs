@@ -1599,8 +1599,11 @@ mod tests {
         let cli = Cli::try_parse_from(["borg", "sessions", "list", "--limit", "10"]).unwrap();
         match cli.command {
             Some(Commands::Sessions {
-                action: Some(commands::sessions::SessionsAction::List { limit }),
-            }) => assert_eq!(limit, 10),
+                action: Some(commands::sessions::SessionsAction::List { limit, archived }),
+            }) => {
+                assert_eq!(limit, 10);
+                assert!(!archived, "archived listing must be opt-in");
+            }
             _ => panic!("Expected Sessions List"),
         }
     }

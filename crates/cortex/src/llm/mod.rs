@@ -2169,15 +2169,16 @@ impl LlmClient {
         let timeout = Duration::from_millis(self.llm_config.request_timeout_ms);
 
         let request_url = url.to_string();
-        // Own copy for the reachability checks below: the Bedrock branch moves
-        // `request_url` into its signing future. Bedrock rebuilds the URL
-        // against the resolved region inside that future, so its key is the
-        // pre-rebuild endpoint — same host in every non-pathological config.
-        let endpoint_url = request_url.clone();
+        // The reachability checks below key off `url` rather than `request_url`,
+        // which the Bedrock branch moves into its signing future. Bedrock
+        // rebuilds the URL against the resolved region inside that future, so
+        // the key is the pre-rebuild endpoint — same host in every
+        // non-pathological config.
+        //
         // A host we just watched swallow a connect is almost certainly still
         // swallowing them. Fail now so the fallback chain gets its turn,
         // instead of spending another connect timeout finding that out.
-        if blackhole::is_blackholed(&endpoint_url, std::time::Instant::now()) {
+        if blackhole::is_blackholed(url, std::time::Instant::now()) {
             return Err(LlmError::Retryable {
                 source: anyhow::anyhow!(
                     "Skipping {}: its endpoint refused to answer a TCP connect moments ago \
@@ -2271,18 +2272,21 @@ impl LlmClient {
                 match result {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
-                        let is_connect_failure = e
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_connect);
-                        // Only connect failures mark the endpoint. A read
+                        let transport_err = e.downcast_ref::<reqwest::Error>();
+                        let is_connect_failure =
+                            transport_err.is_some_and(reqwest::Error::is_connect);
+                        // Only a connect that *timed out* marks the endpoint —
+                        // that is the blackhole this cache exists for. A read
                         // timeout means the socket was accepted and the server
-                        // is merely slow — blackholing that abandons a live
-                        // endpoint mid-conversation.
-                        if is_connect_failure {
-                            blackhole::record_connect_failure(
-                                &endpoint_url,
-                                std::time::Instant::now(),
-                            );
+                        // is merely slow; a refusal or a DNS failure already
+                        // fails instantly and carries a far better message
+                        // (e.g. the Ollama hint below), which a 30s blackhole
+                        // would replace with a generic one even after the
+                        // operator started the server.
+                        let is_connect_blackhole = is_connect_failure
+                            && transport_err.is_some_and(reqwest::Error::is_timeout);
+                        if is_connect_blackhole {
+                            blackhole::record_connect_failure(url, std::time::Instant::now());
                         }
                         // A refused connection to a local Ollama almost always
                         // means the server isn't running — say so instead of
@@ -2318,7 +2322,7 @@ impl LlmClient {
         // a host that recovers early shouldn't stay marked dead for the rest
         // of the TTL. Status doesn't matter here: a 500 is still proof the
         // socket connects.
-        blackhole::clear(&endpoint_url);
+        blackhole::clear(url);
 
         // Capture rate-limit headers (success or failure — providers emit
         // them on both, and the 429 itself carries the freshest bucket state
@@ -2377,6 +2381,14 @@ impl LlmClient {
         if !matches!(err.reason(), FailoverReason::ModelNotFound)
             || !self.provider.requires_vendor_prefix()
             || self.llm_config.model.contains('/')
+            // A family `normalize_model` recognises already went out with a
+            // vendor prefix, so the 404 is about the id, not the prefix.
+            // Blaming the prefix here would tell the user to set exactly the
+            // id the request already used.
+            || self
+                .provider
+                .repair_missing_vendor_prefix(&self.llm_config.model)
+                .is_some()
         {
             return err;
         }

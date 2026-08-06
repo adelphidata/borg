@@ -307,9 +307,19 @@ impl Admin for AdminSvc {
             self.registry.live_ids().into_iter().collect();
         let sessions = async {
             let db = Database::open().await?;
-            let rows = db.list_sessions(100).await?;
+            // Over-fetch: archived rows are dropped below, and taking exactly
+            // 100 here would let them eat the page budget and silently shrink
+            // the listing. `borg sessions list --archived` surfaces the rest.
+            let rows = db.list_sessions(300).await?;
             let mut sessions = Vec::with_capacity(rows.len());
             for r in rows {
+                // Archiving is a soft hide, and this listing is what it hides
+                // from: `borg sessions list` and the TUI session picker both
+                // render this response. A live session is never hidden — it
+                // would vanish from the picker mid-conversation.
+                if r.archived_at.is_some() && !live.contains(&r.id) {
+                    continue;
+                }
                 let count = db.count_session_messages(&r.id).await.unwrap_or(0);
                 let mut title = r.title.clone();
                 if live.contains(&r.id) && !title.contains("(live)") {
@@ -321,6 +331,9 @@ impl Admin for AdminSvc {
                     message_count: count as u64,
                     updated_unix_ts: r.updated_at as u64,
                 });
+                if sessions.len() == 100 {
+                    break;
+                }
             }
             anyhow::Ok(sessions)
         }

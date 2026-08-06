@@ -350,51 +350,28 @@ impl Database {
     /// read-only probing.
     pub(super) async fn migrate_v12(&self) -> Result<()> {
         self.migrate_v11().await?;
-        if self.table_exists("scheduled_tasks").await? {
-            self.add_missing_columns(
-                "scheduled_tasks",
-                &[
-                    ("model", "ALTER TABLE scheduled_tasks ADD COLUMN model TEXT"),
-                    (
-                        "model_provider",
-                        "ALTER TABLE scheduled_tasks ADD COLUMN model_provider TEXT",
-                    ),
-                ],
-            )
-            .await?;
-        } else {
-            tracing::warn!(
-                "shape repair: `scheduled_tasks` table missing entirely; skipping column repair"
-            );
-        }
-        if self.table_exists("sessions").await? {
-            self.add_missing_columns(
-                "sessions",
-                &[
-                    (
-                        "pinned",
-                        "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-                    ),
-                    (
-                        "archived_at",
-                        "ALTER TABLE sessions ADD COLUMN archived_at INTEGER",
-                    ),
-                ],
-            )
-            .await?;
-        } else {
-            tracing::warn!(
-                "shape repair: `sessions` table missing entirely; skipping column repair"
-            );
-        }
-        Ok(())
+        self.add_missing_columns(
+            "scheduled_tasks",
+            &[("model", "TEXT"), ("model_provider", "TEXT")],
+        )
+        .await?;
+        self.add_missing_columns(
+            "sessions",
+            &[
+                ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+                ("archived_at", "INTEGER"),
+            ],
+        )
+        .await
     }
 
-    /// Run each `(column, ddl)` whose column is absent from `table`.
+    /// Add each absent `(column, type)` to `table`, skipping a table that
+    /// doesn't exist at all.
     ///
     /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and re-running an ALTER for an
     /// existing column is a hard error — so every column-adding migration has
-    /// to probe first to stay idempotent.
+    /// to probe first to stay idempotent. Deriving the DDL from the same
+    /// `column` the probe tests keeps the two from disagreeing.
     async fn add_missing_columns(&self, table: &str, columns: &[(&str, &str)]) -> Result<()> {
         let mut rows = self
             .conn
@@ -404,9 +381,19 @@ impl Database {
         while let Some(row) = rows.next().await? {
             existing.insert(row.get::<String>(1)?);
         }
-        for (col, ddl) in columns {
-            if !existing.contains(*col) {
-                self.conn.execute_batch(ddl).await?;
+        // A table that exists has at least one column, so an empty probe means
+        // the table itself is missing — no `table_exists` round-trip needed.
+        if existing.is_empty() {
+            tracing::warn!(
+                "shape repair: `{table}` table missing entirely; skipping column repair"
+            );
+            return Ok(());
+        }
+        for (column, ty) in columns {
+            if !existing.contains(*column) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
+                    .await?;
             }
         }
         Ok(())

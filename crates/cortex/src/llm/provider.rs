@@ -463,29 +463,7 @@ impl Provider {
     /// yields `None` rather than a wrong vendor.
     fn vendor_for_model_family(model: &str) -> Option<&'static str> {
         let lowered = model.to_lowercase();
-        const FAMILIES: &[(&str, &str)] = &[
-            ("claude-", "anthropic"),
-            ("gpt-", "openai"),
-            ("o1", "openai"),
-            ("o3", "openai"),
-            ("o4-", "openai"),
-            ("codex-", "openai"),
-            ("gemini-", "google"),
-            ("gemma-", "google"),
-            ("grok-", "x-ai"),
-            ("qwen", "qwen"),
-            ("deepseek-", "deepseek"),
-            ("glm-", "z-ai"),
-            ("kimi-", "moonshotai"),
-            ("minimax", "minimax"),
-            ("mistral", "mistralai"),
-            ("ministral", "mistralai"),
-            ("magistral", "mistralai"),
-            ("devstral", "mistralai"),
-            ("llama-", "meta-llama"),
-            ("phi-", "microsoft"),
-        ];
-        FAMILIES
+        MODEL_FAMILY_VENDORS
             .iter()
             .find(|(stem, _)| lowered.starts_with(stem))
             .map(|(_, vendor)| *vendor)
@@ -647,6 +625,35 @@ impl Provider {
     }
 }
 
+/// Model-family stem → vendor, used to restore a dropped vendor prefix.
+///
+/// The inverse of the vendor prefixes stripped in [`crate::llm::model_registry`],
+/// so every vendor here must also appear there — otherwise a repaired id sails
+/// past the context-window lookup and silently takes the default window.
+/// `vendor_prefixes_round_trip_through_the_registry` guards that.
+pub(crate) const MODEL_FAMILY_VENDORS: &[(&str, &str)] = &[
+    ("claude-", "anthropic"),
+    ("gpt-", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("o4-", "openai"),
+    ("codex-", "openai"),
+    ("gemini-", "google"),
+    ("gemma-", "google"),
+    ("grok-", "x-ai"),
+    ("qwen", "qwen"),
+    ("deepseek-", "deepseek"),
+    ("glm-", "z-ai"),
+    ("kimi-", "moonshotai"),
+    ("minimax", "minimax"),
+    ("mistral", "mistralai"),
+    ("ministral", "mistralai"),
+    ("magistral", "mistralai"),
+    ("devstral", "mistralai"),
+    ("llama-", "meta-llama"),
+    ("phi-", "microsoft"),
+];
+
 /// Connect timeout for the Ollama reachability probe (per resolved address).
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -791,11 +798,14 @@ mod tests {
     }
 
     /// A config that lost its vendor prefix must self-heal on the next
-    /// request. Without this, a bare id 404s on every attempt and the failure
-    /// names neither the model nor the missing prefix.
+    /// request — without this a bare id 404s on every attempt, and the failure
+    /// names neither the model nor the missing prefix. The repair is a lookup,
+    /// not a guess: an id whose family we don't know passes through untouched
+    /// so the error path can explain it, and an already-prefixed id is never
+    /// rewritten.
     #[test]
     fn openrouter_repairs_a_bare_model_id_from_its_family() {
-        for (bare, expected) in [
+        for (input, expected) in [
             ("claude-sonnet-4.6", "anthropic/claude-sonnet-4.6"),
             ("gpt-5.5", "openai/gpt-5.5"),
             ("o3", "openai/o3"),
@@ -804,31 +814,37 @@ mod tests {
             ("glm-5.1", "z-ai/glm-5.1"),
             ("kimi-k3", "moonshotai/kimi-k3"),
             ("devstral-2512", "mistralai/devstral-2512"),
+            // Unknown family and already-prefixed ids are left exactly as-is.
+            ("some-unknown-model-v9", "some-unknown-model-v9"),
+            ("anthropic/claude-sonnet-4.6", "anthropic/claude-sonnet-4.6"),
         ] {
             assert_eq!(
-                Provider::OpenRouter.normalize_model(bare),
+                Provider::OpenRouter.normalize_model(input),
                 expected,
-                "{bare} must be repaired to its vendor path"
+                "{input} must normalize to {expected}"
             );
         }
-    }
-
-    /// The repair is a lookup, not a guess. An id whose family we don't know
-    /// passes through untouched so the error path can explain it, and an id
-    /// that already carries a prefix is never rewritten.
-    #[test]
-    fn vendor_prefix_repair_leaves_unknown_and_already_prefixed_ids_alone() {
-        assert_eq!(
-            Provider::OpenRouter.normalize_model("some-unknown-model-v9"),
-            "some-unknown-model-v9"
-        );
-        assert_eq!(
-            Provider::OpenRouter.normalize_model("anthropic/claude-sonnet-4.6"),
-            "anthropic/claude-sonnet-4.6"
-        );
+        // An unrepairable id yields no suggestion, so the error path says
+        // "missing prefix" rather than inventing one.
         assert!(Provider::OpenRouter
             .repair_missing_vendor_prefix("some-unknown-model-v9")
             .is_none());
+    }
+
+    /// Repairing a prefix the registry can't strip back off would send the id
+    /// out fine but silently lose its context window to the 200k default —
+    /// which reads as "compaction never fires" and then a wall of 400s. The
+    /// two lists have to agree in both directions.
+    #[test]
+    fn vendor_prefixes_round_trip_through_the_registry() {
+        for (stem, vendor) in MODEL_FAMILY_VENDORS {
+            let repaired = format!("{vendor}/{stem}probe");
+            assert_eq!(
+                crate::llm::model_registry::strip_vendor_prefix(&repaired),
+                format!("{stem}probe"),
+                "`{vendor}/` is repaired onto ids but the registry cannot strip it back off"
+            );
+        }
     }
 
     /// Only OpenRouter routes on the vendor half. Providers that serve bare

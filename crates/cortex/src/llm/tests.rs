@@ -199,6 +199,16 @@ async fn a_blackholed_endpoint_is_skipped_without_dialing() {
     config.llm.base_url = Some(dead_url.to_string());
     let client = LlmClient::new(&config).await.unwrap();
 
+    // The registry is process-global, so an early failure below would otherwise
+    // leak a 30s entry into every sibling test that touches this endpoint.
+    struct ClearOnDrop(&'static str);
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            crate::llm::blackhole::clear(self.0);
+        }
+    }
+    let _guard = ClearOnDrop(dead_url);
+
     crate::llm::blackhole::record_connect_failure(dead_url, std::time::Instant::now());
 
     let started = std::time::Instant::now();
@@ -223,60 +233,90 @@ async fn a_blackholed_endpoint_is_skipped_without_dialing() {
         matches!(err.reason(), FailoverReason::Timeout),
         "a blackholed host is expected to recover — the error must stay retryable"
     );
+}
 
-    crate::llm::blackhole::clear(dead_url);
+/// A *refused* connection is not a blackhole: it fails instantly, so there is
+/// no connect timeout to save, and marking it dead would replace the accurate
+/// error ("is the Ollama server running?") with a generic skip for the whole
+/// TTL — including on the first request after the operator starts the server.
+#[tokio::test]
+async fn a_refused_connection_does_not_blackhole_the_endpoint() {
+    let mut config = Config::default();
+    config.llm.provider = Some("ollama".to_string());
+    // Loopback, port 1: nothing listens, so the connect is refused at once.
+    let refused_url = "http://127.0.0.1:1/v1/chat/completions";
+    config.llm.base_url = Some("http://127.0.0.1:1/v1".to_string());
+    let client = LlmClient::new(&config).await.unwrap();
+
+    let err = client
+        .send_request(
+            refused_url,
+            &serde_json::json!({}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("a refused connection must surface as an error");
+    assert!(
+        err.to_string().contains("ollama serve"),
+        "the refusal must keep its actionable hint, got: {err}"
+    );
+    assert!(
+        !crate::llm::blackhole::is_blackholed(refused_url, std::time::Instant::now()),
+        "a refusal must not suppress the next attempt's real error"
+    );
 }
 
 /// A bare model id on a prefix-routed provider 404s, and the raw
 /// "model not found" reads like an outage — users chase the provider's status
-/// page instead of their own config. The error has to name the missing prefix.
-/// Only the message changes: the reason stays `ModelNotFound` so fast-fail and
-/// failover are untouched.
+/// page instead of their own config, so the error has to name the missing
+/// prefix. It must fire *only* for an id that actually reached the wire bare:
+/// an id `normalize_model` repaired, or one that already carried its vendor,
+/// went out fully qualified, so blaming the prefix would tell the user to set
+/// exactly what the request already sent.
 #[tokio::test]
-async fn model_not_found_names_the_missing_vendor_prefix() {
-    let env_var = "BORG_TEST_OPENROUTER_BARE_MODEL";
+async fn model_not_found_blames_the_vendor_prefix_only_when_one_is_missing() {
+    let env_var = "BORG_TEST_OPENROUTER_VENDOR_PREFIX";
     std::env::set_var(env_var, "sk-test");
-    let mut config = Config::default();
-    config.llm.provider = Some("openrouter".to_string());
-    config.llm.api_key_env = env_var.to_string();
-    // A family the repair doesn't recognise, so it survives normalization and
-    // actually reaches the wire bare.
-    config.llm.model = "some-unknown-model-v9".to_string();
-    let client = LlmClient::new(&config).await.unwrap();
 
-    let raw = crate::llm::llm_error::classify_status(
-        reqwest::StatusCode::NOT_FOUND,
-        "{\"error\":\"model not found\"}",
-        crate::llm::Provider::OpenRouter,
-    );
-    let explained = client.explain_missing_vendor_prefix(raw);
+    for (model, should_explain) in [
+        // Unrecognised family: survives normalization and reaches the wire bare.
+        ("some-unknown-model-v9", true),
+        // Recognised family: goes out as `anthropic/claude-does-not-exist-9`.
+        ("claude-does-not-exist-9", false),
+        // Already fully qualified.
+        ("anthropic/claude-sonnet-4.6", false),
+    ] {
+        let mut config = Config::default();
+        config.llm.provider = Some("openrouter".to_string());
+        config.llm.api_key_env = env_var.to_string();
+        config.llm.model = model.to_string();
+        let client = LlmClient::new(&config).await.unwrap();
 
-    let message = explained.to_string();
-    assert!(
-        message.contains("some-unknown-model-v9") && message.contains("vendor"),
-        "error must name the model and the missing vendor prefix, got: {message}"
-    );
-    assert!(
-        matches!(explained.reason(), FailoverReason::ModelNotFound),
-        "rewriting the message must not change failover behavior"
-    );
-}
+        let raw = crate::llm::llm_error::classify_status(
+            reqwest::StatusCode::NOT_FOUND,
+            "{\"error\":\"model not found\"}",
+            crate::llm::Provider::OpenRouter,
+        );
+        let raw_message = raw.to_string();
+        let explained = client.explain_missing_vendor_prefix(raw);
+        let message = explained.to_string();
 
-/// The rewrite must not fire on an id that already carries its vendor — that
-/// 404 means something else, and blaming the prefix would misdirect.
-#[tokio::test]
-async fn model_not_found_is_left_alone_when_the_prefix_is_present() {
-    let client = make_test_openrouter_client(false).await;
-    let raw = crate::llm::llm_error::classify_status(
-        reqwest::StatusCode::NOT_FOUND,
-        "{\"error\":\"model not found\"}",
-        crate::llm::Provider::OpenRouter,
-    );
-    let passed_through = client.explain_missing_vendor_prefix(raw);
-    assert!(
-        !passed_through.to_string().contains("vendor/model"),
-        "a fully-qualified id must not be blamed on a missing prefix"
-    );
+        if should_explain {
+            assert!(
+                message.contains(model) && message.contains("vendor"),
+                "{model}: error must name the model and the missing vendor prefix, got: {message}"
+            );
+        } else {
+            assert_eq!(
+                message, raw_message,
+                "{model}: a fully-qualified id must pass the error through untouched"
+            );
+        }
+        assert!(
+            matches!(explained.reason(), FailoverReason::ModelNotFound),
+            "{model}: rewriting the message must not change failover behavior"
+        );
+    }
 }
 
 #[tokio::test]

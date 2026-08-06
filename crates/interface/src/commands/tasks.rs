@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use anyhow::Result;
 use clap::Subcommand;
 use protocols::admin::ScheduledTaskCreate;
@@ -193,11 +195,26 @@ pub(crate) fn run_tasks_model(
     provider: Option<&str>,
     clear: bool,
 ) -> Result<()> {
-    if clear && model.is_some() {
-        anyhow::bail!("pass either a model id or --clear, not both");
+    if clear && (model.is_some() || provider.is_some()) {
+        anyhow::bail!("pass either a model id (with optional --provider) or --clear, not both");
     }
     if !clear && model.is_none() {
         anyhow::bail!("provide a model id to pin, or --clear to remove the pin");
+    }
+    // Reject an unknown provider here rather than persisting a typo that only
+    // surfaces as a failed run at 3am.
+    if let Some(p) = provider {
+        use cortex::llm::provider::Provider;
+        if Provider::from_str(p).is_err() {
+            anyhow::bail!(
+                "unknown provider '{p}' — expected one of: {}",
+                Provider::ALL
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
     block_on(async {
@@ -210,11 +227,7 @@ pub(crate) fn run_tasks_model(
                 return Ok(());
             }
         };
-        let (model, provider) = if clear {
-            (None, None)
-        } else {
-            (model, provider)
-        };
+        // The guards above make `clear` equivalent to "both are None".
         db.set_task_model_pin(&full_id, model, provider).await?;
         match model {
             Some(m) => {
@@ -231,23 +244,10 @@ pub(crate) fn run_tasks_model(
 }
 
 /// Resolve a task id prefix to the full id, or `None` when nothing matches.
-///
-/// Refuses an ambiguous prefix rather than picking one: pinning the wrong
-/// task's model is silent — it only shows up as an unexpected bill.
 async fn resolve_task_id_prefix(db: &cortex::db::Database, prefix: &str) -> Result<Option<String>> {
     // `list_tasks` is unpaged, so filtering it can't miss a match.
-    let matches: Vec<String> = db
-        .list_tasks()
-        .await?
-        .into_iter()
-        .map(|t| t.id)
-        .filter(|id| id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(matches.into_iter().next()),
-        n => anyhow::bail!("'{prefix}' matches {n} tasks — use a longer id prefix"),
-    }
+    let ids = db.list_tasks().await?.into_iter().map(|t| t.id).collect();
+    super::resolve_unique_prefix("tasks", prefix, ids)
 }
 
 /// Dispatch for `borg cron ...`.

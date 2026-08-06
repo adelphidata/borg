@@ -36,6 +36,14 @@ pub struct SessionEventDraft {
 }
 
 impl Database {
+    /// Insert a session, or refresh an existing row's activity fields.
+    ///
+    /// Writing to a session un-archives it. Archiving keys on inactivity, so
+    /// activity has to reverse it — otherwise resuming an archived session
+    /// leaves it permanently hidden from listings despite fresh messages, and
+    /// the sweep won't revisit it (it only considers `archived_at IS NULL`).
+    /// A `pinned` session is never archived in the first place, so this can't
+    /// disturb it.
     pub async fn upsert_session(
         &self,
         id: &str,
@@ -50,7 +58,8 @@ impl Database {
                 "INSERT INTO sessions (id, created_at, updated_at, total_tokens, model, title)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
-                updated_at = ?3, total_tokens = ?4, model = ?5, title = ?6",
+                updated_at = ?3, total_tokens = ?4, model = ?5, title = ?6,
+                archived_at = NULL",
                 params!(id, created_at, updated_at, total_tokens, model, title),
             )
             .await?;
@@ -1124,6 +1133,38 @@ mod tests {
             .unwrap()
             .archived_at
             .is_none());
+    }
+
+    /// Resuming an archived conversation must un-archive it. Archiving keys on
+    /// inactivity, so activity has to undo it — otherwise a session the user
+    /// went back to stays hidden from every listing forever, and the sweep
+    /// never revisits it to notice.
+    #[tokio::test]
+    async fn writing_to_an_archived_session_brings_it_back() {
+        let db = test_db().await;
+        let day = 86_400i64;
+        let now = 100 * day;
+
+        db.upsert_session("resumed", day, now - 60 * day, 0, "m", "Resumed")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.archive_stale_sessions(now - 30 * day, now)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The user picks it back up and sends a message.
+        db.upsert_session("resumed", day, now, 12, "m", "Resumed")
+            .await
+            .unwrap();
+
+        let row = db.session_by_id("resumed").await.unwrap().unwrap();
+        assert!(
+            row.archived_at.is_none(),
+            "an archived session that is written to must return to listings"
+        );
     }
 
     /// A pin is the per-session escape hatch from daemon-wide retention. If

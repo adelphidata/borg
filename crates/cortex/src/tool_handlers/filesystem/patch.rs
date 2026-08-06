@@ -105,10 +105,7 @@ fn deny_skill_patch(
             ));
         }
     }
-    if let Some(rejection) = reject_overlong_skill_description(patch_text) {
-        return Some(rejection);
-    }
-    None
+    reject_overlong_skill_description(patch_text)
 }
 
 /// Refuse a skill patch whose frontmatter `description:` exceeds the catalog
@@ -123,11 +120,52 @@ fn deny_skill_patch(
 /// Scans added lines only: an unchanged over-length description in surrounding
 /// context is somebody else's problem, and rejecting it would make an unrelated
 /// edit to an old skill impossible.
+///
+/// Scoped to `SKILL.md` frontmatter. A `description:` line anywhere else in a
+/// skill — a `references/*.md` documenting an API field, a YAML fixture under
+/// `scripts/`, prose in the skill body — is not the catalog's routing signal,
+/// and rejecting the whole patch over it would block edits that have nothing to
+/// do with skill metadata.
 fn reject_overlong_skill_description(patch_text: &str) -> Option<String> {
+    // Tracks the file each hunk belongs to, plus how many `---` markers we've
+    // passed inside it: the frontmatter block sits between the first and the
+    // second, so a hunk that hasn't crossed the closing marker is still
+    // (possibly) editing metadata. A hunk that touches only the description
+    // line carries no markers at all, which is why the default is "inside".
+    let mut in_skill_md = false;
+    let mut markers_seen = 0usize;
     for line in patch_text.lines() {
+        if let Some(path) = line
+            .strip_prefix("*** Add File:")
+            .or_else(|| line.strip_prefix("*** Update File:"))
+            .or_else(|| line.strip_prefix("*** Delete File:"))
+            .or_else(|| line.strip_prefix("*** Move to:"))
+        {
+            in_skill_md = std::path::Path::new(path.trim())
+                .file_name()
+                .is_some_and(|f| f == "SKILL.md");
+            markers_seen = 0;
+            continue;
+        }
+        if !in_skill_md {
+            continue;
+        }
+        // Markers count whether added or carried as context.
+        let body = line
+            .strip_prefix(['+', '-', ' '])
+            .unwrap_or(line)
+            .trim_end();
+        if body.trim() == "---" {
+            markers_seen += 1;
+            continue;
+        }
         let Some(added) = line.strip_prefix('+') else {
             continue;
         };
+        if markers_seen >= 2 {
+            // Past the frontmatter: body prose the catalog never renders.
+            continue;
+        }
         let Some(value) = added.trim_start().strip_prefix("description:") else {
             continue;
         };
@@ -1377,6 +1415,49 @@ mod tests {
         assert!(
             deny_skill_patch(&context_only, std::path::Path::new("/tmp/skills"), &config).is_none(),
             "an unchanged over-length description must not block an unrelated edit"
+        );
+    }
+
+    /// The cap governs the catalog's routing signal, which lives in
+    /// `SKILL.md` frontmatter and nowhere else. A long `description:` in a
+    /// reference doc, a bundled YAML fixture, or the skill's own body prose is
+    /// ordinary content — rejecting the patch over it would block edits that
+    /// have nothing to do with skill metadata.
+    #[test]
+    fn deny_skill_patch_only_measures_skill_md_frontmatter() {
+        let config = Config::default();
+        let overlong = "x".repeat(crate::skills::MAX_SKILL_DESCRIPTION_CHARS + 1);
+
+        let reference_doc = format!(
+            "*** Begin Patch\n*** Add File: my-skill/references/api.md\n\
+             +# Field reference\n+description: {overlong}\n*** End Patch"
+        );
+        assert!(
+            deny_skill_patch(&reference_doc, std::path::Path::new("/tmp/skills"), &config)
+                .is_none(),
+            "a description line outside SKILL.md is not the catalog's routing signal"
+        );
+
+        let body_prose = format!(
+            "*** Begin Patch\n*** Add File: my-skill/SKILL.md\n+---\n+name: my-skill\n\
+             +description: short and useful\n+---\n+## Usage\n+description: {overlong}\n\
+             *** End Patch"
+        );
+        assert!(
+            deny_skill_patch(&body_prose, std::path::Path::new("/tmp/skills"), &config).is_none(),
+            "prose past the frontmatter is never rendered into the catalog"
+        );
+
+        // But the common edit — retouching only the description line, with no
+        // frontmatter markers in the hunk — must still be caught.
+        let metadata_edit = format!(
+            "*** Begin Patch\n*** Update File: my-skill/SKILL.md\n@@\n name: my-skill\n\
+             -description: short\n+description: {overlong}\n*** End Patch"
+        );
+        assert!(
+            deny_skill_patch(&metadata_edit, std::path::Path::new("/tmp/skills"), &config)
+                .is_some(),
+            "an over-length description edit must still be refused"
         );
     }
 

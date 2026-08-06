@@ -4,6 +4,7 @@
 use crate::session::DaemonSessionExecutor;
 use cortex::config::Config;
 use cortex::llm::{CostEventContext, CostEventSink, LlmClient};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -39,6 +40,13 @@ pub(crate) use cortex::agent::silence::is_silent_autonomous as is_silent_respons
 ///
 /// The pin is user-owned by design: it is not in the agent-facing `schedule`
 /// tool schema, so a model can't re-point its own scheduled work.
+///
+/// Switching provider also drops the previous provider's endpoint override and
+/// credentials, so the new one resolves its own. Carrying either across is
+/// worse than failing: a stale `base_url` sends the pinned model to the old
+/// provider's endpoint, and a stale key makes `correct_provider_from_key`
+/// silently route the request straight back to the old provider — the pin
+/// looks applied and isn't.
 fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskRow) -> Config {
     let (model, provider) = match task.model.as_ref() {
         Some(pinned) => (Some(pinned.clone()), task.model_provider.clone()),
@@ -51,9 +59,21 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
         return config;
     };
     config.llm.model = model;
-    if let Some(provider) = provider {
-        config.llm.provider = Some(provider);
+    let Some(provider) = provider else {
+        return config;
+    };
+    if config.llm.provider.as_deref() != Some(provider.as_str()) {
+        config.llm.base_url = None;
+        // Point credential resolution at the pinned provider's own env var.
+        // Leaving the old provider's keys in place doesn't fail loudly — it
+        // reroutes, which is the worse outcome.
+        if let Ok(pinned) = cortex::llm::provider::Provider::from_str(&provider) {
+            config.llm.api_key_env = pinned.default_env_var().to_string();
+        }
+        config.llm.api_key = None;
+        config.llm.api_keys.clear();
     }
+    config.llm.provider = Some(provider);
     config
 }
 
@@ -1683,6 +1703,79 @@ mod scheduled_model_tests {
             fleet.llm.provider.as_deref(),
             Some("groq"),
             "the fleet pair applies as a unit when the task pins nothing"
+        );
+    }
+
+    /// `llm.base_url` overrides the endpoint of the *configured* provider.
+    /// Carried across a provider switch it would send the pinned model to the
+    /// old provider's endpoint — a local Ollama URL answering an OpenRouter
+    /// request — so a switch has to drop it while a same-provider pin keeps it.
+    #[test]
+    fn switching_provider_drops_a_stale_base_url_override() {
+        let mut base = config_with("chat-model", None);
+        base.llm.provider = Some("ollama".to_string());
+        base.llm.base_url = Some("http://localhost:11434/v1".to_string());
+
+        let switched =
+            resolve_scheduled_model(base.clone(), &task_with_pin(Some("m"), Some("openrouter")));
+        assert_eq!(switched.llm.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            switched.llm.base_url, None,
+            "the previous provider's endpoint override must not follow the switch"
+        );
+
+        let same = resolve_scheduled_model(base, &task_with_pin(Some("m"), Some("ollama")));
+        assert_eq!(
+            same.llm.base_url.as_deref(),
+            Some("http://localhost:11434/v1"),
+            "a pin on the same provider must keep the operator's endpoint override"
+        );
+    }
+
+    /// The dangerous failure isn't a 401 — it's `correct_provider_from_key`
+    /// inferring the *old* provider from the leftover key and routing there,
+    /// so the pin reads as applied while every run goes to the wrong vendor.
+    #[test]
+    fn switching_provider_drops_the_previous_providers_credentials() {
+        let anthropic_env = "BORG_TEST_PIN_ANTHROPIC_KEY";
+        let openrouter_env = "OPENROUTER_API_KEY";
+        // An unmistakably Anthropic-shaped key — the shape
+        // `correct_provider_from_key` infers the vendor from.
+        std::env::set_var(anthropic_env, "sk-ant-api03-looks-anthropic");
+        std::env::set_var(openrouter_env, "sk-or-v1-looks-openrouter");
+
+        let mut base = config_with("chat-model", None);
+        base.llm.provider = Some("anthropic".to_string());
+        base.llm.api_key_env = anthropic_env.to_string();
+        base.llm.api_keys = vec![cortex::security::secrets_resolve::SecretRef::Env {
+            var: anthropic_env.to_string(),
+        }];
+
+        let switched =
+            resolve_scheduled_model(base.clone(), &task_with_pin(Some("m"), Some("openrouter")));
+        assert!(
+            switched.llm.api_keys.is_empty() && switched.llm.api_key.is_none(),
+            "the previous provider's keys must not authenticate the pinned provider"
+        );
+        assert_eq!(
+            switched.llm.api_key_env, openrouter_env,
+            "credential lookup must follow the pinned provider's own env var"
+        );
+        let (resolved, keys) = switched
+            .resolve_api_keys()
+            .expect("pinned provider resolves");
+        assert_eq!(
+            resolved,
+            cortex::llm::provider::Provider::OpenRouter,
+            "a leftover key must not be able to route the pin back to the old provider"
+        );
+        assert_eq!(keys, vec!["sk-or-v1-looks-openrouter".to_string()]);
+
+        let same = resolve_scheduled_model(base, &task_with_pin(Some("m"), Some("anthropic")));
+        assert_eq!(
+            same.llm.api_keys.len(),
+            1,
+            "a pin on the same provider must keep the operator's credentials"
         );
     }
 }

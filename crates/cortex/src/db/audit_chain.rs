@@ -321,11 +321,9 @@ impl Database {
         Ok(count)
     }
 
-    /// Delete `messages` rows older than `cutoff`. Hard delete — `messages`
-    /// is not hash-chained, so retention can free disk directly. Returns
-    /// the row count deleted.
     /// Delete `messages` rows older than `cutoff`, except those belonging to a
-    /// pinned session.
+    /// pinned session. Hard delete — `messages` is not hash-chained, so
+    /// retention can free disk directly. Returns the row count deleted.
     ///
     /// A pin is the per-session escape hatch from daemon-wide retention: the
     /// global `purge_policy = Never` is all-or-nothing, so without this the

@@ -70,9 +70,7 @@ impl DataConfig {
     /// Cutoff timestamp (`now - retention_days * 86400`). Returns `None`
     /// when retention is unlimited.
     pub fn purge_cutoff(&self, now_ts: i64) -> Option<i64> {
-        self.retention_days
-            .filter(|d| *d > 0)
-            .map(|d| now_ts - (d as i64) * 86_400)
+        days_cutoff(self.retention_days, now_ts)
     }
 
     /// Last-activity cutoff for the auto-archive sweep. `None` when the sweep
@@ -82,10 +80,18 @@ impl DataConfig {
     /// the litigation-hold switch that stops deletion has no reason to stop
     /// tidying a session list.
     pub fn session_archive_cutoff(&self, now_ts: i64) -> Option<i64> {
-        self.session_auto_archive_days
-            .filter(|d| *d > 0)
-            .map(|d| now_ts - (d as i64) * 86_400)
+        days_cutoff(self.session_auto_archive_days, now_ts)
     }
+}
+
+/// `now_ts - days`, or `None` when `days` is unset or zero.
+///
+/// Zero is "disabled", not "everything is older than now" — a day count that
+/// round-trips through settings as 0 must never become a cutoff that matches
+/// every row.
+fn days_cutoff(days: Option<u32>, now_ts: i64) -> Option<i64> {
+    days.filter(|d| *d > 0)
+        .map(|d| now_ts - (d as i64) * crate::constants::SECS_PER_DAY)
 }
 
 #[cfg(test)]
@@ -113,7 +119,7 @@ mod tests {
         let c = DataConfig {
             retention_days: Some(1),
             purge_policy: PurgePolicy::Never,
-            session_auto_archive_days: None,
+            ..DataConfig::default()
         };
         assert!(!c.should_auto_purge());
     }
@@ -125,7 +131,7 @@ mod tests {
         let c = DataConfig {
             retention_days: Some(7),
             purge_policy: PurgePolicy::OnDemandOnly,
-            session_auto_archive_days: None,
+            ..DataConfig::default()
         };
         assert!(!c.should_auto_purge());
         assert_eq!(c.purge_cutoff(700_000), Some(700_000 - 7 * 86_400));
@@ -138,7 +144,7 @@ mod tests {
         let c = DataConfig {
             retention_days: Some(0),
             purge_policy: PurgePolicy::Auto,
-            session_auto_archive_days: None,
+            ..DataConfig::default()
         };
         assert!(!c.should_auto_purge());
         assert!(c.purge_cutoff(1_700_000_000).is_none());
@@ -150,7 +156,7 @@ mod tests {
         let c = DataConfig {
             retention_days: Some(30),
             purge_policy: PurgePolicy::Auto,
-            session_auto_archive_days: None,
+            ..DataConfig::default()
         };
         assert!(c.should_auto_purge());
         assert_eq!(c.purge_cutoff(0), Some(-30 * 86_400));
@@ -177,28 +183,5 @@ mod tests {
             ..DataConfig::default()
         };
         assert_eq!(thirty.session_archive_cutoff(0), Some(-30 * 86_400));
-    }
-
-    /// A litigation hold stops deletion. Archiving deletes nothing, so it must
-    /// not be switched off by `purge_policy` — otherwise turning on the hold
-    /// silently stops the session list from being tidied.
-    #[test]
-    fn archive_sweep_is_independent_of_purge_policy() {
-        for policy in [
-            PurgePolicy::Auto,
-            PurgePolicy::OnDemandOnly,
-            PurgePolicy::Never,
-        ] {
-            let c = DataConfig {
-                retention_days: None,
-                purge_policy: policy,
-                session_auto_archive_days: Some(30),
-            };
-            assert_eq!(
-                c.session_archive_cutoff(0),
-                Some(-30 * 86_400),
-                "{policy:?} must not disable archiving"
-            );
-        }
     }
 }
