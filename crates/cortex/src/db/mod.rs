@@ -57,6 +57,52 @@ use tracing::instrument;
 
 use crate::config::Config;
 
+/// True only for the durable-storage-exhausted error class: the write cannot
+/// succeed by retrying, because the filesystem or the DB's page budget is
+/// full.
+///
+/// Deliberately narrow. `SQLITE_BUSY` / `SQLITE_LOCKED` are contention, not
+/// exhaustion — treating them as fatal would turn a routine lock wait into a
+/// failed turn. Only this class justifies aborting work that has already been
+/// done.
+///
+/// The numeric code is matched by downcast rather than by string: libsql's
+/// `Display` for `SqliteFailure` renders only the message, so the code never
+/// appears in the text. The low byte is masked so extended result codes
+/// (`SQLITE_IOERR_WRITE` = 778, `SQLITE_IOERR_FSYNC` = 1034, …) are covered by
+/// their primary code. The message fallbacks catch remote/Hrana wrapping that
+/// loses the numeric code entirely.
+pub fn is_storage_exhausted(err: &anyhow::Error) -> bool {
+    /// `SQLITE_FULL` — database or disk is full.
+    const SQLITE_FULL: i32 = 13;
+    /// `SQLITE_IOERR` — a disk I/O error occurred.
+    const SQLITE_IOERR: i32 = 10;
+
+    if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
+        if matches!(code & 0xff, SQLITE_FULL | SQLITE_IOERR) {
+            return true;
+        }
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("database or disk is full") || lower.contains("disk i/o error") {
+            return true;
+        }
+    }
+
+    // The session-file auto-save path writes through `std::fs`, not libsql.
+    // `io::ErrorKind::StorageFull` is still unstable on the pinned toolchain,
+    // so match the raw errno.
+    #[cfg(unix)]
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        if let Some(errno) = io_err.raw_os_error() {
+            if errno == libc::ENOSPC || errno == libc::EDQUOT || errno == libc::EROFS {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// SQLite database (libsql, SQLite-C fork) for structured borg state.
 ///
 /// Holds an internally-`Arc`'d `libsql::Connection`, which is `Send + Sync +
@@ -1287,5 +1333,111 @@ mod recovery_tests {
         assert_eq!(Database::take_recovery_notice(), Some(notice));
         // One-shot: a second drain sees nothing.
         assert_eq!(Database::take_recovery_notice(), None);
+    }
+}
+
+#[cfg(test)]
+mod storage_exhaustion_tests {
+    use super::is_storage_exhausted;
+
+    #[test]
+    fn classifies_only_durable_exhaustion() {
+        // The rows that matter: BUSY/LOCKED must stay non-fatal (otherwise
+        // routine lock contention starts failing turns), and the extended
+        // IOERR codes must be caught (a naive `code == 10` misses 778).
+        let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+            (
+                "SQLITE_FULL",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    13,
+                    "database or disk is full".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_IOERR",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    10,
+                    "disk I/O error".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_IOERR_WRITE (extended)",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    778,
+                    "disk I/O error".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_BUSY",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    5,
+                    "database is locked".to_string(),
+                )),
+                false,
+            ),
+            (
+                "SQLITE_LOCKED",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    6,
+                    "database table is locked".to_string(),
+                )),
+                false,
+            ),
+            (
+                "SQLITE_CONSTRAINT",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    19,
+                    "UNIQUE constraint failed".to_string(),
+                )),
+                false,
+            ),
+            (
+                "opaque anyhow",
+                anyhow::anyhow!("the disk is full of wonder"),
+                false,
+            ),
+        ];
+        for (label, err, want) in cases {
+            assert_eq!(
+                is_storage_exhausted(&err),
+                want,
+                "{label} classified wrong"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_filesystem_errnos_from_the_auto_save_path() {
+        let cases: &[(i32, bool)] = &[
+            (libc::ENOSPC, true),
+            (libc::EDQUOT, true),
+            (libc::EROFS, true),
+            (libc::EACCES, false),
+            (libc::ENOENT, false),
+        ];
+        for (errno, want) in cases {
+            let err = anyhow::Error::new(std::io::Error::from_raw_os_error(*errno));
+            assert_eq!(
+                is_storage_exhausted(&err),
+                *want,
+                "errno {errno} classified wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn message_wrapped_errors_are_still_classified() {
+        // `.context()` is used liberally on the persist path; the classifier
+        // must see through it or every real fault reads as transient.
+        let err = anyhow::Error::new(libsql::Error::SqliteFailure(
+            13,
+            "database or disk is full".to_string(),
+        ))
+        .context("appending session events");
+        assert!(is_storage_exhausted(&err));
     }
 }

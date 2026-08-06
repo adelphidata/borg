@@ -129,6 +129,10 @@ impl Agent {
         self.session.update_from_history(&self.history);
         if let Err(e) = self.session.save() {
             warn!("Failed to auto-save session: {e}");
+            if crate::db::is_storage_exhausted(&e) {
+                self.storage_fault
+                    .get_or_insert_with(|| storage_fault_message(&e));
+            }
         }
     }
 
@@ -230,6 +234,7 @@ impl Agent {
         let session_id = self.session.meta.id.clone();
         let drafts: Vec<crate::db::SessionEventDraft> =
             msgs.iter().map(draft_from_message).collect();
+        let mut fault: Option<String> = None;
         {
             let guard = self.db_guard().await;
             if let Some(ref db) = *guard {
@@ -242,12 +247,33 @@ impl Agent {
                             msg.seq = Some(seq);
                         }
                     }
-                    Err(e) => warn!("Failed to persist message batch to SQLite: {e}"),
+                    Err(e) => {
+                        warn!("Failed to persist message batch to SQLite: {e}");
+                        if crate::db::is_storage_exhausted(&e) {
+                            fault = Some(storage_fault_message(&e));
+                        }
+                    }
                 }
             }
         }
+        if let Some(msg) = fault {
+            self.storage_fault.get_or_insert(msg);
+            // Do NOT extend in-memory history: the next turn's prompt would
+            // then contain a message SQLite never saw, and the divergence
+            // would survive into compaction. Losing it here is honest.
+            return;
+        }
         self.history.extend(msgs);
     }
+}
+
+/// Operator-facing explanation for an exhausted-storage write failure. Names
+/// the cause and the fix — "write failed" alone sends people hunting.
+fn storage_fault_message(err: &anyhow::Error) -> String {
+    format!(
+        "Turn aborted: session storage is full, so the assistant's reply was NOT saved. \
+         Free space on the volume holding ~/.borg/borg.db and retry. ({err})"
+    )
 }
 
 /// Project a [`Message`] onto the durable-log row shape. Shared by the

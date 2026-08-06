@@ -33,6 +33,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         policy: config.policy.clone(),
         hook_registry: HookRegistry::new(),
         turn_count: 0,
+        storage_fault: None,
         rate_guard: SessionRateGuard::new(config.security.action_limits.clone()),
         agent_control: None,
         spawn_depth: 0,

@@ -283,6 +283,7 @@ fn minimal_test_agent(config: Config) -> Agent {
         policy: config.policy.clone(),
         hook_registry: HookRegistry::new(),
         turn_count: 0,
+        storage_fault: None,
         rate_guard: SessionRateGuard::new(config.security.action_limits.clone()),
         agent_control: None,
         spawn_depth: 0,
@@ -1887,4 +1888,92 @@ async fn tool_output_truncation_clamps_to_model_context_window() {
         !large_out.contains("omitted"),
         "large-context model must not truncate a ~3.7k-token output under a huge cap"
     );
+}
+
+// ── session storage exhaustion ────────────────────────────────────────────
+
+/// Build a test agent whose DB is a file-backed database with a page budget
+/// small enough that the next insert returns a *real* `SQLITE_FULL` — not a
+/// mocked error, the actual condition a full disk produces.
+async fn agent_with_full_db() -> (Agent, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = crate::db::Database::open_at(&tmp.path().join("borg.db"))
+        .await
+        .expect("open db");
+    // 2 pages is below the schema's own footprint, so any further write fails.
+    // SQLite refuses to set `max_page_count` below the current page count, so
+    // pin it to exactly what the schema already occupies. Any write that needs
+    // a new page then returns a real SQLITE_FULL — the same error a full disk
+    // produces, not a mocked one.
+    let mut rows = db
+        .conn()
+        .query("PRAGMA page_count", ())
+        .await
+        .expect("read page count");
+    let pages: i64 = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("page_count row")
+        .get(0)
+        .expect("page count value");
+    db.conn()
+        .query(&format!("PRAGMA max_page_count = {pages}"), ())
+        .await
+        .expect("set page cap");
+
+    let agent = minimal_test_agent(Config::default());
+    *agent.db.lock().await = Some(db);
+    (agent, tmp)
+}
+
+#[tokio::test]
+async fn exhausted_storage_records_a_fault_and_does_not_extend_history() {
+    let (mut agent, _tmp) = agent_with_full_db().await;
+    let before = agent.history.len();
+
+    agent
+        // Large enough to require new pages rather than fitting in slack.
+        .persist_messages(vec![Message::assistant("x".repeat(200_000))])
+        .await;
+
+    assert!(
+        agent.storage_fault.is_some(),
+        "a full disk must be recorded, not just logged"
+    );
+    // This is the assertion that fails if someone restores the unconditional
+    // `history.extend`: the next turn's prompt would carry a message SQLite
+    // never saw.
+    assert_eq!(
+        agent.history.len(),
+        before,
+        "in-memory history must not diverge from the durable log"
+    );
+    let msg = agent.storage_fault.clone().unwrap_or_default();
+    assert!(
+        msg.contains("NOT saved"),
+        "the message must say the reply was lost: {msg}"
+    );
+    assert!(
+        msg.contains(".borg"),
+        "the message must say where to free space: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn healthy_storage_records_no_fault_and_extends_history() {
+    // Over-fire guard: normal persistence must be untouched by this path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = crate::db::Database::open_at(&tmp.path().join("borg.db"))
+        .await
+        .expect("open db");
+    let mut agent = minimal_test_agent(Config::default());
+    *agent.db.lock().await = Some(db);
+
+    agent
+        .persist_messages(vec![Message::assistant("a reply")])
+        .await;
+
+    assert!(agent.storage_fault.is_none(), "healthy write must not fault");
+    assert_eq!(agent.history.len(), 1);
 }

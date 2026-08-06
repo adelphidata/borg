@@ -248,6 +248,11 @@ pub struct Agent {
     pub(super) policy: ExecutionPolicy,
     pub(super) hook_registry: HookRegistry,
     pub(super) turn_count: u32,
+    /// Set when a session write failed because durable storage is exhausted
+    /// (disk full, quota, read-only mount). Checked by the agent loop, which
+    /// aborts the turn rather than let the user believe a reply was saved.
+    /// `None` in the normal case; transient DB contention never sets it.
+    pub(super) storage_fault: Option<String>,
     pub(super) rate_guard: SessionRateGuard,
     pub(super) agent_control: Option<crate::multi_agent::AgentControl>,
     pub(super) spawn_depth: u32,
@@ -484,6 +489,7 @@ impl Agent {
             policy: common.policy,
             hook_registry: HookRegistry::new(),
             turn_count: 0,
+            storage_fault: None,
             rate_guard: common.rate_guard,
             agent_control,
             spawn_depth,
@@ -1099,6 +1105,17 @@ impl Agent {
                 return Ok(());
             }
 
+            // Storage is full: stop before burning another LLM call on a turn
+            // whose output cannot be saved. `Err` (not `Ok`) so automated
+            // lanes — scheduled tasks, gateway channels — can't book this as a
+            // success either.
+            if let Some(msg) = self.storage_fault.take() {
+                warn!("{msg}");
+                let _ = event_tx.send(AgentEvent::Error(msg.clone())).await;
+                let _ = event_tx.send(AgentEvent::TurnComplete).await;
+                return Err(anyhow::anyhow!(msg));
+            }
+
             self.drain_sub_agent_completions().await;
 
             match self.check_budget().await {
@@ -1361,7 +1378,21 @@ impl Agent {
                 )
                 .await
             {
-                IterationOutcome::EndTurn => return Ok(()),
+                // The loop-top check catches a fault before the *next* LLM
+                // call; this one catches the final assistant message — the
+                // one whose loss the user actually experiences — in the same
+                // turn it happened, instead of a turn late.
+                IterationOutcome::EndTurn => {
+                    return match self.storage_fault.take() {
+                        Some(msg) => {
+                            warn!("{msg}");
+                            let _ = event_tx.send(AgentEvent::Error(msg.clone())).await;
+                            let _ = event_tx.send(AgentEvent::TurnComplete).await;
+                            Err(anyhow::anyhow!(msg))
+                        }
+                        None => Ok(()),
+                    };
+                }
                 IterationOutcome::NudgeAndContinue => {
                     nudged_for_response = true;
                 }
