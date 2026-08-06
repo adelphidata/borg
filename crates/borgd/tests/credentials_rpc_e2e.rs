@@ -138,7 +138,7 @@ async fn list_then_add_then_remove_round_trips() {
         .map(|p| p.entries.iter().map(|e| e.status.clone()).collect())
         .unwrap_or_default();
     let mut tomb = statuses.iter().filter(|s| *s == "removed").count();
-    for _ in 0..100 {
+    for _ in 0..600 {
         if tomb >= 1 {
             break;
         }
@@ -277,25 +277,47 @@ async fn reset_clears_cooled_entries_only() {
     }
 
     // `report_failure` persists the cooldown through a fire-and-forget task,
-    // and `reset_credentials` rebuilds the pool from the DB — so poll until
-    // the cooldown is visible to the rebuild rather than racing the writer.
-    let mut cleared = 0;
-    for _ in 0..100 {
-        cleared = Admin::reset_credentials(
-            &admin,
-            Request::new(ResetCredentialsRequest {
-                provider: "openrouter".into(),
-            }),
-        )
-        .await
-        .expect("reset")
-        .into_inner()
-        .cleared;
-        if cleared >= 1 {
+    // and `reset_credentials` rebuilds the pool from the DB — so wait for the
+    // cooldown to be durably visible before resetting. The probe must be
+    // read-only: polling with `reset_credentials` itself mutates state, and a
+    // persist landing *after* an early reset re-introduces the cooldown, which
+    // then breaks the idempotency assertion below.
+    //
+    // Budget is deliberately generous (~12s): under a full `cargo test
+    // --workspace` many test binaries compete and the background persist can
+    // be starved well past a second. It still fails rather than hangs.
+    let mut saw_cooling = false;
+    for _ in 0..600 {
+        let listed =
+            Admin::list_credentials(&admin, Request::new(ListCredentialsRequest::default()))
+                .await
+                .expect("list while waiting for cooldown to persist")
+                .into_inner();
+        if listed
+            .providers
+            .first()
+            .is_some_and(|p| p.entries.iter().any(|e| e.status == "exhausted"))
+        {
+            saw_cooling = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    assert!(
+        saw_cooling,
+        "the RateLimit cooldown must become visible to a pool rebuild"
+    );
+
+    let cleared = Admin::reset_credentials(
+        &admin,
+        Request::new(ResetCredentialsRequest {
+            provider: "openrouter".into(),
+        }),
+    )
+    .await
+    .expect("reset")
+    .into_inner()
+    .cleared;
     assert_eq!(cleared, 1, "exactly one cooldown should be cleared");
 
     // Idempotent: second reset clears nothing.
