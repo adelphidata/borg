@@ -712,6 +712,8 @@ mod tests {
             bypass_quiet_hours_once: false,
             min_interval_secs: None,
             last_response_hash: None,
+            model: None,
+            model_provider: None,
         };
         assert!(
             !format_task(&task).contains("Last error"),
