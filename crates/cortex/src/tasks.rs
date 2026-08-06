@@ -133,6 +133,11 @@ pub const RUN_STATUS_FAILED: &str = "failed";
 /// stuck retry). The run is not replayed — we just audit the miss and
 /// reset `next_run` to the next valid fire time.
 pub const RUN_STATUS_MISSED: &str = "missed";
+/// The task body ran, but the result never reached the user — the delivery
+/// channel errored, or an `origin` target was never resolved. Distinct from
+/// `RUN_STATUS_FAILED`: the work succeeded, the handoff didn't. Without this
+/// the run row said `success` while the user got nothing.
+pub const RUN_STATUS_DELIVERY_FAILED: &str = "delivery_failed";
 
 /// One-shot task: runs once at `next_run`, then marked completed.
 pub const SCHEDULE_TYPE_ONCE: &str = "once";
@@ -148,6 +153,7 @@ pub fn format_run_status(status: &str) -> &str {
         RUN_STATUS_SUCCESS => "OK",
         RUN_STATUS_FAILED => "FAIL",
         RUN_STATUS_MISSED => "MISSED",
+        RUN_STATUS_DELIVERY_FAILED => "UNDELIVERED",
         other => other,
     }
 }
@@ -518,8 +524,18 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
     } else {
         "Prompt"
     };
+    // `last_error` is what tells the model (and the operator reading tool
+    // output) that a task has been quietly refused or failing to deliver.
+    // Dropping it here is how those failures stayed invisible.
+    let last_error = match task.last_error.as_deref() {
+        Some(e) if !e.is_empty() => format!(
+            "\n    Last error: {}",
+            crate::util::truncate::truncate_with_ellipsis(e, 120, "...")
+        ),
+        _ => String::new(),
+    };
     format!(
-        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}",
+        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}{}",
         task.name,
         task.status,
         task.id.chars().take(8).collect::<String>(),
@@ -528,6 +544,7 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         next,
         payload_label,
         crate::util::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
+        last_error,
     )
 }
 
@@ -658,6 +675,48 @@ mod tests {
             let got = check_scheduled_command(command, &policy).err();
             assert_eq!(got, *expected, "gate verdict wrong for {command:?}");
         }
+    }
+
+    #[test]
+    fn format_task_surfaces_last_error() {
+        // `format_task` feeds the agent-facing `schedule` tool. Dropping
+        // `last_error` is how a refused or undeliverable task stayed invisible
+        // to both the model and the operator.
+        let mut task = ScheduledTaskRow {
+            id: "abcdef123456".to_string(),
+            name: "brief".to_string(),
+            prompt: "summarize".to_string(),
+            schedule_type: "cron".to_string(),
+            schedule_expr: "0 0 9 * * * *".to_string(),
+            timezone: "local".to_string(),
+            status: TASK_STATUS_ACTIVE.to_string(),
+            next_run: None,
+            created_at: 0,
+            max_retries: 3,
+            retry_count: 0,
+            retry_after: None,
+            last_error: None,
+            timeout_ms: 0,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt".to_string(),
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: 0,
+            bypass_quiet_hours_once: false,
+            min_interval_secs: None,
+            last_response_hash: None,
+        };
+        assert!(
+            !format_task(&task).contains("Last error"),
+            "a healthy task must not grow a noise line"
+        );
+
+        task.last_error = Some("delivery to slack failed: 503".to_string());
+        let out = format_task(&task);
+        assert!(out.contains("Last error"), "got: {out}");
+        assert!(out.contains("slack"), "got: {out}");
     }
 
     #[test]

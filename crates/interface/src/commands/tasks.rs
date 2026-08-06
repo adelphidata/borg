@@ -458,15 +458,18 @@ pub(crate) fn run_tasks_status(id: &str) -> Result<()> {
         };
         println!("    Delivery: {} -> {}", task.delivery_channel, target);
     }
+    // Outside the retry branch on purpose: a policy refusal or a delivery
+    // failure leaves `retry_count` at 0, and nesting this made those errors
+    // invisible in `borg tasks status` — the one place an operator looks.
+    if !detail.last_error.is_empty() {
+        let err = &detail.last_error;
+        println!("    Last error: {}", &err[..err.len().min(100)]);
+    }
     if detail.retry_count > 0 {
         println!(
             "    Retry state: attempt {}/{}",
             detail.retry_count, detail.max_retries
         );
-        if !detail.last_error.is_empty() {
-            let err = &detail.last_error;
-            println!("    Last error: {}", &err[..err.len().min(100)]);
-        }
         if detail.retry_after_unix > 0 {
             let when = format_ts(detail.retry_after_unix, "%Y-%m-%d %H:%M UTC");
             println!("    Next retry: {when}");

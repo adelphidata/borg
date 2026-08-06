@@ -990,25 +990,45 @@ pub(crate) fn is_quiet_hours(config: &Config) -> bool {
 }
 
 /// Send `text` to every channel listed in `config.heartbeat.channels`.
-pub(crate) async fn deliver_to_channels(config: &Config, text: &str) {
+/// Fan a message out to every configured heartbeat channel.
+///
+/// Returns `(attempted, failed)` channel counts so a caller that owes the user
+/// an outcome (a broadcast scheduled task) can tell "nobody heard this" from
+/// "one of three channels was flaky". A partial delivery is still a delivery.
+pub(crate) async fn deliver_to_channels(config: &Config, text: &str) -> (usize, usize) {
+    let mut attempted = 0;
+    let mut failed = 0;
     for channel_name in &config.heartbeat.channels {
-        if let Err(e) = deliver_to_channel(config, channel_name, text).await {
-            tracing::warn!("Heartbeat delivery to {channel_name} failed: {e}");
+        attempted += 1;
+        match deliver_to_channel(config, channel_name, text).await {
+            Ok(true) => {}
+            Ok(false) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("Heartbeat delivery to {channel_name} failed: {e}");
+            }
         }
     }
+    (attempted, failed)
 }
 
-async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> Result<()> {
+/// Deliver to one channel's recipients. `Ok(false)` means the channel had
+/// recipients but every send to them failed.
+async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> Result<bool> {
     let recipients = resolve_recipients(config, channel_name).await?;
     if recipients.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
+    let mut delivered = 0;
     for sender_id in &recipients {
-        if let Err(e) = crate::channel_delivery::send(config, channel_name, sender_id, text).await {
-            tracing::warn!("Heartbeat: deliver to {channel_name}:{sender_id} failed: {e}");
+        match crate::channel_delivery::send(config, channel_name, sender_id, text).await {
+            Ok(()) => delivered += 1,
+            Err(e) => {
+                tracing::warn!("Heartbeat: deliver to {channel_name}:{sender_id} failed: {e}")
+            }
         }
     }
-    Ok(())
+    Ok(delivered > 0)
 }
 
 async fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {

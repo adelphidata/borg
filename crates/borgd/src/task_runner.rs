@@ -234,6 +234,8 @@ pub async fn spawn_task_execution(
                     &format!("Error: {panic_error}"),
                     &exec_ctx.config,
                     None,
+                    &exec_ctx.task_id,
+                    exec_ctx.run_id,
                 )
                 .await;
             }
@@ -667,7 +669,10 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                     }
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                    deliver_task_result(ch, tgt, task_name, &combined, config, None).await;
+                    deliver_task_result(
+                        ch, tgt, task_name, &combined, config, None, task_id, *run_id,
+                    )
+                    .await;
                 }
             } else {
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -700,6 +705,8 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                         &format!("Error: {error_msg}\n{combined}"),
                         config,
                         None,
+                        task_id,
+                        *run_id,
                     )
                     .await;
                 }
@@ -790,7 +797,10 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
                 }
             }
             if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                deliver_task_result(ch, tgt, task_name, &combined, config, None).await;
+                deliver_task_result(
+                    ch, tgt, task_name, &combined, config, None, task_id, *run_id,
+                )
+                .await;
             }
         }
         Ok(Err(e)) => {
@@ -989,6 +999,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                     result_text,
                     config,
                     ctx.executor.as_ref(),
+                    task_id,
+                    *run_id,
                 )
                 .await;
             }
@@ -1301,7 +1313,17 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
 
     let delivery_channel = ctx.delivery_channel.as_deref().unwrap_or("");
     if delivery_channel == cortex::heartbeat_task::BROADCAST_DELIVERY {
-        crate::heartbeat::deliver_to_channels(config, &result_text).await;
+        let (attempted, failed) = crate::heartbeat::deliver_to_channels(config, &result_text).await;
+        // Partial delivery is still delivery — only a total miss means the
+        // user never heard the result.
+        if attempted > 0 && failed == attempted {
+            record_delivery_failure(
+                task_id,
+                *run_id,
+                &format!("broadcast delivery failed on all {attempted} channel(s)"),
+            )
+            .await;
+        }
     } else if !delivery_channel.is_empty() {
         if let Some(tgt) = ctx.delivery_target.as_deref() {
             deliver_task_result(
@@ -1311,6 +1333,8 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                 &result_text,
                 config,
                 ctx.executor.as_ref(),
+                task_id,
+                *run_id,
             )
             .await;
         }
@@ -1483,6 +1507,8 @@ async fn handle_task_failure(
             &msg,
             config,
             None,
+            task_id,
+            run_id,
         )
         .await;
     }
@@ -1508,9 +1534,17 @@ async fn deliver_task_result(
     text: &str,
     config: &Config,
     executor: Option<&Arc<DaemonSessionExecutor>>,
+    task_id: &str,
+    run_id: i64,
 ) {
     if channel == "origin" {
         tracing::warn!("Task '{task_name}' has unresolved 'origin' delivery — dropping");
+        record_delivery_failure(
+            task_id,
+            run_id,
+            "unresolved 'origin' delivery target — result dropped",
+        )
+        .await;
         return;
     }
     let sender = parse_sender(target);
@@ -1535,7 +1569,32 @@ async fn deliver_task_result(
                 }
             }
         }
-        Err(e) => tracing::warn!("Failed to deliver task result via {channel}: {e}"),
+        Err(e) => {
+            tracing::warn!("Failed to deliver task result via {channel}: {e}");
+            // The body succeeded and `complete_task_run` already marked the
+            // run OK. Without this the run reads as a clean success while the
+            // user received nothing.
+            record_delivery_failure(
+                task_id,
+                run_id,
+                &format!("delivery to {channel} failed: {e}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Persist a delivery failure against both the run and the schedule row.
+/// Best-effort: a DB problem here must not take down the task runner, but it
+/// is logged rather than swallowed.
+async fn record_delivery_failure(task_id: &str, run_id: i64, note: &str) {
+    match cortex::db::Database::open().await {
+        Ok(db) => {
+            if let Err(e) = db.record_delivery_failure(task_id, run_id, note).await {
+                tracing::warn!("Task '{task_id}': failed to record delivery failure: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Task '{task_id}': DB open failed recording delivery failure: {e}"),
     }
 }
 

@@ -232,6 +232,40 @@ impl Database {
         Ok(())
     }
 
+    /// Record that a run's body succeeded but its result never reached the
+    /// user (channel send failed, or an `origin` target stayed unresolved).
+    ///
+    /// Deliberately *not* `record_task_failure`: that resets `retry_count` and
+    /// `retry_after`, which would cancel a scheduled retry when the delivery
+    /// of a `[FAILED]` notice is what failed. This only annotates.
+    ///
+    /// The `CASE` on status is load-bearing. On the failure-delivery paths the
+    /// run already carries a real diagnostic; a delivery problem must be
+    /// appended to it, never mask it.
+    pub async fn record_delivery_failure(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        note: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE task_runs \
+                 SET status = CASE WHEN status = 'success' THEN 'delivery_failed' ELSE status END, \
+                     error = CASE WHEN error IS NULL OR error = '' THEN ?2 ELSE error || ' | ' || ?2 END \
+                 WHERE id = ?1",
+                params!(run_id, note),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET last_error = ?2 WHERE id = ?1",
+                params!(task_id, note),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Fetch tasks whose retry_after time has elapsed.
     pub async fn get_tasks_pending_retry(&self, now: i64) -> Result<Vec<ScheduledTaskRow>> {
         let sql = format!(
@@ -1208,4 +1242,135 @@ mod tests {
         assert_eq!(db.daemon_lock_orphan_age(1_000, 300).await.unwrap(), None);
         assert!(!db.clear_stale_daemon_lock(1_000, 300).await.unwrap());
     }
+}
+
+/// Live tests for delivery-failure bookkeeping. The `db::tests` tree is a
+/// disabled lane (pre-async helper signatures), so these live here.
+#[cfg(test)]
+mod delivery_failure_tests {
+    use super::*;
+    use crate::db::NewTask;
+
+    async fn seed(db: &Database, id: &str) {
+        db.create_task(&NewTask {
+            id,
+            name: id,
+            prompt: "summarize",
+            schedule_type: "cron",
+            schedule_expr: "0 0 9 * * * *",
+            timezone: "local",
+            next_run: Some(100),
+            max_retries: Some(3),
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create task");
+    }
+
+
+    /// Read one run's `(status, error)` directly — there is no typed accessor for
+    /// a single run, and the assertion is about exactly these two columns.
+    async fn run_state(db: &Database, run_id: i64) -> (String, Option<String>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, error FROM task_runs WHERE id = ?1",
+                params!(run_id),
+            )
+            .await
+            .expect("query run");
+        let row = rows.next().await.expect("row").expect("run exists");
+        (row.get::<String>(0).unwrap(), row.get::<Option<String>>(1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn record_delivery_failure_downgrades_successful_run_and_sets_last_error() {
+        // The bug: the agent produced a result, the channel send failed, and the
+        // run row still said `success` while the user received nothing.
+        let db = Database::test_db().await;
+        seed(&db, "d1").await;
+        let run_id = db.start_task_run("d1", 1_000).await.expect("start run");
+        db.complete_task_run(run_id, 50, Some("the summary"), None)
+            .await
+            .expect("complete");
+        assert_eq!(run_state(&db, run_id).await.0, "success");
+
+        db.record_delivery_failure("d1", run_id, "delivery to slack failed: 503")
+            .await
+            .expect("record");
+
+        let (status, error) = run_state(&db, run_id).await;
+        assert_eq!(status, "delivery_failed");
+        assert!(
+            error.as_deref().unwrap_or("").contains("slack"),
+            "run error should carry the delivery diagnosis: {error:?}"
+        );
+        assert!(
+            db.tasks_with_last_error()
+                .await
+                .expect("query")
+                .iter()
+                .any(|t| t.id == "d1"),
+            "the task must surface in the last-error sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_delivery_failure_preserves_underlying_run_error() {
+        // On the `[FAILED]`-delivery path the run already carries a real
+        // diagnostic. A delivery problem must append to it, never mask it.
+        let db = Database::test_db().await;
+        seed(&db, "d2").await;
+        let run_id = db.start_task_run("d2", 1_000).await.expect("start run");
+        db.complete_task_run(run_id, 50, Some("out"), Some("exit code 2"))
+            .await
+            .expect("complete");
+
+        db.record_delivery_failure("d2", run_id, "delivery to slack failed: 503")
+            .await
+            .expect("record");
+
+        let (status, error) = run_state(&db, run_id).await;
+        assert_eq!(status, "failed", "the real failure must not be overwritten");
+        let error = error.unwrap_or_default();
+        assert!(error.contains("exit code 2"), "got: {error}");
+        assert!(error.contains("slack"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn record_delivery_failure_does_not_clear_a_pending_retry() {
+        // This is the test that fails if someone "simplifies" this to reuse
+        // `record_task_failure`, which resets retry_count and retry_after — and
+        // would therefore cancel a scheduled retry when delivering the failure
+        // notice is what failed.
+        let db = Database::test_db().await;
+        seed(&db, "d3").await;
+        let run_id = db.start_task_run("d3", 1_000).await.expect("start run");
+        db.set_task_retry("d3", 1, "boom", 9_999).await.expect("set retry");
+
+        db.record_delivery_failure("d3", run_id, "delivery to slack failed: 503")
+            .await
+            .expect("record");
+
+        let task = db
+            .get_task_by_id("d3")
+            .await
+            .expect("query")
+            .expect("task exists");
+        assert_eq!(task.retry_count, 1, "retry attempt count must survive");
+        assert_eq!(
+            task.retry_after,
+            Some(9_999),
+            "the scheduled retry must not be cancelled"
+        );
+    }
+
 }
