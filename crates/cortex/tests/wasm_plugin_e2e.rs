@@ -1,4 +1,3 @@
-#![cfg(feature = "phase9-tests-disabled")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end integration test for the WASM plugin lifecycle.
 //!
@@ -169,16 +168,17 @@ fn write_signed_package_with(
 /// Trust `pubkey_b64` for plugin installs by writing
 /// `security.trusted_publisher_keys` directly to the DB so the next
 /// `Config::load_from_db()` reads the seeded value.
-fn seed_trusted_publisher(db: &Database, pubkey_b64: &str) {
+async fn seed_trusted_publisher(db: &Database, pubkey_b64: &str) {
     let value = serde_json::to_string(&vec![pubkey_b64]).expect("encode trusted-publisher list");
     db.set_setting("security.trusted_publisher_keys", &value)
+        .await
         .expect("set trusted publisher keys");
 }
 
 /// Stage a signed package on disk and install it. Returns the package
 /// directory (so callers can keep it alive) and the installed plugin id.
-fn install_echo_plugin(tmp_root: &Path) -> std::path::PathBuf {
-    let db = Database::open().expect("open db");
+async fn install_echo_plugin(tmp_root: &Path) -> std::path::PathBuf {
+    let db = Database::open().await.expect("open db");
     let signing = SigningKey::from_bytes(&[7u8; 32]);
     let pubkey_b64 = {
         let pkg_dir = tmp_root.join("pkg");
@@ -186,26 +186,28 @@ fn install_echo_plugin(tmp_root: &Path) -> std::path::PathBuf {
         let wasm = minimal_wasm();
         write_signed_package(&pkg_dir, &wasm, &signing)
     };
-    seed_trusted_publisher(&db, &pubkey_b64);
+    seed_trusted_publisher(&db, &pubkey_b64).await;
     drop(db);
 
     let pkg_dir = tmp_root.join("pkg");
-    let summary = wasm_plugins::install_from_dir(&pkg_dir).expect("install_from_dir");
+    let summary = wasm_plugins::install_from_dir(&pkg_dir)
+        .await
+        .expect("install_from_dir");
     assert_eq!(summary.plugin_id, "dev/echo");
     assert_eq!(summary.version, "1.0.0");
     assert_eq!(summary.tool_count, 1);
     pkg_dir
 }
 
-#[test]
-fn install_register_dispatch_uninstall_roundtrip() {
+#[tokio::test]
+async fn install_register_dispatch_uninstall_roundtrip() {
     let _g = SERIAL.lock().expect("serial lock");
     let tmp = isolated_data_dir();
 
-    let _pkg_dir = install_echo_plugin(tmp.path());
+    let _pkg_dir = install_echo_plugin(tmp.path()).await;
 
     // DB registration must surface the tool to the LLM.
-    let defs = wasm_plugins::tool_definitions();
+    let defs = wasm_plugins::tool_definitions().await;
     assert!(
         defs.iter().any(|d| d.function.name == "echo_wasm"),
         "echo_wasm must surface in tool_definitions after install; got: {:?}",
@@ -213,9 +215,10 @@ fn install_register_dispatch_uninstall_roundtrip() {
     );
 
     // The installed package files must exist under data_dir/wasm_plugins/.
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     let row = db
         .get_wasm_plugin("dev/echo")
+        .await
         .expect("get_wasm_plugin")
         .expect("plugin row");
     assert!(
@@ -228,7 +231,9 @@ fn install_register_dispatch_uninstall_roundtrip() {
 
     // End-to-end dispatch: the guest's "OK" bytes must round-trip back through
     // DB lookup, HMAC re-verify, wasmtime execution, and packed-(ptr,len) decode.
-    let out = wasm_plugins::try_execute_tool("echo_wasm", &json!({})).expect("try_execute_tool ok");
+    let out = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+        .await
+        .expect("try_execute_tool ok");
     assert_eq!(
         out.as_deref(),
         Some("OK"),
@@ -236,7 +241,7 @@ fn install_register_dispatch_uninstall_roundtrip() {
     );
 
     // Uninstall: DB row gone, install dir gone, dispatch returns Ok(None).
-    let outcome = wasm_plugins::remove("dev/echo").expect("remove ok");
+    let outcome = wasm_plugins::remove("dev/echo").await.expect("remove ok");
     assert!(outcome.existed, "remove must report the row existed");
     assert!(
         outcome.orphaned_dir.is_none(),
@@ -244,9 +249,10 @@ fn install_register_dispatch_uninstall_roundtrip() {
         outcome.orphaned_dir
     );
 
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     assert!(
         db.get_wasm_plugin("dev/echo")
+            .await
             .expect("get_wasm_plugin")
             .is_none(),
         "DB row must be gone after remove"
@@ -264,11 +270,15 @@ fn install_register_dispatch_uninstall_roundtrip() {
 
     let defs_after = wasm_plugins::tool_definitions();
     assert!(
-        defs_after.iter().all(|d| d.function.name != "echo_wasm"),
+        defs_after
+            .await
+            .iter()
+            .all(|d| d.function.name != "echo_wasm"),
         "echo_wasm must not appear in tool_definitions after remove"
     );
 
     let after = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+        .await
         .expect("dispatch after remove must be Ok");
     assert!(
         after.is_none(),
@@ -277,20 +287,21 @@ fn install_register_dispatch_uninstall_roundtrip() {
     );
 }
 
-#[test]
-fn tampered_wasm_quarantines_on_dispatch() {
+#[tokio::test]
+async fn tampered_wasm_quarantines_on_dispatch() {
     let _g = SERIAL.lock().expect("serial lock");
     let tmp = isolated_data_dir();
 
-    let _pkg_dir = install_echo_plugin(tmp.path());
+    let _pkg_dir = install_echo_plugin(tmp.path()).await;
 
     // Tamper: flip one byte in the installed plugin.wasm. This must trip the
     // HMAC re-check at dispatch time — if it doesn't, the seal isn't being
     // enforced and an attacker who can write to ~/.borg/wasm_plugins/ could
     // swap in arbitrary code.
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     let row = db
         .get_verified_wasm_tool_runtime("echo_wasm")
+        .await
         .expect("runtime row")
         .expect("echo_wasm runtime row exists pre-tamper");
     let wasm_path = row.wasm_path;
@@ -308,11 +319,12 @@ fn tampered_wasm_quarantines_on_dispatch() {
     // on disk must trigger. A regression where dispatch returns Ok would
     // bypass them all.
     let _ = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+        .await
         .expect_err("tampered wasm must fail dispatch");
 
     // Quarantined row must drop out of tool_definitions so the LLM stops
     // being offered a tool that can no longer execute.
-    let defs = wasm_plugins::tool_definitions();
+    let defs = wasm_plugins::tool_definitions().await;
     assert!(
         defs.iter().all(|d| d.function.name != "echo_wasm"),
         "quarantined plugin must not appear in tool_definitions"
@@ -320,9 +332,10 @@ fn tampered_wasm_quarantines_on_dispatch() {
 
     // And the row's status field must reflect the quarantine — used by
     // `borg plugin show` / `borg plugin verify` to surface the reason.
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     let row = db
         .get_wasm_plugin("dev/echo")
+        .await
         .expect("get_wasm_plugin")
         .expect("plugin row still present (quarantined, not deleted)");
     assert_eq!(row.status, "quarantined");
@@ -353,8 +366,8 @@ fn tampered_wasm_quarantines_on_dispatch() {
 /// separate test functions would leave the writer pointing at a dropped
 /// tempdir, and `try_emit_global` would silently write to an orphaned DB
 /// the next test cannot inspect. One test, one tempdir, one writer.
-#[test]
-fn deprecated_key_and_auto_reseal_e2e() {
+#[tokio::test]
+async fn deprecated_key_and_auto_reseal_e2e() {
     let _g = SERIAL.lock().expect("serial lock");
     let tmp = isolated_data_dir();
 
@@ -362,7 +375,9 @@ fn deprecated_key_and_auto_reseal_e2e() {
     // this test's BORG_DATA_DIR. `install_global_audit` is `OnceLock::set` —
     // if a sibling test in this binary already installed one we cannot run
     // the audit-row assertions, so flag the run order explicitly.
-    let audit_db = Arc::new(Mutex::new(Database::open().expect("audit writer db")));
+    let audit_db = Arc::new(tokio::sync::Mutex::new(
+        Database::open().await.expect("audit writer db"),
+    ));
     assert!(
         install_global_audit(AuditWriter::new(audit_db)),
         "audit writer was already installed by another test in this binary — \
@@ -387,12 +402,13 @@ fn deprecated_key_and_auto_reseal_e2e() {
         "echo_pre",
     );
     {
-        let db = Database::open().expect("open db");
+        let db = Database::open().await.expect("open db");
         // trusted publisher list contains only the pre-sunset key for this phase
         db.set_setting(
             "security.trusted_publisher_keys",
             &serde_json::to_string(&vec![&pre_pubkey]).expect("encode trusted"),
         )
+        .await
         .expect("set trusted");
         let future = (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
         let dep_list = serde_json::json!([{
@@ -402,14 +418,16 @@ fn deprecated_key_and_auto_reseal_e2e() {
         }])
         .to_string();
         db.set_setting("security.deprecated_publisher_keys", &dep_list)
+            .await
             .expect("set deprecated");
     }
-    let summary =
-        wasm_plugins::install_from_dir(&pre_pkg).expect("pre-sunset install must succeed");
+    let summary = wasm_plugins::install_from_dir(&pre_pkg)
+        .await
+        .expect("pre-sunset install must succeed");
     assert_eq!(summary.plugin_id, "dev/pre");
 
-    let db = Database::open().expect("open db");
-    let events = db.list_audit_events().expect("list audit events");
+    let db = Database::open().await.expect("open db");
+    let events = db.list_audit_events().await.expect("list audit events");
     let pre_row = events
         .iter()
         .find(|e| {
@@ -451,6 +469,7 @@ fn deprecated_key_and_auto_reseal_e2e() {
         "security.trusted_publisher_keys",
         &serde_json::to_string(&vec![&post_pubkey]).expect("encode trusted"),
     )
+    .await
     .expect("set trusted post");
     let past = (chrono::Utc::now() - chrono::Duration::hours(24)).timestamp();
     let dep_list = serde_json::json!([{
@@ -460,22 +479,28 @@ fn deprecated_key_and_auto_reseal_e2e() {
     }])
     .to_string();
     db.set_setting("security.deprecated_publisher_keys", &dep_list)
+        .await
         .expect("set deprecated post");
     drop(db);
 
-    let err =
-        wasm_plugins::install_from_dir(&post_pkg).expect_err("post-sunset install must reject");
+    let err = wasm_plugins::install_from_dir(&post_pkg)
+        .await
+        .expect_err("post-sunset install must reject");
     let err_msg = format!("{err:#}");
     assert!(
         err_msg.contains("sunset"),
         "rejection must mention sunset so the operator knows why; got: {err_msg}",
     );
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     assert!(
-        db.get_wasm_plugin("dev/post").expect("get post").is_none(),
+        db.get_wasm_plugin("dev/post")
+            .await
+            .expect("get post")
+            .is_none(),
         "post-sunset rejection must not leave a plugin row behind",
     );
     db.delete_setting("security.deprecated_publisher_keys")
+        .await
         .expect("clear deprecated");
     drop(db);
 
@@ -486,10 +511,11 @@ fn deprecated_key_and_auto_reseal_e2e() {
     // be forced to reinstall to track a framing bump. The seal must be
     // rewritten under the current framing AND a `WASM_PLUGIN_RESEALED`
     // audit row must record the migration so the operator sees it happened.
-    let _pkg_dir = install_echo_plugin(tmp.path());
-    let db = Database::open().expect("open db");
+    let _pkg_dir = install_echo_plugin(tmp.path()).await;
+    let db = Database::open().await.expect("open db");
     let row = db
         .get_wasm_plugin("dev/echo")
+        .await
         .expect("get echo")
         .expect("echo row present after install");
     let manifest_bytes = fs::read(&row.manifest_path).expect("read installed manifest");
@@ -506,17 +532,20 @@ fn deprecated_key_and_auto_reseal_e2e() {
         "legacy framing must differ from current — if equal, this test would never exercise reseal",
     );
     db.update_wasm_plugin_local_hmac("dev/echo", &legacy_hmac)
+        .await
         .expect("install legacy hmac");
     drop(db);
 
     let out = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+        .await
         .expect("reseal-execute Ok")
         .expect("reseal-execute Some");
     assert_eq!(out, "OK", "reseal must succeed and guest must still run");
 
-    let db = Database::open().expect("open db");
+    let db = Database::open().await.expect("open db");
     let row_after = db
         .get_wasm_plugin("dev/echo")
+        .await
         .expect("get echo after reseal")
         .expect("echo row still present");
     let current_key = db.derive_hmac_key(wasm_plugins::HMAC_DOMAIN);
@@ -529,7 +558,10 @@ fn deprecated_key_and_auto_reseal_e2e() {
         row_after.local_hmac,
     );
 
-    let events = db.list_audit_events().expect("list audit after reseal");
+    let events = db
+        .list_audit_events()
+        .await
+        .expect("list audit after reseal");
     let reseal_row = events
         .iter()
         .find(|e| {
@@ -563,15 +595,16 @@ fn deprecated_key_and_auto_reseal_e2e() {
 ///
 /// Table-driven so a future fourth knob slots in as one row, not a fourth
 /// near-duplicate test function.
-#[test]
-fn kill_switch_hides_and_refuses_dispatch() {
+#[tokio::test]
+async fn kill_switch_hides_and_refuses_dispatch() {
     let _g = SERIAL.lock().expect("serial lock");
     let tmp = isolated_data_dir();
 
-    let _pkg_dir = install_echo_plugin(tmp.path());
+    let _pkg_dir = install_echo_plugin(tmp.path()).await;
     let pubkey = {
-        let db = Database::open().expect("open db");
+        let db = Database::open().await.expect("open db");
         db.get_wasm_plugin("dev/echo")
+            .await
             .expect("get echo")
             .expect("echo row present")
             .publisher_key
@@ -581,12 +614,14 @@ fn kill_switch_hides_and_refuses_dispatch() {
     // setup is broken and the kill-switch assertions below would falsely pass.
     assert!(
         wasm_plugins::tool_definitions()
+            .await
             .iter()
             .any(|d| d.function.name == "echo_wasm"),
         "baseline: echo_wasm must be visible before any kill switch is engaged",
     );
-    let baseline =
-        wasm_plugins::try_execute_tool("echo_wasm", &json!({})).expect("baseline execute Ok");
+    let baseline = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+        .await
+        .expect("baseline execute Ok");
     assert_eq!(
         baseline.as_deref(),
         Some("OK"),
@@ -627,12 +662,13 @@ fn kill_switch_hides_and_refuses_dispatch() {
 
     for case in &cases {
         {
-            let db = Database::open().expect("open db");
+            let db = Database::open().await.expect("open db");
             db.set_setting(case.setting_key, &case.setting_value)
+                .await
                 .unwrap_or_else(|e| panic!("set {} for {}: {e}", case.setting_key, case.name));
         }
 
-        let defs = wasm_plugins::tool_definitions();
+        let defs = wasm_plugins::tool_definitions().await;
         assert!(
             defs.iter().all(|d| d.function.name != "echo_wasm"),
             "{}: echo_wasm must be hidden from tool_definitions; got: {:?}",
@@ -640,7 +676,7 @@ fn kill_switch_hides_and_refuses_dispatch() {
             defs.iter().map(|d| &d.function.name).collect::<Vec<_>>(),
         );
 
-        match wasm_plugins::try_execute_tool("echo_wasm", &json!({})) {
+        match wasm_plugins::try_execute_tool("echo_wasm", &json!({})).await {
             Ok(out) if case.dispatch_returns_err => panic!(
                 "{}: dispatch must return Err to refuse the in-flight call; got Ok({:?})",
                 case.name, out,
@@ -672,8 +708,9 @@ fn kill_switch_hides_and_refuses_dispatch() {
 
         // Restore the setting before the next case so each case starts clean.
         {
-            let db = Database::open().expect("open db");
+            let db = Database::open().await.expect("open db");
             db.delete_setting(case.setting_key)
+                .await
                 .unwrap_or_else(|e| panic!("clear {} after {}: {e}", case.setting_key, case.name));
         }
 
@@ -682,6 +719,7 @@ fn kill_switch_hides_and_refuses_dispatch() {
         // a bug worth its own test.
         assert!(
             wasm_plugins::tool_definitions()
+                .await
                 .iter()
                 .any(|d| d.function.name == "echo_wasm"),
             "{}: plugin must reappear after clearing the kill switch",

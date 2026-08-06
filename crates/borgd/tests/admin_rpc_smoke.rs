@@ -1,4 +1,3 @@
-#![cfg(feature = "phase9-tests-disabled")]
 //! Integration tests for the admin/status RPCs added in sub-stage 1 of the
 //! popup-migration work. Each test seeds a temp BORG_DATA_DIR with realistic
 //! fixtures, spins a borgd over a UDS, and asserts on a SPECIFIC observable

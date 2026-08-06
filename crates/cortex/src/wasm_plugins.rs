@@ -558,32 +558,51 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
     // calls will still return a clean error to the guest (-1) rather than
     // crashing the host.
     let config = Config::load_from_db().await.ok().map(Arc::new);
-    let services: Arc<dyn HostServices> = Arc::new(BorgHostServices::new(
-        &row.plugin_id,
-        manifest.credentials.clone(),
-        config,
-    )?);
 
-    let engine = compiled_cache::engine()?;
-    let (module, cache_outcome) = compiled_cache::module_for(&effective_hmac, &wasm)?;
+    // Everything below is synchronous and must run OFF the async runtime.
+    //
+    // Two independent reasons, either of which is sufficient:
+    //   * `BorgHostServices::new` builds a `reqwest::blocking` client, and
+    //     that constructor spins up its own tokio runtime and drops it inline.
+    //     Dropping a runtime inside an async context panics
+    //     ("Cannot drop a runtime in a context where blocking is not
+    //     allowed"), so every dispatch aborted the calling task — WASM plugin
+    //     tools could not execute at all.
+    //   * wasmtime execution is CPU-bound and bounded only by fuel and a wall
+    //     clock cap, so parking a tokio worker on it starves the runtime the
+    //     same way a long-running hook would.
+    let exec_plugin_id = row.plugin_id.clone();
+    let exec_tool_name = row.tool_name.clone();
+    let exec_args = args.clone();
+    let exec_creds = manifest.credentials.clone();
+    let exec_manifest = manifest.clone();
+    let exec_hmac = effective_hmac.clone();
+    let (result, duration_ms, cache_outcome) = tokio::task::spawn_blocking(move || {
+        let services: Arc<dyn HostServices> =
+            Arc::new(BorgHostServices::new(&exec_plugin_id, exec_creds, config)?);
+        let engine = compiled_cache::engine()?;
+        let (module, cache_outcome) = compiled_cache::module_for(&exec_hmac, &wasm)?;
+        let start = std::time::Instant::now();
+        let result = plugins::wasm::execute_tool_prepared(
+            &exec_manifest,
+            engine,
+            &module,
+            &wasm,
+            &exec_tool_name,
+            &exec_args,
+            services,
+        );
+        Ok::<_, anyhow::Error>((result, start.elapsed().as_millis() as u64, cache_outcome))
+    })
+    .await
+    .context("WASM plugin execution task panicked")??;
+
     crate::telemetry::wasm_metrics::record_cache(match cache_outcome {
         compiled_cache::CacheOutcome::Hit => crate::telemetry::wasm_metrics::WasmCacheOutcome::Hit,
         compiled_cache::CacheOutcome::Miss => {
             crate::telemetry::wasm_metrics::WasmCacheOutcome::Miss
         }
     });
-
-    let start = std::time::Instant::now();
-    let result = plugins::wasm::execute_tool_prepared(
-        &manifest,
-        engine,
-        &module,
-        &wasm,
-        &row.tool_name,
-        args,
-        services,
-    );
-    let duration_ms = start.elapsed().as_millis() as u64;
     let (error_category, error_message) = match result.as_ref() {
         Ok(_) => (None, None),
         Err(e) => (Some(classify_execute_error(e)), Some(e.to_string())),

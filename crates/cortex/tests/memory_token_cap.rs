@@ -1,4 +1,3 @@
-#![cfg(feature = "phase9-tests-disabled")]
 //! Integration tests for `write_memory_db`'s 20k-token cap and 8k warn band.
 //!
 //! Spec (CLAUDE.md → Memory):
@@ -96,8 +95,8 @@ fn body_with_target_tokens(target: usize) -> String {
     buf
 }
 
-#[test]
-fn under_warn_band_writes_and_persists() {
+#[tokio::test]
+async fn under_warn_band_writes_and_persists() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -110,17 +109,19 @@ fn under_warn_band_writes_and_persists() {
     );
 
     let result = write_memory_db("small_note", &body, WriteMode::Overwrite, "global")
+        .await
         .expect("small write must succeed");
     assert!(result.contains("Written to memory"), "got: {result}");
 
     let stored = read_memory_db("small_note", "global")
+        .await
         .expect("read ok")
         .expect("entry must be persisted");
     assert_eq!(stored, body, "persisted content must match input verbatim");
 }
 
-#[test]
-fn between_warn_and_reject_writes_and_persists() {
+#[tokio::test]
+async fn between_warn_and_reject_writes_and_persists() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -138,17 +139,19 @@ fn between_warn_and_reject_writes_and_persists() {
     );
 
     let result = write_memory_db("warned_note", &body, WriteMode::Overwrite, "global")
+        .await
         .expect("mid-size write must succeed (warning is non-fatal)");
     assert!(result.contains("Written to memory"), "got: {result}");
 
     let stored = read_memory_db("warned_note", "global")
+        .await
         .expect("read ok")
         .expect("warned entry must still be persisted");
     assert_eq!(stored.len(), body.len());
 }
 
-#[test]
-fn over_20k_rejected_and_not_persisted() {
+#[tokio::test]
+async fn over_20k_rejected_and_not_persisted() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -162,6 +165,7 @@ fn over_20k_rejected_and_not_persisted() {
     );
 
     let err = write_memory_db("oversized", &body, WriteMode::Overwrite, "global")
+        .await
         .expect_err("over-cap write must Err per spec");
     let msg = format!("{err:#}");
     assert!(
@@ -171,7 +175,9 @@ fn over_20k_rejected_and_not_persisted() {
 
     // Confirm DB has nothing at this name — rejection must be atomic, not
     // half-written.
-    let stored = read_memory_db("oversized", "global").expect("read ok");
+    let stored = read_memory_db("oversized", "global")
+        .await
+        .expect("read ok");
     assert!(
         stored.is_none(),
         "rejected entry must not be persisted; found {} bytes",
@@ -179,8 +185,8 @@ fn over_20k_rejected_and_not_persisted() {
     );
 }
 
-#[test]
-fn append_mode_uses_combined_size_for_cap_check() {
+#[tokio::test]
+async fn append_mode_uses_combined_size_for_cap_check() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -191,11 +197,13 @@ fn append_mode_uses_combined_size_for_cap_check() {
     // the cap together.
     let half = body_with_target_tokens(15_000);
     write_memory_db("rolling", &half, WriteMode::Overwrite, "global")
+        .await
         .expect("first half writes ok");
     // Confirm seed succeeded.
-    assert!(read_memory_db("rolling", "global").unwrap().is_some());
+    assert!(read_memory_db("rolling", "global").await.unwrap().is_some());
 
     let err = write_memory_db("rolling", &half, WriteMode::Append, "global")
+        .await
         .expect_err("append that pushes total over cap must Err");
     let msg = format!("{err:#}");
     assert!(
@@ -206,6 +214,7 @@ fn append_mode_uses_combined_size_for_cap_check() {
     // The original entry must remain — a rejected append must not corrupt
     // the existing value.
     let stored = read_memory_db("rolling", "global")
+        .await
         .expect("read ok")
         .expect("seed entry must survive a rejected append");
     assert_eq!(
@@ -214,8 +223,8 @@ fn append_mode_uses_combined_size_for_cap_check() {
     );
 }
 
-#[test]
-fn injection_scanner_rejects_override_phrase_under_cap() {
+#[tokio::test]
+async fn injection_scanner_rejects_override_phrase_under_cap() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -228,6 +237,7 @@ fn injection_scanner_rejects_override_phrase_under_cap() {
     assert!(estimate_tokens(body) < MEMORY_ENTRY_WARN_TOKENS);
 
     let err = write_memory_db("malicious", body, WriteMode::Overwrite, "global")
+        .await
         .expect_err("override phrase must be rejected by the injection scanner");
     let msg = format!("{err:#}").to_lowercase();
     // Two assertions on the same error: confirm the *injection* filter
@@ -247,13 +257,16 @@ fn injection_scanner_rejects_override_phrase_under_cap() {
 
     // Must not persist.
     assert!(
-        read_memory_db("malicious", "global").unwrap().is_none(),
+        read_memory_db("malicious", "global")
+            .await
+            .unwrap()
+            .is_none(),
         "injection-rejected entry must not land in DB"
     );
 }
 
-#[test]
-fn read_back_through_low_level_db_matches_write_memory_db() {
+#[tokio::test]
+async fn read_back_through_low_level_db_matches_write_memory_db() {
     // Belt-and-suspenders: the high-level `write_memory_db` and the
     // low-level `Database::get_memory_entry` must agree on what is
     // persisted, so the assertions in the cap tests above can't be
@@ -264,11 +277,14 @@ fn read_back_through_low_level_db_matches_write_memory_db() {
     let _tmp = isolated_data_dir();
 
     let body = body_with_target_tokens(500);
-    write_memory_db("anchor", &body, WriteMode::Overwrite, "global").expect("ok");
+    write_memory_db("anchor", &body, WriteMode::Overwrite, "global")
+        .await
+        .expect("ok");
 
-    let db = Database::open().expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
     let row = db
         .get_memory_entry("global", "anchor")
+        .await
         .expect("ok")
         .expect("row present");
     assert_eq!(row.content, body);
