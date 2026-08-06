@@ -376,7 +376,7 @@ impl McpServerConfig {
             TransportSpec::Stdio { command, args, env } => mcp::manifest::Transport::Stdio {
                 command: command.clone(),
                 args: args.clone(),
-                env: resolve_secret_map(env, cfg, "env")?,
+                env: resolve_secret_map(env, cfg, &format!("mcp.servers.{name}.env"))?,
             },
             TransportSpec::Http {
                 url,
@@ -385,9 +385,19 @@ impl McpServerConfig {
                 client_cert,
                 client_key,
             } => mcp::manifest::Transport::Http {
-                url: url.clone(),
-                headers: resolve_secret_map(headers, cfg, "headers")?,
-                auth: resolve_auth(auth, cfg)?,
+                url: {
+                    // `url` never goes through `resolve_secret_placeholders`,
+                    // so it needs its own check — a trailing space here fails
+                    // as an unhelpful connect error.
+                    warn_if_padded(&format!("mcp.servers.{name}.url"), url);
+                    url.clone()
+                },
+                headers: resolve_secret_map(
+                    headers,
+                    cfg,
+                    &format!("mcp.servers.{name}.headers"),
+                )?,
+                auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
             },
             TransportSpec::Sse {
@@ -397,9 +407,19 @@ impl McpServerConfig {
                 client_cert,
                 client_key,
             } => mcp::manifest::Transport::Sse {
-                url: url.clone(),
-                headers: resolve_secret_map(headers, cfg, "headers")?,
-                auth: resolve_auth(auth, cfg)?,
+                url: {
+                    // `url` never goes through `resolve_secret_placeholders`,
+                    // so it needs its own check — a trailing space here fails
+                    // as an unhelpful connect error.
+                    warn_if_padded(&format!("mcp.servers.{name}.url"), url);
+                    url.clone()
+                },
+                headers: resolve_secret_map(
+                    headers,
+                    cfg,
+                    &format!("mcp.servers.{name}.headers"),
+                )?,
+                auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
             },
         };
@@ -526,11 +546,19 @@ fn resolve_client_identity(
     }
 }
 
-fn resolve_auth(spec: &HttpAuthSpec, cfg: &Config) -> Result<mcp::manifest::HttpAuth> {
+fn resolve_auth(
+    spec: &HttpAuthSpec,
+    cfg: &Config,
+    name: &str,
+) -> Result<mcp::manifest::HttpAuth> {
     match spec {
         HttpAuthSpec::None => Ok(mcp::manifest::HttpAuth::None),
         HttpAuthSpec::Bearer { token } => Ok(mcp::manifest::HttpAuth::Bearer {
-            token: resolve_secret_placeholders(token, cfg, "auth.bearer.token")?,
+            token: resolve_secret_placeholders(
+                token,
+                cfg,
+                &format!("mcp.servers.{name}.auth.bearer.token"),
+            )?,
         }),
     }
 }
@@ -546,6 +574,93 @@ fn resolve_secret_map(
         out.insert(k.clone(), resolved);
     }
     Ok(out)
+}
+
+/// What kind of invisible padding a config value carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaddingReport {
+    /// Leading whitespace characters.
+    pub leading: usize,
+    /// Trailing whitespace characters.
+    pub trailing: usize,
+    /// Which whitespace classes are present, e.g. `"LF"`, `"space, CR"`.
+    pub classes: String,
+}
+
+/// Describe leading/trailing whitespace on a config value, or `None` when
+/// there is none.
+///
+/// Interior whitespace is explicitly not flagged — `"Bearer a b"` and a
+/// multi-word header value are perfectly legal, and flagging them would make
+/// the warning noise. Only the invisible edges matter, because that is what a
+/// paste from a browser or a `cat` of a token file actually produces.
+///
+/// The report deliberately carries no fragment of the value, and not even its
+/// length: these values are credentials, and a length is entropy.
+pub(crate) fn padding_report(value: &str) -> Option<PaddingReport> {
+    if value.is_empty() || value.trim() == value {
+        return None;
+    }
+    let trimmed_start = value.trim_start();
+    let leading = value.len() - trimmed_start.len();
+    let trailing = trimmed_start.len() - trimmed_start.trim_end().len();
+
+    let edges: String = value
+        .chars()
+        .take(leading)
+        .chain(value.chars().rev().take(trailing))
+        .collect();
+    let mut classes = Vec::new();
+    for (ch, label) in [
+        (' ', "space"),
+        ('\t', "tab"),
+        ('\r', "CR"),
+        ('\n', "LF"),
+    ] {
+        if edges.contains(ch) {
+            classes.push(label);
+        }
+    }
+    if edges.chars().any(|c| c.is_whitespace() && !" \t\r\n".contains(c)) {
+        classes.push("other");
+    }
+    Some(PaddingReport {
+        leading,
+        trailing,
+        classes: classes.join(", "),
+    })
+}
+
+/// Warn once per config key about invisible padding on a resolved value.
+///
+/// Never mutates: silently trimming would change a legitimately padded header
+/// value with no trace. Never logs the value. Deduped by key path because
+/// `resolve_to_manifest` runs on every connect and hot-reload, so a flapping
+/// server would otherwise fill the log.
+fn warn_if_padded(key_path: &str, value: &str) {
+    let Some(report) = padding_report(value) else {
+        return;
+    };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut guard = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.insert(key_path.to_string()) {
+            return;
+        }
+    }
+    tracing::warn!(
+        key = %key_path,
+        leading = report.leading,
+        trailing = report.trailing,
+        whitespace = %report.classes,
+        "MCP config value has leading/trailing whitespace — a pasted token with \
+         a trailing newline typically fails later as an opaque 401. The value is \
+         used as-is; re-set it without the padding."
+    );
 }
 
 /// Compiled lazily — the regex is shared across all calls.
@@ -586,6 +701,10 @@ pub fn resolve_secret_placeholders(value: &str, cfg: &Config, field: &str) -> Re
         last_end = whole.end();
     }
     out.push_str(&value[last_end..]);
+    // After interpolation on purpose: a credential sourced from the settings
+    // table or the environment can carry the trailing newline just as easily
+    // as a literal in the config can.
+    warn_if_padded(field, &out);
     Ok(out)
 }
 
@@ -940,5 +1059,83 @@ mod tests {
             err.contains("client_key") && err.contains("client_cert"),
             "error should explain the missing cert: {err}"
         );
+    }
+
+    // ── invisible whitespace on config values ─────────────────────────────
+
+    #[test]
+    fn padding_report_flags_only_edge_whitespace() {
+        // `"Bearer a b"` is the row that fails a naive
+        // `contains(char::is_whitespace)` implementation.
+        let cases: &[(&str, Option<(usize, usize)>)] = &[
+            ("tok", None),
+            ("", None),
+            ("Bearer a b", None),
+            ("multi word header value", None),
+            ("tok\n", Some((0, 1))),
+            (" tok", Some((1, 0))),
+            ("  tok\t\r\n", Some((2, 3))),
+            ("   ", Some((3, 0))),
+        ];
+        for (value, want) in cases {
+            let got = padding_report(value).map(|r| (r.leading, r.trailing));
+            assert_eq!(got, *want, "padding_report wrong for {value:?}");
+        }
+    }
+
+    #[test]
+    fn padding_report_names_the_whitespace_classes() {
+        let r = padding_report("tok\r\n").expect("padded");
+        assert!(r.classes.contains("CR"), "got: {}", r.classes);
+        assert!(r.classes.contains("LF"), "got: {}", r.classes);
+    }
+
+    #[test]
+    fn padding_report_never_contains_the_value() {
+        // These reports are rendered into ~/.borg/logs/. A future
+        // `format!("{value:?}")` would put the credential there.
+        let secret = "sk-live-super-secret-token";
+        let r = padding_report(&format!("{secret}\n")).expect("padded");
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains(secret), "report leaked the value: {rendered}");
+        assert!(
+            !rendered.contains("secret"),
+            "report leaked a fragment: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_sourced_padding_is_detected_after_interpolation() {
+        // This is what fails if the check runs *before* `${SECRET:…}`
+        // interpolation: the config literal is clean, the resolved value is
+        // not, and the resolved value is what reaches the server.
+        let _lock = env_lock();
+        let key = "BORG_TEST_MCP_PADDED";
+        let _g = EnvGuard::set(key, "sk-live-abc\n");
+        let cfg = Config::default();
+        let resolved =
+            resolve_secret_placeholders(&format!("${{SECRET:{key}}}"), &cfg, "headers[X-Api-Key]")
+                .expect("resolves");
+        assert!(
+            padding_report(&resolved).is_some(),
+            "trailing newline from the credential store must be detected"
+        );
+    }
+
+    #[test]
+    fn unresolved_placeholder_error_names_the_server_and_field() {
+        // The qualified key path is what makes the message actionable when
+        // several servers declare the same header name.
+        let _lock = env_lock();
+        let cfg = Config::default();
+        let err = resolve_secret_placeholders(
+            "${SECRET:BORG_TEST_MCP_DEFINITELY_MISSING}",
+            &cfg,
+            "mcp.servers.myserver.headers[X-Api-Key]",
+        )
+        .expect_err("missing credential must error");
+        let msg = err.to_string();
+        assert!(msg.contains("mcp.servers.myserver"), "got: {msg}");
+        assert!(msg.contains("X-Api-Key"), "got: {msg}");
     }
 }
