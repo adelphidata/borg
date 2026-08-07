@@ -1,13 +1,9 @@
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { useIsMobile } from "../lib/useIsMobile";
 
 /** In-column page heading rendered only at the mobile breakpoint. */
-export function MobileTitle({ children, style }: { children: ReactNode; style?: CSSProperties }) {
+export function MobileTitle({ children }: { children: ReactNode }) {
   const isMobile = useIsMobile();
   if (!isMobile) return null;
-  return (
-    <div className="mobile-title" style={style}>
-      {children}
-    </div>
-  );
+  return <div className="mobile-title">{children}</div>;
 }

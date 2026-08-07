@@ -7,7 +7,12 @@ import { LogoIcon } from "./icons";
 function NavItem({ route }: { route: AppRoute }) {
   const Icon = route.icon;
   return (
-    <NavLink to={route.path} end className={({ isActive }) => `nav-item${isActive ? " on" : ""}`}>
+    // `end` only on the root route so parent items stay lit on detail pages (matches TabBar).
+    <NavLink
+      to={route.path}
+      end={route.path === "/"}
+      className={({ isActive }) => `nav-item${isActive ? " on" : ""}`}
+    >
       {({ isActive }) => (
         <>
           <Icon size={16} />

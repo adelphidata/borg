@@ -4,36 +4,29 @@ import { MobileTitle } from "../../components/MobileTitle";
 import { PageChrome } from "../../components/PageChrome";
 import { ChevronIcon } from "../../components/icons";
 import { advancedGroups, basicSettings } from "../../data/mock";
-import { useSettings } from "../../lib/settings";
-import { useTheme } from "../../lib/theme";
+import { useSettingControl } from "../../lib/settings";
 
 export function SettingsPage() {
   const navigate = useNavigate();
-  const { theme } = useTheme();
-  const { values } = useSettings();
+  const { current } = useSettingControl();
   const [advOpen, setAdvOpen] = useState(false);
 
   return (
     <PageChrome title="Settings">
       <div className="settings-scroll">
         <div className="settings-col">
-          <MobileTitle style={{ marginBottom: 6 }}>Settings</MobileTitle>
+          <MobileTitle>Settings</MobileTitle>
 
-          {basicSettings.map((s) => {
-            // Appearance reflects the real theme; everything else reads the local store.
-            const value =
-              s.id === "appearance" ? (theme === "light" ? "Light" : "Dark") : values[s.id];
-            return (
-              <div key={s.id} className="setting-row" onClick={() => navigate(`/settings/${s.id}`)}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="name">{s.name}</div>
-                  {s.desc && <div className="desc">{s.desc}</div>}
-                </div>
-                <div className="value">{value}</div>
-                <ChevronIcon size={13} style={{ color: "var(--ink3)" }} />
+          {basicSettings.map((s) => (
+            <div key={s.id} className="setting-row" onClick={() => navigate(`/settings/${s.id}`)}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="name">{s.name}</div>
+                {s.desc && <div className="desc">{s.desc}</div>}
               </div>
-            );
-          })}
+              <div className="value">{current(s.id)}</div>
+              <ChevronIcon size={13} style={{ color: "var(--ink3)" }} />
+            </div>
+          ))}
 
           <div className="adv-toggle" onClick={() => setAdvOpen((v) => !v)}>
             <span className={`chev${advOpen ? " open" : ""}`}>

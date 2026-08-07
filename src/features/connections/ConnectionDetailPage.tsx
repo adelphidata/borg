@@ -1,7 +1,9 @@
 import { useNavigate, useParams } from "react-router-dom";
+import { AlertBanner } from "../../components/AlertBanner";
 import { BackLink } from "../../components/BackLink";
 import { PageChrome } from "../../components/PageChrome";
 import { Pill } from "../../components/Pill";
+import { StatusDot } from "../../components/StatusDot";
 import { connected, findConnection } from "../../data/mock";
 
 /**
@@ -26,7 +28,7 @@ export function ConnectionDetailPage() {
     );
   }
 
-  const isConnected = connected.some((c) => c.id === conn.id);
+  const isConnected = connected.includes(conn);
 
   return (
     <PageChrome
@@ -45,24 +47,10 @@ export function ConnectionDetailPage() {
                 {isConnected ? conn.sub : (conn.blurb ?? "Not connected yet.")}
               </div>
             </div>
-            {isConnected &&
-              (conn.needsAttention ? (
-                <span className="alert-dot" />
-              ) : (
-                <span className="neon-dot" />
-              ))}
+            {isConnected && <StatusDot needsAttention={conn.needsAttention} />}
           </div>
 
-          {conn.needsAttention && (
-            <div className="alert-banner">
-              <span className="dot" />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="title">The sign-in expired yesterday at 4:12pm</div>
-                <div className="sub">Nothing was lost — Borg queued three messages.</div>
-              </div>
-              <Pill variant="danger">Sign in again</Pill>
-            </div>
-          )}
+          <AlertBanner conn={conn} />
 
           {conn.can && (
             <section>

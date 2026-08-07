@@ -2,21 +2,14 @@ import { useParams } from "react-router-dom";
 import { BackLink } from "../../components/BackLink";
 import { PageChrome } from "../../components/PageChrome";
 import { CheckIcon } from "../../components/icons";
-import { findSetting, type SettingOption } from "../../data/mock";
-import { useSettings } from "../../lib/settings";
-import { useTheme } from "../../lib/theme";
-
-const APPEARANCE_OPTIONS: SettingOption[] = [
-  { value: "Light", desc: "Paper and ink." },
-  { value: "Dark", desc: "Neon on black. The classic." },
-];
+import { findSetting } from "../../data/mock";
+import { useSettingControl } from "../../lib/settings";
 
 /** One setting, expanded into a picker. Selections persist locally until borgd lands. */
 export function SettingDetailPage() {
   const { id = "" } = useParams();
   const setting = findSetting(id);
-  const { values, setValue } = useSettings();
-  const { theme, toggleTheme } = useTheme();
+  const { current, select } = useSettingControl();
 
   if (!setting) {
     return (
@@ -31,17 +24,8 @@ export function SettingDetailPage() {
     );
   }
 
-  // Appearance is backed by the real theme, everything else by the settings store.
-  const isAppearance = setting.id === "appearance";
-  const options = isAppearance ? APPEARANCE_OPTIONS : (setting.options ?? []);
-  const current = isAppearance ? (theme === "light" ? "Light" : "Dark") : values[setting.id];
-  const select = (value: string) => {
-    if (isAppearance) {
-      if (value !== current) toggleTheme();
-    } else {
-      setValue(setting.id, value);
-    }
-  };
+  const options = setting.options ?? [];
+  const value = current(setting.id);
 
   return (
     <PageChrome title={setting.name}>
@@ -56,12 +40,12 @@ export function SettingDetailPage() {
 
           <div className="option-list">
             {options.map((o) => {
-              const on = o.value === current;
+              const on = o.value === value;
               return (
                 <div
                   key={o.value}
                   className={`option-row${on ? " on" : ""}`}
-                  onClick={() => select(o.value)}
+                  onClick={() => select(setting.id, o.value)}
                 >
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div className="value">{o.value}</div>

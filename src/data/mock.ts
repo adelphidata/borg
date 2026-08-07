@@ -1,6 +1,6 @@
 /** Placeholder data until borgd (gRPC daemon) integration lands. */
 
-export interface ConnectionActivity {
+interface ConnectionActivity {
   when: string;
   what: string;
 }
@@ -9,9 +9,12 @@ export interface Connection {
   id: string;
   badge: string;
   name: string;
-  sub: string;
+  /** Status line shown while connected. */
+  sub?: string;
   /** Red dot + banner treatment instead of the neon dot. */
   needsAttention?: boolean;
+  /** Banner copy shown while this connection needs the user. */
+  alert?: { title: string; stackedTitle: string; sub: string; action: string };
   /** One-line pitch shown before connecting. */
   blurb?: string;
   /** What Borg can do once this is connected. */
@@ -19,7 +22,7 @@ export interface Connection {
   activity?: ConnectionActivity[];
 }
 
-export interface HealthCheck {
+interface HealthCheck {
   id: string;
   name: string;
   value: string;
@@ -43,12 +46,12 @@ export interface Setting {
   options?: SettingOption[];
 }
 
-export interface AdvancedGroup {
+interface AdvancedGroup {
   name: string;
   rows: { key: string; desc: string; value: string }[];
 }
 
-export interface OnboardingStep {
+interface OnboardingStep {
   title: string;
   body: string;
   cta: string;
@@ -127,6 +130,12 @@ export const connected: Connection[] = [
     name: "Gmail",
     sub: "needs sign-in",
     needsAttention: true,
+    alert: {
+      title: "Gmail stopped working yesterday at 4:12pm",
+      stackedTitle: "Gmail needs you",
+      sub: "The sign-in expired. Nothing was lost — Borg queued three messages.",
+      action: "Sign in again",
+    },
     can: [
       "Read and triage new mail",
       "Draft and send replies for your approval",
@@ -144,49 +153,42 @@ export const available: Connection[] = [
     id: "slack",
     badge: "SL",
     name: "Slack",
-    sub: "",
     blurb: "Borg joins the channels you choose and speaks only when spoken to.",
   },
   {
     id: "discord",
     badge: "DC",
     name: "Discord",
-    sub: "",
     blurb: "A presence in your server that can fetch, summarise and post.",
   },
   {
     id: "teams",
     badge: "MT",
     name: "Teams",
-    sub: "",
     blurb: "Work chat without leaving the conversation here.",
   },
   {
     id: "google-chat",
     badge: "GC",
     name: "Google Chat",
-    sub: "",
     blurb: "Spaces and DMs, watched quietly.",
   },
   {
     id: "whatsapp",
     badge: "TW",
     name: "WhatsApp",
-    sub: "",
     blurb: "Reach Borg from the app you already use.",
   },
   {
     id: "outlook",
     badge: "OL",
     name: "Outlook",
-    sub: "",
     blurb: "Mail and calendar in one connection.",
   },
   {
     id: "notion",
     badge: "NO",
     name: "Notion",
-    sub: "",
     blurb: "Read and write the pages you point it at.",
   },
 ];
@@ -244,6 +246,12 @@ export const checks: HealthCheck[] = [
   },
 ];
 
+/** Attention dots for the nav, derived from the data above. */
+export const routeAlerts: Record<string, boolean> = {
+  connections: connected.some((c) => c.needsAttention),
+  health: checks.some((c) => !c.ok),
+};
+
 export const basicSettings: Setting[] = [
   {
     id: "model",
@@ -280,7 +288,17 @@ export const basicSettings: Setting[] = [
       { value: "Never", desc: "You'll always start the conversation." },
     ],
   },
-  { id: "appearance", name: "Appearance", desc: "", value: "" }, // value derived from theme at render time
+  {
+    // Store default only — the live value reads and writes the theme (see useResolvedSettings).
+    id: "appearance",
+    name: "Appearance",
+    desc: "",
+    value: "Dark",
+    options: [
+      { value: "Light", desc: "Paper and ink." },
+      { value: "Dark", desc: "Neon on black. The classic." },
+    ],
+  },
   {
     id: "start-login",
     name: "Start when I log in",

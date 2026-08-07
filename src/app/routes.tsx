@@ -2,10 +2,9 @@ import type { ComponentType } from "react";
 import { ChatIcon, GearIcon, PlugIcon, ShieldIcon, type IconProps } from "../components/icons";
 import { ConversationPage } from "../features/conversation/ConversationPage";
 import { ConnectionsPage } from "../features/connections/ConnectionsPage";
-import { ConnectionDetailPage } from "../features/connections/ConnectionDetailPage";
-import { SettingDetailPage } from "../features/settings/SettingDetailPage";
 import { HealthPage } from "../features/health/HealthPage";
 import { SettingsPage } from "../features/settings/SettingsPage";
+import { routeAlerts } from "../data/mock";
 
 export interface AppRoute {
   id: string;
@@ -44,7 +43,7 @@ export const routes: AppRoute[] = [
     icon: PlugIcon,
     page: ConnectionsPage,
     section: "primary",
-    hasAlert: true,
+    hasAlert: routeAlerts.connections,
   },
   {
     id: "health",
@@ -54,6 +53,7 @@ export const routes: AppRoute[] = [
     icon: ShieldIcon,
     page: HealthPage,
     section: "secondary",
+    hasAlert: routeAlerts.health,
   },
   {
     id: "settings",
@@ -64,13 +64,4 @@ export const routes: AppRoute[] = [
     page: SettingsPage,
     section: "secondary",
   },
-];
-
-/**
- * Detail sub-pages reachable from the pages above. Rendered by the router but
- * never shown in the Sidebar or tab bar.
- */
-export const detailRoutes: { id: string; path: string; page: ComponentType }[] = [
-  { id: "connection-detail", path: "/connections/:id", page: ConnectionDetailPage },
-  { id: "setting-detail", path: "/settings/:id", page: SettingDetailPage },
 ];

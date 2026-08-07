@@ -1167,6 +1167,9 @@ a:hover {
   letter-spacing: -0.025em;
   color: var(--ink);
 }
+.settings-col .mobile-title {
+  margin-bottom: 6px;
+}
 .tab-bar {
   flex: none;
   height: 72px;

@@ -8,11 +8,11 @@ import { checks } from "../../data/mock";
 export function HealthPage() {
   const [openId, setOpenId] = useState<string | null>(null);
   // No daemon yet — "Check again" just refreshes the mock timestamp.
-  const [checkedJustNow, setCheckedJustNow] = useState(false);
-  const lastChecked = checkedJustNow ? "last checked just now" : "last checked 4 minutes ago";
+  const [lastChecked, setLastChecked] = useState("a few minutes ago");
+  const failing = checks.filter((c) => !c.ok);
 
   return (
-    <PageChrome title="Health" meta={lastChecked}>
+    <PageChrome title="Health" meta={`last checked ${lastChecked}`}>
       <div className="health-scroll">
         <div className="health-col">
           <MobileTitle>Health</MobileTitle>
@@ -24,8 +24,8 @@ export function HealthPage() {
             <div style={{ flex: 1, paddingTop: 2 }}>
               <h1>Borg is healthy.</h1>
               <p>
-                One thing needs you: the Gmail sign-in expired. Everything else checked out{" "}
-                {checkedJustNow ? "just now" : "four minutes ago"}.
+                {failing.length > 0 && <>One thing needs you: the {failing[0].name}. </>}
+                Everything else checked out {lastChecked}.
               </p>
             </div>
           </div>
@@ -58,7 +58,7 @@ export function HealthPage() {
           </div>
 
           <div className="health-actions">
-            <Pill variant="primary" onClick={() => setCheckedJustNow(true)}>
+            <Pill variant="primary" onClick={() => setLastChecked("just now")}>
               Check again
             </Pill>
             <Pill>Tidy up now</Pill>

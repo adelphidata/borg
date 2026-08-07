@@ -1,7 +1,9 @@
 import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
+const indexHtml = path.join(__dirname, "..", "dist", "index.html");
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -40,10 +42,20 @@ function createWindow() {
   });
 
   // Security: keep top-level navigation inside the app; send anything else to the browser.
+  // Exact origin/file comparison — prefix checks would let localhost:51737 (dev) or any
+  // local file:// path (prod) count as internal.
   win.webContents.on("will-navigate", (event, url) => {
-    const internal = isDev
-      ? url.startsWith(process.env.VITE_DEV_SERVER_URL!)
-      : url.startsWith("file:");
+    let internal = false;
+    try {
+      const target = new URL(url);
+      target.search = "";
+      target.hash = "";
+      internal = isDev
+        ? target.origin === new URL(process.env.VITE_DEV_SERVER_URL!).origin
+        : target.href === pathToFileURL(indexHtml).href;
+    } catch {
+      // unparseable URL → treated as external below
+    }
     if (!internal) {
       event.preventDefault();
       openExternally(url);
@@ -53,7 +65,7 @@ function createWindow() {
   if (isDev) {
     win.loadURL(process.env.VITE_DEV_SERVER_URL!);
   } else {
-    win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    win.loadFile(indexHtml);
   }
 }
 
