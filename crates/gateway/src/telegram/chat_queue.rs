@@ -9,6 +9,57 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(cortex::constants::SESSION_ID
 const QUEUE_CAPACITY: usize = cortex::constants::SESSION_QUEUE_CAPACITY;
 const MAX_ACTIVE_CHATS: usize = cortex::constants::MAX_ACTIVE_SESSIONS;
 
+/// Telegram's hard per-message length cap, counted in UTF-16 code units (the
+/// unit Telegram itself measures in). Clients split anything longer into
+/// several updates, which arrive here as separate messages.
+const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+
+/// A message at least this long is treated as a possible fragment of a longer
+/// paste. Slightly under the hard cap because clients break on a character
+/// boundary near the limit rather than exactly at it.
+const SPLIT_CHUNK_THRESHOLD: usize = TELEGRAM_MESSAGE_CHAR_LIMIT - 128;
+
+/// How long to wait for the next fragment of a split paste before deciding the
+/// message stands alone. Continuation updates follow within milliseconds; a
+/// human typing a second message does not.
+const CHUNK_COALESCE_WINDOW: Duration = Duration::from_millis(400);
+
+/// Ceilings on a single coalesced paste.
+///
+/// Every fragment restarts the 400 ms window, so without a cap a sender
+/// emitting near-limit messages back to back holds the consumer inside the
+/// merge loop indefinitely while the buffer grows without bound — the chat's
+/// idle timeout never gets a chance to fire. Past either ceiling the merge
+/// stops and the rest arrives as ordinary follow-up messages.
+const MAX_COALESCED_FRAGMENTS: usize = 32;
+/// Companion to [`MAX_COALESCED_FRAGMENTS`], bounding total merged length.
+const MAX_COALESCED_UNITS: usize = MAX_COALESCED_FRAGMENTS * TELEGRAM_MESSAGE_CHAR_LIMIT;
+
+/// Could this text be one fragment of a client-split paste?
+///
+/// Length alone is the signal, deliberately: the first fragment of a long
+/// `/command <prompt>` is a COMMAND update and the rest are plain TEXT
+/// updates, so keying on message kind would miss exactly the case that breaks.
+/// Short messages — `/stop`, `/approve`, ordinary chat — never qualify, so
+/// they keep the immediate path with no added latency.
+///
+/// Measured in UTF-16 code units, not `char`s: Telegram's cap is a UTF-16
+/// length. Counting `char`s would put an emoji-heavy 4096-unit fragment at
+/// roughly 2100 chars — under the threshold — so the most visibly split pastes
+/// would be the ones the coalescer never noticed.
+fn is_probable_split_chunk(text: &str) -> bool {
+    text.encode_utf16().count() >= SPLIT_CHUNK_THRESHOLD
+}
+
+/// Do two messages belong to the same paste?
+///
+/// A forum chat multiplexes topics onto one chat queue, and two people can
+/// post at once, so fragments must agree on sender and thread before they are
+/// joined. Getting this wrong would splice one user's text into another's.
+fn same_paste_origin(a: &QueuedMessage, b: &QueuedMessage) -> bool {
+    a.thread_id == b.thread_id && a.inbound.sender_id == b.inbound.sender_id
+}
+
 /// A message queued for sequential processing within a chat.
 pub struct QueuedMessage {
     /// Telegram chat ID this message belongs to.
@@ -95,27 +146,106 @@ impl ChatQueue {
     }
 }
 
+/// Absorb the continuation fragments of a client-split paste into `first`.
+///
+/// Returns the merged message plus, if the wait turned up a message that is
+/// *not* part of this paste, that message so the caller can process it next.
+/// It is deliberately handed back rather than dropped or re-sent: an mpsc
+/// receive cannot be undone, and re-enqueueing would reorder the chat.
+async fn coalesce_split_chunks(
+    mut first: QueuedMessage,
+    rx: &mut mpsc::Receiver<QueuedMessage>,
+) -> (QueuedMessage, Option<QueuedMessage>) {
+    let mut merged = std::mem::take(&mut first.inbound.text);
+    let mut fragments = 1usize;
+
+    loop {
+        let Ok(received) = tokio::time::timeout(CHUNK_COALESCE_WINDOW, rx.recv()).await else {
+            // Nothing followed in the window — the message stands alone.
+            break;
+        };
+        let Some(next) = received else {
+            // Channel closed; deliver what we have.
+            break;
+        };
+        if !same_paste_origin(&first, &next) {
+            first.inbound.text = merged;
+            return (first, Some(next));
+        }
+
+        let more_expected = is_probable_split_chunk(&next.inbound.text);
+        merged.push_str(&next.inbound.text);
+        fragments += 1;
+
+        // A fragment below the split threshold is the tail of the paste.
+        if !more_expected {
+            break;
+        }
+
+        // Stop merging past either ceiling. Whatever follows is delivered as
+        // its own message rather than keeping this loop — and the whole chat
+        // queue behind it — running on a stream that never drops below the
+        // threshold.
+        let units = merged.encode_utf16().count();
+        if fragments >= MAX_COALESCED_FRAGMENTS || units >= MAX_COALESCED_UNITS {
+            warn!(
+                fragments,
+                units,
+                "Split-paste coalescing hit its ceiling; delivering what has merged so far and \
+                 treating the remainder as separate messages"
+            );
+            break;
+        }
+    }
+
+    if fragments > 1 {
+        info!(
+            fragments,
+            units = merged.encode_utf16().count(),
+            "Coalesced a split Telegram paste into one message"
+        );
+    }
+    first.inbound.text = merged;
+    (first, None)
+}
+
 /// Process messages for a single chat sequentially.
 /// Exits after IDLE_TIMEOUT of inactivity.
+///
+/// A paste longer than Telegram's per-message cap arrives as several updates.
+/// When the first carries a command (`/queue <long prompt>`), dispatching each
+/// update independently ran the command against a truncated prompt and then
+/// delivered the remaining fragments as fresh messages — which interrupt the
+/// turn the command just started. Near-cap messages are therefore held briefly
+/// so their continuations can be joined before the handler sees them.
 async fn chat_consumer(
     chat_id: i64,
     mut rx: mpsc::Receiver<QueuedMessage>,
     handler: MessageHandler,
 ) {
+    // A message received while coalescing that turned out to belong to a
+    // different sender/thread; processed before the channel is polled again.
+    let mut carry: Option<QueuedMessage> = None;
+
     loop {
-        match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
-            Ok(Some(msg)) => {
-                handler(msg).await;
-            }
-            Ok(None) => {
-                // Channel closed
-                break;
-            }
-            Err(_) => {
-                // Idle timeout
-                break;
-            }
-        }
+        let msg = match carry.take() {
+            Some(msg) => msg,
+            None => match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
+                Ok(Some(msg)) => msg,
+                // Channel closed, or idle timeout.
+                Ok(None) | Err(_) => break,
+            },
+        };
+
+        let msg = if is_probable_split_chunk(&msg.inbound.text) {
+            let (merged, leftover) = coalesce_split_chunks(msg, &mut rx).await;
+            carry = leftover;
+            merged
+        } else {
+            msg
+        };
+
+        handler(msg).await;
     }
     info!("Chat consumer for {chat_id} exiting");
 }
@@ -138,6 +268,50 @@ mod tests {
             metadata: serde_json::Value::Null,
             peer_kind: None,
         }
+    }
+
+    fn queued(text: &str) -> QueuedMessage {
+        QueuedMessage {
+            chat_id: 1,
+            inbound: make_inbound(text),
+            thread_id: None,
+            message_id: None,
+        }
+    }
+
+    /// Every near-cap fragment restarts the coalesce window, so a sender that
+    /// keeps emitting them holds the consumer in the merge loop and grows the
+    /// buffer without bound — the chat's idle timeout can never fire. The merge
+    /// has to stop at a ceiling and let the rest arrive as ordinary messages.
+    #[tokio::test]
+    async fn coalescing_stops_at_the_fragment_ceiling() {
+        let (tx, mut rx) = mpsc::channel::<QueuedMessage>(4);
+        let chunk = "a".repeat(SPLIT_CHUNK_THRESHOLD);
+
+        // Far more continuation fragments than the ceiling permits, none of
+        // them ever dropping below the split threshold.
+        let feeder_chunk = chunk.clone();
+        let feeder = tokio::spawn(async move {
+            for _ in 0..(MAX_COALESCED_FRAGMENTS * 3) {
+                if tx.send(queued(&feeder_chunk)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (merged, _leftover) = coalesce_split_chunks(queued(&chunk), &mut rx).await;
+        drop(rx);
+        let _ = feeder.await;
+
+        let absorbed = merged.inbound.text.len() / chunk.len();
+        assert!(
+            absorbed <= MAX_COALESCED_FRAGMENTS,
+            "merge must stop at the ceiling, absorbed {absorbed} fragments"
+        );
+        assert!(
+            merged.inbound.text.encode_utf16().count() <= MAX_COALESCED_UNITS,
+            "merged length must stay under the unit ceiling"
+        );
     }
 
     #[tokio::test]
@@ -329,5 +503,186 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// Collect the text of every message the handler is given, in order.
+    fn recording_handler() -> (MessageHandler, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let handler: MessageHandler = Arc::new(move |msg: QueuedMessage| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().await.push(msg.inbound.text);
+            })
+        });
+        (handler, seen)
+    }
+
+    fn inbound_from(sender: &str, text: &str) -> crate::handler::InboundMessage {
+        let mut inbound = make_inbound(text);
+        inbound.sender_id = sender.into();
+        inbound
+    }
+
+    /// REGRESSION: Telegram splits a paste over 4096 chars into several
+    /// updates. A long `/queue <prompt>` therefore arrived as a near-cap
+    /// COMMAND chunk plus plain-TEXT continuations — the command ran against a
+    /// truncated prompt, and each continuation landed as a fresh message that
+    /// interrupted the turn the command had just started. The fragments must
+    /// reach the handler as one message.
+    #[tokio::test]
+    async fn split_paste_is_delivered_as_one_message() {
+        let (handler, seen) = recording_handler();
+        let queue = ChatQueue::new(handler);
+
+        let head = format!("/queue {}", "a".repeat(SPLIT_CHUNK_THRESHOLD));
+        let tail = "b".repeat(50);
+
+        for text in [head.clone(), tail.clone()] {
+            queue
+                .enqueue(QueuedMessage {
+                    chat_id: 1,
+                    inbound: make_inbound(&text),
+                    thread_id: None,
+                    message_id: None,
+                })
+                .await;
+        }
+
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW + Duration::from_millis(300)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            seen.len(),
+            1,
+            "the continuation must not arrive as a second message — that is what \
+             interrupts the running turn"
+        );
+        assert_eq!(
+            seen[0],
+            format!("{head}{tail}"),
+            "the command must see the whole prompt, not a truncated prefix"
+        );
+    }
+
+    /// Short messages must keep the immediate path. Adding the coalesce delay
+    /// to `/stop` would make an interrupt feel broken.
+    #[tokio::test]
+    async fn short_messages_are_not_delayed_or_merged() {
+        let (handler, seen) = recording_handler();
+        let queue = ChatQueue::new(handler);
+
+        for text in ["/stop", "/approve"] {
+            queue
+                .enqueue(QueuedMessage {
+                    chat_id: 1,
+                    inbound: make_inbound(text),
+                    thread_id: None,
+                    message_id: None,
+                })
+                .await;
+        }
+
+        // Well under the coalesce window: short messages must already be through.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            *seen,
+            vec!["/stop".to_string(), "/approve".to_string()],
+            "short messages must stay separate and immediate"
+        );
+    }
+
+    /// A forum chat multiplexes topics and senders onto one queue. A message
+    /// from someone else that lands mid-coalesce must be delivered on its own,
+    /// in order — never spliced into another user's paste, never dropped.
+    #[tokio::test]
+    async fn foreign_sender_is_not_spliced_into_a_paste() {
+        let (handler, seen) = recording_handler();
+        let queue = ChatQueue::new(handler);
+
+        let head = "a".repeat(SPLIT_CHUNK_THRESHOLD);
+        queue
+            .enqueue(QueuedMessage {
+                chat_id: 1,
+                inbound: inbound_from("42", &head),
+                thread_id: None,
+                message_id: None,
+            })
+            .await;
+        queue
+            .enqueue(QueuedMessage {
+                chat_id: 1,
+                inbound: inbound_from("99", "hello from someone else"),
+                thread_id: None,
+                message_id: None,
+            })
+            .await;
+
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW + Duration::from_millis(300)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            *seen,
+            vec![head, "hello from someone else".to_string()],
+            "the other sender's message must be delivered separately and in order"
+        );
+    }
+
+    /// A near-cap message with no continuation is a legitimate long message.
+    /// It must still be delivered once the window closes, not held forever.
+    #[tokio::test]
+    async fn lone_near_cap_message_is_still_delivered() {
+        let (handler, seen) = recording_handler();
+        let queue = ChatQueue::new(handler);
+
+        let text = "a".repeat(SPLIT_CHUNK_THRESHOLD);
+        queue
+            .enqueue(QueuedMessage {
+                chat_id: 1,
+                inbound: make_inbound(&text),
+                thread_id: None,
+                message_id: None,
+            })
+            .await;
+
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW + Duration::from_millis(300)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            *seen,
+            vec![text],
+            "a lone long message must not be stranded"
+        );
+    }
+
+    /// Three-plus fragment pastes must all join: the loop has to keep waiting
+    /// while each fragment is itself near the cap.
+    #[tokio::test]
+    async fn multi_fragment_paste_joins_completely() {
+        let (handler, seen) = recording_handler();
+        let queue = ChatQueue::new(handler);
+
+        let a = "a".repeat(SPLIT_CHUNK_THRESHOLD);
+        let b = "b".repeat(SPLIT_CHUNK_THRESHOLD);
+        let c = "c".repeat(10);
+
+        for text in [&a, &b, &c] {
+            queue
+                .enqueue(QueuedMessage {
+                    chat_id: 1,
+                    inbound: make_inbound(text),
+                    thread_id: None,
+                    message_id: None,
+                })
+                .await;
+        }
+
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW * 2 + Duration::from_millis(400)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1, "all three fragments belong to one message");
+        assert_eq!(seen[0], format!("{a}{b}{c}"));
     }
 }
