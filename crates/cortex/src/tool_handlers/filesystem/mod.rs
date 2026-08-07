@@ -5,9 +5,12 @@
 //!   ACP text-bridge integration, patch-DSL path extraction & normalization.
 //! - [`listing`] — `list_dir` with recursive walk, fuzzy matching, pagination.
 //! - [`read`] — `read_file` (text + image multimodal) and `read_pdf`.
+//! - [`document`] — Word/PowerPoint/Excel/OpenDocument/RTF/EPUB/PDF →
+//!   Markdown conversion used by `read`.
 //! - [`blocked`] — security blocklist enforcement shared by the others.
 
 mod blocked;
+mod document;
 mod listing;
 mod patch;
 mod read;

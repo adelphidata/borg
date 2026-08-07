@@ -1,4 +1,5 @@
-//! `read_file` (text + image multimodal) and `read_pdf` tool handlers.
+//! `read_file` (text, documents, and image multimodal) and `read_pdf` tool
+//! handlers.
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -11,6 +12,7 @@ use crate::types::{ContentPart, MediaData, ToolOutput};
 
 use super::blocked::is_blocked_path;
 use super::default_execution_context;
+use super::document;
 use crate::tool_handlers::{optional_u64_param, require_str_param};
 
 /// Image file extensions that should be returned as multimodal content.
@@ -27,20 +29,114 @@ pub fn handle_read_pdf(args: &serde_json::Value) -> Result<String> {
     if !path.exists() {
         return Ok(format!("File not found: {file_path}"));
     }
-    match pdf_extract::extract_text(path) {
-        Ok(text) => {
-            if text.len() > max_chars {
-                let truncated: String = text.chars().take(max_chars).collect();
-                Ok(format!(
-                    "{truncated}\n\n[truncated — {max_chars}/{} chars shown]",
-                    text.len()
-                ))
-            } else {
-                Ok(text)
-            }
-        }
+    match document::convert(path) {
+        Ok(doc) => Ok(window_text(&doc.markdown, 1, 0, max_chars)),
         Err(e) => Ok(format!("Error reading PDF: {e}")),
     }
+}
+
+/// Convert a document named by a document extension, reporting the failure
+/// when it cannot be read — the caller asked for a `.docx`, so "this `.docx`
+/// is unreadable" is the useful answer.
+fn read_as_document(
+    path: &std::path::Path,
+    raw_path: &str,
+    offset: usize,
+    limit: usize,
+    max_chars: usize,
+) -> ToolOutput {
+    let doc = match document::convert(path) {
+        Ok(doc) => doc,
+        Err(e) => return ToolOutput::Text(format!("Error reading document {raw_path}: {e}")),
+    };
+
+    if doc.markdown.trim().is_empty() {
+        return ToolOutput::Text(format!(
+            "[No extractable text in {raw_path} — the document may be empty, or scanned images with no text layer]"
+        ));
+    }
+
+    // The extension can still be the wrong one *within* the document family
+    // (a `.doc` that is really a `.docx`), which the reader should know.
+    let mismatch = document::Format::from_path(path).is_some_and(|claimed| claimed != doc.format);
+    ToolOutput::Text(frame(&doc, mismatch, offset, limit, max_chars))
+}
+
+/// Try to read a file that failed a text read as a document, for the case
+/// where nothing about its name suggested one. Returns `None` when it is not
+/// a document, so the caller can report the original read failure instead of
+/// masking it with a conversion error.
+///
+/// Detection needs the whole file, not a prefix: ZIP packages (`.docx`,
+/// `.xlsx`, `.odt`, `.epub`) are identified through their central directory,
+/// which sits at the *end* of the container, and OLE files are opened whole.
+fn try_read_as_document(
+    path: &std::path::Path,
+    offset: usize,
+    limit: usize,
+    max_chars: usize,
+) -> Option<ToolOutput> {
+    let doc = document::convert(path).ok()?;
+    if doc.markdown.trim().is_empty() {
+        return None;
+    }
+    Some(ToolOutput::Text(frame(
+        &doc, true, offset, limit, max_chars,
+    )))
+}
+
+/// Prefix converted Markdown with the notice that says what it came from and
+/// that it is a read-only view.
+fn frame(
+    doc: &document::ConvertedDocument,
+    extension_mismatch: bool,
+    offset: usize,
+    limit: usize,
+    max_chars: usize,
+) -> String {
+    let mut output = document::conversion_header(doc, extension_mismatch);
+    output.push_str(&window_text(&doc.markdown, offset, limit, max_chars));
+    output
+}
+
+/// Apply the 1-based `offset`/`limit` line window and the `max_chars` ceiling,
+/// annotating the result whenever the caller is not seeing all of it.
+fn window_text(content: &str, offset: usize, limit: usize, max_chars: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    let start = (offset - 1).min(total_lines);
+    let end = if limit > 0 {
+        (start + limit).min(total_lines)
+    } else {
+        total_lines
+    };
+
+    let mut output = String::new();
+    for line in &lines[start..end] {
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    // Truncate if too long (safe for multi-byte UTF-8)
+    if output.len() > max_chars {
+        let truncate_at = output
+            .char_indices()
+            .take_while(|(i, _)| *i <= max_chars)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        output.truncate(truncate_at);
+        output.push_str(&format!(
+            "\n\n[truncated — {max_chars} chars shown, {total_lines} total lines]"
+        ));
+    } else if end < total_lines {
+        output.push_str(&format!(
+            "\n[showing lines {offset}–{end} of {total_lines}]"
+        ));
+    }
+
+    output
 }
 
 #[instrument(skip_all, fields(tool.name = "read_file"))]
@@ -110,10 +206,12 @@ pub fn handle_read_file_with_context(
         .unwrap_or("")
         .to_lowercase();
 
-    if ext == "pdf" {
-        let pdf_args =
-            serde_json::json!({"file_path": canonical.to_string_lossy(), "max_chars": max_chars});
-        return Ok(ToolOutput::Text(handle_read_pdf(&pdf_args)?));
+    // Word, PowerPoint, Excel, OpenDocument, RTF, EPUB and PDF are opaque to a
+    // text read, so they are converted to Markdown the moment they are read.
+    if document::is_convertible_extension(&ext) {
+        return Ok(read_as_document(
+            &canonical, raw_path, offset, limit, max_chars,
+        ));
     }
 
     if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
@@ -186,6 +284,14 @@ pub fn handle_read_file_with_context(
         match std::fs::read_to_string(&canonical) {
             Ok(c) => c,
             Err(e) => {
+                // The extension promised text but the bytes are not UTF-8.
+                // Before giving up, check whether this is a document wearing
+                // the wrong name — format detection reads the content
+                // signature, so a `.docx` saved as `.txt` still converts.
+                if let Some(converted) = try_read_as_document(&canonical, offset, limit, max_chars)
+                {
+                    return Ok(converted);
+                }
                 return Ok(ToolOutput::Text(format!(
                     "Error reading file: {e}. The file may be binary."
                 )));
@@ -197,42 +303,9 @@ pub fn handle_read_file_with_context(
         return Ok(ToolOutput::Text(format!("[File is empty: {raw_path}]")));
     }
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-
-    // Apply offset (1-based) and limit
-    let start = (offset - 1).min(total_lines);
-    let end = if limit > 0 {
-        (start + limit).min(total_lines)
-    } else {
-        total_lines
-    };
-
-    let mut output = String::new();
-    for line in &lines[start..end] {
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    // Truncate if too long (safe for multi-byte UTF-8)
-    if output.len() > max_chars {
-        let truncate_at = output
-            .char_indices()
-            .take_while(|(i, _)| *i <= max_chars)
-            .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        output.truncate(truncate_at);
-        output.push_str(&format!(
-            "\n\n[truncated — {max_chars} chars shown, {total_lines} total lines]"
-        ));
-    } else if end < total_lines {
-        output.push_str(&format!(
-            "\n[showing lines {offset}–{end} of {total_lines}]"
-        ));
-    }
-
-    Ok(ToolOutput::Text(output))
+    Ok(ToolOutput::Text(window_text(
+        &content, offset, limit, max_chars,
+    )))
 }
 
 /// Build a "file not found" message that surfaces the *resolved* absolute path

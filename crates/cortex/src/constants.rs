@@ -282,6 +282,11 @@ pub const MAX_IMAGE_FILE_SIZE: usize = 50 * 1024 * 1024;
 /// Image compression target size (1 MB).
 pub const IMAGE_COMPRESSION_TARGET: usize = 1_048_576;
 
+/// Max document file size for Markdown conversion (100 MB). Conversion reads
+/// the whole file into memory and expands it into a document model, so the
+/// ceiling guards peak RSS — it is not a correctness limit.
+pub const MAX_DOCUMENT_FILE_SIZE: usize = 100 * 1024 * 1024;
+
 // ── Gateway handler limits ─────────────────────────────────────────
 
 /// Max response size from agent before truncation (256 KB).

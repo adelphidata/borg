@@ -40,6 +40,7 @@ cron = { workspace = true }
 regex = { workspace = true }
 keyring = { workspace = true }
 pdf-extract = { workspace = true }
+anydoc = { workspace = true }
 shellexpand = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
