@@ -68,6 +68,7 @@ pub fn convert(path: &Path) -> Result<ConvertedDocument, DocumentError> {
     if metadata.len() > constants::MAX_DOCUMENT_FILE_SIZE as u64 {
         return Err(DocumentError::TooLarge {
             bytes: metadata.len(),
+            limit: constants::MAX_DOCUMENT_FILE_SIZE,
         });
     }
     let bytes = std::fs::read(path).map_err(DocumentError::Read)?;
@@ -84,6 +85,19 @@ pub fn convert_bytes(
         return Err(DocumentError::Unrecognized);
     };
 
+    // Container formats are ZIP archives, so the on-disk size bounds the
+    // *compressed* bytes only. A small crafted archive expands into arbitrarily
+    // large XML and then into an equally large Markdown string, all resident
+    // before anything downstream gets to window it — the on-disk ceiling alone
+    // is no defense. anydoc does not bound decompression, so hold a much lower
+    // ceiling for these and refuse the expansion outright past it.
+    if is_container_format(format) && bytes.len() > constants::MAX_CONTAINER_DOCUMENT_FILE_SIZE {
+        return Err(DocumentError::TooLarge {
+            bytes: bytes.len() as u64,
+            limit: constants::MAX_CONTAINER_DOCUMENT_FILE_SIZE,
+        });
+    }
+
     let converted = without_panicking("anydoc", || anydoc::to_markdown_bytes(bytes, format))
         .unwrap_or_else(|| {
             Err(ConvertError::Unsupported(
@@ -92,6 +106,14 @@ pub fn convert_bytes(
         });
 
     match converted {
+        Ok(markdown) if markdown.len() > constants::MAX_DOCUMENT_MARKDOWN_BYTES => {
+            // The expansion got past the input ceiling anyway. Refuse rather
+            // than hand a multi-gigabyte string to the windowing code, which
+            // would keep it alive for the length of the call.
+            Err(DocumentError::Expanded {
+                bytes: markdown.len() as u64,
+            })
+        }
         Ok(markdown) => Ok(ConvertedDocument {
             markdown,
             format,
@@ -151,14 +173,32 @@ fn pdf_fallback(bytes: &[u8]) -> Option<String> {
     Some(text)
 }
 
+/// ZIP-container formats, whose on-disk size says nothing about how much they
+/// expand to. OLE (`.doc`/`.ppt`/`.xls`) and the flat formats are not archives,
+/// so they stay on the plain file-size ceiling.
+fn is_container_format(format: Format) -> bool {
+    matches!(
+        format,
+        Format::Docx | Format::Pptx | Format::Excel | Format::Odt | Format::Ods | Format::Odp
+    ) || format == Format::Epub
+}
+
 /// Why a document could not be converted.
 #[derive(Debug)]
 pub enum DocumentError {
     /// The file could not be read off disk.
     Read(std::io::Error),
-    /// The file is past [`constants::MAX_DOCUMENT_FILE_SIZE`].
+    /// The file is past the size ceiling for its format.
     TooLarge {
         /// Actual file size in bytes.
+        bytes: u64,
+        /// The ceiling that was exceeded.
+        limit: usize,
+    },
+    /// The document parsed, but expanded past
+    /// [`constants::MAX_DOCUMENT_MARKDOWN_BYTES`] of Markdown.
+    Expanded {
+        /// Size of the produced Markdown in bytes.
         bytes: u64,
     },
     /// Neither the content signature nor the extension named a known format.
@@ -171,11 +211,17 @@ impl std::fmt::Display for DocumentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DocumentError::Read(e) => write!(f, "could not read file: {e}"),
-            DocumentError::TooLarge { bytes } => write!(
+            DocumentError::TooLarge { bytes, limit } => write!(
                 f,
                 "document too large ({} MB). Max {} MB.",
                 bytes / (1024 * 1024),
-                constants::MAX_DOCUMENT_FILE_SIZE / (1024 * 1024)
+                limit / (1024 * 1024)
+            ),
+            DocumentError::Expanded { bytes } => write!(
+                f,
+                "document expanded to {} MB of text, past the {} MB ceiling.",
+                bytes / (1024 * 1024),
+                constants::MAX_DOCUMENT_MARKDOWN_BYTES / (1024 * 1024)
             ),
             DocumentError::Unrecognized => {
                 write!(f, "unrecognized document format")
@@ -301,6 +347,35 @@ mod tests {
         let err = convert(&path).unwrap_err();
         assert!(matches!(err, DocumentError::TooLarge { .. }), "got {err:?}");
         assert!(err.to_string().contains("too large"), "got {err}");
+    }
+
+    /// A `.docx`/`.xlsx`/`.epub` is a ZIP archive, so the on-disk size bounds
+    /// only the compressed bytes — a few MB of crafted archive expands into
+    /// gigabytes of XML that the parser holds all at once. The plain 100 MB
+    /// file ceiling is no defense against that, so container formats must trip
+    /// their own much lower ceiling.
+    #[test]
+    fn container_formats_are_held_to_a_lower_ceiling_than_flat_ones() {
+        let oversized = vec![0u8; constants::MAX_CONTAINER_DOCUMENT_FILE_SIZE + 1];
+
+        // Well under MAX_DOCUMENT_FILE_SIZE, so only the container ceiling can
+        // reject this.
+        assert!(oversized.len() < constants::MAX_DOCUMENT_FILE_SIZE);
+
+        let err = convert_bytes(&oversized, Some(Format::Docx)).unwrap_err();
+        assert!(
+            matches!(err, DocumentError::TooLarge { limit, .. }
+                if limit == constants::MAX_CONTAINER_DOCUMENT_FILE_SIZE),
+            "a container past its ceiling must be refused, got {err:?}"
+        );
+
+        // RTF is not an archive: it expands roughly linearly, so the same byte
+        // count must get past the size guard and be judged on its content.
+        let err = convert_bytes(&oversized, Some(Format::Rtf)).unwrap_err();
+        assert!(
+            !matches!(err, DocumentError::TooLarge { .. }),
+            "a flat format must not inherit the container ceiling, got {err:?}"
+        );
     }
 
     /// `pdf-extract` panics on this fixture's malformed Type3 font metadata.

@@ -287,6 +287,22 @@ pub const IMAGE_COMPRESSION_TARGET: usize = 1_048_576;
 /// ceiling guards peak RSS — it is not a correctness limit.
 pub const MAX_DOCUMENT_FILE_SIZE: usize = 100 * 1024 * 1024;
 
+/// Max on-disk size for ZIP-container documents — `.docx`, `.xlsx`, `.pptx`,
+/// `.odt`, `.ods`, `.odp`, `.epub` (25 MB).
+///
+/// Deliberately far below [`MAX_DOCUMENT_FILE_SIZE`]: these are archives, so
+/// the compressed size bounds nothing. A crafted archive of a few MB expands
+/// to gigabytes of XML, and the parser holds all of it. Real documents of this
+/// kind are a few MB at most; a 25 MB one is already an outlier.
+pub const MAX_CONTAINER_DOCUMENT_FILE_SIZE: usize = 25 * 1024 * 1024;
+
+/// Max Markdown a single document may expand to (64 MB).
+///
+/// The backstop for what the input ceilings cannot see: whatever the archive
+/// held, the rendered text is refused past this rather than being carried
+/// through the read path in memory.
+pub const MAX_DOCUMENT_MARKDOWN_BYTES: usize = 64 * 1024 * 1024;
+
 // ── Gateway handler limits ─────────────────────────────────────────
 
 /// Max response size from agent before truncation (256 KB).
