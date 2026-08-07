@@ -144,6 +144,10 @@ impl SessionExecutor for StubExecutor {
     async fn cancel_all(&self) -> usize {
         0
     }
+
+    async fn active_turns(&self) -> usize {
+        0
+    }
 }
 
 /// Regression guard: when the heartbeat agent emits a `UserInputRequest`,

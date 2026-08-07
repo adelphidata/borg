@@ -190,6 +190,9 @@ mod tests {
         async fn cancel_all(&self) -> usize {
             0
         }
+        async fn active_turns(&self) -> usize {
+            0
+        }
     }
 
     fn admit(text: &str, sender: &str) -> AdmittedIngress {

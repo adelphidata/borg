@@ -220,20 +220,72 @@ impl GatewayServer {
             return Ok(());
         }
 
-        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
+        // Fail closed on a blank host. `gateway.host` is a free-text setting the
+        // agent itself can write, and this listener carries no mTLS — silently
+        // reading "" as "every interface" would turn a cleared setting into a
+        // public webhook endpoint. Make the operator say which interface.
+        if gateway_config.host.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "gateway.host is empty. Set it to an interface (`borg settings set gateway.host \
+                 127.0.0.1`), or to `0.0.0.0` to listen on every interface deliberately"
+            ));
+        }
+
+        // A wildcard host expands to one target per address family; anything
+        // else is a single target. Binding each family separately is what keeps
+        // the gateway reachable over IPv6 on hosted deploys.
+        let targets = bind_targets(&gateway_config.host, gateway_config.port);
+        let mut listeners = Vec::with_capacity(targets.len());
+        let mut bind_errors = Vec::new();
+        for target in &targets {
+            match tokio::net::TcpListener::bind(target).await {
+                Ok(l) => {
+                    info!("Gateway bound {target}");
+                    listeners.push(l);
+                }
+                Err(e) => bind_errors.push((target.clone(), e)),
+            }
+        }
+
+        if listeners.is_empty() {
+            let (first_target, first_err) = bind_errors
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("bind_targets never returns an empty list"));
+            return Err(if first_err.kind() == std::io::ErrorKind::AddrInUse {
                 anyhow::anyhow!(
-                    "Gateway port {addr} is already in use. Another borg instance may be running. \
-                     Stop it or change [gateway] port in config.toml"
+                    "Gateway port {first_target} is already in use. Another borg instance may be \
+                     running. Stop it or change the gateway port (`borg settings set gateway.port`)"
                 )
             } else {
-                anyhow::anyhow!("Failed to bind gateway to {addr}: {e}")
-            }
-        })?;
-        info!("Gateway listening on {addr} with {channel_count} channel(s)");
+                anyhow::anyhow!("Failed to bind gateway to {first_target}: {first_err}")
+            });
+        }
+
+        // A partial failure is expected and benign in two cases: a dual-stack
+        // host where the `[::]` listener already accepts IPv4 (the follow-up
+        // `0.0.0.0` bind hits AddrInUse), and a host with no IPv6 stack at all
+        // (AddrNotAvailable on `[::]`). Log it — never swallow it — but keep
+        // serving on what did bind.
+        for (target, e) in bind_errors {
+            warn!(
+                "Gateway could not bind {target}: {e} (continuing on {} other listener(s))",
+                listeners.len()
+            );
+        }
+
+        let bound: Vec<String> = listeners
+            .iter()
+            .map(|l| {
+                l.local_addr()
+                    .map_or_else(|_| "<unknown>".to_string(), |a| a.to_string())
+            })
+            .collect();
+        let bound_desc = bound.join(", ");
+        info!("Gateway listening on {bound_desc} with {channel_count} channel(s)");
         crate::activity::log_gateway_activity(
             "info",
-            &format!("Gateway listening on {addr} with {channel_count} channel(s)"),
+            &format!("Gateway listening on {bound_desc} with {channel_count} channel(s)"),
         )
         .await;
 
@@ -252,26 +304,59 @@ impl GatewayServer {
         self.spawn_signal_sse(&inits, &health);
         let poll_handles = self.spawn_poll_loops(&state, &health);
 
-        let shutdown = self.shutdown.clone();
-        let shutdown_tg_client = inits.telegram_client.clone();
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-            info!("Gateway shutting down");
+        // One `axum::serve` per listener, all watching the same shutdown token.
+        // The Telegram webhook teardown is one-shot, so it rides only the first
+        // listener's shutdown future — running it once per address family would
+        // race delete_webhook against itself.
+        let mut serves = Vec::with_capacity(listeners.len());
+        let mut shutdown_tg_client = inits.telegram_client.clone();
+        for listener in listeners {
+            let shutdown = self.shutdown.clone();
+            let tg_client = shutdown_tg_client.take();
+            let app = app.clone();
+            serves.push(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    shutdown.cancelled().await;
+                    info!("Gateway shutting down");
 
-            // Clean up Telegram webhook on shutdown
-            if let Some(client) = shutdown_tg_client {
-                if let Err(e) = client.delete_webhook().await {
-                    warn!("Failed to delete Telegram webhook on shutdown: {e}");
-                } else {
-                    info!("Telegram webhook removed");
-                }
+                    // Clean up Telegram webhook on shutdown
+                    if let Some(client) = tg_client {
+                        if let Err(e) = client.delete_webhook().await {
+                            warn!("Failed to delete Telegram webhook on shutdown: {e}");
+                        } else {
+                            info!("Telegram webhook removed");
+                        }
+                    }
+                })
+                .await
+            }));
+        }
+
+        // Await every listener even when one fails. Returning early would leave
+        // the sibling `axum::serve` tasks detached and still holding the port,
+        // so a supervisor respawn would hit AddrInUse against a gateway the
+        // caller believes it stopped. Cancelling the shutdown token first is
+        // what makes the remaining joins terminate.
+        let mut first_error: Option<anyhow::Error> = None;
+        for serve in serves {
+            let outcome = match serve.await {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => anyhow::anyhow!("Gateway listener failed: {e}"),
+                Err(e) => anyhow::anyhow!("Gateway listener task panicked: {e}"),
+            };
+            warn!("{outcome}");
+            self.shutdown.cancel();
+            if first_error.is_none() {
+                first_error = Some(outcome);
             }
-        })
-        .await?;
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
 
         // Drain poll tasks after the server stops so long-poll HTTP requests
         // finish before the process exits. A JoinError just means the task
@@ -1146,8 +1231,82 @@ async fn poke_handler(
     }
 }
 
+/// How long a restart waits for in-flight turns to finish before stopping
+/// anyway. A ceiling, not a promise: a wedged turn must not block a restart
+/// forever, but the common case (a turn a few seconds from done) should survive.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while draining. Short enough that an idle gateway restarts
+/// with no perceptible delay.
+const RESTART_DRAIN_POLL: Duration = Duration::from_millis(250);
+
+/// Expand a configured `host` into the concrete socket addresses to bind.
+///
+/// A wildcard host means "every interface", but `0.0.0.0` is the IPv4 wildcard
+/// *only* — binding it leaves the gateway unreachable on an IPv6-only network
+/// (a common hosted-deploy setup). `::` is not a safe substitute either: on a
+/// host with `bindv6only=1` it covers IPv6 alone, mirroring the bug. So a
+/// wildcard expands to one address per family and the caller binds each.
+///
+/// Any non-wildcard host is returned verbatim as a single target — an operator
+/// who names an interface gets exactly that interface.
+fn bind_targets(host: &str, port: u16) -> Vec<String> {
+    let trimmed = host.trim();
+    // Empty is deliberately NOT a wildcard — see `blank_host_is_not_a_wildcard`.
+    let is_wildcard = matches!(trimmed, "0.0.0.0" | "::" | "[::]" | "*");
+    if is_wildcard {
+        // IPv6 first, deliberately. On a dual-stack host (`bindv6only=0`, the
+        // Linux default) a `[::]` listener already accepts IPv4, so binding
+        // `0.0.0.0` first makes the subsequent `[::]` bind fail with
+        // `AddrInUse` and leaves the gateway IPv4-only — reinstating the exact
+        // bug this expansion exists to fix. In the reverse order the redundant
+        // bind is the IPv4 one, and losing it costs nothing.
+        vec![format!("[::]:{port}"), format!("0.0.0.0:{port}")]
+    } else if trimmed.contains(':') && !trimmed.starts_with('[') {
+        // Bare IPv6 literal — bracket it so `addr:port` parses.
+        vec![format!("[{trimmed}]:{port}")]
+    } else {
+        vec![format!("{trimmed}:{port}")]
+    }
+}
+
+/// Poll `exec` until no turns are in flight, or `timeout` elapses. Returns the
+/// number still running at exit — 0 means a clean drain, anything else means
+/// the ceiling was hit and the caller should stop anyway.
+///
+/// The timeout is deliberately a ceiling rather than a promise: a wedged turn
+/// must never make the gateway unrestartable.
+async fn wait_for_turns_to_drain(
+    exec: &dyn crate::session_executor::SessionExecutor,
+    timeout: Duration,
+    poll: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = exec.active_turns().await;
+        if remaining == 0 {
+            return 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return remaining;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// Restart the gateway: cancels the shutdown token so the owning process (daemon/TUI)
 /// can detect the clean exit and respawn with fresh config. Only localhost.
+///
+/// The cancel is **deferred until in-flight turns finish**. A restart is
+/// normally requested from inside a turn (`borg restart`, or the agent itself),
+/// and cancelling immediately tore down the gateway while that very turn was
+/// still running — it landed in the shutdown drain wait-set and was killed at
+/// the drain timeout, so the request that asked for the restart never got its
+/// reply. Draining first means the stop happens against an idle gateway.
+///
+/// The HTTP response returns immediately; the wait happens on a spawned task so
+/// the caller (often the in-flight turn itself) is never blocked on its own
+/// restart.
 async fn restart_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1160,10 +1319,53 @@ async fn restart_handler(
     }
     info!("Gateway restart requested via /internal/restart");
     crate::activity::log_gateway_activity("info", "Gateway restart requested").await;
-    state.shutdown.cancel();
+
+    // No executor installed (standalone gateway, tests) means no turns to
+    // drain — restart immediately rather than waiting out the full timeout.
+    let active = match crate::session_executor::global() {
+        Some(exec) => exec.active_turns().await,
+        None => 0,
+    };
+
+    if active == 0 {
+        state.shutdown.cancel();
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "restarting", "deferred": false})),
+        );
+    }
+
+    info!(
+        active,
+        "Deferring gateway restart until in-flight turns finish"
+    );
+    let shutdown = state.shutdown.clone();
+    let exec = crate::session_executor::global().cloned();
+    tokio::spawn(async move {
+        if let Some(exec) = exec {
+            let remaining =
+                wait_for_turns_to_drain(exec.as_ref(), RESTART_DRAIN_TIMEOUT, RESTART_DRAIN_POLL)
+                    .await;
+            if remaining == 0 {
+                info!("In-flight turns drained; restarting gateway");
+            } else {
+                warn!(
+                    remaining,
+                    timeout_secs = RESTART_DRAIN_TIMEOUT.as_secs(),
+                    "Restart drain timed out with turns still in flight; stopping anyway"
+                );
+            }
+        }
+        shutdown.cancel();
+    });
+
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({"status": "restarting"})),
+        axum::Json(serde_json::json!({
+            "status": "restarting",
+            "deferred": true,
+            "active_turns": active,
+        })),
     )
 }
 
@@ -1926,6 +2128,195 @@ description = "Script fallback"
         // Default config has no provider set — result depends on env vars
         // This test validates the detection logic compiles and runs without panic
         let _ = has_provider;
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Executor whose active-turn count follows a scripted sequence, so the
+    /// drain loop can be exercised without a live daemon.
+    struct DrainingExecutor {
+        counts: std::sync::Mutex<std::collections::VecDeque<usize>>,
+        /// Value returned once the script is exhausted.
+        tail: usize,
+        polls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::session_executor::SessionExecutor for DrainingExecutor {
+        async fn start_turn(
+            &self,
+            _turn: crate::session_executor::InboundTurn,
+        ) -> anyhow::Result<(
+            tokio::sync::mpsc::Receiver<cortex::agent::AgentEvent>,
+            CancellationToken,
+        )> {
+            anyhow::bail!("not used")
+        }
+        async fn cancel(&self, _key: &str) -> bool {
+            false
+        }
+        async fn cancel_all(&self) -> usize {
+            0
+        }
+        async fn active_turns(&self) -> usize {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.counts
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .unwrap_or(self.tail)
+        }
+    }
+
+    fn draining_executor(script: &[usize], tail: usize) -> (DrainingExecutor, Arc<AtomicUsize>) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        (
+            DrainingExecutor {
+                counts: std::sync::Mutex::new(script.iter().copied().collect()),
+                tail,
+                polls: polls.clone(),
+            },
+            polls,
+        )
+    }
+
+    /// REGRESSION: `/internal/restart` cancelled the shutdown token outright,
+    /// so the turn that requested the restart was still running when the
+    /// gateway tore down — it landed in the drain wait-set and was killed at
+    /// the drain timeout, and the request never got its reply. The restart
+    /// must wait for in-flight turns to reach zero first.
+    #[tokio::test(start_paused = true)]
+    async fn restart_drain_waits_for_in_flight_turns() {
+        let (exec, polls) = draining_executor(&[2, 2, 1], 0);
+
+        let remaining = wait_for_turns_to_drain(
+            &exec,
+            RESTART_DRAIN_TIMEOUT,
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert_eq!(
+            remaining, 0,
+            "the drain must report a clean exit once the last turn finishes"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            4,
+            "must keep polling while turns are live, then stop at the first zero"
+        );
+    }
+
+    /// The wait is a ceiling, not a promise: a wedged turn must never make the
+    /// gateway unrestartable. On timeout the drain reports what is still
+    /// running so the caller can stop anyway and say why.
+    #[tokio::test(start_paused = true)]
+    async fn restart_drain_gives_up_at_the_timeout() {
+        // Never drains.
+        let (exec, _polls) = draining_executor(&[], 3);
+
+        let remaining = wait_for_turns_to_drain(
+            &exec,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert_eq!(
+            remaining, 3,
+            "a timed-out drain must surface the still-running count, not silently report success"
+        );
+    }
+
+    /// REGRESSION: the gateway formatted one `host:port` into a single
+    /// `TcpListener::bind`, so an operator setting `0.0.0.0` for a hosted
+    /// deploy got an IPv4-only listener and the service was silently
+    /// unreachable over IPv6.
+    #[test]
+    fn wildcard_host_expands_to_both_address_families() {
+        let targets = bind_targets("0.0.0.0", 7842);
+        assert!(
+            targets.contains(&"0.0.0.0:7842".to_string()),
+            "IPv4 wildcard must still be bound: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"[::]:7842".to_string()),
+            "IPv6 wildcard must also be bound, or IPv6-only networks cannot reach the gateway: \
+             {targets:?}"
+        );
+
+        // `::` is not a safe stand-in for both: on a bindv6only=1 host it
+        // covers IPv6 alone, which is the same bug mirrored. It must expand
+        // identically.
+        assert_eq!(
+            bind_targets("::", 7842),
+            bind_targets("0.0.0.0", 7842),
+            "every wildcard spelling must expand to the same per-family set"
+        );
+    }
+
+    /// A blank `gateway.host` must never read as "every interface". It is a
+    /// free-text setting the agent can clear, and this listener has no mTLS, so
+    /// treating empty as a wildcard turns a cleared setting into a public
+    /// webhook endpoint. Blank has to fail, not expand.
+    #[test]
+    fn blank_host_is_not_a_wildcard() {
+        assert_ne!(
+            bind_targets("", 7842),
+            bind_targets("0.0.0.0", 7842),
+            "an empty host must not expand to the wildcard set"
+        );
+        assert!(
+            !bind_targets("", 7842).contains(&"0.0.0.0:7842".to_string()),
+            "an empty host must never produce an all-interfaces bind"
+        );
+    }
+
+    /// An operator who names a specific interface must get exactly that one —
+    /// expanding it would bind addresses they did not ask for, which for the
+    /// default `127.0.0.1` would mean silently exposing the gateway.
+    #[test]
+    fn explicit_host_binds_only_that_interface() {
+        assert_eq!(bind_targets("127.0.0.1", 7842), vec!["127.0.0.1:7842"]);
+        assert_eq!(bind_targets("192.168.1.5", 80), vec!["192.168.1.5:80"]);
+        assert_eq!(
+            bind_targets("example.internal", 443),
+            vec!["example.internal:443"]
+        );
+    }
+
+    /// A bare IPv6 literal has to be bracketed or `addr:port` parsing splits it
+    /// at the wrong colon and the bind fails with a confusing parse error.
+    #[test]
+    fn bare_ipv6_literal_is_bracketed() {
+        assert_eq!(bind_targets("::1", 7842), vec!["[::1]:7842"]);
+        assert_eq!(
+            bind_targets("fd00::1", 7842),
+            vec!["[fd00::1]:7842"],
+            "a ULA address must bind as written, not be re-expanded"
+        );
+        // Already-bracketed input must not be double-bracketed.
+        assert_eq!(bind_targets("[::1]", 7842), vec!["[::1]:7842"]);
+    }
+
+    /// An idle gateway must restart immediately — no drain delay at all.
+    #[tokio::test(start_paused = true)]
+    async fn restart_drain_returns_immediately_when_idle() {
+        let (exec, polls) = draining_executor(&[0], 0);
+
+        let remaining = wait_for_turns_to_drain(
+            &exec,
+            RESTART_DRAIN_TIMEOUT,
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "an idle gateway must not sleep even one poll interval before restarting"
+        );
     }
 }
 

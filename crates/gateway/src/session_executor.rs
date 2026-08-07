@@ -45,6 +45,14 @@ pub trait SessionExecutor: Send + Sync + 'static {
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)>;
     async fn cancel(&self, session_key: &str) -> bool;
     async fn cancel_all(&self) -> usize;
+
+    /// How many sessions currently have a turn in flight.
+    ///
+    /// Used by the restart path to drain before stopping. Without it, an
+    /// in-band restart cancels the shutdown token immediately and kills the
+    /// very turn that asked for the restart — the request never gets its
+    /// reply.
+    async fn active_turns(&self) -> usize;
 }
 
 pub type SessionExecutorHandle = Arc<dyn SessionExecutor>;

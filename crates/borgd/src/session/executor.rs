@@ -260,6 +260,15 @@ impl SessionExecutor for DaemonSessionExecutor {
         }
         count
     }
+
+    async fn active_turns(&self) -> usize {
+        self.registry
+            .live_ids()
+            .iter()
+            .filter_map(|id| self.registry.get(id))
+            .filter(super::SessionHost::is_busy)
+            .count()
+    }
 }
 
 #[cfg(test)]
