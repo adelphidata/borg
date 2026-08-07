@@ -1086,6 +1086,13 @@ mod tests {
     /// for the wrong terminal size.
     #[test]
     fn patch_render_is_memoized_per_width() {
+        // The cache key carries the process-global theme generation, so a
+        // sibling test swapping the palette mid-body would land this test's two
+        // calls under different keys and read as a miss. Hold the shared lock
+        // for the whole body, like every other test that touches the palette.
+        let _lock = crate::tui::themes::active::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The cache is thread-local and shared with other tests on this thread;
         // a unique patch body keeps this test independent of them.
         let patch = concat!(
