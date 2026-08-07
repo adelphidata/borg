@@ -466,7 +466,12 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
                             continue;
                         }
                     }
-                    if let Err(err) = std::fs::write(&full_path, &content) {
+                    // Same atomic writer the forward path uses: a rollback that
+                    // half-writes leaves the file in a third state that is
+                    // neither the pre-patch nor the post-patch content, and it
+                    // would drop the original's mode and owner too.
+                    if let Err(err) = crate::fs_atomic::atomic_write(&full_path, content.as_bytes())
+                    {
                         warn!("Rollback: failed to restore {}: {err}", full_path.display());
                     }
                 }

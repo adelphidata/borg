@@ -130,6 +130,15 @@ pub enum AgentEvent {
     },
     /// Token usage stats for the completed LLM call.
     Usage(UsageData),
+    /// An LLM request attempt went out on the wire — the first try, a retry, or
+    /// a provider-failover leg. Carries the retry index within the current
+    /// provider leg (0 for the first try).
+    ///
+    /// Purely a liveness signal; it says nothing about the response. Consumers
+    /// that render progress should ignore it. It exists so the sub-agent stall
+    /// watchdog can tell a slow provider from a wedged child — see
+    /// [`crate::multi_agent`]'s `StallWatchdog::on_event`.
+    LlmAttemptStarted { attempt: u32 },
     /// Progress update from a spawned sub-agent.
     SubAgentUpdate {
         /// Unique identifier for the sub-agent.
@@ -1471,7 +1480,10 @@ impl Agent {
                     return IterationOutcome::NudgeAndContinue;
                 }
                 let turn_id = format!("{}:{}", self.session.meta.id, self.turn_count);
-                if self.maybe_inject_goal_continuation(&turn_id).await {
+                if self
+                    .maybe_inject_goal_continuation(&turn_id, event_tx, cancel)
+                    .await
+                {
                     IterationOutcome::NudgeAndContinue
                 } else {
                     self.maybe_spawn_auto_title();

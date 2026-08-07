@@ -83,7 +83,7 @@ impl GoogleChatClient {
         text: &str,
         thread_name: Option<&str>,
     ) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
             self.send_single_message(space_name, chunk, thread_name)

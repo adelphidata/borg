@@ -287,6 +287,186 @@ impl Database {
     }
 }
 
+/// One quality gate attached to a session's goal.
+///
+/// A gate is a deterministic check the agent cannot talk its way past: the
+/// command must exit 0 before the goal is allowed to complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalGate {
+    /// Session the gate belongs to.
+    pub session_id: String,
+    /// 1-based position, and the handle `/goal gate remove <N>` takes.
+    pub ordinal: i64,
+    /// Shell command to run. User-supplied; runs through the sandboxed shell
+    /// path like any other command.
+    pub command: String,
+    /// Consecutive failed runs. Reset to 0 whenever the gate passes.
+    pub attempts: i64,
+    /// Exit code of the last run, or `None` if it has never run.
+    pub last_exit_code: Option<i64>,
+    /// Bounded tail of the last run's combined output.
+    pub last_output: Option<String>,
+    /// Workspace fingerprint the last run saw. A later run against the same
+    /// fingerprint replays the recorded verdict instead of re-running.
+    pub last_fingerprint: Option<String>,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+impl GoalGate {
+    /// Whether the last run failed. A gate that has never run has not failed.
+    pub fn last_run_failed(&self) -> bool {
+        matches!(self.last_exit_code, Some(code) if code != 0)
+    }
+}
+
+const GATE_COLS: &str = "session_id, ordinal, command, attempts, last_exit_code, \
+                         last_output, last_fingerprint, created_at";
+
+fn map_gate_row(row: &libsql::Row) -> Result<GoalGate> {
+    Ok(GoalGate {
+        session_id: row.get::<String>(0)?,
+        ordinal: row.get::<i64>(1)?,
+        command: row.get::<String>(2)?,
+        attempts: row.get::<i64>(3)?,
+        last_exit_code: row.get::<Option<i64>>(4)?,
+        last_output: row.get::<Option<String>>(5)?,
+        last_fingerprint: row.get::<Option<String>>(6)?,
+        created_at: row.get::<i64>(7)?,
+    })
+}
+
+impl Database {
+    /// Gates for `session_id`, in ordinal order.
+    pub async fn list_goal_gates(&self, session_id: &str) -> Result<Vec<GoalGate>> {
+        let sql =
+            format!("SELECT {GATE_COLS} FROM goal_gates WHERE session_id = ?1 ORDER BY ordinal");
+        let mut rows = self.conn.query(&sql, params!(session_id)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(map_gate_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Append a gate, returning it with its assigned ordinal.
+    ///
+    /// Ordinals are assigned as `max + 1` rather than `count + 1` so a removal
+    /// followed by an add cannot collide with a surviving row.
+    pub async fn add_goal_gate(&self, session_id: &str, command: &str) -> Result<GoalGate> {
+        let now = now_unix();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM goal_gates WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?;
+        let ordinal: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 1,
+        };
+        self.conn
+            .execute(
+                "INSERT INTO goal_gates
+                    (session_id, ordinal, command, attempts, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params!(session_id, ordinal, command, now),
+            )
+            .await?;
+        Ok(GoalGate {
+            session_id: session_id.to_string(),
+            ordinal,
+            command: command.to_string(),
+            attempts: 0,
+            last_exit_code: None,
+            last_output: None,
+            last_fingerprint: None,
+            created_at: now,
+        })
+    }
+
+    /// Remove one gate by ordinal. Returns whether a row was deleted.
+    pub async fn remove_goal_gate(&self, session_id: &str, ordinal: i64) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM goal_gates WHERE session_id = ?1 AND ordinal = ?2",
+                params!(session_id, ordinal),
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Remove every gate for the session. Returns how many were removed.
+    pub async fn clear_goal_gates(&self, session_id: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .execute(
+                "DELETE FROM goal_gates WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?)
+    }
+
+    /// Record the outcome of a gate run.
+    ///
+    /// `attempts` is a *no-progress* counter, not a turn counter: it feeds the
+    /// retry cap that parks a goal, and what should park a goal is the agent
+    /// failing repeatedly without changing anything, not merely taking several
+    /// turns to get there. So a pass resets it to 0, a failure after the
+    /// workspace changed restarts it at 1, and only a failure against an
+    /// untouched workspace increments.
+    pub async fn record_goal_gate_run(
+        &self,
+        session_id: &str,
+        ordinal: i64,
+        exit_code: i64,
+        output: &str,
+        fingerprint: Option<&str>,
+        made_progress: bool,
+    ) -> Result<()> {
+        let attempts_expr = if exit_code == 0 {
+            "0"
+        } else if made_progress {
+            "1"
+        } else {
+            "attempts + 1"
+        };
+        let sql = format!(
+            "UPDATE goal_gates
+                SET attempts = {attempts_expr},
+                    last_exit_code = ?3,
+                    last_output = ?4,
+                    last_fingerprint = ?5
+              WHERE session_id = ?1 AND ordinal = ?2"
+        );
+        self.conn
+            .execute(
+                &sql,
+                params!(session_id, ordinal, exit_code, output, fingerprint),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Zero the retry budget for every gate on a session.
+    ///
+    /// Called when a goal returns to `Active`. Without it, `/goal resume` after
+    /// a gate-exhaustion pause is a no-op: the first run re-reaches the cap and
+    /// immediately re-pauses, so the message telling the operator to resume
+    /// would be a lie.
+    pub async fn reset_goal_gate_attempts(&self, session_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE goal_gates SET attempts = 0 WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +754,153 @@ mod tests {
         assert_eq!(paused.status, GoalStatus::Paused);
         // Calling again on a Paused goal must be a no-op.
         assert!(db.pause_active_goal("s").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_ordinals_survive_a_removal() {
+        // Ordinals are the handle `/goal gate remove N` takes, so a new gate
+        // must never reuse a live one's number. Assigning `count + 1` would do
+        // exactly that after a middle removal.
+        let db = db_with_session("s").await;
+        for cmd in ["a", "b", "c"] {
+            db.add_goal_gate("s", cmd).await.unwrap();
+        }
+        assert!(db.remove_goal_gate("s", 2).await.unwrap());
+        let added = db.add_goal_gate("s", "d").await.unwrap();
+        assert_eq!(added.ordinal, 4, "must not collide with the surviving 3");
+
+        let ordinals: Vec<i64> = db
+            .list_goal_gates("s")
+            .await
+            .unwrap()
+            .iter()
+            .map(|g| g.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn removing_an_absent_gate_reports_it_rather_than_lying() {
+        let db = db_with_session("s").await;
+        db.add_goal_gate("s", "a").await.unwrap();
+        assert!(!db.remove_goal_gate("s", 99).await.unwrap());
+        assert_eq!(db.list_goal_gates("s").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_run_accumulates_attempts_and_a_pass_resets_them() {
+        // The attempt count is what the retry cap reads. If a pass didn't reset
+        // it, a gate that flapped once would be permanently closer to pausing
+        // the goal; if a failure didn't increment it, the cap would never fire
+        // and an unsatisfiable gate would loop until the token budget died.
+        let db = db_with_session("s").await;
+        let gate = db.add_goal_gate("s", "cargo test").await.unwrap();
+
+        for _ in 0..2 {
+            db.record_goal_gate_run("s", gate.ordinal, 1, "boom", Some("fp1"), false)
+                .await
+                .unwrap();
+        }
+        let after_failures = &db.list_goal_gates("s").await.unwrap()[0];
+        assert_eq!(after_failures.attempts, 2);
+        assert_eq!(after_failures.last_exit_code, Some(1));
+        assert_eq!(after_failures.last_output.as_deref(), Some("boom"));
+        assert_eq!(after_failures.last_fingerprint.as_deref(), Some("fp1"));
+        assert!(after_failures.last_run_failed());
+
+        db.record_goal_gate_run("s", gate.ordinal, 0, "ok", Some("fp2"), false)
+            .await
+            .unwrap();
+        let after_pass = &db.list_goal_gates("s").await.unwrap()[0];
+        assert_eq!(after_pass.attempts, 0, "a pass must reset the retry budget");
+        assert!(!after_pass.last_run_failed());
+    }
+
+    #[tokio::test]
+    async fn workspace_progress_restarts_the_retry_budget() {
+        // The cap must measure "the agent is stuck", not "this is taking a few
+        // turns". A Ralph loop editing code between failures is making progress
+        // and must not be parked; only failing again against an untouched
+        // workspace counts toward the cap.
+        let db = db_with_session("s").await;
+        let gate = db.add_goal_gate("s", "cargo test").await.unwrap();
+
+        for _ in 0..3 {
+            db.record_goal_gate_run("s", gate.ordinal, 1, "red", Some("fp1"), false)
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.list_goal_gates("s").await.unwrap()[0].attempts, 3);
+
+        // Agent edited something and the suite is still red: budget restarts.
+        db.record_goal_gate_run("s", gate.ordinal, 1, "red", Some("fp2"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.list_goal_gates("s").await.unwrap()[0].attempts,
+            1,
+            "progress must restart the budget rather than continue accumulating"
+        );
+    }
+
+    #[tokio::test]
+    async fn resetting_attempts_makes_resume_actually_grant_retries() {
+        // The exhaustion message tells the operator to `/goal resume`. Without
+        // this reset the first run after resuming re-reaches the cap and
+        // re-pauses, making that instruction a lie.
+        let db = db_with_session("s").await;
+        let a = db.add_goal_gate("s", "one").await.unwrap();
+        let b = db.add_goal_gate("s", "two").await.unwrap();
+        for g in [&a, &b] {
+            db.record_goal_gate_run("s", g.ordinal, 1, "red", Some("fp"), false)
+                .await
+                .unwrap();
+        }
+        assert!(db
+            .list_goal_gates("s")
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.attempts == 1));
+
+        db.reset_goal_gate_attempts("s").await.unwrap();
+
+        let gates = db.list_goal_gates("s").await.unwrap();
+        assert!(
+            gates.iter().all(|g| g.attempts == 0),
+            "every gate on the session gets a fresh budget"
+        );
+        // The recorded verdict itself is retained — resume grants retries, it
+        // does not pretend the gate was green.
+        assert!(gates.iter().all(|g| g.last_run_failed()));
+    }
+
+    #[tokio::test]
+    async fn gates_are_scoped_to_their_session() {
+        let db = db_with_session("s").await;
+        db.conn
+            .execute(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('other', 0, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.add_goal_gate("s", "mine").await.unwrap();
+        assert!(db.list_goal_gates("other").await.unwrap().is_empty());
+        assert_eq!(db.clear_goal_gates("other").await.unwrap(), 0);
+        assert_eq!(db.list_goal_gates("s").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_session_cascades_gates() {
+        // Gates outliving their session would resurrect against a recycled id.
+        let db = db_with_session("s").await;
+        db.add_goal_gate("s", "a").await.unwrap();
+        db.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params!("s"))
+            .await
+            .unwrap();
+        assert!(db.list_goal_gates("s").await.unwrap().is_empty());
     }
 
     #[tokio::test]

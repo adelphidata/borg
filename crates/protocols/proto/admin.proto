@@ -123,6 +123,8 @@ service Admin {
   rpc ClearGoal(GoalRef) returns (Empty);
   rpc PauseGoalOnInterrupt(GoalRef) returns (GoalDetail);
   rpc SubscribeGoalEvents(Empty) returns (stream GoalEvent);
+  rpc MutateGoalGates(GoalGateMutation) returns (GoalGateList);
+  rpc MutateSessionHeartbeat(SessionHeartbeatMutation) returns (SessionHeartbeatDetail);
 
   // Public-internet tunnel — start/stop/status. The daemon owns the
   // long-running provider (cloudflared / ngrok / tailscale / custom) under
@@ -877,6 +879,70 @@ message TunnelStatusReply {
   // Human-readable error from the last start attempt, if any. Drained
   // after a successful start.
   string error = 4;
+}
+
+// Quality gates: shell commands that must exit 0 before the goal completes.
+message GoalGate {
+  int64 ordinal = 1;
+  string command = 2;
+  // Consecutive failures; reset to 0 whenever the gate passes.
+  int64 attempts = 3;
+  // Absent until the gate has run at least once.
+  bool last_exit_code_present = 4;
+  int64 last_exit_code = 5;
+}
+
+message GoalGateList {
+  repeated GoalGate gates = 1;
+  // Human-readable outcome of the mutation, for the client to echo.
+  string report = 2;
+}
+
+message GoalGateMutation {
+  string session_id = 1;
+  Op op = 2;
+  // OP_ADD: the shell command.
+  string command = 3;
+  // OP_REMOVE: 1-based ordinal from a prior list.
+  int64 ordinal = 4;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_LIST = 1;
+    OP_ADD = 2;
+    OP_REMOVE = 3;
+    OP_CLEAR = 4;
+  }
+}
+
+// A recurring prompt that re-enters its own session when that session is idle.
+// Distinct from `scheduled_tasks`, which runs an isolated session per tick.
+message SessionHeartbeatDetail {
+  bool present = 1;
+  string session_id = 2;
+  string prompt = 3;
+  int64 interval_secs = 4;
+  bool paused = 5;
+  // Seconds until the next eligible fire; 0 when already due.
+  int64 seconds_until_due = 6;
+  // Human-readable outcome of the mutation, for the client to echo.
+  string report = 7;
+}
+
+message SessionHeartbeatMutation {
+  string session_id = 1;
+  Op op = 2;
+  // OP_SET: required.
+  string prompt = 3;
+  // OP_SET: clamped up to the 60s floor server-side.
+  int64 interval_secs = 4;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_STATUS = 1;
+    OP_SET = 2;
+    OP_PAUSE = 3;
+    OP_RESUME = 4;
+    OP_CLEAR = 5;
+  }
 }
 
 message GoalEvent {

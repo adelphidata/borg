@@ -1248,3 +1248,215 @@ async fn least_used_spreads_load_evenly() {
         "least_used must balance 6 leases evenly over 3 keys; got {counts:?}"
     );
 }
+
+/// Pool with exactly one config key, a 60s base cooldown and a 1h billing bench.
+async fn sole_credential_pool() -> (
+    std::sync::Arc<CredentialPool>,
+    std::sync::Arc<FixedClock>,
+    tempfile::TempDir,
+) {
+    let clock = std::sync::Arc::new(FixedClock(std::sync::atomic::AtomicI64::new(
+        1_000_000_000_000,
+    )));
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let pool = CredentialPool::load_with_clock(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![cortex::llm::credential_pool::ConfigEntry {
+                key: "sk-ant-only-key".to_string(),
+                label: Some("only".to_string()),
+                config_name: "llm.api_keys[0]".to_string(),
+            }],
+            env_vars: vec![],
+            oauth_home: None,
+        },
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    (pool, clock, db_dir)
+}
+
+#[tokio::test]
+async fn sole_credential_never_escalates_past_the_base_cooldown() {
+    // Geometric escalation is a rotation policy: it keeps a capped key from
+    // being re-probed ahead of healthy siblings. A one-key pool has no
+    // siblings, so escalating only benches the single credential the agent
+    // has — up to 64 minutes of hard downtime for what may be a one-second
+    // burst. The multi-key pool must keep escalating; this one must not.
+    let (pool, clock, _dir) = sole_credential_pool().await;
+    let id = pool.entries()[0].id.clone();
+
+    for attempt in 1..=8 {
+        let now = clock.now_ms() + 61_000;
+        clock.0.store(now, Ordering::SeqCst);
+        pool.report_failure(&id, FailoverReason::RateLimit, Some(429), None, None);
+        assert_eq!(
+            cooldown_len_secs(&pool, &id, now),
+            60,
+            "throttle {attempt} on a sole credential must stay at the base cooldown"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sole_credential_still_honors_a_provider_retry_after() {
+    // The provider knows its own bucket. Suppressing escalation must not
+    // suppress a longer hint the provider actually sent.
+    let (pool, clock, _dir) = sole_credential_pool().await;
+    let now = clock.now_ms();
+    let id = pool.entries()[0].id.clone();
+
+    pool.report_failure(
+        &id,
+        FailoverReason::RateLimit,
+        Some(429),
+        Some(std::time::Duration::from_secs(900)),
+        None,
+    );
+    assert_eq!(cooldown_len_secs(&pool, &id, now), 900);
+}
+
+#[tokio::test]
+async fn sole_credential_billing_bench_is_untouched_by_the_escalation_change() {
+    // Only the RateLimit arm was narrowed. A spent account still gets the full
+    // billing bench even when it is the only key — retrying it every 60s is the
+    // exact defect that bench exists to prevent.
+    let (pool, clock, _dir) = sole_credential_pool().await;
+    let now = clock.now_ms();
+    let id = pool.entries()[0].id.clone();
+
+    pool.report_failure(&id, FailoverReason::Billing, Some(402), None, None);
+    assert_eq!(cooldown_len_secs(&pool, &id, now), 3600);
+}
+
+#[tokio::test]
+async fn salvage_offers_a_throttled_credential_but_refuses_a_spent_one() {
+    // `pick_force` is the last gasp before the turn dies with "pool exhausted".
+    // A rate-limit bench is a window that expires, so trying it costs at most
+    // one request. Billing and permanent-auth benches need a human, so
+    // salvaging them would just re-create the every-60s hammering.
+    let (pool, clock, _dir) = sole_credential_pool().await;
+    let id = pool.entries()[0].id.clone();
+
+    pool.report_failure(&id, FailoverReason::RateLimit, Some(429), None, None);
+    assert_eq!(
+        pool.pick_force().map(|c| c.id),
+        Some(id.clone()),
+        "a throttled credential is worth one salvage attempt"
+    );
+
+    clock.0.store(clock.now_ms() + 61_000, Ordering::SeqCst);
+    pool.report_failure(&id, FailoverReason::Billing, Some(402), None, None);
+    assert!(
+        pool.pick_force().is_none(),
+        "a spent account must not be salvaged"
+    );
+}
+
+#[tokio::test]
+async fn salvage_prefers_the_soonest_recovering_salvageable_key() {
+    // With a mix, the gate must filter rather than abort: the billing-benched
+    // key is skipped even though it would sort first by reset time.
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let ids: Vec<String> = pool.entries().into_iter().map(|c| c.id).collect();
+
+    // Bench the first for billing with a short provider hint so it would win
+    // on reset time, and the second for an ordinary throttle.
+    pool.report_failure(
+        &ids[0],
+        FailoverReason::Billing,
+        Some(402),
+        Some(std::time::Duration::from_secs(1)),
+        None,
+    );
+    pool.report_failure(&ids[1], FailoverReason::RateLimit, Some(429), None, None);
+    let _ = clock;
+
+    assert_eq!(
+        pool.pick_force().map(|c| c.id),
+        Some(ids[1].clone()),
+        "the billing-benched key sorts first but must be skipped"
+    );
+}
+
+/// One key and no fallback slot — the shape of a default single-key install.
+/// `max_retries = 1` so the throttled first attempt benches the key and the
+/// second attempt reaches the salvage path with an empty pool and nowhere to
+/// fail over to.
+fn sole_key_no_fallback_config(server_uri: &str) -> Config {
+    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let var = format!("BORG_TEST_SOLE_KEY_{n}");
+    // SAFETY: serialized by SERIAL.
+    unsafe {
+        std::env::set_var(&var, format!("sk-sole-{n}"));
+    }
+
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".into());
+    config.llm.api_key_env = var.clone();
+    config.llm.base_url = Some(format!("{server_uri}/v1/chat/completions"));
+    config.llm.max_retries = 1;
+    config.llm.initial_retry_delay_ms = 1;
+    config.llm.api_keys = vec![SecretRef::Env { var }];
+    config.llm.credential_cooldown_secs = 60;
+    config
+}
+
+#[tokio::test]
+async fn sole_key_install_salvages_its_only_credential_instead_of_going_dark() {
+    // A single-key install has no sibling to rotate to and no fallback to fail
+    // over to, so a burst throttle used to end the turn outright: the key was
+    // benched for the cooldown and `acquire_lease` then refused it. The user
+    // saw "credential pool exhausted" for a throttle that had already cleared.
+    //
+    // With the last-gasp salvage the loop tries the cooling key once more,
+    // which is enough to ride out a transient burst.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let config = sole_key_no_fallback_config(&server.uri());
+
+    // First request throttles, every later one succeeds.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_done("recovered")),
+        )
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    let res = client.stream_chat(&user_message("hi"), None, tx).await;
+    let events = collect_events(rx).await;
+
+    assert!(
+        res.is_ok(),
+        "the salvage attempt must carry the turn: {res:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.contains("recovered")),
+        "the recovered answer must reach the caller, got: {events:?}"
+    );
+}

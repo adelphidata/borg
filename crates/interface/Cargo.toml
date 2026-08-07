@@ -11,6 +11,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
+coding = { path = "../coding" }
 cortex = { path = "../cortex" }
 heartbeat = { path = "../heartbeat" }
 gateway = { path = "../gateway" }

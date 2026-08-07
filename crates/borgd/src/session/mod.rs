@@ -268,8 +268,12 @@ impl SessionHost {
         let inner_fwd = inner.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(evt) = event_rx.recv().await {
-                let proto = convert::to_proto(evt, &inner_fwd.prompts);
-                inner_fwd.buffer.push(proto);
+                // `None` means the event is in-process only (liveness markers);
+                // it never reaches a remote client and consumes no sequence
+                // number.
+                if let Some(proto) = convert::to_proto(evt, &inner_fwd.prompts) {
+                    inner_fwd.buffer.push(proto);
+                }
             }
             // Turn fully streamed → session is idle again. This MUST remain the
             // FINAL statement of the forwarder: the next turn's `start_turn`

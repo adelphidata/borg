@@ -1278,6 +1278,7 @@ name = "coding"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "similar",
  "tempfile",
  "thiserror 2.0.19",
@@ -3903,6 +3904,7 @@ dependencies = [
  "borgd",
  "chrono",
  "clap",
+ "coding",
  "cortex",
  "crossterm",
  "dirs",

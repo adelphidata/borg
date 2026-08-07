@@ -124,10 +124,13 @@ pub async fn run_btw(
             StreamEvent::Done => break,
             // Failover identity only matters for the conversational
             // <environment> section; this one-shot helper has none to sync.
+            // AttemptStarted is a liveness marker for the sub-agent stall
+            // watchdog, which this one-shot path does not run under.
             StreamEvent::ThinkingDelta(_)
             | StreamEvent::Usage(_)
             | StreamEvent::Truncated
             | StreamEvent::ToolIntent
+            | StreamEvent::AttemptStarted { .. }
             | StreamEvent::Failover { .. } => {}
         }
     }

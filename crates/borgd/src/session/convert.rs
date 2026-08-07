@@ -26,11 +26,14 @@ pub const PROMPT_REQUEST_USER_INPUT: &str = "prompt_request:user_input";
 /// Companion to [`PROMPT_REQUEST_USER_INPUT`] for `ShellConfirmation`.
 pub const PROMPT_REQUEST_SHELL: &str = "prompt_request:shell";
 
-/// Translate one core event. Returns `None` only when the event has no
-/// useful wire representation (currently: no such case — every variant maps).
-pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEvent {
+/// Translate one core event. Returns `None` when the event has no useful wire
+/// representation — currently only `LlmAttemptStarted`, which is an in-process
+/// liveness marker for the sub-agent stall watchdog and carries nothing a
+/// remote client could render.
+pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::AgentEvent> {
     use pb::agent_event::Kind;
     let kind = match event {
+        CoreEvent::LlmAttemptStarted { .. } => return None,
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
         CoreEvent::ThinkingDelta(text) => Kind::ThinkingDelta(pb::ThinkingDelta { text }),
         CoreEvent::ToolExecuting {
@@ -136,10 +139,10 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
             Kind::SystemNotice(pb::SystemNotice { category, text })
         }
     };
-    pb::AgentEvent {
+    Some(pb::AgentEvent {
         event_seq: 0, // assigned by SequencedBuffer::push
         kind: Some(kind),
-    }
+    })
 }
 
 /// Translate a wire `pb::AgentEvent` back into a `core::AgentEvent` for
@@ -244,7 +247,7 @@ mod tests {
             command: "ls".into(),
             respond: tx,
         };
-        let proto = to_proto(event, &prompts);
+        let proto = to_proto(event, &prompts).expect("ShellConfirmation has a wire form");
         let pb::agent_event::Kind::ShellConfirmation(sc) = proto.kind.expect("kind") else {
             panic!("expected ShellConfirmation");
         };
@@ -279,7 +282,7 @@ mod tests {
             }],
             respond: tx,
         };
-        let proto = to_proto(event, &prompts);
+        let proto = to_proto(event, &prompts).expect("UserInputRequest has a wire form");
         let pb::agent_event::Kind::UserInputRequest(ui) = proto.kind.expect("kind") else {
             panic!("expected UserInputRequest");
         };
@@ -477,15 +480,23 @@ mod tests {
     fn turn_complete_and_error_are_terminal_other_events_are_not() {
         // Drives the "close the per-turn stream" decision in Session.Send.
         let prompts = Arc::new(PromptRegistry::default());
-        assert!(is_terminal(&to_proto(CoreEvent::TurnComplete, &prompts)));
-        assert!(is_terminal(&to_proto(
-            CoreEvent::Error("boom".into()),
-            &prompts
-        )));
-        assert!(!is_terminal(&to_proto(
-            CoreEvent::TextDelta("hi".into()),
-            &prompts
-        )));
-        assert!(!is_terminal(&to_proto(CoreEvent::Preparing, &prompts)));
+        let wire = |e: CoreEvent| to_proto(e, &prompts).expect("event has a wire form");
+        assert!(is_terminal(&wire(CoreEvent::TurnComplete)));
+        assert!(is_terminal(&wire(CoreEvent::Error("boom".into()))));
+        assert!(!is_terminal(&wire(CoreEvent::TextDelta("hi".into()))));
+        assert!(!is_terminal(&wire(CoreEvent::Preparing)));
+    }
+
+    #[test]
+    fn liveness_only_events_are_dropped_before_the_wire() {
+        // `LlmAttemptStarted` exists so the in-process sub-agent stall watchdog
+        // can tell a slow provider from a wedged child. It carries nothing a
+        // remote client could render, and forwarding it would burn a sequence
+        // number per retry on every session stream.
+        let prompts = Arc::new(PromptRegistry::default());
+        assert!(
+            to_proto(CoreEvent::LlmAttemptStarted { attempt: 0 }, &prompts).is_none(),
+            "liveness markers must not reach the wire"
+        );
     }
 }

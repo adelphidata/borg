@@ -526,6 +526,173 @@ pub async fn handle_run_shell_with_context(
     }
 }
 
+/// Outcome of a goal quality-gate command.
+#[derive(Debug, Clone)]
+pub struct GateRun {
+    /// Process exit status. `-1` when the command timed out or could not be
+    /// spawned, which counts as a failure like any other non-zero code.
+    pub exit_code: i32,
+    /// Combined stdout+stderr, already capped by the shell output limit.
+    pub output: String,
+}
+
+/// Run one goal quality-gate command and report its exit code and output.
+///
+/// Separate from [`handle_run_shell_with_context`] because a gate needs the
+/// *structured* result — the exit code decides whether the goal may complete,
+/// and the output tail becomes the agent's continuation prompt — where the tool
+/// path returns a single pre-formatted string for the model to read. It shares
+/// the same building blocks (sandbox wrapping, env allowlist, own process group
+/// with tree-kill on timeout), so a gate is confined exactly as an agent-issued
+/// command is.
+///
+/// The catastrophic-command policy and the control-plane-write guard both still
+/// apply; a refused gate reports as a failure rather than executing, and the
+/// refusal is audited.
+///
+/// Environment: gets the standard allowlist with **no** skill-declared
+/// credentials. A gate is operator-configured infrastructure rather than a
+/// skill invocation, and it re-runs unattended at every turn boundary, so it
+/// does not inherit a skill's secrets. A gate that needs a token must source it
+/// itself.
+pub async fn run_gate_command(
+    ctx: &ExecutionContext,
+    config: &Config,
+    policy: &ExecutionPolicy,
+    command: &str,
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> GateRun {
+    if crate::tool_handlers::filesystem::shell_command_targets_control_plane(command) {
+        return GateRun {
+            exit_code: -1,
+            output: deny_control_plane_write(command).await,
+        };
+    }
+    if matches!(policy.check(command), crate::policy::PolicyDecision::Deny) {
+        // Audited like the tool path: a gate re-executes at every turn
+        // boundary, so a denied gate command is *more* worth surfacing to
+        // post-hoc review than a one-shot denial, not less.
+        crate::db::try_emit_global(
+            crate::db::audit_events::SANDBOX_DENIAL,
+            "system",
+            &serde_json::json!({
+                "tool": "goal_gate",
+                "command_redacted": redact_command_for_audit(command),
+            }),
+        )
+        .await;
+        return GateRun {
+            exit_code: -1,
+            output: "gate command refused by the catastrophic-command policy".to_string(),
+        };
+    }
+
+    // Same absolute-path shell the tool path uses; sandbox profile generation
+    // rejects a bare `sh`.
+    #[cfg(unix)]
+    let (shell, shell_flag) = ("/bin/sh", "-c");
+    #[cfg(windows)]
+    let (shell, shell_flag) = ("cmd.exe", "/C");
+    let cwd_path = ctx.workspace_cwd().to_path_buf();
+    let (program, full_args) =
+        wrap_run_shell_for_sandbox(ctx, config, shell, shell_flag, command, &cwd_path);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&full_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.current_dir(&cwd_path);
+    crate::security::env_allowlist::apply_filtered_env(&mut cmd, &Default::default());
+    crate::util::process_tree::spawn_in_own_group(&mut cmd);
+
+    let mut child = match cmd.kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return GateRun {
+                exit_code: -1,
+                output: format!("gate command could not be started: {e}"),
+            }
+        }
+    };
+
+    // Registered like an agent-issued command so a long gate (a full test
+    // suite is minutes) is visible to `borg status` / `/doctor` instead of
+    // being an invisible stall at the turn boundary.
+    let _guard = ctx.process_registry().and_then(|reg| {
+        child.id().map(|pid| {
+            reg.register(
+                pid,
+                crate::process_registry::ProcessKind::RunShell,
+                command,
+                ctx.session_id().map(str::to_string),
+            )
+        })
+    });
+
+    // `stream_child_output` emits ToolOutputDelta events; a gate has no tool
+    // call to attribute them to, so they are drained and dropped. The drain
+    // task keeps the receiver alive so the sends don't error on every chunk.
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    // Interruptible: without this, a `/cancel` during a 5-minute gate is
+    // ignored until the timeout expires, because gates run at the turn
+    // boundary where the user has no other way in.
+    let result = tokio::select! {
+        r = stream_child_output(
+            &mut child,
+            timeout,
+            &tx,
+            "goal-gate",
+            "goal_gate",
+            resolved_shell_output_cap(config),
+        ) => r,
+        _ = cancel.cancelled() => {
+            crate::util::process_tree::kill_process_group(child.id());
+            drop(tx);
+            drain.abort();
+            if let Some(g) = _guard {
+                g.complete(None);
+            }
+            return GateRun {
+                exit_code: -1,
+                output: "gate command cancelled".to_string(),
+            };
+        }
+    };
+    drop(tx);
+    drain.abort();
+
+    match result {
+        Ok((stdout, stderr, code)) => {
+            if let Some(g) = _guard {
+                g.complete(code);
+            }
+            let output = if stderr.trim().is_empty() {
+                stdout
+            } else if stdout.trim().is_empty() {
+                stderr
+            } else {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            };
+            GateRun {
+                // A signal-killed child reports no code; treat that as failure
+                // rather than silently passing the gate.
+                exit_code: code.unwrap_or(-1),
+                output,
+            }
+        }
+        Err(e) => {
+            crate::util::process_tree::kill_process_group(child.id());
+            GateRun {
+                exit_code: -1,
+                output: format!("gate command did not complete: {e}"),
+            }
+        }
+    }
+}
+
 /// Message returned when a persistent-session action is requested but no
 /// session registry is installed (CLI/REPL/test — no running daemon).
 fn no_session_registry_msg() -> String {

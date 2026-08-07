@@ -120,6 +120,10 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
             StreamEvent::Failover { provider, model } => {
                 events.push(format!("failover:{provider}:{model}"));
             }
+            // Liveness marker for stall watchdogs, not an observable response
+            // event — recording it would perturb every event-sequence assertion
+            // in this file.
+            StreamEvent::AttemptStarted { .. } => {}
         }
     }
     events

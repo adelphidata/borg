@@ -365,6 +365,55 @@ impl Database {
         .await
     }
 
+    /// `session_heartbeats`: a recurring prompt that re-enters its own session.
+    ///
+    /// Wraps the v13 repair so the newest entry point stays a single call, per
+    /// the shared-`borg.db` stranding reason on [`Self::migrate_v11`]. The
+    /// table is `IF NOT EXISTS`, so a fresh install does no work.
+    pub(super) async fn migrate_v14(&self) -> Result<()> {
+        self.migrate_v13().await?;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_heartbeats (
+                    session_id    TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                    prompt        TEXT NOT NULL,
+                    interval_secs INTEGER NOT NULL,
+                    paused        INTEGER NOT NULL DEFAULT 0,
+                    next_fire_at  INTEGER NOT NULL,
+                    created_at    INTEGER NOT NULL
+                );",
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `goal_gates`: deterministic shell commands that must pass before a goal
+    /// completes.
+    ///
+    /// Wraps the v12 repair so each migration's entry point stays a single
+    /// call, per the shared-`borg.db` stranding reason on
+    /// [`Self::migrate_v11`]. The table is `IF NOT EXISTS`, so a fresh install
+    /// (which already has it from `SCHEMA_SQL`) does no work.
+    pub(super) async fn migrate_v13(&self) -> Result<()> {
+        self.migrate_v12().await?;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS goal_gates (
+                    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    ordinal          INTEGER NOT NULL,
+                    command          TEXT NOT NULL,
+                    attempts         INTEGER NOT NULL DEFAULT 0,
+                    last_exit_code   INTEGER,
+                    last_output      TEXT,
+                    last_fingerprint TEXT,
+                    created_at       INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, ordinal)
+                );",
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Add each absent `(column, type)` to `table`, skipping a table that
     /// doesn't exist at all.
     ///
@@ -716,6 +765,34 @@ CREATE TABLE IF NOT EXISTS goals (
     updated_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
+
+-- A recurring prompt that re-enters its own session when the session is idle
+-- and `next_fire_at` has passed. Distinct from `scheduled_tasks`, which runs a
+-- fresh isolated session per tick; this one reuses the live conversation.
+CREATE TABLE IF NOT EXISTS session_heartbeats (
+    session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    prompt       TEXT NOT NULL,
+    interval_secs INTEGER NOT NULL,
+    paused       INTEGER NOT NULL DEFAULT 0,
+    next_fire_at INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+
+-- Quality gates attached to a session's goal. A gate is a shell command that
+-- must exit 0 before the goal may complete; `last_fingerprint` records the
+-- workspace state it last ran against so an unchanged workspace replays the
+-- recorded verdict instead of re-running the command.
+CREATE TABLE IF NOT EXISTS goal_gates (
+    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal          INTEGER NOT NULL,
+    command          TEXT NOT NULL,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    last_exit_code   INTEGER,
+    last_output      TEXT,
+    last_fingerprint TEXT,
+    created_at       INTEGER NOT NULL,
+    PRIMARY KEY (session_id, ordinal)
+);
 
 CREATE TABLE IF NOT EXISTS token_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

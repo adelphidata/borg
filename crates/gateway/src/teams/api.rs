@@ -146,7 +146,7 @@ impl TeamsClient {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
-        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
             let url = activities_url(&base, conversation_id, Some(activity_id));
@@ -168,7 +168,7 @@ impl TeamsClient {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
-        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
             let url = activities_url(&base, conversation_id, None);
@@ -198,7 +198,7 @@ impl TeamsClient {
         validate_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
-        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = activities_url(&base, conversation_id, Some(activity_id));

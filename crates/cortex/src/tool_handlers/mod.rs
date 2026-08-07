@@ -4,7 +4,7 @@ mod media;
 mod memory;
 mod schedule;
 mod scripts;
-mod shell;
+pub(crate) mod shell;
 pub mod user_input;
 mod web;
 

@@ -359,6 +359,37 @@ async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
     run_git_inner(args, cwd, &[]).await
 }
 
+/// A cheap "has the tree changed?" token: `HEAD` plus a digest of
+/// `git status --porcelain`.
+///
+/// Returns `None` outside a git repo, or when either probe fails — callers must
+/// treat that as "unknown, assume changed" rather than as "unchanged", since a
+/// fingerprint that silently matched would suppress real work.
+///
+/// Deliberately not a content hash of the worktree: this runs at every goal
+/// turn boundary, and two bounded git probes are affordable where walking the
+/// tree is not. It follows `git status`, so it sees tracked edits, staged
+/// changes, and untracked files, but not edits to ignored files.
+pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
+    let repo_root = find_repo_root(cwd)?;
+    let (head, status) = tokio::join!(
+        run_git(&["rev-parse", "HEAD"], &repo_root),
+        run_git(&["status", "--porcelain"], &repo_root),
+    );
+    // A repo with no commits yet has no HEAD; its status alone still
+    // distinguishes states, so substitute a placeholder rather than bail.
+    let head = head.unwrap_or_else(|_| "no-head".to_string());
+    let status = status.ok()?;
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, head.as_bytes());
+    sha2::Digest::update(&mut hasher, b"\0");
+    sha2::Digest::update(&mut hasher, status.as_bytes());
+    Some(format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::finalize(hasher)
+    ))
+}
+
 /// Shared git runner. Always prepends [`hardened_prelude`] so a repository's
 /// own `core.fsmonitor`/hooks can't execute while we work in its tree, and
 /// applies any `extra_env` (e.g. `GIT_INDEX_FILE`, filter-neutralizing

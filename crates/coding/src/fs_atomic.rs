@@ -55,6 +55,15 @@ pub fn split_bom(s: &str) -> (bool, &str) {
 /// content is never world-readable during the write window, then chmod'd to the
 /// target's mode before the rename. A brand-new target gets ordinary
 /// umask-masked `0666` (the same default a plain create would produce).
+///
+/// Ownership (Unix): an in-place rewrite keeps the inode and therefore its
+/// owner for free; this function swaps in a new inode owned by the *writing*
+/// user. Rewriting a user-owned file as root — `sudo borg`, a container or NAS
+/// volume — would silently transfer it to root and lock the real owner out, so
+/// an existing target's uid/gid are restored onto the temp before the rename.
+/// Restoring is best-effort: an unprivileged process cannot chown, which is
+/// also the case where the owner has not changed, so a failure there is
+/// expected and must not fail the write.
 pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = full_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = full_path
@@ -71,11 +80,13 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // (EACCES, EIO, ELOOP) must propagate — treating it as new would let the
     // rename below rewrite a 0600-hardened target with umask-default perms.
     #[cfg(unix)]
-    let existing_perms = match std::fs::metadata(full_path) {
-        Ok(m) => Some(m.permissions()),
+    let existing_meta = match std::fs::metadata(full_path) {
+        Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+    #[cfg(unix)]
+    let existing_perms = existing_meta.as_ref().map(std::fs::Metadata::permissions);
 
     // Inner closure so a single `?`-chain covers create/write/flush, and we can
     // clean up the temp file on any failure.
@@ -106,6 +117,28 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(perms) = existing_perms.clone() {
             std::fs::set_permissions(&tmp_path, perms)?;
+        }
+        // Ownership last, and only when it would actually change: `fchown`
+        // requires privilege, so an ordinary user rewriting their own file
+        // would otherwise take an EPERM on every write. Deliberately not `?` —
+        // see the ownership note in the doc comment.
+        #[cfg(unix)]
+        if let Some(meta) = existing_meta.as_ref() {
+            use std::os::unix::fs::MetadataExt as _;
+            let (uid, gid) = (meta.uid(), meta.gid());
+            // SAFETY: plain libc getters, no arguments, always succeed.
+            let (self_uid, self_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            if (uid, gid) != (self_uid, self_gid) {
+                if let Err(e) = std::os::unix::fs::fchown(&f, Some(uid), Some(gid)) {
+                    tracing::warn!(
+                        path = %full_path.display(),
+                        uid,
+                        gid,
+                        error = %e,
+                        "could not restore file ownership across atomic write; the file is now owned by the writing user"
+                    );
+                }
+            }
         }
         Ok(())
     })();
@@ -207,6 +240,26 @@ mod tests {
             got, want,
             "new-file mode {got:o} != plain-create mode {want:o}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_owner_when_it_already_matches() {
+        use std::os::unix::fs::MetadataExt as _;
+        // The common case: an ordinary user rewriting their own file. The
+        // ownership branch must be a no-op here rather than attempting a
+        // privileged fchown that would fail the write with EPERM.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("owned.txt");
+        std::fs::write(&target, "old").unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let (uid, gid) = (before.uid(), before.gid());
+
+        atomic_write(&target, b"new").expect("write must not fail on an unprivileged chown path");
+
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!((after.uid(), after.gid()), (uid, gid));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]

@@ -20,6 +20,7 @@ mod pki;
 mod plugins;
 mod redaction_audit;
 mod scripts;
+mod session_heartbeat;
 mod sessions;
 mod settings;
 mod skill_audit;
@@ -37,11 +38,12 @@ mod tests;
 pub use audit_chain::{compute_row_hash, AuditChainOutcome, AuditChainRow, GENESIS_PREV_HASH};
 pub use audit_writer::{audit_events, install_global_audit, try_emit_global, AuditWriter};
 pub use device_pairing::{hash_pairing_code, ConsumeOutcome};
-pub use goals::{GoalAccountingOutcome, GoalUpdate};
+pub use goals::{GoalAccountingOutcome, GoalGate, GoalUpdate};
 pub use issue_state::IssueStateRow;
 pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use redaction_audit::RedactionAuditRow;
+pub use session_heartbeat::{SessionHeartbeat, MIN_HEARTBEAT_INTERVAL_SECS};
 pub use sessions::{MessageFtsHit, SessionEventDraft};
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
@@ -808,7 +810,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 12;
+    const CURRENT_VERSION: u32 = 14;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -834,7 +836,7 @@ impl Database {
             // damaged DB, where each step is individually idempotent, so a
             // crash or a rare concurrent-repair race just leaves work for
             // the next open instead of corrupting anything.
-            return self.migrate_v12().await;
+            return self.migrate_v14().await;
         }
 
         // Acquire the writer lock explicitly. libsql's `Transaction` API is
@@ -916,8 +918,14 @@ impl Database {
         if current < 12 {
             self.migrate_v12().await?;
         }
+        if current < 13 {
+            self.migrate_v13().await?;
+        }
+        if current < 14 {
+            self.migrate_v14().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 12,
+            Database::CURRENT_VERSION == 14,
             "add the new migrate_vN call above and bump this constant",
         );
 

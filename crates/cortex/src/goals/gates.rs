@@ -1,0 +1,199 @@
+//! Quality gates: deterministic checks a goal must pass before it completes.
+//!
+//! A goal's completion is otherwise declared by the model, which can be wrong
+//! or optimistic — a Ralph loop will happily call "fix the failing tests" done
+//! against a red suite. A gate is a shell command attached to the goal that
+//! must exit 0, evaluated at the turn boundary before any continuation is
+//! injected. A failing gate does two things: it blocks completion, and its exit
+//! code plus output tail become the continuation prompt, so the next turn
+//! argues with concrete evidence instead of a prose verdict.
+//!
+//! Gates run only at the turn boundary, never mid-turn, so `/goal gate …`
+//! management is always safe to issue while the agent is working.
+
+use crate::db::GoalGate;
+
+/// Bytes of gate output fed back to the model.
+///
+/// The tail, not the head: a failing test suite prints its summary and the
+/// first failure detail last, while the head is usually compilation noise.
+/// ~3 KB is enough for a few failures without crowding out the conversation.
+const GATE_OUTPUT_TAIL_BYTES: usize = 3072;
+
+/// What the gate pass decided for this turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// No gates configured, or every gate passed. The goal may be judged
+    /// complete and the loop continues normally.
+    AllPassed,
+    /// A gate failed and still has retries left. Carries the continuation
+    /// prompt built from its evidence.
+    Failed {
+        /// 1-based gate ordinal.
+        ordinal: i64,
+        /// Prompt to inject instead of the ordinary continuation.
+        prompt: String,
+    },
+    /// A gate exhausted its retry budget. The caller pauses the goal — the
+    /// agent has demonstrated it cannot satisfy this check on its own.
+    Exhausted {
+        /// 1-based gate ordinal.
+        ordinal: i64,
+        /// Operator-facing explanation.
+        message: String,
+    },
+}
+
+/// Keep the last [`GATE_OUTPUT_TAIL_BYTES`] of `output`, trimmed to a char
+/// boundary so the result stays valid UTF-8.
+pub(crate) fn output_tail(output: &str) -> &str {
+    if output.len() <= GATE_OUTPUT_TAIL_BYTES {
+        return output;
+    }
+    let start = output.len() - GATE_OUTPUT_TAIL_BYTES;
+    let start = (start..output.len())
+        .find(|i| output.is_char_boundary(*i))
+        .unwrap_or(output.len());
+    &output[start..]
+}
+
+/// Continuation prompt for a failed gate.
+///
+/// Deliberately concrete: the command, its exit code, and its real output. The
+/// point of a gate over an LLM judge is that the agent iterates against the
+/// actual failure rather than a summary of it.
+pub(crate) fn failure_prompt(gate: &GoalGate, exit_code: i64, output: &str) -> String {
+    let tail = output_tail(output);
+    let body = if tail.trim().is_empty() {
+        "(the command produced no output)"
+    } else {
+        tail
+    };
+    format!(
+        "A quality gate for this goal is failing, so the goal is not complete.\n\n\
+         <gate_failure ordinal=\"{ordinal}\" exit_code=\"{exit_code}\">\n\
+         <command>{command}</command>\n\
+         <output>\n{body}\n</output>\n\
+         </gate_failure>\n\n\
+         Fix the underlying problem so this command exits 0. Do not modify or \
+         remove the gate itself, and do not claim the goal is complete while it \
+         is failing.",
+        ordinal = gate.ordinal,
+        command = gate.command,
+    )
+}
+
+/// Message shown when a gate burns through its retry budget.
+pub(crate) fn exhausted_message(gate: &GoalGate, max_attempts: i64) -> String {
+    format!(
+        "Goal paused: quality gate {} (`{}`) failed {} times in a row. \
+         Fix it manually, drop it with `/goal gate remove {}`, then `/goal resume`.",
+        gate.ordinal, gate.command, max_attempts, gate.ordinal
+    )
+}
+
+/// Whether a recorded failure can be replayed instead of re-run.
+///
+/// A gate that failed against a workspace state identical to the current one
+/// will fail again — re-running a full test suite to learn that wastes minutes
+/// per turn. Both fingerprints must be present and equal: `None` means "we
+/// could not tell", which must fall through to a real run, because treating
+/// unknown as unchanged would suppress a check that should have happened.
+pub(crate) fn can_replay_failure(gate: &GoalGate, current: Option<&str>) -> bool {
+    match (gate.last_fingerprint.as_deref(), current) {
+        (Some(recorded), Some(now)) => gate.last_run_failed() && recorded == now,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate(ordinal: i64) -> GoalGate {
+        GoalGate {
+            session_id: "s".into(),
+            ordinal,
+            command: "cargo test".into(),
+            attempts: 0,
+            last_exit_code: None,
+            last_output: None,
+            last_fingerprint: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn failure_prompt_carries_the_real_evidence() {
+        // The whole reason a gate beats an LLM judge is that the agent gets the
+        // actual failure text. A prompt that only said "a gate failed" would
+        // leave it guessing.
+        let p = failure_prompt(&gate(2), 101, "test tests::foo ... FAILED\n1 failed");
+        assert!(p.contains("cargo test"), "must name the command: {p}");
+        assert!(p.contains("101"), "must carry the exit code: {p}");
+        assert!(p.contains("tests::foo"), "must carry the output: {p}");
+    }
+
+    #[test]
+    fn failure_prompt_survives_a_silent_command() {
+        // A command that fails with no output must still produce a usable
+        // prompt rather than an empty <output> block the model reads as noise.
+        let p = failure_prompt(&gate(1), 1, "   \n  ");
+        assert!(p.contains("no output"), "{p}");
+    }
+
+    #[test]
+    fn output_tail_keeps_the_end_and_stays_utf8() {
+        // Test runners put the summary and the first real failure at the end,
+        // so the tail is the informative half. Multi-byte characters near the
+        // cut must not be split.
+        let long = format!("{}✅ done", "x".repeat(GATE_OUTPUT_TAIL_BYTES * 2));
+        let tail = output_tail(&long);
+        assert!(tail.ends_with("✅ done"));
+        assert!(tail.len() <= GATE_OUTPUT_TAIL_BYTES);
+        // Short output is returned whole.
+        assert_eq!(output_tail("short"), "short");
+    }
+
+    #[test]
+    fn replay_requires_a_known_and_matching_fingerprint() {
+        let mut g = gate(1);
+        g.last_exit_code = Some(1);
+        g.last_fingerprint = Some("abc".into());
+
+        assert!(
+            can_replay_failure(&g, Some("abc")),
+            "same workspace, recorded failure → replay"
+        );
+        assert!(
+            !can_replay_failure(&g, Some("def")),
+            "workspace changed → must re-run"
+        );
+        // Unknown fingerprint (not a git repo, or a failed probe) must never
+        // read as "unchanged" — that would silently skip the check forever.
+        assert!(!can_replay_failure(&g, None), "unknown → must re-run");
+        g.last_fingerprint = None;
+        assert!(
+            !can_replay_failure(&g, Some("abc")),
+            "unknown → must re-run"
+        );
+    }
+
+    #[test]
+    fn a_passing_gate_is_never_replayed_as_a_failure() {
+        // Replay exists to skip re-running a known-red check. A green gate has
+        // nothing to replay, and treating it as one would block completion
+        // forever on a gate that already passed.
+        let mut g = gate(1);
+        g.last_exit_code = Some(0);
+        g.last_fingerprint = Some("abc".into());
+        assert!(!can_replay_failure(&g, Some("abc")));
+    }
+
+    #[test]
+    fn exhausted_message_tells_the_operator_how_to_get_unstuck() {
+        let m = exhausted_message(&gate(3), 3);
+        assert!(m.contains("/goal gate remove 3"), "{m}");
+        assert!(m.contains("/goal resume"), "{m}");
+    }
+}

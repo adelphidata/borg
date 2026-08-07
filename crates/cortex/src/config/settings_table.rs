@@ -112,6 +112,7 @@ define_settings! {
         "conversation.compaction_marker_tokens" => conversation.compaction_marker_tokens, parsed(usize);
         "conversation.max_transcript_chars" => conversation.max_transcript_chars, parsed(usize);
         "conversation.age_based_degradation" => conversation.age_based_degradation, parsed(bool);
+        "conversation.degradation_min_reclaim_tokens" => conversation.degradation_min_reclaim_tokens, parsed(usize);
         "conversation.protect_first_n" => conversation.protect_first_n, parsed(usize);
         "conversation.concurrent_tools.enabled" => conversation.concurrent_tools.enabled, parsed(bool);
         "conversation.concurrent_tools.max_workers" => conversation.concurrent_tools.max_workers, parsed(usize);
@@ -389,6 +390,8 @@ define_settings! {
         // ── Per-session goals (/goal) ──
         "goals.enabled" => goals.enabled, parsed(bool);
         "goals.default_token_budget" => goals.default_token_budget, opt_parsed(i64);
+        "goals.gate_timeout_ms" => goals.gate_timeout_ms, parsed(u64);
+        "goals.gate_max_attempts" => goals.gate_max_attempts, parsed(i64);
 
         // ── Discovery (mDNS + Tailscale peer enumeration) ──
         "discovery.mdns_enabled" => discovery.mdns_enabled, parsed(bool);

@@ -219,6 +219,18 @@ impl Agent {
                 self.stream_health.record_provider_switch();
                 self.active_failover_identity = Some((provider, model));
             }
+            StreamEvent::AttemptStarted { attempt } => {
+                // Liveness only — forward it so a sub-agent's stall watchdog
+                // sees that a request is in flight. A retry storm or a long
+                // prefill emits nothing else for minutes.
+                if event_tx
+                    .send(AgentEvent::LlmAttemptStarted { attempt })
+                    .await
+                    .is_err()
+                {
+                    trace!("Event channel closed, could not deliver attempt marker");
+                }
+            }
             StreamEvent::Done => return StreamEventOutcome::Terminal,
             StreamEvent::Error(e) => {
                 warn!("LLM stream emitted error mid-response: {e}");

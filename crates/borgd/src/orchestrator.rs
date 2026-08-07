@@ -125,6 +125,9 @@ pub async fn start(
     cost_event_sink: Arc<dyn CostEventSink>,
     goal_bus: GoalEventBus,
 ) -> OrchestratorHandles {
+    // Cloned before the executor takes ownership; the session-heartbeat poller
+    // needs the same live-session map to decide what is hosted and idle.
+    let heartbeat_registry = registry.clone();
     let executor = Arc::new(DaemonSessionExecutor::new(
         registry,
         config.clone(),
@@ -213,6 +216,30 @@ pub async fn start(
             }
         },
     );
+
+    // Session-heartbeat poller: fires each session's recurring prompt back into
+    // its own conversation when that session is idle and due. Supervised like
+    // every other long-running subsystem — a bare `tokio::spawn` here would
+    // silently stop firing after one panic.
+    {
+        let hb_shutdown = shutdown.clone();
+        let hb_registry = heartbeat_registry;
+        // Reuses the supervisor's handle rather than calling `Database::open()`
+        // per tick — that runs the migration check every time and contends the
+        // writer lock for the daemon's lifetime.
+        let hb_db = supervisor_db.clone();
+        spawn_supervised(
+            SupervisorConfig::new("session-heartbeat"),
+            hb_shutdown.clone(),
+            supervisor_db.clone(),
+            move || {
+                let hb_registry = hb_registry.clone();
+                let hb_db = hb_db.clone();
+                let cancel = hb_shutdown.child_token();
+                async move { crate::session_heartbeat::run(hb_registry, hb_db, cancel).await }
+            },
+        );
+    }
 
     // iMessage monitor (macOS only, optional).
     #[cfg(target_os = "macos")]

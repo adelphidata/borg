@@ -20,6 +20,27 @@ pub(super) enum TickOutcome {
     Cancel,
 }
 
+/// Raise the configured stale-cycle count so it can never be shorter than a
+/// single in-flight request is allowed to take.
+///
+/// One attempt emits `LlmAttemptStarted` and then nothing until the response
+/// begins, so the quiet window between them is bounded by
+/// `llm.request_timeout_ms`, not by the configured cycle count. An operator who
+/// raises that timeout for a slow local model would otherwise have the watchdog
+/// cancel a child mid-prefill — the threshold has to move with it. One extra
+/// cycle of slack absorbs the rounding plus the tick that fires just before the
+/// timeout would.
+pub(super) fn effective_stale_cycles(
+    configured_cycles: u32,
+    interval_secs: u64,
+    request_timeout_ms: u64,
+) -> u32 {
+    let interval_secs = interval_secs.max(1);
+    let timeout_secs = request_timeout_ms.div_ceil(1000);
+    let floor = timeout_secs.div_ceil(interval_secs).saturating_add(1);
+    configured_cycles.max(u32::try_from(floor).unwrap_or(u32::MAX))
+}
+
 /// Counts consecutive heartbeat ticks with no forward progress.
 pub(super) struct StallWatchdog {
     idle_cycles: u32,
@@ -53,6 +74,13 @@ impl StallWatchdog {
     ///   start and `ToolResult`.
     /// - `ToolResult` — a tool finished, success or failure. A failed tool is
     ///   still observable forward progress.
+    /// - `LlmAttemptStarted` — a request went out on the wire. Discrete (one
+    ///   per attempt) and produced by the transport, so a hung tool cannot
+    ///   forge it. Without it the watchdog is blind to three windows that emit
+    ///   nothing else: a retry storm (`max_retries` × `request_timeout_ms` plus
+    ///   backoff), each leg of the `llm.fallback` chain, and the summarizer
+    ///   call that compaction makes before the main stream opens. All three
+    ///   can outlast the threshold on a healthy child.
     ///
     /// Deliberately NOT progress:
     ///
@@ -69,6 +97,7 @@ impl StallWatchdog {
                 | AgentEvent::ThinkingDelta(_)
                 | AgentEvent::Usage(_)
                 | AgentEvent::ToolResult { .. }
+                | AgentEvent::LlmAttemptStarted { .. }
         );
         if is_progress {
             self.idle_cycles = 0;
@@ -203,5 +232,63 @@ mod tests {
         // …and the watchdog must be able to announce a *second* stall, not
         // stay latched from the first one.
         assert_eq!(w.on_tick(), TickOutcome::EmitStalled);
+    }
+
+    #[test]
+    fn retry_storm_of_attempt_starts_never_cancels() {
+        // A provider outage retries `max_retries` times per leg and then walks
+        // the fallback chain. Each attempt can burn the full request timeout
+        // and emits no text, no thinking, and no Usage — the response never
+        // arrives. Before `LlmAttemptStarted` counted, that silence was
+        // indistinguishable from a frozen child and the child was cancelled
+        // with a stall error while the transport was working normally.
+        let mut w = StallWatchdog::new(THRESHOLD);
+        for i in 0..(THRESHOLD + STALL_GRACE_CYCLES + 5) {
+            assert!(
+                w.on_event(&AgentEvent::LlmAttemptStarted { attempt: i }),
+                "an outgoing request attempt is forward progress (iteration {i})"
+            );
+            assert_eq!(w.on_tick(), TickOutcome::Quiet);
+        }
+    }
+
+    #[test]
+    fn attempt_start_alone_cannot_hold_off_the_watchdog_forever() {
+        // The marker fires once per attempt, not on a timer. A child that
+        // opens one request and then genuinely wedges must still be caught —
+        // otherwise the exclusion list above is meaningless.
+        let mut w = StallWatchdog::new(THRESHOLD);
+        assert!(w.on_event(&AgentEvent::LlmAttemptStarted { attempt: 0 }));
+        let mut outcomes = Vec::new();
+        for _ in 0..(THRESHOLD + STALL_GRACE_CYCLES) {
+            outcomes.push(w.on_tick());
+        }
+        assert_eq!(
+            outcomes.last().copied(),
+            Some(TickOutcome::Cancel),
+            "a single attempt must not buy unlimited quiet: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn stale_threshold_floor_tracks_the_request_timeout() {
+        // The quiet window between `LlmAttemptStarted` and the first response
+        // token is bounded by `llm.request_timeout_ms`, not by the configured
+        // cycle count. An operator running a slow local model raises that
+        // timeout; the watchdog has to widen with it or it cancels healthy
+        // children mid-prefill.
+        //
+        // Defaults: 15 cycles × 30s = 450s vs a 120s timeout → config wins.
+        assert_eq!(effective_stale_cycles(15, 30, 120_000), 15);
+
+        // A 600s timeout needs 20 cycles to cover it, +1 for rounding slack.
+        assert_eq!(effective_stale_cycles(15, 30, 600_000), 21);
+
+        // Sub-interval timeouts still leave a full cycle of slack rather than
+        // collapsing the threshold to zero.
+        assert_eq!(effective_stale_cycles(1, 30, 5_000), 2);
+
+        // A zero interval is clamped to 1s rather than dividing by zero.
+        assert_eq!(effective_stale_cycles(1, 0, 3_000), 4);
     }
 }

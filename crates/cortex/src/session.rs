@@ -80,15 +80,16 @@ impl Session {
         session
     }
 
-    /// Persist this session to disk as JSON (atomic write via temp file).
+    /// Persist this session to disk as JSON.
+    ///
+    /// Goes through the shared atomic writer rather than a local temp+rename:
+    /// that hand-rolled version named its temp file `<id>.json.tmp`, so two
+    /// writers on the same session raced on one path, and it never fsynced, so
+    /// a crash just after the rename could surface a zero-length transcript.
     pub fn save(&self) -> Result<()> {
         let path = session_path(&self.meta.id)?;
-        let tmp_path = path.with_extension("json.tmp");
         let json = serde_json::to_string(self)?;
-        // Write to temp file first, then rename for atomicity
-        fs::write(&tmp_path, &json)?;
-        fs::rename(&tmp_path, &path)?;
-
+        coding::fs_atomic::atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -474,6 +475,41 @@ mod tests {
         };
         let path = sessions_dir.join(format!("{id}.json"));
         fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_for_the_session_loader_to_trip_over() {
+        // The old hand-rolled save wrote `<id>.json.tmp` beside the target.
+        // Two writers on one session raced on that single path, and a crash
+        // between write and rename left the stray file in the sessions dir
+        // that `load_last_session` scans. The shared atomic writer uses a
+        // process- and call-unique temp name and removes it on every path.
+        let _lock = SESSION_ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        let sdir = tmp.path().join("sessions");
+        fs::create_dir_all(&sdir).unwrap();
+
+        let session = Session::new_with_id("save-residue".to_string());
+        session.save().unwrap();
+
+        let entries: Vec<String> = fs::read_dir(&sdir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["save-residue.json".to_string()],
+            "save must leave only the transcript behind, got: {entries:?}"
+        );
+
+        // And the transcript must be readable back — a rename that landed on
+        // the temp name instead would leave this unparseable.
+        assert_eq!(
+            Session::load("save-residue").unwrap().meta.id,
+            "save-residue"
+        );
+        std::env::remove_var("BORG_DATA_DIR");
     }
 
     #[test]

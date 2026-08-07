@@ -137,12 +137,19 @@ pub fn is_personalized_content(content: &str) -> bool {
     !TEMPLATE_MARKERS.iter().any(|m| content.contains(m))
 }
 
+/// Persist the agent's persona to `IDENTITY.md`.
+///
+/// Crash-safe: a truncating write that dies mid-way leaves a short or empty
+/// file, and [`load_identity`] treats unreadable/empty content as "not
+/// personalized" and silently falls back to [`DEFAULT_IDENTITY`] — so the
+/// failure surfaces as "my persona was never set" rather than as an error.
+/// The atomic write makes the file either the old persona or the new one.
 pub fn save_identity(content: &str) -> Result<()> {
     let path = identity_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, content)?;
+    coding::fs_atomic::atomic_write(&path, content.as_bytes())?;
     debug!("Saved IDENTITY.md ({} bytes)", content.len());
     Ok(())
 }

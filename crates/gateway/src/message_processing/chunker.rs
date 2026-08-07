@@ -1,3 +1,24 @@
+/// Chunks to put on the wire for one outbound message, or an error when there
+/// is nothing to send.
+///
+/// Empty input yields zero chunks, and a `for chunk in &chunks` send loop over
+/// zero chunks does nothing and returns `Ok(())` — the caller then records a
+/// successful delivery for a message that was never sent, so it is neither
+/// delivered nor retried. Reporting the failure instead keeps the delivery row
+/// eligible for the drain loop. (The interaction-edit paths additionally index
+/// `chunks[0]`, which panics on empty rather than merely lying.)
+///
+/// Callers upstream of the adapters generally drop empty replies before they
+/// are enqueued; this is the adapter's own contract, so it holds no matter who
+/// calls it.
+pub fn chunks_for_delivery(text: &str, max_chars: usize) -> anyhow::Result<Vec<String>> {
+    let chunks = chunk_text_nonempty(text, max_chars);
+    if chunks.is_empty() {
+        anyhow::bail!("refusing to send an empty message");
+    }
+    Ok(chunks)
+}
+
 /// Split text into non-empty chunks. Falls back to a single-element vec containing
 /// the original text if `chunk_text` returns empty (e.g. for empty input).
 pub fn chunk_text_nonempty(text: &str, max_chars: usize) -> Vec<String> {
@@ -545,6 +566,28 @@ mod tests {
             rejoined.matches('x').count(),
             60 + 70 + 55 + 68 + 40 + 72,
             "fence body content lost across the split"
+        );
+    }
+
+    #[test]
+    fn chunks_for_delivery_refuses_an_empty_message() {
+        // A zero-chunk result makes every adapter's `for chunk in &chunks`
+        // send loop a no-op that still returns Ok(()), so the delivery is
+        // marked delivered without anything reaching the wire — neither sent
+        // nor retried. Whitespace-only text is a real (if odd) message and
+        // stays sendable; only genuinely empty input is refused.
+        assert!(chunks_for_delivery("", 100).is_err());
+        assert_eq!(chunks_for_delivery("hi", 100).unwrap(), vec!["hi"]);
+        assert_eq!(chunks_for_delivery("   ", 100).unwrap(), vec!["   "]);
+    }
+
+    #[test]
+    fn chunks_for_delivery_matches_the_underlying_split() {
+        // The guard must not change how non-empty text is chunked.
+        let long = "x".repeat(250);
+        assert_eq!(
+            chunks_for_delivery(&long, 100).unwrap(),
+            chunk_text_nonempty(&long, 100)
         );
     }
 }

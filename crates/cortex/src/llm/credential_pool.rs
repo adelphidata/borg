@@ -405,6 +405,37 @@ struct PoolInner {
     proactive_min_window_secs: u64,
 }
 
+/// Whether a benched credential is worth one last-gasp attempt.
+///
+/// `Billing` (a spent account) and `AuthPermanent` (a revoked or invalid key)
+/// do not clear with time — only a human can fix them. Every other bench,
+/// including `RateLimit`, is a window that expires, so a salvage attempt is at
+/// worst one wasted request and at best keeps a single-key install alive.
+///
+/// Reads the persisted `last_error_reason` string rather than a typed field
+/// because that is what survives a restart; the strings come from
+/// [`FailoverReason`]'s `Display`, so they are compared against it directly
+/// instead of being hardcoded.
+fn is_salvageable(c: &PooledCredential, now_ms: i64) -> bool {
+    // An OAuth credential whose access token has expired needs the serialized
+    // refresh that `acquire_lease_refreshing` performs. Salvage hands the
+    // credential back directly, bypassing that, so a stale token would go on
+    // the wire, 401, and spend the one-shot `auth_refresh_grace` — turning a
+    // recoverable session into a tombstoned credential.
+    if matches!(c.auth_type, AuthType::OAuth) {
+        if let Some(expires_at) = c.expires_at_ms {
+            if expires_at <= now_ms {
+                return false;
+            }
+        }
+    }
+    let Some(reason) = c.last_error_reason.as_deref() else {
+        return true;
+    };
+    reason != FailoverReason::Billing.to_string()
+        && reason != FailoverReason::AuthPermanent.to_string()
+}
+
 /// Shared tail of the two cooldown arms: bench the credential until
 /// `now + dur`, extend-never-shorten, and record the diagnosis.
 ///
@@ -1203,8 +1234,15 @@ impl CredentialPool {
     /// Salvage attempt when every credential is cooling. Returns the credential
     /// whose cooldown expires soonest (regardless of strategy). Used by the
     /// failover loop as a last-gasp before propagating an exhaustion error.
-    /// Returns `None` only when every entry is removed.
+    ///
+    /// Entries benched for a reason that cannot clear on its own — `Billing`
+    /// (a spent account) and `AuthPermanent` (a dead key) — are skipped. Both
+    /// need human action, so re-attempting them buys nothing and re-creates the
+    /// every-60s hammering that the long billing bench exists to prevent. An
+    /// OAuth credential with an expired access token is skipped too, since this
+    /// path bypasses the refresh. Returns `None` when no entry qualifies.
     pub fn pick_force(&self) -> Option<PooledCredential> {
+        let now = self.clock.now_ms();
         let mut g = self
             .inner
             .lock()
@@ -1212,7 +1250,7 @@ impl CredentialPool {
         let pick_id = g
             .creds
             .iter()
-            .filter(|c| !c.is_removed())
+            .filter(|c| !c.is_removed() && is_salvageable(c, now))
             .min_by_key(|c| {
                 // Cooling entries: soonest reset_at wins.
                 // Available entries: treat as i64::MIN so they're preferred.
@@ -1320,6 +1358,11 @@ impl CredentialPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cooldown = g.cooldown;
         let billing_cooldown = g.billing_cooldown;
+        // Computed before the mutable borrow below. Escalation exists to stop a
+        // capped key from stealing rotation slots from its siblings; with no
+        // siblings there is nothing to protect and the escalation only benches
+        // the one credential the agent has.
+        let is_sole_credential = g.creds.iter().filter(|c| !c.is_removed()).count() <= 1;
         let Some(c) = g.creds.iter_mut().find(|c| c.id == credential_id) else {
             return;
         };
@@ -1385,8 +1428,16 @@ impl CredentialPool {
                 // sitting behind a hard per-hour cap should not be re-probed
                 // every 60s all night, but a merely bursty key must still
                 // recover fast, so the first hit keeps the short cooldown.
+                //
+                // Escalation is a *rotation* policy: it stops one capped key
+                // from being re-probed ahead of healthy siblings. A pool of one
+                // has no siblings, so escalating there buys nothing and costs
+                // everything — the agent is simply down for up to
+                // COOLDOWN_MAX_SECS on what may be a one-second burst. Hold
+                // such a pool at the base cooldown and let it re-probe.
                 let dur = match retry_after {
                     Some(d) => d.as_secs().clamp(1, COOLDOWN_MAX_SECS),
+                    None if is_sole_credential => cooldown.as_secs().clamp(1, COOLDOWN_MAX_SECS),
                     None => {
                         let shift = c
                             .consecutive_rate_limits

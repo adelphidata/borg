@@ -111,7 +111,7 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
 
         for (i, chunk) in chunks.iter().enumerate() {
             // Only reply to the original message on the first chunk

@@ -1144,6 +1144,20 @@ impl Admin for AdminSvc {
         goals::set_goal(self, req).await
     }
 
+    async fn mutate_goal_gates(
+        &self,
+        req: Request<protocols::admin::GoalGateMutation>,
+    ) -> Result<Response<protocols::admin::GoalGateList>, TStatus> {
+        goals::mutate_goal_gates(req).await
+    }
+
+    async fn mutate_session_heartbeat(
+        &self,
+        req: Request<protocols::admin::SessionHeartbeatMutation>,
+    ) -> Result<Response<protocols::admin::SessionHeartbeatDetail>, TStatus> {
+        goals::mutate_session_heartbeat(req).await
+    }
+
     async fn clear_goal(&self, req: Request<GoalRef>) -> Result<Response<Empty>, TStatus> {
         goals::clear_goal(self, req).await
     }

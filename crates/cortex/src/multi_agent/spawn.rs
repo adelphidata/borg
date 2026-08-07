@@ -499,7 +499,11 @@ fn run_sub_agent(
         // no ticks, no events, no watchdog.
         let heartbeat_enabled = agents_config.heartbeat_interval_secs > 0;
         let heartbeat_interval_secs = agents_config.heartbeat_interval_secs.max(1);
-        let stale_threshold = agents_config.heartbeat_stale_cycles.max(1);
+        let stale_threshold = super::stall::effective_stale_cycles(
+            agents_config.heartbeat_stale_cycles.max(1),
+            heartbeat_interval_secs,
+            config.llm.request_timeout_ms,
+        );
         let mut heartbeat_tick =
             tokio::time::interval(std::time::Duration::from_secs(heartbeat_interval_secs));
         // Skip the immediate first tick — we want to wait one full interval

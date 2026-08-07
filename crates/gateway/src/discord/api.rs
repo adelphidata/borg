@@ -178,7 +178,7 @@ impl DiscordClient {
         interaction_token: &str,
         text: &str,
     ) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, DISCORD_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DISCORD_MESSAGE_CHUNK_SIZE)?;
 
         // Edit the original response with the first chunk
         let url = format!(
@@ -228,7 +228,7 @@ impl DiscordClient {
     /// Send a message to a channel, chunking at 2000 characters.
     pub async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
-        let chunks = chunker::chunk_text_nonempty(text, DISCORD_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DISCORD_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
             let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");

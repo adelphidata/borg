@@ -10,6 +10,7 @@
 //! prompt-assembly and finalization must never break the agent.
 
 use crate::goals::event_kind;
+use crate::goals::gates::GateVerdict;
 use crate::goals::prompts;
 use crate::goals::runtime::PendingSteering;
 use crate::goals::runtime::SteeringReason;
@@ -200,7 +201,12 @@ impl Agent {
     /// - User steering pending → false.
     /// - Same `turn_id` already reserved → false (so a max-iterations cap
     ///   on the inner loop can't spawn infinite continuations).
-    pub(super) async fn maybe_inject_goal_continuation(&mut self, turn_id: &str) -> bool {
+    pub(super) async fn maybe_inject_goal_continuation(
+        &mut self,
+        turn_id: &str,
+        event_tx: &tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
         if !self.config.goals.enabled {
             return false;
         }
@@ -224,15 +230,251 @@ impl Agent {
             }
         };
         let pending = self.user_input_is_pending();
-        if !crate::goals::runtime::should_continue(goal.status, pending, false) {
+
+        // Gates run BEFORE the `should_continue` short-circuit, because the
+        // case they exist for is precisely the one that short-circuit swallows:
+        // the model marks the goal `complete` mid-turn, and by the time we get
+        // here the row is no longer Active. Checking gates only on the
+        // continue path would make them a nicer continuation prompt rather than
+        // a completion contract — a red suite could still be declared done.
+        //
+        // Only `Complete` is re-opened. Paused / Blocked / BudgetLimited were
+        // parked deliberately by the operator or the budget guard, and a gate
+        // must not drag the loop back out of them.
+        let gating = matches!(goal.status, GoalStatus::Active | GoalStatus::Complete)
+            && !pending
+            && !self.in_plan_mode();
+        let verdict = if gating {
+            self.evaluate_goal_gates(cancel).await
+        } else {
+            GateVerdict::AllPassed
+        };
+
+        // A failing gate on a goal the model just completed reverts it: the
+        // completion was not true, and leaving the row Complete would both lie
+        // in `/goal status` and stop the loop that has to fix it.
+        if goal.status == GoalStatus::Complete && !matches!(verdict, GateVerdict::AllPassed) {
+            if !self.reopen_completed_goal_for_failed_gate().await {
+                // Could not revert the row; do not inject a continuation that
+                // contradicts the persisted state.
+                return false;
+            }
+        } else if !crate::goals::runtime::should_continue(goal.status, pending, false) {
             return false;
         }
         if !self.goal_runtime.try_reserve_continuation(turn_id) {
             return false;
         }
-        let prompt = prompts::continuation_prompt(&goal);
+
+        let prompt = match verdict {
+            GateVerdict::AllPassed => prompts::continuation_prompt(&goal),
+            GateVerdict::Failed { prompt, .. } => prompt,
+            GateVerdict::Exhausted { message, .. } => {
+                // The agent has had its retries and cannot satisfy the check.
+                // Continuing would burn the token budget re-failing, so park
+                // the goal for the operator exactly as the budget cap does.
+                self.pause_goal_for_failed_gate(&message, event_tx).await;
+                self.goal_runtime.clear_continuation_reservation();
+                return false;
+            }
+        };
         self.log_and_persist(Message::user(prompt)).await;
         true
+    }
+
+    /// Flip a `Complete` goal back to `Active` because a gate says it is not
+    /// done. Returns whether the row now reads Active.
+    async fn reopen_completed_goal_for_failed_gate(&self) -> bool {
+        let session_id = self.session.meta.id.clone();
+        let updated = {
+            let guard = self.db_guard().await;
+            match guard.as_ref() {
+                Some(db) => {
+                    db.update_goal(
+                        &session_id,
+                        crate::db::GoalUpdate {
+                            status: Some(GoalStatus::Active),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                }
+                None => Ok(None),
+            }
+        };
+        match updated {
+            Ok(Some(goal)) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    "goal marked complete but a quality gate is failing; reopening"
+                );
+                self.goal_runtime.adopt(&goal);
+                self.emit_goal_lifecycle(event_kind::STATUS_CHANGED, Some(&goal));
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!("goal gates: reopening the completed goal failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Run the active goal's quality gates and report the verdict.
+    ///
+    /// Best-effort like the rest of this module: if the DB is unreachable the
+    /// gates are treated as passing, because a storage hiccup must not
+    /// permanently wedge a goal loop that is otherwise healthy.
+    async fn evaluate_goal_gates(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> GateVerdict {
+        let session_id = self.session.meta.id.clone();
+        let gates = {
+            let guard = self.db_guard().await;
+            let Some(db) = guard.as_ref() else {
+                return GateVerdict::AllPassed;
+            };
+            match db.list_goal_gates(&session_id).await {
+                Ok(gates) => gates,
+                Err(e) => {
+                    tracing::warn!("goal gates: list_goal_gates failed: {e}");
+                    return GateVerdict::AllPassed;
+                }
+            }
+        };
+        if gates.is_empty() {
+            return GateVerdict::AllPassed;
+        }
+
+        // One fingerprint for the whole pass: the workspace cannot change
+        // between gates, and probing per gate would double the git calls.
+        let fingerprint =
+            crate::git::workspace_fingerprint(self.execution_context.workspace_cwd()).await;
+        // Both are operator-settable and unvalidated at the settings layer. A
+        // zero or negative cap would pause the goal on the first failure with a
+        // "failed 0 times" message; a zero timeout would fail every gate
+        // instantly. Clamp at the point of use.
+        let max_attempts = self.config.goals.gate_max_attempts.max(1);
+        let timeout =
+            std::time::Duration::from_millis(self.config.goals.gate_timeout_ms.max(1_000));
+
+        for gate in &gates {
+            // Replay a known failure against an unchanged workspace instead of
+            // re-running it: the result cannot differ, and a full test suite
+            // per turn is minutes of wall clock for no information.
+            let (exit_code, output) =
+                if crate::goals::gates::can_replay_failure(gate, fingerprint.as_deref()) {
+                    tracing::debug!(
+                        ordinal = gate.ordinal,
+                        "goal gate: workspace unchanged, replaying recorded failure"
+                    );
+                    (
+                        gate.last_exit_code.unwrap_or(-1),
+                        gate.last_output.clone().unwrap_or_default(),
+                    )
+                } else {
+                    let run = crate::tool_handlers::shell::run_gate_command(
+                        &self.execution_context,
+                        &self.config,
+                        &self.policy,
+                        &gate.command,
+                        timeout,
+                        cancel,
+                    )
+                    .await;
+                    (i64::from(run.exit_code), run.output)
+                };
+
+            // The retry cap counts failures the agent made *no progress*
+            // against, not failing turns. A turn-boundary count gives a Ralph
+            // loop ~3 edit-compile-test cycles before the goal is parked, which
+            // is far too tight; what actually signals "stuck" is failing again
+            // without having touched the workspace. Outside a git repo the
+            // fingerprint is unknown and we fall back to counting turns, since
+            // the alternative is a cap that never fires.
+            let made_progress = match (fingerprint.as_deref(), gate.last_fingerprint.as_deref()) {
+                (Some(now), Some(before)) => now != before,
+                _ => false,
+            };
+
+            // Record every run — including replays, so a repeated failure on an
+            // untouched workspace still advances the attempt count rather than
+            // looping forever.
+            {
+                let guard = self.db_guard().await;
+                if let Some(db) = guard.as_ref() {
+                    if let Err(e) = db
+                        .record_goal_gate_run(
+                            &session_id,
+                            gate.ordinal,
+                            exit_code,
+                            crate::goals::gates::output_tail(&output),
+                            fingerprint.as_deref(),
+                            made_progress,
+                        )
+                        .await
+                    {
+                        tracing::warn!("goal gates: record_goal_gate_run failed: {e}");
+                    }
+                }
+            }
+
+            if exit_code == 0 {
+                continue;
+            }
+            // `attempts` is the count *before* this run. A run that made
+            // progress restarts the budget at 1, so it can only exhaust the cap
+            // when the cap is 1.
+            let attempts_now = if made_progress { 1 } else { gate.attempts + 1 };
+            if attempts_now >= max_attempts {
+                return GateVerdict::Exhausted {
+                    ordinal: gate.ordinal,
+                    message: crate::goals::gates::exhausted_message(gate, max_attempts),
+                };
+            }
+            return GateVerdict::Failed {
+                ordinal: gate.ordinal,
+                prompt: crate::goals::gates::failure_prompt(gate, exit_code, &output),
+            };
+        }
+        GateVerdict::AllPassed
+    }
+
+    /// Park the goal after a gate exhausted its retries and tell the user why.
+    async fn pause_goal_for_failed_gate(
+        &self,
+        message: &str,
+        event_tx: &tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,
+    ) {
+        let session_id = self.session.meta.id.clone();
+        let paused = {
+            let guard = self.db_guard().await;
+            match guard.as_ref() {
+                Some(db) => db.pause_active_goal(&session_id).await,
+                None => Ok(None),
+            }
+        };
+        match paused {
+            Ok(Some(goal)) => {
+                tracing::warn!(session_id = %session_id, "{message}");
+                self.emit_goal_lifecycle(event_kind::STATUS_CHANGED, Some(&goal));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("goal gates: pause_active_goal failed: {e}"),
+        }
+        // Surfaced as a notice, not just a log line: the loop stopping without
+        // an explanation reads as the agent giving up for no reason.
+        if event_tx
+            .send(crate::agent::AgentEvent::SystemNotice {
+                category: "goal".to_string(),
+                text: message.to_string(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::trace!("goal gates: event channel closed before the pause notice");
+        }
     }
 
     /// Forward a goal lifecycle event to the optional [`GoalEventSink`]

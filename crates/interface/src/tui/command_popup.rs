@@ -30,6 +30,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "/goal",
         "Set, view, pause, resume, edit, or clear the session goal",
     ),
+    (
+        "/heartbeat",
+        "Recurring prompt that re-enters this session when idle (alias: /hb)",
+    ),
     ("/mode", "Switch collaboration mode"),
     ("/model", "Switch LLM provider/model"),
     ("/theme", "Pick TUI theme (alias: /skin)"),

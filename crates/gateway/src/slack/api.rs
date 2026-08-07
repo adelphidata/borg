@@ -141,7 +141,7 @@ impl SlackClient {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
             self.send_single_message(channel, chunk, thread_ts).await?;

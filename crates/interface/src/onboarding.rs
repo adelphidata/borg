@@ -411,20 +411,17 @@ model = "auto"
     ))
 }
 
-/// Write content to a temporary file in the same directory, then atomically rename.
-/// This prevents partial writes from leaving corrupted files.
+/// Crash-safe write for the non-secret onboarding files (config, persona,
+/// memory, setup notes).
+///
+/// Delegates to the shared writer rather than repeating temp+rename here: this
+/// module's copy had no fsync (a crash right after the rename could surface a
+/// zero-length file) and used a fixed `<name>.tmp` path that two writers would
+/// race on. Secrets keep their own [`write_secret_file`], which must create at
+/// mode 0600 rather than the umask default.
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<()> {
-    let tmp_path = tmp_path_for(path);
-    std::fs::write(&tmp_path, content)
-        .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "Failed to rename {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    coding::fs_atomic::atomic_write(path, content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 /// Append (or replace) a `KEY=VALUE` line in `<data_dir>/.env`. The temp file
@@ -1183,8 +1180,13 @@ mod tests {
         let path = dir.path().join("test.toml");
         atomic_write(&path, "key = \"value\"").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "key = \"value\"");
-        // No .tmp file should remain (test.toml.tmp, not test.tmp)
-        assert!(!dir.path().join("test.toml.tmp").exists());
+        // The target must be the only thing left behind — no temp residue
+        // under any naming scheme.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["test.toml".to_string()]);
     }
 
     #[test]

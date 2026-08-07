@@ -78,12 +78,41 @@ pub fn enforce_tool_result_share_limit(history: &mut [Message], max_tokens: usiz
 /// - Messages older than tier 2: tool results over `AGE_TIER2_TOKEN_THRESHOLD` tokens
 ///   are replaced with a one-line status summary.
 pub fn age_based_tool_result_degradation(history: &mut [Message]) {
+    degrade_old_tool_results(history, 0);
+}
+
+/// [`age_based_tool_result_degradation`] with a minimum-reclaim gate. Returns
+/// the tokens reclaimed, or `0` when nothing was committed.
+///
+/// Degradation rewrites messages the provider has *already seen*, which
+/// invalidates the prompt-cache prefix from the earliest rewritten position
+/// onward. Because the tier windows are measured in messages from the end, that
+/// position advances every turn: left ungated, one or two results cross a tier
+/// boundary per turn, each rewrite breaks the cached prefix, and the session
+/// pays full input price on every turn to save a few dozen tokens.
+///
+/// The gate makes those breaks episodic instead. Pending savings accumulate
+/// across turns while the plan is repeatedly declined — declining costs nothing,
+/// since a declined plan leaves history byte-identical — and commit in one batch
+/// once they are worth a cache break. No extra state is needed for the
+/// hysteresis: already-degraded messages yield no further savings, so the turn
+/// after a commit naturally plans a near-empty batch and is declined again.
+///
+/// `min_reclaim_tokens == 0` disables the gate and restores the unconditional
+/// behavior.
+pub fn degrade_old_tool_results(history: &mut [Message], min_reclaim_tokens: usize) -> usize {
     let len = history.len();
     if len == 0 {
-        return;
+        return 0;
     }
 
-    for (i, msg) in history.iter_mut().enumerate() {
+    // Plan first, commit second: a rejected plan must not have touched history,
+    // and planning is cheap enough (no LLM, no clone of the transcript) to redo
+    // each turn.
+    let mut plan: Vec<(usize, String)> = Vec::new();
+    let mut reclaimed = 0usize;
+
+    for (i, msg) in history.iter().enumerate() {
         if msg.role != Role::Tool {
             continue;
         }
@@ -94,16 +123,18 @@ pub fn age_based_tool_result_degradation(history: &mut [Message]) {
         }
 
         let text = match &msg.content {
-            Some(MessageContent::Text(s)) => s.clone(),
+            Some(MessageContent::Text(s)) => s.as_str(),
             _ => continue,
         };
 
-        let toks = estimate_tokens(&text);
+        let toks = estimate_tokens(text);
 
-        if age < AGE_TIER2_WINDOW {
+        let replacement = if age < AGE_TIER2_WINDOW {
             // Tier 2: truncate large results
             if toks > AGE_TIER1_TOKEN_THRESHOLD {
-                msg.content = Some(MessageContent::Text(truncate_with_context(&text)));
+                truncate_with_context(text)
+            } else {
+                continue;
             }
         } else {
             // Tier 3: one-liner
@@ -118,12 +149,26 @@ pub fn age_based_tool_result_degradation(history: &mut [Message]) {
                     "ok"
                 };
                 let tool_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
-                msg.content = Some(MessageContent::Text(format!(
-                    "[tool result {tool_id} — {status}]"
-                )));
+                format!("[tool result {tool_id} — {status}]")
+            } else {
+                continue;
             }
-        }
+        };
+
+        // A "degradation" that grows the message reclaims nothing; count only
+        // real savings so a no-op rewrite can't drag the batch over the line.
+        reclaimed += toks.saturating_sub(estimate_tokens(&replacement));
+        plan.push((i, replacement));
     }
+
+    if plan.is_empty() || reclaimed < min_reclaim_tokens {
+        return 0;
+    }
+
+    for (i, replacement) in plan {
+        history[i].content = Some(MessageContent::Text(replacement));
+    }
+    reclaimed
 }
 
 /// Truncate text to first 3 lines + omission note + last 2 lines.
@@ -472,6 +517,82 @@ mod tests {
             .collect();
 
         assert_eq!(after_first, after_second, "running twice should be no-op");
+    }
+
+    #[test]
+    fn reclaim_gate_leaves_history_byte_identical_when_declined() {
+        // This is the whole point of the gate: a declined pass must not touch
+        // a single byte, because any edit to already-sent history invalidates
+        // the provider prompt-cache prefix from that position onward. Asserting
+        // on a token count instead of exact content would miss a rewrite that
+        // happened to be token-neutral.
+        let mut history = make_history(12);
+        let before: Vec<Option<String>> = history
+            .iter()
+            .map(|m| m.text_content().map(String::from))
+            .collect();
+
+        let reclaimed = degrade_old_tool_results(&mut history, usize::MAX);
+
+        assert_eq!(reclaimed, 0, "an unreachable threshold must decline");
+        let after: Vec<Option<String>> = history
+            .iter()
+            .map(|m| m.text_content().map(String::from))
+            .collect();
+        assert_eq!(before, after, "a declined pass must not rewrite history");
+    }
+
+    #[test]
+    fn reclaim_gate_commits_once_the_batch_is_worth_a_cache_break() {
+        // Same history, a threshold the batch clears: the pass commits and
+        // reports what it saved.
+        let mut history = make_history(12);
+        let before = history_tokens(&history);
+
+        let reclaimed = degrade_old_tool_results(&mut history, 1);
+
+        assert!(reclaimed > 0, "an eligible batch must commit");
+        let saved = before - history_tokens(&history);
+        assert_eq!(
+            reclaimed, saved,
+            "the reported reclaim must match the actual history shrink"
+        );
+    }
+
+    #[test]
+    fn zero_threshold_reproduces_the_ungated_behavior() {
+        // The escape hatch has to be exact — operators disabling the gate must
+        // get the old semantics, not an approximation of them.
+        let mut gated = make_history(12);
+        let mut ungated = make_history(12);
+
+        degrade_old_tool_results(&mut gated, 0);
+        age_based_tool_result_degradation(&mut ungated);
+
+        let gated_text: Vec<Option<String>> = gated
+            .iter()
+            .map(|m| m.text_content().map(String::from))
+            .collect();
+        let ungated_text: Vec<Option<String>> = ungated
+            .iter()
+            .map(|m| m.text_content().map(String::from))
+            .collect();
+        assert_eq!(gated_text, ungated_text);
+    }
+
+    #[test]
+    fn a_committed_pass_declines_on_the_next_turn_without_extra_state() {
+        // The hysteresis comes for free: once the eligible results are already
+        // degraded, the next plan reclaims nothing and is declined, so the
+        // cache prefix stays stable until enough new drift accumulates. If this
+        // regresses, degradation re-fires every turn and the gate buys nothing.
+        let mut history = make_history(12);
+        assert!(degrade_old_tool_results(&mut history, 1) > 0);
+        assert_eq!(
+            degrade_old_tool_results(&mut history, 1),
+            0,
+            "a settled history must not keep re-breaking the cache"
+        );
     }
 
     #[test]

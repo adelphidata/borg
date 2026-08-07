@@ -577,9 +577,21 @@ Rules:
         // can't grow until the provider has no room left to answer.
         let max_hist = self.effective_history_budget();
 
-        // Age-based degradation: progressively reduce old tool results
+        // Age-based degradation: progressively reduce old tool results.
+        // Gated on a minimum reclaim so the rewrites — which invalidate the
+        // provider prompt-cache prefix — batch into occasional breaks instead
+        // of firing every turn as results drift across the tier boundaries.
         if self.config.conversation.age_based_degradation {
-            crate::conversation::age_based_tool_result_degradation(&mut self.history);
+            let reclaimed = crate::conversation::degrade_old_tool_results(
+                &mut self.history,
+                self.config.conversation.degradation_min_reclaim_tokens,
+            );
+            if reclaimed > 0 {
+                tracing::debug!(
+                    reclaimed_tokens = reclaimed,
+                    "age-based tool-result degradation committed"
+                );
+            }
         }
 
         enforce_tool_result_share_limit(&mut self.history, max_hist, 0.5);

@@ -25,6 +25,156 @@ pub(super) async fn get_goal(req: Request<GoalRef>) -> Result<Response<GoalDetai
     Ok(Response::new(detail))
 }
 
+pub(super) async fn mutate_goal_gates(
+    req: Request<protocols::admin::GoalGateMutation>,
+) -> Result<Response<protocols::admin::GoalGateList>, TStatus> {
+    use protocols::admin::goal_gate_mutation::Op;
+
+    let req = req.into_inner();
+    let op = Op::try_from(req.op).unwrap_or(Op::Unspecified);
+    let reply = async {
+        let db = Database::open().await?;
+        let Some(session_id) = resolve_goal_session_id(&db, &req.session_id).await? else {
+            return anyhow::Ok(protocols::admin::GoalGateList {
+                gates: Vec::new(),
+                report: "no session yet — set a goal first".to_string(),
+            });
+        };
+        let report = match op {
+            Op::Add => {
+                let command = req.command.trim();
+                if command.is_empty() {
+                    return anyhow::Ok(protocols::admin::GoalGateList {
+                        gates: gates_to_proto(&db, &session_id).await?,
+                        report: "gate command must not be empty".to_string(),
+                    });
+                }
+                let gate = db.add_goal_gate(&session_id, command).await?;
+                format!("gate {} added: {}", gate.ordinal, gate.command)
+            }
+            Op::Remove => {
+                if db.remove_goal_gate(&session_id, req.ordinal).await? {
+                    format!("gate {} removed", req.ordinal)
+                } else {
+                    format!("no gate {}", req.ordinal)
+                }
+            }
+            Op::Clear => {
+                let n = db.clear_goal_gates(&session_id).await?;
+                format!("{n} gate(s) removed")
+            }
+            Op::List | Op::Unspecified => String::new(),
+        };
+        anyhow::Ok(protocols::admin::GoalGateList {
+            gates: gates_to_proto(&db, &session_id).await?,
+            report,
+        })
+    }
+    .await
+    .map_err(map_internal("mutate_goal_gates"))?;
+    Ok(Response::new(reply))
+}
+
+/// Current gates for `session_id`, projected onto the wire type.
+async fn gates_to_proto(
+    db: &Database,
+    session_id: &str,
+) -> anyhow::Result<Vec<protocols::admin::GoalGate>> {
+    Ok(db
+        .list_goal_gates(session_id)
+        .await?
+        .into_iter()
+        .map(|g| protocols::admin::GoalGate {
+            ordinal: g.ordinal,
+            command: g.command,
+            attempts: g.attempts,
+            last_exit_code_present: g.last_exit_code.is_some(),
+            last_exit_code: g.last_exit_code.unwrap_or(0),
+        })
+        .collect())
+}
+
+pub(super) async fn mutate_session_heartbeat(
+    req: Request<protocols::admin::SessionHeartbeatMutation>,
+) -> Result<Response<protocols::admin::SessionHeartbeatDetail>, TStatus> {
+    use protocols::admin::session_heartbeat_mutation::Op;
+
+    let req = req.into_inner();
+    let op = Op::try_from(req.op).unwrap_or(Op::Unspecified);
+    let detail = async {
+        let db = Database::open().await?;
+        let Some(session_id) = resolve_goal_session_id(&db, &req.session_id).await? else {
+            return anyhow::Ok(protocols::admin::SessionHeartbeatDetail {
+                report: "no session yet".to_string(),
+                ..Default::default()
+            });
+        };
+        let report = match op {
+            Op::Set => {
+                let prompt = req.prompt.trim();
+                if prompt.is_empty() {
+                    return anyhow::Ok(
+                        heartbeat_detail(&db, &session_id, "heartbeat prompt must not be empty")
+                            .await?,
+                    );
+                }
+                let hb = db
+                    .set_session_heartbeat(&session_id, prompt, req.interval_secs)
+                    .await?;
+                format!("set — every {}s", hb.interval_secs)
+            }
+            Op::Pause => match db.set_session_heartbeat_paused(&session_id, true).await? {
+                Some(_) => "paused".to_string(),
+                None => "no heartbeat set".to_string(),
+            },
+            Op::Resume => match db.set_session_heartbeat_paused(&session_id, false).await? {
+                Some(hb) => format!(
+                    "resumed — next fire in {}s",
+                    hb.seconds_until_due(now_unix())
+                ),
+                None => "no heartbeat set".to_string(),
+            },
+            Op::Clear => {
+                if db.clear_session_heartbeat(&session_id).await? {
+                    "cleared".to_string()
+                } else {
+                    "no heartbeat set".to_string()
+                }
+            }
+            Op::Status | Op::Unspecified => String::new(),
+        };
+        anyhow::Ok(heartbeat_detail(&db, &session_id, &report).await?)
+    }
+    .await
+    .map_err(map_internal("mutate_session_heartbeat"))?;
+    Ok(Response::new(detail))
+}
+
+/// Current heartbeat state for `session_id`, projected onto the wire type.
+async fn heartbeat_detail(
+    db: &Database,
+    session_id: &str,
+    report: &str,
+) -> anyhow::Result<protocols::admin::SessionHeartbeatDetail> {
+    let hb = db.get_session_heartbeat(session_id).await?;
+    Ok(match hb {
+        Some(hb) => protocols::admin::SessionHeartbeatDetail {
+            present: true,
+            session_id: hb.session_id.clone(),
+            prompt: hb.prompt.clone(),
+            interval_secs: hb.interval_secs,
+            paused: hb.paused,
+            seconds_until_due: hb.seconds_until_due(now_unix()),
+            report: report.to_string(),
+        },
+        None => protocols::admin::SessionHeartbeatDetail {
+            session_id: session_id.to_string(),
+            report: report.to_string(),
+            ..Default::default()
+        },
+    })
+}
+
 pub(super) async fn set_goal(
     svc: &AdminSvc,
     req: Request<GoalMutation>,
@@ -165,6 +315,15 @@ pub(super) async fn set_goal(
                         "goal changed concurrently during status update".into(),
                     )
                 })?;
+                // Returning to Active grants a fresh retry budget. A gate that
+                // exhausted its budget tells the operator to `/goal resume`;
+                // without this the first run after resuming re-reaches the cap
+                // and re-pauses immediately, making that advice a lie.
+                if goal.status == cortex::goals::GoalStatus::Active {
+                    if let Err(e) = db.reset_goal_gate_attempts(&session_id).await {
+                        tracing::warn!("resetting goal gate attempts on resume failed: {e}");
+                    }
+                }
                 let kind = if goal.status == cortex::goals::GoalStatus::Complete {
                     cortex::goals::event_kind::COMPLETED
                 } else {

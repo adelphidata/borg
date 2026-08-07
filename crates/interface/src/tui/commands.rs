@@ -221,6 +221,16 @@ impl App<'_> {
             return Some(self.cmd_goal_dispatch(rest.trim()));
         }
 
+        // `/hb` is the alias; both land on the same parser.
+        for name in ["/heartbeat", "/hb"] {
+            if trimmed == name {
+                return Some(self.cmd_heartbeat(HeartbeatSubcommand::Status));
+            }
+            if let Some(rest) = trimmed.strip_prefix(&format!("{name} ")) {
+                return Some(self.cmd_heartbeat(parse_heartbeat_subcommand(rest.trim())));
+            }
+        }
+
         if trimmed == "/handoff" {
             return Some(self.cmd_handoff_show());
         }
@@ -1273,6 +1283,7 @@ impl App<'_> {
                 self.push_system_message(GOAL_USAGE.to_string());
                 Ok(AppAction::Continue)
             }
+            GoalSubcommand::Gate(sub) => self.cmd_goal_gate(sub),
             GoalSubcommand::Budget { budget } => {
                 if let Some(b) = budget {
                     if let Err(e) = cortex::goals::validate_budget(Some(b)) {
@@ -1378,6 +1389,84 @@ impl App<'_> {
                 c.request_handoff("", &platform).await
             })
         })
+    }
+
+    /// `/goal gate …` — add, list, remove, or clear the goal's quality gates.
+    ///
+    /// Every op round-trips through the daemon and re-renders the full list, so
+    /// the user always sees the state their change produced rather than the
+    /// state the client guessed.
+    fn cmd_goal_gate(&mut self, sub: GateSubcommand) -> Result<AppAction> {
+        use protocols::admin::goal_gate_mutation::Op;
+
+        let (op, command, ordinal) = match sub {
+            GateSubcommand::List => (Op::List, String::new(), 0),
+            GateSubcommand::Add(c) => (Op::Add, c, 0),
+            GateSubcommand::Remove(n) => (Op::Remove, String::new(), n),
+            GateSubcommand::Clear => (Op::Clear, String::new(), 0),
+            GateSubcommand::Usage => {
+                self.push_system_message(GOAL_USAGE.to_string());
+                return Ok(AppAction::Continue);
+            }
+        };
+
+        let report = match self.rpc_mutate_goal_gates(op as i32, &command, ordinal) {
+            Ok(list) => format_goal_gates(&list),
+            Err(e) => format!("/goal gate: failed — {e}"),
+        };
+        self.push_system_message(report);
+        Ok(AppAction::Continue)
+    }
+
+    fn rpc_mutate_goal_gates(
+        &self,
+        op: i32,
+        command: &str,
+        ordinal: i64,
+    ) -> Result<protocols::admin::GoalGateList> {
+        let client = self.client.clone();
+        let command = command.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.mutate_goal_gates("", op, &command, ordinal).await
+            })
+        })
+    }
+
+    /// `/heartbeat …` — manage this session's recurring prompt.
+    fn cmd_heartbeat(&mut self, sub: HeartbeatSubcommand) -> Result<AppAction> {
+        use protocols::admin::session_heartbeat_mutation::Op;
+
+        let (op, prompt, interval) = match sub {
+            HeartbeatSubcommand::Status => (Op::Status, String::new(), 0),
+            HeartbeatSubcommand::Set {
+                interval_secs,
+                prompt,
+            } => (Op::Set, prompt, interval_secs),
+            HeartbeatSubcommand::Pause => (Op::Pause, String::new(), 0),
+            HeartbeatSubcommand::Resume => (Op::Resume, String::new(), 0),
+            HeartbeatSubcommand::Clear => (Op::Clear, String::new(), 0),
+            HeartbeatSubcommand::Usage => {
+                self.push_system_message(HEARTBEAT_USAGE.to_string());
+                return Ok(AppAction::Continue);
+            }
+        };
+
+        let client = self.client.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.mutate_session_heartbeat("", op as i32, &prompt, interval)
+                    .await
+            })
+        });
+        let report = match result {
+            Ok(detail) => format_session_heartbeat(&detail),
+            Err(e) => format!("/heartbeat: failed — {e}"),
+        };
+        self.push_system_message(report);
+        Ok(AppAction::Continue)
     }
 
     fn rpc_clear_goal(&self) -> Result<()> {
@@ -1772,12 +1861,180 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
 }
 
 /// Multi-line usage card for `/goal`.
+/// Render a gate list (plus any mutation report) for the transcript.
+fn format_goal_gates(list: &protocols::admin::GoalGateList) -> String {
+    let mut out = String::new();
+    if !list.report.is_empty() {
+        out.push_str(&format!("/goal gate: {}\n", list.report));
+    }
+    if list.gates.is_empty() {
+        out.push_str("No quality gates. Add one with `/goal gate add <command>`.");
+        return out;
+    }
+    out.push_str("Quality gates (all must exit 0 before the goal completes):");
+    for g in &list.gates {
+        // Report the last verdict, not just the command — "which of these is
+        // red?" is the question a user actually has here.
+        let state = if !g.last_exit_code_present {
+            "not yet run".to_string()
+        } else if g.last_exit_code == 0 {
+            "passing".to_string()
+        } else {
+            format!(
+                "FAILING (exit {}, {} attempt(s))",
+                g.last_exit_code, g.attempts
+            )
+        };
+        out.push_str(&format!("\n  {}. {}  — {state}", g.ordinal, g.command));
+    }
+    out
+}
+
 const GOAL_USAGE: &str = "Usage:\n  /goal                       Show current goal\n  \
      /goal <text>                Set or replace the session goal\n  \
      /goal --budget N <text>     Set with a token budget\n  \
      /goal budget N|none         Change the budget in place\n  \
      /goal edit <text>           Replace the objective\n  \
-     /goal pause|resume|clear    Manage goal status";
+     /goal pause|resume|clear    Manage goal status\n  \
+     /goal gate add <cmd>        Require <cmd> to exit 0 before completing\n  \
+     /goal gate [list]           Show gates and their last result\n  \
+     /goal gate remove <N>       Drop gate N\n  \
+     /goal gate clear            Drop all gates";
+
+/// Parsed `/heartbeat …` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HeartbeatSubcommand {
+    /// `/heartbeat` / `/heartbeat status`.
+    Status,
+    /// `/heartbeat every <interval> <prompt>`.
+    Set {
+        /// Firing interval in seconds (clamped to the 60s floor server-side).
+        interval_secs: i64,
+        /// Prompt injected as an ordinary user message.
+        prompt: String,
+    },
+    /// `/heartbeat pause`.
+    Pause,
+    /// `/heartbeat resume`.
+    Resume,
+    /// `/heartbeat clear`.
+    Clear,
+    /// Anything else — show usage rather than guessing.
+    Usage,
+}
+
+/// Parse a duration like `90s`, `10m`, `2h`, `1d`, or a bare number of seconds.
+///
+/// Returns `None` for anything unrecognized so the caller can show usage — a
+/// silently-misread interval is worse than an error, since the user would only
+/// discover it when the heartbeat fired at the wrong cadence.
+pub(super) fn parse_interval_secs(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (digits, mult) = match raw.chars().last()? {
+        's' | 'S' => (&raw[..raw.len() - 1], 1),
+        'm' | 'M' => (&raw[..raw.len() - 1], 60),
+        'h' | 'H' => (&raw[..raw.len() - 1], 3600),
+        'd' | 'D' => (&raw[..raw.len() - 1], 86_400),
+        _ => (raw, 1),
+    };
+    let n: i64 = digits.trim().parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    n.checked_mul(mult)
+}
+
+/// Parse the text after `/heartbeat`.
+pub(super) fn parse_heartbeat_subcommand(rest: &str) -> HeartbeatSubcommand {
+    let rest = rest.trim();
+    match rest {
+        "" | "status" => return HeartbeatSubcommand::Status,
+        "pause" => return HeartbeatSubcommand::Pause,
+        "resume" => return HeartbeatSubcommand::Resume,
+        "clear" => return HeartbeatSubcommand::Clear,
+        _ => {}
+    }
+    let Some(after) = rest.strip_prefix("every ") else {
+        return HeartbeatSubcommand::Usage;
+    };
+    let mut parts = after.trim().splitn(2, char::is_whitespace);
+    let Some(interval_raw) = parts.next() else {
+        return HeartbeatSubcommand::Usage;
+    };
+    let Some(interval_secs) = parse_interval_secs(interval_raw) else {
+        return HeartbeatSubcommand::Usage;
+    };
+    // The prompt is the rest of the line verbatim — it is prose, so splitting
+    // or normalizing it would change what the agent is asked to do.
+    let prompt = parts.next().unwrap_or("").trim().to_string();
+    if prompt.is_empty() {
+        return HeartbeatSubcommand::Usage;
+    }
+    HeartbeatSubcommand::Set {
+        interval_secs,
+        prompt,
+    }
+}
+
+/// Render `SessionHeartbeatDetail` (plus any mutation report) for the transcript.
+fn format_session_heartbeat(d: &protocols::admin::SessionHeartbeatDetail) -> String {
+    let mut out = String::new();
+    if !d.report.is_empty() {
+        out.push_str(&format!("/heartbeat: {}\n", d.report));
+    }
+    if !d.present {
+        out.push_str(
+            "No heartbeat set for this session. \
+             Example: `/heartbeat every 15m Check whether the deploy finished`.",
+        );
+        return out;
+    }
+    let state = if d.paused {
+        "paused".to_string()
+    } else {
+        format!("next fire in {}", format_secs(d.seconds_until_due))
+    };
+    out.push_str(&format!(
+        "Heartbeat: every {} — {state}\n  \"{}\"",
+        format_secs(d.interval_secs),
+        d.prompt
+    ));
+    out
+}
+
+/// Compact duration for display: `90s`, `15m`, `2h`, `1d`.
+fn format_secs(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+const HEARTBEAT_USAGE: &str = "Usage:\n  \
+     /heartbeat every <interval> <prompt>   Recurring prompt in THIS session (min 60s)\n  \
+     /heartbeat [status]                    Show it\n  \
+     /heartbeat pause|resume|clear          Manage it\n\n\
+     Intervals: 90s, 10m, 2h, 1d. For durable isolated jobs use the scheduler instead.";
+
+/// The `gate` verbs under `/goal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GateSubcommand {
+    /// `/goal gate` / `/goal gate list`.
+    List,
+    /// `/goal gate add <command>`.
+    Add(String),
+    /// `/goal gate remove <N>`.
+    Remove(i64),
+    /// `/goal gate clear`.
+    Clear,
+    /// Anything else under `gate` — show usage rather than guessing.
+    Usage,
+}
 
 /// Parsed `/goal …` subcommand. Splits the dispatcher's pure-parse half from
 /// the side-effecting RPC half so the parser can be tested independently.
@@ -1806,6 +2063,8 @@ pub(super) enum GoalSubcommand {
         /// New budget; `None` means unbounded.
         budget: Option<i64>,
     },
+    /// `/goal gate …` — manage the goal's quality gates.
+    Gate(GateSubcommand),
     /// `/goal <text>` or `/goal edit <text>` or `/goal --budget N <text>`.
     Set {
         /// Raw objective text (unvalidated, to be passed to
@@ -1816,6 +2075,40 @@ pub(super) enum GoalSubcommand {
     },
 }
 
+/// Parse the text after `/goal gate`.
+///
+/// `add` deliberately takes the rest of the line verbatim — a gate command is a
+/// shell line (`cargo test -p coding -- --nocapture`), so splitting on
+/// whitespace or trying to strip quotes would mangle it.
+pub(super) fn parse_gate_subcommand(rest: &str) -> GateSubcommand {
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "list" {
+        return GateSubcommand::List;
+    }
+    if rest == "clear" {
+        return GateSubcommand::Clear;
+    }
+    if let Some(command) = rest.strip_prefix("add ") {
+        let command = command.trim();
+        if command.is_empty() {
+            return GateSubcommand::Usage;
+        }
+        return GateSubcommand::Add(command.to_string());
+    }
+    if let Some(n) = rest
+        .strip_prefix("remove ")
+        .or_else(|| rest.strip_prefix("rm "))
+    {
+        // An unparseable ordinal is a typo, not a request to add a gate named
+        // "remove x" — say so instead of doing something surprising.
+        return match n.trim().parse::<i64>() {
+            Ok(n) if n > 0 => GateSubcommand::Remove(n),
+            _ => GateSubcommand::Usage,
+        };
+    }
+    GateSubcommand::Usage
+}
+
 pub(super) fn parse_goal_subcommand(args: &str) -> GoalSubcommand {
     match args.trim() {
         "" => return GoalSubcommand::Show,
@@ -1824,7 +2117,16 @@ pub(super) fn parse_goal_subcommand(args: &str) -> GoalSubcommand {
         "resume" => return GoalSubcommand::Resume,
         "edit" => return GoalSubcommand::BareEdit,
         "--budget" => return GoalSubcommand::Usage,
+        "gate" | "gates" => return GoalSubcommand::Gate(GateSubcommand::List),
         _ => {}
+    }
+    // `gate` verbs are matched before the objective fallback so `/goal gate
+    // add cargo test` manages a gate rather than replacing the objective with
+    // the literal text "gate add cargo test".
+    for prefix in ["gate ", "gates "] {
+        if let Some(rest) = args.trim().strip_prefix(prefix) {
+            return GoalSubcommand::Gate(parse_gate_subcommand(rest.trim()));
+        }
     }
     // `/goal budget N` / `/goal budget none` — in-place budget change. Only a
     // lone integer or none/unbounded qualifies. A word-valued first token (e.g.
@@ -2100,6 +2402,221 @@ mod tests {
         let (b, rest) = parse_goal_budget_prefix("ship it");
         assert!(b.is_none());
         assert_eq!(rest, "ship it");
+    }
+
+    #[test]
+    fn heartbeat_interval_units_parse_and_bad_ones_are_refused() {
+        // A misread interval is silent until the heartbeat fires at the wrong
+        // cadence, so anything unrecognized must surface usage instead of being
+        // coerced to a plausible-looking number.
+        assert_eq!(parse_interval_secs("90s"), Some(90));
+        assert_eq!(parse_interval_secs("10m"), Some(600));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+        assert_eq!(parse_interval_secs("1d"), Some(86_400));
+        assert_eq!(parse_interval_secs("300"), Some(300), "bare = seconds");
+        assert_eq!(parse_interval_secs("15M"), Some(900), "case-insensitive");
+
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("soon"), None);
+        assert_eq!(parse_interval_secs("0"), None);
+        assert_eq!(parse_interval_secs("-5m"), None);
+        assert_eq!(parse_interval_secs("1.5h"), None);
+    }
+
+    #[test]
+    fn heartbeat_set_keeps_the_prompt_verbatim() {
+        // The prompt is prose the agent acts on; normalizing it would change
+        // the instruction the user wrote.
+        assert_eq!(
+            parse_heartbeat_subcommand("every 15m Check CI for PR #12, then summarize"),
+            HeartbeatSubcommand::Set {
+                interval_secs: 900,
+                prompt: "Check CI for PR #12, then summarize".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn heartbeat_verbs_and_malformed_input_route_correctly() {
+        assert_eq!(parse_heartbeat_subcommand(""), HeartbeatSubcommand::Status);
+        assert_eq!(
+            parse_heartbeat_subcommand("status"),
+            HeartbeatSubcommand::Status
+        );
+        assert_eq!(
+            parse_heartbeat_subcommand("pause"),
+            HeartbeatSubcommand::Pause
+        );
+        assert_eq!(
+            parse_heartbeat_subcommand("resume"),
+            HeartbeatSubcommand::Resume
+        );
+        assert_eq!(
+            parse_heartbeat_subcommand("clear"),
+            HeartbeatSubcommand::Clear
+        );
+
+        // An interval with no prompt would set a heartbeat that says nothing.
+        assert_eq!(
+            parse_heartbeat_subcommand("every 10m"),
+            HeartbeatSubcommand::Usage
+        );
+        // Missing the `every` keyword entirely.
+        assert_eq!(
+            parse_heartbeat_subcommand("10m check ci"),
+            HeartbeatSubcommand::Usage
+        );
+        assert_eq!(
+            parse_heartbeat_subcommand("every soon check ci"),
+            HeartbeatSubcommand::Usage
+        );
+    }
+
+    #[test]
+    fn format_session_heartbeat_distinguishes_paused_from_counting_down() {
+        // "Why hasn't it fired?" is the question this display answers.
+        let base = protocols::admin::SessionHeartbeatDetail {
+            present: true,
+            session_id: "s".into(),
+            prompt: "Check CI".into(),
+            interval_secs: 900,
+            paused: false,
+            seconds_until_due: 120,
+            report: String::new(),
+        };
+        let running = format_session_heartbeat(&base);
+        assert!(running.contains("every 15m"), "{running}");
+        assert!(running.contains("next fire in 2m"), "{running}");
+        assert!(running.contains("Check CI"), "{running}");
+
+        let paused = format_session_heartbeat(&protocols::admin::SessionHeartbeatDetail {
+            paused: true,
+            ..base
+        });
+        assert!(paused.contains("paused"), "{paused}");
+        assert!(
+            !paused.contains("next fire"),
+            "a paused heartbeat must not advertise a countdown: {paused}"
+        );
+    }
+
+    #[test]
+    fn format_session_heartbeat_tells_the_user_how_to_set_one() {
+        let none = protocols::admin::SessionHeartbeatDetail::default();
+        let out = format_session_heartbeat(&none);
+        assert!(out.contains("/heartbeat every"), "{out}");
+    }
+
+    #[test]
+    fn goal_gate_verbs_are_not_swallowed_as_objectives() {
+        // The failure this guards: `/goal gate add cargo test` falling through
+        // to the objective fallback and *replacing the goal* with the literal
+        // text "gate add cargo test", silently discarding the real objective
+        // and its accounting.
+        assert_eq!(
+            parse_goal_subcommand("gate"),
+            GoalSubcommand::Gate(GateSubcommand::List)
+        );
+        assert_eq!(
+            parse_goal_subcommand("gate list"),
+            GoalSubcommand::Gate(GateSubcommand::List)
+        );
+        assert_eq!(
+            parse_goal_subcommand("gate clear"),
+            GoalSubcommand::Gate(GateSubcommand::Clear)
+        );
+        assert_eq!(
+            parse_goal_subcommand("gate add cargo test -p coding"),
+            GoalSubcommand::Gate(GateSubcommand::Add("cargo test -p coding".to_string()))
+        );
+        assert_eq!(
+            parse_goal_subcommand("gate remove 2"),
+            GoalSubcommand::Gate(GateSubcommand::Remove(2))
+        );
+    }
+
+    #[test]
+    fn goal_gate_add_keeps_the_command_line_verbatim() {
+        // A gate command is a shell line. Splitting on whitespace, stripping
+        // quotes, or trimming flags would silently change what gets run.
+        let raw = r#"bash -c "cargo test 2>&1 | tail -5""#;
+        assert_eq!(
+            parse_gate_subcommand(&format!("add {raw}")),
+            GateSubcommand::Add(raw.to_string())
+        );
+    }
+
+    #[test]
+    fn goal_gate_rejects_malformed_input_instead_of_guessing() {
+        // A bad ordinal is a typo. Coercing it (to 0, or to "add a gate named
+        // remove x") would either no-op silently or create a nonsense gate.
+        assert_eq!(parse_gate_subcommand("remove"), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("remove x"), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("remove 0"), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("remove -1"), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("add"), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("add    "), GateSubcommand::Usage);
+        assert_eq!(parse_gate_subcommand("frobnicate"), GateSubcommand::Usage);
+    }
+
+    #[test]
+    fn a_goal_objective_may_still_start_with_the_word_gate() {
+        // Only the `gate` *verb* is claimed; an objective that happens to begin
+        // with "gate" (no recognized sub-verb) must remain an objective.
+        assert_eq!(
+            parse_goal_subcommand("gateway rewrite for the delivery queue"),
+            GoalSubcommand::Set {
+                objective: "gateway rewrite for the delivery queue".to_string(),
+                budget: None,
+            }
+        );
+    }
+
+    #[test]
+    fn format_goal_gates_reports_which_gate_is_red() {
+        // "Which one is failing?" is the question this list exists to answer.
+        let list = protocols::admin::GoalGateList {
+            report: String::new(),
+            gates: vec![
+                protocols::admin::GoalGate {
+                    ordinal: 1,
+                    command: "cargo fmt --check".to_string(),
+                    attempts: 0,
+                    last_exit_code_present: true,
+                    last_exit_code: 0,
+                },
+                protocols::admin::GoalGate {
+                    ordinal: 2,
+                    command: "cargo test".to_string(),
+                    attempts: 2,
+                    last_exit_code_present: true,
+                    last_exit_code: 101,
+                },
+                protocols::admin::GoalGate {
+                    ordinal: 3,
+                    command: "cargo clippy".to_string(),
+                    attempts: 0,
+                    last_exit_code_present: false,
+                    last_exit_code: 0,
+                },
+            ],
+        };
+        let out = format_goal_gates(&list);
+        assert!(out.contains("1. cargo fmt --check  — passing"), "{out}");
+        assert!(
+            out.contains("2. cargo test  — FAILING (exit 101, 2 attempt(s))"),
+            "{out}"
+        );
+        assert!(out.contains("3. cargo clippy  — not yet run"), "{out}");
+    }
+
+    #[test]
+    fn format_goal_gates_tells_the_user_how_to_add_one_when_empty() {
+        let list = protocols::admin::GoalGateList {
+            report: String::new(),
+            gates: Vec::new(),
+        };
+        assert!(format_goal_gates(&list).contains("/goal gate add"));
     }
 
     #[test]

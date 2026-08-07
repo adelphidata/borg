@@ -246,6 +246,18 @@ pub enum StreamEvent {
     /// served the response instead of the configured primary — otherwise the
     /// model misidentifies itself during a primary outage. Non-terminal.
     Failover { provider: String, model: String },
+    /// A request attempt is about to go out on the wire. Emitted once per
+    /// attempt — the first try, every retry, and every provider-failover leg —
+    /// with `attempt` counting retries within the current provider leg (0 for
+    /// the first try).
+    ///
+    /// This exists so downstream liveness watchdogs can distinguish "waiting on
+    /// a slow-but-healthy provider" from "wedged". Between attempts a retry
+    /// storm or a long prefill produces no other event for minutes; without
+    /// this marker that silence is indistinguishable from a frozen child. It is
+    /// discrete (one per attempt) and originates in the transport, so a hung
+    /// tool cannot forge it. Non-terminal.
+    AttemptStarted { attempt: u32 },
     /// Stream completed.
     Done,
     /// Stream error.
@@ -1918,6 +1930,10 @@ impl LlmClient {
         self.maybe_restore_primary();
 
         let max_provider_attempts = 1 + self.provider_slots.len();
+        // One last-gasp salvage per call, shared across every provider leg. A
+        // pool that is exhausted now will still be exhausted on the next retry,
+        // so re-salvaging would just hammer a benched key.
+        let mut salvage_used = false;
 
         for _provider_attempt in 0..max_provider_attempts {
             let max_retries = self.llm_config.max_retries;
@@ -1932,6 +1948,16 @@ impl LlmClient {
                         tracing::trace!("llm: stream receiver closed");
                     }
                     return Ok(());
+                }
+                // Liveness marker for stall watchdogs — see `AttemptStarted`.
+                // Sent before the credential lease so a pool that blocks on a
+                // refresh still reports the attempt.
+                if tx
+                    .send(StreamEvent::AttemptStarted { attempt })
+                    .await
+                    .is_err()
+                {
+                    tracing::trace!("llm: stream receiver closed");
                 }
 
                 // Pool path: pick a fresh credential before each attempt. The
@@ -1981,10 +2007,34 @@ impl LlmClient {
                             should_failover = true;
                             break;
                         }
-                        if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
-                            tracing::trace!("llm: stream receiver closed");
+                        // No fallback to move to, so the alternative to trying a
+                        // cooling key is going dark. That is the wrong trade for
+                        // a single-key install, where an ordinary burst throttle
+                        // benches the only credential the agent has. `pick_force`
+                        // refuses entries benched for billing or permanent auth
+                        // failure, so this cannot hammer a key that needs a human.
+                        let salvaged = if salvage_used {
+                            None
+                        } else {
+                            pool.pick_force()
+                        };
+                        if let Some(cred) = salvaged {
+                            salvage_used = true;
+                            warn!(
+                                target: "cortex::llm",
+                                id = %cred.id,
+                                label = %cred.label,
+                                "no fallback available; making one salvage attempt on a cooling credential"
+                            );
+                            self.api_key = cred.key.clone();
+                            self.active_credential_base_url = cred.base_url.clone();
+                            Some(cred.id)
+                        } else {
+                            if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
+                                tracing::trace!("llm: stream receiver closed");
+                            }
+                            bail!("{msg}");
                         }
-                        bail!("{msg}");
                     }
                 } else {
                     None

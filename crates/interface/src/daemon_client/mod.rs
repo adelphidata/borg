@@ -658,6 +658,36 @@ rpc_wrappers! {
             status: String::new(),
         });
 
+    /// Manage the goal's quality gates. Every op returns the full post-mutation
+    /// gate list plus a short report line the caller echoes to the user.
+    admin fn mutate_goal_gates(
+        session_id: &str,
+        op: i32,
+        command: &str,
+        ordinal: i64,
+    ) -> protocols::admin::GoalGateList =
+        mutate_goal_gates("Admin.MutateGoalGates", protocols::admin::GoalGateMutation {
+            session_id: session_id.to_string(),
+            op,
+            command: command.to_string(),
+            ordinal,
+        });
+
+    /// Manage this session's recurring heartbeat prompt. Every op returns the
+    /// post-mutation state plus a short report line the caller echoes.
+    admin fn mutate_session_heartbeat(
+        session_id: &str,
+        op: i32,
+        prompt: &str,
+        interval_secs: i64,
+    ) -> protocols::admin::SessionHeartbeatDetail =
+        mutate_session_heartbeat("Admin.MutateSessionHeartbeat", protocols::admin::SessionHeartbeatMutation {
+            session_id: session_id.to_string(),
+            op,
+            prompt: prompt.to_string(),
+            interval_secs,
+        });
+
     /// Delete the goal row. No-op when none exists.
     admin fn clear_goal(session_id: &str) =
         clear_goal("Admin.ClearGoal", GoalRef {

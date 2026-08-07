@@ -118,6 +118,9 @@ impl<'a> App<'a> {
                 self.handle_event_shell_confirmation(command, respond)
             }
             AgentEvent::Usage(usage) => self.handle_event_usage(usage),
+            // Liveness marker for the sub-agent stall watchdog — nothing to
+            // render. The spinner already covers "a request is in flight".
+            AgentEvent::LlmAttemptStarted { .. } => {}
             AgentEvent::TurnComplete => self.handle_event_turn_complete(),
             AgentEvent::Error(e) => self.handle_event_error(e),
             AgentEvent::SteerReceived { text } => self.handle_event_steer_received(text),

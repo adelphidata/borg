@@ -375,6 +375,179 @@ async fn seed_active_goal(agent: &Agent, objective: &str, budget: Option<i64>) -
         .goal_id
 }
 
+/// Event sink for the continuation tests. These exercise history mutation and
+/// the reservation guard, not the notice channel, so the receiver is dropped —
+/// sends fail silently, which is the same thing that happens when the TUI has
+/// gone away mid-turn.
+fn discard_events() -> tokio::sync::mpsc::Sender<crate::agent::AgentEvent> {
+    tokio::sync::mpsc::channel(1).0
+}
+
+/// The contract quality gates exist for: a goal the model marked `complete`
+/// must NOT stay complete while a gate is red.
+///
+/// This is the exact hole an earlier version had — the `should_continue`
+/// short-circuit fired first, so by the time gates were consulted the row was
+/// already `Complete` and the loop had ended. The agent could declare "fix the
+/// failing tests" done against a red suite.
+#[tokio::test]
+async fn a_failing_gate_reopens_a_goal_the_model_marked_complete() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let session_id = agent.session.meta.id.clone();
+    seed_active_goal(&agent, "make the suite green", None).await;
+
+    {
+        let guard = agent.db_guard().await;
+        let db = guard.as_ref().expect("db");
+        // A gate that always fails, standing in for a red test suite.
+        db.add_goal_gate(&session_id, "exit 7").await.expect("gate");
+        // The model declares victory mid-turn.
+        db.update_goal(
+            &session_id,
+            crate::db::GoalUpdate {
+                status: Some(GoalStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete");
+    }
+
+    let continued = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        continued,
+        "a red gate must keep the loop running instead of accepting completion"
+    );
+
+    let goal = {
+        let guard = agent.db_guard().await;
+        guard
+            .as_ref()
+            .expect("db")
+            .get_goal(&session_id)
+            .await
+            .expect("read")
+            .expect("row")
+    };
+    assert_eq!(
+        goal.status,
+        GoalStatus::Active,
+        "the premature completion must be reverted, not just ignored"
+    );
+
+    // And the injected prompt must carry the gate's real evidence.
+    let last = agent.history.last().expect("a continuation was injected");
+    let text = last.text_content().unwrap_or_default();
+    assert!(
+        text.contains("exit 7"),
+        "must name the failing command: {text}"
+    );
+    assert!(
+        text.contains("7"),
+        "must carry the exit code the agent has to fix: {text}"
+    );
+}
+
+/// Negative: a *passing* gate leaves a completed goal completed. Without this,
+/// the reopen path above would trap every goal in an endless loop.
+#[tokio::test]
+async fn a_passing_gate_lets_a_completed_goal_stay_complete() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let session_id = agent.session.meta.id.clone();
+    seed_active_goal(&agent, "make the suite green", None).await;
+
+    {
+        let guard = agent.db_guard().await;
+        let db = guard.as_ref().expect("db");
+        db.add_goal_gate(&session_id, "exit 0").await.expect("gate");
+        db.update_goal(
+            &session_id,
+            crate::db::GoalUpdate {
+                status: Some(GoalStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete");
+    }
+
+    let continued = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!continued, "a green gate must let the goal finish");
+    let goal = {
+        let guard = agent.db_guard().await;
+        guard
+            .as_ref()
+            .expect("db")
+            .get_goal(&session_id)
+            .await
+            .expect("read")
+            .expect("row")
+    };
+    assert_eq!(goal.status, GoalStatus::Complete);
+}
+
+/// Negative: a gate must not drag a goal out of a state the *operator* chose.
+/// Only `Complete` (a model claim) is re-opened; `Paused` is a human decision.
+#[tokio::test]
+async fn a_failing_gate_does_not_resurrect_a_paused_goal() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let session_id = agent.session.meta.id.clone();
+    seed_active_goal(&agent, "make the suite green", None).await;
+
+    {
+        let guard = agent.db_guard().await;
+        let db = guard.as_ref().expect("db");
+        db.add_goal_gate(&session_id, "exit 7").await.expect("gate");
+        db.update_goal(
+            &session_id,
+            crate::db::GoalUpdate {
+                status: Some(GoalStatus::Paused),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pause");
+    }
+
+    let continued = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!continued, "a paused goal must stay paused");
+    let goal = {
+        let guard = agent.db_guard().await;
+        guard
+            .as_ref()
+            .expect("db")
+            .get_goal(&session_id)
+            .await
+            .expect("read")
+            .expect("row")
+    };
+    assert_eq!(goal.status, GoalStatus::Paused);
+}
+
 /// Positive: an Active goal ending a turn injects the continuation prompt as a
 /// synthetic user message and reserves the turn so the loop re-enters.
 #[tokio::test]
@@ -384,7 +557,13 @@ async fn continuation_injects_for_active_goal_and_reserves_turn() {
     seed_active_goal(&agent, "ship the feature", Some(5000)).await;
 
     let before = agent.history.len();
-    let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+    let injected = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
     assert!(injected, "Active goal must self-continue");
     assert_eq!(
         agent.history.len(),
@@ -403,7 +582,13 @@ async fn continuation_injects_for_active_goal_and_reserves_turn() {
     );
     // Reservation is now held for turn-1, so a re-entrant call for the same
     // turn must NOT inject a second continuation (loop-safety guard).
-    let second = agent.maybe_inject_goal_continuation("turn-1").await;
+    let second = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
     assert!(!second, "same turn_id must not double-continue");
     assert_eq!(
         agent.history.len(),
@@ -443,7 +628,13 @@ async fn continuation_suppressed_for_non_active_statuses() {
             .expect("set status");
         }
         let before = agent.history.len();
-        let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+        let injected = agent
+            .maybe_inject_goal_continuation(
+                "turn-1",
+                &discard_events(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
         assert!(!injected, "status={status:?} must not continue");
         assert_eq!(
             agent.history.len(),
@@ -458,7 +649,15 @@ async fn continuation_suppressed_for_non_active_statuses() {
 async fn continuation_false_when_no_goal() {
     let db = Database::test_db().await;
     let mut agent = agent_with_db(Some(db)).await;
-    assert!(!agent.maybe_inject_goal_continuation("turn-1").await);
+    assert!(
+        !agent
+            .maybe_inject_goal_continuation(
+                "turn-1",
+                &discard_events(),
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .await
+    );
 }
 
 /// Negative: goals disabled short-circuits before any DB read.
@@ -469,7 +668,13 @@ async fn continuation_false_when_goals_disabled() {
     seed_active_goal(&agent, "x", None).await;
     agent.config.goals.enabled = false;
     assert!(
-        !agent.maybe_inject_goal_continuation("turn-1").await,
+        !agent
+            .maybe_inject_goal_continuation(
+                "turn-1",
+                &discard_events(),
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .await,
         "disabled goals must never auto-continue"
     );
     assert!(agent.history.is_empty());
@@ -483,7 +688,15 @@ async fn continuation_false_in_plan_mode() {
     let mut agent = agent_with_db(Some(db)).await;
     seed_active_goal(&agent, "x", None).await;
     agent.config.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
-    assert!(!agent.maybe_inject_goal_continuation("turn-1").await);
+    assert!(
+        !agent
+            .maybe_inject_goal_continuation(
+                "turn-1",
+                &discard_events(),
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .await
+    );
     assert!(agent.history.is_empty());
 }
 
@@ -505,7 +718,13 @@ async fn continuation_suppressed_by_pending_user_steer() {
         agent.user_input_is_pending(),
         "a buffered steer must read as pending input"
     );
-    let injected = agent.maybe_inject_goal_continuation("turn-1").await;
+    let injected = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
     assert!(
         !injected,
         "pending user input must suppress auto-continuation"

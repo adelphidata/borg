@@ -36,6 +36,7 @@ pub use history::{normalize_history, rewind_to_nth_user, undo_last_turn};
 pub use summarize::SummarizeFailure;
 pub use tokens::history_tokens;
 pub use truncation::{
-    age_based_tool_result_degradation, compact_tool_results, enforce_tool_result_share_limit,
-    AGE_TIER1_TOKEN_THRESHOLD, AGE_TIER1_WINDOW, AGE_TIER2_TOKEN_THRESHOLD, AGE_TIER2_WINDOW,
+    age_based_tool_result_degradation, compact_tool_results, degrade_old_tool_results,
+    enforce_tool_result_share_limit, AGE_TIER1_TOKEN_THRESHOLD, AGE_TIER1_WINDOW,
+    AGE_TIER2_TOKEN_THRESHOLD, AGE_TIER2_WINDOW,
 };

@@ -83,6 +83,17 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Default for [`ConversationConfig::degradation_min_reclaim_tokens`].
+///
+/// 4096 is roughly the smallest batch worth breaking a provider prompt-cache
+/// prefix for: below it the re-sent uncached input costs more than the trimmed
+/// tokens save. Large enough that ordinary turn-to-turn tier drift accumulates
+/// for a while before committing, small enough that a genuinely bloated history
+/// still gets trimmed promptly.
+fn default_degradation_min_reclaim_tokens() -> usize {
+    4096
+}
+
 /// Where the browser session actually runs.
 ///
 /// `Local` launches a headless Chromium-family browser that borg owns.
@@ -1011,6 +1022,18 @@ pub struct ConversationConfig {
     /// Saves 2K-8K tokens/turn in long conversations.
     #[serde(default = "default_true")]
     pub age_based_degradation: bool,
+    /// Minimum tokens a degradation pass must reclaim before it is allowed to
+    /// rewrite history.
+    ///
+    /// Degradation edits messages the provider has already seen, so every
+    /// commit invalidates the prompt-cache prefix from the earliest edit
+    /// onward. The tier windows are counted backwards from the newest message,
+    /// so without a gate one or two results cross a boundary every turn and the
+    /// cache breaks every turn — paying full input price to save a few dozen
+    /// tokens. This threshold batches those rewrites into occasional, worthwhile
+    /// breaks. `0` disables the gate (rewrite whenever anything is eligible).
+    #[serde(default = "default_degradation_min_reclaim_tokens")]
+    pub degradation_min_reclaim_tokens: usize,
     /// Number of earliest history messages to preserve verbatim across
     /// compactions. 0 = legacy behavior (head can be dropped into the
     /// summary). Non-zero = protect the first N messages and iteratively
@@ -1046,6 +1069,7 @@ impl Default for ConversationConfig {
             max_transcript_chars: constants::MAX_TRANSCRIPT_CHARS,
             collaboration_mode: CollaborationMode::Execute,
             age_based_degradation: true,
+            degradation_min_reclaim_tokens: default_degradation_min_reclaim_tokens(),
             protect_first_n: 3,
             concurrent_tools: ConcurrentToolsConfig::default(),
             context_window_guidance: String::new(),
