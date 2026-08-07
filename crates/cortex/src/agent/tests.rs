@@ -491,6 +491,7 @@ async fn environment_section_reports_failover_model_identity() {
 /// and re-announces it every time.
 #[tokio::test]
 async fn latched_compaction_outage_skips_proactive_compaction() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
     let mut config = Config::default();
     // Force the history over budget so the LLM-compaction block is reached.
     config.conversation.max_history_tokens = 32;
@@ -503,6 +504,7 @@ async fn latched_compaction_outage_skips_proactive_compaction() {
     agent.compaction_outage = Some(super::prompt_assembly::CompactionOutage {
         category: crate::error_format::ErrorCategory::Auth,
         turns_until_retry: super::prompt_assembly::COMPACTION_OUTAGE_RETRY_TURNS,
+        streak: 1,
         announced: true,
     });
 
@@ -546,6 +548,7 @@ async fn latched_compaction_outage_skips_proactive_compaction() {
 /// without restarting the session.
 #[tokio::test]
 async fn compaction_outage_cooldown_expires_and_allows_a_probe() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
     let mut config = Config::default();
     config.conversation.max_history_tokens = 32;
     // No provider configured, so the probe fails at client construction —
@@ -560,6 +563,7 @@ async fn compaction_outage_cooldown_expires_and_allows_a_probe() {
     agent.compaction_outage = Some(super::prompt_assembly::CompactionOutage {
         category: crate::error_format::ErrorCategory::Auth,
         turns_until_retry: 0,
+        streak: 1,
         announced: true,
     });
 
@@ -580,6 +584,7 @@ async fn compaction_outage_announces_once_and_clears_only_on_success() {
     use crate::conversation::SummarizeFailure;
     use crate::error_format::ErrorCategory;
 
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
     let mut agent = minimal_test_agent(Config::default());
     let (tx, mut rx) = mpsc::channel(16);
 
@@ -615,8 +620,10 @@ async fn compaction_outage_announces_once_and_clears_only_on_success() {
             .compaction_outage
             .expect("still latched")
             .turns_until_retry,
-        super::prompt_assembly::COMPACTION_OUTAGE_RETRY_TURNS,
-        "a failed probe must re-arm the full cooldown"
+        super::prompt_assembly::compaction_cooldown_turns(2),
+        "a failed probe must re-arm on the NEXT rung of the ladder, not the base \
+         cooldown — otherwise a permanently-dead summarizer is re-probed at a \
+         fixed rate forever"
     );
 
     // Only dropped messages prove the summarizer works.
@@ -627,6 +634,81 @@ async fn compaction_outage_announces_once_and_clears_only_on_success() {
     );
 }
 
+/// Spec: the cooldown ladder escalates 1x/3x/9x off the base and then stops at
+/// the absolute cap. A flat cooldown means a summarizer that is down for good
+/// is re-probed at a fixed rate forever; an uncapped one eventually stops
+/// probing within any realistic session, so a restored key would never resume.
+#[test]
+fn compaction_cooldown_escalates_then_clamps() {
+    use super::prompt_assembly::{
+        compaction_cooldown_turns as cooldown, COMPACTION_OUTAGE_MAX_RETRY_TURNS as CAP,
+        COMPACTION_OUTAGE_RETRY_TURNS as BASE,
+    };
+
+    // A 0 streak is treated as the first failure, not as "no cooldown" — an
+    // uninitialised streak must never mean "probe every turn".
+    assert_eq!(cooldown(0), BASE);
+    assert_eq!(cooldown(1), BASE);
+    assert_eq!(cooldown(2), BASE * 3);
+    assert_eq!(cooldown(3), BASE * 9);
+
+    for streak in 4..=64 {
+        assert_eq!(
+            cooldown(streak),
+            CAP,
+            "streak {streak} must clamp rather than grow without bound or overflow"
+        );
+    }
+}
+
+/// REGRESSION: the outage lived only on `Agent`, and borgd builds a fresh
+/// `Agent` for every scheduled and heartbeat turn — so the latch was absent on
+/// each one, the dead summarizer was re-probed at full price every turn, and
+/// the cooldown structurally never elapsed. A newly-built agent must inherit
+/// the live outage from the process-wide mirror.
+#[tokio::test]
+async fn compaction_outage_survives_a_fresh_agent() {
+    use crate::conversation::SummarizeFailure;
+    use crate::error_format::ErrorCategory;
+
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+
+    let mut first = minimal_test_agent(Config::default());
+    let (tx, _rx) = mpsc::channel(16);
+    first
+        .record_compaction_outcome(
+            0,
+            Some(SummarizeFailure::Persistent(ErrorCategory::Auth)),
+            Some(&tx),
+        )
+        .await;
+
+    let inherited = super::prompt_assembly::load_compaction_outage()
+        .expect("a live outage must be visible to the next agent built in this process");
+    assert_eq!(
+        inherited.streak, 1,
+        "the streak must carry so the next failure escalates instead of restarting the ladder"
+    );
+    assert_eq!(
+        inherited.turns_until_retry,
+        super::prompt_assembly::compaction_cooldown_turns(1),
+        "the remaining cooldown must carry, or a per-turn agent never reaches the probe"
+    );
+    assert!(
+        !inherited.announced,
+        "the notice is per-session: a new agent has never told its user, so inheriting \
+         `announced` would swallow the warning entirely"
+    );
+
+    // A success anywhere in the process clears it for everyone — the outage is
+    // a property of the provider, not of one conversation.
+    first.record_compaction_outcome(5, None, Some(&tx)).await;
+    assert!(
+        super::prompt_assembly::load_compaction_outage().is_none(),
+        "a demonstrated success must clear the mirror, not just the local latch"
+    );
+}
+
 /// The notice must name the failure class. "Compaction is paused" alone sends
 /// the user hunting through context settings for a billing problem.
 #[tokio::test]
@@ -634,6 +716,7 @@ async fn persistent_billing_outage_latches_and_names_the_cause() {
     use crate::conversation::SummarizeFailure;
     use crate::error_format::ErrorCategory;
 
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
     let mut agent = minimal_test_agent(Config::default());
     let (tx, mut rx) = mpsc::channel(16);
 
@@ -666,6 +749,7 @@ async fn persistent_billing_outage_latches_and_names_the_cause() {
 async fn transient_compaction_failure_does_not_latch() {
     use crate::conversation::SummarizeFailure;
 
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
     let mut agent = minimal_test_agent(Config::default());
     let (tx, mut rx) = mpsc::channel(16);
 

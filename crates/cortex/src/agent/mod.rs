@@ -532,7 +532,11 @@ impl Agent {
             auto_title_spawned: false,
             active_failover_identity: None,
             compaction_strikes: prompt_assembly::CompactionStrikes::new(),
-            compaction_outage: None,
+            // Inherit any live outage from the process-wide mirror. borgd
+            // builds a fresh `Agent` per scheduled/heartbeat turn; starting at
+            // `None` would re-probe a known-dead summarizer on every one of
+            // them and the cooldown would never elapse.
+            compaction_outage: prompt_assembly::load_compaction_outage(),
             stream_health: stream_handler::StreamHealth::new(),
             prompt_cache_scope: None,
         }

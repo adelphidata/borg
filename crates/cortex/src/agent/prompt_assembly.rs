@@ -57,7 +57,85 @@ pub(crate) const SUMMARY_OUTPUT_TOKENS_FLOOR: u32 = 16_384;
 /// Turns a summarizer outage suppresses proactive compaction before one probe
 /// is let through. Long enough that a dead key isn't re-billed every turn,
 /// short enough that a restored key resumes compacting without a restart.
+///
+/// This is the *first* cooldown only; each consecutive failed re-probe triples
+/// it via [`compaction_cooldown_turns`].
 pub(crate) const COMPACTION_OUTAGE_RETRY_TURNS: u32 = 10;
+
+/// Ceiling on the escalated cooldown. Without a cap the ladder would eventually
+/// stop probing altogether within any realistic session; 90 turns keeps a
+/// restored credential recoverable without a restart while making a
+/// permanently-dead one nearly free.
+pub(crate) const COMPACTION_OUTAGE_MAX_RETRY_TURNS: u32 = 90;
+
+/// Process-wide mirror of the summarizer outage latch.
+///
+/// Deliberately NOT owned solely by [`Agent`]: a summarizer outage is a
+/// property of the provider and credential, not of one conversation, and borgd
+/// builds a fresh `Agent` for every scheduled and heartbeat turn. A purely
+/// per-`Agent` latch is therefore structurally always absent — each run probes
+/// the dead summarizer again at full price and no cooldown ever elapses, which
+/// is exactly the "wedged session re-pays a failing summarizer forever" case
+/// this guards against.
+///
+/// The `announced` flag is *not* inherited (see
+/// [`load_compaction_outage`]) — the cooldown is a provider fact, but the
+/// user-facing notice is per-session.
+static COMPACTION_OUTAGE_LATCH: std::sync::Mutex<Option<CompactionOutage>> =
+    std::sync::Mutex::new(None);
+
+/// Cooldown for the `streak`-th consecutive failed probe: 1x, 3x, 9x the base,
+/// clamped at [`COMPACTION_OUTAGE_MAX_RETRY_TURNS`]. `streak` is 1-based; 0 is
+/// treated as the first failure.
+pub(crate) fn compaction_cooldown_turns(streak: u32) -> u32 {
+    let steps = streak.saturating_sub(1).min(10);
+    COMPACTION_OUTAGE_RETRY_TURNS
+        .saturating_mul(3u32.saturating_pow(steps))
+        .min(COMPACTION_OUTAGE_MAX_RETRY_TURNS)
+}
+
+/// Seed a newly-built `Agent`'s latch from the process-wide mirror.
+///
+/// `announced` is forced back to false: a new session has never been told that
+/// compaction is paused, and inheriting the flag would swallow the notice
+/// entirely for every turn borgd runs on a fresh `Agent`.
+pub(crate) fn load_compaction_outage() -> Option<CompactionOutage> {
+    let latched = COMPACTION_OUTAGE_LATCH.lock().ok()?.as_ref().copied();
+    latched.map(|mut o| {
+        o.announced = false;
+        o
+    })
+}
+
+/// Publish the current latch state to the process-wide mirror.
+pub(crate) fn store_compaction_outage(outage: Option<CompactionOutage>) {
+    if let Ok(mut guard) = COMPACTION_OUTAGE_LATCH.lock() {
+        *guard = outage;
+    }
+}
+
+/// Serializes tests that exercise the process-wide mirror.
+///
+/// `cargo test` runs the suite multi-threaded in one process, and the mirror is
+/// exactly one shared cell — without this, one test's `store` lands between
+/// another's reset and its assertion and the streak/cooldown expectations flip.
+/// Held for the body of each such test via [`lock_compaction_outage_mirror`].
+///
+/// A `tokio` mutex rather than a `std` one because the guard is held across the
+/// awaits in those tests.
+#[cfg(test)]
+static COMPACTION_OUTAGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take exclusive use of the process-wide mirror and clear it, so a test starts
+/// from a known state and no sibling test can perturb it. Keep the returned
+/// guard alive for the whole test.
+#[cfg(test)]
+#[must_use = "the mirror is only exclusive while the guard is alive"]
+pub(crate) async fn lock_compaction_outage_mirror() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = COMPACTION_OUTAGE_TEST_LOCK.lock().await;
+    store_compaction_outage(None);
+    guard
+}
 
 /// A summarizer failure that retrying cannot fix, latched so the agent stops
 /// re-paying for it every turn.
@@ -71,6 +149,10 @@ pub(crate) struct CompactionOutage {
     pub(crate) category: crate::error_format::ErrorCategory,
     /// Turns left before a single probe is allowed through.
     pub(crate) turns_until_retry: u32,
+    /// 1-based count of consecutive failed probes, used to pick the cooldown
+    /// from the escalation ladder. Seeded from the process-wide streak so a
+    /// freshly-built `Agent` inherits the penalty instead of resetting it.
+    pub(crate) streak: u32,
     /// Whether the user has been shown the notice yet. Tracked separately from
     /// the latch itself because a latch can be armed from a path with no event
     /// channel (manual `/compact`); it then stays unannounced until a path that
@@ -619,8 +701,13 @@ Rules:
                     debug!(
                         category = %outage.category,
                         turns_until_retry = outage.turns_until_retry,
+                        streak = outage.streak,
                         "Skipping proactive compaction: summarizer is still failing"
                     );
+                    // Persist the countdown: without this a fresh `Agent` would
+                    // reload the full cooldown every turn and never reach the
+                    // probe, turning a temporary outage into a permanent one.
+                    store_compaction_outage(Some(*outage));
                     return Ok(());
                 }
                 debug!(
@@ -767,14 +854,18 @@ Rules:
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) {
         if dropped > 0 {
-            // Demonstrated success — whatever was wrong is over.
+            // Demonstrated success — whatever was wrong is over. Clearing the
+            // mirror resets the ladder so a recovered provider starts from the
+            // base cooldown rather than inheriting an old penalty.
             self.compaction_outage = None;
+            store_compaction_outage(None);
             return;
         }
 
         let Some(SummarizeFailure::Persistent(category)) = failure else {
             // Transient, or nothing to compact: keep normal retry semantics.
             self.compaction_outage = None;
+            store_compaction_outage(None);
             return;
         };
 
@@ -786,14 +877,38 @@ Rules:
                  it is restored."
             );
         }
+        // Escalate before arming: each consecutive failure triples the wait, so
+        // a summarizer that is down for good costs a handful of probes instead
+        // of one every ten turns forever. The prior streak comes from the
+        // process-wide mirror, so a scheduled turn on a brand-new `Agent`
+        // continues the ladder instead of restarting it.
+        // Read the streak only off `self` — it was seeded from the mirror at
+        // construction. Consulting the global here instead would make the
+        // cooldown depend on unrelated concurrent agents.
+        let streak = self
+            .compaction_outage
+            .map_or(0, |o| o.streak)
+            .saturating_add(1);
+        let cooldown = compaction_cooldown_turns(streak);
+
         let outage = self.compaction_outage.get_or_insert(CompactionOutage {
             category,
-            turns_until_retry: COMPACTION_OUTAGE_RETRY_TURNS,
+            turns_until_retry: cooldown,
+            streak,
             announced: false,
         });
-        // Re-arm: a fresh latch and a failed re-probe both get a full cooldown.
+        // Re-arm: a fresh latch and a failed re-probe both get the cooldown for
+        // the current rung of the ladder.
         outage.category = category;
-        outage.turns_until_retry = COMPACTION_OUTAGE_RETRY_TURNS;
+        outage.turns_until_retry = cooldown;
+        outage.streak = streak;
+        debug!(
+            %category,
+            streak,
+            cooldown,
+            "Summarizer outage re-armed with escalated cooldown"
+        );
+        store_compaction_outage(Some(*outage));
 
         // Announce once, from whichever path first has a channel to the user.
         let Some(event_tx) = event_tx else { return };
