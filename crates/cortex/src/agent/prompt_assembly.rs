@@ -1643,7 +1643,17 @@ mod tests {
         let fn_idx = AGENT_RS_SRC
             .find("async fn compact_history_if_needed")
             .expect("compact_history_if_needed must exist");
-        let body = &AGENT_RS_SRC[fn_idx..(fn_idx + 8000).min(AGENT_RS_SRC.len())];
+        // Bound the search at the *next* function rather than a fixed byte
+        // count. A hardcoded window silently becomes a false alarm the moment
+        // the function grows past it — this guard already fired once for that
+        // reason, with the dispatch present and simply sitting past byte 8000.
+        let rest = &AGENT_RS_SRC[fn_idx..];
+        let body_end = rest
+            .find("\nasync fn ")
+            .or_else(|| rest.find("\nfn "))
+            .or_else(|| rest.find("\npub "))
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
         assert!(
             body.contains("AgentEvent::HistoryCompacted"),
             "compact_history_if_needed must emit AgentEvent::HistoryCompacted so the TUI \
