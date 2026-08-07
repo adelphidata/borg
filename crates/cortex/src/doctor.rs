@@ -178,7 +178,7 @@ impl StepKind {
             Self::Browser => checks::system::check_browser(config, checks),
             Self::Agents => checks::runtime::check_agents(config, checks).await,
             Self::Security => checks::security::check_config_security(config, checks),
-            Self::SupplyChain => checks::security::check_supply_chain(checks),
+            Self::SupplyChain => checks::security::check_supply_chain(config, checks),
             Self::HostAudit => crate::host_audit::run_host_security_checks(checks),
         }
     }

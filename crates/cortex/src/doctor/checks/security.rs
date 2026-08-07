@@ -252,7 +252,8 @@ pub(in crate::doctor) fn check_config_security(config: &Config, checks: &mut Vec
 /// single check row per advisory hit, so operators can squelch noisy entries
 /// one at a time. No I/O — both the lockfile and the advisory list are
 /// `include_str!`-embedded at compile time.
-pub(in crate::doctor) fn check_supply_chain(checks: &mut Vec<DiagnosticCheck>) {
+pub(in crate::doctor) fn check_supply_chain(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    check_mcp_supply_chain(config, checks);
     let hits = crate::security::advisory::scan_embedded();
     if hits.is_empty() {
         checks.push(DiagnosticCheck::pass(
@@ -276,6 +277,71 @@ pub(in crate::doctor) fn check_supply_chain(checks: &mut Vec<DiagnosticCheck>) {
         check.remediation_kind = RemediationKind::Manual;
         check.remediation_key = Some("supply_chain.advisory");
         checks.push(check);
+    }
+}
+
+/// Flag stdio MCP servers whose launch command pulls unpinned third-party code
+/// or permits install scripts.
+///
+/// The embedded advisory scan above covers borg's *own* compiled dependencies.
+/// It says nothing about the packages an `npx -y @some/server` line fetches at
+/// spawn time — which execute as a subprocess of the agent, with its
+/// environment, on every startup.
+fn check_mcp_supply_chain(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    use crate::config::mcp::TransportSpec;
+
+    let mut flagged = 0usize;
+    let mut stdio_servers = 0usize;
+
+    for (name, server) in &config.mcp.servers {
+        if !server.enabled {
+            continue;
+        }
+        let TransportSpec::Stdio { command, args, .. } = &server.transport else {
+            continue;
+        };
+        stdio_servers += 1;
+        let Some(risk) = crate::config::mcp_supply_chain::stdio_package_risk(command, args) else {
+            continue;
+        };
+        let Some(summary) = risk.summary() else {
+            continue;
+        };
+        flagged += 1;
+
+        let mut check = DiagnosticCheck::warn(
+            "Supply Chain",
+            format!("MCP server '{name}'"),
+            format!("{summary}."),
+        );
+        // Only advise what actually applies: `--ignore-scripts` is an npm flag
+        // and telling a `uvx` operator to pass it sends them to a command line
+        // that errors out.
+        let mut hint = String::new();
+        if risk.unpinned {
+            hint.push_str(&format!(
+                "Pin the exact version (`{}`) in `mcp.servers.{name}` so restarts can't \
+                 silently pull different code.",
+                risk.pin_example
+            ));
+        }
+        if risk.runs_install_scripts {
+            if !hint.is_empty() {
+                hint.push(' ');
+            }
+            hint.push_str("Add `--ignore-scripts` so package install hooks can't run first.");
+        }
+        check.user_hint = Some(hint);
+        check.remediation_kind = RemediationKind::Manual;
+        check.remediation_key = Some("supply_chain.mcp_package");
+        checks.push(check);
+    }
+
+    if stdio_servers > 0 && flagged == 0 {
+        checks.push(DiagnosticCheck::pass(
+            "Supply Chain",
+            "MCP server packages pinned",
+        ));
     }
 }
 
@@ -405,5 +471,93 @@ mod tests {
         check_config_security(&config, &mut checks);
         let check = checks.iter().find(|c| c.name.contains("budget")).unwrap();
         assert!(matches!(check.status, CheckStatus::Pass));
+    }
+
+    fn stdio_server(
+        command: &str,
+        args: &[&str],
+        enabled: bool,
+    ) -> crate::config::mcp::McpServerConfig {
+        crate::config::mcp::McpServerConfig {
+            enabled,
+            transport: crate::config::mcp::TransportSpec::Stdio {
+                command: command.to_string(),
+                args: args.iter().map(|s| (*s).to_string()).collect(),
+                env: Default::default(),
+            },
+            connect_timeout_ms: 60_000,
+            call_timeout_ms: 300_000,
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+            tools: Default::default(),
+            cache_tools: true,
+        }
+    }
+
+    /// The embedded advisory scan covers borg's own compiled deps and says
+    /// nothing about what an `npx -y <pkg>` MCP server fetches at spawn time.
+    /// That package runs as a subprocess of the agent, so an unpinned spec
+    /// must be surfaced.
+    #[test]
+    fn unpinned_mcp_stdio_server_warns() {
+        let mut config = Config::default();
+        config.mcp.servers.insert(
+            "github".to_string(),
+            stdio_server("npx", &["-y", "@scope/srv"], true),
+        );
+
+        let mut checks = Vec::new();
+        check_mcp_supply_chain(&config, &mut checks);
+
+        let check = checks
+            .iter()
+            .find(|c| c.name.contains("github"))
+            .expect("an unpinned stdio server must produce a row");
+        assert!(matches!(check.status, CheckStatus::Warn(_)));
+        assert!(
+            check
+                .user_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--ignore-scripts")),
+            "the hint must give the operator the actual fix"
+        );
+    }
+
+    /// A hardened server must report clean — otherwise the row is noise and
+    /// operators stop reading it.
+    #[test]
+    fn pinned_mcp_stdio_server_passes() {
+        let mut config = Config::default();
+        config.mcp.servers.insert(
+            "github".to_string(),
+            stdio_server("npx", &["-y", "--ignore-scripts", "@scope/srv@1.2.3"], true),
+        );
+
+        let mut checks = Vec::new();
+        check_mcp_supply_chain(&config, &mut checks);
+
+        assert!(
+            checks.iter().all(|c| matches!(c.status, CheckStatus::Pass)),
+            "a pinned, script-free server must not be flagged: {checks:?}"
+        );
+    }
+
+    /// A disabled server is never spawned, so flagging it is a false positive
+    /// that pushes operators to ignore real findings.
+    #[test]
+    fn disabled_mcp_server_is_not_flagged() {
+        let mut config = Config::default();
+        config.mcp.servers.insert(
+            "off".to_string(),
+            stdio_server("npx", &["-y", "@scope/srv"], false),
+        );
+
+        let mut checks = Vec::new();
+        check_mcp_supply_chain(&config, &mut checks);
+
+        assert!(
+            checks.is_empty(),
+            "a disabled server fetches nothing and must produce no row: {checks:?}"
+        );
     }
 }

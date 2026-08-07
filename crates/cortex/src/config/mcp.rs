@@ -416,6 +416,7 @@ impl McpServerConfig {
             },
         };
         warn_on_hidden_whitespace(name, &transport);
+        warn_on_supply_chain_risk(name, &transport);
         Ok(mcp::manifest::ServerManifest {
             name: name.to_string(),
             transport,
@@ -454,6 +455,33 @@ fn warn_on_hidden_whitespace(server: &str, transport: &mcp::manifest::Transport)
              without the surrounding whitespace."
         );
     }
+}
+
+/// Warn when a stdio server's launch command pulls unpinned third-party code
+/// or lets install scripts run.
+///
+/// Advisory, like [`warn_on_hidden_whitespace`], and for the same reason: the
+/// command line is the operator's, and silently rewriting it (injecting
+/// `--ignore-scripts`, inventing a version) would break legitimate servers.
+/// Deduped per process per server so a reconnect loop can't flood the log.
+fn warn_on_supply_chain_risk(server: &str, transport: &mcp::manifest::Transport) {
+    let mcp::manifest::Transport::Stdio { command, args, .. } = transport else {
+        return;
+    };
+    let Some(risk) = crate::config::mcp_supply_chain::stdio_package_risk(command, args) else {
+        return;
+    };
+    let Some(summary) = risk.summary() else {
+        return;
+    };
+    if !claim_whitespace_warning(server, "__supply_chain") {
+        return;
+    }
+    tracing::warn!(
+        launcher = %risk.launcher,
+        "mcp server '{server}': {summary}. This code runs as a subprocess of the agent \
+         at every startup."
+    );
 }
 
 /// Dotted field paths whose resolved value has leading/trailing whitespace.
