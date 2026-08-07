@@ -175,6 +175,129 @@ const HARDCODED_DENY: &[&str] = &[
     "find ~* -exec rm *",
 ];
 
+/// Commands that stop, restart, or unregister borg's own daemon.
+///
+/// The agent runs *inside* `borgd`. A command that stops or restarts it kills
+/// the turn issuing the command, so the request never completes and the user
+/// sees a silent truncation rather than an answer — and a `disable`/`uninstall`
+/// spelling leaves the daemon down with nothing left running to bring it back.
+/// Prompt injection makes this a cheap denial-of-service against the agent, and
+/// even without an attacker it is a foot-gun the agent has no reason to fire:
+/// config changes land through the settings table, and a genuine restart goes
+/// via `/internal/restart`, which drains in-flight turns first.
+///
+/// **Every pattern is start-anchored on the lifecycle verb.** That is what
+/// keeps the guard from firing on data: `grep 'systemctl stop borgd' log`,
+/// `sqlite3 db "… 'pkill borgd' …"`, and `rg pkill` all lead with a
+/// data-sink program, so no pattern can match them. Encoding the daemon name
+/// alone (`*borgd*`) would flag every one of those and train the agent to
+/// route around the guard.
+///
+/// Known residual: indirection that hides the verb from the leading token,
+/// such as `pgrep borgd | xargs kill`, is not caught. This is a
+/// defense-in-depth layer over an obvious foot-gun, not a security boundary —
+/// an agent determined to stop the daemon has other ways, and the sandbox is
+/// what actually constrains it.
+/// Lifecycle verbs, start-anchored. A match here is only half the test — the
+/// target still has to name borg's own daemon, per [`names_borg_daemon`].
+const DAEMON_LIFECYCLE_DENY: &[&str] = &[
+    // Direct process kills.
+    "pkill *",
+    "killall *",
+    "kill *",
+    // systemd (Linux service install).
+    "systemctl stop *",
+    "systemctl restart *",
+    "systemctl disable *",
+    "systemctl kill *",
+    "systemctl mask *",
+    // Same verbs with a flag in between (`systemctl --user stop borg`). The
+    // wildcard requires a real token, so `systemctl status borgd` — which
+    // contains no lifecycle verb — still passes.
+    "systemctl * stop *",
+    "systemctl * restart *",
+    "systemctl * disable *",
+    "systemctl * kill *",
+    "systemctl * mask *",
+    // launchd (macOS service install).
+    "launchctl unload *",
+    "launchctl bootout *",
+    "launchctl remove *",
+    "launchctl stop *",
+    "launchctl disable *",
+    // Homebrew service wrapper.
+    "brew services stop *",
+    "brew services restart *",
+    // borg's own service subcommands.
+    "borg service stop*",
+    "borg service restart*",
+    "borg service uninstall*",
+    "borg daemon stop*",
+    "borgd stop*",
+];
+
+/// Does any token name borg's *own* daemon?
+///
+/// Deliberately not a `*borg*` substring test. BorgBackup's CLI is literally
+/// `borg`, and its units are commonly `borgbackup.service` / `borgmatic.timer`
+/// / `borg-backup.timer` — a substring match hard-denies an operator asking the
+/// agent to manage their backups, with no way to phrase it that gets through.
+/// So a token counts only when it is the daemon's own name (`borg`, `borgd`),
+/// its unit (`borg.service`, `borgd.service`), or its launchd label
+/// (`com.borg.daemon`). Path- and PID-qualified spellings reduce to the same
+/// basename first.
+fn names_borg_daemon(folded: &str) -> bool {
+    folded.split_whitespace().any(|token| {
+        let base = token.rsplit('/').next().unwrap_or(token);
+        let base = base.trim_matches(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        });
+        base == "borg"
+            || base == "borgd"
+            || base.starts_with("borg.")
+            || base.starts_with("borgd.")
+            || base.starts_with("com.borg.")
+    })
+}
+
+/// Does this normalized command stop or restart borg's own daemon?
+///
+/// Returns the operator-facing reason so the denial can say what to do
+/// instead, rather than the generic policy message.
+fn daemon_lifecycle_reason(normalized: &str) -> Option<&'static str> {
+    let folded = normalized.to_ascii_lowercase();
+    if !names_borg_daemon(&folded) {
+        return None;
+    }
+    DAEMON_LIFECYCLE_DENY
+        .iter()
+        .any(|pattern| glob_match(pattern, normalized) || glob_match(pattern, &folded))
+        .then_some(
+            "this would stop or restart the borg daemon the agent is running inside, \
+             killing the current turn before it can reply",
+        )
+}
+
+/// Public entry point for the daemon-lifecycle guard.
+///
+/// Normalizes first so wrapper prefixes (`sudo`, `env …`) and path-qualified
+/// spellings (`/usr/bin/systemctl`) reduce to the same shape the patterns
+/// anchor on. Checked per fragment so `cd /tmp && systemctl stop borg` is
+/// caught as well as the bare form.
+pub fn daemon_lifecycle_denial(command: &str) -> Option<&'static str> {
+    let mut candidates = vec![command.trim()];
+    candidates.extend(command_fragments(command));
+    let deob = deobfuscate(command);
+    if deob != command {
+        candidates.push(deob.trim());
+        candidates.extend(command_fragments(&deob));
+    }
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| daemon_lifecycle_reason(&normalize_for_catastrophic(candidate)))
+}
+
 /// Deny patterns whose discrimination depends on ASCII case and must therefore
 /// be matched case-sensitively only. Every *other* `HARDCODED_DENY` pattern is
 /// additionally matched case-folded (see [`matches_hardcoded_deny`]) so a
@@ -937,6 +1060,12 @@ fn is_catastrophic_command_at_depth(command: &str, depth: u8) -> bool {
             return true;
         }
         if writes_to_sensitive_path(&normalized) {
+            return true;
+        }
+        // Shares this loop so the lifecycle guard inherits fragmenting,
+        // deobfuscation, and `sh -c` unwrapping — and so the computer_use
+        // typed-text surface refuses the same payloads as the shell.
+        if daemon_lifecycle_reason(&normalized).is_some() {
             return true;
         }
 
@@ -2837,5 +2966,130 @@ mod tests {
             ("cp evil ~/.npmrc", PolicyDecision::Deny),
             ("cp evil /home/user/.npmrc", PolicyDecision::Deny),
         ]);
+    }
+
+    /// The agent runs inside `borgd`. Stopping or restarting it kills the very
+    /// turn issuing the command, so the user gets a silent truncation instead
+    /// of a reply — and `disable`/`uninstall` leaves nothing running to
+    /// recover. Prompt injection makes this a one-line DoS.
+    #[test]
+    fn daemon_lifecycle_commands_are_denied() {
+        for command in [
+            "pkill -f borgd",
+            "pkill borgd",
+            "killall borgd",
+            "kill -9 $(pgrep borgd)",
+            "systemctl stop borgd",
+            "systemctl --user restart borg",
+            "systemctl disable borgd.service",
+            "launchctl unload ~/Library/LaunchAgents/com.borg.daemon.plist",
+            "launchctl bootout gui/501/com.borg.daemon",
+            "brew services stop borg",
+            "borg service uninstall",
+            "borg service restart",
+            "borgd stop",
+        ] {
+            assert!(
+                daemon_lifecycle_denial(command).is_some(),
+                "{command} must be refused — it takes down the agent mid-turn"
+            );
+        }
+    }
+
+    /// BorgBackup ships a CLI named `borg` and units named `borgbackup` /
+    /// `borgmatic` / `borg-backup`. Matching the daemon by `*borg*` substring
+    /// hard-denied every one of those at the catastrophic layer, so an operator
+    /// asking the agent to manage their backups got a refusal talking about
+    /// "the borg daemon the agent is running inside" and no way to rephrase it.
+    /// Only borg's own name, unit, and launchd label may trip this guard.
+    #[test]
+    fn other_programs_named_borg_are_not_denied() {
+        for command in [
+            "systemctl stop borgbackup.service",
+            "systemctl restart borgmatic.timer",
+            "systemctl stop borg-backup.timer",
+            "pkill -f borgmatic",
+            "killall borgbackup",
+            "brew services restart borgbackup",
+            "launchctl unload ~/Library/LaunchAgents/com.borgbackup.agent.plist",
+        ] {
+            assert!(
+                daemon_lifecycle_denial(command).is_none(),
+                "{command} targets BorgBackup, not borg's daemon — it must not be refused"
+            );
+        }
+    }
+
+    /// Wrappers and path-qualified spellings must reduce to the same shape, or
+    /// the guard is bypassed by writing the command slightly differently.
+    #[test]
+    fn daemon_lifecycle_survives_wrappers_and_paths() {
+        for command in [
+            "sudo systemctl stop borgd",
+            "/usr/bin/systemctl stop borgd",
+            "sudo /bin/pkill -f borgd",
+            "cd /tmp && systemctl stop borgd",
+            "echo hi; killall borgd",
+        ] {
+            assert!(
+                daemon_lifecycle_denial(command).is_some(),
+                "{command} must be refused despite the wrapper/prefix"
+            );
+        }
+    }
+
+    /// The guard must be start-anchored on the lifecycle verb. Data-sink
+    /// programs carry these words as *content* all the time — searching logs
+    /// for a restart, storing a command string in SQL. Flagging those would
+    /// make the guard useless noise and push the agent to route around it.
+    #[test]
+    fn lifecycle_words_inside_data_are_not_denied() {
+        for command in [
+            "grep 'systemctl stop borgd' /var/log/syslog",
+            "rg 'pkill borgd' ~/.borg/logs",
+            "journalctl -u sshd | grep borgd",
+            "sqlite3 notes.db \"insert into t values ('killall borgd')\"",
+            "echo 'run: systemctl restart borgd'",
+            "cat scripts/restart-borgd.sh",
+            "git log --grep 'stop borgd'",
+            "borg service status",
+            "borg settings set gateway.port 7842",
+            "systemctl status borgd",
+            "systemctl stop nginx",
+            "pkill -f some-other-process",
+        ] {
+            assert_eq!(
+                daemon_lifecycle_denial(command),
+                None,
+                "{command} only mentions the daemon as data — refusing it is a false positive"
+            );
+        }
+    }
+
+    /// The guard rides the shared catastrophic layer, so the shell surface and
+    /// the computer_use typed-text surface refuse the same payloads. A
+    /// divergence would make one the bypass for the other.
+    #[test]
+    fn daemon_lifecycle_reaches_the_shared_catastrophic_layer() {
+        assert!(is_catastrophic_command("systemctl stop borgd"));
+        assert!(
+            is_catastrophic_command("sh -c 'pkill -f borgd'"),
+            "an inline shell payload must not hide the lifecycle verb"
+        );
+        assert_eq!(
+            ExecutionPolicy::default().check("systemctl stop borgd"),
+            PolicyDecision::Deny
+        );
+    }
+
+    /// The refusal has to tell the agent what to do instead, or it will just
+    /// try another spelling.
+    #[test]
+    fn daemon_lifecycle_reason_is_actionable() {
+        let reason = daemon_lifecycle_denial("systemctl stop borgd").expect("denied");
+        assert!(
+            reason.contains("killing the current turn"),
+            "the reason must explain the consequence, got: {reason}"
+        );
     }
 }

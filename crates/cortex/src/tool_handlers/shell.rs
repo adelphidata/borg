@@ -352,6 +352,28 @@ pub async fn handle_run_shell_with_context(
         return Ok(deny_control_plane_write(command).await);
     }
 
+    // Checked ahead of the generic policy pass purely so the refusal can name
+    // the cause and the supported alternative — the catastrophic layer would
+    // deny it anyway, but only with "denied by policy".
+    if let Some(reason) = crate::policy::daemon_lifecycle_denial(command) {
+        crate::db::try_emit_global(
+            crate::db::audit_events::SANDBOX_DENIAL,
+            "system",
+            &serde_json::json!({
+                "tool": "run_shell",
+                "command_redacted": redact_command_for_audit(command),
+                "cause": "daemon_lifecycle",
+            }),
+        )
+        .await;
+        return Ok(format!(
+            "{SHELL_DENIED_PREFIX}: {reason}. Configuration changes take effect without a \
+             restart (`borg settings set …`); if a restart is genuinely required, ask the \
+             user to run it, or use the daemon's own restart endpoint, which drains \
+             in-flight turns first."
+        ));
+    }
+
     match policy.check(command) {
         crate::policy::PolicyDecision::Deny => {
             // Audit the denial so post-hoc review can spot prompt-injection
