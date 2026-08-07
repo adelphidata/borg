@@ -24,12 +24,6 @@ impl MultiAgentArgs {
 
 const MULTI_AGENT_DISABLED: &str = "Error: Multi-agent system is not enabled.";
 
-/// Returned for `send_to_agent`, which is not implemented in this build.
-/// Falling through with a structured tool-output string keeps the agent loop
-/// alive (vs. an `Err` that aborts the turn) so the model can pick a different
-/// tool. Any future implementation must remove this constant.
-const SEND_TO_AGENT_UNSUPPORTED: &str = "Error: send_to_agent is unavailable in this build. Use spawn_agent + wait_for_agent to coordinate work.";
-
 pub(crate) async fn handle_spawn_agent(
     args: &MultiAgentArgs,
     agent_control: &mut Option<AgentControl>,
@@ -48,8 +42,15 @@ pub(crate) async fn handle_spawn_agent(
     }
 }
 
-pub(crate) fn handle_send_to_agent(_args: &MultiAgentArgs) -> Result<String> {
-    Ok(SEND_TO_AGENT_UNSUPPORTED.to_string())
+pub(crate) async fn handle_send_to_agent(
+    args: &MultiAgentArgs,
+    agent_control: &Option<AgentControl>,
+) -> Result<String> {
+    if let Some(ctrl) = agent_control {
+        multi_agent::tools::handle_send_to_agent(args.as_value(), ctrl).await
+    } else {
+        Ok(MULTI_AGENT_DISABLED.to_string())
+    }
 }
 
 pub(crate) async fn handle_wait_for_agent(
@@ -101,15 +102,22 @@ mod tests {
         assert!(out.contains("not enabled"), "got: {out}");
     }
 
-    #[test]
-    fn send_to_agent_returns_unsupported_string() {
-        // Returning Err would abort the agent turn; panicking would crash the
-        // daemon. Both are worse than a structured tool-output string.
-        let args = MultiAgentArgs(serde_json::json!({}));
-        let out = handle_send_to_agent(&args).expect("returns Ok");
-        assert!(
-            out.starts_with("Error:") && out.contains("send_to_agent"),
-            "got: {out}"
-        );
+    /// REGRESSION: this dispatch used to return a hardcoded "unavailable in
+    /// this build" string, so the real `send_input` path — steer channel,
+    /// pending-input ledger, undelivered reporting — was unreachable from the
+    /// agent loop. With multi-agent off it must still degrade to the same
+    /// structured string the other multi-agent tools use: returning `Err`
+    /// would abort the turn instead of letting the model pick another tool.
+    #[tokio::test]
+    async fn send_to_agent_without_multi_agent_reports_disabled_not_unsupported() {
+        let ctrl: Option<AgentControl> = None;
+        let args = MultiAgentArgs(serde_json::json!({
+            "agent_id": "agent-x",
+            "message": "change of plan",
+        }));
+        let out = handle_send_to_agent(&args, &ctrl)
+            .await
+            .expect("returns Ok");
+        assert_eq!(out, MULTI_AGENT_DISABLED, "got: {out}");
     }
 }

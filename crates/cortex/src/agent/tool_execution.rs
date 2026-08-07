@@ -834,7 +834,7 @@ impl Agent {
                 .await
             }
             crate::tool::Tool::SendToAgent(args) => {
-                crate::tool::multi_agent::handle_send_to_agent(args)
+                crate::tool::multi_agent::handle_send_to_agent(args, &self.agent_control).await
             }
             crate::tool::Tool::WaitForAgent(args) => {
                 crate::tool::multi_agent::handle_wait_for_agent(args, &mut self.agent_control).await

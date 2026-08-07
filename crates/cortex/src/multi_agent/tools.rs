@@ -358,6 +358,7 @@ pub async fn handle_spawn_agent(
                     "files_written": c.files_written,
                 });
                 attach_error_detail(&mut obj, c.error_detail());
+                attach_undelivered_input(&mut obj, &c.undelivered_input);
                 obj
             })
             .collect();
@@ -408,6 +409,7 @@ pub async fn handle_spawn_agent(
             "files_written": completion.files_written,
         });
         attach_error_detail(&mut obj, completion.error_detail());
+        attach_undelivered_input(&mut obj, &completion.undelivered_input);
         return Ok(obj.to_string());
     }
 
@@ -487,8 +489,18 @@ pub async fn handle_send_to_agent(
 ) -> Result<String> {
     let agent_id = require_str_param(args, "agent_id")?;
     let message = require_str_param(args, "message")?;
-    agent_control.send_input(agent_id, message).await?;
-    Ok(json!({"status": "sent"}).to_string())
+    agent_control.send_input(agent_id, message)?;
+    // "queued", not "sent": the child absorbs steers at its next tool boundary,
+    // so a child that finishes first never sees this. Claiming delivery here
+    // would be the lie the old no-op delivery path told. The undelivered case
+    // surfaces on the completion record.
+    Ok(json!({
+        "status": "queued",
+        "note": "The sub-agent will pick this up at its next tool boundary. \
+                 If it finishes first, the message is reported back as \
+                 undelivered_input on its completion."
+    })
+    .to_string())
 }
 
 /// Handle the wait_for_agent tool call.
@@ -513,6 +525,7 @@ pub async fn handle_wait_for_agent(
             .map(|s| super::bound_sub_agent_summary(s, super::SUB_AGENT_SUMMARY_MAX_CHARS)),
     });
     attach_error_detail(&mut obj, completion.error_detail());
+    attach_undelivered_input(&mut obj, &completion.undelivered_input);
     Ok(obj.to_string())
 }
 
@@ -525,6 +538,24 @@ fn attach_error_detail(obj: &mut serde_json::Value, detail: Option<(String, &'st
         obj["error"] = json!(error);
         obj["next_action"] = json!(next_action);
     }
+}
+
+/// Fold any parent-queued message the child never absorbed into the JSON
+/// surfaced to the parent. Absent when everything landed, so the common case
+/// costs no context.
+///
+/// Without this a `send_to_agent` racing the child's final response would
+/// report `queued` and then a clean `completed`, leaving the parent to assume
+/// its guidance shaped the result when it never arrived.
+fn attach_undelivered_input(obj: &mut serde_json::Value, undelivered: &[String]) {
+    if undelivered.is_empty() {
+        return;
+    }
+    obj["undelivered_input"] = json!(undelivered);
+    obj["undelivered_input_note"] = json!(
+        "The sub-agent finished before absorbing these queued messages — its \
+         result does NOT reflect them. Re-delegate if the guidance still applies."
+    );
 }
 
 /// Handle the list_agents tool call.

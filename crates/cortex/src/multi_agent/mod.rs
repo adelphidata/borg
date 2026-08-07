@@ -327,6 +327,16 @@ pub struct SubAgentCompletion {
     /// side is to re-read any file it cares about, regardless of
     /// whether the child's reported list includes it.
     pub files_written: Vec<String>,
+    /// Messages `send_input` accepted for this child that the child never
+    /// drained — it finished (or was cancelled) before reaching the tool
+    /// boundary where steers are absorbed.
+    ///
+    /// Delivery is inherently racy: the parent can queue guidance at the
+    /// instant the child is writing its final response. Without this field
+    /// the parent would read a clean `Completed` and assume its steer
+    /// landed, when the guidance evaporated. Surfacing the undelivered text
+    /// lets the parent decide whether the result is still valid.
+    pub undelivered_input: Vec<String>,
 }
 
 /// Upper bound on the sub-agent error text echoed back to the parent agent.
@@ -400,7 +410,16 @@ impl SubAgentCompletion {
 /// Handle to a spawned sub-agent.
 struct SubAgentHandle {
     pub info: SubAgentInfo,
-    pub input_tx: mpsc::Sender<String>,
+    /// Unbounded because this receiver is handed straight to the child's
+    /// `Agent::set_steer_channel`, which drains at tool boundaries. A bounded
+    /// channel would make `send_input` block the parent's turn whenever the
+    /// child is mid-LLM-call.
+    pub input_tx: mpsc::UnboundedSender<String>,
+    /// Ledger of messages accepted by `send_input` but not yet observed as
+    /// drained by the child (via `AgentEvent::SteerReceived`). Shared with the
+    /// spawn task, which pops on delivery and reports the remainder as
+    /// `SubAgentCompletion::undelivered_input`.
+    pub pending_input: Arc<std::sync::Mutex<Vec<String>>>,
     pub cancel: CancellationToken,
     /// Live progress signals written by the spawn task, read at listing time.
     pub live: Arc<LiveActivity>,
@@ -808,7 +827,8 @@ impl AgentControl {
             .await;
         self.publish(AgentTreeEventKind::Spawned, &info);
 
-        let (input_tx, input_rx) = mpsc::channel::<String>(16);
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+        let pending_input = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let cancel = CancellationToken::new();
         let is_paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
@@ -829,6 +849,7 @@ impl AgentControl {
             role_kind,
             fork_context: fork_context.map(<[crate::types::Message]>::to_vec),
             input_rx,
+            pending_input: pending_input.clone(),
             cancel: cancel.clone(),
             is_paused: is_paused.clone(),
             pause_notify: pause_notify.clone(),
@@ -846,6 +867,7 @@ impl AgentControl {
         let handle = SubAgentHandle {
             info,
             input_tx,
+            pending_input,
             cancel,
             live,
             is_paused,
@@ -968,17 +990,44 @@ impl AgentControl {
         Some(acc)
     }
 
-    /// Send an additional message to a running sub-agent.
-    pub async fn send_input(&self, agent_id: &str, message: &str) -> Result<()> {
+    /// Queue an additional message for a running sub-agent.
+    ///
+    /// The message lands on the child's steer channel and is absorbed into its
+    /// history at the next tool boundary — it is *queued*, not delivered
+    /// synchronously, and a child that terminates first will never see it. The
+    /// ledger push makes that case observable: anything still on it when the
+    /// child finishes is reported as
+    /// [`SubAgentCompletion::undelivered_input`] rather than silently lost.
+    ///
+    /// Recording before the send keeps the ledger a superset of what is in
+    /// flight; on send failure the entry is removed again so a dead child
+    /// doesn't accrue phantom pending input.
+    pub fn send_input(&self, agent_id: &str, message: &str) -> Result<()> {
         let handle = self
             .agents
             .get(agent_id)
             .ok_or_else(|| anyhow::anyhow!("Agent '{agent_id}' not found"))?;
-        handle
-            .input_tx
-            .send(message.to_string())
-            .await
-            .map_err(|_| anyhow::anyhow!("Agent '{agent_id}' is no longer running"))?;
+
+        // Recover the guard on poisoning rather than skipping the bookkeeping:
+        // a dropped push would report the message as delivered while nothing
+        // could ever surface it as undelivered.
+        let lock_pending = || {
+            handle
+                .pending_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+
+        lock_pending().push(message.to_string());
+
+        if handle.input_tx.send(message.to_string()).is_err() {
+            let mut pending = lock_pending();
+            if let Some(pos) = pending.iter().rposition(|m| m == message) {
+                pending.remove(pos);
+            }
+            drop(pending);
+            anyhow::bail!("Agent '{agent_id}' is no longer running");
+        }
         Ok(())
     }
 
@@ -1005,6 +1054,13 @@ impl AgentControl {
                             _ => None,
                         },
                         files_written: handle.info.metrics.files_touched.clone(),
+                        // The child is already terminal; anything still on the
+                        // ledger never reached it.
+                        undelivered_input: handle
+                            .pending_input
+                            .lock()
+                            .map(|mut g| std::mem::take(&mut *g))
+                            .unwrap_or_default(),
                     });
                 }
                 _ => {}
@@ -1248,6 +1304,7 @@ impl AgentControl {
                     },
                     final_response: None,
                     files_written: Vec::new(),
+                    undelivered_input: Vec::new(),
                 })),
             }
         }
@@ -1294,10 +1351,20 @@ impl AgentControl {
         nickname: &str,
         parent_session_id: &str,
     ) -> CancellationToken {
-        let (input_tx, _input_rx) = mpsc::channel::<String>(1);
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
         let cancel = CancellationToken::new();
         let is_paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
+        // Park the receiver for the mock's lifetime so `send_input` behaves as
+        // it does against a live child (sender open, message queued) instead of
+        // failing immediately on a dropped receiver.
+        let join_handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let _input_rx = input_rx;
+                cancel.cancelled().await;
+            })
+        };
         let handle = SubAgentHandle {
             info: SubAgentInfo {
                 id: agent_id.to_string(),
@@ -1315,11 +1382,12 @@ impl AgentControl {
                 current_tool: None,
             },
             input_tx,
+            pending_input: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancel: cancel.clone(),
             live: Arc::new(LiveActivity::default()),
             is_paused,
             pause_notify,
-            _join_handle: tokio::spawn(async {}),
+            _join_handle: join_handle,
         };
         self.agents.insert(agent_id.to_string(), handle);
         cancel
@@ -2514,6 +2582,7 @@ mod sub_agent_surface_tests {
             },
             final_response: Some("done".to_string()),
             files_written: vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()],
+            undelivered_input: Vec::new(),
         })
         .await
         .unwrap();
@@ -2554,6 +2623,7 @@ mod sub_agent_surface_tests {
             },
             final_response: None,
             files_written: Vec::new(),
+            undelivered_input: Vec::new(),
         })
         .await
         .unwrap();
@@ -2598,6 +2668,7 @@ mod sub_agent_surface_tests {
             },
             final_response: Some("done".to_string()),
             files_written: Vec::new(),
+            undelivered_input: Vec::new(),
         })
         .await
         .unwrap();
@@ -2700,6 +2771,110 @@ mod sub_agent_surface_tests {
         assert!(
             leaf_blocklist.contains(&"spawn_agent"),
             "leaf task in the SAME batch: spawn_agent still blocked, regardless of sibling"
+        );
+    }
+
+    /// REGRESSION: `send_input` used to hand the message to a channel the
+    /// spawn loop drained into a `/* Future: */` no-op, so every mid-run
+    /// message to a live child was discarded while `send_to_agent` reported
+    /// success. The message must now be recorded as in-flight so a child that
+    /// never absorbs it can report it back rather than losing it silently.
+    #[tokio::test]
+    async fn send_input_records_queued_message_as_pending() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        ctrl.insert_mock_handle("agent-x", "atlas");
+
+        ctrl.send_input("agent-x", "change of plan: skip the refactor")
+            .expect("queueing input to a live child succeeds");
+
+        let pending = ctrl
+            .agents
+            .get("agent-x")
+            .expect("handle present")
+            .pending_input
+            .lock()
+            .expect("ledger lock")
+            .clone();
+        assert_eq!(
+            pending,
+            vec!["change of plan: skip the refactor".to_string()],
+            "the queued message must be tracked until the child absorbs it"
+        );
+    }
+
+    /// A child that terminates before draining its steer channel must surface
+    /// the queued text on the completion record. Reporting a clean `Completed`
+    /// while the parent's guidance evaporated is the silent-loss case that
+    /// makes `send_to_agent` untrustworthy.
+    #[tokio::test]
+    async fn undelivered_input_survives_onto_the_completion_record() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        ctrl.insert_mock_handle("agent-x", "atlas");
+        ctrl.send_input("agent-x", "also update the docs")
+            .expect("queue input");
+
+        // Drive the handle terminal without the child ever draining the
+        // channel — the finish-before-absorb race.
+        let tx = ctrl.test_completion_tx();
+        tx.send(SubAgentCompletion {
+            agent_id: "agent-x".to_string(),
+            nickname: "atlas".to_string(),
+            status: SubAgentStatus::Completed {
+                result: "done".to_string(),
+            },
+            final_response: Some("done".to_string()),
+            files_written: Vec::new(),
+            undelivered_input: vec!["also update the docs".to_string()],
+        })
+        .await
+        .unwrap();
+
+        let completion = ctrl
+            .wait_for_agent("agent-x", 5)
+            .await
+            .expect("completion delivered");
+        assert_eq!(
+            completion.undelivered_input,
+            vec!["also update the docs".to_string()],
+            "guidance the child never absorbed must reach the parent"
+        );
+    }
+
+    /// `send_input` against a child whose receiver is gone must fail loudly
+    /// AND leave no phantom entry on the ledger — otherwise a dead child would
+    /// accrue pending input that is reported as undelivered forever.
+    #[tokio::test]
+    async fn send_input_to_dead_child_errors_without_leaving_ledger_residue() {
+        let cfg = MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&cfg, "p", 0);
+        let cancel = ctrl.insert_mock_handle("agent-x", "atlas");
+
+        // The mock parks its receiver until cancelled; cancelling drops it.
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            if ctrl.agents["agent-x"].input_tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let err = ctrl
+            .send_input("agent-x", "too late")
+            .expect_err("a child with no receiver must not accept input");
+        assert!(
+            err.to_string().contains("no longer running"),
+            "error should name the real cause, got: {err}"
+        );
+        assert!(
+            ctrl.agents["agent-x"]
+                .pending_input
+                .lock()
+                .expect("ledger lock")
+                .is_empty(),
+            "a rejected send must not leave the message on the ledger"
         );
     }
 }

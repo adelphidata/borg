@@ -254,7 +254,11 @@ pub(super) struct SubAgentSpawn {
     pub(super) role: Option<AgentRole>,
     pub(super) role_kind: AgentRoleKind,
     pub(super) fork_context: Option<Vec<crate::types::Message>>,
-    pub(super) input_rx: mpsc::Receiver<String>,
+    pub(super) input_rx: mpsc::UnboundedReceiver<String>,
+    /// Shared ledger of parent-queued messages not yet observed as absorbed by
+    /// the child. Popped on each `SteerReceived`; the remainder ships as
+    /// `SubAgentCompletion::undelivered_input`.
+    pub(super) pending_input: Arc<std::sync::Mutex<Vec<String>>>,
     pub(super) cancel: CancellationToken,
     pub(super) is_paused: Arc<AtomicBool>,
     pub(super) pause_notify: Arc<Notify>,
@@ -293,6 +297,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         role_kind,
         fork_context,
         input_rx,
+        pending_input,
         cancel,
         is_paused,
         pause_notify,
@@ -318,6 +323,9 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
                     },
                     final_response: None,
                     files_written: Vec::new(),
+                    // Nothing could have been queued yet: the handle is only
+                    // published to the parent after the task is spawned.
+                    undelivered_input: Vec::new(),
                 })
                 .await
                 .is_err()
@@ -342,6 +350,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         role_kind,
         fork_context,
         input_rx,
+        pending_input.clone(),
         cancel,
         is_paused,
         pause_notify,
@@ -356,6 +365,20 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
     .await;
 
     let files_written_vec = files_written.lock().map(|g| g.clone()).unwrap_or_default();
+
+    // Whatever the child never absorbed. Drained (not cloned) so a parent that
+    // inspects the handle afterwards doesn't see the same text reported twice.
+    let undelivered_input = pending_input
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    if !undelivered_input.is_empty() {
+        tracing::warn!(
+            %agent_id,
+            count = undelivered_input.len(),
+            "sub-agent finished before absorbing queued input; reporting it as undelivered",
+        );
+    }
 
     let (status, final_response) = match result {
         Ok(response) => (
@@ -385,6 +408,7 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
             status,
             final_response,
             files_written: files_written_vec,
+            undelivered_input,
         })
         .await
         .is_err()
@@ -408,7 +432,8 @@ fn run_sub_agent(
     role: Option<AgentRole>,
     role_kind: AgentRoleKind,
     fork_context: Option<Vec<crate::types::Message>>,
-    mut input_rx: mpsc::Receiver<String>,
+    input_rx: mpsc::UnboundedReceiver<String>,
+    pending_input: Arc<std::sync::Mutex<Vec<String>>>,
     cancel: CancellationToken,
     is_paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
@@ -446,6 +471,14 @@ fn run_sub_agent(
         // from the controller, so a whole tree keys on the root session
         // rather than re-scoping at every level.
         agent.set_prompt_cache_scope(prompt_cache_scope);
+
+        // Hand the parent's input channel to the child's steering machinery.
+        // Without this the receiver was polled in the event loop below and the
+        // message thrown away, while `send_to_agent` told the parent's LLM the
+        // message had been sent. The agent loop absorbs steers at tool
+        // boundaries and at turn end, so queued guidance becomes a real user
+        // message in the child's history.
+        agent.set_steer_channel(input_rx);
 
         if let Some(context_msgs) = fork_context {
             for msg in context_msgs {
@@ -617,6 +650,22 @@ fn run_sub_agent(
                                 }
                             }
                         }
+                        Some(AgentEvent::SteerReceived { text }) => {
+                            // The child absorbed a parent-queued message into
+                            // its history: clear the matching ledger entry so
+                            // it isn't reported as undelivered at completion.
+                            // Matched by value from the front — the channel is
+                            // FIFO, so the oldest identical text is the one
+                            // that just landed.
+                            // Recover on poisoning: skipping the removal would
+                            // report an absorbed message as undelivered.
+                            let mut pending = pending_input
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(pos) = pending.iter().position(|m| *m == text) {
+                                pending.remove(pos);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -658,14 +707,6 @@ fn run_sub_agent(
                         cancel.cancel();
                         break;
                         }
-                    }
-                }
-                msg = input_rx.recv() => {
-                    match msg {
-                        Some(_additional_message) => {
-                            // Future: support sending additional messages to running sub-agents
-                        }
-                        None => break,
                     }
                 }
             }
