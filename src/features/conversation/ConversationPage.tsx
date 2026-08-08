@@ -27,7 +27,7 @@ function Composer() {
             onChange={(e) => setDraft(e.target.value)}
           />
           {/* No daemon yet — "send" just clears the draft until borgd is wired in. */}
-          <button type="button" className="send" onClick={() => setDraft("")}>
+          <button type="button" aria-label="Send" className="send" onClick={() => setDraft("")}>
             <SendIcon size={14} />
           </button>
         </div>

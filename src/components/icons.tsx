@@ -14,13 +14,15 @@ export type IconProps = SVGProps<SVGSVGElement> & { size?: number };
 
 const NEON = "var(--neon)";
 
-/** Hairline stroke weight shared by every UI icon, matching the app's 1.6px line style. */
+/** Default stroke weight for factory-built icons, matching the app's 1.6px line style. */
 const STROKE = 1.6;
 
 function lucide(Icon: LucideIcon, fallback: number, strokeWidth = STROKE) {
-  return function WrappedIcon({ size, ...props }: IconProps) {
+  function WrappedIcon({ size, ...props }: IconProps) {
     return <Icon size={size ?? fallback} strokeWidth={strokeWidth} {...props} />;
-  };
+  }
+  WrappedIcon.displayName = Icon.displayName ?? "Icon";
+  return WrappedIcon;
 }
 
 /** Borg reticle logo. `full` adds the cross ticks used in the app header. */
@@ -46,10 +48,10 @@ export const ChevronIcon = lucide(ChevronRight, 13, 2);
 export function SendIcon({ size, ...props }: IconProps) {
   return (
     // Fixed dark stroke: this icon sits on the neon send button, so currentColor won't contrast.
-    <ArrowUp size={size ?? 14} strokeWidth={2.3} stroke="#0C100D" {...props} />
+    <ArrowUp size={size ?? 14} {...props} strokeWidth={2.3} stroke="#0C100D" />
   );
 }
 
 export function CheckIcon({ size, ...props }: IconProps) {
-  return <Check size={size ?? 22} strokeWidth={2.2} stroke={NEON} {...props} />;
+  return <Check size={size ?? 22} {...props} strokeWidth={2.2} stroke={NEON} />;
 }

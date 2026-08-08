@@ -51,7 +51,7 @@ export function SettingDetailPage() {
                     <div className="value">{o.value}</div>
                     {o.desc && <div className="desc">{o.desc}</div>}
                   </div>
-                  {on && <CheckIcon size={15} />}
+                  {on && <CheckIcon size={15} role="img" aria-label="Selected" />}
                 </div>
               );
             })}
