@@ -34,6 +34,7 @@ pub mod btw;
 mod credentials;
 mod goal_loop;
 mod hooks_dispatch;
+pub mod media_markers;
 mod prompt_assembly;
 mod session_manager;
 pub mod silence;
@@ -228,6 +229,16 @@ pub(super) const EMPTY_RESPONSE_REASONING_LABEL: &str =
 /// leaves the user unable to tell a finished turn from a broken one.
 pub(super) const EMPTY_RESPONSE_NO_REASONING: &str =
     "[The model returned an empty response. Try rephrasing, or check the provider status.]";
+
+/// Marker persisted as the assistant turn when the model produced no visible
+/// text. The live display may carry a labeled reasoning excerpt
+/// ([`EMPTY_RESPONSE_REASONING_LABEL`]), but raw reasoning must NEVER reach
+/// persisted assistant content: replayed on later requests it reads to
+/// providers as injected chain-of-thought, which can deterministically yield
+/// another empty response — re-triggering this very path and wedging the
+/// session for good.
+pub(super) const EMPTY_RESPONSE_PERSISTED_MARKER: &str =
+    "[No visible answer was produced this turn.]";
 
 use tool_validation::UnknownToolTracker;
 use tool_validation::{
@@ -1077,7 +1088,81 @@ impl Agent {
     }
 
     /// Core agent loop: stream LLM, execute tool calls, repeat until text-only response.
+    ///
+    /// Wraps the loop body with turn-scoped subprocess ownership: a baseline
+    /// of already-running registered processes is captured at turn start, and
+    /// if the turn is ABANDONED (the cancellation token fired — user /stop,
+    /// session cancel/replacement, deadline abort) any process spawned during
+    /// the turn is reaped so a backgrounded dev server can't run unbounded
+    /// with nobody left to drive it. Normal completion leaves them alive —
+    /// surviving the turn is the point of backgrounding.
     pub async fn run_agent_loop(
+        &mut self,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        // Stamp the owning session id into the execution context so
+        // subprocesses registered during this turn are attributable to this
+        // session (the abandoned-turn reap only touches its own session's
+        // spawns).
+        if self.execution_context.session_id() != Some(self.session.meta.id.as_str()) {
+            self.execution_context = self
+                .execution_context
+                .clone()
+                .with_session_id(Some(self.session.meta.id.clone()));
+        }
+        let turn_baseline = self
+            .execution_context
+            .process_registry()
+            .map(|reg| reg.begin_turn(&self.session.meta.id));
+
+        let result = self.run_agent_loop_inner(event_tx, cancel.clone()).await;
+
+        if cancel.is_cancelled() {
+            if let (Some(reg), Some(baseline)) = (
+                self.execution_context.process_registry().cloned(),
+                turn_baseline,
+            ) {
+                let never_kill = crate::process_registry::compile_never_kill_patterns(
+                    &self.config.process_registry.never_kill_patterns,
+                );
+                let grace = self.config.process_registry.sigterm_grace_secs;
+                // The kill path blocks (SIGTERM → liveness poll → SIGKILL);
+                // keep it off the async workers. Fire-and-forget is safe: the
+                // generation guard inside makes a late reap a no-op once a
+                // replacement turn claims the session.
+                let blocking = tokio::task::spawn_blocking(move || {
+                    reg.reap_abandoned_turn(&baseline, &never_kill, grace)
+                });
+                let session_id = self.session.meta.id.clone();
+                tokio::spawn(async move {
+                    match blocking.await {
+                        Ok(report) if report.stale_generation => tracing::debug!(
+                            session_id = %session_id,
+                            "abandoned-turn reap skipped: generation advanced"
+                        ),
+                        Ok(report) => tracing::debug!(
+                            session_id = %session_id,
+                            killed = report.killed.len(),
+                            exempted_by_pin = report.exempted_by_pin,
+                            exempted_by_pattern = report.exempted_by_pattern,
+                            exempted_by_kind = report.exempted_by_kind,
+                            already_gone = report.already_gone,
+                            "abandoned-turn reap complete"
+                        ),
+                        Err(e) => tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "abandoned-turn reap task failed"
+                        ),
+                    }
+                });
+            }
+        }
+        result
+    }
+
+    async fn run_agent_loop_inner(
         &mut self,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,

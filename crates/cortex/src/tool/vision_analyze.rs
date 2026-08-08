@@ -199,26 +199,10 @@ async fn fetch_remote(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
 
-    // Inspect content-length when the server reports it so we reject oversized
-    // payloads before streaming the body.
-    if let Some(reported) = resp.content_length() {
-        if reported as usize > MAX_DOWNLOAD_BYTES {
-            anyhow::bail!(
-                "image is {} MB; vision_analyze caps at {} MB.",
-                reported as usize / (1024 * 1024),
-                MAX_DOWNLOAD_BYTES / (1024 * 1024)
-            );
-        }
-    }
-
-    let bytes = resp.bytes().await?.to_vec();
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        anyhow::bail!(
-            "image is {} MB; vision_analyze caps at {} MB.",
-            bytes.len() / (1024 * 1024),
-            MAX_DOWNLOAD_BYTES / (1024 * 1024)
-        );
-    }
+    // Streamed read with a running cap — Content-Length can lie or be absent
+    // (chunked encoding), so the ceiling is enforced chunk-by-chunk rather
+    // than after buffering the whole body.
+    let bytes = media::read_body_capped(resp, MAX_DOWNLOAD_BYTES as u64, "image").await?;
 
     let filename = url::Url::parse(&effective_url)
         .ok()

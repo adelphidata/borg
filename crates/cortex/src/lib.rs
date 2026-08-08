@@ -65,6 +65,8 @@ pub mod daily_summary;
 pub mod db;
 /// Diagnostic checks for `borg doctor`.
 pub mod doctor;
+/// Global emergency stop (`borg pause` / `borg resume`) gate helpers.
+pub mod emergency_pause;
 /// Typed `Error` umbrella for the crate's public API.
 pub mod error;
 /// Structured error formatting for user-facing messages.

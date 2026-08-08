@@ -42,7 +42,7 @@ use crate::util::time::now_unix;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
@@ -219,6 +219,54 @@ impl AutoReapReport {
     }
 }
 
+/// Turn-scoped process baseline captured by [`ProcessRegistry::begin_turn`].
+///
+/// Records which processes were already running when the turn started (those
+/// always survive an abandoned-turn reap) plus the session's turn generation
+/// at capture time (a stale generation makes the reap a no-op).
+#[derive(Clone, Debug)]
+pub struct TurnBaseline {
+    /// Session that owns the turn. The reap only considers entries whose
+    /// `session_id` matches — a concurrent session's spawns are untouchable.
+    pub session_id: String,
+    /// The session's turn generation when this baseline was captured.
+    pub generation: u64,
+    /// Registry ids running at turn start — exempt from the abandoned reap.
+    pub baseline_ids: HashSet<u64>,
+}
+
+/// Report returned by [`ProcessRegistry::reap_abandoned_turn`].
+#[derive(Clone, Debug, Default)]
+pub struct AbandonedTurnReport {
+    /// Entries killed (SIGTERM or SIGKILL; includes signal-failed entries
+    /// recorded as `Dead`, mirroring `auto_reap`).
+    pub killed: Vec<ProcessEntry>,
+    /// Turn-spawned entries spared by an explicit user pin.
+    pub exempted_by_pin: usize,
+    /// Turn-spawned entries spared by a `never_kill_patterns` match.
+    pub exempted_by_pattern: usize,
+    /// Turn-spawned entries spared by kind (Browser).
+    pub exempted_by_kind: usize,
+    /// Entries whose PID was already gone — recorded `Dead`, not signaled.
+    pub already_gone: usize,
+    /// Entries skipped because the PID was recycled to a different process.
+    pub recycled_skipped: usize,
+    /// True when the whole reap was skipped because a replacement turn has
+    /// claimed the session since the baseline was captured.
+    pub stale_generation: bool,
+}
+
+/// First few tokens of a command for log lines — enough to identify the
+/// workload without dumping a full pipeline into the log.
+fn command_head(command: &str) -> String {
+    const HEAD_MAX_CHARS: usize = 64;
+    if command.chars().count() <= HEAD_MAX_CHARS {
+        return command.to_string();
+    }
+    let head: String = command.chars().take(HEAD_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
 /// Convert glob-style patterns (`cargo build*`, `bun *`) into anchored
 /// regexes. Only `*` is honoured; other regex metacharacters are
 /// escaped. Empty / invalid patterns are silently dropped with a
@@ -293,6 +341,14 @@ struct Inner {
     /// Used by the maintenance sweep to detect repeat-offender workloads
     /// that the operator should add to `never_kill_patterns`.
     last_auto_reaped_commands: Vec<String>,
+    /// Per-session turn generation, bumped by [`ProcessRegistry::begin_turn`].
+    /// The abandoned-turn reap compares its captured generation against this
+    /// map: if a replacement turn has claimed the session since the baseline
+    /// was taken, the (now stale) reap is a no-op — it must never kill
+    /// processes the replacement turn legitimately spawned. One `u64` per
+    /// session id; bounded by the number of distinct sessions this daemon
+    /// hosts over its lifetime.
+    turn_generations: HashMap<String, u64>,
 }
 
 impl ProcessRegistry {
@@ -495,6 +551,134 @@ impl ProcessRegistry {
     /// passes to detect "you keep killing the same workload — whitelist it."
     pub fn previous_auto_reaped_commands(&self) -> Vec<String> {
         self.lock().last_auto_reaped_commands.clone()
+    }
+
+    /// Ids of all currently running entries. The turn-scoped baseline: any
+    /// running entry present *now* predates the turn and must survive an
+    /// abandoned-turn reap.
+    pub fn snapshot_running_ids(&self) -> HashSet<u64> {
+        self.lock().running.keys().copied().collect()
+    }
+
+    /// Open a turn for `session_id`: bump the session's turn generation and
+    /// capture the running-id baseline. Call at turn start; keep the returned
+    /// [`TurnBaseline`] for the life of the turn. On abandonment, pass it to
+    /// [`ProcessRegistry::reap_abandoned_turn`]; on normal completion just
+    /// drop it — backgrounded processes are supposed to outlive their turn.
+    pub fn begin_turn(&self, session_id: &str) -> TurnBaseline {
+        let mut inner = self.lock();
+        let generation = {
+            let g = inner
+                .turn_generations
+                .entry(session_id.to_string())
+                .or_insert(0);
+            *g = g.wrapping_add(1);
+            *g
+        };
+        TurnBaseline {
+            session_id: session_id.to_string(),
+            generation,
+            baseline_ids: inner.running.keys().copied().collect(),
+        }
+    }
+
+    /// Reap background processes spawned during an *abandoned* turn (user
+    /// /stop, session cancel/replacement, deadline abort) — the agent loop
+    /// was interrupted, so nobody is left to drive or kill them.
+    ///
+    /// Kill set: running entries owned by `baseline.session_id` that are
+    /// absent from the baseline (i.e. started during the turn). Exemptions
+    /// mirror `auto_reap`: kind-exempt (Browser), user pin, never-kill
+    /// pattern match. Already-dead PIDs are moved to `finished` as `Dead`
+    /// without signaling.
+    ///
+    /// Generation guard: if [`ProcessRegistry::begin_turn`] has been called
+    /// again for this session since `baseline` was captured, a replacement
+    /// turn owns the session — this reap returns immediately as a no-op
+    /// (`stale_generation = true`) so it cannot kill the replacement turn's
+    /// legitimate spawns.
+    pub fn reap_abandoned_turn(
+        &self,
+        baseline: &TurnBaseline,
+        never_kill_patterns: &[Regex],
+        sigterm_grace_secs: u64,
+    ) -> AbandonedTurnReport {
+        let now = now_unix();
+        let mut report = AbandonedTurnReport::default();
+        let candidates: Vec<ProcessEntry> = {
+            let inner = self.lock();
+            // Generation check happens under the same lock that `begin_turn`
+            // writes under, so "stale" and "enumerate" cannot interleave with
+            // a replacement turn's claim.
+            if inner.turn_generations.get(&baseline.session_id).copied()
+                != Some(baseline.generation)
+            {
+                report.stale_generation = true;
+                return report;
+            }
+            inner
+                .running
+                .values()
+                .filter(|e| e.session_id.as_deref() == Some(baseline.session_id.as_str()))
+                .filter(|e| !baseline.baseline_ids.contains(&e.id))
+                .cloned()
+                .collect()
+        };
+
+        for entry in candidates {
+            if entry.kind.is_auto_reap_exempt() {
+                report.exempted_by_kind += 1;
+                continue;
+            }
+            if entry.pinned {
+                report.exempted_by_pin += 1;
+                continue;
+            }
+            if matches_any(&entry.command, never_kill_patterns) {
+                report.exempted_by_pattern += 1;
+                continue;
+            }
+            // Already gone (or unsignalable pid 0): record as Dead, don't
+            // signal — a recycled PID would be an unrelated bystander.
+            if entry.pid == 0 || !pid_alive(entry.pid) {
+                self.finalize(entry.id, ProcessStatus::Dead, None);
+                report.already_gone += 1;
+                continue;
+            }
+            let outcome =
+                send_term_then_kill(entry.pid, sigterm_grace_secs, entry.start_fingerprint);
+            let Some(mut finished) = finalize_killed(self, entry.id, now) else {
+                // Entry finalized concurrently (guard drop, reap_dead) —
+                // nothing further to record.
+                continue;
+            };
+            match outcome {
+                KillOutcome::TermSufficed | KillOutcome::NeededKill => {
+                    tracing::info!(
+                        pid = entry.pid,
+                        command = %command_head(&entry.command),
+                        reason = "abandoned turn",
+                        "process_registry: reaped turn-scoped background process"
+                    );
+                    report.killed.push(finished);
+                }
+                KillOutcome::SignalFailed => {
+                    // Couldn't signal at all — mirror auto_reap and record
+                    // Dead so the entry doesn't linger as Running.
+                    finished.status = ProcessStatus::Dead;
+                    report.killed.push(finished);
+                }
+                KillOutcome::Recycled => {
+                    tracing::warn!(
+                        pid = entry.pid,
+                        id = entry.id,
+                        "process_registry: PID recycled before abandoned-turn reap; skipped kill"
+                    );
+                    report.recycled_skipped += 1;
+                }
+            }
+        }
+        report
     }
 
     /// Drop finished entries older than `ttl_secs`, and enforce the
@@ -1217,6 +1401,215 @@ mod tests {
         let last = reg.previous_auto_reaped_commands();
         assert_eq!(last, vec!["rustc --emit=link".to_string()]);
         drop(g);
+    }
+
+    /// Spawn a throwaway `sh -c sleep 99` for reap tests.
+    #[cfg(unix)]
+    fn spawn_sleeper() -> std::process::Child {
+        use std::process::{Command, Stdio};
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 99")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_turn_reaps_turn_spawned_but_spares_baseline() {
+        // A process running BEFORE the turn started (in the baseline) must
+        // survive the abandon-reap; one spawned DURING the turn must die.
+        let reg = ProcessRegistry::new();
+        let sess = Some("sess-a".to_string());
+        let mut pre = spawn_sleeper();
+        let g_pre = reg.register(
+            pre.id(),
+            ProcessKind::RunShell,
+            "sleep 99 #pre",
+            sess.clone(),
+        );
+
+        let baseline = reg.begin_turn("sess-a");
+        assert!(baseline.baseline_ids.contains(&g_pre.id()));
+
+        let mut spawned = spawn_sleeper();
+        let g_spawned = reg.register(
+            spawned.id(),
+            ProcessKind::RunShell,
+            "sleep 99 #turn",
+            sess.clone(),
+        );
+
+        let report = reg.reap_abandoned_turn(&baseline, &[], 2);
+        assert_eq!(report.killed.len(), 1, "exactly the turn-spawned process");
+        assert_eq!(report.killed[0].id, g_spawned.id());
+        assert!(!report.stale_generation);
+        let _ = spawned.wait();
+        assert!(
+            !pid_alive(spawned.id()),
+            "turn-spawned process must be dead"
+        );
+        assert!(pid_alive(pre.id()), "baseline process must survive");
+        // The reaped entry left the running set; the baseline one didn't.
+        let running_ids = reg.snapshot_running_ids();
+        assert!(running_ids.contains(&g_pre.id()));
+        assert!(!running_ids.contains(&g_spawned.id()));
+
+        let _ = pre.kill();
+        let _ = pre.wait();
+        drop(g_spawned); // finalized by the reap; Drop is a no-op
+        g_pre.complete(Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_turn_processes_survive_next_turns_abandonment() {
+        // Normal completion performs no reap — and once the next turn begins,
+        // the survivor sits in that turn's baseline, so even an abandonment
+        // of the NEXT turn leaves it alone.
+        let reg = ProcessRegistry::new();
+        let sess = Some("sess-b".to_string());
+        let _turn1 = reg.begin_turn("sess-b");
+        let mut server = spawn_sleeper();
+        let g = reg.register(server.id(), ProcessKind::RunShell, "dev server", sess);
+        // Turn 1 completes normally: no reap call, baseline dropped.
+
+        let turn2 = reg.begin_turn("sess-b");
+        let report = reg.reap_abandoned_turn(&turn2, &[], 2);
+        assert!(report.killed.is_empty());
+        assert!(
+            pid_alive(server.id()),
+            "process from a completed turn must survive later abandonment"
+        );
+        let _ = server.kill();
+        let _ = server.wait();
+        g.complete(Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_generation_reap_is_noop_even_with_new_processes() {
+        // The dangerous race: turn 1 is abandoned, but before its reaper
+        // enumerates, a replacement turn claims the session and spawns a
+        // legitimate process. The stale reaper must touch NOTHING.
+        let reg = ProcessRegistry::new();
+        let sess = Some("sess-c".to_string());
+        let turn1 = reg.begin_turn("sess-c");
+        let orphan = spawn_sleeper();
+        let g_orphan = reg.register(orphan.id(), ProcessKind::RunShell, "orphan", sess.clone());
+
+        // Replacement turn claims the session and spawns its own process.
+        let _turn2 = reg.begin_turn("sess-c");
+        let fresh = spawn_sleeper();
+        let g_fresh = reg.register(fresh.id(), ProcessKind::RunShell, "fresh", sess);
+
+        let report = reg.reap_abandoned_turn(&turn1, &[], 2);
+        assert!(report.stale_generation, "stale reap must report itself");
+        assert!(report.killed.is_empty(), "stale reap must kill nothing");
+        assert!(pid_alive(orphan.id()));
+        assert!(pid_alive(fresh.id()));
+
+        for (mut child, guard) in [(orphan, g_orphan), (fresh, g_fresh)] {
+            let _ = child.kill();
+            let _ = child.wait();
+            guard.complete(Some(0));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_turn_reap_honors_pin_and_never_kill() {
+        let reg = ProcessRegistry::new();
+        let sess = Some("sess-d".to_string());
+        let baseline = reg.begin_turn("sess-d");
+
+        let pinned = spawn_sleeper();
+        let g_pin = reg.register(pinned.id(), ProcessKind::RunShell, "pin me", sess.clone());
+        reg.pin(g_pin.id()).expect("pin");
+        let allowed = spawn_sleeper();
+        let g_allow = reg.register(
+            allowed.id(),
+            ProcessKind::RunShell,
+            "cargo build --release",
+            sess,
+        );
+
+        let patterns = compile_never_kill_patterns(&["cargo build*".into()]);
+        let report = reg.reap_abandoned_turn(&baseline, &patterns, 2);
+        assert_eq!(report.killed.len(), 0);
+        assert_eq!(report.exempted_by_pin, 1);
+        assert_eq!(report.exempted_by_pattern, 1);
+        assert!(pid_alive(pinned.id()), "pinned process must survive");
+        assert!(pid_alive(allowed.id()), "never-kill process must survive");
+
+        for (mut child, guard) in [(pinned, g_pin), (allowed, g_allow)] {
+            let _ = child.kill();
+            let _ = child.wait();
+            guard.complete(Some(0));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_turn_reap_skips_already_dead_and_other_sessions() {
+        let reg = ProcessRegistry::new();
+        let baseline = reg.begin_turn("sess-e");
+
+        // Turn-spawned but already dead: excluded from the kill sweep,
+        // recorded Dead.
+        let g_ghost = reg.register(
+            0xFFFF_FFFE,
+            ProcessKind::RunShell,
+            "ghost",
+            Some("sess-e".into()),
+        );
+        // A concurrent session's process, spawned mid-turn: not ours to kill.
+        let mut other = spawn_sleeper();
+        let g_other = reg.register(
+            other.id(),
+            ProcessKind::RunShell,
+            "other-session",
+            Some("sess-OTHER".into()),
+        );
+
+        let report = reg.reap_abandoned_turn(&baseline, &[], 2);
+        assert_eq!(report.already_gone, 1);
+        assert!(report.killed.is_empty());
+        assert!(pid_alive(other.id()), "other session's process untouched");
+        let snap = reg.snapshot();
+        let ghost = snap
+            .finished
+            .iter()
+            .find(|e| e.id == g_ghost.id())
+            .expect("ghost moved to finished");
+        assert_eq!(ghost.status, ProcessStatus::Dead);
+
+        let _ = other.kill();
+        let _ = other.wait();
+        g_other.complete(Some(0));
+        drop(g_ghost); // finalized by the reap; Drop is a no-op
+    }
+
+    #[test]
+    fn begin_turn_generations_are_per_session() {
+        // Generations advance independently per session — session B's turns
+        // must not stale-out session A's baseline.
+        let reg = ProcessRegistry::new();
+        let a1 = reg.begin_turn("a");
+        let _b1 = reg.begin_turn("b");
+        let _b2 = reg.begin_turn("b");
+        let report = reg.reap_abandoned_turn(&a1, &[], 1);
+        assert!(
+            !report.stale_generation,
+            "session b's turns must not invalidate session a's baseline"
+        );
+        let a2 = reg.begin_turn("a");
+        assert_eq!(a2.generation, a1.generation + 1);
+        let report = reg.reap_abandoned_turn(&a1, &[], 1);
+        assert!(report.stale_generation);
     }
 
     #[test]

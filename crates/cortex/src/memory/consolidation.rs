@@ -725,6 +725,8 @@ mod backfill_tests {
             forked_from_message_id: None,
             pinned: false,
             archived_at: None,
+            cwd: None,
+            git_repo_root: None,
         }
     }
 

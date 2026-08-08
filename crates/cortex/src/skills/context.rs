@@ -28,6 +28,13 @@ pub struct SkillBudgetReport {
     pub budget_tokens: usize,
     /// Estimated tokens consumed by the rendered skills section.
     pub used_tokens: usize,
+    /// Per-skill token cost as actually rendered into the catalog this turn:
+    /// full-body skills at their full cost, metadata-only (downgraded) skills
+    /// at their small metadata cost. Skills omitted entirely do not appear —
+    /// they contribute zero tokens. Order matches the rendered catalog
+    /// (relevance-ranked), so it is deterministic for a given request.
+    /// Feeds the per-skill rows of the `/context` breakdown.
+    pub per_skill_tokens: Vec<(String, usize)>,
 }
 
 impl SkillBudgetReport {
@@ -224,6 +231,21 @@ pub fn load_skills_context(
 
     // Read before the drain below empties the map.
     let full_count = full_overrides.len();
+
+    // Per-skill costs as rendered: the full body where one was admitted,
+    // otherwise the metadata entry. Recorded before the drain below consumes
+    // `full_overrides`.
+    report.per_skill_tokens = metadata_parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, maybe_meta)| {
+            let rendered = full_overrides.get(&i).or(maybe_meta.as_ref())?;
+            Some((
+                sorted_skills[i].manifest.name.clone(),
+                estimate_tokens(rendered),
+            ))
+        })
+        .collect();
 
     // Build final output: full body for upgraded skills, metadata for the rest,
     // skipping omitted entries.

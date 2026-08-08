@@ -170,6 +170,8 @@ pub async fn run(
     let mut last_tick_wall = std::time::Instant::now();
     let mut last_stalled_scan = std::time::Instant::now();
     let mut lock_refresh_failures: u32 = 0;
+    // Emergency-stop edge tracker: log once per engagement, not per tick.
+    let mut pause_gate = cortex::emergency_pause::PauseGate::new();
 
     loop {
         // `biased` ensures shutdown wins over a coincident tick, so SIGTERM
@@ -245,6 +247,30 @@ pub async fn run(
                     "stalled-task scan made repairs",
                 );
             }
+        }
+
+        // Emergency stop (`borg pause`): skip the entire claim+dispatch arm
+        // while engaged. `claim_due_tasks` is never called, so `next_run`
+        // stays due and every run is deferred — not lost — until resume.
+        // The lock refresh, liveness bump, and stalled/drift recovery above
+        // deliberately keep running: pause halts NEW agent work only, and
+        // maintenance is not agent work. The read goes straight to the DB
+        // (fail-safe: corrupt/unreadable flag ⇒ paused) so a CLI write from
+        // another process gates the very next tick.
+        if cortex::emergency_pause::is_engaged(&db).await {
+            if let Some(cortex::emergency_pause::PauseTransition::Engaged) =
+                pause_gate.observe(true)
+            {
+                tracing::warn!(
+                    "emergency pause engaged — scheduled-task dispatch suspended; \
+                     due runs are deferred until `borg resume`"
+                );
+            }
+            continue;
+        } else if let Some(cortex::emergency_pause::PauseTransition::Released) =
+            pause_gate.observe(false)
+        {
+            tracing::info!("emergency pause released — scheduled-task dispatch resumed");
         }
 
         // Claim+dispatch critical section. The non-blocking tick lock makes

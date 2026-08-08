@@ -124,19 +124,36 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     // registry-keyed, so a deferred tool stays callable once discovered.
     {
         use crate::config::mcp::McpDisclosureTier;
-        let mcp_defs = crate::mcp_clients::tool_definitions();
-        let (listing, names) = render_mcp_catalog_listings(&mcp_defs);
+        let by_server = crate::mcp_clients::tool_definitions_by_server();
+        let mcp_defs: Vec<ToolDefinition> = by_server
+            .iter()
+            .flat_map(|(_, defs)| defs.iter().cloned())
+            .collect();
         let schema_tokens = estimate_defs_tokens(&mcp_defs);
+        // The tier decision keeps its existing semantics (the budget knob is
+        // `listing_max_tokens`); the fullest and most-degraded per-server
+        // renderings stand in for the old flat listing/names estimates.
+        let fullest = render_deferred_mcp_listing(&by_server, usize::MAX);
+        let most_degraded = render_deferred_mcp_listing(&by_server, 0);
         let tier = config.mcp.disclosure_tier(
             schema_tokens,
-            crate::memory::tokenizer::estimate_tokens(&listing),
-            crate::memory::tokenizer::estimate_tokens(&names),
+            crate::memory::tokenizer::estimate_tokens(&fullest),
+            crate::memory::tokenizer::estimate_tokens(&most_degraded),
         );
-        match tier {
-            McpDisclosureTier::Eager => defs.extend(mcp_defs),
-            McpDisclosureTier::Listed => defs.push(build_search_tools_def(Some(&listing))),
-            McpDisclosureTier::NamesOnly => defs.push(build_search_tools_def(Some(&names))),
-            McpDisclosureTier::Bare => defs.push(build_search_tools_def(None)),
+        if tier == McpDisclosureTier::Eager {
+            defs.extend(mcp_defs);
+        } else {
+            // Deferred: per-server, largest-first degradation against the
+            // listing budget. Even when nothing fits, every server keeps a
+            // one-line summary so the model knows the tools exist and
+            // searches instead of substituting a generic tool.
+            let listing = render_deferred_mcp_listing(&by_server, config.mcp.listing_max_tokens);
+            let listing = if listing.is_empty() {
+                None
+            } else {
+                Some(listing)
+            };
+            defs.push(build_search_tools_def(listing.as_deref()));
         }
     }
 
@@ -443,26 +460,100 @@ fn estimate_defs_tokens(defs: &[ToolDefinition]) -> usize {
     defs.iter().map(estimate_def_tokens).sum()
 }
 
-/// Build the two deferred-mode catalog listings from the MCP tool
-/// definitions: `(name — one-line description, names-only)`. Sorted by name
-/// so the rendered text is deterministic for a given registry state (a
-/// stable tools array is what keeps provider prompt caches warm).
-fn render_mcp_catalog_listings(defs: &[ToolDefinition]) -> (String, String) {
-    let mut rows: Vec<(&str, &str)> = defs
+/// Nudge appended to the deferred catalog whenever at least one server's
+/// listing is collapsed to a summary line, so the model searches for the
+/// hidden tools instead of substituting a generic tool.
+const MCP_COLLAPSED_NUDGE: &str = "Servers marked \"discover via tool search\" have tools not \
+     listed here — call search_tools FIRST to find them before falling back to a generic tool.";
+
+/// Render the deferred-mode MCP catalog listing with per-server, largest-first
+/// degradation.
+///
+/// Each server starts at its full form (a name-sorted `name — one-line
+/// description` block). While the rendered text exceeds `budget_tokens`,
+/// servers collapse one at a time — largest first — to a one-line summary
+/// (`<server> (<N> tools — discover via tool search)`), so one oversized
+/// server no longer drags every co-attached server down to a terse form.
+/// Even when every server is collapsed the summary lines all remain, plus a
+/// nudge to use the tool-search meta-tool — the floor is never "nothing".
+///
+/// Byte-stable for a given catalog: servers are ordered by
+/// `(full-form size desc, name asc)` — never map iteration order — and the
+/// degradation walk is deterministic, so the rendered text (and with it the
+/// prompt-cache prefix) is identical across turns.
+fn render_deferred_mcp_listing(
+    servers: &[(String, Vec<ToolDefinition>)],
+    budget_tokens: usize,
+) -> String {
+    if servers.is_empty() {
+        return String::new();
+    }
+    struct Entry<'a> {
+        name: &'a str,
+        full_tokens: usize,
+        full: String,
+        summary: String,
+    }
+    let mut entries: Vec<Entry<'_>> = servers
         .iter()
-        .map(|d| {
-            let first_line = d.function.description.lines().next().unwrap_or_default();
-            (d.function.name.as_str(), first_line)
+        .map(|(name, defs)| {
+            let mut rows: Vec<(&str, &str)> = defs
+                .iter()
+                .map(|d| {
+                    let first_line = d.function.description.lines().next().unwrap_or_default();
+                    (d.function.name.as_str(), first_line)
+                })
+                .collect();
+            rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let full = std::iter::once(format!("{name}:"))
+                .chain(rows.iter().map(|(n, desc)| format!("  {n} — {desc}")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Entry {
+                name,
+                full_tokens: crate::memory::tokenizer::estimate_tokens(&full),
+                full,
+                summary: format!("{name} ({} tools — discover via tool search)", defs.len()),
+            }
         })
         .collect();
-    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let listing = rows
-        .iter()
-        .map(|(n, desc)| format!("{n} — {desc}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let names = rows.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\n");
-    (listing, names)
+    // Largest first, name as the deterministic tie-break. This is both the
+    // degradation order and the render order.
+    entries.sort_by(|a, b| {
+        b.full_tokens
+            .cmp(&a.full_tokens)
+            .then_with(|| a.name.cmp(b.name))
+    });
+
+    let render = |collapsed: usize| -> String {
+        let mut blocks: Vec<&str> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if i < collapsed {
+                    e.summary.as_str()
+                } else {
+                    e.full.as_str()
+                }
+            })
+            .collect();
+        if collapsed > 0 {
+            blocks.push(MCP_COLLAPSED_NUDGE);
+        }
+        blocks.join("\n")
+    };
+
+    for collapsed in 0..=entries.len() {
+        let text = render(collapsed);
+        // The all-collapsed floor is returned even over budget: one summary
+        // line per server is the minimum disclosure.
+        if crate::memory::tokenizer::estimate_tokens(&text) <= budget_tokens
+            || collapsed == entries.len()
+        {
+            return text;
+        }
+    }
+    unreachable!("loop returns at collapsed == entries.len()")
 }
 
 /// Build the `search_tools` meta-tool definition, advertised in place of the
@@ -535,7 +626,8 @@ fn build_schedule_tool_def() -> ToolDefinition {
         "limit": {"type":"integer","description":"Number of runs to return (for runs action, default: 5)"},
         "pre_run_command": {"type":"string","description":"Optional shell command (only for type=prompt) that runs before the LLM. Its stdout is prepended to the prompt as a <preprocessed_context source=\"pre_run\"> XML block. On non-zero exit or timeout the LLM still runs and the block is marked status=\"failed\". Use this to do mechanical fetching/parsing in shell so the model only has to reason. Wake gate: if the command exits 0 and its LAST stdout line is exactly {\"wakeAgent\": false}, the LLM turn and delivery are skipped entirely for that run (recorded as completed, result 'skipped by wake gate'). A last line of {\"wakeAgent\": true} (extra keys allowed) proceeds normally with the gate line stripped from the injected context. Use the gate for polling tasks so runs cost nothing when nothing changed."},
         "pre_run_cwd": {"type":"string","description":"Optional working directory for pre_run_command (default: $HOME)."},
-        "pre_run_timeout_ms": {"type":"integer","description":"Timeout (ms) for pre_run_command (default: 60000)."}
+        "pre_run_timeout_ms": {"type":"integer","description":"Timeout (ms) for pre_run_command (default: 60000)."},
+        "monitor_mode": {"type":"boolean","description":"Only for type=prompt with a pre_run_command: hash the pre-run output each run and skip the LLM turn entirely when it is unchanged from the last run that reached the model (recorded as a no_change run). The first run always reaches the model and stores the baseline; a pre-run failure never counts as a change. Use for watch-for-changes jobs so unchanged polls cost nothing."}
     });
 
     ToolDefinition::new(
@@ -1111,21 +1203,128 @@ mod mcp_disclosure_tests {
         )
     }
 
-    #[test]
-    fn catalog_listings_are_sorted_and_first_line_only() {
-        let defs = vec![
-            def(
-                "mcp_b_two",
-                "Second tool.\nExtra detail that must not leak.",
+    /// Three fake servers: one huge, two small. `(server, tools)` in the
+    /// name-sorted order `tool_definitions_by_server` produces.
+    fn three_servers() -> Vec<(String, Vec<ToolDefinition>)> {
+        let huge_tools: Vec<ToolDefinition> = (0..40)
+            .map(|i| {
+                def(
+                    &format!("mcp_huge_tool_{i:02}"),
+                    "A verbosely described operation on the oversized flat-API server.",
+                )
+            })
+            .collect();
+        vec![
+            ("huge".to_string(), huge_tools),
+            (
+                "small_a".to_string(),
+                vec![
+                    def("mcp_small_a_get", "Get a record."),
+                    def("mcp_small_a_list", "List records."),
+                ],
             ),
-            def("mcp_a_one", "First tool."),
-        ];
-        let (listing, names) = render_mcp_catalog_listings(&defs);
-        assert_eq!(
-            listing, "mcp_a_one — First tool.\nmcp_b_two — Second tool.",
-            "listing must be name-sorted with one-line descriptions"
+            (
+                "small_b".to_string(),
+                vec![def("mcp_small_b_search", "Search things.")],
+            ),
+        ]
+    }
+
+    #[test]
+    fn oversized_server_collapses_while_small_servers_keep_listings() {
+        let servers = three_servers();
+        // Budget fits both small servers' full blocks but not the huge one.
+        let listing = render_deferred_mcp_listing(&servers, 120);
+        assert!(
+            listing.contains("huge (40 tools — discover via tool search)"),
+            "largest server must collapse to a one-line summary:\n{listing}"
         );
-        assert_eq!(names, "mcp_a_one\nmcp_b_two");
+        assert!(
+            !listing.contains("mcp_huge_tool_00"),
+            "collapsed server must not list individual tools:\n{listing}"
+        );
+        for kept in [
+            "small_a:",
+            "  mcp_small_a_get — Get a record.",
+            "  mcp_small_a_list — List records.",
+            "small_b:",
+            "  mcp_small_b_search — Search things.",
+        ] {
+            assert!(
+                listing.contains(kept),
+                "small servers must keep full listings ({kept:?} missing):\n{listing}"
+            );
+        }
+        assert!(
+            listing.contains("search_tools FIRST"),
+            "a partially collapsed catalog must carry the search-first nudge:\n{listing}"
+        );
+    }
+
+    #[test]
+    fn deferred_listing_is_byte_identical_across_renders() {
+        // Prompt caches key on the tools array byte-for-byte; the ordering is
+        // (size desc, name asc), never map iteration order.
+        let a = render_deferred_mcp_listing(&three_servers(), 120);
+        let b = render_deferred_mcp_listing(&three_servers(), 120);
+        assert_eq!(a, b, "same catalog + budget must render byte-identically");
+        // Largest-first render order: huge's summary precedes both small blocks.
+        let huge_pos = a.find("huge (").expect("huge summary present");
+        assert!(huge_pos < a.find("small_a:").expect("small_a present"));
+        assert!(a.find("small_a:").unwrap() < a.find("small_b:").expect("small_b present"));
+    }
+
+    #[test]
+    fn most_degraded_tier_still_lists_every_server_summary() {
+        // Zero budget: nothing fits, but the floor is one summary line per
+        // server plus the nudge — never the old empty "Bare" form where the
+        // model didn't know the tools existed.
+        let listing = render_deferred_mcp_listing(&three_servers(), 0);
+        for line in [
+            "huge (40 tools — discover via tool search)",
+            "small_a (2 tools — discover via tool search)",
+            "small_b (1 tools — discover via tool search)",
+        ] {
+            assert!(
+                listing.contains(line),
+                "every server keeps its summary line ({line:?} missing):\n{listing}"
+            );
+        }
+        assert!(
+            !listing.contains("mcp_small_b_search —"),
+            "no per-tool rows at the floor:\n{listing}"
+        );
+        assert!(listing.contains("search_tools FIRST"));
+    }
+
+    #[test]
+    fn generous_budget_keeps_every_server_at_full_form() {
+        let listing = render_deferred_mcp_listing(&three_servers(), usize::MAX);
+        assert!(
+            !listing.contains("discover via tool search"),
+            "no server collapses when everything fits:\n{listing}"
+        );
+        // Full blocks are name-sorted within each server.
+        let get = listing.find("mcp_small_a_get").unwrap();
+        let list = listing.find("mcp_small_a_list").unwrap();
+        assert!(get < list, "tools within a server are name-sorted");
+        // First line only: multi-line descriptions must not leak detail.
+        let servers = vec![(
+            "s".to_string(),
+            vec![def(
+                "mcp_s_t",
+                "First line.\nExtra detail that must not leak.",
+            )],
+        )];
+        let one = render_deferred_mcp_listing(&servers, usize::MAX);
+        assert!(one.contains("mcp_s_t — First line."));
+        assert!(!one.contains("Extra detail"));
+    }
+
+    #[test]
+    fn empty_catalog_renders_empty() {
+        assert_eq!(render_deferred_mcp_listing(&[], 100), "");
+        assert_eq!(render_deferred_mcp_listing(&[], 0), "");
     }
 
     #[test]

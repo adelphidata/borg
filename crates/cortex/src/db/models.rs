@@ -42,6 +42,13 @@ pub struct SessionRow {
     /// When the stale-session sweep archived this session, if it did.
     /// Archiving is a soft hide and is always reversible.
     pub archived_at: Option<i64>,
+    /// Canonicalized working directory the session was opened from.
+    /// `None` for sessions without a meaningful workspace (gateway
+    /// channels, daemon-internal lanes, pre-v16 rows).
+    pub cwd: Option<String>,
+    /// Canonicalized toplevel of the git checkout enclosing `cwd`, when
+    /// there is one. Drives workspace-scoped resume (`borg --continue`).
+    pub git_repo_root: Option<String>,
 }
 
 impl SessionRow {
@@ -49,7 +56,8 @@ impl SessionRow {
     /// `SELECT ... FROM sessions` that maps into a `SessionRow` interpolates
     /// this so the column order and the field decoding never drift apart.
     pub const COLUMNS: &'static str = "id, created_at, updated_at, total_tokens, \
-         model, title, parent_session_id, forked_from_message_id, pinned, archived_at";
+         model, title, parent_session_id, forked_from_message_id, pinned, archived_at, \
+         cwd, git_repo_root";
 
     /// Decode a row produced by a `SELECT {COLUMNS} FROM sessions` query.
     pub fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
@@ -64,6 +72,8 @@ impl SessionRow {
             forked_from_message_id: row.get::<Option<i64>>(7)?,
             pinned: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
             archived_at: row.get::<Option<i64>>(9)?,
+            cwd: row.get::<Option<String>>(10)?,
+            git_repo_root: row.get::<Option<String>>(11)?,
         })
     }
 }
@@ -158,6 +168,15 @@ pub struct ScheduledTaskRow {
     /// Provider for [`Self::model`], when the pinned id needs a provider that
     /// differs from the global one. `None` uses the configured provider.
     pub model_provider: Option<String>,
+    /// Monitor mode: when true and the task has a `pre_run_command`, a run
+    /// whose successful pre-run output hashes identically to
+    /// [`Self::last_pre_run_hash`] skips the LLM turn entirely and is
+    /// recorded as a no-change run. Failed pre-runs never update or consult
+    /// the baseline — the task runs normally with the failure surfaced.
+    pub monitor_mode: bool,
+    /// Baseline hash of the last successful `pre_run_command` output that
+    /// reached the LLM. `None` until the first monitored run completes.
+    pub last_pre_run_hash: Option<String>,
 }
 
 /// Task run log row from SQLite.

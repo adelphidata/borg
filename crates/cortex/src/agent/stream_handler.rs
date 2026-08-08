@@ -286,13 +286,17 @@ impl Agent {
             // The turn is ending with nothing visible. Silence here reads as
             // a completed turn, so deliver the model's own reasoning tail if
             // it produced any (it frequently holds the actual answer), and an
-            // explicit notice otherwise. Delivery-only: the excerpt is
-            // emitted and persisted as an assistant message, but raw
-            // reasoning is never promoted earlier in the turn.
+            // explicit notice otherwise. Display-only: the excerpt goes out
+            // as a text delta, while the persisted assistant message carries
+            // only a neutral marker — chain-of-thought replayed as assistant
+            // content reads to providers as injected reasoning and can
+            // deterministically produce another empty response, making this
+            // path self-reinforcing.
             let terminal = self.empty_response_terminal();
             tracing::debug!("Empty assistant response; delivering terminal notice");
-            let _ = event_tx.send(AgentEvent::TextDelta(terminal.clone())).await;
-            self.log_and_persist(Message::assistant(&terminal)).await;
+            let _ = event_tx.send(AgentEvent::TextDelta(terminal)).await;
+            self.log_and_persist(Message::assistant(super::EMPTY_RESPONSE_PERSISTED_MARKER))
+                .await;
         }
         self.maybe_record_plan_emission(text_content).await;
         self.auto_save();
@@ -306,7 +310,9 @@ impl Agent {
     ///
     /// The label is unconditional so the excerpt can never be mistaken for a
     /// normal answer, and the text is redacted on the same terms as any other
-    /// assistant output.
+    /// assistant output. Display-only: this string is emitted as a text
+    /// delta but must never be persisted (see
+    /// [`super::EMPTY_RESPONSE_PERSISTED_MARKER`]).
     pub(super) fn empty_response_terminal(&self) -> String {
         let reasoning = self.turn_reasoning.trim();
         if reasoning.is_empty() {

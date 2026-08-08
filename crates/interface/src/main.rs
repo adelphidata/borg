@@ -70,6 +70,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "SESSION_ID")]
     resume: Option<String>,
 
+    /// Resume the most recent session for this workspace (the enclosing git
+    /// repo, or this directory when outside one). Falls back to the global
+    /// most-recent session, and starts fresh when there are none.
+    /// Only applies when launching the interactive TUI.
+    /// (No `-c` short form: it would collide with subcommand flags like
+    /// `logs -c`.)
+    #[arg(long = "continue", global = true, conflicts_with = "resume")]
+    continue_session: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -215,6 +224,18 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Emergency stop: halt all NEW agent work (in-flight turns finish)
+    ///
+    /// Scheduled runs are deferred (not lost), new gateway/interactive turns
+    /// get a "paused" notice, and heartbeat injection is skipped until
+    /// `borg resume`. Internal maintenance keeps running.
+    Pause {
+        /// Reason shown in `borg status` and in paused-turn notices
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Release the emergency stop and resume normal operation
+    Resume,
     /// Set the agent to away mode (auto-replies to messages)
     Away {
         /// Custom away message (uses config default if omitted)
@@ -623,7 +644,14 @@ async fn async_main() -> Result<()> {
     match cli.command {
         Some(Commands::Start) | None => {
             ensure_onboarded()?;
-            if let Some(hint) = repl::run(cli.resume.clone()).await? {
+            let resume = if cli.resume.is_some() {
+                cli.resume.clone()
+            } else if cli.continue_session {
+                resolve_continue_session().await
+            } else {
+                None
+            };
+            if let Some(hint) = repl::run(resume).await? {
                 println!();
                 println!("Session: {} ({})", hint.title, hint.short_id);
                 println!("Resume with: borg --resume {}", hint.short_id);
@@ -677,6 +705,8 @@ async fn async_main() -> Result<()> {
         Some(Commands::Poke) => commands::misc::run_poke().await?,
         Some(Commands::Dream) => commands::misc::run_dream().await?,
         Some(Commands::Cancel { session }) => commands::misc::run_cancel(session).await?,
+        Some(Commands::Pause { reason }) => commands::pause::run_pause(reason).await?,
+        Some(Commands::Resume) => commands::pause::run_resume().await?,
         Some(Commands::Away { message }) => commands::misc::run_away(message).await?,
         Some(Commands::Available) => commands::misc::run_available().await?,
         Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action).await?,
@@ -727,6 +757,73 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve `--continue` to a session id: the most recent non-archived session
+/// stamped with this workspace (enclosing git repo toplevel, else exact cwd
+/// match), falling back to the global most-recent session with a printed
+/// note. Never errors — any failure path prints/logs and returns `None`, so
+/// the TUI just starts a fresh session.
+async fn resolve_continue_session() -> Option<String> {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("borg: --continue: cannot determine working directory ({e}); starting fresh");
+            return None;
+        }
+    };
+    let (cwd, repo_root) = cortex::session::workspace_identity(&cwd);
+    let db = match cortex::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("borg: --continue: database unavailable ({e}); starting fresh");
+            return None;
+        }
+    };
+    let workspace_hit = db
+        .most_recent_session_in_workspace(
+            repo_root.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+            &cwd.to_string_lossy(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "--continue workspace lookup failed");
+            None
+        });
+    let row = match workspace_hit {
+        Some(row) => row,
+        None => {
+            // Global fallback: newest non-archived session anywhere.
+            let global = match db.list_sessions(50).await {
+                Ok(rows) => rows.into_iter().find(|r| r.archived_at.is_none()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "--continue global lookup failed");
+                    None
+                }
+            };
+            match global {
+                Some(row) => {
+                    eprintln!(
+                        "borg: no previous session for this workspace; \
+                         continuing the most recent session instead"
+                    );
+                    row
+                }
+                None => return None, // empty DB — start fresh, never error
+            }
+        }
+    };
+    // The TUI resume path resolves ids against the on-disk session files and
+    // hard-exits on a miss; verify here so a DB row whose file is gone
+    // degrades to a fresh session instead.
+    if cortex::session::resolve_session_id(&row.id).is_err() {
+        eprintln!(
+            "borg: most recent workspace session {} has no session file; starting fresh",
+            &row.id[..row.id.len().min(8)]
+        );
+        return None;
+    }
+    Some(row.id)
 }
 
 fn ensure_onboarded() -> Result<()> {
@@ -1382,6 +1479,36 @@ mod tests {
     fn test_parse_resume_requires_value() {
         // --resume with no value should fail to parse
         assert!(Cli::try_parse_from(["borg", "--resume"]).is_err());
+    }
+
+    // -- --continue flag parsing --
+
+    #[test]
+    fn test_parse_continue_flag() {
+        let cli = Cli::try_parse_from(["borg", "--continue"]).unwrap();
+        assert!(cli.continue_session);
+        assert!(cli.command.is_none());
+
+        let cli = Cli::try_parse_from(["borg", "start", "--continue"]).unwrap();
+        assert!(cli.continue_session);
+        assert!(matches!(cli.command, Some(Commands::Start)));
+
+        let cli = Cli::try_parse_from(["borg"]).unwrap();
+        assert!(!cli.continue_session);
+    }
+
+    #[test]
+    fn test_continue_conflicts_with_resume() {
+        // Two different answers to "which session?" must be rejected, not
+        // silently prioritized.
+        assert!(Cli::try_parse_from(["borg", "--continue", "--resume", "abcd1234"]).is_err());
+    }
+
+    #[test]
+    fn test_continue_has_no_short_flag() {
+        // `-c` is claimed by subcommand flags (e.g. `logs -c`); a global short
+        // would collide, so `--continue` must stay long-only at the top level.
+        assert!(Cli::try_parse_from(["borg", "-c"]).is_err());
     }
 
     // ── Export CLI parse tests ──

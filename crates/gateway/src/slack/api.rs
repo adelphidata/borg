@@ -369,13 +369,6 @@ impl SlackClient {
             .await
             .context("Failed to download Slack file")?;
 
-        // Check Content-Length before buffering to prevent memory exhaustion
-        if let Some(content_length) = resp.content_length() {
-            if content_length as usize > MAX_FILE_DOWNLOAD {
-                bail!("Slack file too large ({content_length} bytes, max {MAX_FILE_DOWNLOAD})");
-            }
-        }
-
         let content_type = resp
             .headers()
             .get("content-type")
@@ -383,20 +376,12 @@ impl SlackClient {
             .unwrap_or("application/octet-stream")
             .to_string();
 
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read Slack file bytes")?;
+        // Streamed read with a running cap — Content-Length can lie or be
+        // absent, so the ceiling is enforced chunk-by-chunk while streaming.
+        let bytes =
+            cortex::media::read_body_capped(resp, MAX_FILE_DOWNLOAD as u64, "Slack file").await?;
 
-        if bytes.len() > MAX_FILE_DOWNLOAD {
-            bail!(
-                "Slack file too large ({} bytes, max {})",
-                bytes.len(),
-                MAX_FILE_DOWNLOAD
-            );
-        }
-
-        Ok((bytes.to_vec(), content_type))
+        Ok((bytes, content_type))
     }
 
     /// Fetch recent messages from a Slack channel via `conversations.history`.

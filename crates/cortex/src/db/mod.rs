@@ -105,6 +105,114 @@ pub fn is_storage_exhausted(err: &anyhow::Error) -> bool {
     false
 }
 
+/// True for the *possibly transient* I/O error class: `SQLITE_IOERR` (and its
+/// extended codes), or a raw `EIO` from the `std::fs` session-save path.
+///
+/// `disk i/o error` is ambiguous: it covers everything from a dying disk to a
+/// one-shot hiccup (page-cache pressure, NFS blip, a checkpoint racing an
+/// unmount probe). [`is_storage_exhausted`] classifies it as fatal — correctly,
+/// once it has proven persistent — but treating the *first* occurrence as
+/// fatal aborts a turn for an error that would have succeeded on retry.
+/// Callers use this predicate to retry a small number of times (see
+/// [`with_transient_io_retry`]) before letting the exhausted classification
+/// stand.
+///
+/// Deliberately excludes the durable-exhaustion class: `SQLITE_FULL`,
+/// `database or disk is full`, and `ENOSPC`/`EDQUOT`/`EROFS` never succeed on
+/// retry and must stay immediately fatal.
+pub fn is_transient_io_error(err: &anyhow::Error) -> bool {
+    /// `SQLITE_IOERR` — a disk I/O error occurred.
+    const SQLITE_IOERR: i32 = 10;
+
+    if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
+        if code & 0xff == SQLITE_IOERR {
+            return true;
+        }
+        // Remote/Hrana wrapping can lose the numeric code; fall back on the
+        // message, but never claim the unambiguous full-disk message.
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("disk i/o error") && !lower.contains("database or disk is full") {
+            return true;
+        }
+    }
+
+    // The session-file auto-save path writes through `std::fs`. A raw EIO is
+    // the same ambiguous class as SQLITE_IOERR; ENOSPC/EDQUOT/EROFS are not.
+    #[cfg(unix)]
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        if io_err.raw_os_error() == Some(libc::EIO) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Additional attempts made for a transient I/O failure before the error is
+/// surfaced to the caller (total attempts = 1 + this).
+const TRANSIENT_IO_MAX_RETRIES: u32 = 2;
+
+/// Linear backoff before retry `attempt` (1-based): 50ms, then 100ms.
+fn transient_io_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(50 * u64::from(attempt))
+}
+
+/// Run `op`, retrying up to [`TRANSIENT_IO_MAX_RETRIES`] times with a short
+/// backoff when the failure is a transient-capable I/O error (see
+/// [`is_transient_io_error`]). Any other error — including durable exhaustion
+/// like `SQLITE_FULL`/`ENOSPC` — is returned immediately.
+///
+/// Never swallows: every retried failure is logged at `warn`, and the final
+/// error (still carrying its `SQLITE_IOERR` identity, so
+/// [`is_storage_exhausted`] classifies it fatal) is returned to the caller.
+pub async fn with_transient_io_retry<T, F, Fut>(op_name: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < TRANSIENT_IO_MAX_RETRIES && is_transient_io_error(&e) => {
+                attempt += 1;
+                let backoff = transient_io_backoff(attempt);
+                tracing::warn!(
+                    "{op_name}: transient disk I/O error (retry {attempt}/{TRANSIENT_IO_MAX_RETRIES} \
+                     after {backoff:?}): {e:#}"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Synchronous sibling of [`with_transient_io_retry`] for `std::fs`-backed
+/// writers (the session auto-save path). Uses a blocking sleep; the backoff
+/// totals 150ms and only ever runs on an already-failing error path.
+pub fn with_transient_io_retry_sync<T, F>(op_name: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < TRANSIENT_IO_MAX_RETRIES && is_transient_io_error(&e) => {
+                attempt += 1;
+                let backoff = transient_io_backoff(attempt);
+                tracing::warn!(
+                    "{op_name}: transient disk I/O error (retry {attempt}/{TRANSIENT_IO_MAX_RETRIES} \
+                     after {backoff:?}): {e:#}"
+                );
+                std::thread::sleep(backoff);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// SQLite database (libsql, SQLite-C fork) for structured borg state.
 ///
 /// Holds an internally-`Arc`'d `libsql::Connection`, which is `Send + Sync +
@@ -454,6 +562,43 @@ impl Database {
                             .context("re-create database after concurrent quarantine")?;
                         return Ok((db, None));
                     }
+                    // Writability preflight: a merely *read-only* database is
+                    // healthy data behind a permissions problem (stray chmod,
+                    // read-only mount, root-owned file, read-only `-wal`
+                    // sibling), and libsql fails to open it just like a
+                    // corrupt one. Quarantining it would move the user's
+                    // entire history aside and boot empty — data-loss-shaped
+                    // for a chmod. Repair perms when we can; otherwise fail
+                    // with instructions and do NOT quarantine.
+                    match Self::ensure_db_files_writable(path) {
+                        Ok(repaired) => {
+                            if repaired {
+                                match Self::open_at_inner(path, busy_timeout_ms, key, false).await {
+                                    Ok(db) => {
+                                        tracing::warn!(
+                                            "database at {} opened after repairing read-only file permissions",
+                                            path.display()
+                                        );
+                                        return Ok((db, None));
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "database at {} still unreadable after permission repair ({e:#}); \
+                                         treating as corrupt",
+                                        path.display()
+                                    ),
+                                }
+                            }
+                        }
+                        // Unwritable and unrepairable: this is a permissions
+                        // problem, not corruption. Surface it instead of
+                        // destroying a healthy database.
+                        Err(perm_err) => {
+                            return Err(perm_err.context(format!(
+                                "database at {} failed to open ({first_err:#})",
+                                path.display()
+                            )));
+                        }
+                    }
                     tracing::warn!(
                         "database at {} is unreadable ({first_err:#}); preserving it and starting fresh",
                         path.display()
@@ -499,6 +644,94 @@ impl Database {
             .filter(|p| !p.as_os_str().is_empty())
             .and_then(|p| std::fs::metadata(p).ok())
             .is_some_and(|meta| meta.is_file())
+    }
+
+    /// Writability preflight for the recovery path: check the database file
+    /// and its `-wal`/`-shm` siblings for write permission, repairing with the
+    /// moral equivalent of `chmod u+rw` where possible (the OS naturally
+    /// refuses for files we don't own).
+    ///
+    /// Returns `Ok(true)` when at least one file's permissions were repaired
+    /// (the caller should retry the open), `Ok(false)` when every existing
+    /// file was already writable (the failure is real corruption, not perms),
+    /// and `Err` with exact operator instructions when an unwritable file
+    /// could not be repaired — in which case the caller must NOT quarantine.
+    fn ensure_db_files_writable(path: &Path) -> Result<bool> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("borg.db");
+        let mut repaired = false;
+        for candidate in [
+            path.to_path_buf(),
+            path.with_file_name(format!("{file_name}-wal")),
+            path.with_file_name(format!("{file_name}-shm")),
+        ] {
+            if !candidate.is_file() {
+                continue;
+            }
+            if Self::file_is_writable(&candidate) {
+                continue;
+            }
+            match Self::repair_file_writability(&candidate) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "repaired read-only permissions on {} (chmod u+rw)",
+                        candidate.display()
+                    );
+                    repaired = true;
+                }
+                Err(repair_err) => {
+                    return Err(anyhow::anyhow!(
+                        "database file {p} is not writable, and automatic permission repair \
+                         failed ({repair_err:#}). This is a permissions problem, not corruption \
+                         — your data is intact and has NOT been moved aside. Fix it manually \
+                         with: chmod u+rw {p} (check ownership and read-only mounts with: \
+                         ls -l {p}). Do NOT delete the {name}-wal file: it holds committed \
+                         transactions that would be silently lost.",
+                        p = candidate.display(),
+                        name = file_name,
+                    ));
+                }
+            }
+        }
+        Ok(repaired)
+    }
+
+    /// True when the file can actually be opened for writing by this process.
+    /// An `open(2)` probe rather than a permission-bit inspection: mode bits
+    /// alone miss root-owned files and read-only mounts.
+    fn file_is_writable(path: &Path) -> bool {
+        std::fs::OpenOptions::new().write(true).open(path).is_ok()
+    }
+
+    /// Attempt the equivalent of `chmod u+rw` on `path`, verifying with a
+    /// write-open probe afterwards (chmod can "succeed" on filesystems that
+    /// still refuse the write, and mode bits don't grant access on a
+    /// read-only mount).
+    fn repair_file_writability(path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("stat {} before permission repair", path.display()))?;
+        #[cfg(unix)]
+        let perms = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(meta.permissions().mode() | 0o600)
+        };
+        #[cfg(not(unix))]
+        let perms = {
+            let mut p = meta.permissions();
+            p.set_readonly(false);
+            p
+        };
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod u+rw {}", path.display()))?;
+        if !Self::file_is_writable(path) {
+            anyhow::bail!(
+                "{} is still not writable after chmod (read-only mount or ACL?)",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Move an unreadable database (and any stale WAL/SHM siblings) aside to
@@ -810,7 +1043,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 14;
+    const CURRENT_VERSION: u32 = 16;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -836,7 +1069,7 @@ impl Database {
             // damaged DB, where each step is individually idempotent, so a
             // crash or a rare concurrent-repair race just leaves work for
             // the next open instead of corrupting anything.
-            return self.migrate_v14().await;
+            return self.migrate_v16().await;
         }
 
         // Acquire the writer lock explicitly. libsql's `Transaction` API is
@@ -924,8 +1157,14 @@ impl Database {
         if current < 14 {
             self.migrate_v14().await?;
         }
+        if current < 15 {
+            self.migrate_v15().await?;
+        }
+        if current < 16 {
+            self.migrate_v16().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 14,
+            Database::CURRENT_VERSION == 16,
             "add the new migrate_vN call above and bump this constant",
         );
 
@@ -1331,6 +1570,128 @@ mod recovery_tests {
         assert!(!dir.path().join("borg.db-shm").exists());
     }
 
+    /// A healthy database that has merely gone read-only (stray chmod) must
+    /// NEVER be quarantined: the open path repairs the permissions (we own
+    /// the file, so `chmod u+rw` succeeds) or fails with instructions, and in
+    /// either case no `.corrupt-*` sibling appears and the data survives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_healthy_db_is_repaired_not_quarantined() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+
+        // Create a healthy, migrated database, then seed a marker row so we
+        // can prove the original data survived (a quarantine-and-recreate
+        // would boot an empty DB in which the marker is gone).
+        {
+            let db = Database::open_at(&path).await.unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO settings (key, value) VALUES ('perm_test_marker', 'survived')",
+                    libsql::params![],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Stray chmod: the db file and any WAL/SHM siblings go read-only.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let p = entry.unwrap().path();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+
+        let result = Database::open_at_recovering(&path, 5000, None, 4242).await;
+
+        // Never a quarantine, regardless of which contract branch fired.
+        let corrupt_siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert!(
+            corrupt_siblings.is_empty(),
+            "a read-only healthy db must never be quarantined: {corrupt_siblings:?}"
+        );
+
+        match result {
+            // We own the file, so repair must succeed and the data survive.
+            Ok((db, notice)) => {
+                assert!(notice.is_none(), "permission repair is not a recovery");
+                let mut rows = db
+                    .conn()
+                    .query(
+                        "SELECT value FROM settings WHERE key = 'perm_test_marker'",
+                        libsql::params![],
+                    )
+                    .await
+                    .unwrap();
+                let row = rows.next().await.unwrap().expect("marker row survives");
+                assert_eq!(row.get::<String>(0).unwrap(), "survived");
+            }
+            // Acceptable fallback per the contract: a descriptive,
+            // operator-actionable error instead of data loss.
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("chmod u+rw"), "error must give the fix: {msg}");
+                assert!(
+                    msg.contains("-wal"),
+                    "error must warn about the -wal file: {msg}"
+                );
+                assert!(path.is_file(), "original db must remain in place");
+            }
+        }
+    }
+
+    /// The unrepairable-permissions error must name the exact file, the exact
+    /// `chmod` command, and warn against deleting the `-wal` (which silently
+    /// loses committed transactions). macOS-only: `UF_IMMUTABLE` blocks
+    /// chmod even for the owner, which is the only way to force the repair
+    /// failure deterministically without root (Linux `chattr +i` needs root;
+    /// plain read-only modes are repairable because we own the file).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unrepairable_file_error_names_file_and_chmod_and_wal_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn chflags(path: &std::path::Path, flags: libc::c_uint) {
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chflags(c.as_ptr(), flags) }, 0, "chflags");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        std::fs::write(&path, b"data").unwrap();
+        let wal = dir.path().join("borg.db-wal");
+        std::fs::write(&wal, b"wal").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o400)).unwrap();
+        chflags(&wal, libc::UF_IMMUTABLE);
+
+        let result = Database::ensure_db_files_writable(&path);
+
+        // Clear the flag first so tempdir cleanup works even on assert failure.
+        chflags(&wal, 0);
+
+        let e = result.expect_err("an immutable read-only -wal must be unrepairable");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains(&wal.display().to_string()),
+            "must name the exact file: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("chmod u+rw {}", wal.display())),
+            "must give the exact chmod command: {msg}"
+        );
+        assert!(
+            msg.contains("Do NOT delete the borg.db-wal file"),
+            "must warn against deleting the -wal: {msg}"
+        );
+        assert!(
+            msg.contains("NOT been moved aside"),
+            "must state no quarantine happened: {msg}"
+        );
+    }
+
     #[test]
     fn take_recovery_notice_drains_exactly_once() {
         let notice = RecoveryNotice {
@@ -1431,6 +1792,153 @@ mod storage_exhaustion_tests {
                 "errno {errno} classified wrong"
             );
         }
+    }
+
+    /// The transient/durable split that gates the retry wrappers: IOERR (and
+    /// its extended codes, and raw EIO) may be retried; SQLITE_FULL and the
+    /// exhaustion errnos must never be (retrying a full disk just burns time
+    /// before the same fatal verdict).
+    #[cfg(unix)]
+    #[test]
+    fn transient_classifier_splits_ioerr_from_durable_exhaustion() {
+        use super::is_transient_io_error;
+        let sqlite = |code: i32, msg: &str| {
+            anyhow::Error::new(libsql::Error::SqliteFailure(code, msg.to_string()))
+        };
+        let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+            ("SQLITE_IOERR", sqlite(10, "disk I/O error"), true),
+            (
+                "SQLITE_IOERR_FSYNC (extended)",
+                sqlite(1034, "disk I/O error"),
+                true,
+            ),
+            (
+                "codeless Hrana i/o message",
+                sqlite(1, "disk I/O error"),
+                true,
+            ),
+            ("SQLITE_FULL", sqlite(13, "database or disk is full"), false),
+            ("SQLITE_BUSY", sqlite(5, "database is locked"), false),
+            (
+                "ENOSPC",
+                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+                false,
+            ),
+            (
+                "EROFS",
+                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EROFS)),
+                false,
+            ),
+            (
+                "EIO",
+                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO)),
+                true,
+            ),
+        ];
+        for (label, err, want) in cases {
+            assert_eq!(
+                is_transient_io_error(&err),
+                want,
+                "{label} classified wrong"
+            );
+        }
+    }
+
+    /// A one-shot IOERR must not surface: the wrapper retries and the second
+    /// attempt's success wins. Exactly one extra attempt is made — no
+    /// retry-forever, no retry on success.
+    #[tokio::test]
+    async fn transient_ioerr_is_retried_and_recovers() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = super::with_transient_io_retry("test op", || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n == 1 {
+                    Err(anyhow::Error::new(libsql::Error::SqliteFailure(
+                        10,
+                        "disk I/O error".to_string(),
+                    )))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 2, "second attempt's value must be returned");
+        assert_eq!(calls.get(), 2, "exactly one retry for a one-shot IOERR");
+    }
+
+    /// Durable exhaustion is fatal on the FIRST attempt — a full disk gets no
+    /// retries — while a persistent IOERR is retried exactly twice before the
+    /// still-IOERR error (which classifies exhausted) surfaces.
+    #[tokio::test]
+    async fn retry_budget_is_two_for_ioerr_and_zero_for_full() {
+        // SQLITE_FULL: one call, straight out.
+        let calls = std::cell::Cell::new(0u32);
+        let err = super::with_transient_io_retry("test op", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err::<(), _>(anyhow::Error::new(libsql::Error::SqliteFailure(
+                    13,
+                    "database or disk is full".to_string(),
+                )))
+            }
+        })
+        .await
+        .expect_err("SQLITE_FULL must fail");
+        assert_eq!(calls.get(), 1, "durable exhaustion must never be retried");
+        assert!(is_storage_exhausted(&err));
+
+        // Persistent IOERR: 1 initial + 2 retries, then fatal-classifiable.
+        let calls = std::cell::Cell::new(0u32);
+        let err = super::with_transient_io_retry("test op", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err::<(), _>(anyhow::Error::new(libsql::Error::SqliteFailure(
+                    10,
+                    "disk I/O error".to_string(),
+                )))
+            }
+        })
+        .await
+        .expect_err("persistent IOERR must eventually fail");
+        assert_eq!(calls.get(), 3, "1 initial attempt + 2 retries");
+        assert!(
+            is_storage_exhausted(&err),
+            "post-retry IOERR must still classify as fatal exhaustion"
+        );
+    }
+
+    /// The sync wrapper (session auto-save path) shares the same contract:
+    /// retry EIO, recover on success, and pass durable errnos straight out.
+    #[cfg(unix)]
+    #[test]
+    fn sync_wrapper_retries_eio_and_passes_enospc_through() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = super::with_transient_io_retry_sync("test op", || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+                    libc::EIO,
+                )))
+            } else {
+                Ok("saved")
+            }
+        });
+        assert_eq!(out.unwrap(), "saved");
+        assert_eq!(calls.get(), 3, "two EIO failures consume the full budget");
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = super::with_transient_io_retry_sync("test op", || {
+            calls.set(calls.get() + 1);
+            Err::<(), _>(anyhow::Error::new(std::io::Error::from_raw_os_error(
+                libc::ENOSPC,
+            )))
+        })
+        .expect_err("ENOSPC must fail");
+        assert_eq!(calls.get(), 1, "ENOSPC must never be retried");
+        assert!(is_storage_exhausted(&err));
     }
 
     #[test]

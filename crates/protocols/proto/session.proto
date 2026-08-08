@@ -303,6 +303,10 @@ message SessionState {
 message ContextComponent {
   string label = 1;
   uint64 tokens = 2;
+  // True for a child/detail row itemizing part of the nearest preceding
+  // non-detail component (e.g. one skill, or one MCP server). Display-only:
+  // its tokens are already counted in the parent, so totals must skip it.
+  bool detail = 3;
 }
 
 message ContextBreakdown {

@@ -31,7 +31,8 @@ pub use cortex::agent::silence::SILENT_SENTINEL;
 pub(crate) use cortex::agent::silence::is_silent_autonomous as is_silent_response;
 
 /// Apply the model this scheduled run should use: per-task pin, else the
-/// scheduler-fleet default, else the global `llm.model` (left untouched).
+/// `tasks.model` scheduler-fleet default, else the `heartbeat.model`
+/// proactive-fleet default, else the global `llm.model` (left untouched).
 ///
 /// Model and provider resolve as a *unit*. Mixing a task's pinned model with
 /// the fleet's provider would send an id to an endpoint that doesn't serve it —
@@ -50,10 +51,16 @@ pub(crate) use cortex::agent::silence::is_silent_autonomous as is_silent_respons
 fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskRow) -> Config {
     let (model, provider) = match task.model.as_ref() {
         Some(pinned) => (Some(pinned.clone()), task.model_provider.clone()),
-        None => (
-            config.tasks.model.clone(),
-            config.tasks.model_provider.clone(),
-        ),
+        None => match config.tasks.model.clone() {
+            Some(fleet) => (Some(fleet), config.tasks.model_provider.clone()),
+            // `heartbeat.model` carries no provider of its own: it rides the
+            // globally configured provider, so a wrong pairing fails loudly
+            // instead of silently rerouting.
+            None => match config.heartbeat.model.trim() {
+                "" => (None, None),
+                hb => (Some(hb.to_string()), None),
+            },
+        },
     };
     let Some(model) = model else {
         return config;
@@ -119,6 +126,8 @@ pub async fn spawn_task_execution(
     let pre_run_command = task.pre_run_command.clone();
     let pre_run_cwd = task.pre_run_cwd.clone();
     let pre_run_timeout_ms = task.pre_run_timeout_ms;
+    let monitor_mode = task.monitor_mode;
+    let last_pre_run_hash = task.last_pre_run_hash.clone();
 
     tokio::spawn(async move {
         // Liveness registration for the wedged-run recovery sweep: while
@@ -127,6 +136,48 @@ pub async fn spawn_task_execution(
         // RAII — the id deregisters when this task ends, including via
         // panic unwind or tokio's task-boundary panic catch.
         let _live_guard = cortex::tasks::LiveRunGuard::register(run_id);
+        // Emergency stop (`borg pause`): the dispatcher gate normally stops
+        // runs from being claimed at all, but a run can reach here through
+        // the claim-vs-pause race window or the orchestrator path. This run
+        // is already claimed (its `next_run` has advanced), so "defer, don't
+        // lose" here means holding the run — LiveRunGuard keeps the wedged-
+        // run sweep off it — until the operator resumes, then executing.
+        {
+            let mut logged = false;
+            loop {
+                let paused = match cortex::db::Database::open().await {
+                    Ok(db) => cortex::emergency_pause::is_engaged(&db).await,
+                    Err(e) => {
+                        // Fail safe: an unreadable flag defers the run.
+                        tracing::warn!(
+                            task = %task_name,
+                            error = %e,
+                            "emergency-pause check could not open DB — deferring run"
+                        );
+                        true
+                    }
+                };
+                if !paused {
+                    break;
+                }
+                if !logged {
+                    logged = true;
+                    tracing::warn!(
+                        task = %task_name,
+                        run_id,
+                        "emergency pause engaged — holding claimed run until `borg resume`"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            if logged {
+                tracing::info!(
+                    task = %task_name,
+                    run_id,
+                    "emergency pause released — executing held run"
+                );
+            }
+        }
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
@@ -172,6 +223,8 @@ pub async fn spawn_task_execution(
             pre_run_command,
             pre_run_cwd,
             pre_run_timeout_ms,
+            monitor_mode,
+            last_pre_run_hash,
             executor,
         };
 
@@ -249,6 +302,47 @@ pub async fn spawn_task_execution(
 /// the run. The row is truthful — the run *completed*, doing exactly what
 /// the gate asked: nothing.
 pub(crate) const WAKE_GATE_SKIP_RESULT: &str = "skipped by wake gate (pre_run wakeAgent=false)";
+
+/// `task_runs.result` marker recorded when monitor mode suppressed the run
+/// because the pre-run output was byte-identical to the stored baseline. The
+/// run *completed* successfully — the correct action was to do nothing.
+pub(crate) const MONITOR_NO_CHANGE_RESULT: &str =
+    "no_change (monitor_mode: pre_run output unchanged)";
+
+/// Decision for a monitor-mode task after its `pre_run_command` ran.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MonitorGate {
+    /// Output hashes identically to the stored baseline — skip the LLM turn
+    /// and record the run as a no-change completion.
+    SkipUnchanged,
+    /// First run (no baseline) or output changed — run the LLM turn, then
+    /// persist this hash as the new baseline once the turn succeeds.
+    RunAndStore(String),
+    /// Monitor mode off, or the pre-run failed — run normally and leave the
+    /// stored baseline untouched. A failed probe is *not* a change: treating
+    /// it as one would rebaseline onto garbage and swallow the next real
+    /// change.
+    RunKeepBaseline,
+}
+
+/// Evaluate the monitor-mode gate for a pre-run outcome. Pure so the
+/// change/no-change/first-run/failure decision table is directly testable.
+pub(crate) fn evaluate_monitor_gate(
+    monitor_mode: bool,
+    pre_run_success: bool,
+    stdout: &str,
+    baseline: Option<&str>,
+) -> MonitorGate {
+    if !monitor_mode || !pre_run_success {
+        return MonitorGate::RunKeepBaseline;
+    }
+    let new_hash = response_hash(stdout);
+    if baseline == Some(new_hash.as_str()) {
+        MonitorGate::SkipUnchanged
+    } else {
+        MonitorGate::RunAndStore(new_hash)
+    }
+}
 
 /// Decision extracted from the last line of a `pre_run_command`'s stdout.
 #[derive(Debug, PartialEq, Eq)]
@@ -513,6 +607,11 @@ struct TaskExecContext {
     pre_run_command: Option<String>,
     pre_run_cwd: Option<String>,
     pre_run_timeout_ms: i64,
+    /// Monitor mode: skip the LLM turn when the successful pre-run output
+    /// hashes identically to `last_pre_run_hash`. See `ScheduledTaskRow`.
+    monitor_mode: bool,
+    /// Stored baseline hash of the last pre-run output that reached the LLM.
+    last_pre_run_hash: Option<String>,
     /// Session executor for agentic turns (heartbeat remediation). `None` on
     /// paths that only run cheap tool-less tasks (tests, manual triggers).
     executor: Option<Arc<DaemonSessionExecutor>>,
@@ -628,6 +727,8 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         pre_run_command: _,
         pre_run_cwd: _,
         pre_run_timeout_ms: _,
+        monitor_mode: _,
+        last_pre_run_hash: _,
         executor: _,
     } = ctx;
     let cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -895,6 +996,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         pre_run_command,
         pre_run_cwd,
         pre_run_timeout_ms,
+        monitor_mode,
+        last_pre_run_hash,
         executor: _,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
@@ -915,6 +1018,11 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     // status + stderr) is injected as <preprocessed_context> ahead of the
     // user prompt so the model reasons over deterministic data instead of
     // attempting to fetch/parse it itself.
+    // Set when monitor mode decided this run should execute: the new baseline
+    // hash to persist once the LLM turn succeeds. Persisting only on success
+    // means a failed/timed-out turn re-fires on the same (still-changed)
+    // output instead of silently swallowing the change.
+    let mut pending_pre_run_hash: Option<String> = None;
     let user_msg = if let Some(cmd) = pre_run_command.as_deref() {
         let mut outcome =
             run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms, config).await;
@@ -961,7 +1069,62 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                 WakeGate::Absent => {}
             }
         }
-        format!("{}{task_prompt}", render_pre_run_block(&outcome))
+        // Monitor gate: hash the (post-wake-gate) stdout that would reach the
+        // LLM and compare against the stored baseline. Runs after the wake
+        // gate so a stripped control line can't churn the hash. A failed
+        // pre-run never consults or moves the baseline.
+        let mut change_note = "";
+        match evaluate_monitor_gate(
+            *monitor_mode,
+            outcome.success,
+            &outcome.stdout,
+            last_pre_run_hash.as_deref(),
+        ) {
+            MonitorGate::SkipUnchanged => {
+                tracing::debug!(
+                    task = %task_name,
+                    run_id,
+                    "monitor mode: pre_run output unchanged — skipping LLM turn"
+                );
+                let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+                match cortex::db::Database::open().await {
+                    Ok(db) => {
+                        if let Err(e) = db
+                            .complete_task_run(
+                                *run_id,
+                                duration_ms,
+                                Some(MONITOR_NO_CHANGE_RESULT),
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Task '{task_name}': failed to record monitor no-change run: {e}"
+                            );
+                        }
+                        if let Err(e) = db.clear_task_retry(task_id).await {
+                            tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Task '{task_name}': DB open failed at monitor skip: {e}")
+                    }
+                }
+                return;
+            }
+            MonitorGate::RunAndStore(new_hash) => {
+                if last_pre_run_hash.is_some() {
+                    change_note = "<monitor_note>pre_run output changed since the \
+                                   previous monitored run</monitor_note>\n";
+                }
+                pending_pre_run_hash = Some(new_hash);
+            }
+            MonitorGate::RunKeepBaseline => {}
+        }
+        format!(
+            "{change_note}{}{task_prompt}",
+            render_pre_run_block(&outcome)
+        )
     } else {
         task_prompt.clone()
     };
@@ -1017,6 +1180,15 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                     }
                     if let Err(e) = db.clear_task_retry(task_id).await {
                         tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                    }
+                    // Monitor mode: the turn succeeded on changed output —
+                    // this hash is now the baseline future runs dedup against.
+                    if let Some(h) = pending_pre_run_hash.as_deref() {
+                        if let Err(e) = db.update_task_pre_run_hash(task_id, Some(h)).await {
+                            tracing::warn!(
+                                "Task '{task_name}': failed to persist pre_run baseline hash: {e}"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -1775,6 +1947,73 @@ pub async fn deliver_celebration_to_channels(
 }
 
 #[cfg(test)]
+mod monitor_gate_tests {
+    use super::*;
+
+    /// Spec (monitor-mode): unchanged successful output → skip the turn;
+    /// first run or changed output → run and rebaseline; monitor off or a
+    /// failed pre-run → run normally with the baseline untouched. A failure
+    /// must never count as a change — rebaselining onto a probe error would
+    /// swallow the next real change.
+    #[test]
+    fn monitor_gate_decision_table() {
+        let baseline = response_hash("stable output");
+
+        // (monitor, success, stdout, baseline) → expected
+        let cases: &[(bool, bool, &str, Option<&str>, MonitorGate)] = &[
+            // Unchanged output with a stored baseline: skip.
+            (
+                true,
+                true,
+                "stable output",
+                Some(baseline.as_str()),
+                MonitorGate::SkipUnchanged,
+            ),
+            // Changed output: run and store the new hash.
+            (
+                true,
+                true,
+                "different output",
+                Some(baseline.as_str()),
+                MonitorGate::RunAndStore(response_hash("different output")),
+            ),
+            // First run (no baseline): always run, store the baseline.
+            (
+                true,
+                true,
+                "stable output",
+                None,
+                MonitorGate::RunAndStore(baseline.clone()),
+            ),
+            // Pre-run failure: never a change, baseline untouched — even if
+            // the (empty) failure stdout would hash differently.
+            (
+                true,
+                false,
+                "",
+                Some(baseline.as_str()),
+                MonitorGate::RunKeepBaseline,
+            ),
+            // Monitor off: identical output still runs.
+            (
+                false,
+                true,
+                "stable output",
+                Some(baseline.as_str()),
+                MonitorGate::RunKeepBaseline,
+            ),
+        ];
+        for (monitor, success, stdout, base, expected) in cases {
+            assert_eq!(
+                &evaluate_monitor_gate(*monitor, *success, stdout, *base),
+                expected,
+                "monitor={monitor} success={success} stdout={stdout:?} baseline={base:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod scheduled_model_tests {
     use super::*;
 
@@ -1806,6 +2045,8 @@ mod scheduled_model_tests {
             last_response_hash: None,
             model: model.map(str::to_string),
             model_provider: provider.map(str::to_string),
+            monitor_mode: false,
+            last_pre_run_hash: None,
         }
     }
 
@@ -1841,6 +2082,54 @@ mod scheduled_model_tests {
                 .model,
             "chat-model",
             "with nothing pinned the run must follow the global model"
+        );
+    }
+
+    /// `heartbeat.model` is the user-owned fleet default for proactive runs:
+    /// it applies only when neither a per-task pin nor `tasks.model` is set,
+    /// empty means inherit, and it never overrides the provider.
+    #[test]
+    fn heartbeat_model_slots_between_fleet_and_global() {
+        // Default (empty) inherits the global model.
+        assert_eq!(
+            resolve_scheduled_model(config_with("chat-model", None), &task_with_pin(None, None))
+                .llm
+                .model,
+            "chat-model"
+        );
+
+        // Non-empty heartbeat.model wins over global when nothing else is set,
+        // and rides the configured provider unchanged.
+        let mut hb = config_with("chat-model", None);
+        hb.heartbeat.model = "cheap-model".to_string();
+        let resolved = resolve_scheduled_model(hb, &task_with_pin(None, None));
+        assert_eq!(resolved.llm.model, "cheap-model");
+        assert_eq!(resolved.llm.provider.as_deref(), Some("openrouter"));
+
+        // Whitespace-only is empty: inherit, don't send "  " as a model id.
+        let mut blank = config_with("chat-model", None);
+        blank.heartbeat.model = "   ".to_string();
+        assert_eq!(
+            resolve_scheduled_model(blank, &task_with_pin(None, None))
+                .llm
+                .model,
+            "chat-model"
+        );
+
+        // tasks.model outranks heartbeat.model; a per-task pin outranks both.
+        let mut both = config_with("chat-model", Some("fleet-model"));
+        both.heartbeat.model = "cheap-model".to_string();
+        assert_eq!(
+            resolve_scheduled_model(both.clone(), &task_with_pin(None, None))
+                .llm
+                .model,
+            "fleet-model"
+        );
+        assert_eq!(
+            resolve_scheduled_model(both, &task_with_pin(Some("pinned"), None))
+                .llm
+                .model,
+            "pinned"
         );
     }
 

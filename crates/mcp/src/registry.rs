@@ -225,6 +225,28 @@ impl McpRegistry {
             }
         }
 
+        // Pre-pass: count how many *distinct* raw names in this batch sanitize
+        // to each namespaced name. When two raw names (e.g. `read-file` and
+        // `read_file`) collapse to one sanitized name, first-wins registration
+        // would let the model call an ambiguous name that silently routes to
+        // an arbitrarily-chosen handler. Fail closed instead: every member of
+        // an ambiguous group is skipped, so the ambiguous name is never
+        // registered at all. Filtered-out tools don't participate — they can
+        // never register, so a lone admitted survivor is unambiguous.
+        let mut sanitized_claims: BTreeMap<String, std::collections::BTreeSet<&str>> =
+            BTreeMap::new();
+        for tool in discovered {
+            if !filter.admits(&tool.name) {
+                continue;
+            }
+            if let Some(full) = sanitize_full_name(server, &tool.name) {
+                sanitized_claims
+                    .entry(full)
+                    .or_default()
+                    .insert(tool.name.as_str());
+            }
+        }
+
         // Track how many we've already accepted for this server in this call.
         let mut accepted_for_server: usize = 0;
         let mut registered_names: Vec<String> = Vec::new();
@@ -265,7 +287,12 @@ impl McpRegistry {
                 }
             };
 
-            if builtin_names.iter().any(|b| *b == full_name) || inner.tools.contains_key(&full_name)
+            let ambiguous_in_batch = sanitized_claims
+                .get(&full_name)
+                .is_some_and(|raw_names| raw_names.len() >= 2);
+            if ambiguous_in_batch
+                || builtin_names.iter().any(|b| *b == full_name)
+                || inner.tools.contains_key(&full_name)
             {
                 outcomes.push(ToolRegistrationOutcome::Collision {
                     original: tool.name.clone(),
@@ -286,7 +313,7 @@ impl McpRegistry {
             // one bad key anywhere in the tools array 400s the entire LLM
             // request. The reverse map restores wire names at dispatch.
             let mut input_schema = tool.input_schema.clone();
-            let arg_renames = sanitize_property_keys(&mut input_schema);
+            let arg_renames = sanitize_property_keys(&mut input_schema, &tool.name);
             if !arg_renames.is_empty() {
                 tracing::warn!(
                     server = %server,
@@ -547,13 +574,18 @@ fn property_key_conforms(key: &str) -> bool {
 /// - every non-conforming char → `_`
 /// - truncate to 64 chars
 /// - collisions deduped with a numeric `_2`/`_3`… suffix in schema order
-/// - `required` arrays remapped alongside their sibling `properties`
+/// - `required` arrays remapped alongside their sibling `properties`, as are
+///   `dependentRequired` (keys + value name lists) and `dependentSchemas`
+///   (keys) property references
 /// - nested schemas (`properties`, `items`, `additionalProperties`, …) are
 ///   walked recursively
 ///
 /// Returns the reverse map (sanitized → original). Empty when the schema was
 /// already clean — the schema is then byte-identical to its input.
-pub fn sanitize_property_keys(schema: &mut Value) -> BTreeMap<String, String> {
+///
+/// `tool` is used only for log attribution when a remapped
+/// `dependentRequired`/`dependentSchemas` key collides with an existing key.
+pub fn sanitize_property_keys(schema: &mut Value, tool: &str) -> BTreeMap<String, String> {
     let mut renames = BTreeMap::new();
     // One `taken` set for the WHOLE schema, pre-seeded with every conforming
     // property key at every nesting level. `unrename_tool_args` applies the
@@ -565,7 +597,7 @@ pub fn sanitize_property_keys(schema: &mut Value) -> BTreeMap<String, String> {
     // arguments at dispatch.
     let mut taken = std::collections::BTreeSet::new();
     collect_conforming_property_keys(schema, &mut taken);
-    sanitize_property_keys_inner(schema, &mut renames, &mut taken);
+    sanitize_property_keys_inner(schema, &mut renames, &mut taken, tool);
     renames
 }
 
@@ -598,13 +630,14 @@ fn sanitize_property_keys_inner(
     value: &mut Value,
     renames: &mut BTreeMap<String, String>,
     taken: &mut std::collections::BTreeSet<String>,
+    tool: &str,
 ) {
     let Value::Object(obj) = value else {
         // Arrays of schemas (`oneOf`, `anyOf`, tuple `items`) are handled by
         // the recursion below via their owning object.
         if let Value::Array(items) = value {
             for item in items {
-                sanitize_property_keys_inner(item, renames, taken);
+                sanitize_property_keys_inner(item, renames, taken, tool);
             }
         }
         return;
@@ -639,6 +672,62 @@ fn sanitize_property_keys_inner(
                 }
             }
         }
+
+        // `dependentRequired` / `dependentSchemas` reference sibling property
+        // names too — a rename that skips them leaves keywords pointing at
+        // names that no longer exist (the provider then 400s or silently
+        // drops the constraint). `dependentRequired` keys AND the names in
+        // its value lists are property references; its values are string
+        // lists, NOT schemas, so they must not be recursed into as schemas.
+        // `dependentSchemas` keys are property references; its values are
+        // schemas and are covered by the generic recursion below.
+        let remap = |name: &str| -> Option<String> {
+            local
+                .iter()
+                .find(|(old, _)| old == name)
+                .map(|(_, renamed)| renamed.clone())
+        };
+        if let Some(Value::Object(dep_req)) = obj.get_mut("dependentRequired") {
+            let entries: Vec<(String, Value)> = std::mem::take(dep_req).into_iter().collect();
+            for (key, mut val) in entries {
+                if let Value::Array(names) = &mut val {
+                    for entry in names {
+                        if let Value::String(name) = entry {
+                            if let Some(renamed) = remap(name) {
+                                *name = renamed;
+                            }
+                        }
+                    }
+                }
+                let key = remap(&key).unwrap_or(key);
+                if dep_req.contains_key(&key) {
+                    // A remapped key landing on an existing one loses a
+                    // constraint — surface it rather than dropping silently.
+                    tracing::warn!(
+                        tool = %tool,
+                        key = %key,
+                        "dependentRequired key remap collided with an existing key; \
+                         the earlier entry is overwritten",
+                    );
+                }
+                dep_req.insert(key, val);
+            }
+        }
+        if let Some(Value::Object(dep_schemas)) = obj.get_mut("dependentSchemas") {
+            let entries: Vec<(String, Value)> = std::mem::take(dep_schemas).into_iter().collect();
+            for (key, val) in entries {
+                let key = remap(&key).unwrap_or(key);
+                if dep_schemas.contains_key(&key) {
+                    tracing::warn!(
+                        tool = %tool,
+                        key = %key,
+                        "dependentSchemas key remap collided with an existing key; \
+                         the earlier entry is overwritten",
+                    );
+                }
+                dep_schemas.insert(key, val);
+            }
+        }
     }
 
     // Recurse into every nested value. This covers `properties` values,
@@ -646,7 +735,7 @@ fn sanitize_property_keys_inner(
     // anything else carrying sub-schemas — renaming only ever happens at a
     // `properties` map, so visiting non-schema values is harmless.
     for (_, v) in obj.iter_mut() {
-        sanitize_property_keys_inner(v, renames, taken);
+        sanitize_property_keys_inner(v, renames, taken, tool);
     }
 }
 
@@ -983,6 +1072,79 @@ mod tests {
         assert!(reg.tools().is_empty());
     }
 
+    /// Confused-deputy guard: when two distinct raw names from the same
+    /// server sanitize to one registry name, the model would be calling an
+    /// ambiguous name that routes to an arbitrarily-chosen handler. The
+    /// whole ambiguous group must fail closed — no member registers, every
+    /// member reports a collision — while unique names in the same batch
+    /// register normally.
+    #[test]
+    fn ambiguous_sanitized_names_fail_closed_both_ways() {
+        struct Case {
+            name: &'static str,
+            raw_names: &'static [&'static str],
+            expect_registered: &'static [&'static str],
+            expect_collisions: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                name: "two raw names collapse to one sanitized name",
+                raw_names: &["read-file", "read_file"],
+                expect_registered: &[],
+                expect_collisions: &["read-file", "read_file"],
+            },
+            Case {
+                name: "three-way collapse skips all members",
+                raw_names: &["read-file", "read_file", "read.file"],
+                expect_registered: &[],
+                expect_collisions: &["read-file", "read_file", "read.file"],
+            },
+            Case {
+                name: "control: unique names all register",
+                raw_names: &["read_file", "write_file"],
+                expect_registered: &["mcp_fs_read_file", "mcp_fs_write_file"],
+                expect_collisions: &[],
+            },
+            Case {
+                name: "ambiguous group does not poison unrelated unique name",
+                raw_names: &["read-file", "read_file", "write_file"],
+                expect_registered: &["mcp_fs_write_file"],
+                expect_collisions: &["read-file", "read_file"],
+            },
+        ];
+        for case in cases {
+            let reg = McpRegistry::new();
+            let tools: Vec<McpToolSchema> = case
+                .raw_names
+                .iter()
+                .map(|n| McpToolSchema {
+                    name: (*n).into(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                    annotations: None,
+                })
+                .collect();
+            let outcomes = reg.replace_server_tools("fs", &tools, &ToolFilter::default(), &[]);
+
+            let registered: Vec<_> = reg.tools().into_iter().map(|t| t.full_name).collect();
+            assert_eq!(
+                registered, case.expect_registered,
+                "case `{}`: registered set mismatch",
+                case.name
+            );
+            for raw in case.expect_collisions {
+                assert!(
+                    outcomes.iter().any(|o| matches!(
+                        o,
+                        ToolRegistrationOutcome::Collision { original, .. } if original == raw
+                    )),
+                    "case `{}`: expected collision outcome for `{raw}`, got {outcomes:?}",
+                    case.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn replace_full_drops_previous() {
         // tools/list_changed semantics: a fresh list fully replaces the
@@ -1158,7 +1320,7 @@ mod tests {
             },
             "required": ["issue_class~neq", "clean_key"],
         });
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
 
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("issue_class_neq"));
@@ -1195,7 +1357,7 @@ mod tests {
                 "key?": {"type": "string"},
             },
         });
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
         let props = schema["properties"].as_object().unwrap();
 
         // Both long keys truncate to the same 64-char stem; the collision is
@@ -1216,7 +1378,7 @@ mod tests {
                 "key?": {"type": "string"},
             },
         });
-        let renames2 = sanitize_property_keys(&mut schema2);
+        let renames2 = sanitize_property_keys(&mut schema2, "test_tool");
         assert_eq!(schema, schema2);
         assert_eq!(renames, renames2);
     }
@@ -1240,7 +1402,7 @@ mod tests {
                 },
             },
         });
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
         assert!(schema["properties"]["filters"]["properties"]
             .as_object()
             .unwrap()
@@ -1280,7 +1442,7 @@ mod tests {
                 },
             },
         });
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
 
         let top = schema["properties"].as_object().unwrap();
         let nested = schema["properties"]["nested"]["properties"]
@@ -1313,6 +1475,117 @@ mod tests {
         );
     }
 
+    /// JSON Schema 2020-12 `dependentRequired` and `dependentSchemas`
+    /// reference property names; after a rename those references must be
+    /// remapped or the provider 400s / silently drops the constraint.
+    /// `dependentRequired` values are string lists (NOT schemas) and must
+    /// be remapped as name references, not recursed into.
+    #[test]
+    fn sanitize_property_keys_remaps_dependent_keywords() {
+        struct Case {
+            name: &'static str,
+            input: Value,
+            expected: Value,
+        }
+        let cases = [
+            Case {
+                name: "dependentRequired keys and value lists follow the rename",
+                input: json!({
+                    "type": "object",
+                    "properties": {
+                        "credit~card": {"type": "string"},
+                        "billing_address": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "credit~card": ["billing_address"],
+                        "billing_address": ["credit~card"]
+                    }
+                }),
+                expected: json!({
+                    "type": "object",
+                    "properties": {
+                        "credit_card": {"type": "string"},
+                        "billing_address": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "credit_card": ["billing_address"],
+                        "billing_address": ["credit_card"]
+                    }
+                }),
+            },
+            Case {
+                name: "dependentSchemas keys follow the rename; values recurse as schemas",
+                input: json!({
+                    "type": "object",
+                    "properties": {
+                        "issue~class": {"type": "string"}
+                    },
+                    "dependentSchemas": {
+                        "issue~class": {
+                            "properties": {"nested~bad": {"type": "string"}},
+                            "required": ["nested~bad"]
+                        }
+                    }
+                }),
+                expected: json!({
+                    "type": "object",
+                    "properties": {
+                        "issue_class": {"type": "string"}
+                    },
+                    "dependentSchemas": {
+                        "issue_class": {
+                            "properties": {"nested_bad": {"type": "string"}},
+                            "required": ["nested_bad"]
+                        }
+                    }
+                }),
+            },
+            Case {
+                name: "dependent entries for untouched keys stay untouched",
+                input: json!({
+                    "type": "object",
+                    "properties": {
+                        "bad~one": {"type": "string"},
+                        "clean": {"type": "string"},
+                        "other": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "clean": ["other"]
+                    },
+                    "dependentSchemas": {
+                        "clean": {"required": ["other"]}
+                    }
+                }),
+                expected: json!({
+                    "type": "object",
+                    "properties": {
+                        "bad_one": {"type": "string"},
+                        "clean": {"type": "string"},
+                        "other": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "clean": ["other"]
+                    },
+                    "dependentSchemas": {
+                        "clean": {"required": ["other"]}
+                    }
+                }),
+            },
+        ];
+        for case in cases {
+            let mut schema = case.input.clone();
+            let renames = sanitize_property_keys(&mut schema, "test_tool");
+            assert_eq!(
+                schema, case.expected,
+                "case `{}`: dependent keywords not consistently remapped",
+                case.name
+            );
+            for (renamed, original) in &renames {
+                assert_ne!(renamed, original, "case `{}`: no-op rename", case.name);
+            }
+        }
+    }
+
     #[test]
     fn sanitize_property_keys_clean_schema_is_untouched() {
         let original = json!({
@@ -1325,7 +1598,7 @@ mod tests {
             "required": ["name"],
         });
         let mut schema = original.clone();
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
         assert!(renames.is_empty());
         assert_eq!(schema, original, "clean schema must be byte-identical");
     }
@@ -1342,7 +1615,7 @@ mod tests {
                 },
             },
         });
-        let renames = sanitize_property_keys(&mut schema);
+        let renames = sanitize_property_keys(&mut schema, "test_tool");
 
         // Model calls with the sanitized names it was shown, at any depth.
         let mut args = json!({

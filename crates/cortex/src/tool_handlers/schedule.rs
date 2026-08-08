@@ -5,7 +5,8 @@ use crate::db::Database;
 use crate::tasks;
 
 use super::{
-    optional_i64_param, optional_str_param, optional_u64_param, require_str_param, with_db,
+    optional_bool_param, optional_i64_param, optional_str_param, optional_u64_param,
+    require_str_param, with_db,
 };
 
 /// Unified schedule handler: dispatches to manage_tasks or manage_cron based on `type` field.
@@ -215,6 +216,16 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
     let max_retries = optional_i64_param(args, "max_retries").map(|v| v as i32);
     let timeout_ms = optional_i64_param(args, "timeout_ms");
     let allowed_tools = optional_str_param(args, "allowed_tools").map(str::to_string);
+    // Monitor mode dedups on the pre_run output hash — without a
+    // pre_run_command there is nothing to hash and every run would fire,
+    // so refuse at create time instead of persisting a no-op flag.
+    let monitor_mode = optional_bool_param(args, "monitor_mode", false);
+    if monitor_mode && pre_run_command.is_none() {
+        return Ok(
+            "Error: monitor_mode requires a pre_run_command (its output hash decides whether the run fires)."
+                .to_string(),
+        );
+    }
     with_db(move |db| async move {
         match db
             .create_task(&crate::db::NewTask {
@@ -238,10 +249,22 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
             })
             .await
         {
-            Ok(()) => Ok(format!(
-                "Scheduled task created: {task_name} (id: {})",
-                &id[..8]
-            )),
+            Ok(()) => {
+                if monitor_mode {
+                    if let Err(e) = db.set_task_monitor_mode(&id, true).await {
+                        // The row exists but the flag didn't land — surface it
+                        // rather than reporting a monitor job that isn't one.
+                        return Ok(format!(
+                            "Error: task {id} created but enabling monitor_mode failed: {e}. \
+                             Retry with action='update'."
+                        ));
+                    }
+                }
+                Ok(format!(
+                    "Scheduled task created: {task_name} (id: {})",
+                    &id[..8]
+                ))
+            }
             Err(e) => Ok(format!("Error creating task: {e}")),
         }
     })
@@ -329,7 +352,25 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
             return Ok(validation);
         }
     }
+    let monitor_mode = args
+        .get("monitor_mode")
+        .and_then(serde_json::Value::as_bool);
     with_db(move |db| async move {
+        // Enabling monitor_mode only makes sense on a task with a
+        // pre_run_command — its output hash is what decides whether the run
+        // fires. Check before mutating anything.
+        if monitor_mode == Some(true) {
+            match db.get_task_by_id(&task_id).await {
+                Ok(Some(existing)) if existing.pre_run_command.is_none() => {
+                    return Ok(format!(
+                        "Error: monitor_mode requires a pre_run_command, and task {task_id} has none."
+                    ));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(format!("Task {task_id} not found.")),
+                Err(e) => return Ok(format!("Error: {e}")),
+            }
+        }
         let update = crate::db::UpdateTask {
             name: name.as_deref(),
             prompt: prompt.as_deref(),
@@ -338,7 +379,24 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
             timezone: timezone.as_deref(),
         };
         match db.update_task(&task_id, &update).await {
-            Ok(true) => Ok(format!("Task {task_id} updated.")),
+            Ok(true) => {
+                if let Some(m) = monitor_mode {
+                    if let Err(e) = db.set_task_monitor_mode(&task_id, m).await {
+                        return Ok(format!(
+                            "Error: task {task_id} updated but setting monitor_mode failed: {e}"
+                        ));
+                    }
+                    // Toggling monitor mode invalidates the old baseline:
+                    // clear it so the next monitored run re-baselines instead
+                    // of dedup-ing against a hash from a different regime.
+                    if let Err(e) = db.update_task_pre_run_hash(&task_id, None).await {
+                        return Ok(format!(
+                            "Error: task {task_id} updated but clearing the monitor baseline failed: {e}"
+                        ));
+                    }
+                }
+                Ok(format!("Task {task_id} updated."))
+            }
             Ok(false) => Ok(format!("Task {task_id} not found.")),
             Err(e) => Ok(format!("Error: {e}")),
         }
@@ -699,6 +757,28 @@ mod tests {
                 "expected a refusal for {cmd:?}, got: {out}"
             );
         }
+    }
+
+    /// Monitor mode dedups on the pre_run output hash; without a
+    /// pre_run_command there is nothing to hash and the flag is a silent
+    /// no-op. Refuse before `with_db` — no DB needed, and its absence is
+    /// itself the assertion that no row was created.
+    #[tokio::test]
+    async fn manage_tasks_create_refuses_monitor_mode_without_pre_run() {
+        let args = serde_json::json!({
+            "name": "watch",
+            "prompt": "report",
+            "schedule_type": "interval",
+            "schedule_expr": "5m",
+            "monitor_mode": true,
+        });
+        let out = manage_tasks_create(&args, &Config::default())
+            .await
+            .expect("handler returns Ok with an error string");
+        assert!(
+            out.starts_with("Error: monitor_mode requires a pre_run_command"),
+            "monitor_mode without a pre_run_command must be refused, got: {out}"
+        );
     }
 
     #[tokio::test]

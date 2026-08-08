@@ -68,11 +68,15 @@ impl GoogleChatClient {
                 resp.status()
             );
         }
-        Ok(resp
-            .bytes()
-            .await
-            .context("google_chat: read body")?
-            .to_vec())
+        // Streamed read with a running cap — Content-Length can lie or be
+        // absent, so the ceiling is enforced chunk-by-chunk while streaming.
+        cortex::media::read_body_capped(
+            resp,
+            crate::constants::ATTACHMENT_DOWNLOAD_MAX_BYTES,
+            "Google Chat attachment",
+        )
+        .await
+        .context("google_chat: read body")
     }
 
     /// Send a message to a Google Chat space, automatically chunking at 4096 chars.

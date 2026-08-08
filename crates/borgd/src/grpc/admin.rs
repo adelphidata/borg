@@ -320,6 +320,14 @@ impl Admin for AdminSvc {
                 if r.archived_at.is_some() && !live.contains(&r.id) {
                     continue;
                 }
+                // The page budget must never hide a pin: once 100 rows are
+                // taken, only pinned sessions may still join. `list_sessions`
+                // guarantees pinned rows are present past the recency window;
+                // dropping them here would recreate the vanishing-pin bug one
+                // layer up.
+                if sessions.len() >= 100 && !r.pinned {
+                    continue;
+                }
                 let count = db.count_session_messages(&r.id).await.unwrap_or(0);
                 let mut title = r.title.clone();
                 if live.contains(&r.id) && !title.contains("(live)") {
@@ -330,10 +338,8 @@ impl Admin for AdminSvc {
                     title,
                     message_count: count as u64,
                     updated_unix_ts: r.updated_at as u64,
+                    pinned: r.pinned,
                 });
-                if sessions.len() == 100 {
-                    break;
-                }
             }
             anyhow::Ok(sessions)
         }

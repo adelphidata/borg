@@ -642,7 +642,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let services = grpc::build_services_with_extras(
-        registry,
+        registry.clone(),
         factory,
         capability_router,
         cost_event_bus.clone(),
@@ -774,6 +774,23 @@ pub async fn run(cfg: Config) -> Result<()> {
             })
             .await
             .context("UDS server")?;
+    }
+
+    // Drain-then-finalize. The transports above have stopped, but gateway- and
+    // heartbeat-driven turns run on spawned tasks that no listener waits for —
+    // returning now would drop them mid-stream (losing the turn's tail) and
+    // skip every session's end-of-session work (short-term-memory flush, lease
+    // release). Wait bounded for in-flight turns to settle, THEN close every
+    // live host; a turn still running at the ceiling is cancelled, which
+    // persists its partial tail before the backend finalizes.
+    let closed = registry
+        .shutdown_close_all(
+            crate::session::SHUTDOWN_DRAIN_TIMEOUT,
+            crate::session::SHUTDOWN_DRAIN_POLL,
+        )
+        .await;
+    if closed > 0 {
+        tracing::info!(closed, "session hosts finalized at shutdown");
     }
 
     // `_lifecycle` drop records the shutdown counter as this scope unwinds.

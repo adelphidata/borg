@@ -79,8 +79,10 @@ enum HookHandlerConfig {
     },
 }
 
-// Claude Code-compatible event names; keep in sync if HookPoint variants change.
-const EVENT_NAMES: &[(&str, HookPoint)] = &[
+// hooks.json-compatible event names; keep in sync if HookPoint variants change.
+// Shared with `hooks::webhook` so webhook `events` filters use the same
+// vocabulary as `~/.borg/hooks.json`.
+pub(crate) const EVENT_NAMES: &[(&str, HookPoint)] = &[
     ("SessionStart", HookPoint::SessionStart),
     ("SessionEnd", HookPoint::SessionEnd),
     ("UserPromptSubmit", HookPoint::BeforeAgentStart),
@@ -89,14 +91,14 @@ const EVENT_NAMES: &[(&str, HookPoint)] = &[
     ("Stop", HookPoint::TurnComplete),
 ];
 
-fn parse_event_name(s: &str) -> Option<HookPoint> {
+pub(crate) fn parse_event_name(s: &str) -> Option<HookPoint> {
     EVENT_NAMES
         .iter()
         .find(|(name, _)| *name == s)
         .map(|(_, point)| *point)
 }
 
-fn event_name_for_point(point: HookPoint) -> &'static str {
+pub(crate) fn event_name_for_point(point: HookPoint) -> &'static str {
     EVENT_NAMES
         .iter()
         .find(|(_, p)| *p == point)

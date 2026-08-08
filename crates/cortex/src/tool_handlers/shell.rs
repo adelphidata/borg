@@ -130,6 +130,11 @@ fn resolved_shell_output_cap(config: &Config) -> usize {
 }
 
 /// Read stdout/stderr from a child process line-by-line, emitting `ToolOutputDelta` events.
+///
+/// `suppress_deltas` disables the live streaming entirely: the final buffered
+/// output is still returned. Used when the command reads a blocked env file —
+/// the final result goes through [`mask_env_assignments`], but a raw delta
+/// would have already carried the unmasked secret to TUI/gRPC/ACP streams.
 async fn stream_child_output(
     child: &mut tokio::process::Child,
     timeout: Duration,
@@ -137,6 +142,7 @@ async fn stream_child_output(
     tool_call_id: &str,
     tool_name: &str,
     max_output_bytes: usize,
+    suppress_deltas: bool,
 ) -> Result<(String, String, Option<i32>)> {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -145,6 +151,11 @@ async fn stream_child_output(
     // other, and neither can grow without limit.
     let mut stdout_buf = HeadTailBuffer::new(max_output_bytes);
     let mut stderr_buf = HeadTailBuffer::new(max_output_bytes);
+    // Streaming deltas decode incrementally so a multibyte char split across a
+    // read boundary doesn't render as two U+FFFD. The buffers above keep raw
+    // bytes and decode once at the end, so they don't need this.
+    let mut stdout_decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
+    let mut stderr_decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
 
     let streaming_future = async {
         let mut stdout_pipe = stdout_pipe;
@@ -171,12 +182,15 @@ async fn stream_child_output(
                         Ok(n) => {
                             // Best-effort streaming delta: a full/closed channel just means no
                             // live listener — the final buffered output is still returned below.
-                            let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
-                                tool_call_id: tool_call_id.to_string(),
-                                name: tool_name.to_string(),
-                                delta: String::from_utf8_lossy(&stdout_chunk[..n]).into_owned(),
-                                is_stderr: false,
-                            });
+                            let delta = stdout_decoder.decode(&stdout_chunk[..n]);
+                            if !suppress_deltas && !delta.is_empty() {
+                                let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    name: tool_name.to_string(),
+                                    delta,
+                                    is_stderr: false,
+                                });
+                            }
                             stdout_buf.push_bytes(&stdout_chunk[..n]);
                         }
                         Err(e) => {
@@ -197,12 +211,15 @@ async fn stream_child_output(
                     match res {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
-                            let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
-                                tool_call_id: tool_call_id.to_string(),
-                                name: tool_name.to_string(),
-                                delta: String::from_utf8_lossy(&stderr_chunk[..n]).into_owned(),
-                                is_stderr: true,
-                            });
+                            let delta = stderr_decoder.decode(&stderr_chunk[..n]);
+                            if !suppress_deltas && !delta.is_empty() {
+                                let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    name: tool_name.to_string(),
+                                    delta,
+                                    is_stderr: true,
+                                });
+                            }
                             stderr_buf.push_bytes(&stderr_chunk[..n]);
                         }
                         Err(e) => {
@@ -211,6 +228,21 @@ async fn stream_child_output(
                         }
                     }
                 }
+            }
+        }
+
+        // Both streams are done: a dangling partial UTF-8 sequence can never
+        // complete, so flush it into a final delta (one replacement char)
+        // rather than silently dropping the bytes from the live stream.
+        for (decoder, is_stderr) in [(&mut stdout_decoder, false), (&mut stderr_decoder, true)] {
+            let tail = decoder.flush();
+            if !suppress_deltas && !tail.is_empty() {
+                let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                    tool_call_id: tool_call_id.to_string(),
+                    name: tool_name.to_string(),
+                    delta: tail,
+                    is_stderr,
+                });
             }
         }
 
@@ -307,7 +339,9 @@ pub async fn handle_run_shell_with_context(
     // prompt — the command was policy-checked when the session was started.
     match action {
         "run" | "start" => {}
-        "write_stdin" | "poll" | "kill" => return handle_session_action(action, args).await,
+        "write_stdin" | "poll" | "kill" => {
+            return handle_session_action(action, args, &config.security).await
+        }
         other => {
             return Ok(format!(
                 "Unknown run_shell action '{other}'. Valid: run, start, write_stdin, poll, kill."
@@ -429,6 +463,12 @@ pub async fn handle_run_shell_with_context(
         .await;
     }
 
+    // Decided once, before spawning: when the command reads a blocked env
+    // file, live streaming deltas are suppressed (a raw delta would leak the
+    // secret before the final masking below could touch it) and the final
+    // output goes through `mask_env_assignments`.
+    let mask_env = command_reads_blocked_env_file(command, &config.security);
+
     if want_tty {
         if ctx.enforce_workspace_root() {
             // PTY-wrapped shells go through `portable_pty::CommandBuilder`,
@@ -445,7 +485,7 @@ pub async fn handle_run_shell_with_context(
                     .to_string(),
             );
         }
-        return run_in_pty(
+        let result = run_in_pty(
             shell,
             shell_flag,
             command,
@@ -457,8 +497,16 @@ pub async fn handle_run_shell_with_context(
             tool_call_id,
             ctx,
             resolved_shell_output_cap(config),
+            mask_env,
         )
-        .await;
+        .await?;
+        // Same env-file value masking as the piped path below: a PTY `cat
+        // .env` leaks identically.
+        return Ok(if mask_env {
+            mask_env_assignments(&result)
+        } else {
+            result
+        });
     }
 
     let cwd_path = workdir
@@ -515,6 +563,7 @@ pub async fn handle_run_shell_with_context(
         tool_call_id,
         "run_shell",
         resolved_shell_output_cap(config),
+        mask_env,
     )
     .await
     {
@@ -523,9 +572,34 @@ pub async fn handle_run_shell_with_context(
                 g.complete(code);
             }
             let status = code.unwrap_or(-1);
-            Ok(format!(
-                "Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            ))
+            // A file-read of a blocked env/credential file only reaches here
+            // outside the sandboxed (ACP) path; the generic secret patterns
+            // miss unrecognized-vendor keys, so mask every KEY=value line.
+            let (stdout, stderr) = if mask_env {
+                (mask_env_assignments(&stdout), mask_env_assignments(&stderr))
+            } else {
+                (stdout, stderr)
+            };
+            let mut result =
+                format!("Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+            if code != Some(0) {
+                // Concatenate only the bounded head of each stream, not the
+                // full outputs: the hint scanner reads at most its scan
+                // window anyway, so a full-output copy is pure allocation
+                // waste on large results.
+                let combined = format!(
+                    "{}\n{}",
+                    crate::tool_handlers::hints::output_head(&stdout),
+                    crate::tool_handlers::hints::output_head(&stderr)
+                );
+                if let Some(hint) =
+                    crate::tool_handlers::hints::shell_failure_hint(command, code, &combined)
+                {
+                    result.push_str("\nhint: ");
+                    result.push_str(hint);
+                }
+            }
+            Ok(result)
         }
         Err(e) => {
             // `child` is dropped on the way out of either branch, which kills
@@ -669,6 +743,7 @@ pub async fn run_gate_command(
             "goal-gate",
             "goal_gate",
             resolved_shell_output_cap(config),
+            false,
         ) => r,
         _ = cancel.cancelled() => {
             crate::util::process_tree::kill_process_group(child.id());
@@ -787,7 +862,11 @@ async fn start_session(
 /// the process-global session registry. Returns an explanatory message (as a
 /// normal tool result, not an error) when the session is unknown or no
 /// registry is installed, so the agent loop treats it as recoverable.
-async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result<String> {
+async fn handle_session_action(
+    action: &str,
+    args: &serde_json::Value,
+    security: &crate::config::SecurityConfig,
+) -> Result<String> {
     // `write_stdin` injects fresh commands into a live shell that were never
     // seen by the start-time policy/control-plane checks, so re-guard the stdin
     // here — before the registry lookup, so the deny holds regardless of
@@ -803,6 +882,18 @@ async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result
     let Some(sessions) = crate::shell_session::global() else {
         return Ok(no_session_registry_msg());
     };
+    session_action_with_registry(action, args, security, &sessions).await
+}
+
+/// [`handle_session_action`] body against an explicit registry, so tests can
+/// drive the write_stdin/poll/kill flow (including env-file masking) without
+/// installing the once-only process-global registry.
+async fn session_action_with_registry(
+    action: &str,
+    args: &serde_json::Value,
+    security: &crate::config::SecurityConfig,
+    sessions: &crate::shell_session::ShellSessionRegistry,
+) -> Result<String> {
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -811,6 +902,12 @@ async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result
     match action {
         "write_stdin" => {
             let stdin = args.get("stdin").and_then(|v| v.as_str()).unwrap_or("");
+            // The one-shot paths mask env-file reads at result time; a live
+            // session leaks the same content through later polls, so flag the
+            // session now (sticky — output attribution is asynchronous).
+            if command_reads_blocked_env_file(stdin, security) {
+                sessions.mark_env_mask(session_id);
+            }
             match sessions.write_stdin(session_id, stdin).await {
                 Ok(()) => Ok(format!(
                     "Wrote {} bytes to session {session_id}. Use action=poll to read output.",
@@ -821,6 +918,7 @@ async fn handle_session_action(action: &str, args: &serde_json::Value) -> Result
         }
         "poll" => match sessions.poll(session_id) {
             Ok(out) if out.is_empty() => Ok(format!("[no new output from session {session_id}]")),
+            Ok(out) if sessions.needs_env_mask(session_id) => Ok(mask_env_assignments(&out)),
             Ok(out) => Ok(out),
             Err(e) => Ok(e.to_string()),
         },
@@ -895,6 +993,7 @@ async fn run_in_pty(
     tool_call_id: &str,
     ctx: &ExecutionContext,
     max_output_bytes: usize,
+    suppress_deltas: bool,
 ) -> Result<String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -957,17 +1056,26 @@ async fn run_in_pty(
         // single bounded buffer.
         let mut combined = HeadTailBuffer::new(max_output_bytes);
         let mut buf = [0u8; 4096];
+        // Incremental decode for the live deltas so a multibyte char split
+        // across a PTY read boundary doesn't stream as two U+FFFD; `combined`
+        // keeps raw bytes and decodes once at the end.
+        let mut decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     // Best-effort streaming delta; dropped sends don't affect `combined` below.
-                    let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
-                        tool_call_id: tool_call_id.clone(),
-                        name: "run_shell".to_string(),
-                        delta: String::from_utf8_lossy(&buf[..n]).into_owned(),
-                        is_stderr: false,
-                    });
+                    // Suppressed entirely when the command reads a blocked env
+                    // file — only the masked final result may carry the content.
+                    let delta = decoder.decode(&buf[..n]);
+                    if !suppress_deltas && !delta.is_empty() {
+                        let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
+                            tool_call_id: tool_call_id.clone(),
+                            name: "run_shell".to_string(),
+                            delta,
+                            is_stderr: false,
+                        });
+                    }
                     combined.push_bytes(&buf[..n]);
                 }
                 // A PTY master read after the slave closes surfaces as an error
@@ -975,6 +1083,16 @@ async fn run_in_pty(
                 // here — not a truncation. Treat it as EOF like `Ok(0)`.
                 Err(_) => break,
             }
+        }
+        // Surface a dangling partial sequence instead of dropping it.
+        let tail = decoder.flush();
+        if !suppress_deltas && !tail.is_empty() {
+            let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
+                tool_call_id: tool_call_id.clone(),
+                name: "run_shell".to_string(),
+                delta: tail,
+                is_stderr: false,
+            });
         }
         combined.into_output()
     });
@@ -1001,9 +1119,16 @@ async fn run_in_pty(
             if let Some(g) = _guard {
                 g.complete(Some(exit_code as i32));
             }
-            Ok(format!(
-                "Exit code: {exit_code}\n--- output (tty) ---\n{combined}"
-            ))
+            let mut result = format!("Exit code: {exit_code}\n--- output (tty) ---\n{combined}");
+            if let Some(hint) = crate::tool_handlers::hints::shell_failure_hint(
+                command,
+                Some(exit_code as i32),
+                &combined,
+            ) {
+                result.push_str("\nhint: ");
+                result.push_str(hint);
+            }
+            Ok(result)
         }
         Ok(Err(e)) => Err(e),
         Err(_) => {
@@ -1042,11 +1167,103 @@ async fn deny_control_plane_write(command: &str) -> String {
     )
 }
 
+/// Whether `command` reads a blocked env/credential file through a plain
+/// file-read command (`cat .env`, `head ~/.aws/credentials`, `grep KEY .env`)
+/// or a `< file` stdin redirection (`cat < .env`, `while read …; done < .env`).
+///
+/// **Best-effort defense-in-depth, not a security boundary.** This is a
+/// lexical scan of the command text: globs (`cat .en?`), variable expansion
+/// (`cat $F`), command substitution, and read commands not on the list all
+/// bypass it. The actual boundary remains the sandbox plus the
+/// `blocked_paths` deny rules; this only adds [`mask_env_assignments`]
+/// masking on outputs the boundary doesn't cover (e.g. unsandboxed lanes).
+///
+/// The `read_file` tool already refuses these via `blocked_paths`, but a shell
+/// read only gets the generic secret-pattern redaction, which misses
+/// unrecognized-vendor keys. Reuses
+/// [`crate::tool_handlers::filesystem::is_blocked_path`]'s component/
+/// dotted-family matching (including the operator's `allowed_paths`
+/// overrides) rather than duplicating the list; `.example`/`.sample`/
+/// `.template`/`.dist` variants are exempt — they hold placeholders by
+/// convention.
+fn command_reads_blocked_env_file(command: &str, security: &crate::config::SecurityConfig) -> bool {
+    use crate::tool_handlers::filesystem::is_blocked_path;
+
+    const READ_COMMANDS: &[&str] = &[
+        "cat", "head", "tail", "bat", "less", "more", "nl", "zcat", "tac", "sed", "awk", "grep",
+        "egrep", "fgrep", "rg", "strings", "sort", "uniq", "cut", "tr", "wc", "xxd", "hexdump",
+        "od", "base64",
+    ];
+    const PLACEHOLDER_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist"];
+
+    let arg_is_blocked = |arg: &str| -> bool {
+        let arg = arg.trim_matches(|c| c == '"' || c == '\'');
+        let path = std::path::Path::new(arg);
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        if PLACEHOLDER_SUFFIXES.iter().any(|s| file_name.ends_with(s)) {
+            return false;
+        }
+        is_blocked_path(path, &security.blocked_paths, &security.allowed_paths)
+    };
+
+    for segment in crate::policy::pipeline_segments(command) {
+        // `< file` stdin redirection feeds the file to whatever runs, so it
+        // counts in every segment regardless of the command head. Heredocs
+        // (`<<`) and herestrings (`<<<`) are not file reads and are skipped.
+        let mut expect_redirect_target = false;
+        for tok in segment.split_whitespace() {
+            if expect_redirect_target {
+                expect_redirect_target = false;
+                if arg_is_blocked(tok) {
+                    return true;
+                }
+                continue;
+            }
+            if tok == "<" {
+                expect_redirect_target = true;
+            } else if let Some(rest) = tok.strip_prefix('<') {
+                if !rest.starts_with('<') && arg_is_blocked(rest) {
+                    return true;
+                }
+            }
+        }
+
+        let mut tokens = segment.split_whitespace();
+        let Some(head) = tokens.next() else { continue };
+        if !READ_COMMANDS.contains(&crate::tool_handlers::hints::head_token_base(head)) {
+            continue;
+        }
+        for arg in tokens {
+            if arg.starts_with('-') {
+                continue;
+            }
+            if arg_is_blocked(arg) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Mask the value of every `KEY=value` (or `export KEY=value`) line,
+/// preserving the key, so dumping an env/credential file can't leak secrets
+/// whose vendors the pattern-based redactor doesn't recognize.
+fn mask_env_assignments(text: &str) -> String {
+    static ENV_ASSIGN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::expect_used)]
+        regex::Regex::new(r"(?m)^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=)(.+)$")
+            .expect("static env-assignment regex compiles")
+    });
+    ENV_ASSIGN.replace_all(text, "${1}[REDACTED]").into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_run_shell, parse_timeout_ms, redact_command_for_audit, wrap_run_shell_for_sandbox,
-        HeadTailBuffer,
+        command_reads_blocked_env_file, handle_run_shell, mask_env_assignments, parse_timeout_ms,
+        redact_command_for_audit, wrap_run_shell_for_sandbox, HeadTailBuffer,
     };
     use crate::agent::AgentEvent;
     use crate::config::Config;
@@ -1840,6 +2057,242 @@ mod tests {
             "benign read-shaped command must execute: {result}"
         );
         assert!(!result.contains("denied"), "must not be denied: {result}");
+    }
+
+    /// Table-driven spec for the env-file read detector: only file-read heads
+    /// with a blocked env/credential argument count, and placeholder variants
+    /// (`.example` etc.) are exempt.
+    #[test]
+    fn env_file_read_detection_matches_read_commands_and_blocked_names() {
+        let security = crate::config::SecurityConfig::default();
+        let cases: &[(&str, bool)] = &[
+            ("cat .env", true),
+            ("cat ./.env", true),
+            ("head -n 5 ~/.env", true),
+            ("tail /srv/app/.env.production", true),
+            ("cat subdir/.env.local", true),
+            ("zcat credentials.json", true),
+            ("bat ~/.aws/credentials", true),
+            // Pipeline segments are each inspected.
+            ("echo x | cat .env", true),
+            ("cat .env | grep KEY", true),
+            ("true && cat .env", true),
+            // Placeholder variants hold no real secrets by convention.
+            ("cat .env.example", false),
+            ("cat .env.sample", false),
+            ("cat config/.env.template", false),
+            ("cat .env.dist", false),
+            // Non-read heads and non-blocked files don't trigger.
+            ("rm .env", false),
+            ("cat notes.txt", false),
+            ("cat environment.txt", false),
+            // Family matching is component-suffix, not substring.
+            ("cat .environment", false),
+            ("echo .env", false),
+            // `< file` stdin redirection counts regardless of the head.
+            ("cat < .env", true),
+            ("cat <.env", true),
+            ("while read -r l; do echo $l; done < .env", true),
+            ("tr -d '\\n' < .env", true),
+            ("sort < notes.txt", false),
+            // Heredocs/herestrings are not file reads.
+            ("cat << EOF", false),
+            ("cat <<EOF", false),
+            // Broader read-command heads.
+            ("grep KEY .env", true),
+            ("egrep KEY .env", true),
+            ("fgrep KEY .env", true),
+            ("rg SECRET ~/.aws/credentials", true),
+            ("sed -n 1p .env", true),
+            ("awk '{print}' .env", true),
+            ("strings .env", true),
+            ("sort .env", true),
+            ("uniq .env", true),
+            ("cut -d= -f2 .env", true),
+            ("wc -l .env", true),
+            ("xxd .env", true),
+            ("hexdump -C .env", true),
+            ("od -c .env", true),
+            ("base64 .env", true),
+            ("grep KEY notes.txt", false),
+            ("grep KEY .env.example", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                command_reads_blocked_env_file(command, &security),
+                *expected,
+                "detector disagreed for {command:?}"
+            );
+        }
+    }
+
+    /// Values in KEY=value lines are masked while keys, comments, and
+    /// non-assignment lines survive verbatim.
+    #[test]
+    fn mask_env_assignments_hides_values_and_keeps_keys() {
+        let input = "# comment\nAPI_KEY=super-secret-123\nexport DB_URL=postgres://u:p@h/db\nEMPTY=\nplain text line\n";
+        let masked = mask_env_assignments(input);
+        assert!(masked.contains("API_KEY=[REDACTED]"), "got: {masked}");
+        assert!(
+            masked.contains("export DB_URL=[REDACTED]"),
+            "export form must mask too: {masked}"
+        );
+        assert!(!masked.contains("super-secret-123"), "got: {masked}");
+        assert!(!masked.contains("postgres://"), "got: {masked}");
+        // Non-assignment content is untouched; empty values have nothing to hide.
+        assert!(masked.contains("# comment"));
+        assert!(masked.contains("plain text line"));
+        assert!(masked.contains("EMPTY=\n"), "got: {masked}");
+    }
+
+    /// End-to-end: `cat .env` gets its values masked (regardless of key
+    /// vendor), while `cat .env.example` passes through untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cat_env_masks_values_but_example_files_pass_through() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".env"),
+            "SOME_UNKNOWN_VENDOR_KEY=real-secret-value-42\n",
+        )
+        .expect("write .env");
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "SOME_UNKNOWN_VENDOR_KEY=placeholder-value\n",
+        )
+        .expect("write .env.example");
+
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+
+        let args = serde_json::json!({
+            "command": "cat .env",
+            "workdir": tmp.path().to_string_lossy().as_ref(),
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-env", None)
+            .await
+            .expect("cat .env runs");
+        assert!(
+            result.contains("SOME_UNKNOWN_VENDOR_KEY=[REDACTED]"),
+            "value must be masked, key kept: {result}"
+        );
+        assert!(
+            !result.contains("real-secret-value-42"),
+            "secret leaked: {result}"
+        );
+        // Live streaming deltas must be suppressed for the whole call: masking
+        // only touches the final result, so any delta would have carried the
+        // raw secret to TUI/gRPC/ACP streams before masking ran.
+        while let Ok(event) = event_rx.try_recv() {
+            if let crate::agent::AgentEvent::ToolOutputDelta { delta, .. } = event {
+                panic!("streaming delta leaked env-file content: {delta:?}");
+            }
+        }
+
+        let args = serde_json::json!({
+            "command": "cat .env.example",
+            "workdir": tmp.path().to_string_lossy().as_ref(),
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-ex", None)
+            .await
+            .expect("cat .env.example runs");
+        assert!(
+            result.contains("SOME_UNKNOWN_VENDOR_KEY=placeholder-value"),
+            "placeholder files must not be masked: {result}"
+        );
+    }
+
+    /// The persistent-session lane must enforce the same env-file masking as
+    /// the one-shot paths: `write_stdin("cat .env")` flags the session, and
+    /// every later poll's KEY=value lines come back masked — otherwise the
+    /// session lane is a one-action bypass of the boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_poll_masks_env_values_after_blocked_file_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".env"),
+            "SOME_UNKNOWN_VENDOR_KEY=session-secret-42\n",
+        )
+        .expect("write .env");
+
+        let reg = crate::shell_session::ShellSessionRegistry::new();
+        let child = tokio::process::Command::new("sh")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(tmp.path())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let id = reg.register(child, None, 64 * 1024);
+        let security = crate::config::SecurityConfig::default();
+
+        let write_args = serde_json::json!({ "session_id": id, "stdin": "cat .env\n" });
+        super::session_action_with_registry("write_stdin", &write_args, &security, &reg)
+            .await
+            .expect("write_stdin");
+
+        let poll_args = serde_json::json!({ "session_id": id });
+        let mut out = String::new();
+        for _ in 0..50 {
+            let polled = super::session_action_with_registry("poll", &poll_args, &security, &reg)
+                .await
+                .expect("poll");
+            if polled.contains("SOME_UNKNOWN_VENDOR_KEY") {
+                out = polled;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            out.contains("SOME_UNKNOWN_VENDOR_KEY=[REDACTED]"),
+            "session poll must mask env values after a blocked-file read: {out:?}"
+        );
+        assert!(
+            !out.contains("session-secret-42"),
+            "secret leaked through the session lane: {out:?}"
+        );
+
+        super::session_action_with_registry("kill", &poll_args, &security, &reg)
+            .await
+            .expect("kill");
+    }
+
+    /// End-to-end hint attachment: a failing command with a known shape gets
+    /// exactly one `hint:` line; a clean command gets none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_command_gets_a_hint_line_and_clean_output_does_not() {
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let args = serde_json::json!({
+            "command": "definitely_not_a_real_command_xyz_42"
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-h1", None)
+            .await
+            .expect("failing command still returns Ok");
+        assert!(
+            result.contains("\nhint: ") && result.contains("PATH"),
+            "command-not-found should carry the PATH hint: {result}"
+        );
+        assert_eq!(
+            result.matches("\nhint: ").count(),
+            1,
+            "at most one hint line: {result}"
+        );
+
+        let args = serde_json::json!({ "command": "printf 'clean\\n'" });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-h2", None)
+            .await
+            .expect("clean command runs");
+        assert!(
+            !result.contains("\nhint: "),
+            "clean output must not get a hint: {result}"
+        );
     }
 
     #[tokio::test]

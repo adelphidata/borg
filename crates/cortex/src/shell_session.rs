@@ -155,6 +155,17 @@ struct Session {
     guard: Option<ProcessGuard>,
     /// Detached drain task. Aborted on `kill`.
     drain: tokio::task::JoinHandle<()>,
+    /// Working directory last reported for this session, sampled at
+    /// registration and refreshed on every `poll`. Lets `poll` append a
+    /// `cwd: <path>` note when a `cd` moved the session, so the model stops
+    /// defensively prefixing every command with `cd X &&`. `None` when the
+    /// platform can't report it — then no note is ever emitted.
+    last_cwd: Option<std::path::PathBuf>,
+    /// Set once a `write_stdin` was detected reading a blocked env/credential
+    /// file. Sticky for the session's lifetime: output arrives asynchronously,
+    /// so per-command attribution is impossible — from that point every poll's
+    /// output must go through env-assignment masking in the shell handler.
+    env_mask: bool,
 }
 
 /// Registry of live interactive shell sessions. Cheap to clone — state is
@@ -231,6 +242,10 @@ impl ShellSessionRegistry {
                 output,
                 guard,
                 drain,
+                // Baseline for the `poll` cwd-change note. Best-effort: an
+                // unreadable cwd just means the note is never produced.
+                last_cwd: pid.and_then(crate::util::process_tree::process_cwd),
+                env_mask: false,
             },
         );
         id
@@ -264,19 +279,59 @@ impl ShellSessionRegistry {
     }
 
     /// Return output accumulated since the last `poll` for this session,
-    /// draining it so nothing is re-emitted or retained afterwards. Errors if
-    /// the session is unknown.
+    /// draining it so nothing is re-emitted or retained afterwards. When the
+    /// session's working directory changed since the last observation (a `cd`
+    /// ran), a `cwd: <path>` note is appended so the model knows where the
+    /// shell now lives. Errors if the session is unknown.
     pub fn poll(&self, id: &str) -> Result<String> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let session = inner
             .sessions
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
-        let mut buf = session
-            .output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(buf.take())
+        let mut out = {
+            let mut buf = session
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buf.take()
+        };
+        // Only note an *observed change*: a first-ever successful read (prior
+        // baseline unknown) seeds silently, and an unreadable cwd (dead child,
+        // unsupported platform) never fabricates a note.
+        if let Some(now) = session.pid.and_then(crate::util::process_tree::process_cwd) {
+            if session.last_cwd.as_ref().is_some_and(|prev| prev != &now) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("cwd: {}", now.display()));
+            }
+            session.last_cwd = Some(now);
+        }
+        Ok(out)
+    }
+
+    /// Mark this session as having read a blocked env/credential file via
+    /// `write_stdin`; every subsequent [`Self::poll`] is reported as needing
+    /// env-assignment masking (see [`Self::needs_env_mask`]). Sticky by design:
+    /// session output is drained asynchronously, so the file's contents can
+    /// surface on any later poll. Unknown ids are ignored — the corresponding
+    /// `write_stdin` fails on the same missing session anyway.
+    pub fn mark_env_mask(&self, id: &str) {
+        if let Some(session) = self.lock().sessions.get_mut(id) {
+            session.env_mask = true;
+        }
+    }
+
+    /// Whether output polled from this session must go through
+    /// env-assignment masking (a prior `write_stdin` read a blocked
+    /// env/credential file). Unknown ids report `false`; `poll` errors on
+    /// them before masking matters.
+    pub fn needs_env_mask(&self, id: &str) -> bool {
+        self.lock()
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.env_mask)
     }
 
     /// Terminate a session: abort its drain task, kill the child's whole
@@ -348,6 +403,11 @@ fn spawn_drain(
         let mut ebuf = [0u8; 4096];
         let mut sdone = stdout.is_none();
         let mut edone = stderr.is_none();
+        // Per-stream incremental decoders: a multibyte char split across two
+        // pipe reads must not land in the buffer as two U+FFFD. Flushed at
+        // each stream's EOF so a truncated trailing sequence still surfaces.
+        let mut sdec = crate::util::utf8_stream::Utf8StreamDecoder::new();
+        let mut edec = crate::util::utf8_stream::Utf8StreamDecoder::new();
         while !sdone || !edone {
             tokio::select! {
                 r = async {
@@ -357,8 +417,11 @@ fn spawn_drain(
                     }
                 }, if !sdone => {
                     match r {
-                        Ok(0) | Err(_) => sdone = true,
-                        Ok(n) => append(&output, &sbuf[..n]),
+                        Ok(0) | Err(_) => {
+                            sdone = true;
+                            append(&output, &sdec.flush());
+                        }
+                        Ok(n) => append(&output, &sdec.decode(&sbuf[..n])),
                     }
                 }
                 r = async {
@@ -368,8 +431,11 @@ fn spawn_drain(
                     }
                 }, if !edone => {
                     match r {
-                        Ok(0) | Err(_) => edone = true,
-                        Ok(n) => append(&output, &ebuf[..n]),
+                        Ok(0) | Err(_) => {
+                            edone = true;
+                            append(&output, &edec.flush());
+                        }
+                        Ok(n) => append(&output, &edec.decode(&ebuf[..n])),
                     }
                 }
             }
@@ -377,12 +443,14 @@ fn spawn_drain(
     })
 }
 
-fn append(output: &Arc<Mutex<SessionOutput>>, bytes: &[u8]) {
-    let chunk = String::from_utf8_lossy(bytes);
+fn append(output: &Arc<Mutex<SessionOutput>>, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
     let mut buf = output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    buf.push(&chunk);
+    buf.push(chunk);
 }
 
 #[cfg(test)]
@@ -605,6 +673,97 @@ mod tests {
             CAP,
             "retained payload must be exactly the cap, not 2x it"
         );
+    }
+
+    /// A `cd` inside a live session must surface a `cwd: <path>` note on the
+    /// next poll — that's what lets the model drop defensive `cd X &&`
+    /// prefixes — and a session that never changes directory must never get
+    /// one. Platform-gated to where `process_cwd` is implemented.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn poll_notes_cwd_only_when_it_changed() {
+        let reg = ShellSessionRegistry::new();
+        let child = Command::new("sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir("/")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let id = reg.register(child, None, TEST_CAP);
+
+        // No directory change yet: output-producing polls carry no cwd note.
+        reg.write_stdin(&id, "echo before\n").await.expect("write");
+        let out = poll_until(&reg, &id, "before").await;
+        assert!(
+            !out.contains("cwd: "),
+            "no cwd note while the directory is unchanged: {out:?}"
+        );
+
+        // The target must be symlink-free: the kernel reports the resolved
+        // path (`/tmp` on macOS is a symlink to `/private/tmp`).
+        let target = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        reg.write_stdin(&id, &format!("cd {}\necho moved\n", target.display()))
+            .await
+            .expect("write cd");
+        let out = poll_until(&reg, &id, "cwd: ").await;
+        assert!(
+            out.contains(&format!("cwd: {}", target.display())),
+            "poll after a cd must note the new cwd: {out:?}"
+        );
+
+        // Once noted, an unchanged cwd produces no further notes.
+        reg.write_stdin(&id, "echo after\n").await.expect("write");
+        let out = poll_until(&reg, &id, "after").await;
+        assert!(
+            !out.contains("cwd: "),
+            "cwd note must appear only on change, not on every poll: {out:?}"
+        );
+
+        reg.kill(&id).await.expect("kill");
+    }
+
+    /// A multibyte character split across two separate pipe reads must reach
+    /// the session buffer intact — per-chunk lossy decoding would turn the
+    /// split 😀 into two U+FFFD.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_multibyte_output_survives_chunked_drain() {
+        // 😀 is F0 9F 98 80. `write_stdin` is &str-typed, so the split is
+        // produced inside the session: two `printf` commands emit the first
+        // two bytes and the last two bytes far enough apart that the drain
+        // task reads them as separate chunks.
+        let reg = ShellSessionRegistry::new();
+        let child = Command::new("sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let id = reg.register(child, None, TEST_CAP);
+        // First half of the emoji, no newline — lands as its own drain chunk.
+        reg.write_stdin(&id, "printf '\\360\\237'\n")
+            .await
+            .expect("write first half");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Second half completes the codepoint on a later read.
+        reg.write_stdin(&id, "printf '\\230\\200\\n'\n")
+            .await
+            .expect("write second half");
+
+        let out = poll_until(&reg, &id, "😀").await;
+        assert!(
+            out.contains('😀'),
+            "split emoji must reassemble across drain chunks: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "no replacement chars for a cleanly split codepoint: {out:?}"
+        );
+
+        reg.kill(&id).await.expect("kill");
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ fn make_session(id: &str, title: &str) -> SessionSummary {
         title: title.to_string(),
         updated_unix_ts: 1_735_689_600, // 2025-01-01T00:00:00Z
         message_count: 5,
+        pinned: false,
     }
 }
 
@@ -24,6 +25,28 @@ fn make_popup_with_sessions(count: usize) -> SessionsPopup {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// The `*` pin marker is the only TUI signal distinguishing a pinned session;
+/// it must render for pinned rows and stay absent (aligned padding) for
+/// unpinned ones.
+#[test]
+fn row_label_marks_pinned_sessions() {
+    let mut pinned = make_session("s1", "Pinned one");
+    pinned.pinned = true;
+    let unpinned = make_session("s2", "Plain one");
+
+    let pinned_label = SessionsPopup::row_label(&pinned);
+    let unpinned_label = SessionsPopup::row_label(&unpinned);
+
+    assert!(
+        pinned_label.starts_with(" * Pinned one"),
+        "pinned rows must lead with the * marker: {pinned_label:?}"
+    );
+    assert!(
+        unpinned_label.starts_with("   Plain one"),
+        "unpinned rows keep the column alignment with a blank marker: {unpinned_label:?}"
+    );
 }
 
 #[test]

@@ -234,6 +234,32 @@ pub struct ResumeHint {
     pub title: String,
 }
 
+/// Stamp `session_id`'s row with this process's workspace identity (cwd +
+/// enclosing git repo toplevel). Fire-and-forget: a failed stamp only costs
+/// `--continue` precision, so it logs and moves on rather than blocking boot.
+async fn stamp_session_workspace(session_id: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        tracing::warn!("workspace stamp skipped: current_dir unavailable");
+        return;
+    };
+    let (cwd, repo_root) = cortex::session::workspace_identity(&cwd);
+    match cortex::db::Database::open().await {
+        Ok(db) => {
+            if let Err(e) = db
+                .set_session_workspace(
+                    session_id,
+                    &cwd.to_string_lossy(),
+                    repo_root.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(session_id = %session_id, error = %e, "workspace stamp failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "workspace stamp skipped: db open failed"),
+    }
+}
+
 pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // Kick off a background fetch of the OpenRouter model catalog so the
     // `/model` picker reflects the live list (dropping stale IDs, tagging
@@ -305,6 +331,12 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let mut client = crate::daemon_client::connect_or_spawn().await?;
     let (session_id, _last_seq) = client.open_session(resume.as_deref()).await?;
 
+    // Stamp the session's workspace identity with the TUI process's real cwd.
+    // The daemon stamps its own process cwd at open, which is wrong whenever
+    // the (long-lived) daemon was launched from a different directory; this
+    // overwrite keeps `borg --continue` scoped to where the user actually is.
+    stamp_session_workspace(&session_id).await;
+
     // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
     // <id>` inside the TUI. Launching the TUI with no args always starts a
     // fresh session.
@@ -318,6 +350,10 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                     eprintln!("borg: failed to load session '{}': {e}", meta.id);
                     return Ok(None);
                 }
+                // The conversation continues under the *loaded* session id,
+                // so that row (not just the host's fresh one) carries the
+                // workspace the user resumed it from.
+                stamp_session_workspace(&meta.id).await;
                 resumed_info = Some((title, count));
             }
             Err(e) => {

@@ -316,6 +316,158 @@ fn matching_pattern_indices(text: &str) -> Vec<usize> {
     }
 }
 
+/// True for characters an attacker can thread through a credential to defeat
+/// contiguous regex matching while most render surfaces (terminals, chat
+/// clients, log viewers) display the token as if unbroken: all Unicode `Cc`
+/// controls (C0 including `\n`/`\r`/`\t`, DEL, C1) plus the zero-width and
+/// bidi formatting characters. `\n`/`\r`/`\t` are deliberately included —
+/// a newline mid-token is exactly the `ghp_abc\n123…` smuggle shape.
+fn is_smuggle_char(c: char) -> bool {
+    c.is_control() // Unicode Cc: U+0000..=U+001F, U+007F..=U+009F
+        || matches!(c,
+            '\u{00AD}' // soft hyphen
+            | '\u{034F}' // combining grapheme joiner
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
+            | '\u{202A}'..='\u{202E}' // bidi embedding/override
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{FE00}'..='\u{FE0F}' // variation selectors
+            | '\u{FEFF}' // zero-width no-break space / BOM
+        )
+}
+
+/// Copy of `text` with smuggle characters removed. Returns `None` when
+/// nothing was stripped (the second pass has no work). The byte-offset map
+/// back into `text` is built separately — and only when a pattern actually
+/// matched the stripped copy — by [`smuggle_byte_map`]: `\n`/`\t` count as
+/// smuggle chars, so ordinary multi-line text reaches this path constantly
+/// and must not pay for a per-byte `usize` table it will never use.
+fn strip_smuggle_chars(text: &str) -> Option<String> {
+    let mut stripped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if !is_smuggle_char(c) {
+            stripped.push(c);
+        }
+    }
+    if stripped.len() == text.len() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+/// Per-byte index table for the stripped copy of `text`: entry `i` is the
+/// byte offset in `text` of stripped-copy byte `i`. Must walk `text` exactly
+/// as [`strip_smuggle_chars`] does.
+fn smuggle_byte_map(text: &str) -> Vec<usize> {
+    let mut map: Vec<usize> = Vec::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        if is_smuggle_char(c) {
+            continue;
+        }
+        for off in 0..c.len_utf8() {
+            map.push(i + off);
+        }
+    }
+    map
+}
+
+/// True when any pattern matches `text` as-is (contiguous matching only,
+/// validators honored). Used by the smuggled-span guard below; must NOT
+/// consult the smuggling pass itself.
+fn contains_contiguous_secret(text: &str) -> bool {
+    matching_pattern_indices(text)
+        .into_iter()
+        .map(|i| &SECRET_PATTERNS[i])
+        .any(|p| match p.validator {
+            None => p.regex.is_match(text),
+            Some(v) => p.regex.find_iter(text).any(|m| v(m.as_str())),
+        })
+}
+
+/// Second matching pass for control-char / zero-width smuggled secrets:
+/// find pattern matches in the stripped copy of `text` and map them back to
+/// original-byte spans. Returns non-overlapping `(start, end, label)` spans
+/// in ascending order (earlier patterns win overlaps, mirroring the
+/// contiguous pass's pattern priority).
+///
+/// A span is only accepted when:
+/// - it contains at least one stripped character strictly inside the match
+///   (a fully contiguous match is the first pass's job — masking it again
+///   here would widen the span across neighboring smuggle chars);
+/// - the original span consists solely of the matched characters plus
+///   smuggle characters, so the mask never swallows adjacent legitimate
+///   text;
+/// - no contiguous fragment of the span (the runs between smuggle chars)
+///   matches a pattern on its own — the contiguous pass already handled
+///   those, and re-masking would double-mask / widen.
+fn smuggled_secret_spans(text: &str) -> Vec<(usize, usize, &'static str)> {
+    let Some(stripped) = strip_smuggle_chars(text) else {
+        return Vec::new();
+    };
+    let matched = matching_pattern_indices(&stripped);
+    if matched.is_empty() {
+        // The common case (multi-line text, no secret shape): bail before
+        // building the per-byte offset map.
+        return Vec::new();
+    }
+    let map = smuggle_byte_map(text);
+    let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+    for pattern in matched.into_iter().map(|i| &SECRET_PATTERNS[i]) {
+        for caps in pattern.regex.captures_iter(&stripped) {
+            let full = match caps.get(0) {
+                Some(m) => m,
+                None => continue,
+            };
+            if pattern.validator.is_some_and(|v| !v(full.as_str())) {
+                continue;
+            }
+            // For capture-only patterns mask just the credential value,
+            // matching the contiguous pass's prefix-preserving behavior.
+            let target = if pattern.capture_only {
+                match caps.get(1) {
+                    Some(m) => m,
+                    None => continue,
+                }
+            } else {
+                full
+            };
+            if target.as_str().is_empty() || target.as_str().starts_with("[REDACTED") {
+                continue;
+            }
+            let orig_start = map[target.start()];
+            let orig_end = map[target.end() - 1] + 1;
+            // Contiguous in the original → the first pass's responsibility.
+            if orig_end - orig_start == target.end() - target.start() {
+                continue;
+            }
+            let span = &text[orig_start..orig_end];
+            // The mask must cover only token chars + smuggle chars.
+            let despanned: String = span.chars().filter(|c| !is_smuggle_char(*c)).collect();
+            if despanned != target.as_str() {
+                continue;
+            }
+            // A self-matching contiguous fragment was already masked (or
+            // deliberately left, per its validator) by the first pass.
+            if span
+                .split(is_smuggle_char)
+                .any(|frag| !frag.is_empty() && contains_contiguous_secret(frag))
+            {
+                continue;
+            }
+            if spans
+                .iter()
+                .any(|&(s, e, _)| orig_start < e && s < orig_end)
+            {
+                continue; // earlier pattern already claimed an overlapping span
+            }
+            spans.push((orig_start, orig_end, pattern.label));
+        }
+    }
+    spans.sort_unstable_by_key(|&(s, e, _)| (s, e));
+    spans
+}
+
 /// A single per-pattern audit record produced by [`redact_with_audit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionHit {
@@ -352,7 +504,10 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
     // capture-only branch skips already-redacted values explicitly), so a
     // pattern the set didn't match can never become relevant mid-loop.
     let matched = matching_pattern_indices(text);
-    if matched.is_empty() {
+    // Performance gate for the anti-smuggling second pass: clean text (no
+    // control / zero-width chars) never pays for the stripped copy.
+    let may_smuggle = text.chars().any(is_smuggle_char);
+    if matched.is_empty() && !may_smuggle {
         return RedactionOutcome {
             text: text.to_string(),
             hits: Vec::new(),
@@ -400,6 +555,21 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
             hits.push(RedactionHit { label, count });
         }
     }
+
+    // Second pass: secrets whose bodies are split by control / zero-width
+    // characters (`sk-abc\x1bdef…`, `ghp_abc\n123…`) defeat the contiguous
+    // patterns above. Runs on the pass-one output so contiguous matches are
+    // already `[REDACTED …]` markers and can't be re-masked or widened.
+    if may_smuggle {
+        let spans = smuggled_secret_spans(&result);
+        for (start, end, label) in spans.into_iter().rev() {
+            result.replace_range(start..end, &format!("[REDACTED {label}]"));
+            match hits.iter_mut().find(|h| h.label == label) {
+                Some(hit) => hit.count += 1,
+                None => hits.push(RedactionHit { label, count: 1 }),
+            }
+        }
+    }
     RedactionOutcome { text: result, hits }
 }
 
@@ -407,13 +577,12 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
 /// validators so a match `redact_with_audit` would leave unredacted doesn't
 /// count as a secret here either.
 pub fn contains_secrets(text: &str) -> bool {
-    matching_pattern_indices(text)
-        .into_iter()
-        .map(|i| &SECRET_PATTERNS[i])
-        .any(|p| match p.validator {
-            None => p.regex.is_match(text),
-            Some(v) => p.regex.find_iter(text).any(|m| v(m.as_str())),
-        })
+    if contains_contiguous_secret(text) {
+        return true;
+    }
+    // Same anti-smuggling second pass as `redact_with_audit`, behind the
+    // same gate: a secret split by control / zero-width chars still counts.
+    text.chars().any(is_smuggle_char) && !smuggled_secret_spans(text).is_empty()
 }
 
 /// One representative sample per secret pattern. Used by cross-module tests
@@ -917,7 +1086,7 @@ mod tests {
 
 #[cfg(test)]
 mod gitlab_pattern_tests {
-    use super::redact_secrets;
+    use super::{contains_secrets, redact_secrets, redact_with_audit, RedactionHit};
 
     #[test]
     fn redacts_every_gitlab_token_family() {
@@ -968,6 +1137,170 @@ mod gitlab_pattern_tests {
                 "{input:?} must not be redacted, got: {out}"
             );
         }
+    }
+
+    #[test]
+    fn smuggled_secrets_are_masked_and_clean_neighbors_are_not() {
+        // Control-char / zero-width smuggling: a token body split by ESC,
+        // NUL, newline, zero-width, or bidi chars must still be masked, while
+        // controls between unrelated short strings must not create a mask.
+        struct Case {
+            name: &'static str,
+            input: String,
+            masked: bool,
+            label: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "ESC-split OpenAI-style key",
+                input: format!(
+                    "key: sk-{}\u{1b}{}",
+                    "a1B2c3D4e5F6g7H8i9J0k1L2", "m3N4o5P6q7R8s9T0u1V2w3X4"
+                ),
+                masked: true,
+                label: "API Key",
+            },
+            Case {
+                name: "newline-split GitHub token",
+                input: format!(
+                    "token ghp_{}\n{} end",
+                    "ABCDEFGHIJKLMNOPQR", "abcdefghijklmnopqr"
+                ),
+                masked: true,
+                label: "GitHub Token",
+            },
+            Case {
+                name: "zero-width-space-split Anthropic key",
+                input: format!(
+                    "sk-ant-api03-{}\u{200b}{}",
+                    "aBcDeFgHiJkLmNoP", "qRsTuVwXyZ01234567"
+                ),
+                masked: true,
+                label: "Anthropic API Key",
+            },
+            Case {
+                name: "NUL-and-bidi-split AWS key",
+                input: format!("cred AKIA\u{0}IOSF\u{202e}ODNN7EXAMPLE here"),
+                masked: true,
+                label: "AWS Access Key",
+            },
+            Case {
+                name: "multibyte text around a DEL-split Slack token",
+                input: format!("héllo → xoxb-1234567890-abcdef\u{7f}ghijklmnopqrstuvwx ←"),
+                masked: true,
+                label: "Slack Token",
+            },
+            Case {
+                name: "soft-hyphen-split GitHub token",
+                input: format!(
+                    "token ghp_{}\u{ad}{} end",
+                    "ABCDEFGHIJKLMNOPQR", "abcdefghijklmnopqr"
+                ),
+                masked: true,
+                label: "GitHub Token",
+            },
+            Case {
+                name: "variation-selector-split Anthropic key",
+                input: format!(
+                    "sk-ant-api03-{}\u{fe0f}{}",
+                    "aBcDeFgHiJkLmNoP", "qRsTuVwXyZ01234567"
+                ),
+                masked: true,
+                label: "Anthropic API Key",
+            },
+            Case {
+                name: "combining-grapheme-joiner-and-MVS-split AWS key",
+                input: "cred AKIA\u{34f}IOSF\u{180e}ODNN7EXAMPLE here".to_string(),
+                masked: true,
+                label: "AWS Access Key",
+            },
+            Case {
+                name: "control between unrelated short strings",
+                input: "abc\u{0}def and ghp_short\u{1b}bits".to_string(),
+                masked: false,
+                label: "",
+            },
+            Case {
+                name: "controls but no secret",
+                input: "line one\nline two \u{1b}[31mred\u{1b}[0m\ttabbed".to_string(),
+                masked: false,
+                label: "",
+            },
+        ];
+        for case in &cases {
+            let outcome = redact_with_audit(&case.input);
+            if case.masked {
+                assert!(
+                    outcome.text.contains(&format!("[REDACTED {}]", case.label)),
+                    "{}: expected [REDACTED {}], got: {:?}",
+                    case.name,
+                    case.label,
+                    outcome.text
+                );
+                assert_eq!(
+                    outcome.hits.iter().map(|h| h.count).sum::<usize>(),
+                    1,
+                    "{}: expected exactly one hit, got {:?}",
+                    case.name,
+                    outcome.hits
+                );
+                assert!(
+                    contains_secrets(&case.input),
+                    "{}: contains_secrets must agree",
+                    case.name
+                );
+            } else {
+                assert_eq!(
+                    outcome.text, case.input,
+                    "{}: text must pass through unchanged",
+                    case.name
+                );
+                assert!(outcome.hits.is_empty(), "{}: no hits expected", case.name);
+                assert!(!contains_secrets(&case.input), "{}", case.name);
+            }
+        }
+    }
+
+    #[test]
+    fn smuggled_mask_does_not_swallow_adjacent_clean_text() {
+        // The mask span must cover only token chars + smuggle chars — the
+        // words on either side of the smuggled token survive verbatim.
+        let input = format!(
+            "before ghp_{}\u{200b}{} after",
+            "ABCDEFGHIJKLMNOPQR", "abcdefghijklmnopqr"
+        );
+        let out = redact_secrets(&input);
+        assert_eq!(out, "before [REDACTED GitHub Token] after", "got: {out}");
+    }
+
+    #[test]
+    fn contiguous_secret_near_controls_is_masked_exactly_once() {
+        // A contiguous secret with control chars elsewhere in the text must
+        // be handled by the first pass alone — no second mask, no widening
+        // of the span across the neighboring escape sequence.
+        let input = format!("\u{1b}[32mok\u{1b}[0m key AKIAIOSFODNN7EXAMPLE done\nnext line");
+        let outcome = redact_with_audit(&input);
+        assert_eq!(
+            outcome.text,
+            "\u{1b}[32mok\u{1b}[0m key [REDACTED AWS Access Key] done\nnext line"
+        );
+        assert_eq!(
+            outcome.hits,
+            vec![RedactionHit {
+                label: "AWS Access Key",
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn clean_text_fast_path_returns_text_unchanged() {
+        // No controls, no zero-width, no secrets: the gate must keep the
+        // original bytes intact (the smuggling pass never runs).
+        let input = "plain sentence with numbers 12345 and a url https://example.com/path";
+        let outcome = redact_with_audit(input);
+        assert_eq!(outcome.text, input);
+        assert!(outcome.hits.is_empty());
     }
 
     #[test]

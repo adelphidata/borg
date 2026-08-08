@@ -168,26 +168,9 @@ impl SignalClient {
             bail!("Signal attachment download failed ({})", resp.status());
         }
 
-        // Check Content-Length before reading body to avoid OOM
-        if let Some(len) = resp.content_length() {
-            if len > max_bytes {
-                bail!("Signal attachment too large ({len} bytes, max {max_bytes})");
-            }
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read attachment body")?;
-
-        if bytes.len() as u64 > max_bytes {
-            bail!(
-                "Signal attachment too large ({} bytes, max {max_bytes})",
-                bytes.len()
-            );
-        }
-
-        Ok(bytes.to_vec())
+        // Streamed read with a running cap — Content-Length can lie or be
+        // absent, so the ceiling is enforced chunk-by-chunk while streaming.
+        cortex::media::read_body_capped(resp, max_bytes, "Signal attachment").await
     }
 
     /// Send a typing indicator to a recipient or group.

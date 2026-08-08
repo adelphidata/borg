@@ -546,6 +546,33 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
         }
     } else if meta.is_file() {
         fs::copy(from, to)?;
+    } else if meta.file_type().is_symlink() {
+        // Backups archive symlinks as symlink entries (`follow_symlinks(false)`),
+        // so the staged tree can contain them. Recreate the link rather than
+        // silently dropping it — a restore that omits entries while returning
+        // Ok would falsely report success.
+        let target = fs::read_link(from)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, to).with_context(|| {
+            format!(
+                "restore: recreate symlink {} → {}",
+                to.display(),
+                target.display()
+            )
+        })?;
+        #[cfg(not(unix))]
+        return Err(anyhow!(
+            "restore: cannot recreate symlink {} → {} on this platform",
+            to.display(),
+            target.display()
+        ));
+    } else {
+        // Sockets/FIFOs/etc. — refuse rather than silently omit, so a
+        // partial restore never masquerades as a complete one.
+        return Err(anyhow!(
+            "restore: unsupported file type at {} (not a file, directory, or symlink)",
+            from.display()
+        ));
     }
     Ok(())
 }
@@ -578,6 +605,59 @@ impl<W: Write> Write for ShaWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cross-device restore fallback must reproduce the staged tree
+    /// faithfully — a symlink silently dropped (the old behavior: neither the
+    /// file nor the dir branch matched, so the entry was skipped with `Ok`)
+    /// is a partial restore reported as success.
+    #[cfg(unix)]
+    #[test]
+    fn copy_recursive_preserves_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("skills")).unwrap();
+        fs::write(src.join("skills/real.md"), b"content").unwrap();
+        std::os::unix::fs::symlink("skills/real.md", src.join("alias.md")).unwrap();
+
+        copy_recursive(&src, &dst).expect("copy must succeed");
+
+        let link = dst.join("alias.md");
+        let meta = fs::symlink_metadata(&link).expect("symlink must exist in the restored tree");
+        assert!(meta.file_type().is_symlink(), "entry must stay a symlink");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("skills/real.md"),
+            "link target must round-trip"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("skills/real.md")).unwrap(),
+            "content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_recursive_refuses_special_files_instead_of_omitting_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.txt"), b"x").unwrap();
+        // Create a FIFO — a file type the restore copy cannot reproduce.
+        let status = std::process::Command::new("mkfifo")
+            .arg(src.join("pipe"))
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let err = copy_recursive(&src, &dst)
+            .expect_err("a tree containing an uncopyable entry must fail loudly, not partially");
+        assert!(
+            err.to_string().contains("unsupported file type"),
+            "error must name the problem, got: {err}"
+        );
+    }
 
     fn populate_borg_home(home: &Path) {
         fs::create_dir_all(home.join("blobs")).unwrap();

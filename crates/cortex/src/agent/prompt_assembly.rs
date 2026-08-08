@@ -285,12 +285,18 @@ impl CompactionStrikes {
 }
 
 /// One labeled slice of the context window in [`ContextBreakdown`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextComponent {
     /// Human-facing component name (e.g. "Conversation history").
     pub label: String,
     /// Estimated token count for this component.
     pub tokens: usize,
+    /// True for a child/detail row that itemizes part of the nearest
+    /// preceding non-detail component (e.g. one skill inside the dynamic
+    /// system-prompt suffix, or one MCP server inside the MCP tool-schema
+    /// bucket). Detail rows are display-only: their tokens are already
+    /// counted in the parent, so totals must skip them.
+    pub detail: bool,
 }
 
 /// Component-level context-usage snapshot produced by
@@ -305,9 +311,15 @@ pub struct ContextBreakdown {
 }
 
 impl ContextBreakdown {
-    /// Sum of all component estimates.
+    /// Sum of all top-level component estimates. Detail rows are skipped:
+    /// their tokens are already included in their parent component, so
+    /// counting them would double-charge the window.
     pub fn used_tokens(&self) -> usize {
-        self.components.iter().map(|c| c.tokens).sum()
+        self.components
+            .iter()
+            .filter(|c| !c.detail)
+            .map(|c| c.tokens)
+            .sum()
     }
 
     /// Remaining window after all components (clamped at zero — estimates
@@ -315,6 +327,101 @@ impl ContextBreakdown {
     pub fn free_tokens(&self) -> usize {
         self.context_window.saturating_sub(self.used_tokens())
     }
+}
+
+/// Assemble the `/context` component list from pre-measured inputs. Pure so
+/// the row structure (parent buckets, detail children, ordering) is testable
+/// without a live agent, registry, or skill tree.
+///
+/// Detail rows immediately follow their parent bucket and are sorted by
+/// descending token count (name-ascending tiebreak) so the ordering is
+/// deterministic. Their tokens are already included in the parent:
+/// skill rows itemize part of the dynamic system-prompt suffix, and
+/// per-server rows itemize the MCP tool-schema bucket. An advertised
+/// `mcp_`-named definition missing from `mcp_server_of` (registry gone)
+/// still counts toward the MCP parent but gets no child row, so children
+/// sum to *at most* the parent, never more.
+fn breakdown_components(
+    stable_tokens: usize,
+    dynamic_tokens: usize,
+    tool_defs: &[crate::types::ToolDefinition],
+    mcp_server_of: &std::collections::HashMap<String, String>,
+    skill_sizes: &[(String, usize)],
+    history_tokens: usize,
+) -> Vec<ContextComponent> {
+    let (mut native_tools, mut mcp_tools) = (0usize, 0usize);
+    // BTreeMap for a deterministic walk; final order is by size below.
+    let mut per_server: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for d in tool_defs {
+        // Same per-definition formula the disclosure tier uses, so the
+        // two surfaces can't drift.
+        let tokens = crate::tool::definitions::estimate_def_tokens(d);
+        if d.function.name.starts_with("mcp_")
+            || d.function.name == crate::tool::names::SEARCH_TOOLS
+        {
+            mcp_tools += tokens;
+            if let Some(server) = mcp_server_of.get(&d.function.name) {
+                *per_server.entry(server.as_str()).or_default() += tokens;
+            }
+        } else {
+            native_tools += tokens;
+        }
+    }
+
+    // Descending by size, then name, so equal-sized rows can't flip order
+    // between invocations.
+    let sort_desc = |rows: &mut Vec<(String, usize)>| {
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    };
+    let mut skill_rows: Vec<(String, usize)> = skill_sizes
+        .iter()
+        .map(|(name, tokens)| (format!("Skill: {name}"), *tokens))
+        .collect();
+    sort_desc(&mut skill_rows);
+    let mut server_rows: Vec<(String, usize)> = per_server
+        .into_iter()
+        .map(|(server, tokens)| (format!("MCP: {server}"), tokens))
+        .collect();
+    sort_desc(&mut server_rows);
+
+    let detail = |rows: Vec<(String, usize)>| {
+        rows.into_iter().map(|(label, tokens)| ContextComponent {
+            label,
+            tokens,
+            detail: true,
+        })
+    };
+
+    let mut components = vec![
+        ContextComponent {
+            label: "System prompt (cache-stable prefix)".to_string(),
+            tokens: stable_tokens,
+            detail: false,
+        },
+        ContextComponent {
+            label: "System prompt (dynamic suffix)".to_string(),
+            tokens: dynamic_tokens,
+            detail: false,
+        },
+    ];
+    components.extend(detail(skill_rows));
+    components.push(ContextComponent {
+        label: "Tool schemas (native)".to_string(),
+        tokens: native_tools,
+        detail: false,
+    });
+    components.push(ContextComponent {
+        label: "Tool schemas (MCP)".to_string(),
+        tokens: mcp_tools,
+        detail: false,
+    });
+    components.extend(detail(server_rows));
+    components.push(ContextComponent {
+        label: "Conversation history".to_string(),
+        tokens: history_tokens,
+        detail: false,
+    });
+    components
 }
 
 /// LLM config for compaction summarizer calls: the operator's compaction
@@ -1087,7 +1194,8 @@ Rules:
         match result {
             Ok((ctx, report)) => {
                 self.warn_skill_budget_loss(&report);
-                self.caches.set_skills(user_request, ctx);
+                self.caches
+                    .set_skills(user_request, ctx, report.per_skill_tokens);
             }
             Err(e) => warn!("Failed to load skills context: {e}"),
         }
@@ -1120,41 +1228,22 @@ Rules:
 
         let stable = &built.text[..built.stable_prefix_len];
         let dynamic = &built.text[built.stable_prefix_len..];
-        let (mut native_tools, mut mcp_tools) = (0usize, 0usize);
-        for d in &tool_defs {
-            // Same per-definition formula the disclosure tier uses, so the
-            // two surfaces can't drift.
-            let tokens = crate::tool::definitions::estimate_def_tokens(d);
-            if d.function.name.starts_with("mcp_")
-                || d.function.name == crate::tool::names::SEARCH_TOOLS
-            {
-                mcp_tools += tokens;
-            } else {
-                native_tools += tokens;
-            }
-        }
-        let components = vec![
-            ContextComponent {
-                label: "System prompt (cache-stable prefix)".to_string(),
-                tokens: est(stable),
-            },
-            ContextComponent {
-                label: "System prompt (dynamic suffix)".to_string(),
-                tokens: est(dynamic),
-            },
-            ContextComponent {
-                label: "Tool schemas (native)".to_string(),
-                tokens: native_tools,
-            },
-            ContextComponent {
-                label: "Tool schemas (MCP)".to_string(),
-                tokens: mcp_tools,
-            },
-            ContextComponent {
-                label: "Conversation history".to_string(),
-                tokens: crate::conversation::history_tokens(&self.history),
-            },
-        ];
+        // build_system_prompt above rendered (or cache-hit) the skills
+        // catalog for exactly this request, so the cached per-skill sizes
+        // describe the dynamic suffix we just measured.
+        let skill_sizes: Vec<(String, usize)> = self
+            .caches
+            .skill_sizes_for_request(&user_msg)
+            .unwrap_or(&[])
+            .to_vec();
+        let components = breakdown_components(
+            est(stable),
+            est(dynamic),
+            &tool_defs,
+            &crate::mcp_clients::tool_server_map(),
+            &skill_sizes,
+            crate::conversation::history_tokens(&self.history),
+        );
         Ok(ContextBreakdown {
             context_window: self.active_context_window() as usize,
             components,
@@ -1396,10 +1485,156 @@ fn contains_untrusted_marker(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_flush_transcript, compaction_llm_config, contains_untrusted_marker, CompactionGate,
-        CompactionStrikes, MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
+        breakdown_components, build_flush_transcript, compaction_llm_config,
+        contains_untrusted_marker, CompactionGate, CompactionStrikes, ContextBreakdown,
+        MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
     };
     use crate::types::Message;
+
+    /// Spec for the `/context` detail rows: two skills and two MCP servers
+    /// must each produce a child row directly under their parent bucket,
+    /// per-server rows must sum exactly into the "Tool schemas (MCP)" parent
+    /// (no tool unattributed when the registry knows every name), children
+    /// must never inflate `used_tokens`, and ordering must be deterministic
+    /// (descending size).
+    #[test]
+    fn breakdown_details_split_skills_and_mcp_servers_without_double_counting() {
+        use crate::types::ToolDefinition;
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let tool_defs = vec![
+            ToolDefinition::new("run_shell", "Run a command.", schema.clone()),
+            ToolDefinition::new("mcp_github_search", "Search issues.", schema.clone()),
+            ToolDefinition::new(
+                "mcp_github_create",
+                "Create an issue with a much longer description so github outweighs linear.",
+                schema.clone(),
+            ),
+            ToolDefinition::new("mcp_linear_list", "List projects.", schema.clone()),
+        ];
+        let server_of: std::collections::HashMap<String, String> = [
+            ("mcp_github_search", "github"),
+            ("mcp_github_create", "github"),
+            ("mcp_linear_list", "linear"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        // One full-body skill and one downgraded (names-only) skill: the
+        // small one must still show its real cost rather than looking free.
+        let skill_sizes = vec![("calendar".to_string(), 40), ("research".to_string(), 900)];
+
+        let components =
+            breakdown_components(1_000, 2_000, &tool_defs, &server_of, &skill_sizes, 5_000);
+
+        let labels: Vec<(&str, usize, bool)> = components
+            .iter()
+            .map(|c| (c.label.as_str(), c.tokens, c.detail))
+            .collect();
+
+        // Skill children sit directly under the dynamic suffix, largest first.
+        let dyn_idx = labels
+            .iter()
+            .position(|(l, _, _)| *l == "System prompt (dynamic suffix)")
+            .expect("dynamic suffix bucket");
+        assert_eq!(
+            &labels[dyn_idx + 1..dyn_idx + 3],
+            &[
+                ("Skill: research", 900, true),
+                ("Skill: calendar", 40, true)
+            ],
+            "skill detail rows must follow their parent, sorted descending: {labels:?}"
+        );
+
+        // MCP children sit directly under the MCP bucket and sum into it.
+        let mcp_idx = labels
+            .iter()
+            .position(|(l, _, _)| *l == "Tool schemas (MCP)")
+            .expect("MCP bucket");
+        let mcp_parent = components[mcp_idx].tokens;
+        let children = &components[mcp_idx + 1..mcp_idx + 3];
+        assert!(
+            children
+                .iter()
+                .all(|c| c.detail && c.label.starts_with("MCP: ")),
+            "rows after the MCP bucket must be per-server details: {labels:?}"
+        );
+        assert_eq!(
+            children.iter().map(|c| c.tokens).sum::<usize>(),
+            mcp_parent,
+            "fully-attributed servers must sum exactly into the parent bucket"
+        );
+        assert_eq!(
+            children[0].label, "MCP: github",
+            "two github tools (one long) must outweigh linear: {labels:?}"
+        );
+        assert_eq!(children[1].label, "MCP: linear");
+
+        // Native bucket keeps the non-MCP tool and has no children.
+        let native = components
+            .iter()
+            .find(|c| c.label == "Tool schemas (native)")
+            .expect("native bucket");
+        assert!(native.tokens > 0 && !native.detail);
+
+        // Detail rows are display-only: totals count each token once.
+        let breakdown = ContextBreakdown {
+            context_window: 100_000,
+            components: components.clone(),
+        };
+        let top_level: usize = components
+            .iter()
+            .filter(|c| !c.detail)
+            .map(|c| c.tokens)
+            .sum();
+        assert_eq!(
+            breakdown.used_tokens(),
+            top_level,
+            "used_tokens must skip detail rows or the window double-counts"
+        );
+
+        // Deterministic: identical inputs produce the identical row list.
+        assert_eq!(
+            components,
+            breakdown_components(1_000, 2_000, &tool_defs, &server_of, &skill_sizes, 5_000)
+        );
+    }
+
+    /// An `mcp_`-named tool the registry can no longer attribute still counts
+    /// toward the MCP parent (the schema is really sent) but produces no
+    /// child row — children must sum to at most the parent, never more.
+    #[test]
+    fn breakdown_unattributed_mcp_tool_counts_in_parent_only() {
+        use crate::types::ToolDefinition;
+        let schema = serde_json::json!({"type": "object"});
+        let tool_defs = vec![
+            ToolDefinition::new("mcp_ghost_call", "Orphaned tool.", schema.clone()),
+            ToolDefinition::new("mcp_github_search", "Search.", schema.clone()),
+        ];
+        let server_of: std::collections::HashMap<String, String> =
+            [("mcp_github_search".to_string(), "github".to_string())]
+                .into_iter()
+                .collect();
+
+        let components = breakdown_components(0, 0, &tool_defs, &server_of, &[], 0);
+        let mcp_parent = components
+            .iter()
+            .find(|c| c.label == "Tool schemas (MCP)")
+            .expect("MCP bucket")
+            .tokens;
+        let child_sum: usize = components
+            .iter()
+            .filter(|c| c.detail && c.label.starts_with("MCP: "))
+            .map(|c| c.tokens)
+            .sum();
+        assert!(
+            child_sum < mcp_parent,
+            "orphaned schema tokens must stay in the parent: {child_sum} vs {mcp_parent}"
+        );
+        assert!(
+            components.iter().all(|c| c.label != "MCP: ghost"),
+            "no fabricated server row for an unattributable tool"
+        );
+    }
 
     const AGENT_RS_SRC: &str = include_str!("prompt_assembly.rs");
 

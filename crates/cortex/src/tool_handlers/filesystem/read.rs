@@ -458,6 +458,52 @@ mod tests {
     }
 
     #[test]
+    fn handle_read_file_non_utf8_flagged_binary_not_mojibake() {
+        // A latin-1 (non-UTF-8) file must be refused as binary, never served
+        // as lossy text: U+FFFD replacement chars are "printable", so if the
+        // read path ever switched to a lossy decode, the model would edit the
+        // mojibake and write it back, permanently destroying the original
+        // bytes. A valid UTF-8 file with multibyte chars must still read fine.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let latin1 = dir.path().join("latin1.txt");
+        // "café" in latin-1: 0xE9 is invalid as UTF-8 here.
+        std::fs::write(&latin1, [b'c', b'a', b'f', 0xE9, b'\n']).unwrap();
+        let result = handle_read_file(&json!({"path": latin1.to_string_lossy()}), &config).unwrap();
+        match result {
+            ToolOutput::Text(s) => {
+                assert!(
+                    !s.contains('\u{FFFD}'),
+                    "must never serve replacement-char mojibake as content: {s}"
+                );
+                assert!(
+                    s.contains("binary") || s.contains("Error reading file"),
+                    "non-UTF-8 file must be flagged unreadable/binary, got: {s}"
+                );
+                assert!(
+                    !s.starts_with("caf"),
+                    "must not serve the file as ordinary editable text: {s}"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
+
+        let utf8 = dir.path().join("utf8.txt");
+        std::fs::write(&utf8, "café — 日本語\n").unwrap();
+        let result = handle_read_file(&json!({"path": utf8.to_string_lossy()}), &config).unwrap();
+        match result {
+            ToolOutput::Text(s) => {
+                assert_eq!(
+                    s, "café — 日本語\n",
+                    "valid multibyte UTF-8 must read as-is"
+                )
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
     fn handle_read_file_blocked_path() {
         let config = Config::default();
         let home = dirs::home_dir().unwrap();

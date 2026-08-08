@@ -930,15 +930,14 @@ pub(crate) fn build_openai_request(
     });
     let chat_request = ChatRequest {
         model: request.model.to_string(),
-        // Repair replayed/resumed histories (duplicate tool_call_ids, orphaned
-        // tool results, consecutive assistant turns) that strict providers 400
-        // on. A no-op on well-formed live-loop histories. Streaming also runs
-        // the null-content/empty-message sanitizer first.
-        messages: if stream {
-            repair_message_sequence(&sanitize_openai_messages(request.messages))
-        } else {
-            repair_message_sequence(request.messages)
-        },
+        // Sanitize null-content/empty messages, then repair replayed/resumed
+        // histories (duplicate tool_call_ids, orphaned tool results,
+        // consecutive assistant turns) that strict providers 400 on. A no-op
+        // on well-formed live-loop histories. Both the streaming and
+        // non-streaming paths need this: non-streaming carries summarization,
+        // title generation, and aux-model calls, and a resumed session with a
+        // stub message would otherwise 400 exactly when it tries to compact.
+        messages: repair_message_sequence(&sanitize_openai_messages(request.messages)),
         tools,
         temperature: request.llm_config.temperature,
         max_tokens: request.llm_config.max_tokens,
@@ -2276,6 +2275,41 @@ mod tests {
         assert_eq!(params["properties"]["id"]["minLength"], 1);
         assert_eq!(params["properties"]["id"]["maxLength"], 36);
         assert_eq!(params["properties"]["tags"]["maxItems"], 4);
+    }
+
+    #[test]
+    fn build_openai_request_sanitizes_empty_messages_on_both_stream_modes() {
+        // A resumed session can carry an empty non-final assistant/user stub.
+        // Strict providers 400 on it, and the non-streaming path is exactly
+        // the one summarization/compaction and title generation use — the
+        // sanitizer must run there too, not only when streaming.
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant(""), // empty non-final stub — must be dropped
+            Message::user("continue"),
+        ];
+        let req = TransportRequest {
+            provider: Provider::OpenAi,
+            model: "gpt-4.1",
+            messages: &messages,
+            tools: None,
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        };
+
+        for stream in [false, true] {
+            let body = build_openai_request(&req, stream).expect("body");
+            let sent = body["messages"].as_array().expect("messages array");
+            assert_eq!(
+                sent.len(),
+                2,
+                "stream={stream}: empty stub not dropped: {body}"
+            );
+            assert_eq!(sent[0]["content"], "hi");
+            assert_eq!(sent[1]["content"], "continue");
+        }
     }
 
     #[test]

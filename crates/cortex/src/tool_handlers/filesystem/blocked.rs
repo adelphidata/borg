@@ -252,6 +252,52 @@ fn is_sensitive_pseudo_path(path: &std::path::Path) -> bool {
     }
 }
 
+/// Case-insensitive basenames of agent-instruction files that are read into
+/// future system prompts (see `crate::project_doc`) — plus the equivalent
+/// files of other agent tooling the user may keep in the same tree. A write to
+/// any of these persists into every later turn, which makes them the natural
+/// persistence target for a prompt injection. Matched on the final path
+/// component in ANY directory, so `.claude/CLAUDE.md`-style nesting is covered
+/// automatically.
+const INSTRUCTION_FILE_BASENAMES: &[&str] = &[
+    "agents.md",
+    "claude.md",
+    "gemini.md",
+    ".cursorrules",
+    ".clinerules",
+    ".windsurfrules",
+];
+
+/// Write deny for agent-instruction files, gated by
+/// `security.allow_instruction_writes` (default false).
+///
+/// Both the canonicalized form (symlinks and `..` resolved via
+/// [`canonicalize_write_target`], same double-check pattern as
+/// [`is_blocked_path`]) and the name-preserving literal form are matched, so
+/// neither a `sub/../AGENTS.md` traversal, a symlink whose target is an
+/// instruction file, nor a symlink *named* like one slips past. Reads are
+/// unaffected — only write paths consult this.
+pub fn is_instruction_file_write_denied(path: &std::path::Path) -> bool {
+    let resolved = canonicalize_write_target(path);
+    let literal = lexically_normalized(path);
+    [resolved.as_path(), literal.as_path()].iter().any(|p| {
+        p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            INSTRUCTION_FILE_BASENAMES.contains(&lower.as_str())
+        })
+    })
+}
+
+/// Denial message for an instruction-file write: short, actionable, and
+/// returned as a normal tool result (never a panic) so the model can read it.
+pub(crate) fn instruction_write_denied_message(raw_path: &str) -> String {
+    format!(
+        "Access denied: {raw_path} is an agent-instruction file that steers future \
+         agent behavior. Ask the user to edit it themselves, or have them set \
+         `security.allow_instruction_writes` to true."
+    )
+}
+
 /// Hard-coded write deny for Borg control-plane files inside `$BORG_HOME`.
 ///
 /// Returns `true` if `path` resolves (after `canonicalize`) to:
@@ -1019,6 +1065,68 @@ mod tests {
             is_blocked_path(&entry, &blocked, &[]),
             "two-hop symlink into .ssh must canonicalize and be blocked"
         );
+    }
+
+    #[test]
+    fn instruction_file_write_deny_table() {
+        // Protected instruction-file basenames must be denied case-insensitively
+        // in any directory; unrelated names must not be swept up. Table-driven
+        // over (path, expected_denied).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir_all(root.join("sub/deep")).expect("mkdir");
+        let cases: &[(&str, bool)] = &[
+            ("AGENTS.md", true),
+            ("agents.md", true), // lowercase variant
+            ("CLAUDE.md", true),
+            ("sub/deep/AGENTS.md", true),    // nested dir
+            ("sub/.claude/CLAUDE.md", true), // dot-dir nesting via basename
+            ("sub/../AGENTS.md", true),      // traversal must not launder
+            (".cursorrules", true),
+            (".clinerules", true),
+            (".windsurfrules", true),
+            ("GEMINI.md", true),
+            ("NOTES.md", false),      // unrelated markdown
+            ("sub/README.md", false), // unrelated nested
+            ("MYAGENTS.md", false),   // shares a suffix, not the basename
+            ("agents.md.txt", false), // basename match is exact, not prefix
+        ];
+        for (rel, denied) in cases {
+            let path = root.join(rel);
+            assert_eq!(
+                is_instruction_file_write_denied(&path),
+                *denied,
+                "unexpected verdict for {rel}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn instruction_file_write_deny_resolves_symlink() {
+        // A symlink with an innocuous name whose target is an instruction file
+        // must be denied via the canonicalized form — otherwise a prepared
+        // symlink lets a write reach AGENTS.md under a laundered name.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let target = root.join("AGENTS.md");
+        std::fs::write(&target, b"# rules").expect("seed");
+        let link = root.join("innocuous.md");
+        symlink(&target, &link).expect("symlink");
+        assert!(
+            is_instruction_file_write_denied(&link),
+            "symlink to AGENTS.md must be denied via canonicalization"
+        );
+        // And the inverse: a symlink *named* AGENTS.md pointing elsewhere is
+        // denied by the literal (name-preserving) form.
+        let harmless = root.join("harmless.txt");
+        std::fs::write(&harmless, b"x").expect("seed harmless");
+        let named = root.join("sub_agents_dir");
+        std::fs::create_dir_all(&named).expect("mkdir");
+        let named_link = named.join("agents.md");
+        symlink(&harmless, &named_link).expect("symlink named agents.md");
+        assert!(is_instruction_file_write_denied(&named_link));
     }
 
     #[test]

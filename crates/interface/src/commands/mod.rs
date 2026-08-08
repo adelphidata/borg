@@ -14,6 +14,7 @@ pub(crate) mod mcp_client;
 pub(crate) mod memory;
 pub(crate) mod misc;
 pub(crate) mod pairing;
+pub(crate) mod pause;
 pub(crate) mod providers;
 pub(crate) mod revoke;
 pub(crate) mod sessions;

@@ -10,6 +10,8 @@ pub mod dedup;
 pub mod inbound_prep;
 /// Inbound link expansion/understanding.
 pub mod link_understanding;
+/// Outbound `[MEDIA:<path>]` attachment delivery + fallback notices.
+pub(crate) mod media_egress;
 /// Placeholders for inbound media that failed to download.
 pub(crate) mod media_failure;
 /// Plain-text rendering for SMS/iMessage and similar channels.

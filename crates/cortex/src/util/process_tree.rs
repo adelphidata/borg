@@ -49,6 +49,64 @@ pub(crate) fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+/// Current working directory of a live process, if the platform can report it.
+///
+/// Used by persistent shell sessions to notice when a `cd` moved the session
+/// somewhere new. Best-effort by design: `None` (unsupported platform, dead
+/// pid, or a failed kernel query) simply means "unknown" and callers must
+/// treat it as "no observable change", never as an error.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Current working directory of a live process, if the platform can report it.
+///
+/// macOS: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, which works without extra
+/// entitlements for our own (same-uid) children.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: FFI call writing at most `size` bytes into `info`, which is a
+    // plain-old-data struct we own; a non-positive return means the kernel
+    // wrote nothing usable and we bail before reading it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    // `vip_path` is declared as `[[c_char; 32]; 32]` (a libc workaround for
+    // `[c_char; MAXPATHLEN]`) — one contiguous NUL-terminated 1024-byte path.
+    // SAFETY: reinterpreting the initialized, contiguous char array as bytes.
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 32 * 32)
+    };
+    let len = bytes.iter().position(|&b| b == 0)?;
+    if len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &bytes[..len],
+    )))
+}
+
+/// Current working directory of a live process — unsupported on this
+/// platform, so always `None` ("unknown", not an error).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Whether `pid` still exists. Signal 0 performs the permission and existence
 /// checks without delivering anything.
 ///

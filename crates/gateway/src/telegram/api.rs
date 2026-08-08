@@ -706,19 +706,28 @@ impl TelegramClient {
             }
         }
 
-        let bytes = resp
-            .bytes()
+        // Streamed read with a running cap — Content-Length can lie or be
+        // absent, so the ceiling is enforced chunk-by-chunk. Inlined (rather
+        // than the shared capped reader) because chunk-read errors embed the
+        // request URL, which contains the bot token and must go through
+        // `scrub_err`.
+        let mut resp = resp;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to read file bytes"))?;
-
-        if bytes.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
-            bail!(
-                "Downloaded file too large: {} bytes (max {TELEGRAM_MAX_FILE_SIZE_BYTES})",
-                bytes.len()
-            );
+            .map_err(|e| self.scrub_err(e, "Failed to read file bytes"))?
+        {
+            if bytes.len() as u64 + chunk.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
+                bail!(
+                    "Downloaded file too large: exceeds max {TELEGRAM_MAX_FILE_SIZE_BYTES} bytes \
+                     (Content-Length was absent or understated)"
+                );
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Send a message with an inline keyboard.

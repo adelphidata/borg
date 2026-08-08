@@ -100,6 +100,37 @@ pub trait NativeChannel: Send + Sync {
         Ok(())
     }
 
+    /// Whether this channel can attach local files to replies via
+    /// [`NativeChannel::send_media`]. Channels that leave this `false` get a
+    /// text fallback notice from the media-egress path instead of a silent
+    /// drop.
+    fn supports_media_attachments(&self) -> bool {
+        false
+    }
+
+    /// Send one local file as an attachment on this channel, using
+    /// `response_context` to reconstruct the delivery target. `caption` is a
+    /// short optional caption (channels without a caption concept may ignore
+    /// it — the filename is still shown by the platform).
+    ///
+    /// Callers must validate the path first
+    /// (`cortex::agent::media_markers::validate_media_path`); implementations
+    /// may assume it points at an existing regular file.
+    async fn send_media(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        response_context: &serde_json::Value,
+        health: &Arc<RwLock<ChannelHealthRegistry>>,
+    ) -> Result<()> {
+        let _ = (caption, response_context, health);
+        anyhow::bail!(
+            "channel {} has no attachment support for {}",
+            self.names()[0],
+            path.display()
+        )
+    }
+
     /// Return the bot mention string for group activation filtering.
     /// E.g., `Some("@mybot")` for Telegram, `Some("<@U123>")` for Slack.
     fn bot_mention(&self) -> Option<String> {
@@ -370,6 +401,13 @@ pub async fn dispatch_webhook(
                             &response_text,
                         );
 
+                        // Media egress: pull `[MEDIA:<path>]` markers out of the
+                        // reply. Attachments are delivered after the response
+                        // context is prepared (below); failures become text
+                        // notices so they ride the normal delivery path.
+                        let (clean_text, media_paths) =
+                            cortex::agent::media_markers::extract_media_markers(&response_text);
+
                         // Persist to delivery queue for at-least-once guarantee.
                         // A single DB connection is reused for enqueue + status update.
                         let delivery_id = uuid::Uuid::new_v4().to_string();
@@ -396,6 +434,43 @@ pub async fn dispatch_webhook(
                                 "Failed to prepare {channel_name} response context: {e}"
                             );
                         }
+
+                        // Deliver attachments first so any failure notice can
+                        // be appended to the text reply below. Attachment
+                        // sends are live-only (not replayed by the delivery
+                        // queue's retry loop); the queued text carries the
+                        // notices for anything that did not go out.
+                        let (any_media_sent, media_notices) = if media_paths.is_empty() {
+                            (false, Vec::new())
+                        } else {
+                            crate::message_processing::media_egress::deliver_reply_media(
+                                channel.as_ref(),
+                                &media_paths,
+                                &config.security,
+                                clean_text.trim().is_empty(),
+                                &response_context,
+                                &health,
+                            )
+                            .await
+                        };
+
+                        let response_text =
+                            match crate::message_processing::media_egress::compose_reply_text(
+                                &clean_text,
+                                &media_notices,
+                            ) {
+                                Some(text) => text,
+                                None => {
+                                    // Marker-only reply whose attachments all
+                                    // went out — the attachments carry the
+                                    // content, nothing left to send as text.
+                                    debug_assert!(any_media_sent || media_paths.is_empty());
+                                    tracing::debug!(
+                                        "{channel_name} reply was attachment-only; text send skipped"
+                                    );
+                                    return;
+                                }
+                            };
 
                         let payload = serde_json::json!({
                             "text": response_text,

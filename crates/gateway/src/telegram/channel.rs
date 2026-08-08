@@ -136,6 +136,60 @@ impl NativeChannel for TelegramChannel {
         .await
     }
 
+    fn supports_media_attachments(&self) -> bool {
+        true
+    }
+
+    async fn send_media(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        response_context: &serde_json::Value,
+        health: &Arc<RwLock<ChannelHealthRegistry>>,
+    ) -> Result<()> {
+        use anyhow::Context as _;
+
+        let ctx: TelegramResponseContext = serde_json::from_value(response_context.clone())?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read media file {}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        // Telegram caps captions at 1024 chars; truncate rather than let the
+        // whole send 400.
+        let caption = caption.map(|c| c.chars().take(1024).collect::<String>());
+        let source = super::types::MediaSource::Bytes {
+            bytes: &bytes,
+            filename,
+            mime: None,
+        };
+
+        let result = if super::delivery::is_photo_path(path) {
+            self.client
+                .send_photo(ctx.chat_id, source, caption.as_deref(), ctx.thread_id, None)
+                .await
+        } else {
+            self.client
+                .send_document(ctx.chat_id, source, caption.as_deref(), ctx.thread_id, None)
+                .await
+        };
+        match result {
+            Ok(()) => {
+                health.write().await.record_outbound("telegram");
+                Ok(())
+            }
+            Err(e) => {
+                health
+                    .write()
+                    .await
+                    .record_error("telegram", &e.to_string());
+                Err(e)
+            }
+        }
+    }
+
     async fn prepare_response_context(
         &self,
         response_context: &mut serde_json::Value,

@@ -1,4 +1,5 @@
 pub mod filesystem;
+pub(crate) mod hints;
 mod list;
 mod media;
 mod memory;

@@ -155,10 +155,54 @@ impl DispatchHarness {
         .expect("create due prompt task");
     }
 
+    /// Insert an *interval* `scheduled_tasks` row, due now, with the given
+    /// preamble and monitor mode armed. Interval (not `once`) so the task
+    /// stays active after a run and the test can re-arm `next_run` to drive
+    /// a second and third dispatch against the same row.
+    async fn seed_monitor_task(&self, id: &str, pre_run_command: &str) {
+        let db = Database::open().await.expect("open db");
+        let now = chrono::Utc::now().timestamp();
+        db.create_task(&NewTask {
+            id,
+            name: id,
+            prompt: "report status",
+            schedule_type: "interval",
+            schedule_expr: "5m",
+            timezone: "UTC",
+            next_run: Some(now - 1),
+            max_retries: Some(0),
+            timeout_ms: Some(15_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: Some(pre_run_command),
+            pre_run_cwd: None,
+            pre_run_timeout_ms: Some(5_000),
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create monitor task");
+        assert!(
+            db.set_task_monitor_mode(id, true)
+                .await
+                .expect("arm monitor"),
+            "monitor flag must land on the seeded task"
+        );
+    }
+
     /// Spin up `scheduler::run` and poll until the task either succeeds in
     /// `task_runs` or the timeout elapses. Returns once the task row exists,
     /// regardless of status (the test asserts on captured request bodies).
     async fn run_until_task_recorded(self, task_id: &str) -> (MockServer, bool) {
+        let recorded = self.run_until_n_runs(task_id, 1).await;
+        (self.server, recorded)
+    }
+
+    /// Spin up `scheduler::run` and poll until `task_id` has at least `n`
+    /// rows in `task_runs` (or 15s elapse). Borrows the harness so a test
+    /// can dispatch the same row repeatedly, mutating state in between.
+    async fn run_until_n_runs(&self, task_id: &str, n: usize) -> bool {
         let shutdown = CancellationToken::new();
         let semaphore = Arc::new(Semaphore::new(2));
         let hooks = scheduler::DispatcherHooks {
@@ -187,18 +231,27 @@ impl DispatchHarness {
         while started.elapsed() < Duration::from_secs(15) {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let db = Database::open().await.expect("db");
-            if let Ok(rows) = db.task_run_history(task_id, 5).await {
-                if !rows.is_empty() {
+            if let Ok(rows) = db.task_run_history(task_id, 10).await {
+                // A run row is inserted at *claim* time with status
+                // 'running'; wait for the newest to reach a terminal state so
+                // callers can assert on captured requests and ledger rows
+                // without racing the in-flight execution.
+                if rows.len() >= n && rows.first().is_some_and(|r| r.status != "running") {
                     recorded = true;
                     break;
                 }
             }
         }
 
+        // The terminal task_runs status lands just before trailing writes in
+        // the same finalize block (e.g. the monitor baseline hash). Give the
+        // spawned execution a beat to finish them before callers assert.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), dispatcher).await;
 
-        (self.server, recorded)
+        recorded
     }
 }
 
@@ -320,5 +373,158 @@ async fn failure_preamble_still_invokes_llm_with_failed_status() {
         user.contains("report status"),
         "the original task prompt must follow the preprocessed_context block \
          even on preamble failure; got:\n{user}"
+    );
+}
+
+/// Re-arm an interval task so the dispatcher claims it again immediately.
+async fn make_due_again(task_id: &str) {
+    let db = Database::open().await.expect("db");
+    let now = chrono::Utc::now().timestamp();
+    db.update_task_next_run(task_id, Some(now - 1))
+        .await
+        .expect("re-arm next_run");
+}
+
+async fn stored_pre_run_hash(task_id: &str) -> Option<String> {
+    let db = Database::open().await.expect("db");
+    db.get_task_by_id(task_id)
+        .await
+        .expect("get task")
+        .expect("task exists")
+        .last_pre_run_hash
+}
+
+/// Monitor mode, unchanged output: the first run of a monitor task must
+/// execute (no baseline yet) and persist one; a re-run with byte-identical
+/// pre-run output must NOT invoke the LLM, must be recorded as a no-change
+/// run, and must leave the baseline hash untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_unchanged_pre_run_skips_llm_and_keeps_baseline() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let h = DispatchHarness::setup().await;
+    h.mount_text_response("all quiet").await;
+    h.seed_monitor_task("monitor-stable", "echo stable-output")
+        .await;
+
+    // First run: no baseline → must reach the LLM and store one.
+    assert!(h.run_until_n_runs("monitor-stable", 1).await);
+    assert_eq!(
+        captured_chat_bodies(&h.server).await.len(),
+        1,
+        "first monitored run has no baseline and must invoke the LLM"
+    );
+    let baseline = stored_pre_run_hash("monitor-stable").await;
+    assert!(
+        baseline.is_some(),
+        "first monitored run must persist the pre_run output hash as baseline"
+    );
+
+    // Second run: identical output → skip the LLM, record no-change.
+    make_due_again("monitor-stable").await;
+    assert!(h.run_until_n_runs("monitor-stable", 2).await);
+    assert_eq!(
+        captured_chat_bodies(&h.server).await.len(),
+        1,
+        "unchanged pre_run output must not invoke the LLM again"
+    );
+    let db = Database::open().await.expect("db");
+    let runs = db.task_run_history("monitor-stable", 10).await.unwrap();
+    assert_eq!(runs.len(), 2, "exactly two runs must be in the ledger");
+    // `started_at` has second granularity, so the two runs may tie and come
+    // back in either order — find the suppressed one by its marker.
+    let no_change = runs
+        .iter()
+        .find(|r| r.result.as_deref().unwrap_or("").contains("no_change"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the run ledger must mark the suppressed run as no_change; got {:?}",
+                runs.iter().map(|r| r.result.clone()).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        no_change.status, "success",
+        "a no-change run completed — it did exactly what monitoring asked"
+    );
+    assert_eq!(
+        stored_pre_run_hash("monitor-stable").await,
+        baseline,
+        "a skipped run must not move the baseline"
+    );
+}
+
+/// Monitor mode, changed output and pre-run failure: changed output runs the
+/// LLM (with a change note) and rebaselines; a failing pre-run runs the LLM
+/// normally and leaves the stored baseline untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_changed_output_reruns_and_failure_keeps_hash() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let h = DispatchHarness::setup().await;
+    h.mount_text_response("noted").await;
+
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let state_file = state_dir.path().join("state.txt");
+    std::fs::write(&state_file, "v1\n").expect("write v1");
+    // `cat` of a state file the test mutates between dispatches. Deleting the
+    // file later makes the same command fail (non-zero) without editing the task.
+    let cmd = format!("cat {}", state_file.display());
+    h.seed_monitor_task("monitor-change", &cmd).await;
+
+    // Run 1: baseline v1.
+    assert!(h.run_until_n_runs("monitor-change", 1).await);
+    assert_eq!(captured_chat_bodies(&h.server).await.len(), 1);
+    let hash_v1 = stored_pre_run_hash("monitor-change")
+        .await
+        .expect("baseline v1");
+
+    // Run 2: output changed → LLM runs again, baseline moves.
+    std::fs::write(&state_file, "v2\n").expect("write v2");
+    make_due_again("monitor-change").await;
+    assert!(h.run_until_n_runs("monitor-change", 2).await);
+    let bodies = captured_chat_bodies(&h.server).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "changed pre_run output must invoke the LLM"
+    );
+    let user = user_message_text(&bodies[1]).expect("second run user message");
+    assert!(
+        user.contains("v2"),
+        "the new output must be injected into the prompt; got:\n{user}"
+    );
+    assert!(
+        user.contains("<monitor_note>"),
+        "a changed monitored run must carry the change note; got:\n{user}"
+    );
+    let hash_v2 = stored_pre_run_hash("monitor-change")
+        .await
+        .expect("baseline v2");
+    assert_ne!(hash_v2, hash_v1, "changed output must store a new baseline");
+
+    // Run 3: pre-run fails (file gone) → LLM still runs (failure surfaced),
+    // baseline untouched. A failure is not a change.
+    std::fs::remove_file(&state_file).expect("remove state file");
+    make_due_again("monitor-change").await;
+    assert!(h.run_until_n_runs("monitor-change", 3).await);
+    let bodies = captured_chat_bodies(&h.server).await;
+    assert_eq!(
+        bodies.len(),
+        3,
+        "a failing pre_run must run the task normally, never silently skip"
+    );
+    let user = user_message_text(&bodies[2]).expect("third run user message");
+    assert!(
+        user.contains("status=\"failed\""),
+        "the pre_run failure must be surfaced to the model; got:\n{user}"
+    );
+    assert_eq!(
+        stored_pre_run_hash("monitor-change").await.as_deref(),
+        Some(hash_v2.as_str()),
+        "a failed pre_run must leave the stored baseline untouched"
     );
 }

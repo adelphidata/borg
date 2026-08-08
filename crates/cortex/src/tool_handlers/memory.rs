@@ -578,7 +578,10 @@ fn format_message_fts_hits(hits: &[crate::db::MessageFtsHit]) -> String {
     }
     let mut out = String::from("## Session message matches\n");
     for (i, h) in hits.iter().enumerate() {
-        let snippet = truncate_for_display(&h.content, 240);
+        // Strip persisted ANSI escapes BEFORE truncating so escape bytes
+        // don't consume the snippet budget or re-enter model context.
+        let clean = crate::util::ansi::strip_ansi(&h.content);
+        let snippet = truncate_for_display(&clean, 240);
         out.push_str(&format!(
             "\n{}. session={} role={} score={:.3}\n   {}\n",
             i + 1,
@@ -609,12 +612,16 @@ pub fn format_search_results(results: &[embeddings::SearchResult]) -> String {
             (Some(s), Some(e)) => format!("lines {s}-{e}, "),
             _ => String::new(),
         };
+        // Chunks indexed before ANSI stripping landed at index time may still
+        // carry escapes — strip at this recall boundary too, before the
+        // 500-char cap so escape bytes don't consume the snippet budget.
+        let clean = crate::util::ansi::strip_ansi(&r.snippet);
         output.push_str(&format!(
             "[{}] {} ({lines}score: {:.2})\n> {}\n\n",
             i + 1,
             r.filename,
             r.score,
-            r.snippet.chars().take(500).collect::<String>()
+            clean.chars().take(500).collect::<String>()
         ));
     }
     output.trim_end().to_string()
@@ -719,6 +726,35 @@ mod tests {
         assert!(out.contains("xyz"), "second session_id must be rendered");
         assert!(out.contains("deploy"));
         assert!(out.contains("1.230") || out.contains("1.23"));
+    }
+
+    #[test]
+    fn format_message_fts_hits_strips_ansi_before_truncation() {
+        // A persisted message whose content fits the 240-char snippet budget
+        // only after ANSI stripping must come back clean AND untruncated:
+        // escape bytes must not consume the content budget.
+        let visible = "v".repeat(240);
+        let content = format!(
+            "{}{visible}",
+            "\u{1b}[31m\u{1b}[0m\u{1b}[2A\u{1b}]0;t\u{07}".repeat(20)
+        );
+        let hits = vec![crate::db::MessageFtsHit {
+            id: 1,
+            session_id: "abc".into(),
+            role: "tool".into(),
+            content,
+            created_at: 0,
+            score: 1.0,
+        }];
+        let out = format_message_fts_hits(&hits);
+        assert!(
+            !out.contains('\u{1b}'),
+            "no escape bytes may reach model context"
+        );
+        assert!(
+            out.contains(&visible) && !out.contains('…'),
+            "content fitting the budget after stripping must not be truncated"
+        );
     }
 
     #[test]

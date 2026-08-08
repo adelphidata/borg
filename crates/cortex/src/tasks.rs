@@ -714,6 +714,8 @@ mod tests {
             last_response_hash: None,
             model: None,
             model_provider: None,
+            monitor_mode: false,
+            last_pre_run_hash: None,
         };
         assert!(
             !format_task(&task).contains("Last error"),

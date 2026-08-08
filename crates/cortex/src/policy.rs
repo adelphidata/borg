@@ -845,6 +845,20 @@ pub(crate) fn command_fragments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// [`command_fragments`] further split on single `|`: one entry per pipeline
+/// stage. The shared approximation of "the simple commands inside this shell
+/// string" — callers needing per-stage head commands (failure hints, env-file
+/// read detection) must use this rather than rolling their own splitter, so
+/// every layer fragments a command the same way.
+pub(crate) fn pipeline_segments(command: &str) -> Vec<&str> {
+    command_fragments(command)
+        .into_iter()
+        .flat_map(|fragment| fragment.split('|'))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
 /// Filenames/paths that must not be *written* via `cp`/`mv`/`install` or shell
 /// redirection — SSH-key implant (`authorized_keys`, private keys), credential
 /// theft (`.netrc`, `.aws/credentials`, `.pgpass`, `.npmrc`, `.pypirc`), and

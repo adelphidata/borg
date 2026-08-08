@@ -114,6 +114,15 @@ impl SessionHost {
         self.inner.buffer.subscribe()
     }
 
+    /// True while at least one event-stream subscriber is attached (a gRPC
+    /// `Session.Stream` holds a broadcast receiver for its whole lifetime).
+    /// The registry sweep treats a subscribed host like a busy one: never
+    /// evicted — closing a host under an attached client would kill its
+    /// stream, and `Send`/`Cancel` do not rebuild hosts.
+    pub fn has_subscribers(&self) -> bool {
+        self.inner.buffer.receiver_count() > 0
+    }
+
     /// Push an out-of-band [`SystemNotice`](protocols::session::SystemNotice)
     /// event into the session's buffer so live subscribers and replayers see
     /// it as a system cell. Used by daemon-level emitters (posture
@@ -416,10 +425,49 @@ fn spawn_deadline_watcher(
     });
 }
 
+/// A session idle longer than this becomes eligible for eviction. Eviction is
+/// lossless: history is persisted in SQLite by the cortex session layer, and a
+/// later turn rebuilds the host from the persisted session (gRPC `Open` with a
+/// resume id, or the gateway executor's `ensure_host`).
+pub const SESSION_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Hard cap on live hosts. When exceeded, the least-recently-active idle
+/// sessions are evicted first. Each host owns an `Agent` with in-memory
+/// history, so an unbounded registry grows until the OS kills the daemon.
+pub const SESSION_REGISTRY_MAX: usize = 128;
+
+/// How long daemon shutdown waits for in-flight turns to finish before
+/// closing hosts anyway. Same ceiling-not-promise semantics as the gateway's
+/// restart drain: a wedged turn must never make the daemon unstoppable, but
+/// the common case (a turn a few seconds from done) should complete and have
+/// its full tail persisted.
+pub const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll interval while draining at shutdown. Short enough that an idle daemon
+/// stops with no perceptible delay.
+pub const SHUTDOWN_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bound on each host's close during shutdown. `close()` cancels any
+/// still-running turn and then waits for the backend to finalize (the agent
+/// mutex is held for the turn's duration); this cap keeps a backend that
+/// ignores cancellation from wedging the shutdown.
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One registry slot: the host plus its last-activity stamp.
+struct RegistryEntry {
+    host: SessionHost,
+    last_activity: std::time::Instant,
+}
+
 /// Daemon-wide map of `session_id` → live `SessionHost`. Cheap-to-clone.
+///
+/// Bounded: [`SessionRegistry::sweep`] (driven by the session-heartbeat
+/// poller) evicts idle-expired entries and enforces [`SESSION_REGISTRY_MAX`]
+/// LRU-first. A session with a turn in flight, a live event-stream
+/// subscriber, or an id in the caller's exempt set is never evicted.
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
-    inner: Arc<Mutex<HashMap<String, SessionHost>>>,
+    inner: Arc<Mutex<HashMap<String, RegistryEntry>>>,
 }
 
 impl SessionRegistry {
@@ -434,25 +482,45 @@ impl SessionRegistry {
     /// background so this call stays sync).
     pub fn insert(&self, host: SessionHost) {
         let id = host.id().to_string();
+        let entry = RegistryEntry {
+            host,
+            last_activity: std::time::Instant::now(),
+        };
         let prior = {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.insert(id, host)
+            guard.insert(id, entry)
         };
         if let Some(prior) = prior {
-            tokio::spawn(async move { prior.close().await });
+            tokio::spawn(async move { prior.host.close().await });
         }
     }
 
-    /// Look up a session by id.
+    /// Look up a session by id, refreshing its last-activity stamp. Every
+    /// turn-driving path (gRPC `Send`, gateway executor, heartbeat fire) goes
+    /// through here, so "recently `get`" ≈ "recently active".
     pub fn get(&self, id: &str) -> Option<SessionHost> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_mut(id).map(|e| {
+            e.last_activity = std::time::Instant::now();
+            e.host.clone()
+        })
+    }
+
+    /// Look up a session by id WITHOUT refreshing its last-activity stamp.
+    /// For pure inspection (busy checks, status polls) that must not keep an
+    /// otherwise-idle session alive past its TTL.
+    pub fn peek(&self, id: &str) -> Option<SessionHost> {
         let guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(id).cloned()
+        guard.get(id).map(|e| e.host.clone())
     }
 
     /// Remove and return a session host.
@@ -462,7 +530,172 @@ impl SessionRegistry {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(id)
+            guard.remove(id).map(|e| e.host)
+        }
+    }
+
+    /// Evict idle-expired entries and enforce the entry cap, LRU-first.
+    /// Returns the number of sessions evicted.
+    ///
+    /// Rules:
+    /// * an entry idle for `idle_ttl` or longer is evicted;
+    /// * if the map still holds more than `max_entries`, the least-recently-
+    ///   active entries are evicted until it fits;
+    /// * a busy host (turn in flight) is NEVER evicted, even when idle-expired
+    ///   or over-cap — it is skipped and reconsidered on the next sweep;
+    /// * a host with a live event-stream subscriber (an attached client, e.g.
+    ///   an open TUI holding `Session.Stream`) is treated like a busy one and
+    ///   never evicted in either pass — `Send`/`Cancel` do not rebuild hosts,
+    ///   so evicting under an attached client would close its stream and turn
+    ///   the next message into a NotFound;
+    /// * ids in `exempt` (sessions with an active session-heartbeat row) are
+    ///   never evicted in either pass, INCLUDING the count cap: heartbeats
+    ///   fire only into a live host and nothing on the heartbeat path
+    ///   rebuilds one, so eviction would strand the row due-forever. A
+    ///   bounded number of heartbeat sessions staying resident is
+    ///   user-configured intent, not a leak.
+    ///
+    /// Evicted hosts are closed in the background (persist + finalize), the
+    /// same way `insert` retires a replaced host. Must be called from within a
+    /// tokio runtime.
+    pub fn sweep(
+        &self,
+        idle_ttl: std::time::Duration,
+        max_entries: usize,
+        exempt: &std::collections::HashSet<String>,
+    ) -> usize {
+        let now = std::time::Instant::now();
+        let evictable = |id: &String, e: &RegistryEntry| {
+            !e.host.is_busy() && !e.host.has_subscribers() && !exempt.contains(id)
+        };
+        let evicted: Vec<(String, std::time::Duration, SessionHost)> = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            // Pass 1: idle-TTL expiry.
+            let mut ids: Vec<String> = guard
+                .iter()
+                .filter(|(id, e)| {
+                    now.duration_since(e.last_activity) >= idle_ttl && evictable(id, e)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            // Pass 2: count cap — evict least-recently-active idle hosts until
+            // the survivors fit. Busy/subscribed/exempt hosts are skipped, so
+            // the map may transiently stay over cap when everything is
+            // mid-turn or attached.
+            let remaining = guard.len() - ids.len();
+            if remaining > max_entries {
+                let mut candidates: Vec<(String, std::time::Instant)> = guard
+                    .iter()
+                    .filter(|(id, e)| evictable(id, e) && !ids.contains(*id))
+                    .map(|(id, e)| (id.clone(), e.last_activity))
+                    .collect();
+                candidates.sort_by_key(|(_, at)| *at);
+                let overflow = remaining - max_entries;
+                ids.extend(candidates.into_iter().take(overflow).map(|(id, _)| id));
+            }
+
+            ids.into_iter()
+                .filter_map(|id| {
+                    guard
+                        .remove(&id)
+                        .map(|e| (id, now.duration_since(e.last_activity), e.host))
+                })
+                .collect()
+        };
+
+        let n = evicted.len();
+        for (id, idle_for, host) in evicted {
+            tracing::info!(
+                session_id = %id,
+                idle_secs = idle_for.as_secs(),
+                "evicting idle session host (history persisted; a later turn rebuilds it)"
+            );
+            tokio::spawn(async move { host.close().await });
+        }
+        n
+    }
+
+    /// Drain-then-finalize for daemon shutdown: wait (bounded by
+    /// `drain_timeout`, polled every `poll`) for every in-flight turn to
+    /// settle, then remove and close every host so end-of-session work
+    /// (partial-tail persistence, short-term-memory flush, lease release)
+    /// runs from a settled transcript instead of being dropped with the
+    /// runtime.
+    ///
+    /// Ordering is the invariant: finalize happens strictly AFTER the drain
+    /// wait. A host still busy when the ceiling is hit is closed anyway —
+    /// `close()` cancels its turn token, the agent loop persists the partial
+    /// tail with an interruption marker, and only then does the backend
+    /// finalize. Returns the number of hosts closed.
+    pub async fn shutdown_close_all(
+        &self,
+        drain_timeout: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        loop {
+            let busy = {
+                let guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.values().filter(|e| e.host.is_busy()).count()
+            };
+            if busy == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    busy,
+                    timeout_secs = drain_timeout.as_secs(),
+                    "shutdown drain timed out with turns still in flight; \
+                     cancelling and closing anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(poll).await;
+        }
+
+        let hosts: Vec<SessionHost> = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.drain().map(|(_, e)| e.host).collect()
+        };
+        let n = hosts.len();
+        // Close concurrently: hosts are independent, and after a clean drain
+        // each close is a fast finalize. The per-host timeout guards against
+        // a backend that ignores cancellation.
+        let closes = hosts.into_iter().map(|host| async move {
+            if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, host.close())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    session_id = %host.id(),
+                    "session close timed out at shutdown; backend may not have finalized"
+                );
+            }
+        });
+        futures::future::join_all(closes).await;
+        n
+    }
+
+    /// Backdate an entry's last-activity stamp so eviction tests don't sleep.
+    #[cfg(test)]
+    pub(crate) fn backdate(&self, id: &str, by: std::time::Duration) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(e) = guard.get_mut(id) {
+            e.last_activity -= by;
         }
     }
 
@@ -476,7 +709,7 @@ impl SessionRegistry {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.values().cloned().collect()
+            guard.values().map(|e| e.host.clone()).collect()
         };
         let n = hosts.len();
         for h in hosts {
@@ -970,6 +1203,235 @@ mod tests {
         assert!(
             matches!(&last.kind, Some(Kind::TurnComplete(_))),
             "expected TurnComplete, got {:?}",
+            last.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_evicts_idle_expired_entry_and_closes_it() {
+        // Real failure mode: gateway channel sessions are inserted by the
+        // executor and (before eviction existed) removed only by explicit
+        // Close — a channel-heavy daemon grew without bound. An entry idle
+        // past the TTL must be removed AND its backend finalized, and a
+        // `peek` (pure inspection) must not have saved it.
+        let registry = SessionRegistry::new();
+        let backend = stub("s-idle", &[], 1);
+        let close_calls = backend.close_calls.clone();
+        registry.insert(SessionHost::new(backend));
+
+        registry.backdate("s-idle", Duration::from_secs(3600));
+        assert!(registry.peek("s-idle").is_some(), "peek must not evict");
+
+        let evicted = registry.sweep(
+            Duration::from_secs(1800),
+            SESSION_REGISTRY_MAX,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(evicted, 1);
+        assert!(
+            registry.get("s-idle").is_none(),
+            "idle-expired entry must be gone after sweep"
+        );
+        wait_for_close_calls(&close_calls, 1).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_never_evicts_busy_session_even_when_idle_expired() {
+        // The critical invariant: eviction mid-turn would abort a live LLM
+        // turn. A host whose turn is in flight stays, no matter how stale its
+        // activity stamp or how far over the cap the registry is.
+        let registry = SessionRegistry::new();
+        let host = SessionHost::new(stub("s-busy-evict", &["a", "b", "c"], 500));
+        registry.insert(host.clone());
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(host.is_busy());
+
+        registry.backdate("s-busy-evict", Duration::from_secs(3600));
+        // Both the TTL pass and the cap pass (max_entries = 0 puts every
+        // entry over cap) must skip the busy host.
+        let evicted = registry.sweep(Duration::from_secs(1), 0, &std::collections::HashSet::new());
+        assert_eq!(evicted, 0, "a busy session must never be evicted");
+        assert!(registry.peek("s-busy-evict").is_some());
+
+        host.cancel_turn().await;
+    }
+
+    #[tokio::test]
+    async fn sweep_cap_evicts_least_recently_active_first() {
+        // Real failure mode: cap eviction that picks arbitrary victims would
+        // churn hot sessions (dropping their warm history/prompt cache) while
+        // keeping cold ones resident.
+        let registry = SessionRegistry::new();
+        for id in ["s-old", "s-mid", "s-new"] {
+            registry.insert(SessionHost::new(stub(id, &[], 1)));
+        }
+        registry.backdate("s-old", Duration::from_secs(300));
+        registry.backdate("s-mid", Duration::from_secs(200));
+        registry.backdate("s-new", Duration::from_secs(100));
+
+        // TTL far in the future: only the cap pass may evict.
+        let evicted = registry.sweep(
+            Duration::from_secs(86_400),
+            2,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(evicted, 1);
+        assert!(
+            registry.peek("s-old").is_none(),
+            "least-recently-active entry must be the cap victim"
+        );
+        assert!(registry.peek("s-mid").is_some());
+        assert!(registry.peek("s-new").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_refreshes_recency_and_saves_entry_from_lru_eviction() {
+        // Real failure mode: if `get` (the turn-driving lookup) did not touch
+        // the activity stamp, an actively-used session would look idle and be
+        // evicted mid-conversation — losing its warm in-memory history.
+        let registry = SessionRegistry::new();
+        registry.insert(SessionHost::new(stub("s-touched", &[], 1)));
+        registry.insert(SessionHost::new(stub("s-stale", &[], 1)));
+        registry.backdate("s-touched", Duration::from_secs(600));
+        registry.backdate("s-stale", Duration::from_secs(300));
+
+        // Touch the older entry; it must now outrank the untouched one.
+        assert!(registry.get("s-touched").is_some());
+
+        let evicted = registry.sweep(
+            Duration::from_secs(86_400),
+            1,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(evicted, 1);
+        assert!(
+            registry.peek("s-touched").is_some(),
+            "a just-touched entry must survive the LRU cap"
+        );
+        assert!(registry.peek("s-stale").is_none());
+    }
+
+    #[tokio::test]
+    async fn sweep_spares_exempt_ids_in_both_passes_and_still_evicts_siblings() {
+        // Regression: a `/heartbeat every 2h` session idles past the 1h TTL,
+        // gets evicted, and its heartbeat never fires again — `select_fireable`
+        // needs a live host and nothing on the heartbeat path rebuilds one.
+        // An id in the exempt set must survive BOTH the TTL pass and the
+        // count-cap pass; a non-exempt sibling in the same sweep must not.
+        let registry = SessionRegistry::new();
+        registry.insert(SessionHost::new(stub("s-hb", &[], 1)));
+        registry.insert(SessionHost::new(stub("s-plain", &[], 1)));
+        registry.backdate("s-hb", Duration::from_secs(7200));
+        registry.backdate("s-plain", Duration::from_secs(7200));
+
+        let exempt = std::collections::HashSet::from(["s-hb".to_string()]);
+        // Both entries are idle-expired AND over cap (max_entries = 0), so
+        // one sweep exercises the exemption in both passes at once.
+        let evicted = registry.sweep(Duration::from_secs(3600), 0, &exempt);
+        assert_eq!(evicted, 1, "only the non-exempt sibling may be evicted");
+        assert!(
+            registry.peek("s-hb").is_some(),
+            "an exempt (heartbeat-owning) session must survive both passes"
+        );
+        assert!(
+            registry.peek("s-plain").is_none(),
+            "exemption must not shield unrelated idle sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_never_evicts_host_with_live_subscriber_until_it_detaches() {
+        // Regression: sweep ignored attached clients. An idle-but-open TUI
+        // (>1h without a message, Session.Stream still held) got its host
+        // closed under it; the next Send hit host_or_err → NotFound because
+        // only Open re-creates hosts.
+        let registry = SessionRegistry::new();
+        registry.insert(SessionHost::new(stub("s-attached", &[], 1)));
+        let host = registry.peek("s-attached").expect("present");
+        // Exactly what the gRPC Stream handler holds for its lifetime.
+        let rx = host.subscribe();
+        registry.backdate("s-attached", Duration::from_secs(7200));
+
+        let none = std::collections::HashSet::new();
+        // Idle-expired AND over cap (max_entries = 0): the subscribed host
+        // must survive both passes.
+        let evicted = registry.sweep(Duration::from_secs(3600), 0, &none);
+        assert_eq!(evicted, 0, "a host with a live subscriber is never evicted");
+        assert!(registry.peek("s-attached").is_some());
+
+        drop(rx);
+        let evicted = registry.sweep(Duration::from_secs(3600), 0, &none);
+        assert_eq!(
+            evicted, 1,
+            "once the last subscriber detaches the host is evictable again"
+        );
+        assert!(registry.peek("s-attached").is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_close_all_waits_for_in_flight_turn_before_finalizing() {
+        // The finalize-before-drain hazard: if shutdown closed hosts while a
+        // turn was still streaming, the turn would be cancelled and its tail
+        // lost even though it was seconds from done. Drain-then-finalize means
+        // a turn that fits inside the drain window completes naturally
+        // (terminal TurnComplete, not a cancel Error) and the backend is
+        // finalized only afterwards.
+        let registry = SessionRegistry::new();
+        let backend = stub("s-shutdown-drain", &["a", "b", "c"], 50);
+        let close_calls = backend.close_calls.clone();
+        let host = SessionHost::new(backend);
+        let mut rx = host.subscribe();
+        registry.insert(host.clone());
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(host.is_busy());
+
+        let closed = registry
+            .shutdown_close_all(Duration::from_secs(5), Duration::from_millis(10))
+            .await;
+
+        assert_eq!(closed, 1);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1, "backend finalized");
+        assert!(registry.peek("s-shutdown-drain").is_none());
+        let evts = drain_until_terminal(&mut rx).await;
+        let last = evts.last().expect("at least one event");
+        assert!(
+            matches!(&last.kind, Some(Kind::TurnComplete(_))),
+            "turn inside the drain window must complete naturally, got {:?}",
+            last.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_close_all_cancels_wedged_turn_after_drain_timeout() {
+        // The ceiling is a ceiling: a turn that outlives the drain window must
+        // not make the daemon unstoppable. It is cancelled (the production
+        // agent loop persists the partial tail on this path) and the backend
+        // still finalizes exactly once.
+        let registry = SessionRegistry::new();
+        let backend = stub("s-shutdown-wedge", &["a", "b", "c", "d"], 5_000);
+        let close_calls = backend.close_calls.clone();
+        let host = SessionHost::new(backend);
+        let mut rx = host.subscribe();
+        registry.insert(host.clone());
+        host.start_turn("hang".into(), Vec::new(), None, None).await;
+
+        let started = std::time::Instant::now();
+        let closed = registry
+            .shutdown_close_all(Duration::from_millis(50), Duration::from_millis(10))
+            .await;
+
+        assert_eq!(closed, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a wedged turn must not stall shutdown past the drain ceiling, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1, "backend finalized");
+        let evts = drain_until_terminal(&mut rx).await;
+        let last = evts.last().expect("at least one event");
+        assert!(
+            matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
+            "over-ceiling turn must be cancelled (tail-persisting path), got {:?}",
             last.kind
         );
     }

@@ -130,6 +130,13 @@ fn classify_summarize_failure(err: &anyhow::Error) -> SummarizeFailure {
 /// Returns `Err` when the summarizer produced nothing usable (e.g. a provider
 /// auth outage). The caller aborts compaction in that case rather than dropping
 /// the summarized range for a degraded placeholder.
+///
+/// The `chat_streamed` calls in this module carry no per-call cache key on
+/// purpose: the session-scoped prompt-cache/sticky-routing key rides on the
+/// `LlmClient` itself. Every compaction caller builds that client via
+/// `Agent::make_llm_client_from_config`, which applies
+/// `with_prompt_cache_key(session scope)` — see the guard test at the bottom
+/// of this file.
 pub(super) async fn summarize_with_llm(
     messages: &[Message],
     llm: &mut LlmClient,
@@ -219,6 +226,9 @@ fn redact_summary_text(summary: &str) -> String {
 /// the summarizer produced nothing usable — the caller aborts compaction in
 /// that case, sharing the v1 path's abort idiom rather than carrying an
 /// empty-string sentinel.
+///
+/// Cache-key note: same as [`summarize_with_llm`] — the session-scoped
+/// routing/cache key is already attached to the passed `LlmClient`.
 pub(super) async fn summarize_with_llm_v2(
     messages: &[Message],
     previous_summary: Option<&str>,
@@ -448,6 +458,41 @@ mod failure_classification_tests {
                 "{msg} must stay retryable"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_key_guard {
+    /// The `chat_streamed` calls in this module pass no per-call cache key —
+    /// the session-scoped prompt-cache/sticky-routing key must already ride
+    /// on the `LlmClient` handed in. Every compaction path (proactive,
+    /// reactive, manual `/compact`, and the override-retry) builds that
+    /// client through `Agent::make_llm_client_from_config`; if that builder
+    /// stops applying the session key, each summarizer call can land on a
+    /// different upstream (and cache shard) than the conversation it serves,
+    /// silently losing prompt-cache hits. Source-grep is the sanctioned
+    /// idiom for prompt-cache invariants the type system can't express.
+    #[test]
+    fn compaction_client_builder_applies_session_cache_key() {
+        let src = include_str!("../agent/mod.rs");
+        let fn_idx = src
+            .find("async fn make_llm_client_from_config")
+            .expect("make_llm_client_from_config must exist — compaction clients come from it");
+        // Bound the search at the next sibling item rather than a fixed byte
+        // window, so the guard doesn't false-alarm when the function grows.
+        let rest = &src[fn_idx..];
+        let body_end = ["\n    async fn ", "\n    fn ", "\n    pub "]
+            .iter()
+            .filter_map(|p| rest.find(p))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
+        assert!(
+            body.contains(".with_prompt_cache_key(self.prompt_cache_key())"),
+            "make_llm_client_from_config must attach the session-scoped cache key \
+             to every client it builds — the summarizer's chat_streamed calls rely \
+             on the client carrying it"
+        );
     }
 }
 

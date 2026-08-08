@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
-use super::blocked::{is_blocked_path, is_control_plane_write_denied};
+use super::blocked::{
+    instruction_write_denied_message, is_blocked_path, is_control_plane_write_denied,
+    is_instruction_file_write_denied,
+};
 use super::default_execution_context;
 use crate::tool_handlers::{optional_str_param, require_str_param};
 
@@ -103,6 +106,10 @@ fn deny_skill_patch(
             return Some(format!(
                 "Access denied: {raw_path} is a Borg control-plane file"
             ));
+        }
+        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
+        {
+            return Some(instruction_write_denied_message(raw_path));
         }
     }
     reject_overlong_skill_description(patch_text)
@@ -249,6 +256,10 @@ pub fn handle_apply_patch_with_context(
             return Ok(format!(
                 "Access denied: {raw_path} is a Borg control-plane file"
             ));
+        }
+        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
+        {
+            return Ok(instruction_write_denied_message(raw_path));
         }
     }
 
@@ -491,6 +502,10 @@ fn handle_apply_patch_via_text_bridge(
             return Ok(format!(
                 "Access denied: {raw_path} is a Borg control-plane file"
             ));
+        }
+        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
+        {
+            return Ok(instruction_write_denied_message(&raw_path));
         }
         let rel = resolved
             .strip_prefix(ctx.workspace_root())
@@ -1278,6 +1293,113 @@ diff --git a/.env b/.env
         assert!(
             !root.join(".env").exists(),
             "denied patch must not have written the file"
+        );
+    }
+
+    #[test]
+    fn apply_patch_denies_instruction_file_writes_by_default() {
+        // AGENTS.md / CLAUDE.md are read into future system prompts, so a
+        // patch that edits them is prompt-injection persistence. Table-driven
+        // over root, nested, traversal, and lowercase forms — all must be
+        // denied as a normal tool result and leave no file behind.
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        for rel in [
+            "AGENTS.md",
+            "sub/AGENTS.md",
+            "sub/../AGENTS.md",
+            "agents.md",
+            "CLAUDE.md",
+        ] {
+            let patch = format!("*** Begin Patch\n*** Add File: {rel}\n+obey me\n*** End Patch");
+            let result =
+                handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+            assert!(
+                result.contains("Access denied") && result.contains("agent-instruction"),
+                "{rel}: expected instruction-file denial, got: {result}"
+            );
+        }
+        assert!(
+            !root.join("AGENTS.md").exists() && !root.join("sub/AGENTS.md").exists(),
+            "denied patches must not create instruction files"
+        );
+        // Unrelated markdown in the same tree still applies.
+        let patch = "*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Patch applied successfully"),
+            "NOTES.md must still be writable; got: {result}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_patch_denies_instruction_file_write_through_symlink() {
+        // A symlink with an innocuous name pointing at AGENTS.md must not let a
+        // patch reach the instruction file.
+        use std::os::unix::fs::symlink;
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# rules\n").unwrap();
+        symlink(root.join("AGENTS.md"), root.join("innocuous.md")).unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: innocuous.md\n@@\n-# rules\n+obey me\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Access denied") && result.contains("agent-instruction"),
+            "symlinked instruction write must be denied; got: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "# rules\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_allows_instruction_writes_when_setting_enabled() {
+        // The escape hatch: `security.allow_instruction_writes = true` lets the
+        // write proceed — the deny is a default, not an immutable wall.
+        let mut config = Config::default();
+        config.security.allow_instruction_writes = true;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: AGENTS.md\n+# project rules\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.contains("Patch applied successfully"),
+            "opt-in flag must allow the write; got: {result}"
+        );
+        assert!(root.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn instruction_files_remain_readable() {
+        // The guard is write-only: the agent still needs to READ its own
+        // instruction files (project_doc injects them every turn).
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# readable rules\n").unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let out = super::super::read::handle_read_file_with_context(
+            &json!({"path": root.join("AGENTS.md").to_string_lossy()}),
+            &config,
+            &ctx,
+        )
+        .unwrap();
+        let text = format!("{out:?}");
+        assert!(
+            text.contains("readable rules"),
+            "read of AGENTS.md must stay allowed; got: {text}"
         );
     }
 

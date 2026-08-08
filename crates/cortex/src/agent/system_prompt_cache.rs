@@ -46,6 +46,10 @@ pub(crate) struct SystemPromptCache {
     project_docs: Option<Option<String>>,
     skills_context: Option<String>,
     skills_request: Option<String>,
+    /// Per-skill token costs recorded when `skills_context` was rendered.
+    /// Lives and dies with the skills caches — same setter, same
+    /// invalidation events — so it can never describe a stale render.
+    skills_per_skill_tokens: Option<Vec<(String, usize)>>,
     last_skill_drop_signature: Option<Vec<String>>,
 }
 
@@ -115,10 +119,29 @@ impl SystemPromptCache {
     }
 
     /// Record a freshly-rendered skills context against the request that
-    /// produced it.
-    pub(crate) fn set_skills(&mut self, request: String, context: String) {
+    /// produced it, along with the per-skill token costs of that render.
+    pub(crate) fn set_skills(
+        &mut self,
+        request: String,
+        context: String,
+        per_skill_tokens: Vec<(String, usize)>,
+    ) {
         self.skills_context = Some(context);
         self.skills_request = Some(request);
+        self.skills_per_skill_tokens = Some(per_skill_tokens);
+    }
+
+    /// Per-skill token costs of the cached skills render, only if it was
+    /// rendered for this exact request (same hit rule as
+    /// [`Self::skills_for_request`]).
+    pub(crate) fn skill_sizes_for_request(&self, request: &str) -> Option<&[(String, usize)]> {
+        match (
+            self.skills_per_skill_tokens.as_ref(),
+            self.skills_request.as_ref(),
+        ) {
+            (Some(sizes), Some(req)) if req == request => Some(sizes.as_slice()),
+            _ => None,
+        }
     }
 
     /// True if the previously-recorded drop signature equals `candidate`.
@@ -152,6 +175,7 @@ impl SystemPromptCache {
         self.credentials = Some(fresh_credentials);
         self.skills_context = None;
         self.skills_request = None;
+        self.skills_per_skill_tokens = None;
         self.last_skill_drop_signature = None;
     }
 
@@ -162,6 +186,7 @@ impl SystemPromptCache {
     pub(crate) fn on_skill_modified(&mut self) {
         self.skills_context = None;
         self.skills_request = None;
+        self.skills_per_skill_tokens = None;
         self.last_skill_drop_signature = None;
     }
 
@@ -199,6 +224,7 @@ impl SystemPromptCache {
             project_docs: None,
             skills_context,
             skills_request,
+            skills_per_skill_tokens: None,
             last_skill_drop_signature,
         }
     }
@@ -284,11 +310,18 @@ mod tests {
     #[test]
     fn skills_for_request_hits_only_on_exact_request_match() {
         let mut c = SystemPromptCache::default();
-        c.set_skills("hello".into(), "ctx".into());
+        c.set_skills("hello".into(), "ctx".into(), vec![("git".into(), 42)]);
         assert_eq!(c.skills_for_request("hello"), Some("ctx"));
         assert_eq!(c.skills_for_request("hello world"), None);
         assert!(!c.skills_stale_for("hello"));
         assert!(c.skills_stale_for("hello world"));
+        // Per-skill sizes obey the exact same hit rule as the rendered text —
+        // a mismatch would let /context attribute stale sizes to a fresh render.
+        assert_eq!(
+            c.skill_sizes_for_request("hello"),
+            Some(&[("git".to_string(), 42usize)][..])
+        );
+        assert_eq!(c.skill_sizes_for_request("hello world"), None);
     }
 
     #[test]

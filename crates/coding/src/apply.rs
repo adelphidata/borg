@@ -577,6 +577,21 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<(String
             continue;
         }
 
+        // A whitespace-only (but non-empty) search pattern matches blank
+        // regions in almost any file via the trim-tolerant strategies and
+        // would land the edit at an arbitrary wrong location. Empty search
+        // stays valid — it is the append/insertion form handled above — and
+        // `@@` context anchors pin the match to one scope, so anchored
+        // blank-line hunks stay valid too.
+        if hunk.context_anchors.is_empty() && hunk.search.chars().all(char::is_whitespace) {
+            bail!(
+                "In file '{file_path}' (patch line {}): hunk search text is whitespace-only \
+                 (spaces/tabs/blank lines). It would match an arbitrary blank region; include \
+                 at least one line of real code or text as context.",
+                hunk.source_line
+            );
+        }
+
         let search_lines: Vec<String> = hunk.search.lines().map(String::from).collect();
         let new_lines_vec: Vec<String> = hunk.replace.lines().map(String::from).collect();
         let search_start = if hunk.context_anchors.is_empty() {
@@ -753,6 +768,14 @@ fn locate_hunk_match<'a>(
             )
         }
         MatchOutcome::NotFound => {
+            if let Some(rendered) = format_whitespace_near_miss(content_lines, effective_search) {
+                bail!(
+                    "Could not find search text: the closest candidate differs ONLY in \
+                     whitespace. Differing lines shown with whitespace visualized \
+                     ({WS_LEGEND}):\n{rendered}Adjust the search lines to match the file's \
+                     exact whitespace."
+                )
+            }
             let hint = format_nearest_context_hint(content_lines, effective_search);
             bail!(
                 "Could not find search text (tried strategies: exact, trim_trailing_whitespace, trim_surrounding_whitespace, unicode_normalized, indentation_flexible, block_anchor):\n---\n{}\n---{hint}",
@@ -786,6 +809,78 @@ fn format_ambiguous_candidates(
         out.push_str(&format!("  … and {} more\n", count - positions.len()));
     }
     out
+}
+
+/// Legend explaining the whitespace visualization used by
+/// [`format_whitespace_near_miss`]. Kept as a distinct constant so tests can
+/// assert its presence in whitespace-shaped failures and its absence in
+/// genuine no-match errors.
+const WS_LEGEND: &str = "'\u{2192}' = tab, '\u{00B7}' = space";
+
+/// Per-line whitespace normalization for near-miss detection: collapse every
+/// run of whitespace to a single space and drop leading/trailing runs, so
+/// tab-vs-space and single-vs-double-space differences compare equal while
+/// any content difference does not.
+fn ws_normalized(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Make whitespace visible: tabs as `→`, spaces as `·`.
+fn visualize_whitespace(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\t' => '\u{2192}',
+            ' ' => '\u{00B7}',
+            other => other,
+        })
+        .collect()
+}
+
+/// When a failed hunk has a candidate window in the file that equals the
+/// search pattern after whitespace normalization but is not byte-equal, the
+/// miss is whitespace-shaped: render that candidate with whitespace made
+/// visible so the retry can copy the file's exact indentation instead of
+/// guessing. Byte-equal lines within the window are printed plainly; only
+/// differing lines get the file/patch visualization pair. Returns `None` for
+/// genuine no-matches so unrelated errors gain no noise.
+fn format_whitespace_near_miss(content_lines: &[String], pattern: &[String]) -> Option<String> {
+    /// The near-miss scan is O(file_lines × pattern_lines) with per-line
+    /// normalization allocations; past this many file lines the scan costs
+    /// more than the retry hint is worth, so the plain not-found error stands.
+    const NEAR_MISS_MAX_FILE_LINES: usize = 100_000;
+
+    if pattern.is_empty()
+        || pattern.len() > content_lines.len()
+        || content_lines.len() > NEAR_MISS_MAX_FILE_LINES
+    {
+        return None;
+    }
+    // Normalize the pattern once, not once per candidate window.
+    let normalized_pattern: Vec<String> = pattern.iter().map(|p| ws_normalized(p)).collect();
+    let start = (0..=content_lines.len() - pattern.len()).find(|&i| {
+        let window = &content_lines[i..i + pattern.len()];
+        window != pattern
+            && window
+                .iter()
+                .zip(&normalized_pattern)
+                .all(|(line, pat_norm)| ws_normalized(line) == *pat_norm)
+    })?;
+
+    let mut out = String::new();
+    for (offset, pat) in pattern.iter().enumerate() {
+        let line = &content_lines[start + offset];
+        let line_no = start + offset + 1;
+        if line == pat {
+            out.push_str(&format!("  L{line_no}: {line}\n"));
+        } else {
+            out.push_str(&format!(
+                "  L{line_no} file:  {}\n",
+                visualize_whitespace(line)
+            ));
+            out.push_str(&format!("       patch: {}\n", visualize_whitespace(pat)));
+        }
+    }
+    Some(out)
 }
 
 fn format_nearest_context_hint(content_lines: &[String], search_lines: &[String]) -> String {
@@ -2063,6 +2158,126 @@ EOF";
         assert!(
             err.contains("renamed_target"),
             "snippet should surface the actual file content the LLM should align to: {err}"
+        );
+        assert!(
+            !err.contains(WS_LEGEND),
+            "genuine no-match (content drift, not whitespace) must not carry the \
+             whitespace legend: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_near_miss_error_visualizes_indentation() {
+        // A hunk that fails ONLY because of a tab-vs-spaces difference must
+        // render the closest candidate with whitespace made visible (tabs as
+        // →, spaces as ·) so the model can copy the file's exact whitespace
+        // instead of retrying blind. Byte-equal lines in the window stay
+        // plain; only the differing line gets the file/patch pair.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("tabs.rs");
+        // File uses an interior TAB between `=` and `1;`.
+        std::fs::write(&file_path, "fn main() {\n    let x =\t1;\n}\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "tabs.rs".to_string(),
+            move_to: None,
+            // Patch uses a space where the file has a tab.
+            hunks: vec![simple_hunk(
+                "fn main() {\n    let x = 1;",
+                "fn main() {\n    let x = 2;",
+            )],
+        }]);
+        let err = format!("{:#}", apply_patch(&patch, dir.path()).unwrap_err());
+
+        assert!(
+            err.contains("differs ONLY in whitespace"),
+            "must name the failure as whitespace-shaped: {err}"
+        );
+        assert!(err.contains(WS_LEGEND), "must include the legend: {err}");
+        assert!(
+            err.contains(
+                "L2 file:  \u{00B7}\u{00B7}\u{00B7}\u{00B7}let\u{00B7}x\u{00B7}=\u{2192}1;"
+            ),
+            "file side of the differing line must show the tab as \u{2192}: {err}"
+        );
+        assert!(
+            err.contains("patch: \u{00B7}\u{00B7}\u{00B7}\u{00B7}let\u{00B7}x\u{00B7}=\u{00B7}1;"),
+            "patch side must show its space as \u{00B7} at the same position: {err}"
+        );
+        assert!(
+            err.contains("L1: fn main() {"),
+            "byte-equal context lines must render plainly, not visualized: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_search_pattern_is_rejected() {
+        // A whitespace-only search matches a blank region in almost any file
+        // via the trim-tolerant strategies and would land the edit at an
+        // arbitrary wrong location — reject it up front and tell the model to
+        // include real context. (Truly empty search stays valid: it is the
+        // append form, covered by append_hunk_empty_search.)
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("blank.txt");
+        let original = "alpha\n\nbeta\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        for search in ["    ", "\t", "\n  \n\t\n"] {
+            let patch = make_patch(vec![PatchOperation::UpdateFile {
+                path: "blank.txt".to_string(),
+                move_to: None,
+                hunks: vec![simple_hunk(search, "injected")],
+            }]);
+            let err = format!("{:#}", apply_patch(&patch, dir.path()).unwrap_err());
+            assert!(
+                err.contains("whitespace-only"),
+                "search {search:?} must be rejected as whitespace-only: {err}"
+            );
+            assert!(
+                err.contains("real code or text as context"),
+                "error must tell the model to add real context lines: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file_path).unwrap(),
+                original,
+                "rejected patch must not touch the file"
+            );
+        }
+
+        // A structurally empty update op (no hunks at all) is still rejected
+        // at parse time — the whitespace-only guard must not have loosened it.
+        let empty = "*** Begin Patch\n*** Update File: blank.txt\n*** End Patch";
+        crate::apply_patch_to_dir(empty, dir.path())
+            .expect_err("empty update op must still be rejected");
+    }
+
+    #[test]
+    fn anchored_whitespace_only_search_is_still_applied() {
+        // An `@@` anchor pins the hunk to one scope, so a whitespace-only
+        // search under an anchor is unambiguous by construction and must keep
+        // working — the whitespace-only rejection is for UNANCHORED hunks
+        // that could land anywhere.
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("two.rs");
+        let original = "fn alpha() {\n    \n}\nfn beta() {\n    \n}\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "two.rs".to_string(),
+            move_to: None,
+            hunks: vec![Hunk {
+                context_anchors: vec!["fn beta".to_string()],
+                search: "    ".to_string(),
+                replace: "    let x = 1;".to_string(),
+                is_end_of_file: false,
+                source_line: 0,
+            }],
+        }]);
+        apply_patch(&patch, dir.path()).expect("anchored blank-line hunk must apply");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn alpha() {\n    \n}\nfn beta() {\n    let x = 1;\n}\n",
+            "the anchor must direct the edit into fn beta, leaving fn alpha untouched"
         );
     }
 

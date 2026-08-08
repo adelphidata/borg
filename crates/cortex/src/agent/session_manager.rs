@@ -125,9 +125,16 @@ impl Agent {
     }
 
     /// Auto-save current session state.
+    ///
+    /// A transient disk I/O error (EIO) is retried a couple of times before
+    /// it is allowed to classify as a fatal storage fault — one hiccup must
+    /// not abort the turn. Durable exhaustion (ENOSPC/EDQUOT/EROFS) fails
+    /// immediately as before.
     pub fn auto_save(&mut self) {
         self.session.update_from_history(&self.history);
-        if let Err(e) = self.session.save() {
+        if let Err(e) =
+            crate::db::with_transient_io_retry_sync("session auto-save", || self.session.save())
+        {
             warn!("Failed to auto-save session: {e}");
             if crate::db::is_storage_exhausted(&e) {
                 self.storage_fault
@@ -250,6 +257,13 @@ impl Agent {
         {
             let guard = self.db_guard().await;
             if let Some(ref db) = *guard {
+                // Deliberately NOT wrapped in `with_transient_io_retry`: an
+                // IOERR surfacing from the COMMIT is ambiguous — the batch may
+                // already be durable — and re-running the append would insert
+                // every draft a second time into the HMAC-chained log (the
+                // chain re-reads the tail, so the duplicates even verify).
+                // Only idempotent writers (the whole-file session auto-save)
+                // may retry.
                 match db.append_session_events(&session_id, &drafts).await {
                     // Stamp the durable log positions onto the in-memory copies
                     // so the working set stays mappable to the log (compaction

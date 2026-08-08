@@ -236,6 +236,9 @@ impl Agent {
         // Silent reply protocol
         system.push_str(&Self::build_silent_reply_section());
 
+        // Media attachment marker (channels)
+        system.push_str(Self::build_media_attachment_section());
+
         // Heartbeat ack protocol
         system.push_str(&self.build_heartbeat_section());
 
@@ -290,7 +293,8 @@ impl Agent {
                     &user_request,
                 )?;
                 self.warn_skill_budget_loss(&report);
-                self.caches.set_skills(user_request, rendered.clone());
+                self.caches
+                    .set_skills(user_request, rendered.clone(), report.per_skill_tokens);
                 rendered
             };
             if !skills.is_empty() {
@@ -502,6 +506,15 @@ impl Agent {
             - Never wrap it in markdown or code blocks\n\
             </silent_replies>\n"
         )
+    }
+
+    /// Build the media attachment marker section (see
+    /// `agent::media_markers` for the parser that keeps this promise).
+    pub(super) fn build_media_attachment_section() -> &'static str {
+        "\n<media_attachments>\n\
+        To attach a locally saved file (image, document, etc.) to a reply on a messaging channel, put [MEDIA:/absolute/path] on its own line.\n\
+        The marker line is stripped before sending and the file is attached; one marker line per file. Support depends on the channel.\n\
+        </media_attachments>\n"
     }
 
     /// Build the heartbeat ack protocol section.

@@ -136,11 +136,15 @@ impl TwilioClient {
         if !resp.status().is_success() {
             anyhow::bail!("twilio media download returned HTTP {}", resp.status());
         }
-        Ok(resp
-            .bytes()
-            .await
-            .context("twilio: read media body")?
-            .to_vec())
+        // Streamed read with a running cap — Content-Length can lie or be
+        // absent, so the ceiling is enforced chunk-by-chunk while streaming.
+        cortex::media::read_body_capped(
+            resp,
+            crate::constants::ATTACHMENT_DOWNLOAD_MAX_BYTES,
+            "Twilio media",
+        )
+        .await
+        .context("twilio: read media body")
     }
 
     /// Returns the Messages API URL (for testing).

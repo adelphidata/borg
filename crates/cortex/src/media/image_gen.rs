@@ -321,15 +321,21 @@ async fn generate_fal(
         }
         match client.get(&fal_img.url).send().await {
             Ok(img_resp) if img_resp.status().is_success() => {
-                let bytes = img_resp.bytes().await?;
-                if bytes.len() > constants::MAX_IMAGE_FILE_SIZE {
-                    warn!(
-                        "Skipping oversized FAL image ({} bytes, max {})",
-                        bytes.len(),
-                        constants::MAX_IMAGE_FILE_SIZE
-                    );
-                    continue;
-                }
+                // Streamed cap — Content-Length can lie, so enforce the
+                // ceiling chunk-by-chunk instead of after buffering.
+                let bytes = match super::core::read_body_capped(
+                    img_resp,
+                    constants::MAX_IMAGE_FILE_SIZE as u64,
+                    "FAL image",
+                )
+                .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("Skipping FAL image: {e}");
+                        continue;
+                    }
+                };
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 images.push(ImageResult {
                     base64_data: b64,

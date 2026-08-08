@@ -387,6 +387,42 @@ impl Database {
         Ok(())
     }
 
+    /// Monitor-mode scheduled tasks: `monitor_mode` marks a task whose LLM
+    /// turn is suppressed whenever its `pre_run_command` output is unchanged
+    /// from the previous run; `last_pre_run_hash` stores that baseline.
+    ///
+    /// Wraps the v14 repair so the newest entry point stays a single call,
+    /// per the shared-`borg.db` stranding reason on [`Self::migrate_v11`].
+    /// Column adds are probe-first, so a fresh install (which already has
+    /// both columns from `SCHEMA_SQL`) does no work.
+    pub(super) async fn migrate_v15(&self) -> Result<()> {
+        self.migrate_v14().await?;
+        self.add_missing_columns(
+            "scheduled_tasks",
+            &[
+                ("monitor_mode", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_pre_run_hash", "TEXT"),
+            ],
+        )
+        .await
+    }
+
+    /// Workspace identity on sessions: `cwd` is the (canonicalized) working
+    /// directory the session was opened from and `git_repo_root` the toplevel
+    /// of the enclosing git checkout, when there is one. Both nullable —
+    /// sessions opened by channels/daemon lanes with no meaningful workspace
+    /// stay `NULL` and are simply invisible to workspace-scoped resume.
+    ///
+    /// Wraps the v15 repair so the newest entry point stays a single call,
+    /// per the shared-`borg.db` stranding reason on [`Self::migrate_v11`].
+    /// Column adds are probe-first, so a fresh install (which already has
+    /// both columns from `SCHEMA_SQL`) does no work.
+    pub(super) async fn migrate_v16(&self) -> Result<()> {
+        self.migrate_v15().await?;
+        self.add_missing_columns("sessions", &[("cwd", "TEXT"), ("git_repo_root", "TEXT")])
+            .await
+    }
+
     /// `goal_gates`: deterministic shell commands that must pass before a goal
     /// completes.
     ///
@@ -703,8 +739,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- auto-archive sweep. `archived_at` soft-hides a session from listings; it
     -- is never a delete, so archiving is always reversible.
     pinned INTEGER NOT NULL DEFAULT 0,
-    archived_at INTEGER
+    archived_at INTEGER,
+    cwd TEXT,
+    git_repo_root TEXT
 );
+-- ^ `cwd`/`git_repo_root`: workspace identity for workspace-scoped resume
+-- (`borg --continue`) — the canonicalized directory the session was opened
+-- from and the toplevel of its enclosing git checkout. NULL when the session
+-- has no meaningful workspace (gateway channels, daemon-internal lanes).
+-- Comments must stay OUTSIDE the column list: SQLite's ALTER machinery
+-- rewrites the stored CREATE text and trips over inline comments.
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
 
@@ -836,7 +880,9 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     min_interval_secs INTEGER,
     last_response_hash TEXT,
     model TEXT,
-    model_provider TEXT
+    model_provider TEXT,
+    monitor_mode INTEGER NOT NULL DEFAULT 0,
+    last_pre_run_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run);
 CREATE INDEX IF NOT EXISTS idx_tasks_retry ON scheduled_tasks(status, retry_after);
@@ -1641,6 +1687,198 @@ mod tests {
         db.insert_message("s1", "user", Some("hello"), None, None, None, None)
             .await
             .unwrap();
+    }
+
+    // v15 adds monitor-mode columns to scheduled_tasks. A pre-v15 DB (shape
+    // simulated by rebuilding the table without them, version stamped 14)
+    // must gain both columns and land on CURRENT_VERSION; a fresh DB must
+    // already carry them from SCHEMA_SQL.
+    #[tokio::test]
+    async fn v15_adds_monitor_columns_to_scheduled_tasks() {
+        async fn scheduled_task_columns(db: &Database) -> Vec<String> {
+            let mut rows = db
+                .conn
+                .query("PRAGMA table_info(scheduled_tasks)", ())
+                .await
+                .unwrap();
+            let mut cols = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                cols.push(row.get::<String>(1).unwrap());
+            }
+            cols
+        }
+
+        // Fresh DB: SCHEMA_SQL emits the final shape directly.
+        let fresh = Database::test_db().await;
+        let cols = scheduled_task_columns(&fresh).await;
+        for required in ["monitor_mode", "last_pre_run_hash"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "fresh scheduled_tasks must have {required}; columns: {cols:?}"
+            );
+        }
+        assert_eq!(
+            fresh.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION
+        );
+
+        // Upgrade path: pre-v15 shape (no monitor columns), version 14.
+        let db = Database::test_db().await;
+        db.conn
+            .execute_batch(
+                "DROP TABLE task_runs;
+                 DROP TABLE scheduled_tasks;
+                 CREATE TABLE scheduled_tasks (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    schedule_type TEXT NOT NULL,
+                    schedule_expr TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'local',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    next_run INTEGER,
+                    created_at INTEGER NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 3,
+                    retry_after INTEGER,
+                    last_error TEXT,
+                    timeout_ms INTEGER NOT NULL DEFAULT 300000,
+                    delivery_channel TEXT,
+                    delivery_target TEXT,
+                    allowed_tools TEXT,
+                    task_type TEXT NOT NULL DEFAULT 'prompt',
+                    pre_run_command TEXT,
+                    pre_run_cwd TEXT,
+                    pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+                    bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0,
+                    min_interval_secs INTEGER,
+                    last_response_hash TEXT,
+                    model TEXT,
+                    model_provider TEXT
+                 );",
+            )
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "14").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let cols = scheduled_task_columns(&db).await;
+        for required in ["monitor_mode", "last_pre_run_hash"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "v15 must add {required}; columns: {cols:?}"
+            );
+        }
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION,
+            "upgrade must land on CURRENT_VERSION"
+        );
+
+        // The upgraded shape must actually be readable through the accessors
+        // (TASK_COLUMNS indexes into the new columns).
+        db.create_task(&crate::db::NewTask {
+            id: "post-upgrade",
+            name: "post-upgrade",
+            prompt: "p",
+            schedule_type: "interval",
+            schedule_expr: "5m",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: Some("true"),
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .unwrap();
+        let row = db.get_task_by_id("post-upgrade").await.unwrap().unwrap();
+        assert!(!row.monitor_mode, "new column must default to off");
+        assert_eq!(row.last_pre_run_hash, None);
+    }
+
+    // v16 adds workspace-identity columns to sessions. A pre-v16 DB (shape
+    // simulated by dropping them, version stamped 15) must gain both columns
+    // and land on CURRENT_VERSION; a fresh DB must already carry them from
+    // SCHEMA_SQL.
+    #[tokio::test]
+    async fn v16_adds_workspace_columns_to_sessions() {
+        async fn session_columns(db: &Database) -> Vec<String> {
+            let mut rows = db
+                .conn
+                .query("PRAGMA table_info(sessions)", ())
+                .await
+                .unwrap();
+            let mut cols = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                cols.push(row.get::<String>(1).unwrap());
+            }
+            cols
+        }
+
+        // Fresh DB: SCHEMA_SQL emits the final shape directly.
+        let fresh = Database::test_db().await;
+        let cols = session_columns(&fresh).await;
+        for required in ["cwd", "git_repo_root"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "fresh sessions must have {required}; columns: {cols:?}"
+            );
+        }
+        assert_eq!(
+            fresh.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION
+        );
+
+        // Upgrade path: pre-v16 shape (no workspace columns), version 15.
+        let db = Database::test_db().await;
+        db.conn
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN cwd;
+                 ALTER TABLE sessions DROP COLUMN git_repo_root;",
+            )
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "15").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let cols = session_columns(&db).await;
+        for required in ["cwd", "git_repo_root"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "v16 must add {required}; columns: {cols:?}"
+            );
+        }
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION,
+            "upgrade must land on CURRENT_VERSION"
+        );
+
+        // The upgraded shape must be usable end-to-end: stamp a workspace and
+        // resolve it back (SessionRow::COLUMNS indexes into the new columns).
+        db.upsert_session("post-upgrade", 1, 2, 0, "m", "t")
+            .await
+            .unwrap();
+        db.set_session_workspace("post-upgrade", "/w/repo/sub", Some("/w/repo"))
+            .await
+            .unwrap();
+        let row = db
+            .most_recent_session_in_workspace(Some("/w/repo"), "/w/repo/sub")
+            .await
+            .unwrap()
+            .expect("stamped session must be resolvable after upgrade");
+        assert_eq!(row.id, "post-upgrade");
+        assert_eq!(row.cwd.as_deref(), Some("/w/repo/sub"));
+        assert_eq!(row.git_repo_root.as_deref(), Some("/w/repo"));
     }
 
     // The stranding mechanism is version-number-based, so a divergent binary

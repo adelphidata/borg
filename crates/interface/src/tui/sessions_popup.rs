@@ -138,6 +138,20 @@ impl SessionsPopup {
         }
     }
 
+    /// One listing row: pin marker, truncated title, message count, date.
+    /// Extracted from `render` so the pin indicator is unit-testable.
+    fn row_label(session: &SessionSummary) -> String {
+        let date = chrono::DateTime::from_timestamp(session.updated_unix_ts as i64, 0)
+            .map(|dt| dt.format(crate::commands::TS_FMT).to_string())
+            .unwrap_or_default();
+        let title: String = session.title.chars().take(40).collect();
+        let pin = if session.pinned { '*' } else { ' ' };
+        format!(
+            " {pin} {title:<40} {} messages  {date}",
+            session.message_count
+        )
+    }
+
     pub fn render(&self, frame: &mut Frame) {
         let Some((inner, content_height)) =
             popup_utils::begin_popup_render(frame, self.visible, "Sessions", 3, 1)
@@ -155,11 +169,7 @@ impl SessionsPopup {
         }
 
         for (i, session) in self.sessions.iter().enumerate() {
-            let date = chrono::DateTime::from_timestamp(session.updated_unix_ts as i64, 0)
-                .map(|dt| dt.format(crate::commands::TS_FMT).to_string())
-                .unwrap_or_default();
-            let title: String = session.title.chars().take(40).collect();
-            let label = format!("  {title:<40} {} messages  {date}", session.message_count);
+            let label = Self::row_label(session);
 
             let style = if i == self.cursor {
                 theme::popup_selected()

@@ -80,7 +80,12 @@ fn build_transcript(messages: &[crate::db::MessageRow]) -> String {
             continue;
         }
         if let Some(ref content) = msg.content {
-            if content.is_empty() {
+            // Strip terminal escape sequences BEFORE truncating so persisted
+            // ANSI bytes (colored shell output quoted into a message) never
+            // consume the per-message content budget or reach model context
+            // on recall.
+            let clean = crate::util::ansi::strip_ansi(content);
+            if clean.is_empty() {
                 continue;
             }
             let role_label = match msg.role.as_str() {
@@ -88,7 +93,7 @@ fn build_transcript(messages: &[crate::db::MessageRow]) -> String {
                 "assistant" => "Assistant",
                 _ => &msg.role,
             };
-            let truncated: String = content
+            let truncated: String = clean
                 .chars()
                 .take(constants::MAX_SESSION_MESSAGE_CHARS)
                 .collect();
@@ -162,6 +167,43 @@ mod tests {
     #[cfg(feature = "phase9-tests-disabled")]
     #[test]
     fn session_indexing_db_methods() {}
+
+    #[test]
+    fn build_transcript_strips_ansi_escapes() {
+        // Colored output + cursor moves quoted into a message must come back
+        // clean when the transcript re-enters model context via recall.
+        let messages = vec![make_message(
+            "assistant",
+            "result: \u{1b}[31mFAILED\u{1b}[0m\u{1b}[2A\u{1b}[K retry \u{1b}]0;title\u{07}done",
+        )];
+        let transcript = build_transcript(&messages);
+        assert!(transcript.contains("Assistant: result: FAILED retry done"));
+        assert!(
+            !transcript.contains('\u{1b}'),
+            "no escape bytes may survive into the transcript"
+        );
+    }
+
+    #[test]
+    fn build_transcript_truncation_uses_stripped_length() {
+        // Content that fits the per-message budget only after stripping must
+        // NOT be truncated: escape bytes must not consume the content budget.
+        let visible = "v".repeat(constants::MAX_SESSION_MESSAGE_CHARS);
+        // Prepend enough ANSI that the raw char count far exceeds the budget.
+        let content = format!("{}{visible}", "\u{1b}[31m".repeat(200));
+        let messages = vec![make_message("user", &content)];
+        let transcript = build_transcript(&messages);
+        assert!(
+            transcript.contains(&format!("User: {visible}")),
+            "full visible text must survive; escapes must not eat the budget"
+        );
+    }
+
+    #[test]
+    fn build_transcript_skips_ansi_only_messages() {
+        let messages = vec![make_message("user", "\u{1b}[31m\u{1b}[0m")];
+        assert!(build_transcript(&messages).trim().is_empty());
+    }
 
     #[test]
     fn build_transcript_large_session_bounded() {

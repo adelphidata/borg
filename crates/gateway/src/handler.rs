@@ -1182,6 +1182,35 @@ async fn process_message(
         return Ok(response_text);
     }
 
+    // Manifest/script channels have no attachment transport. Strip any
+    // `[MEDIA:<path>]` markers and surface a per-file notice instead of
+    // leaking the marker line or silently dropping the promised attachment.
+    let response_text = {
+        let (clean_text, media_paths) =
+            cortex::agent::media_markers::extract_media_markers(&response_text);
+        if media_paths.is_empty() {
+            response_text
+        } else {
+            let notices: Vec<String> = media_paths
+                .iter()
+                .map(|p| {
+                    warn!(
+                        channel = %channel_name,
+                        path = %p.display(),
+                        "channel has no attachment support; sending notice instead"
+                    );
+                    crate::message_processing::media_egress::attachment_notice(
+                        p,
+                        "this channel does not support attachments",
+                    )
+                })
+                .collect();
+            // Notices are non-empty here, so compose always yields text.
+            crate::message_processing::media_egress::compose_reply_text(&clean_text, &notices)
+                .unwrap_or(response_text)
+        }
+    };
+
     // Chunk text if max_message_chars is configured
     let chunks = match channel.manifest.settings.max_message_chars {
         Some(max) if max > 0 => chunker::chunk_text(&response_text, max),

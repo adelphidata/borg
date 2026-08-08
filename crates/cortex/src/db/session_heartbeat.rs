@@ -168,6 +168,28 @@ impl Database {
         Ok(out)
     }
 
+    /// Session ids of every active (unpaused) heartbeat.
+    ///
+    /// Used by the daemon's registry sweep to exempt heartbeat-owning sessions
+    /// from idle eviction: a heartbeat fires only into a live host, and
+    /// nothing on the heartbeat path rebuilds one — evicting the host would
+    /// leave the row due forever. Paused heartbeats are excluded so they do
+    /// not pin their session in memory.
+    pub async fn active_session_heartbeat_session_ids(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT session_id FROM session_heartbeats WHERE paused = 0",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
     /// Re-anchor the timer after a fire.
     ///
     /// Anchors on *now*, not on the previous `next_fire_at`. That is what makes
@@ -310,6 +332,26 @@ mod tests {
         );
         let after = db.get_session_heartbeat("s").await.unwrap().unwrap();
         assert_eq!(after.next_fire_at, six_intervals_later + 60);
+    }
+
+    #[tokio::test]
+    async fn active_ids_list_unpaused_heartbeats_only() {
+        // The daemon exempts these ids from registry eviction; the set must
+        // track pause state — a paused heartbeat never fires, so letting it
+        // pin its session in memory would leak the exemption.
+        let db = db_with_session("a").await;
+        db.upsert_session("b", 0, 0, 0, "m", "test").await.unwrap();
+        db.set_session_heartbeat("a", "p", 60).await.unwrap();
+        db.set_session_heartbeat("b", "p", 60).await.unwrap();
+        db.set_session_heartbeat_paused("b", true).await.unwrap();
+
+        let ids = db.active_session_heartbeat_session_ids().await.unwrap();
+        assert_eq!(ids, vec!["a".to_string()]);
+
+        db.set_session_heartbeat_paused("b", false).await.unwrap();
+        let mut ids = db.active_session_heartbeat_session_ids().await.unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[tokio::test]

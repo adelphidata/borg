@@ -27,6 +27,45 @@ pub(crate) async fn ensure_success(
     anyhow::bail!("{label} returned {status}: {body}")
 }
 
+/// Read a response body into memory with a hard byte ceiling enforced
+/// chunk-by-chunk while streaming.
+///
+/// `Content-Length` is checked first as a fast reject, but the running total
+/// is the real boundary: the header can lie or be absent entirely (chunked
+/// transfer encoding), and a post-hoc `bytes().await` length check only fires
+/// after the whole body — however large — has been buffered into memory.
+/// Aborting mid-stream drops the connection, so at most `max_bytes` (plus one
+/// chunk) is ever resident.
+///
+/// `what` labels the payload in error messages ("image", "Slack file", …).
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: u64,
+    what: &str,
+) -> Result<Vec<u8>> {
+    use anyhow::Context;
+    if let Some(reported) = resp.content_length() {
+        if reported > max_bytes {
+            anyhow::bail!("{what} too large ({reported} bytes, max {max_bytes})");
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("read {what} body"))?
+    {
+        if buf.len() as u64 + chunk.len() as u64 > max_bytes {
+            anyhow::bail!(
+                "{what} too large (body exceeded max {max_bytes} bytes mid-stream; \
+                 Content-Length was absent or understated)"
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Parse a data URI like `data:image/png;base64,abc123` into a MediaData struct.
 ///
 /// Validates the `;base64` marker is present and the data portion is non-empty.
@@ -234,6 +273,81 @@ pub fn validate_base64(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve one HTTP response with `Transfer-Encoding: chunked` (no
+    /// Content-Length header at all) whose body is `total` bytes of chunks.
+    /// Chunked encoding is exactly the shape where a Content-Length pre-check
+    /// is blind and only a streamed running cap can stop an oversized body.
+    async fn serve_chunked(total: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut tmp = [0u8; 1024];
+            let _ = sock.read(&mut tmp).await; // drain request headers
+            let header =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            const CHUNK: usize = 64 * 1024;
+            let payload = vec![b'x'; CHUNK];
+            let mut sent = 0usize;
+            while sent < total {
+                let n = CHUNK.min(total - sent);
+                let frame = format!("{n:x}\r\n");
+                // A capped reader aborts mid-stream by dropping the
+                // connection; treat write failure as the expected end.
+                if sock.write_all(frame.as_bytes()).await.is_err()
+                    || sock.write_all(&payload[..n]).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                sent += n;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_stops_chunked_body_with_no_content_length_at_cap() {
+        // 4 MB body, 256 KB cap, no Content-Length. A buffer-then-check
+        // implementation would slurp all 4 MB (or hang on an unbounded
+        // stream); the streamed cap must abort shortly past 256 KB.
+        let base = serve_chunked(4 * 1024 * 1024).await;
+        let resp = reqwest::get(format!("{base}/big")).await.unwrap();
+        assert_eq!(
+            resp.content_length(),
+            None,
+            "test precondition: chunked response must not report a length"
+        );
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_body_capped(resp, 256 * 1024, "test payload"),
+        )
+        .await
+        .expect("capped read must abort mid-stream, not buffer the whole body")
+        .expect_err("body over the cap must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "error must explain the size rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_returns_full_body_under_cap() {
+        let base = serve_chunked(150 * 1024).await;
+        let resp = reqwest::get(format!("{base}/ok")).await.unwrap();
+        let body = read_body_capped(resp, 256 * 1024, "test payload")
+            .await
+            .expect("body under the cap must be returned intact");
+        assert_eq!(body.len(), 150 * 1024);
+        assert!(body.iter().all(|b| *b == b'x'));
+    }
 
     #[test]
     fn parse_valid_data_uri() {

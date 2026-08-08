@@ -597,6 +597,7 @@ impl Session for SessionSvc {
                 .map(|c| ContextComponent {
                     label: c.label,
                     tokens: c.tokens as u64,
+                    detail: c.detail,
                 })
                 .collect(),
         }))

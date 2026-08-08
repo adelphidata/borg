@@ -155,8 +155,9 @@ async fn run_list(limit: usize) -> Result<()> {
             .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
         let short = super::short_id(&s.id);
+        let pin = if s.pinned { " *" } else { "" };
         println!(
-            "{:10} {:>6}  {:16}  {}",
+            "{:10} {:>6}  {:16}  {}{pin}",
             short, s.message_count, updated, s.title
         );
     }

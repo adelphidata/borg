@@ -237,6 +237,48 @@ impl NativeChannel for SlackChannel {
         Ok(())
     }
 
+    fn supports_media_attachments(&self) -> bool {
+        true
+    }
+
+    async fn send_media(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        response_context: &serde_json::Value,
+        health: &Arc<RwLock<ChannelHealthRegistry>>,
+    ) -> Result<()> {
+        use anyhow::Context as _;
+
+        let ctx: SlackResponseContext = serde_json::from_value(response_context.clone())?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read media file {}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        // Slack's file upload has no separate caption field at this seam; the
+        // filename is displayed with the upload, which covers the minimal
+        // caption the egress path asks for.
+        let _ = caption;
+
+        match self
+            .client
+            .upload_file(&ctx.channel_id, &bytes, filename, None)
+            .await
+        {
+            Ok(()) => {
+                health.write().await.record_outbound("slack");
+                Ok(())
+            }
+            Err(e) => {
+                health.write().await.record_error("slack", &e.to_string());
+                Err(e)
+            }
+        }
+    }
+
     fn bot_mention(&self) -> Option<String> {
         self.bot_user_id.as_ref().map(|id| format!("<@{id}>"))
     }

@@ -141,12 +141,72 @@ impl DaemonSessionExecutor {
     }
 }
 
+/// Build the short-circuit stream returned instead of running a turn while
+/// the emergency pause is engaged. User turns get the paused notice as a
+/// single `TextDelta` before the channel closes (the gateway's collect loop
+/// treats channel-close as turn completion, so the notice is delivered like
+/// a normal one-line reply). Internal turns (heartbeat, greeting, proactive
+/// delivery) are deferred silently — same shape as the busy-session defer —
+/// so a pause never posts notices into channels on the agent's own cadence.
+/// The token is pre-cancelled because no live turn sits behind it.
+fn paused_turn_stream(
+    kind: TurnKind,
+    notice: String,
+) -> (mpsc::Receiver<AgentEvent>, CancellationToken) {
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let (tx, rx) = mpsc::channel::<AgentEvent>(1);
+    if matches!(kind, TurnKind::User) {
+        // Capacity 1 and nothing else in flight: try_send cannot fail here,
+        // but a full/closed channel would only drop the courtesy notice.
+        if tx.try_send(AgentEvent::TextDelta(notice)).is_err() {
+            tracing::warn!("paused-turn notice could not be enqueued");
+        }
+    }
+    drop(tx);
+    (rx, cancelled)
+}
+
 #[async_trait]
 impl SessionExecutor for DaemonSessionExecutor {
     async fn start_turn(
         &self,
         turn: InboundTurn,
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+        // Emergency stop (`borg pause`): reject NEW turns before any host is
+        // created or any in-flight turn is cancelled. Reads the settings DB
+        // directly (not the cached config watch) so a pause written by the
+        // CLI in another process gates the very next inbound message, and so
+        // a corrupt flag fails safe to paused. A DB that cannot even be
+        // opened is "unreadable" for the same fail-safe purpose — nothing
+        // downstream would work anyway.
+        let paused_reason = match cortex::db::Database::open().await {
+            Ok(db) => {
+                if cortex::emergency_pause::is_engaged(&db).await {
+                    let (reason, _) = cortex::emergency_pause::details(&db).await;
+                    Some(reason)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "emergency-pause check could not open DB — failing safe to paused"
+                );
+                Some(None)
+            }
+        };
+        if let Some(reason) = paused_reason {
+            tracing::info!(
+                session_key = %turn.session_key,
+                kind = ?turn.kind,
+                "turn rejected: emergency pause engaged (`borg resume` to continue)"
+            );
+            let notice = cortex::emergency_pause::paused_notice(reason.as_deref());
+            return Ok(paused_turn_stream(turn.kind, notice));
+        }
+
         let host = self.ensure_host(&turn.session_key).await?;
 
         match turn.kind {
@@ -262,10 +322,12 @@ impl SessionExecutor for DaemonSessionExecutor {
     }
 
     async fn active_turns(&self) -> usize {
+        // `peek`: a status poll must not refresh last-activity, or idle
+        // sessions would never hit their eviction TTL.
         self.registry
             .live_ids()
             .iter()
-            .filter_map(|id| self.registry.get(id))
+            .filter_map(|id| self.registry.peek(id))
             .filter(super::SessionHost::is_busy)
             .count()
     }
@@ -299,5 +361,55 @@ mod tests {
         );
 
         assert_eq!(executor.current_config().llm.model, live.llm.model);
+    }
+
+    #[tokio::test]
+    async fn paused_user_turn_delivers_the_notice_then_ends_the_turn() {
+        // Spec: while `borg pause` is engaged, an interactive/gateway turn
+        // must come back as a brief notice — not silence (the user would
+        // think the agent is broken) and not a hung stream (the gateway's
+        // collect loop would wait out its full timeout).
+        let (mut rx, cancel) = paused_turn_stream(
+            TurnKind::User,
+            cortex::emergency_pause::paused_notice(Some("incident response")),
+        );
+        let first = rx.recv().await;
+        match first {
+            Some(AgentEvent::TextDelta(text)) => {
+                assert!(
+                    text.contains("borg is paused") && text.contains("borg resume"),
+                    "notice must name the resume command: {text}"
+                );
+                assert!(
+                    text.contains("incident response"),
+                    "operator reason must ride along: {text}"
+                );
+            }
+            Some(_) => panic!("expected the paused notice as a text delta, got another event"),
+            None => panic!("stream closed without delivering the paused notice"),
+        }
+        assert!(
+            rx.recv().await.is_none(),
+            "the stream must close after the notice so the turn terminates"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "no live turn backs the token; it must read as already finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_internal_turn_defers_silently() {
+        // Heartbeats/greetings re-fire on their own cadence — a pause must
+        // defer them without posting pause notices into channels.
+        let (mut rx, cancel) = paused_turn_stream(
+            TurnKind::Internal,
+            cortex::emergency_pause::paused_notice(None),
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "internal turns must produce no output while paused"
+        );
+        assert!(cancel.is_cancelled());
     }
 }

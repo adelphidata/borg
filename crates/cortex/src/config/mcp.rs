@@ -86,9 +86,11 @@ pub struct McpConfig {
     #[serde(default)]
     pub tool_search_mode: McpToolSearchMode,
     /// Token budget for the deferred-mode catalog listing embedded in the
-    /// `search_tools` description (name + one-line description per tool).
-    /// Over budget the listing degrades to names-only; over budget even
-    /// names-only, to the bare meta-tool. In `auto` mode this is also the
+    /// `search_tools` description (name + one-line description per tool,
+    /// grouped by server). Over budget, servers degrade one at a time —
+    /// largest first — to a one-line summary, so one oversized server can't
+    /// drag every co-attached server down to a terse form; the floor is one
+    /// summary line per server. In `auto` mode this is also the
     /// eager-vs-defer activation threshold: full schemas are advertised
     /// eagerly only while they fit this budget. Default: 2000.
     #[serde(default = "default_listing_max_tokens")]
@@ -136,17 +138,24 @@ impl std::fmt::Display for McpToolSearchMode {
 
 /// Which disclosure shape the per-turn tool list should use for MCP tools.
 /// Produced by [`McpConfig::disclosure_tier`] from the three size estimates.
+///
+/// On every deferred tier the catalog listing itself degrades *per server*,
+/// largest first (see `tool::definitions::render_deferred_mcp_listing`); the
+/// tiers below classify how much of the catalog fits the listing budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpDisclosureTier {
     /// Advertise every MCP schema directly.
     Eager,
-    /// Defer schemas; `search_tools` carries a name + one-line-description
-    /// catalog listing.
+    /// Defer schemas; `search_tools` carries the full per-server
+    /// name + one-line-description catalog listing.
     Listed,
-    /// Defer schemas; the listing degrades to tool names only.
+    /// Defer schemas; the listing is over budget, so servers collapse
+    /// largest-first to one-line summaries until it fits.
     NamesOnly,
-    /// Defer schemas; even names don't fit — bare `search_tools`, discovery
-    /// through queries only.
+    /// Defer schemas; even fully collapsed the listing is over budget — it
+    /// still renders one summary line per server (never nothing), so the
+    /// model knows the tools exist and searches instead of substituting a
+    /// generic tool.
     Bare,
 }
 

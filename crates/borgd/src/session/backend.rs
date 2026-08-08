@@ -282,6 +282,12 @@ impl AgentBackend {
         goal_bus: Option<crate::goal_bus::GoalEventBus>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics).await?;
+        // Captured before the context is moved into the agent: the client's
+        // workspace (when provided) is the session's real working directory,
+        // which the workspace stamp below prefers over the daemon's own cwd.
+        let workspace_cwd_hint = execution_context
+            .as_ref()
+            .map(|c| c.workspace_cwd().to_path_buf());
         if let Some(execution_context) = execution_context {
             agent.set_execution_context(execution_context);
         }
@@ -323,6 +329,11 @@ impl AgentBackend {
         for hook in cortex::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
             agent.hook_registry_mut().register(Box::new(hook));
         }
+        // Outbound signed webhooks (webhooks.endpoints). None when unconfigured;
+        // construction problems are logged inside from_config, never fatal.
+        if let Some(hook) = cortex::hooks::WebhookHook::from_config(&agent.config().webhooks) {
+            agent.hook_registry_mut().register(Box::new(hook));
+        }
 
         if let Some(id) = resume_id {
             if let Err(e) = agent.load_session(id) {
@@ -354,6 +365,25 @@ impl AgentBackend {
                 .await
             {
                 tracing::warn!(session_id = %session_id, error = %e, "upsert_session on open failed");
+            }
+            // Stamp workspace identity so workspace-scoped resume
+            // (`borg --continue`) can find this session again. Client-provided
+            // workspace wins; a daemon opened without one falls back to its
+            // own process cwd (best-effort — TUI clients re-stamp with their
+            // real cwd right after open).
+            let stamp_cwd = workspace_cwd_hint.or_else(|| std::env::current_dir().ok());
+            if let Some(dir) = stamp_cwd {
+                let (dir, repo_root) = cortex::session::workspace_identity(&dir);
+                if let Err(e) = db
+                    .set_session_workspace(
+                        &session_id,
+                        &dir.to_string_lossy(),
+                        repo_root.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(session_id = %session_id, error = %e, "workspace stamp on open failed");
+                }
             }
             // Take ownership of the session up front. A conflict here (another
             // live worker owns it) is only possible in a multi-worker setup; we

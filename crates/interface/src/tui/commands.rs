@@ -1730,12 +1730,23 @@ pub(super) enum VoiceMode {
 /// is testable without a daemon.
 pub(super) fn format_context_breakdown(breakdown: &protocols::session::ContextBreakdown) -> String {
     const BAR_WIDTH: usize = 24;
+    /// Detail rows rendered per parent bucket before collapsing to "+N more"
+    /// — keeps a many-skill / many-server install from flooding the popup.
+    const DETAIL_CAP: usize = 10;
     let window = breakdown.context_window.max(1);
-    let used: u64 = breakdown.components.iter().map(|c| c.tokens).sum();
+    // Detail rows itemize part of their parent bucket: counting them here
+    // would double-charge the window.
+    let used: u64 = breakdown
+        .components
+        .iter()
+        .filter(|c| !c.detail)
+        .map(|c| c.tokens)
+        .sum();
     let free = breakdown.context_window.saturating_sub(used);
     let label_width = breakdown
         .components
         .iter()
+        .filter(|c| !c.detail)
         .map(|c| c.label.len())
         .chain(std::iter::once("Free space".len()))
         .max()
@@ -1746,12 +1757,7 @@ pub(super) fn format_context_breakdown(breakdown: &protocols::session::ContextBr
         breakdown.context_window,
         (used as f64 / window as f64) * 100.0
     );
-    for (label, tokens) in breakdown
-        .components
-        .iter()
-        .map(|c| (c.label.as_str(), c.tokens))
-        .chain(std::iter::once(("Free space", free)))
-    {
+    let push_bar_row = |out: &mut String, label: &str, tokens: u64| {
         let frac = tokens as f64 / window as f64;
         let filled = ((frac * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
         let bar: String = "█".repeat(filled) + &"░".repeat(BAR_WIDTH - filled);
@@ -1759,7 +1765,31 @@ pub(super) fn format_context_breakdown(breakdown: &protocols::session::ContextBr
             "  {label:<label_width$}  {bar}  ~{tokens:>8} ({:>4.1}%)\n",
             frac * 100.0
         ));
+    };
+
+    let comps = &breakdown.components;
+    let mut i = 0;
+    while i < comps.len() {
+        push_bar_row(&mut out, &comps[i].label, comps[i].tokens);
+        i += 1;
+        // Gather this bucket's detail children (they directly follow it).
+        let mut details: Vec<&protocols::session::ContextComponent> = Vec::new();
+        while i < comps.len() && comps[i].detail {
+            details.push(&comps[i]);
+            i += 1;
+        }
+        // Largest first; defensive re-sort in case a daemon version emits
+        // them unsorted (name tiebreak keeps equal sizes stable).
+        details.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.label.cmp(&b.label)));
+        for d in details.iter().take(DETAIL_CAP) {
+            let pct = (d.tokens as f64 / window as f64) * 100.0;
+            out.push_str(&format!("    ↳ {}  ~{} ({pct:.1}%)\n", d.label, d.tokens));
+        }
+        if details.len() > DETAIL_CAP {
+            out.push_str(&format!("    ↳ +{} more\n", details.len() - DETAIL_CAP));
+        }
     }
+    push_bar_row(&mut out, "Free space", free);
     out.push_str("Estimates reflect the next request, not cumulative session spend.");
     out
 }
@@ -3267,10 +3297,12 @@ mod tests {
                 ContextComponent {
                     label: "System prompt (cache-stable prefix)".into(),
                     tokens: 10_000,
+                    detail: false,
                 },
                 ContextComponent {
                     label: "Conversation history".into(),
                     tokens: 40_000,
+                    detail: false,
                 },
             ],
         };
@@ -3295,6 +3327,81 @@ mod tests {
         assert_eq!(filled, 10, "40% of 24 cells rounds to 10: {history_line}");
     }
 
+    /// Detail rows (per-skill / per-MCP-server) itemize their parent bucket:
+    /// they must render indented under it, never count toward the header
+    /// total or free space, sort largest-first, and collapse past the cap
+    /// into a "+N more" line.
+    #[test]
+    fn format_context_breakdown_indents_caps_and_never_double_counts_details() {
+        use protocols::session::{ContextBreakdown, ContextComponent};
+        let top = |label: &str, tokens| ContextComponent {
+            label: label.into(),
+            tokens,
+            detail: false,
+        };
+        let child = |label: &str, tokens| ContextComponent {
+            label: label.into(),
+            tokens,
+            detail: true,
+        };
+        let mut components = vec![
+            top("System prompt (dynamic suffix)", 30_000),
+            // 12 skill children (each 100 tokens): two must collapse.
+            // Emitted smallest-variant-first to prove the renderer re-sorts.
+            child("Skill: aa", 100),
+        ];
+        components.push(child("Skill: big", 5_000));
+        for i in 0..10 {
+            components.push(child(&format!("Skill: s{i:02}"), 100));
+        }
+        components.push(top("Tool schemas (MCP)", 6_000));
+        components.push(child("MCP: linear", 1_000));
+        components.push(child("MCP: github", 5_000));
+        let breakdown = ContextBreakdown {
+            context_window: 100_000,
+            components,
+        };
+
+        let out = format_context_breakdown(&breakdown);
+
+        // Header totals only the parent buckets: 30k + 6k, not +details.
+        assert!(
+            out.contains("~36000 / 100000 tokens (36% used)"),
+            "detail rows must not inflate the total: {out}"
+        );
+        // Free space derives from the same non-detail sum.
+        assert!(
+            out.contains("Free space") && out.contains("~   64000"),
+            "free space must ignore detail rows: {out}"
+        );
+        // Children render indented, largest first, under their own parent.
+        let lines: Vec<&str> = out.lines().collect();
+        let dyn_line = lines
+            .iter()
+            .position(|l| l.contains("System prompt (dynamic suffix)"))
+            .unwrap();
+        assert!(
+            lines[dyn_line + 1].starts_with("    ↳ Skill: big"),
+            "largest skill must lead its parent's details: {out}"
+        );
+        let mcp_line = lines
+            .iter()
+            .position(|l| l.contains("Tool schemas (MCP)"))
+            .unwrap();
+        assert!(
+            lines[mcp_line + 1].starts_with("    ↳ MCP: github")
+                && lines[mcp_line + 2].starts_with("    ↳ MCP: linear"),
+            "server details must sort descending under the MCP bucket: {out}"
+        );
+        // 12 skill children against a cap of 10 → exactly 2 collapse.
+        assert!(
+            out.contains("↳ +2 more"),
+            "children past the cap must collapse into +N more: {out}"
+        );
+        let skill_rows = out.matches("↳ Skill: ").count();
+        assert_eq!(skill_rows, 10, "cap must hold at 10 rendered rows: {out}");
+    }
+
     #[test]
     fn format_context_breakdown_overfull_window_clamps_free_space() {
         use protocols::session::{ContextBreakdown, ContextComponent};
@@ -3305,6 +3412,7 @@ mod tests {
             components: vec![ContextComponent {
                 label: "Conversation history".into(),
                 tokens: 1_500,
+                detail: false,
             }],
         };
         let out = format_context_breakdown(&breakdown);

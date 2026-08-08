@@ -709,6 +709,13 @@ pub const META_LAST_UNCLEAN_SHUTDOWN_AT: &str = "last_unclean_shutdown_at";
 /// `meta` key holding the unix timestamp of the last graceful shutdown.
 pub const META_LAST_CLEAN_SHUTDOWN_AT: &str = "last_clean_shutdown_at";
 
+/// `meta` key holding the operator-supplied reason for the current
+/// emergency pause (`borg pause --reason …`). Cleared on `borg resume`.
+pub const META_EMERGENCY_PAUSE_REASON: &str = "emergency_pause_reason";
+/// `meta` key holding the unix timestamp at which the current emergency
+/// pause was engaged. Cleared on `borg resume`.
+pub const META_EMERGENCY_PAUSE_SINCE: &str = "emergency_pause_since";
+
 /// launchd service label (macOS): the daemon's reverse-DNS identifier; the
 /// installed plist is `<label>.plist`. Shared by the service installer
 /// (`borgd_launcher`) and the `borg doctor` service-install check so neither

@@ -20,6 +20,7 @@ pub mod tunnel;
 pub mod ui;
 pub mod update;
 pub mod voice;
+pub mod webhooks;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,7 @@ pub use tunnel::{
 pub use ui::UiConfig;
 pub use update::*;
 pub use voice::VoiceConfig;
+pub use webhooks::{WebhookEndpoint, WebhooksConfig};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -152,6 +154,9 @@ pub struct Config {
     /// User-authored lifecycle hooks loaded from `~/.borg/hooks.json`.
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// Outbound signed lifecycle webhooks.
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
     /// Compaction model overrides (use cheaper model for context compaction).
     #[serde(default)]
     pub compaction: CompactionConfig,

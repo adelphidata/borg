@@ -1410,6 +1410,51 @@ fn empty_response_terminal_labels_reasoning_excerpt() {
     );
 }
 
+/// Regression: the empty-response terminal must be display-only. Persisting
+/// the reasoning excerpt puts chain-of-thought into replayable assistant
+/// content, which providers read as injected reasoning — subsequent calls
+/// then deterministically return empty responses, re-entering this exact
+/// path and wedging the session permanently.
+#[tokio::test]
+async fn empty_response_persists_neutral_marker_not_reasoning() {
+    let mut agent = minimal_test_agent(Config::default());
+    let reasoning = "chain-of-thought: the answer is 42 because of the mice";
+    agent.turn_reasoning = reasoning.to_string();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    agent.finalize_text_response("", &tx).await;
+    drop(tx);
+
+    // The user still sees the labeled excerpt live, via the display channel.
+    let mut displayed = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let AgentEvent::TextDelta(t) = ev {
+            displayed.push_str(&t);
+        }
+    }
+    assert!(
+        displayed.contains("the answer is 42"),
+        "reasoning excerpt must still be delivered for display: {displayed}"
+    );
+
+    // But the persisted assistant message carries only the neutral marker.
+    let persisted = agent
+        .history
+        .last()
+        .expect("empty-response turn must persist an assistant message");
+    assert_eq!(persisted.role, crate::types::Role::Assistant);
+    let content = persisted
+        .content
+        .as_ref()
+        .and_then(|c| c.text())
+        .expect("persisted marker must be non-empty text");
+    assert!(
+        !content.contains("answer is 42") && !content.contains("chain-of-thought"),
+        "persisted assistant content must not contain reasoning: {content}"
+    );
+    assert_eq!(content, crate::agent::EMPTY_RESPONSE_PERSISTED_MARKER);
+}
+
 // NOTE: the `build_system_prompt_*_after_*` ordering tests above are the
 // prompt-cache guards (an explicitly-allowed source-grep exception). The
 // section *content* itself is verified by the tests below, which call the
@@ -1636,6 +1681,47 @@ fn run_agent_loop_resets_per_turn_loop_guards() {
     assert!(
         body.contains("self.unknown_tool_tracker.reset()"),
         "run_agent_loop must reset the unknown-tool tracker at start of turn"
+    );
+}
+
+#[test]
+fn run_agent_loop_reaps_processes_only_on_abandoned_turns() {
+    // Source-grep guard for the turn-scoped subprocess ownership seam.
+    // Invariants the type system can't express:
+    //  1. a process baseline is captured (begin_turn) BEFORE the loop body
+    //     runs, so pre-existing processes are never reap candidates;
+    //  2. the abandoned-turn reap runs ONLY under `cancel.is_cancelled()` —
+    //     normal completion must leave backgrounded processes alive.
+    let start = AGENT_RS_SRC
+        .find("pub async fn run_agent_loop(")
+        .expect("run_agent_loop must exist");
+    let end_rel = AGENT_RS_SRC[start..]
+        .find("async fn run_agent_loop_inner(")
+        .expect("run_agent_loop_inner must follow the wrapper");
+    let wrapper = &AGENT_RS_SRC[start..start + end_rel];
+
+    let begin_idx = wrapper
+        .find(".begin_turn(")
+        .expect("run_agent_loop must capture a process baseline via begin_turn");
+    let inner_idx = wrapper
+        .find("run_agent_loop_inner(")
+        .expect("wrapper must delegate to run_agent_loop_inner");
+    assert!(
+        begin_idx < inner_idx,
+        "baseline must be captured BEFORE the loop body runs — otherwise \
+         turn-spawned processes land in their own baseline and never reap"
+    );
+    let cancelled_idx = wrapper
+        .find("cancel.is_cancelled()")
+        .expect("wrapper must distinguish abandonment from normal completion");
+    let reap_idx = wrapper
+        .find("reap_abandoned_turn(")
+        .expect("wrapper must reap turn-spawned processes on abandonment");
+    assert!(
+        inner_idx < cancelled_idx && cancelled_idx < reap_idx,
+        "reap_abandoned_turn must run after the loop body and only under the \
+         cancellation check — a reap on the normal-completion path would kill \
+         every backgrounded process the user asked for"
     );
 }
 

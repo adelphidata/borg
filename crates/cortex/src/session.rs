@@ -33,6 +33,24 @@ pub struct Session {
     pub messages: Vec<Message>,
 }
 
+/// Resolve the workspace identity of a directory for session stamping and
+/// workspace-scoped resume: the symlink-canonicalized `cwd` plus the
+/// (equally canonicalized) toplevel of its enclosing git checkout, if any.
+///
+/// Canonicalization keeps comparisons stable across symlinked paths (e.g.
+/// macOS `/tmp` → `/private/tmp`); when it fails (dir vanished, permission)
+/// the raw path is used rather than erroring — a best-guess stamp beats none.
+/// The git toplevel is found by a pure filesystem walk (no `git` subprocess);
+/// a linked `git worktree` checkout counts as its own workspace, which is
+/// what workspace-scoped resume wants — worktrees are deliberately separate
+/// working contexts.
+pub fn workspace_identity(cwd: &std::path::Path) -> (PathBuf, Option<PathBuf>) {
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let repo_root =
+        crate::git::find_repo_root(&canonical_cwd).map(|root| root.canonicalize().unwrap_or(root));
+    (canonical_cwd, repo_root)
+}
+
 fn sessions_dir() -> Result<PathBuf> {
     let dir = Config::sessions_dir()?;
     fs::create_dir_all(&dir)?;
@@ -234,6 +252,50 @@ pub async fn recover_session_from_db(session_id: &str) -> Result<Option<Vec<Mess
 mod tests {
     use super::*;
     use crate::types::MessageContent;
+
+    /// Workspace identity must find the git toplevel from any subdirectory
+    /// and symlink-canonicalize both paths — otherwise a session stamped from
+    /// `repo/sub` and a `--continue` issued from `repo/` (or through a
+    /// symlinked temp path like macOS `/tmp`) would never compare equal.
+    #[test]
+    fn workspace_identity_finds_git_toplevel_and_canonicalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let sub = repo.join("deep").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git must be runnable in tests");
+        assert!(init.success(), "git init failed");
+
+        let canonical_repo = repo.canonicalize().unwrap();
+        let (cwd, root) = workspace_identity(&sub);
+        assert_eq!(
+            root.as_deref(),
+            Some(canonical_repo.as_path()),
+            "subdirectory must resolve to the canonical repo toplevel"
+        );
+        assert_eq!(
+            cwd,
+            sub.canonicalize().unwrap(),
+            "cwd must be canonicalized"
+        );
+
+        // Same repo reached from its (possibly symlinked) raw tempdir path
+        // must produce the identical root string — that equality is what the
+        // DB resolver compares on.
+        let (_, root_from_repo) = workspace_identity(&repo);
+        assert_eq!(root_from_repo, root);
+
+        // Outside any repo: no root, but still a canonical cwd.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let (cwd, root) = workspace_identity(&plain);
+        assert_eq!(root, None, "non-repo directory must not claim a repo root");
+        assert_eq!(cwd, plain.canonicalize().unwrap());
+    }
 
     #[test]
     fn session_new_generates_valid_uuid_and_rfc3339_timestamps() {

@@ -87,6 +87,11 @@ impl SequencedBuffer {
         self.bcast.subscribe()
     }
 
+    /// Number of live broadcast receivers — i.e. attached subscribers.
+    pub fn receiver_count(&self) -> usize {
+        self.bcast.receiver_count()
+    }
+
     /// Highest assigned `event_seq`, or 0 if no events have been pushed.
     pub fn last_seq(&self) -> u64 {
         let g = self

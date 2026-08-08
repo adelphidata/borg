@@ -472,6 +472,9 @@ message SessionSummary {
   string title = 2;
   uint64 message_count = 3;
   uint64 updated_unix_ts = 4;
+  // True when the user pinned this session (exempt from retention purge and
+  // stale auto-archive; always present in listings).
+  bool pinned = 5;
 }
 message SessionRef { string id = 1; }
 message SessionDetail {

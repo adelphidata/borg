@@ -265,6 +265,22 @@ pub struct SecurityConfig {
     /// there would be an approval prompt by another name.
     #[serde(default)]
     pub scheduled_command_sandbox: bool,
+    /// Global emergency stop (`borg pause` / `borg resume`). While true, the
+    /// daemon starts no NEW work: scheduled-task dispatch is deferred,
+    /// gateway/interactive turns get a "paused" notice, and heartbeat prompt
+    /// injection is skipped. In-flight turns and internal maintenance keep
+    /// running. Gates read this key straight from the settings DB (not this
+    /// cached struct) so a pause takes effect on a live daemon immediately;
+    /// see `crate::emergency_pause`.
+    #[serde(default)]
+    pub emergency_paused: bool,
+    /// Allow the agent's own write tools (`apply_patch` in all its lanes) to
+    /// modify agent-instruction files (AGENTS.md, CLAUDE.md, .cursorrules, …).
+    /// Off by default: these files are injected into future system prompts, so
+    /// a prompt-injected edit to one persists into every later turn. Reads are
+    /// always allowed; the user can edit the files themselves.
+    #[serde(default)]
+    pub allow_instruction_writes: bool,
     /// Base64-encoded Ed25519 public keys trusted to sign WASM plugin
     /// manifests. `borg plugin install` rejects any package whose publisher
     /// key is not in this list. Empty by default — operators must opt in.
@@ -344,6 +360,8 @@ impl Default for SecurityConfig {
             max_shell_output_bytes: default_max_shell_output_bytes(),
             url_policy: UrlPolicyConfig::default(),
             scheduled_command_sandbox: false,
+            emergency_paused: false,
+            allow_instruction_writes: false,
             trusted_publisher_keys: Vec::new(),
             deprecated_publisher_keys: Vec::new(),
         }
@@ -429,6 +447,12 @@ mod tests {
         assert!(
             cfg.output_redaction,
             "output_redaction must default to true (security-first)"
+        );
+        // Security-first: instruction-file writes must stay opt-in, or a
+        // prompt-injected AGENTS.md edit persists into every future turn.
+        assert!(
+            !cfg.allow_instruction_writes,
+            "allow_instruction_writes must default to false"
         );
         assert_eq!(cfg.verifier, VerifierKind::Tofu);
         assert_eq!(cfg.kek_backend, KekBackend::Auto);

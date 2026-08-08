@@ -107,6 +107,13 @@ pub const TELEGRAM_MAX_RETRY_AFTER_SECS: u64 = 300;
 /// ceiling with a small margin for header/envelope overhead.
 pub const TELEGRAM_MAX_FILE_SIZE_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Max bytes downloaded for a channel attachment (Teams / Twilio /
+/// Google Chat voice-message audio and similar) before the fetch is aborted.
+/// Why: these arrive from provider CDNs whose Content-Length can lie or be
+/// absent, so the cap is enforced while streaming; 25 MiB comfortably fits
+/// every voice note while bounding memory.
+pub const ATTACHMENT_DOWNLOAD_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
 // ── Slack ─────────────────────────────────────────────────────────
 
 /// Slack API base URL.

@@ -66,6 +66,75 @@ impl Database {
         Ok(())
     }
 
+    /// Stamp a session's workspace identity: the canonicalized directory it
+    /// was opened from and (when inside a git checkout) the repo toplevel.
+    /// Last write wins — a session resumed from a different directory follows
+    /// its user, keeping workspace-scoped resume anchored to where the
+    /// session was most recently used. No-op when the row doesn't exist yet.
+    pub async fn set_session_workspace(
+        &self,
+        id: &str,
+        cwd: &str,
+        git_repo_root: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET cwd = ?1, git_repo_root = ?2 WHERE id = ?3",
+                params!(cwd, git_repo_root, id),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Most recent non-archived session belonging to the given workspace.
+    ///
+    /// Matching is two-tier: prefer sessions stamped with the same
+    /// `git_repo_root` (any directory inside the same checkout counts as the
+    /// same workspace), then fall back to an exact `cwd` match for
+    /// directories outside any git repo. Returns `None` when neither tier
+    /// matches — callers decide whether to fall back to the global MRU.
+    /// Both arguments must be canonicalized the same way the stamps were
+    /// (see `crate::session::workspace_identity`).
+    pub async fn most_recent_session_in_workspace(
+        &self,
+        git_repo_root: Option<&str>,
+        cwd: &str,
+    ) -> Result<Option<SessionRow>> {
+        if let Some(root) = git_repo_root {
+            let mut rows = self
+                .conn
+                .query(
+                    &format!(
+                        "SELECT {} FROM sessions \
+                         WHERE git_repo_root = ?1 AND archived_at IS NULL \
+                         ORDER BY updated_at DESC, id DESC LIMIT 1",
+                        SessionRow::COLUMNS
+                    ),
+                    params!(root),
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                return Ok(Some(SessionRow::from_row(&row)?));
+            }
+        }
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM sessions \
+                     WHERE cwd = ?1 AND archived_at IS NULL \
+                     ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    SessionRow::COLUMNS
+                ),
+                params!(cwd),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(SessionRow::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Overwrite a session's title without touching token totals or model.
     /// Used by the aux-LLM title generator after the first user→assistant
     /// exchange. No-op when the session row hasn't been inserted yet.
@@ -95,12 +164,30 @@ impl Database {
         }
     }
 
+    /// List sessions by recency, always including pinned sessions.
+    ///
+    /// The recency window (`ORDER BY updated_at DESC LIMIT ?`) alone would let
+    /// a pinned session fall off the end and become unreachable in the session
+    /// picker — even though pinning promises the session is kept (it is exempt
+    /// from retention purge and stale auto-archive). So a second bounded query
+    /// appends any non-archived pinned rows the window missed, deduplicated.
+    ///
+    /// A pin never bypasses the archive filter: archived pinned rows are not
+    /// resurrected by the catch-up (they stay reachable only the way any
+    /// archived session is — inside the window, where callers filter on
+    /// `archived_at` themselves).
+    ///
+    /// Ordering stays globally `updated_at DESC`: every row outside the top-
+    /// `limit` window is by construction no newer than the window's oldest row,
+    /// so appending the pinned extras (themselves recency-sorted) preserves the
+    /// order. The result may exceed `limit` by the number of caught-up pinned
+    /// rows, itself bounded by `limit`.
     pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
         let mut rows = self
             .conn
             .query(
                 &format!(
-                    "SELECT {} FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+                    "SELECT {} FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?1",
                     SessionRow::COLUMNS
                 ),
                 params!(limit as i64),
@@ -109,6 +196,29 @@ impl Database {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(SessionRow::from_row(&row)?);
+        }
+        // `NOT IN (window)` in SQL rather than only deduping in Rust, so the
+        // catch-up's own LIMIT budgets *missed* pinned rows — a window already
+        // full of pinned sessions can't starve older pinned ones out of it.
+        let mut pinned_rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {cols} FROM sessions \
+                     WHERE pinned = 1 AND archived_at IS NULL \
+                       AND id NOT IN \
+                         (SELECT id FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?1) \
+                     ORDER BY updated_at DESC, id DESC LIMIT ?1",
+                    cols = SessionRow::COLUMNS
+                ),
+                params!(limit as i64),
+            )
+            .await?;
+        while let Some(row) = pinned_rows.next().await? {
+            let r = SessionRow::from_row(&row)?;
+            if !out.iter().any(|s| s.id == r.id) {
+                out.push(r);
+            }
         }
         Ok(out)
     }
@@ -292,7 +402,20 @@ impl Database {
 
         match result {
             Ok(ids) => {
-                self.conn.execute_batch("COMMIT").await?;
+                if let Err(commit_err) = self.conn.execute_batch("COMMIT").await {
+                    // A failed COMMIT may leave the transaction open on this
+                    // shared connection, wedging every later writer inside
+                    // "cannot start a transaction within a transaction".
+                    // Best-effort ROLLBACK clears that state; if the commit
+                    // actually landed (fsync ambiguity) the rollback is a
+                    // harmless no-op error.
+                    if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                        tracing::warn!(
+                            "sessions: rollback after failed append_session_events commit also failed: {re}"
+                        );
+                    }
+                    return Err(commit_err.into());
+                }
                 Ok(ids)
             }
             Err(e) => {
@@ -1081,6 +1204,112 @@ mod tests {
         Database::test_db().await
     }
 
+    /// The workspace resolver must scope by git repo root first (any cwd
+    /// inside the same checkout counts), fall back to an exact cwd match for
+    /// non-repo directories, skip archived rows, and honor recency within a
+    /// workspace — otherwise `--continue` in repo A can resume a repo-B (or
+    /// dead) session.
+    #[tokio::test]
+    async fn workspace_resolver_scopes_by_repo_then_cwd_and_skips_archived() {
+        let db = test_db().await;
+        // (id, updated_at, cwd, repo_root, archived)
+        let rows: &[(&str, i64, &str, Option<&str>, bool)] = &[
+            ("a-old", 10, "/w/a/sub", Some("/w/a"), false),
+            ("a-new", 20, "/w/a", Some("/w/a"), false),
+            ("a-dead", 30, "/w/a", Some("/w/a"), true), // newest in A but archived
+            ("b", 40, "/w/b", Some("/w/b"), false),
+            ("nogit", 50, "/w/plain", None, false),
+        ];
+        for (id, updated_at, cwd, root, archived) in rows {
+            db.upsert_session(id, 1, *updated_at, 0, "m", "")
+                .await
+                .unwrap();
+            db.set_session_workspace(id, cwd, *root).await.unwrap();
+            if *archived {
+                db.conn
+                    .execute(
+                        "UPDATE sessions SET archived_at = 99 WHERE id = ?1",
+                        params!(*id),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Repo tier: newest *non-archived* session of repo A wins, even though
+        // an archived A-session and other-workspace sessions are more recent.
+        let hit = db
+            .most_recent_session_in_workspace(Some("/w/a"), "/w/a/somewhere-else")
+            .await
+            .unwrap()
+            .expect("repo A has live sessions");
+        assert_eq!(
+            hit.id, "a-new",
+            "repo tier must be recency-ordered and skip archived"
+        );
+
+        // Repo isolation: repo B resolves to its own session, never A's.
+        let hit = db
+            .most_recent_session_in_workspace(Some("/w/b"), "/w/b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, "b");
+
+        // cwd tier: outside any repo, an exact cwd match resolves.
+        let hit = db
+            .most_recent_session_in_workspace(None, "/w/plain")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, "nogit");
+
+        // Unknown repo root falls through to the cwd tier rather than
+        // grabbing some other workspace's session.
+        let hit = db
+            .most_recent_session_in_workspace(Some("/w/unknown"), "/w/plain")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, "nogit", "repo miss must fall back to cwd match");
+
+        // Nothing matches either tier → None (caller decides global fallback).
+        assert!(db
+            .most_recent_session_in_workspace(Some("/w/nowhere"), "/w/nowhere")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A session resumed from a new directory follows its user: the stamp is
+    /// last-write-wins, and clearing the repo root (repo → plain dir) must
+    /// actually clear it rather than leave a stale association.
+    #[tokio::test]
+    async fn workspace_stamp_is_last_write_wins() {
+        let db = test_db().await;
+        db.upsert_session("s", 1, 2, 0, "m", "").await.unwrap();
+        db.set_session_workspace("s", "/w/a", Some("/w/a"))
+            .await
+            .unwrap();
+        db.set_session_workspace("s", "/elsewhere", None)
+            .await
+            .unwrap();
+
+        let row = db.session_by_id("s").await.unwrap().unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/elsewhere"));
+        assert_eq!(
+            row.git_repo_root, None,
+            "re-stamp must clear a stale repo root"
+        );
+        assert!(
+            db.most_recent_session_in_workspace(Some("/w/a"), "/w/a")
+                .await
+                .unwrap()
+                .is_none(),
+            "old workspace must no longer resolve the moved session"
+        );
+    }
+
     /// The sweep ages on last activity, not creation. A conversation started
     /// long ago but used recently is active — archiving it by birthday is the
     /// failure this ordering exists to prevent.
@@ -1212,6 +1441,80 @@ mod tests {
             "pinned session keeps its history"
         );
         assert_eq!(remaining(&db, "drop").await, 0);
+    }
+
+    /// Pinning promises the session is kept — so it must never silently fall
+    /// out of the recency window and become unreachable in the picker. The
+    /// catch-up must not, however, let a pin bypass the archive filter, and
+    /// must not duplicate a pinned row that is already inside the window.
+    #[tokio::test]
+    async fn pinned_sessions_survive_the_recency_window() {
+        let db = test_db().await;
+        let day = 86_400i64;
+        let now = 100 * day;
+
+        // Old rows, all outside the recency window below.
+        db.upsert_session("old-pinned", day, now - 90 * day, 0, "m", "Old pinned")
+            .await
+            .unwrap();
+        db.upsert_session("old-unpinned", day, now - 89 * day, 0, "m", "Old unpinned")
+            .await
+            .unwrap();
+        db.upsert_session("old-archived", day, now - 88 * day, 0, "m", "Old archived")
+            .await
+            .unwrap();
+        // Archive first (the sweep skips pinned rows), then pin, so the row is
+        // both archived and pinned via public API only.
+        assert_eq!(
+            db.archive_stale_sessions(now - 80 * day, now)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(db.unarchive_session("old-pinned").await.unwrap());
+        assert!(db.unarchive_session("old-unpinned").await.unwrap());
+        assert!(db.set_session_pinned("old-pinned", true).await.unwrap());
+        assert!(db.set_session_pinned("old-archived", true).await.unwrap());
+
+        // Recent rows filling the window, one of them pinned.
+        for i in 0..4i64 {
+            db.upsert_session(&format!("recent-{i}"), now, now - i, 0, "m", "Recent")
+                .await
+                .unwrap();
+        }
+        assert!(db.set_session_pinned("recent-0", true).await.unwrap());
+
+        let listed = db.list_sessions(4).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+
+        // The old pinned session is reachable despite being outside the
+        // window — and exactly once.
+        assert_eq!(
+            ids.iter().filter(|id| **id == "old-pinned").count(),
+            1,
+            "pinned session outside the recency window must appear exactly once, got {ids:?}"
+        );
+        // An in-window pinned session is not duplicated by the catch-up.
+        assert_eq!(ids.iter().filter(|id| **id == "recent-0").count(), 1);
+        // A pin does not bypass the archive filter.
+        assert!(
+            !ids.contains(&"old-archived"),
+            "archived pinned session must stay out of the catch-up"
+        );
+        // Unpinned old sessions stay outside the window.
+        assert!(!ids.contains(&"old-unpinned"));
+        // Order stays recency-descending overall (pinned extras are older
+        // than every window row, so they land at the tail) — callers like
+        // "most recent session" lookups rely on `first()` semantics.
+        assert!(
+            listed
+                .windows(2)
+                .all(|w| w[0].updated_at >= w[1].updated_at),
+            "listing must stay sorted by updated_at DESC"
+        );
+        assert_eq!(listed.first().unwrap().id, "recent-0");
+        // The pinned flag is surfaced so UIs can render it.
+        assert!(listed.iter().find(|s| s.id == "old-pinned").unwrap().pinned);
     }
 
     #[tokio::test]

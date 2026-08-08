@@ -326,6 +326,54 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Like [`tool_definitions`], but grouped by owning server and name-sorted at
+/// both levels (servers ascending, tools ascending within a server). Backs the
+/// per-server deferred-catalog rendering in `tool::definitions`: degradation
+/// decisions are made per server, so the grouping — and its determinism — is
+/// part of the prompt-cache-stability contract. Same live filtering as
+/// [`tool_definitions`] (`disabled_servers` excluded).
+pub fn tool_definitions_by_server() -> Vec<(String, Vec<ToolDefinition>)> {
+    let Some(reg) = REGISTRY.get() else {
+        return Vec::new();
+    };
+    let mut by_server: std::collections::BTreeMap<String, Vec<ToolDefinition>> =
+        std::collections::BTreeMap::new();
+    for t in reg.tools() {
+        if is_server_disabled(&t.server) {
+            continue;
+        }
+        by_server
+            .entry(t.server)
+            .or_default()
+            .push(ToolDefinition::new(
+                t.full_name,
+                t.description.unwrap_or_default(),
+                t.input_schema,
+            ));
+    }
+    let mut out: Vec<(String, Vec<ToolDefinition>)> = by_server.into_iter().collect();
+    for (_, defs) in &mut out {
+        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+    }
+    out
+}
+
+/// Map each advertised MCP tool's full name (`mcp_<server>_<tool>`) to the
+/// server it belongs to, for per-server grouping in observability surfaces
+/// (`/context`). Filtering mirrors [`tool_definitions`] exactly (disabled
+/// servers excluded live) so the grouping can never attribute tokens to a
+/// tool that isn't actually advertised.
+pub fn tool_server_map() -> std::collections::HashMap<String, String> {
+    let Some(reg) = REGISTRY.get() else {
+        return std::collections::HashMap::new();
+    };
+    reg.tools()
+        .into_iter()
+        .filter(|t: &RegisteredTool| !is_server_disabled(&t.server))
+        .map(|t: RegisteredTool| (t.full_name, t.server))
+        .collect()
+}
+
 /// Search registered MCP tools by keyword and return the result as a JSON
 /// string. Backs the `search_tools` meta-tool used when
 /// [`crate::config::McpConfig::disclosure_tier`] holds MCP schemas out of

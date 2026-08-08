@@ -54,6 +54,28 @@ pub(crate) async fn run_status() -> Result<()> {
     let config = cortex::config::Config::load_from_db().await?;
     let db = cortex::db::Database::open_readonly().await?;
 
+    // Emergency stop banner: the operator must see PAUSED before anything
+    // else — every other section describes an agent that isn't taking work.
+    if cortex::emergency_pause::is_engaged(&db).await {
+        let (reason, since) = cortex::emergency_pause::details(&db).await;
+        println!("PAUSED — new work halted (borg resume to continue)");
+        if let Some(r) = &reason {
+            println!("  reason: {r}");
+        }
+        if let Some(s) = since {
+            let ago = now.timestamp().saturating_sub(s);
+            let when = chrono::DateTime::from_timestamp(s, 0)
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| s.to_string());
+            println!("  since:  {when} ({})", format_ago(ago));
+        }
+        println!();
+    }
+
     if config.evolution.enabled {
         if let Ok(evo_state) = db.get_evolution_state().await {
             println!("Borg Status");
@@ -88,6 +110,20 @@ pub(crate) async fn run_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Coarse "Xm ago" formatter for the pause banner.
+pub(crate) fn format_ago(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h ago", secs / 86_400, (secs % 86_400) / 3600)
+    }
 }
 
 pub(crate) fn format_bar(value: usize, width: usize) -> String {

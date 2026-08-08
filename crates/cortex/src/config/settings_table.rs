@@ -128,6 +128,8 @@ define_settings! {
         "security.output_redaction" => security.output_redaction, parsed(bool);
         "security.max_shell_output_bytes" => security.max_shell_output_bytes, parsed(usize);
         "security.scheduled_command_sandbox" => security.scheduled_command_sandbox, parsed(bool);
+        "security.emergency_paused" => security.emergency_paused, parsed(bool);
+        "security.allow_instruction_writes" => security.allow_instruction_writes, parsed(bool);
         "security.blocked_paths" => security.blocked_paths, json;
         "security.allowed_paths" => security.allowed_paths, json;
         "security.trusted_publisher_keys" => security.trusted_publisher_keys, json;
@@ -221,6 +223,7 @@ define_settings! {
         "heartbeat.remediation_timeout_secs" => heartbeat.remediation_timeout_secs, parsed(u64);
         "heartbeat.remediation_token_budget" => heartbeat.remediation_token_budget, parsed(u64);
         "heartbeat.remediation_max_ticks" => heartbeat.remediation_max_ticks, parsed(u32);
+        "heartbeat.model" => heartbeat.model, string;
 
         // ── User ──
         "user.name" => user.name, opt_string;
@@ -323,6 +326,10 @@ define_settings! {
 
         // ── Hooks ──
         "hooks.enabled" => hooks.enabled, parsed(bool);
+
+        // webhooks.endpoints handled in custom_apply below: the generic
+        // json_count arm reports only "Invalid JSON", hiding the URL-policy
+        // message (https-only unless loopback) that the operator needs.
 
         // ── Compaction ──
         "compaction.provider" => compaction.provider, opt_string;
@@ -441,6 +448,18 @@ define_settings! {
     }
 
     custom_apply {
+        // webhooks.endpoints: JSON array of endpoints. Deserialization runs
+        // the URL policy (https-only unless loopback); surface that message
+        // verbatim instead of a generic "Invalid JSON".
+        "webhooks.endpoints" => |s, key, value| {
+            let endpoints: Vec<crate::config::webhooks::WebhookEndpoint> =
+                ::serde_json::from_str(value)
+                    .map_err(|e| ::anyhow::anyhow!("Invalid {key}: {e}"))?;
+            let n = endpoints.len();
+            s.webhooks.endpoints = endpoints;
+            Ok(format!("{key} = ({n} endpoints)"))
+        };
+
         // llm.claude_cli_path: opt_string. Empty or the legacy "(auto-detect)"
         // display sentinel both clear to None — earlier versions of the
         // extractor returned the sentinel as the round-trip value, so this
@@ -796,6 +815,11 @@ define_settings! {
     }
 
     custom_extract {
+        // Round-trippable full JSON, same shape json_count would emit.
+        "webhooks.endpoints" => |c| {
+            ::serde_json::to_string(&c.webhooks.endpoints).unwrap_or_default()
+        };
+
         // Round-trippable: empty string when None. The "(auto-detect)" string
         // is for human display only and must never be persisted, since it is
         // not a valid Provider name.
@@ -998,6 +1022,7 @@ define_settings! {
         "security.output_redaction" => "Output redaction", Bool, "Security";
         "security.max_shell_output_bytes" => "Shell output cap (bytes)", Uint, "Security";
         "security.scheduled_command_sandbox" => "Sandbox scheduled commands", Bool, "Security";
+        "security.emergency_paused" => "Emergency pause (halt new work)", Bool, "Security";
         "security.verifier" => "mTLS verifier", Select, "Security";
 
         // — Maintenance (self-healing) —

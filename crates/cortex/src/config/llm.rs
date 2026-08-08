@@ -710,6 +710,14 @@ pub struct HeartbeatConfig {
     /// so a goal the agent keeps believing it can finish (or one stalled on an
     /// un-fixable provider error) cannot churn forever. Default 12.
     pub remediation_max_ticks: u32,
+    /// Fleet-default model for proactive/scheduled runs (heartbeats and
+    /// scheduled tasks). Empty (the default) inherits the main `llm.model`.
+    /// Resolution order for a scheduled run: per-task pin (`scheduled_tasks.
+    /// model`) > `tasks.model` fleet default > this > `llm.model`. Uses the
+    /// configured provider unchanged — pair it with a model the active
+    /// provider serves. User-owned: not settable through the agent-facing
+    /// `schedule` tool.
+    pub model: String,
 }
 
 impl Default for HeartbeatConfig {
@@ -733,6 +741,7 @@ impl Default for HeartbeatConfig {
             remediation_timeout_secs: 600,
             remediation_token_budget: 50_000,
             remediation_max_ticks: 12,
+            model: String::new(),
         }
     }
 }

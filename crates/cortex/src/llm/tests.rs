@@ -3567,6 +3567,109 @@ async fn restored_primary_refailure_reparks_with_fresh_cooldown() {
     assert!(!client.maybe_restore_primary());
 }
 
+/// One-key credential pool on a throwaway DB with the real system clock, for
+/// exercising the reset-aware branch of `maybe_restore_primary` (which
+/// compares the pool's recovery clock against wall time).
+async fn one_key_system_clock_pool() -> (Arc<credential_pool::CredentialPool>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("pool.db");
+    let db = crate::db::Database::open_at(&db_path).await.expect("db");
+    let pool = credential_pool::CredentialPool::load(
+        &db,
+        &db_path,
+        Provider::OpenAi,
+        credential_pool::PoolLoadConfig {
+            strategy: credential_pool::CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![credential_pool::ConfigEntry {
+                key: "sk-restore-gate".to_string(),
+                label: Some("only".to_string()),
+                config_name: "llm.api_keys[0]".to_string(),
+            }],
+            env_vars: vec![],
+            oauth_home: None,
+        },
+    )
+    .await
+    .expect("pool loads");
+    (pool, dir)
+}
+
+#[tokio::test]
+async fn primary_restore_defers_while_the_pool_reports_a_future_reset() {
+    // A subscription-window 429 can carry a reset hours away. Once the
+    // provider-level exponential cooldown (tens of seconds) expires, probing
+    // the primary every turn is a guaranteed failure plus two provider
+    // switches and two prompt-cache invalidations per turn. The pool's
+    // recovery clock knows better and must hold the client on the fallback.
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_POOL_GATE").await;
+    let (pool, _dir) = one_key_system_clock_pool().await;
+    client.primary_pool = Some(pool.clone());
+
+    client.record_provider_failure(FailoverReason::RateLimit);
+    assert!(client.try_failover_provider(), "failover must switch slots");
+
+    // The provider said "come back in an hour" — bench the only key that long.
+    let id = pool.entries()[0].id.clone();
+    pool.report_failure(
+        &id,
+        FailoverReason::RateLimit,
+        Some(429),
+        Some(std::time::Duration::from_secs(3600)),
+        None,
+    );
+
+    // The generic provider-level cooldown has expired…
+    client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
+    // …but the provider-reported reset still holds the restore.
+    assert!(
+        !client.maybe_restore_primary(),
+        "a provider-reported reset an hour away must keep the client on the fallback"
+    );
+    assert_eq!(client.active_slot_index, 0);
+
+    // The bench clears (window elapsed / operator reset): restore proceeds.
+    pool.reset_cooldowns();
+    assert!(
+        client.maybe_restore_primary(),
+        "once the pool recovers the primary must be restored"
+    );
+    assert_eq!(client.active_slot_index, usize::MAX);
+}
+
+#[tokio::test]
+async fn primary_restore_falls_open_when_the_pool_cannot_name_a_recovery_time() {
+    // Fail-open guard: the reset-aware gate may only delay a restore when it
+    // holds a concrete future timestamp. A pool with no available key but no
+    // recovery clock (every entry tombstoned) must not park the client on the
+    // fallback forever — the provider-level cooldown stays the sole authority,
+    // so recovery is never later than it was before the gate existed.
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_POOL_FAILOPEN").await;
+    let (pool, _dir) = one_key_system_clock_pool().await;
+    client.primary_pool = Some(pool.clone());
+
+    client.record_provider_failure(FailoverReason::RateLimit);
+    assert!(client.try_failover_provider(), "failover must switch slots");
+
+    // Tombstone the only key: nothing is available, yet there is no reset
+    // time to honor.
+    let id = pool.entries()[0].id.clone();
+    pool.report_failure(&id, FailoverReason::AuthPermanent, Some(403), None, None);
+    assert!(!pool.has_available());
+    assert_eq!(pool.next_recovery_at_ms(), None);
+
+    client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
+    assert!(
+        client.maybe_restore_primary(),
+        "an unknowable recovery time must fall open to the provider-level cooldown"
+    );
+    assert_eq!(client.active_slot_index, usize::MAX);
+}
+
 /// Collect every `{"type":"text","text":…}` value anywhere in the Anthropic
 /// message array — the shape Anthropic rejects when it is whitespace-only.
 fn collect_anthropic_text_blocks(v: &serde_json::Value, out: &mut Vec<String>) {

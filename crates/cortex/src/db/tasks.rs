@@ -6,7 +6,7 @@ use anyhow::Result;
 use libsql::params;
 
 /// Column list shared by all scheduled-task SELECT queries.
-const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider";
+const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash";
 
 /// Returns true if `pid` is alive on this host. `kill(pid, 0)` only probes —
 /// 0 means alive; ESRCH means dead; any other errno (e.g. EPERM) is treated
@@ -62,6 +62,8 @@ fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
         last_response_hash: row.get::<Option<String>>(23)?,
         model: row.get::<Option<String>>(24)?,
         model_provider: row.get::<Option<String>>(25)?,
+        monitor_mode: row.get::<Option<i64>>(26)?.unwrap_or(0) != 0,
+        last_pre_run_hash: row.get::<Option<String>>(27)?,
     })
 }
 
@@ -973,6 +975,34 @@ impl Database {
         Ok(())
     }
 
+    /// Set a task's monitor-mode flag. Returns false when no such task
+    /// exists. Kept off [`UpdateTask`] so the flag round-trips as a bool
+    /// (not a stringly field) and the create path can set it without
+    /// widening `NewTask` for every caller.
+    pub async fn set_task_monitor_mode(&self, id: &str, monitor_mode: bool) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET monitor_mode = ?1 WHERE id = ?2",
+                params!(monitor_mode as i64, id),
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// Persist the baseline hash of the last successful `pre_run_command`
+    /// output that reached the LLM for a monitor-mode task. Pass `None` to
+    /// clear the baseline (forcing the next run to execute and re-baseline).
+    pub async fn update_task_pre_run_hash(&self, id: &str, hash: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET last_pre_run_hash = ?1 WHERE id = ?2",
+                params!(hash, id),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Persist the hash of the most recently delivered response for a task.
     /// Used by the heartbeat dispatch path as belt-and-suspenders dedup
     /// behind the primary `[SILENT]` suppression. Pass `None` to clear.
@@ -1067,6 +1097,70 @@ mod tests {
                 .await
                 .unwrap(),
             "pinning a nonexistent task must report that it did nothing"
+        );
+    }
+
+    /// Monitor mode has to survive a write/read round trip through the
+    /// schema — a `monitor_mode`/`last_pre_run_hash` column missed in
+    /// `TASK_COLUMNS` or `map_task_row` reads back as off/None every run,
+    /// silently turning every monitor job into a normal (always-firing) one.
+    #[tokio::test]
+    async fn monitor_mode_and_pre_run_hash_round_trip() {
+        let db = test_db().await;
+        db.create_task(&NewTask {
+            id: "monitor-task",
+            name: "watch",
+            prompt: "report the change",
+            schedule_type: "interval",
+            schedule_expr: "5m",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: Some("curl -s https://example.com/status"),
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("create task");
+
+        // Fresh task: monitoring off, no baseline.
+        let fresh = db.get_task_by_id("monitor-task").await.unwrap().unwrap();
+        assert!(!fresh.monitor_mode);
+        assert_eq!(fresh.last_pre_run_hash, None);
+
+        assert!(db
+            .set_task_monitor_mode("monitor-task", true)
+            .await
+            .unwrap());
+        db.update_task_pre_run_hash("monitor-task", Some("abc123"))
+            .await
+            .unwrap();
+        let armed = db.get_task_by_id("monitor-task").await.unwrap().unwrap();
+        assert!(armed.monitor_mode);
+        assert_eq!(armed.last_pre_run_hash.as_deref(), Some("abc123"));
+
+        // Clearing the baseline forces the next run to re-baseline.
+        db.update_task_pre_run_hash("monitor-task", None)
+            .await
+            .unwrap();
+        let cleared = db.get_task_by_id("monitor-task").await.unwrap().unwrap();
+        assert!(
+            cleared.monitor_mode,
+            "clearing the baseline must not disarm"
+        );
+        assert_eq!(cleared.last_pre_run_hash, None);
+
+        assert!(
+            !db.set_task_monitor_mode("no-such-task", true)
+                .await
+                .unwrap(),
+            "arming a nonexistent task must report that it did nothing"
         );
     }
 

@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use tracing::{debug, trace};
 
 mod script;
+mod webhook;
 pub use script::ScriptHook;
+pub use webhook::WebhookHook;
 
 /// Points in the agent lifecycle where hooks can intercept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

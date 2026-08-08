@@ -167,17 +167,10 @@ pub async fn fetch_link_content(
     // Cap response body to prevent memory exhaustion
     const MAX_BODY_BYTES: usize = 2 * 1024 * 1024; // 2 MB
 
-    // Early rejection via Content-Length header (before downloading)
-    if let Some(cl) = resp.content_length() {
-        if cl > MAX_BODY_BYTES as u64 {
-            anyhow::bail!("Response too large (Content-Length: {cl} bytes)");
-        }
-    }
-
-    let bytes = resp.bytes().await?;
-    if bytes.len() > MAX_BODY_BYTES {
-        anyhow::bail!("Response too large ({} bytes)", bytes.len());
-    }
+    // Streamed read with a running cap — Content-Length can lie or be
+    // absent (chunked encoding), so the ceiling is enforced chunk-by-chunk
+    // rather than after buffering the whole body.
+    let bytes = cortex::media::read_body_capped(resp, MAX_BODY_BYTES as u64, "linked page").await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let text = if body.contains("<html") || body.contains("<HTML") || body.contains("<!DOCTYPE") {

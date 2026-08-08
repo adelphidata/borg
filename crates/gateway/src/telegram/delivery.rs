@@ -280,6 +280,31 @@ mod tests {
         );
     }
 
+    /// Spec: image extensions route through `sendPhoto`; anything else must
+    /// go via `sendDocument` so the original bytes survive (Telegram
+    /// re-encodes photos — a PDF or GIF sent as photo is rejected or
+    /// flattened). Case-insensitive on the extension.
+    #[test]
+    fn photo_vs_document_routing_by_extension() {
+        let cases = [
+            ("/tmp/chart.png", true),
+            ("/tmp/pic.JPG", true),
+            ("/tmp/pic.jpeg", true),
+            ("/tmp/sticker.webp", true),
+            ("/tmp/report.pdf", false),
+            ("/tmp/anim.gif", false),
+            ("/tmp/data.csv", false),
+            ("/tmp/noext", false),
+        ];
+        for (path, want_photo) in cases {
+            assert_eq!(
+                is_photo_path(std::path::Path::new(path)),
+                want_photo,
+                "routing for {path}"
+            );
+        }
+    }
+
     /// Spec: voice send happens only when every prerequisite holds —
     /// synthesizer configured, per-chat voice mode set, and the policy
     /// rule (`should_send_voice_reply`) accepts the response text +
@@ -459,6 +484,19 @@ pub(crate) fn should_attempt_voice_send(
         return false;
     };
     should_send_voice_reply(mode, response_text, input_was_voice)
+}
+
+/// File extensions Telegram accepts through `sendPhoto`. Everything else
+/// (PDFs, CSVs, audio, GIFs — Telegram re-encodes photos and would flatten a
+/// GIF) goes through `sendDocument`, which preserves the original bytes.
+pub(crate) fn is_photo_path(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp")
+    )
 }
 
 /// Plan the outbound chunks for a markdown response: fence-aware markdown
