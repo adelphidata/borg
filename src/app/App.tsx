@@ -16,9 +16,12 @@ function Shell() {
   const isMobile = useIsMobile();
 
   return (
-    <div className={`app${isMobile ? " mobile" : ""}`}>
-      {!isMobile && <div className="drag-strip" />}
-      <div className="app-body">
+    <div className="flex h-full flex-col bg-surface transition-[background] duration-[250ms]">
+      {/* macOS drag strip over the hidden title bar */}
+      {!isMobile && (
+        <div className="flex h-[38px] flex-none items-center gap-2 border-b border-line2 bg-surface2 px-[15px] [-webkit-app-region:drag]" />
+      )}
+      <div className="flex min-h-0 flex-1">
         {!isMobile && <Sidebar />}
         <Routes>
           {routes.map((r) => (

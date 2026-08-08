@@ -1,10 +1,13 @@
 import { useNavigate, useParams } from "react-router-dom";
 import { AlertBanner } from "../../components/AlertBanner";
 import { BackLink } from "../../components/BackLink";
+import { Badge } from "../../components/Badge";
 import { PageChrome } from "../../components/PageChrome";
 import { Pill } from "../../components/Pill";
 import { StatusDot } from "../../components/StatusDot";
+import { DETAIL_COL, SECTION_LABEL, scrollCol } from "../../components/pageClasses";
 import { connected, findConnection } from "../../data/mock";
+import { useIsMobile } from "../../lib/useIsMobile";
 
 /**
  * One connection, up close. Connected services show status + recent activity;
@@ -13,15 +16,19 @@ import { connected, findConnection } from "../../data/mock";
 export function ConnectionDetailPage() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const conn = findConnection(id);
+  const scroll = scrollCol(isMobile, "px-[38px] py-[34px]");
 
   if (!conn) {
     return (
       <PageChrome title="Connections">
-        <div className="conn-scroll">
-          <div className="detail-col">
+        <div className={scroll}>
+          <div className={DETAIL_COL}>
             <BackLink to="/connections" label="Connections" />
-            <div className="ambient">That connection doesn’t exist.</div>
+            <div className="text-[14.5px] leading-[1.62] text-pretty text-ink2">
+              That connection doesn’t exist.
+            </div>
           </div>
         </div>
       </PageChrome>
@@ -35,15 +42,19 @@ export function ConnectionDetailPage() {
       title={conn.name}
       meta={isConnected ? (conn.needsAttention ? "needs attention" : "connected") : "not connected"}
     >
-      <div className="conn-scroll">
-        <div className="detail-col">
+      <div className={scroll}>
+        <div className={DETAIL_COL}>
           <BackLink to="/connections" label="Connections" />
 
-          <div className="detail-head">
-            <span className={`badge lg${isConnected ? "" : " off"}`}>{conn.badge}</span>
+          <div className="flex items-center gap-4">
+            <Badge on={isConnected} sizeClasses="h-10 w-10 rounded-xl text-[12.5px]">
+              {conn.badge}
+            </Badge>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="name">{conn.name}</div>
-              <div className="sub">
+              <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
+                {conn.name}
+              </div>
+              <div className="mt-1 text-[12.5px] leading-[1.4] text-ink3">
                 {isConnected ? conn.sub : (conn.blurb ?? "Not connected yet.")}
               </div>
             </div>
@@ -54,11 +65,14 @@ export function ConnectionDetailPage() {
 
           {conn.can && (
             <section>
-              <div className="section-label">What Borg can do here</div>
-              <div className="detail-list">
+              <div className={SECTION_LABEL}>What Borg can do here</div>
+              <div className="flex flex-col">
                 {conn.can.map((line) => (
-                  <div key={line} className="detail-list-row">
-                    <span className="tick" />
+                  <div
+                    key={line}
+                    className="flex items-center gap-[13px] border-b border-line2 px-0.5 py-3 text-[13.5px] leading-[1.45] text-ink"
+                  >
+                    <span className="h-[5px] w-[5px] flex-none rounded-full bg-neon" />
                     <span>{line}</span>
                   </div>
                 ))}
@@ -68,19 +82,24 @@ export function ConnectionDetailPage() {
 
           {isConnected && conn.activity && (
             <section>
-              <div className="section-label">Recently</div>
-              <div className="detail-list">
+              <div className={SECTION_LABEL}>Recently</div>
+              <div className="flex flex-col">
                 {conn.activity.map((a) => (
-                  <div key={a.when + a.what} className="detail-activity-row">
-                    <span className="when">{a.when}</span>
-                    <span className="what">{a.what}</span>
+                  <div
+                    key={a.when + a.what}
+                    className="flex items-baseline gap-4 border-b border-line2 px-0.5 py-3"
+                  >
+                    <span className="w-[140px] flex-none text-[11.5px] leading-[1.4] text-ink3">
+                      {a.when}
+                    </span>
+                    <span className="text-[13.5px] leading-[1.45] text-ink2">{a.what}</span>
                   </div>
                 ))}
               </div>
             </section>
           )}
 
-          <div className="detail-actions">
+          <div className="flex gap-[9px]">
             {isConnected ? (
               <>
                 <Pill>Pause</Pill>

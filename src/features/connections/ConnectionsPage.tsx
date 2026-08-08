@@ -1,8 +1,10 @@
 import { useNavigate } from "react-router-dom";
 import { AlertBanner } from "../../components/AlertBanner";
+import { Badge } from "../../components/Badge";
 import { MobileTitle } from "../../components/MobileTitle";
 import { PageChrome } from "../../components/PageChrome";
 import { StatusDot } from "../../components/StatusDot";
+import { SECTION_LABEL, scrollCol } from "../../components/pageClasses";
 import { available, connected } from "../../data/mock";
 import { useIsMobile } from "../../lib/useIsMobile";
 
@@ -10,16 +12,20 @@ import { useIsMobile } from "../../lib/useIsMobile";
 function ConnCards({ open }: { open: (id: string) => void }) {
   return (
     <section>
-      <div className="section-label">Connected</div>
-      <div className="conn-grid">
+      <div className={SECTION_LABEL}>Connected</div>
+      <div className="grid grid-cols-4 gap-3">
         {connected.map((c) => (
-          <div key={c.id} className="conn-card" onClick={() => open(c.id)}>
-            <div className="head">
-              <span className="badge">{c.badge}</span>
+          <div
+            key={c.id}
+            className="rounded-[11px] border border-line bg-surface2 p-4"
+            onClick={() => open(c.id)}
+          >
+            <div className="mb-[11px] flex items-center justify-between">
+              <Badge>{c.badge}</Badge>
               <StatusDot needsAttention={c.needsAttention} />
             </div>
-            <div className="name">{c.name}</div>
-            <div className="sub">{c.sub}</div>
+            <div className="text-[13.5px] leading-[1.2] font-medium text-ink">{c.name}</div>
+            <div className="mt-[5px] text-[11.5px] leading-[1.4] text-ink3">{c.sub}</div>
           </div>
         ))}
       </div>
@@ -30,13 +36,17 @@ function ConnCards({ open }: { open: (id: string) => void }) {
 /** Mobile: connected services as list rows. */
 function ConnList({ open }: { open: (id: string) => void }) {
   return (
-    <div className="conn-list">
+    <div className="flex flex-col">
       {connected.map((c) => (
-        <div key={c.id} className="conn-row" onClick={() => open(c.id)}>
-          <span className="badge">{c.badge}</span>
+        <div
+          key={c.id}
+          className="flex items-center gap-[13px] border-b border-line2 py-3.5"
+          onClick={() => open(c.id)}
+        >
+          <Badge sizeClasses="h-[30px] w-[30px] rounded-[9px] text-[10.5px]">{c.badge}</Badge>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="name">{c.name}</div>
-            <div className="sub">{c.sub}</div>
+            <div className="text-[13.5px] leading-[1.25] font-medium text-ink">{c.name}</div>
+            <div className="mt-[3px] text-[11.5px] leading-[1.3] text-ink3">{c.sub}</div>
           </div>
           <StatusDot needsAttention={c.needsAttention} />
         </div>
@@ -46,14 +56,19 @@ function ConnList({ open }: { open: (id: string) => void }) {
 }
 
 function AddGrid({ open }: { open: (id: string) => void }) {
+  const isMobile = useIsMobile();
   return (
     <section>
-      <div className="section-label">Add</div>
-      <div className="conn-grid add">
+      <div className={SECTION_LABEL}>Add</div>
+      <div className={`grid gap-3 ${isMobile ? "grid-cols-2" : "grid-cols-4"}`}>
         {available.map((c) => (
-          <div key={c.id} className="add-card" onClick={() => open(c.id)}>
-            <span className="badge off">{c.badge}</span>
-            <span className="name">{c.name}</span>
+          <div
+            key={c.id}
+            className="flex cursor-pointer items-center gap-3 rounded-[11px] border border-line2 px-4 py-3.5 transition-[border-color] duration-150 hover:border-neon"
+            onClick={() => open(c.id)}
+          >
+            <Badge on={false}>{c.badge}</Badge>
+            <span className="text-[13px] leading-[1.2] font-medium text-ink2">{c.name}</span>
           </div>
         ))}
       </div>
@@ -74,8 +89,8 @@ export function ConnectionsPage() {
 
   return (
     <PageChrome title="Connections" meta={meta}>
-      <div className="conn-scroll">
-        <div className="conn-col">
+      <div className={scrollCol(isMobile, "px-[38px] py-[34px]")}>
+        <div className="flex max-w-[860px] flex-col gap-[30px]">
           <MobileTitle>Connections</MobileTitle>
           {alerted && (
             <AlertBanner conn={alerted} stacked={isMobile} onAction={() => open(alerted.id)} />

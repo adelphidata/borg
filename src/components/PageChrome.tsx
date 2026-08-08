@@ -21,20 +21,24 @@ export function PageChrome({ title, meta, mobileBrandHeader = false, children }:
   const isMobile = useIsMobile();
 
   return (
-    <main className="page">
+    <main className="flex min-w-0 flex-1 flex-col bg-surface">
       {!isMobile && (
-        <header className="page-header">
-          <span className="title">{title}</span>
-          <span className="spacer" />
-          {meta && <span className="meta">{meta}</span>}
+        <header className="flex h-14 flex-none items-center gap-3 border-b border-line2 px-[30px]">
+          <span className="text-[14px] leading-none font-medium tracking-[-0.01em] text-ink">
+            {title}
+          </span>
+          <span className="flex-1" />
+          {meta && <span className="text-[11.5px] leading-none text-ink3">{meta}</span>}
         </header>
       )}
       {isMobile && mobileBrandHeader && (
-        <header className="mobile-header">
+        <header className="flex flex-none items-center gap-2.5 border-b border-line2 px-[22px] pt-[calc(10px+env(safe-area-inset-top))] pb-3.5">
           <LogoIcon size={17} />
-          <span className="brand">BORG</span>
+          <span className="text-[12.5px] leading-none font-semibold tracking-[0.2em] text-ink">
+            BORG
+          </span>
           <span style={{ flex: 1 }} />
-          <span className="pulse" />
+          <span className="h-1.5 w-1.5 animate-bpulse rounded-full bg-neon shadow-(--glow)" />
         </header>
       )}
       {children}

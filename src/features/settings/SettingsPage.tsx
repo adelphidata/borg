@@ -3,57 +3,87 @@ import { useNavigate } from "react-router-dom";
 import { MobileTitle } from "../../components/MobileTitle";
 import { PageChrome } from "../../components/PageChrome";
 import { ChevronIcon } from "../../components/icons";
+import { SECTION_LABEL, scrollCol } from "../../components/pageClasses";
 import { advancedGroups, basicSettings } from "../../data/mock";
 import { useSettingControl } from "../../lib/settings";
+import { useIsMobile } from "../../lib/useIsMobile";
+
+/** Settings pages share edge-to-edge 38px desktop padding. */
+export const SETTINGS_SCROLL_DESKTOP_PADDING = "p-[38px]";
 
 export function SettingsPage() {
+  const isMobile = useIsMobile();
   const navigate = useNavigate();
   const { current } = useSettingControl();
   const [advOpen, setAdvOpen] = useState(false);
 
   return (
     <PageChrome title="Settings">
-      <div className="settings-scroll">
-        <div className="settings-col">
-          <MobileTitle>Settings</MobileTitle>
+      <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
+        <div className="flex max-w-[620px] flex-col">
+          <MobileTitle className="mb-1.5">Settings</MobileTitle>
 
           {basicSettings.map((s) => (
-            <div key={s.id} className="setting-row" onClick={() => navigate(`/settings/${s.id}`)}>
+            <div
+              key={s.id}
+              className="flex cursor-pointer items-center gap-[18px] border-b border-line2 px-0.5 py-[18px]"
+              onClick={() => navigate(`/settings/${s.id}`)}
+            >
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="name">{s.name}</div>
-                {s.desc && <div className="desc">{s.desc}</div>}
+                <div className="text-[14px] leading-[1.3] font-medium text-ink">{s.name}</div>
+                {s.desc && (
+                  <div className="mt-1 text-[12.5px] leading-[1.45] text-ink3">{s.desc}</div>
+                )}
               </div>
-              <div className="value">{current(s.id)}</div>
+              <div className="flex-none text-[13px] leading-none text-ink2">{current(s.id)}</div>
               <ChevronIcon size={13} style={{ color: "var(--ink3)" }} />
             </div>
           ))}
 
-          <div className="adv-toggle" onClick={() => setAdvOpen((v) => !v)}>
-            <span className={`chev${advOpen ? " open" : ""}`}>
+          <div
+            className="flex cursor-pointer items-center gap-[11px] px-0.5 pt-[22px]"
+            onClick={() => setAdvOpen((v) => !v)}
+          >
+            <span
+              className={`flex transition-transform duration-[180ms] ${advOpen ? "[transform:rotate(90deg)]" : ""}`}
+            >
               <ChevronIcon size={13} style={{ color: "var(--neon)" }} />
             </span>
-            <span className="label">Advanced</span>
-            <span className="rule" />
+            <span className="text-[10px] leading-none font-medium tracking-[0.16em] uppercase text-ink2">
+              Advanced
+            </span>
+            <span className="h-px flex-1 bg-line2" />
           </div>
 
           {advOpen && (
-            <div className="adv-body">
-              <div className="adv-note">
+            <div className="flex flex-col gap-6 pt-2">
+              <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
                 Borg works without changing any of this. Everything below is on a sensible default.
               </div>
               {advancedGroups.map((g) => (
                 <div key={g.name}>
-                  <div className="section-label" style={{ marginBottom: 11 }}>
+                  <div className={SECTION_LABEL} style={{ marginBottom: 11 }}>
                     {g.name}
                   </div>
-                  <div className="adv-group-box">
+                  <div className="overflow-hidden rounded-[10px] border border-line2 bg-surface2">
                     {g.rows.map((r) => (
-                      <div key={r.key} className="adv-row">
+                      <div
+                        key={r.key}
+                        className="flex items-center justify-between gap-[18px] border-b border-line2 px-4 py-[13px] last:border-b-0"
+                      >
                         <div style={{ minWidth: 0 }}>
-                          <div className="key">{r.key}</div>
-                          {r.desc && <div className="desc">{r.desc}</div>}
+                          <div className="text-[13px] leading-[1.3] font-medium text-ink">
+                            {r.key}
+                          </div>
+                          {r.desc && (
+                            <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
+                              {r.desc}
+                            </div>
+                          )}
                         </div>
-                        <span className="value">{r.value}</span>
+                        <span className="flex-none text-[12.5px] leading-none font-medium text-neon-ink">
+                          {r.value}
+                        </span>
                       </div>
                     ))}
                   </div>
