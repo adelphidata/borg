@@ -223,7 +223,7 @@ impl Transport for HttpTransport {
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_error_body_capped(resp).await;
             return Err(McpError::Auth(format!(
                 "{}: HTTP {}: {}",
                 self.server_name,
@@ -250,7 +250,7 @@ impl Transport for HttpTransport {
         }
         if !status.is_success() {
             let code = status.as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_error_body_capped(resp).await;
             let detail = format!(
                 "{}: HTTP {}: {}",
                 self.server_name,
@@ -289,26 +289,16 @@ impl Transport for HttpTransport {
         // rather than `resp.bytes()` which buffers the whole body first. A
         // hostile server streaming a multi-GB chunked response is aborted after
         // ~max_response_bytes instead of OOMing the process.
-        let mut body: Vec<u8> = Vec::new();
-        loop {
-            match resp.chunk().await {
-                Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > self.max_response_bytes {
-                        return Err(McpError::Protocol(format!(
-                            "{}: response body exceeds max_response_bytes ({} bytes)",
-                            self.server_name, self.max_response_bytes
-                        )));
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    return Err(McpError::TransportClosed(format!(
-                        "{}: body read failed: {e}",
-                        self.server_name
-                    )))
-                }
-            }
+        let (body, truncated) = read_body_capped(&mut resp, self.max_response_bytes)
+            .await
+            .map_err(|e| {
+                McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
+            })?;
+        if truncated {
+            return Err(McpError::Protocol(format!(
+                "{}: response body exceeds max_response_bytes ({} bytes)",
+                self.server_name, self.max_response_bytes
+            )));
         }
         // Streamable HTTP framing: either one JSON object, or newline-delimited
         // JSON objects when the server batches a response + notifications.
@@ -345,12 +335,53 @@ impl Transport for HttpTransport {
     }
 }
 
+/// How much of a non-2xx body is shown in the error message. The status code
+/// carries the diagnosis; the body is best-effort color.
+const ERROR_BODY_DISPLAY_BYTES: usize = 200;
+
+/// Read a response body chunk-by-chunk, keeping at most `cap` bytes. Returns
+/// the (possibly truncated) bytes and whether truncation happened; the caller
+/// decides if truncation is an error (success path) or fine (error display).
+/// Enforcing the cap *as we read* is the point — `resp.bytes()`/`resp.text()`
+/// buffer the whole body first, letting a hostile server stream gigabytes.
+async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+) -> std::result::Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let remaining = cap - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, false))
+}
+
+/// Display-ready prefix of an error response's body. Read failures degrade to
+/// an empty string — a server that 500s and then breaks the stream still gets
+/// its status reported.
+async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
+    let body = match read_body_capped(&mut resp, ERROR_BODY_DISPLAY_BYTES).await {
+        Ok((body, _)) => body,
+        Err(_) => Vec::new(),
+    };
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    // Back up to a char boundary — byte-slicing mid-codepoint panics, and
+    // lossy-decoded error bodies routinely end mid-character at the cap.
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

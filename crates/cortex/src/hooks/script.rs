@@ -417,8 +417,8 @@ const MAX_HOOK_STREAM_BYTES: u64 = 8 * 1024;
 const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// Spawn `sh -c <command>` with the payload on both `$1` and stdin, enforce
-/// `timeout`, reap the child on timeout. Follows the polling pattern from
-/// `host_audit::run_cmd_timeout`.
+/// `timeout` via `process_tree::wait_or_kill_group` (which takes the hook's
+/// whole process group with it on expiry).
 ///
 /// All three pipes are serviced by dedicated threads *while* we poll, not after.
 /// Draining only once `try_wait` reports exit is a deadlock: a hook that writes
@@ -427,16 +427,19 @@ const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// deadline and reported as a timeout. The same reasoning applies in reverse to
 /// the stdin write.
 fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32, SubprocessError> {
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .arg("borg-hook") // $0 inside the script
         .arg(payload) // $1
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(SubprocessError::Spawn)?;
+        .stderr(Stdio::piped());
+    // Own process group so the timeout path below can kill the hook's whole
+    // tree — `child.kill()` alone leaves backgrounded grandchildren running
+    // (and holding our pipes) past the deadline.
+    crate::util::process_tree::spawn_in_own_group_std(&mut cmd);
+    let mut child = cmd.spawn().map_err(SubprocessError::Spawn)?;
 
     // Feed stdin from its own thread and let the handle drop, closing the pipe so
     // a hook blocked on `cat` sees EOF. A hook that exits without reading its
@@ -457,20 +460,10 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
     let stdout_drain = child.stdout.take().map(spawn_stream_drain);
     let stderr_drain = child.stderr.take().map(spawn_stream_drain);
 
-    let deadline = Instant::now() + timeout;
-    let outcome = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status.code().unwrap_or(-1)),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(SubprocessError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => break Err(SubprocessError::Io(e)),
-        }
+    let outcome = match crate::util::process_tree::wait_or_kill_group(&mut child, timeout) {
+        Ok(status) => Ok(status.code().unwrap_or(-1)),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(SubprocessError::Timeout),
+        Err(e) => Err(SubprocessError::Io(e)),
     };
 
     // The child is gone, but its pipes are NOT necessarily at EOF: a hook that
@@ -1312,6 +1305,34 @@ mod tests {
             assert!(
                 elapsed < Duration::from_secs(3),
                 "child should be killed promptly, elapsed={elapsed:?}"
+            );
+        }
+
+        /// A timed-out hook must not leave backgrounded grandchildren running:
+        /// killing only the direct `sh` reparents the grandchild to init, where
+        /// it keeps holding our pipes (and doing whatever it was doing) with
+        /// nothing left to reap it. The group kill has to take out the tree.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn timeout_kills_the_hooks_whole_process_tree() {
+            let dir = tmp();
+            let pid_file = dir.path().join("grandchild.pid");
+            let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+            let result = tokio::task::spawn_blocking(move || {
+                run_subprocess(&command, "{}", Duration::from_secs(1))
+            })
+            .await
+            .expect("join");
+            assert!(matches!(result, Err(SubprocessError::Timeout)));
+
+            let grandchild: i32 = std::fs::read_to_string(&pid_file)
+                .expect("hook should have recorded the grandchild pid")
+                .trim()
+                .parse()
+                .expect("pid");
+            assert!(
+                crate::util::process_tree::wait_for_pid_exit(grandchild).await,
+                "grandchild {grandchild} survived the hook timeout"
             );
         }
 

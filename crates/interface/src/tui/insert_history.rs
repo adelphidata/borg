@@ -66,11 +66,16 @@ impl InsertHistoryMode {
 /// update `terminal.viewport_area` so subsequent draw passes know where the
 /// viewport moved to. Resize reflow uses the same viewport-aware path after
 /// clearing old scrollback.
+///
+/// Returns `true` when the raw writes may have touched cells inside the
+/// viewport, in which case the caller must invalidate the diff cache before
+/// the next draw. This is the writer's knowledge to report — callers cannot
+/// reconstruct it from geometry after the fact.
 pub fn insert_history_lines_with_mode<B>(
     terminal: &mut super::custom_terminal::Terminal<B>,
     lines: Vec<Line>,
     mode: InsertHistoryMode,
-) -> io::Result<()>
+) -> io::Result<bool>
 where
     B: Backend + Write,
 {
@@ -205,7 +210,15 @@ where
         terminal.note_history_rows_inserted(wrapped_lines);
     }
 
-    Ok(())
+    // Zellij mode scrolls the whole screen with raw newlines, viewport
+    // included. Standard mode isolates the viewport behind the DECSTBM region
+    // `1..top` — unless the viewport sits at row 0/1, where that region is
+    // degenerate and the writes above can land inside it.
+    let clobbered_viewport = match mode {
+        InsertHistoryMode::Zellij => true,
+        InsertHistoryMode::Standard => area.top() <= 1,
+    };
+    Ok(clobbered_viewport)
 }
 
 /// Render a single wrapped history line: clear continuation rows for wide lines,

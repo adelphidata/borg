@@ -162,6 +162,9 @@ where
     pub last_known_cursor_pos: Position,
     /// Count of visible history rows rendered above the viewport in inline mode.
     visible_history_rows: u16,
+    /// When set, the next flush emits every cell instead of diffing against the
+    /// previous buffer. Consumed by [`Self::flush`].
+    force_full_repaint: bool,
 }
 
 impl<B> Drop for Terminal<B>
@@ -203,6 +206,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
+            force_full_repaint: false,
         })
     }
 
@@ -248,7 +252,8 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
-        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let force = std::mem::take(&mut self.force_full_repaint);
+        let updates = diff_buffers(self.previous_buffer(), self.current_buffer(), force);
         let last_put_command = updates.iter().rfind(|command| command.is_put());
         if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
             self.last_known_cursor_pos = Position { x, y };
@@ -381,13 +386,17 @@ where
         Ok(())
     }
 
-    /// Force the next draw pass to repaint the entire viewport by resetting the
-    /// diff buffer. Call this after operations that move screen content outside of
-    /// ratatui's knowledge (e.g., scrolling via raw newlines under an outer
-    /// multiplexer), since the diff buffer's assumptions about what is currently
-    /// displayed are invalid.
+    /// Force the next draw pass to repaint the entire viewport. Call this after
+    /// operations that move screen content outside of ratatui's knowledge
+    /// (e.g., scrolling via raw newlines under an outer multiplexer), since the
+    /// diff buffer's assumptions about what is currently displayed are invalid.
+    ///
+    /// Resetting the diff buffer would not be enough: a reset cell is a
+    /// default-style space, so any default-style space in the next frame would
+    /// compare equal and be skipped — letting stale terminal content show
+    /// through those gaps. The flag makes [`Self::flush`] emit every cell.
     pub fn invalidate_viewport(&mut self) {
-        self.previous_buffer_mut().reset();
+        self.force_full_repaint = true;
     }
 
     /// Re-probe the terminal's cursor position (CPR) and move the inline
@@ -520,7 +529,10 @@ impl DrawCommand {
     }
 }
 
-fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
+/// `force` bypasses the cell-equality check so every cell (through each row's
+/// trailing-blank `ClearToEnd`) is emitted — used after raw terminal writes
+/// leave screen content the previous buffer knows nothing about.
+fn diff_buffers(a: &Buffer, b: &Buffer, force: bool) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
@@ -562,7 +574,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
     let mut to_skip: usize = 0;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
+        if !current.skip && (force || current != previous || invalidated > 0) && to_skip == 0 {
             let (x, y) = a.pos_of(i);
             let row = i / a.area.width as usize;
             if x <= last_nonblank_columns[row] {
@@ -728,7 +740,7 @@ mod tests {
             .expect("cell should exist")
             .set_symbol("X");
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, /*force*/ false);
 
         let clear_count = commands
             .iter()
@@ -744,6 +756,29 @@ mod tests {
                 .any(|command| matches!(command, DrawCommand::Put { x: 2, y: 0, .. })),
             "expected diff_buffers to update the final cell; commands: {commands:?}",
         );
+    }
+
+    /// After raw terminal writes (history insertion, multiplexer newline
+    /// scrolls) the screen may hold content ratatui never drew. A forced
+    /// repaint must emit even interior default-style spaces — they compare
+    /// equal to an empty previous buffer, so an ordinary diff skips them and
+    /// stale glyphs show through the gaps between words.
+    #[test]
+    fn invalidation_forces_interior_default_spaces_to_repaint() {
+        let area = Rect::new(0, 0, 8, 1);
+        let previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "a b", Style::default());
+
+        let commands = diff_buffers(&previous, &next, /*force*/ true);
+        for x in 0..3u16 {
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, DrawCommand::Put { x: cx, y: 0, .. } if *cx == x)),
+                "cell {x} (including the interior space) must repaint; commands: {commands:?}",
+            );
+        }
     }
 
     #[test]
@@ -787,7 +822,7 @@ mod tests {
         previous.set_string(0, 0, "中文", Style::default());
         next.set_string(0, 0, "中", Style::default());
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, /*force*/ false);
         assert!(
             commands
                 .iter()
