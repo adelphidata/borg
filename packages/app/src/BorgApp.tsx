@@ -7,7 +7,7 @@ import { OnboardingPage } from "./features/onboarding/OnboardingPage";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { SettingsProvider } from "./lib/settings";
 import { PlatformProvider, type Platform } from "./lib/platform";
-import { useQuery } from "./lib/useDaemon";
+import { useMutation, useQuery } from "./lib/useDaemon";
 import { routes } from "./routes";
 
 // TODO(daemon): no RPC carries an operator identity yet; the footer stays static.
@@ -23,6 +23,21 @@ function Shell({ platform }: { platform: Platform }) {
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)
     .map((s) => ({ id: s.id, title: s.title || "Untitled" }));
+
+  // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`
+  // brings a conversation back. The daemon also closes the session if it is
+  // live, so the refetch is enough to drop the row.
+  const archiveSession = useMutation(
+    (borg, id: string) => borg.admin.setSessionArchived({ id, archived: true }),
+    {
+      onSuccess: (_data, id) => {
+        sessions.refetch();
+        // Closing the conversation on screen would otherwise leave the user
+        // staring at a session that is no longer in the list.
+        if (location.pathname === `/c/${id}`) navigate("/");
+      },
+    },
+  );
 
   // Attention dots: doctor warnings light Health, pending pairings light
   // Connections. Unreachable daemon lights nothing — the pages say it better.
@@ -59,6 +74,8 @@ function Shell({ platform }: { platform: Platform }) {
             routes={navRoutes}
             recents={recents}
             onOpenRecent={(id) => navigate(`/c/${id}`)}
+            onArchiveRecent={(id) => void archiveSession.run(id)}
+            archiveError={archiveSession.error?.message}
             onNewConversation={() => navigate("/c/new")}
             user={user}
           />

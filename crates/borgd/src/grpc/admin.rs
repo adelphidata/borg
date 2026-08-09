@@ -35,9 +35,9 @@ use protocols::admin::{
     RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
-    ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SessionSummary,
-    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
-    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
+    ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList, SessionRef,
+    SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry,
+    SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
     TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
@@ -349,6 +349,49 @@ impl Admin for AdminSvc {
         .await
         .map_err(|e| TStatus::internal(format!("list_sessions failed: {e}")))?;
         Ok(Response::new(SessionList { sessions }))
+    }
+
+    async fn set_session_archived(
+        &self,
+        req: Request<SessionArchiveMutation>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_archived failed: {e}")))?;
+        // Reject an unknown id before touching the registry: closing a live
+        // session is not undoable, and a request answered with an error must
+        // not have cancelled a turn on its way out.
+        let known = db
+            .session_by_id(&req.id)
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_archived failed: {e}")))?
+            .is_some();
+        if !known {
+            return Err(TStatus::not_found(format!(
+                "session `{}` not found",
+                req.id
+            )));
+        }
+        // `list_sessions` above exempts live sessions from the archived filter
+        // — hiding a conversation mid-turn would be worse than the clutter — so
+        // archiving one has to close it too, or the row the user just archived
+        // stays on screen.
+        //
+        // The close MUST precede the stamp, never follow it: `close()` finalizes
+        // through the agent, and that path calls `upsert_session`, which clears
+        // `archived_at`. Stamping first would let the close silently unarchive
+        // the conversation the user just closed.
+        if req.archived {
+            if let Some(host) = self.registry.remove_host(&req.id) {
+                host.close().await;
+            }
+        }
+        let stamp = req.archived.then(|| chrono::Utc::now().timestamp());
+        db.set_session_archived(&req.id, stamp)
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_archived failed: {e}")))?;
+        Ok(Response::new(Empty {}))
     }
 
     async fn get_session(

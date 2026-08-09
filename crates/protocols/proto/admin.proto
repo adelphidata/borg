@@ -19,6 +19,7 @@ service Admin {
   // Sessions.
   rpc ListSessions(Empty) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
+  rpc SetSessionArchived(SessionArchiveMutation) returns (Empty);
 
   // Scheduled tasks.
   rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
@@ -477,6 +478,12 @@ message SessionSummary {
   bool pinned = 5;
 }
 message SessionRef { string id = 1; }
+// Archive (soft-hide) one session, or restore it. Archiving never deletes —
+// `borg sessions list --archived` still finds the row.
+message SessionArchiveMutation {
+  string id = 1;
+  bool archived = 2;
+}
 message SessionDetail {
   string id = 1;
   string title = 2;

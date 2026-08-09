@@ -9,6 +9,13 @@ export interface SidebarProps {
   recents: RecentItem[];
   /** Opens one recent conversation. */
   onOpenRecent: (id: string) => void;
+  /** Archives one recent conversation, removing it from the list. */
+  onArchiveRecent: (id: string) => void;
+  /**
+   * Why the last archive failed, if it did. Rendered under the list — a × that
+   * silently does nothing reads as a broken button.
+   */
+  archiveError?: string;
   /** Starts a fresh conversation. */
   onNewConversation: () => void;
   user: NavUser;
@@ -63,7 +70,55 @@ function Rule({ className = "mb-4" }: { className?: string }) {
   return <div className={`mx-1.5 h-px bg-line2 ${className}`} />;
 }
 
-export function Sidebar({ routes, recents, onOpenRecent, onNewConversation, user }: SidebarProps) {
+/**
+ * One recent conversation. The archive control only materializes on hover or
+ * keyboard focus: eight rows each carrying a permanent × would read as a list
+ * of delete buttons rather than a list of conversations.
+ */
+function RecentRow({
+  item,
+  onOpen,
+  onArchive,
+}: {
+  item: RecentItem;
+  onOpen: () => void;
+  onArchive: () => void;
+}) {
+  return (
+    <div
+      className="group flex cursor-pointer items-center gap-1 rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
+      onClick={onOpen}
+    >
+      <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+        {item.title}
+      </span>
+      <button
+        type="button"
+        aria-label={`Archive ${item.title}`}
+        title="Archive conversation"
+        // Without this the row's own onClick would open the conversation the
+        // user just asked to close.
+        onClick={(e) => {
+          e.stopPropagation();
+          onArchive();
+        }}
+        className="flex-none rounded px-1 text-[13px] leading-none text-ink3 opacity-0 transition-opacity duration-150 group-hover:opacity-100 hover:text-ink focus-visible:opacity-100"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export function Sidebar({
+  routes,
+  recents,
+  onOpenRecent,
+  onArchiveRecent,
+  archiveError,
+  onNewConversation,
+  user,
+}: SidebarProps) {
   return (
     <aside className="flex w-[236px] flex-none flex-col border-r border-line2 bg-surface2 px-[14px] pt-[18px] pb-4">
       <div className="flex items-center gap-[11px] px-2 pt-0.5 pb-5">
@@ -92,15 +147,19 @@ export function Sidebar({ routes, recents, onOpenRecent, onNewConversation, user
       </div>
       <div className="flex flex-col gap-px">
         {recents.map((r) => (
-          <div
+          <RecentRow
             key={r.id}
-            className="cursor-pointer overflow-hidden rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ellipsis whitespace-nowrap text-ink3 hover:bg-surface3 hover:text-ink2"
-            onClick={() => onOpenRecent(r.id)}
-          >
-            {r.title}
-          </div>
+            item={r}
+            onOpen={() => onOpenRecent(r.id)}
+            onArchive={() => onArchiveRecent(r.id)}
+          />
         ))}
       </div>
+      {archiveError && (
+        <div role="alert" className="px-3 pt-1.5 text-[11px] leading-[1.35] text-alert">
+          Could not archive: {archiveError}
+        </div>
+      )}
 
       <div className="flex-1" />
 

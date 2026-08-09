@@ -23,19 +23,21 @@
 use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::grpc::status::StatusSvc;
-use borgd::session::SessionRegistry;
+use borgd::session::backend::{InlineImage, SessionBackend};
+use borgd::session::{SessionHost, SessionRegistry};
 use cortex::db::{Database, NewTask, UpdateTask};
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ScheduledTaskUpdate,
+    ScheduledTaskUpdate, SessionArchiveMutation,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
 use protocols::status::{Empty as StatusEmpty, Int64Cursor};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
@@ -51,6 +53,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 struct Harness {
     _tmp: tempfile::TempDir,
     socket: PathBuf,
+    /// The same registry the served `AdminSvc` holds, so a test can seed a
+    /// live session host and observe what a handler does to it.
+    registry: SessionRegistry,
     _shutdown: oneshot::Sender<()>,
 }
 
@@ -68,7 +73,7 @@ async fn start_harness() -> Harness {
     let listener = bind_uds(&socket).expect("bind_uds");
     let stream = UnixListenerStream::new(listener);
     let registry = SessionRegistry::new();
-    let admin = AdminSvc::new(registry);
+    let admin = AdminSvc::new(registry.clone());
     let status = StatusSvc::new();
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -91,6 +96,7 @@ async fn start_harness() -> Harness {
     Harness {
         _tmp: tmp,
         socket,
+        registry,
         _shutdown: tx,
     }
 }
@@ -745,4 +751,207 @@ async fn daemon_status_reports_elapsed_uptime() {
         status.uptime_secs
     );
     assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("keep-me", 1, 20, 0, "m", "Keep")
+            .await
+            .expect("seed keep");
+        db.upsert_session("close-me", 1, 10, 0, "m", "Close")
+            .await
+            .expect("seed close");
+    }
+    let ids = |list: protocols::admin::SessionList| {
+        list.sessions.into_iter().map(|s| s.id).collect::<Vec<_>>()
+    };
+    let before = ids(admin
+        .list_sessions(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner());
+    assert_eq!(before, vec!["keep-me".to_string(), "close-me".to_string()]);
+
+    // Archiving is the sidebar's "close this conversation". The observable
+    // contract is the listing the sidebar renders — a handler that stamped the
+    // row but left it in ListSessions would look like a dead button.
+    admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "close-me".into(),
+            archived: true,
+        })
+        .await
+        .expect("archive");
+    let after = ids(admin
+        .list_sessions(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner());
+    assert_eq!(
+        after,
+        vec!["keep-me".to_string()],
+        "an archived session must drop out of the listing, its neighbour must not"
+    );
+
+    // Soft hide, not delete: the row survives with a real timestamp so
+    // `borg sessions list --archived` can still find it.
+    {
+        let db = Database::open().await.expect("db");
+        let row = db
+            .session_by_id("close-me")
+            .await
+            .expect("query")
+            .expect("archived session must still exist");
+        assert!(
+            row.archived_at.unwrap_or(0) > 0,
+            "archiving must stamp a real time, not delete the row"
+        );
+    }
+
+    admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "close-me".into(),
+            archived: false,
+        })
+        .await
+        .expect("unarchive");
+    let restored = ids(admin
+        .list_sessions(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner());
+    assert_eq!(restored, before, "restoring must bring the session back");
+
+    let missed = admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "no-such-session".into(),
+            archived: true,
+        })
+        .await
+        .expect_err("archiving an unknown session must fail");
+    assert_eq!(
+        missed.code(),
+        tonic::Code::NotFound,
+        "a typo'd id must report NotFound, not a silent success"
+    );
+}
+
+/// Minimal backend for the live-session case: it never runs a turn, it only
+/// records that the daemon finalized it.
+struct CloseCountingBackend {
+    id: String,
+    close_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for CloseCountingBackend {
+    async fn run_turn(
+        &self,
+        _text: String,
+        _images: Vec<InlineImage>,
+        _event_tx: tokio::sync::mpsc::Sender<cortex::agent::AgentEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+        _text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
+    ) {
+    }
+
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn close_session(&self) -> anyhow::Result<()> {
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn archiving_a_live_session_closes_its_host_and_a_missing_one_closes_nothing() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("live-one", 1, 10, 0, "m", "Live")
+            .await
+            .expect("seed live");
+    }
+    let close_calls = Arc::new(AtomicUsize::new(0));
+    h.registry
+        .insert(SessionHost::new(Arc::new(CloseCountingBackend {
+            id: "live-one".into(),
+            close_calls: Arc::clone(&close_calls),
+        })));
+
+    // ListSessions deliberately exempts live sessions from the archived
+    // filter, so stamping the row alone would leave it on screen. Archiving
+    // has to end the session too — this is the branch that makes the sidebar's
+    // × actually remove the row.
+    admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "live-one".into(),
+            archived: true,
+        })
+        .await
+        .expect("archive live session");
+
+    assert!(
+        h.registry.peek("live-one").is_none(),
+        "archiving a live session must remove its host from the registry"
+    );
+    assert_eq!(
+        close_calls.load(Ordering::SeqCst),
+        1,
+        "the host must be finalized once, not dropped or closed twice"
+    );
+    let listed = admin
+        .list_sessions(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner()
+        .sessions;
+    assert!(
+        listed.is_empty(),
+        "an archived session must leave the listing even though it was live; got {:?}",
+        listed.into_iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+
+    // The unknown-id path must not have side effects: a request answered with
+    // NotFound must not cancel a live turn on its way out.
+    let other_calls = Arc::new(AtomicUsize::new(0));
+    h.registry
+        .insert(SessionHost::new(Arc::new(CloseCountingBackend {
+            id: "bystander".into(),
+            close_calls: Arc::clone(&other_calls),
+        })));
+    let missed = admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "bystander".into(),
+            archived: true,
+        })
+        .await
+        .expect_err("a session with no DB row must not archive");
+    assert_eq!(missed.code(), tonic::Code::NotFound);
+    assert!(
+        h.registry.peek("bystander").is_some(),
+        "a rejected archive must leave the live session running"
+    );
+    assert_eq!(
+        other_calls.load(Ordering::SeqCst),
+        0,
+        "a rejected archive must not have closed anything"
+    );
 }

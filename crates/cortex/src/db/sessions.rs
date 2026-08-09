@@ -784,17 +784,32 @@ impl Database {
         Ok(updated as usize)
     }
 
-    /// Clear a session's archived flag, bringing it back into listings.
-    /// Returns false when no such session exists.
-    pub async fn unarchive_session(&self, id: &str) -> Result<bool> {
+    /// Archive or restore one session on demand. Returns false when no such
+    /// session exists.
+    ///
+    /// The per-session counterpart to [`Self::archive_stale_sessions`]: the
+    /// sweep hides conversations by age, this hides the one the user closed.
+    /// Like the sweep it never deletes — `Some(now)` stamps the close, `None`
+    /// clears it — so a closed conversation stays recoverable.
+    ///
+    /// Unlike the sweep it ignores `pinned` and re-stamps an already-archived
+    /// row: both guards exist to keep *automatic* archiving from surprising the
+    /// user, and neither should override an explicit request.
+    pub async fn set_session_archived(&self, id: &str, archived_at: Option<i64>) -> Result<bool> {
         let updated = self
             .conn
             .execute(
-                "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
-                params!(id),
+                "UPDATE sessions SET archived_at = ?1 WHERE id = ?2",
+                params!(archived_at, id),
             )
             .await?;
         Ok(updated > 0)
+    }
+
+    /// Clear a session's archived flag, bringing it back into listings.
+    /// Returns false when no such session exists.
+    pub async fn unarchive_session(&self, id: &str) -> Result<bool> {
+        self.set_session_archived(id, None).await
     }
 
     /// Free every lease whose deadline has passed, relative to `now`. This is
@@ -1362,6 +1377,67 @@ mod tests {
             .unwrap()
             .archived_at
             .is_none());
+    }
+
+    /// An explicit archive is a user decision, so it must not inherit the
+    /// sweep's guards: a pinned session still closes on request, and the stamp
+    /// is reversible. Only a nonexistent id reports "nothing archived".
+    #[tokio::test]
+    async fn explicit_archive_overrides_pin_and_reverses() {
+        let db = test_db().await;
+        db.upsert_session("kept", 1, 10, 0, "m", "Kept")
+            .await
+            .unwrap();
+        db.upsert_session("closed", 1, 20, 0, "m", "Closed")
+            .await
+            .unwrap();
+        assert!(db.set_session_pinned("closed", true).await.unwrap());
+
+        assert!(db.set_session_archived("closed", Some(777)).await.unwrap());
+        let row = db.session_by_id("closed").await.unwrap().unwrap();
+        assert_eq!(
+            row.archived_at,
+            Some(777),
+            "an explicit close must archive even a pinned session"
+        );
+        assert!(row.pinned, "closing must not silently drop the pin");
+        assert!(
+            db.session_by_id("kept")
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_none(),
+            "archiving one session must not touch its neighbours"
+        );
+
+        // Re-archiving re-stamps rather than reporting a miss — the timestamp
+        // records the latest close.
+        assert!(db.set_session_archived("closed", Some(888)).await.unwrap());
+        assert_eq!(
+            db.session_by_id("closed")
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            Some(888)
+        );
+
+        assert!(db.set_session_archived("closed", None).await.unwrap());
+        assert!(db
+            .session_by_id("closed")
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+
+        assert!(
+            !db.set_session_archived("no-such-session", Some(1))
+                .await
+                .unwrap(),
+            "a miss must be reported, not silently succeed"
+        );
     }
 
     /// Resuming an archived conversation must un-archive it. Archiving keys on

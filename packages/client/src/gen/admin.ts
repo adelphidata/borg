@@ -398,6 +398,15 @@ export interface SessionRef {
   id: string;
 }
 
+/**
+ * Archive (soft-hide) one session, or restore it. Archiving never deletes —
+ * `borg sessions list --archived` still finds the row.
+ */
+export interface SessionArchiveMutation {
+  id: string;
+  archived: boolean;
+}
+
 export interface SessionDetail {
   id: string;
   title: string;
@@ -5519,6 +5528,82 @@ export const SessionRef: MessageFns<SessionRef> = {
   fromPartial<I extends Exact<DeepPartial<SessionRef>, I>>(object: I): SessionRef {
     const message = createBaseSessionRef();
     message.id = object.id ?? "";
+    return message;
+  },
+};
+
+function createBaseSessionArchiveMutation(): SessionArchiveMutation {
+  return { id: "", archived: false };
+}
+
+export const SessionArchiveMutation: MessageFns<SessionArchiveMutation> = {
+  encode(message: SessionArchiveMutation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.archived !== false) {
+      writer.uint32(16).bool(message.archived);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionArchiveMutation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionArchiveMutation();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.id = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.archived = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionArchiveMutation {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      archived: isSet(object.archived) ? globalThis.Boolean(object.archived) : false,
+    };
+  },
+
+  toJSON(message: SessionArchiveMutation): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.archived !== false) {
+      obj.archived = message.archived;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SessionArchiveMutation>, I>>(base?: I): SessionArchiveMutation {
+    return SessionArchiveMutation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SessionArchiveMutation>, I>>(object: I): SessionArchiveMutation {
+    const message = createBaseSessionArchiveMutation();
+    message.id = object.id ?? "";
+    message.archived = object.archived ?? false;
     return message;
   },
 };
@@ -12699,6 +12784,14 @@ export const AdminDefinition = {
       requestType: SessionRef as typeof SessionRef,
       requestStream: false,
       responseType: SessionDetail as typeof SessionDetail,
+      responseStream: false,
+      options: {},
+    },
+    setSessionArchived: {
+      name: "SetSessionArchived",
+      requestType: SessionArchiveMutation as typeof SessionArchiveMutation,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
       responseStream: false,
       options: {},
     },
