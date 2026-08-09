@@ -1,17 +1,38 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
+import { dispatchKeybind, installKeybinds, useKeybind } from "./lib/keybinds";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { SettingsProvider } from "./lib/settings";
-import { PlatformProvider, type Platform } from "./lib/platform";
+import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useMutation, useQuery } from "./lib/useDaemon";
 import { routes } from "./routes";
 
 // TODO(daemon): no RPC carries an operator identity yet; the footer stays static.
 const user = { name: "Operator", initials: "OP" };
+
+/**
+ * Installs the keyboard layer and lets the native shell drive it.
+ *
+ * Menu items and global hotkeys arrive as action ids and go through the same
+ * registry as typed chords, so ⌘N from the File menu and ⌘N from the keyboard
+ * run one implementation.
+ */
+function KeyboardLayer() {
+  const navigate = useNavigate();
+  const native = useNative();
+
+  useEffect(() => installKeybinds(window, /macintosh|mac os x/i.test(navigator.userAgent)), []);
+  useEffect(() => native.onMenuCommand((action) => void dispatchKeybind(action)), [native]);
+
+  useKeybind("new-conversation", () => navigate("/c/new"));
+  useKeybind("open-settings", () => navigate("/settings"));
+
+  return null;
+}
 
 function Shell({ platform }: { platform: Platform }) {
   const isMobile = useIsMobile();
@@ -64,6 +85,7 @@ function Shell({ platform }: { platform: Platform }) {
 
   return (
     <div className="flex h-full flex-col bg-surface transition-[background] duration-[250ms]">
+      <KeyboardLayer />
       {/* macOS drag strip over the hidden title bar — desktop only; a browser has its own chrome. */}
       {platform.titleBarDrag && !isMobile && (
         <div className="flex h-[38px] flex-none items-center gap-2 border-b border-line2 bg-surface2 px-[15px] [-webkit-app-region:drag]" />

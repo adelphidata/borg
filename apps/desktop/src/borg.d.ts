@@ -1,4 +1,5 @@
 import type { BorgTransport } from "@borg/client";
+import type { NativeBridge } from "@borg/app";
 
 declare global {
   interface Window {
@@ -6,6 +7,7 @@ declare global {
     borg: {
       platform: NodeJS.Platform;
       transport: BorgTransport;
+      native: NativeBridge;
     };
   }
 }

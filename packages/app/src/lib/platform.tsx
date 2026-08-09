@@ -1,5 +1,6 @@
 import { createContext, useContext, type ReactNode } from "react";
 import type { BorgTransport } from "@borg/client";
+import { NO_NATIVE, type NativeBridge } from "./native";
 
 /**
  * Everything that differs between the Electron window and the browser tab.
@@ -12,6 +13,8 @@ export interface Platform {
   transport: BorgTransport;
   /** Reserve a draggable strip for a frameless window. Desktop only. */
   titleBarDrag: boolean;
+  /** Menus, notifications, badges, updates. Absent in the browser. */
+  native?: NativeBridge;
 }
 
 const PlatformContext = createContext<Platform | null>(null);
@@ -35,4 +38,14 @@ export function usePlatform(): Platform {
 /** The daemon transport for the current surface. */
 export function useTransport(): BorgTransport {
   return usePlatform().transport;
+}
+
+/**
+ * The native shell, or a stub that does nothing.
+ *
+ * Always safe to call: a page that notifies or sets a badge works in the
+ * browser too, it just has no visible effect there.
+ */
+export function useNative(): NativeBridge {
+  return usePlatform().native ?? NO_NATIVE;
 }

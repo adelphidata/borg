@@ -1,7 +1,14 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { BorgTransport, MethodPath, StreamHandlers } from "@borg/client";
 import { BorgError } from "@borg/client";
-import { CHANNELS, type StreamEvent, type UnaryReply } from "./channels";
+import type { NativeBridge } from "@borg/app";
+import {
+  CHANNELS,
+  type StreamEvent,
+  type UnaryReply,
+  type WireNotification,
+  type WireUpdateStatus,
+} from "./channels";
 
 /**
  * The renderer's `BorgTransport`, implemented over IPC.
@@ -51,7 +58,39 @@ const transport: BorgTransport = {
   },
 };
 
+/** Subscribes to a main→renderer push channel and returns its unsubscribe. */
+function subscribe<T>(channel: string, handler: (payload: T) => void): () => void {
+  const listener = (_event: unknown, payload: T) => handler(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.off(channel, listener);
+}
+
+/**
+ * The native shell, exposed alongside the transport rather than inside it.
+ *
+ * This is the only sanctioned widening of `window.borg`: it carries no Node
+ * APIs and no filesystem reach, just the handful of OS affordances a browser
+ * tab cannot offer. `@borg/app` reaches it through `useNative()` and degrades
+ * to no-ops when it is absent.
+ */
+const native: NativeBridge = {
+  onMenuCommand: (handler) => subscribe<string>(CHANNELS.menuCommand, handler),
+  onActivateSession: (handler) => subscribe<string>(CHANNELS.activateSession, handler),
+  notify: (notification) => {
+    void ipcRenderer.invoke(CHANNELS.notify, notification satisfies WireNotification);
+  },
+  setBadgeCount: (count) => {
+    void ipcRenderer.invoke(CHANNELS.setBadge, count);
+  },
+  updates: {
+    subscribe: (handler) => subscribe<WireUpdateStatus>(CHANNELS.updateStatus, handler),
+    check: () => void ipcRenderer.invoke(CHANNELS.updateCheck),
+    install: () => void ipcRenderer.invoke(CHANNELS.updateInstall),
+  },
+};
+
 contextBridge.exposeInMainWorld("borg", {
   platform: process.platform,
   transport,
+  native,
 });

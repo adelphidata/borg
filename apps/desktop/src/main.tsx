@@ -15,6 +15,7 @@ const platform: Platform = {
   kind: "desktop",
   transport: window.borg.transport,
   titleBarDrag: window.borg.platform === "darwin",
+  native: window.borg.native,
 };
 
 createRoot(document.getElementById("root")!).render(

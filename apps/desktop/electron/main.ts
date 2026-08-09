@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerBorgIpc } from "./ipc";
+import { registerNativeIpc } from "./native";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 // Resolve against the app root (the directory holding package.json), not
@@ -78,7 +79,11 @@ function createWindow() {
 
 app.whenReady().then(() => {
   const borg = registerBorgIpc();
-  app.once("will-quit", () => borg.dispose());
+  const native = registerNativeIpc();
+  app.once("will-quit", () => {
+    borg.dispose();
+    native.dispose();
+  });
 
   createWindow();
   app.on("activate", () => {

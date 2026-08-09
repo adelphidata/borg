@@ -8,7 +8,9 @@
 
 export { BorgApp } from "./BorgApp";
 export { routes } from "./routes";
-export { usePlatform, useTransport } from "./lib/platform";
+export { usePlatform, useTransport, useNative } from "./lib/platform";
+export type { NativeBridge, NativeNotification, UpdateStatus } from "./lib/native";
+export { CHORDS, dispatchKeybind, useKeybind } from "./lib/keybinds";
 export { useBorg, useQuery } from "./lib/useDaemon";
 export type { Query } from "./lib/useDaemon";
 export { signOut } from "./lib/session";

@@ -152,6 +152,11 @@ web-lint:
     bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
     bun run --filter '*' typecheck
 
+# Unit-test the shared TypeScript packages (Vitest)
+web-test:
+    bun run --cwd packages/ui test
+    bun run --cwd packages/app test
+
 # Build the browser SPA. Run before `cargo build` — borgd embeds apps/web/dist.
 web-build:
     bun run --cwd apps/web build
@@ -169,4 +174,4 @@ desktop-build:
     bun run --cwd apps/desktop build
 
 # Everything CI runs for the web surfaces
-web-ci: web-install gen-check web-lint web-build desktop-build
+web-ci: web-install gen-check web-lint web-test web-build desktop-build
