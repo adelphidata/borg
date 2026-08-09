@@ -4,6 +4,7 @@ import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, useKeybind } from "./lib/keybinds";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
+import { CommandPalette } from "./features/palette/CommandPalette";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
 import { QuickEntryPage } from "./features/quick/QuickEntryPage";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
@@ -125,6 +126,7 @@ function Shell({ platform }: { platform: Platform }) {
         </Routes>
       </div>
       {isMobile && <TabBar routes={navRoutes} />}
+      <CommandPalette />
       <UpdatePill />
     </div>
   );

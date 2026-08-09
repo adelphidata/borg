@@ -64,9 +64,17 @@ export const basicSettings: BasicSetting[] = [
     options: [
       { value: "Light", desc: "Paper and ink." },
       { value: "Dark", desc: "Neon on black. The classic." },
+      { value: "System", desc: "Follow this machine." },
     ],
   },
 ];
+
+/** Display label for each theme preference, shared by the list and the editor. */
+export const APPEARANCE_LABELS: Record<"light" | "dark" | "system", string> = {
+  light: "Light",
+  dark: "Dark",
+  system: "System",
+};
 
 export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);

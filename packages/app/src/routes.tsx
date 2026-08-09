@@ -1,11 +1,13 @@
 import type { ComponentType } from "react";
-import { ChatIcon, GearIcon, PlugIcon, ShieldIcon } from "@borg/ui";
+import { ChatIcon, GearIcon, PlugIcon, ScheduleIcon, ShieldIcon, UsageIcon } from "@borg/ui";
 import type { IconProps } from "@borg/ui";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionsPage } from "./features/connections/ConnectionsPage";
 import { HealthPage } from "./features/health/HealthPage";
+import { SchedulesPage } from "./features/schedules/SchedulesPage";
 import { SessionsPage } from "./features/sessions/SessionsPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
+import { UsagePage } from "./features/usage/UsagePage";
 
 export interface AppRoute {
   id: string;
@@ -62,6 +64,28 @@ export const routes: AppRoute[] = [
     icon: PlugIcon,
     page: ConnectionsPage,
     section: "primary",
+  },
+  {
+    id: "schedules",
+    path: "/schedules",
+    label: "Scheduled",
+    tabLabel: "Tasks",
+    icon: ScheduleIcon,
+    page: SchedulesPage,
+    section: "primary",
+    // Five tabs is the ceiling on a phone. Both of these stay off the tab bar
+    // and are reached from More, or from the palette on a keyboard.
+    nav: { tabBar: false },
+  },
+  {
+    id: "usage",
+    path: "/usage",
+    label: "Usage",
+    tabLabel: "Usage",
+    icon: UsageIcon,
+    page: UsagePage,
+    section: "secondary",
+    nav: { tabBar: false },
   },
   {
     id: "health",

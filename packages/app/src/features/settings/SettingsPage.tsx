@@ -12,7 +12,8 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings, type DaemonSetting } from "../../lib/settings";
-import { advancedGroupOf, basicSettings } from "./catalog";
+import { routes } from "../../routes";
+import { APPEARANCE_LABELS, advancedGroupOf, basicSettings } from "./catalog";
 
 /** Registry keys already surfaced by the curated list above the fold. */
 const CURATED_KEYS = new Set(basicSettings.flatMap((s) => (s.key ? [s.key] : [])));
@@ -38,7 +39,7 @@ export function SettingsPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const { settings } = useSettings();
-  const { theme } = useTheme();
+  const { preference } = useTheme();
   const [advOpen, setAdvOpen] = useState(false);
 
   return (
@@ -47,16 +48,35 @@ export function SettingsPage() {
         <div className="flex max-w-[620px] flex-col">
           <MobileTitle className="mb-1.5">Settings</MobileTitle>
 
+          {/* The tab bar tops out at five, so the pages it cannot hold are
+              reached from here. On desktop the sidebar already lists them. */}
+          {isMobile && (
+            <div className="mb-6">
+              {routes
+                .filter((r) => r.nav?.tabBar === false)
+                .map((route) => (
+                  <button
+                    key={route.id}
+                    type="button"
+                    onClick={() => navigate(route.path)}
+                    className="flex w-full cursor-pointer items-center gap-3 border-0 border-b border-line2 bg-transparent px-1 py-3.5 text-left last:border-0"
+                  >
+                    <route.icon size={16} />
+                    <span className="flex-1 text-[13.5px] leading-none text-ink">
+                      {route.label}
+                    </span>
+                    <ChevronIcon />
+                  </button>
+                ))}
+            </div>
+          )}
+
           <DaemonState query={settings} label="settings">
             {(map) => (
               <>
                 {basicSettings.map((s) => {
                   const value =
-                    s.key === null
-                      ? theme === "light"
-                        ? "Light"
-                        : "Dark"
-                      : (map.get(s.key)?.value ?? "—");
+                    s.key === null ? APPEARANCE_LABELS[preference] : (map.get(s.key)?.value ?? "—");
                   return (
                     <div
                       key={s.id}

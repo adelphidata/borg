@@ -55,7 +55,13 @@ export { Sidebar } from "./nav/Sidebar";
 export type { SidebarProps } from "./nav/Sidebar";
 export { TabBar } from "./nav/TabBar";
 
-export { ThemeProvider, useTheme } from "./lib/theme";
-export type { Theme } from "./lib/theme";
+export {
+  THEME_PREFERENCES,
+  ThemeProvider,
+  resolveTheme,
+  readPreference,
+  useTheme,
+} from "./lib/theme";
+export type { Theme, ThemePreference } from "./lib/theme";
 export { useIsMobile } from "./lib/useIsMobile";
 export { STORAGE_KEYS } from "./lib/storageKeys";

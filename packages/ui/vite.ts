@@ -9,10 +9,17 @@ import STORAGE_KEYS from "./storage-keys.json" with { type: "json" };
  * the inline script and the provider can never disagree on the key.
  */
 export function borgThemePreload(): Plugin {
+  // Mirrors `resolveTheme` in src/lib/theme.tsx: an explicit choice wins,
+  // "system" asks the OS, and anything else (including no value at all) is
+  // dark. Resolving "system" here too is what keeps a system-light user from
+  // seeing a dark frame before the provider mounts.
   const script = [
     "try {",
-    `  document.documentElement.dataset.theme =`,
-    `    localStorage.getItem(${JSON.stringify(STORAGE_KEYS.theme)}) === "light" ? "light" : "dark";`,
+    `  var p = localStorage.getItem(${JSON.stringify(STORAGE_KEYS.theme)});`,
+    `  var dark = p === "system"`,
+    `    ? window.matchMedia("(prefers-color-scheme: dark)").matches`,
+    `    : p !== "light";`,
+    `  document.documentElement.dataset.theme = dark ? "dark" : "light";`,
     "} catch {}",
   ].join("\n");
 

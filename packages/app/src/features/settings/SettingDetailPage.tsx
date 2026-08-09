@@ -10,10 +10,11 @@ import {
   scrollCol,
   useIsMobile,
   useTheme,
+  THEME_PREFERENCES,
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
-import { findBasicSetting, type SettingOption } from "./catalog";
+import { APPEARANCE_LABELS, findBasicSetting, type SettingOption } from "./catalog";
 
 function DetailShell({ title, children }: { title: string; children: ReactNode }) {
   const isMobile = useIsMobile();
@@ -131,9 +132,9 @@ function ValueEditor({
 
 /** The local-only theme setting — applies before paint, so it never touches borgd. */
 function AppearanceDetail() {
-  const { theme, toggleTheme } = useTheme();
-  const value = theme === "light" ? "Light" : "Dark";
+  const { preference, setPreference } = useTheme();
   const setting = findBasicSetting("appearance")!;
+  const value = APPEARANCE_LABELS[preference];
 
   return (
     <DetailShell title={setting.name}>
@@ -142,7 +143,10 @@ function AppearanceDetail() {
         options={setting.options ?? []}
         value={value}
         disabled={false}
-        onPick={(v) => v !== value && toggleTheme()}
+        onPick={(picked) => {
+          const next = THEME_PREFERENCES.find((p) => APPEARANCE_LABELS[p] === picked);
+          if (next && next !== preference) setPreference(next);
+        }}
       />
       <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
         Changes apply straight away. Nothing to save.
