@@ -46,7 +46,7 @@ function Shell({ platform }: { platform: Platform }) {
             <Route key={r.id} path={r.path} element={<r.page />} />
           ))}
           <Route path="/c/:sessionId" element={<ConversationPage />} />
-          <Route path="/connections/:id" element={<ConnectionDetailPage />} />
+          <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
           <Route path="/settings/key/:key" element={<SettingDetailPage />} />
           <Route path="/settings/:id" element={<SettingDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
