@@ -414,6 +414,8 @@ impl Admin for AdminSvc {
                         role: m.role,
                         text: m.content.unwrap_or_default(),
                         unix_ts: m.created_at as u64,
+                        tool_calls_json: m.tool_calls_json.unwrap_or_default(),
+                        tool_call_id: m.tool_call_id.unwrap_or_default(),
                     })
                     .collect(),
             }))

@@ -1,12 +1,27 @@
 import type { SVGProps } from "react";
 import {
+  Archive,
   ArrowUp,
+  CalendarClock,
   Check,
+  ChevronDown,
   ChevronRight,
+  Copy,
+  GitBranch,
+  Image,
+  ListTree,
   MessageCircle,
+  MoreHorizontal,
+  Paperclip,
+  Pencil,
   Plug,
+  Plus,
+  Search,
   Settings,
   ShieldCheck,
+  Trash2,
+  Wallet,
+  X,
   type LucideIcon,
 } from "lucide-react";
 
@@ -44,6 +59,21 @@ export const PlugIcon = lucide(Plug, 16);
 export const ShieldIcon = lucide(ShieldCheck, 16);
 export const GearIcon = lucide(Settings, 16);
 export const ChevronIcon = lucide(ChevronRight, 13, 2);
+export const ChevronDownIcon = lucide(ChevronDown, 13, 2);
+export const CopyIcon = lucide(Copy, 14);
+export const SearchIcon = lucide(Search, 15);
+export const PlusIcon = lucide(Plus, 15);
+export const CloseIcon = lucide(X, 15);
+export const AttachIcon = lucide(Paperclip, 15);
+export const ImageIcon = lucide(Image, 15);
+export const MoreIcon = lucide(MoreHorizontal, 15);
+export const TrashIcon = lucide(Trash2, 14);
+export const PencilIcon = lucide(Pencil, 14);
+export const BranchIcon = lucide(GitBranch, 14);
+export const ArchiveIcon = lucide(Archive, 14);
+export const ScheduleIcon = lucide(CalendarClock, 16);
+export const UsageIcon = lucide(Wallet, 16);
+export const AgentsIcon = lucide(ListTree, 16);
 
 export function SendIcon({ size, ...props }: IconProps) {
   return (

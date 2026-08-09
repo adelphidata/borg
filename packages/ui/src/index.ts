@@ -12,19 +12,36 @@ export { AlertBanner } from "./components/AlertBanner";
 export { BackLink } from "./components/BackLink";
 export { Badge } from "./components/Badge";
 export { Brackets } from "./components/Brackets";
+export { CodeBlock } from "./components/CodeBlock";
+export { Markdown } from "./components/Markdown";
 export { MobileTitle } from "./components/MobileTitle";
 export { PageChrome } from "./components/PageChrome";
 export { Pill } from "./components/Pill";
 export { StatusDot } from "./components/StatusDot";
 export {
+  AgentsIcon,
+  ArchiveIcon,
+  AttachIcon,
+  BranchIcon,
   ChatIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronIcon,
+  CloseIcon,
+  CopyIcon,
   GearIcon,
+  ImageIcon,
   LogoIcon,
+  MoreIcon,
+  PencilIcon,
   PlugIcon,
+  PlusIcon,
+  ScheduleIcon,
+  SearchIcon,
   SendIcon,
   ShieldIcon,
+  TrashIcon,
+  UsageIcon,
 } from "./components/icons";
 export type { IconProps } from "./components/icons";
 export {

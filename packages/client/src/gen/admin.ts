@@ -417,6 +417,18 @@ export interface MessageView {
   role: string;
   text: string;
   unixTs: number;
+  /**
+   * Assistant rows only: the serialized `Vec<ToolCall>` this turn issued, so a
+   * client replaying history can name each tool call and show its arguments.
+   * Empty for every other role.
+   */
+  toolCallsJson: string;
+  /**
+   * Tool rows only: the id of the call this row is the result of. Pair it with
+   * the preceding assistant row's `tool_calls_json` to recover the tool name —
+   * the row itself carries no name.
+   */
+  toolCallId: string;
 }
 
 /** Scheduled tasks. */
@@ -5703,7 +5715,7 @@ export const SessionDetail: MessageFns<SessionDetail> = {
 };
 
 function createBaseMessageView(): MessageView {
-  return { role: "", text: "", unixTs: 0 };
+  return { role: "", text: "", unixTs: 0, toolCallsJson: "", toolCallId: "" };
 }
 
 export const MessageView: MessageFns<MessageView> = {
@@ -5716,6 +5728,12 @@ export const MessageView: MessageFns<MessageView> = {
     }
     if (message.unixTs !== 0) {
       writer.uint32(24).uint64(message.unixTs);
+    }
+    if (message.toolCallsJson !== "") {
+      writer.uint32(34).string(message.toolCallsJson);
+    }
+    if (message.toolCallId !== "") {
+      writer.uint32(42).string(message.toolCallId);
     }
     return writer;
   },
@@ -5751,6 +5769,22 @@ export const MessageView: MessageFns<MessageView> = {
           message.unixTs = longToNumber(reader.uint64());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.toolCallsJson = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.toolCallId = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5769,6 +5803,16 @@ export const MessageView: MessageFns<MessageView> = {
         : isSet(object.unix_ts)
         ? globalThis.Number(object.unix_ts)
         : 0,
+      toolCallsJson: isSet(object.toolCallsJson)
+        ? globalThis.String(object.toolCallsJson)
+        : isSet(object.tool_calls_json)
+        ? globalThis.String(object.tool_calls_json)
+        : "",
+      toolCallId: isSet(object.toolCallId)
+        ? globalThis.String(object.toolCallId)
+        : isSet(object.tool_call_id)
+        ? globalThis.String(object.tool_call_id)
+        : "",
     };
   },
 
@@ -5783,6 +5827,12 @@ export const MessageView: MessageFns<MessageView> = {
     if (message.unixTs !== 0) {
       obj.unixTs = Math.round(message.unixTs);
     }
+    if (message.toolCallsJson !== "") {
+      obj.toolCallsJson = message.toolCallsJson;
+    }
+    if (message.toolCallId !== "") {
+      obj.toolCallId = message.toolCallId;
+    }
     return obj;
   },
 
@@ -5794,6 +5844,8 @@ export const MessageView: MessageFns<MessageView> = {
     message.role = object.role ?? "";
     message.text = object.text ?? "";
     message.unixTs = object.unixTs ?? 0;
+    message.toolCallsJson = object.toolCallsJson ?? "";
+    message.toolCallId = object.toolCallId ?? "";
     return message;
   },
 };

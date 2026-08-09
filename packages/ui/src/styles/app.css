@@ -117,3 +117,42 @@
     color: var(--ink);
   }
 }
+
+/*
+ * Fenced code blocks. Shiki emits both palettes into one tree as custom
+ * properties, so switching theme swaps variables instead of re-highlighting.
+ * Light is the default; the dark rule mirrors the [data-theme] switch above.
+ */
+.borg-code,
+.borg-code pre {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.borg-code .shiki {
+  margin: 0;
+  padding: 12px 14px;
+  background-color: var(--shiki-light-bg);
+  user-select: text;
+}
+.borg-code .shiki span {
+  color: var(--shiki-light);
+}
+[data-theme="dark"] .borg-code .shiki {
+  background-color: var(--shiki-dark-bg);
+}
+[data-theme="dark"] .borg-code .shiki span {
+  color: var(--shiki-dark);
+}
+
+/* Prose defaults react-markdown does not carry on its own. */
+.borg-prose :is(strong, b) {
+  font-weight: 600;
+}
+.borg-prose :is(ul, ol) ul {
+  list-style: circle;
+}
+.borg-prose input[type="checkbox"] {
+  margin-right: 6px;
+  accent-color: var(--neon);
+}
