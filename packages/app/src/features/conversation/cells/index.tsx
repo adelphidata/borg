@@ -1,4 +1,5 @@
-import { Brackets, Markdown, Pill } from "@borg/ui";
+import { useState } from "react";
+import { Brackets, Markdown, PencilIcon, Pill } from "@borg/ui";
 import type { Cell } from "../useConversation";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
@@ -76,27 +77,106 @@ function SubAgentCell({ cell }: { cell: Cell & { kind: "sub-agent" } }) {
   );
 }
 
+/**
+ * A user turn, rewritable in place.
+ *
+ * Editing truncates the conversation from this message onward — the daemon
+ * has no way to splice a turn in the middle — so the button says so before it
+ * does it.
+ */
+function UserCell({
+  cell,
+  onEdit,
+}: {
+  cell: Cell & { kind: "user" };
+  onEdit: ((text: string) => void) | undefined;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(cell.text);
+
+  if (editing) {
+    return (
+      <div className="flex flex-col items-end gap-2">
+        <textarea
+          autoFocus
+          rows={Math.min(10, draft.split("\n").length + 1)}
+          className="w-full resize-none rounded-[13px] border border-line bg-surface2 px-4 py-[11px] text-[13.5px] leading-[1.45] text-ink outline-none select-text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setEditing(false);
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              if (draft.trim() !== "") {
+                setEditing(false);
+                onEdit?.(draft.trim());
+              }
+            }
+          }}
+        />
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] leading-none text-ink3">
+            Replies after this are discarded
+          </span>
+          <Pill square onClick={() => setEditing(false)}>
+            Cancel
+          </Pill>
+          <Pill
+            variant="primary"
+            square
+            onClick={() => {
+              if (draft.trim() === "") return;
+              setEditing(false);
+              onEdit?.(draft.trim());
+            }}
+          >
+            Resend
+          </Pill>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex items-start justify-end gap-1.5">
+      {onEdit && (
+        <button
+          type="button"
+          aria-label="Edit and resend"
+          onClick={() => {
+            setDraft(cell.text);
+            setEditing(true);
+          }}
+          className="mt-2 flex h-6 w-6 flex-none cursor-pointer items-center justify-center rounded border-0 bg-transparent text-ink3 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:text-ink"
+        >
+          <PencilIcon size={13} />
+        </button>
+      )}
+      <div className="max-w-[78%] rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
+        {cell.text}
+        {cell.attachments !== undefined && (
+          <div className="mt-1.5 text-[11px] leading-none text-ink3">
+            {cell.attachments} image{cell.attachments === 1 ? "" : "s"} attached
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function TranscriptCell({
   cell,
   respond,
+  onEdit,
 }: {
   cell: Cell;
   respond: (promptId: string, value: string) => void;
+  /** Absent when this turn cannot be rewritten — mid-turn, or not a user cell. */
+  onEdit?: (text: string) => void;
 }) {
   switch (cell.kind) {
     case "user":
-      return (
-        <div className="flex justify-end">
-          <div className="max-w-[78%] rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
-            {cell.text}
-            {cell.attachments !== undefined && (
-              <div className="mt-1.5 text-[11px] leading-none text-ink3">
-                {cell.attachments} image{cell.attachments === 1 ? "" : "s"} attached
-              </div>
-            )}
-          </div>
-        </div>
-      );
+      return <UserCell cell={cell} onEdit={onEdit} />;
     case "assistant":
       return (
         <ReplyCard kicker="Borg">

@@ -1,8 +1,9 @@
-import { useEffect, useRef } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { PageChrome, useIsMobile } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { Composer } from "./Composer";
+import { ContextBar } from "./ContextBar";
 import { PlanPanel } from "./cells/PlanPanel";
 import { TranscriptCell } from "./cells";
 import { useConversation } from "./useConversation";
@@ -10,8 +11,24 @@ import { useConversation } from "./useConversation";
 export function ConversationPage() {
   const { sessionId: target } = useParams();
   const isMobile = useIsMobile();
-  const { opened, cells, plan, busy, sendError, streamError, send, steer, cancel, respond } =
-    useConversation(target);
+  const navigate = useNavigate();
+  const [compacting, setCompacting] = useState(false);
+  const {
+    opened,
+    cells,
+    plan,
+    busy,
+    sendError,
+    streamError,
+    send,
+    steer,
+    cancel,
+    respond,
+    editAndResend,
+    compact,
+    fork,
+    context,
+  } = useConversation(target);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Follow the newest cell, like any chat surface.
@@ -38,9 +55,27 @@ export function ConversationPage() {
                     Nothing here yet. Ask Borg anything.
                   </div>
                 )}
-                {cells.map((cell, i) => (
-                  <TranscriptCell key={i} cell={cell} respond={respond} />
-                ))}
+                {/* The daemon rewinds by user-message ordinal, so each user
+                    cell needs its position among user cells, not in the list. */}
+                {(() => {
+                  let nth = -1;
+                  return cells.map((cell, i) => {
+                    if (cell.kind === "user") nth += 1;
+                    const ordinal = nth;
+                    return (
+                      <TranscriptCell
+                        key={i}
+                        cell={cell}
+                        respond={respond}
+                        onEdit={
+                          cell.kind === "user" && !busy
+                            ? (text) => editAndResend(ordinal, text)
+                            : undefined
+                        }
+                      />
+                    );
+                  });
+                })()}
                 {busy && (
                   <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
                 )}
@@ -65,6 +100,20 @@ export function ConversationPage() {
             Lost the connection to Borg. Reconnecting…
           </div>
         )}
+        <ContextBar
+          context={context}
+          busy={busy}
+          compacting={compacting}
+          onCompact={() => {
+            setCompacting(true);
+            void compact().finally(() => setCompacting(false));
+          }}
+          onFork={() => {
+            void fork().then((id) => {
+              if (id) navigate(`/c/${id}`);
+            });
+          }}
+        />
         <PlanPanel steps={plan} />
       </div>
 

@@ -36,7 +36,8 @@ use protocols::admin::{
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
     ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry,
+    SessionSummary, SessionTitleMutation, SetCredentialStrategyRequest,
+    SetSubprocessPinnedRequest, SettingEntry,
     SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
     TunnelStatusReply, WarningList, WebhookRef,
 };
@@ -391,6 +392,36 @@ impl Admin for AdminSvc {
         db.set_session_archived(&req.id, stamp)
             .await
             .map_err(|e| TStatus::internal(format!("set_session_archived failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn set_session_title(
+        &self,
+        req: Request<SessionTitleMutation>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let title = req.title.trim();
+        // A blank title renders as an unnamed row, which is exactly what the
+        // rename was meant to fix — refuse rather than silently store it.
+        if title.is_empty() {
+            return Err(TStatus::invalid_argument("title must not be empty"));
+        }
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?;
+        // `update_session_title` is a no-op for an unknown id, so check first:
+        // a rename that quietly did nothing looks identical to one that worked.
+        let known = db
+            .session_by_id(&req.id)
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?
+            .is_some();
+        if !known {
+            return Err(TStatus::not_found(format!("session `{}` not found", req.id)));
+        }
+        db.update_session_title(&req.id, title)
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 

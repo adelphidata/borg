@@ -18,6 +18,8 @@ export interface SidebarProps {
   archiveError?: string;
   /** Starts a fresh conversation. */
   onNewConversation: () => void;
+  /** Opens the full, searchable conversation list. */
+  onSeeAllConversations: () => void;
   user: NavUser;
 }
 
@@ -57,7 +59,7 @@ function NavSection({ routes, section }: { routes: AppRoute[]; section: AppRoute
   return (
     <div className="flex flex-col gap-[3px]">
       {routes
-        .filter((r) => r.section === section)
+        .filter((r) => r.section === section && r.nav?.sidebar !== false)
         .map((r) => (
           <NavItem key={r.id} route={r} />
         ))}
@@ -117,6 +119,7 @@ export function Sidebar({
   onArchiveRecent,
   archiveError,
   onNewConversation,
+  onSeeAllConversations,
   user,
 }: SidebarProps) {
   return (
@@ -160,6 +163,14 @@ export function Sidebar({
           Could not archive: {archiveError}
         </div>
       )}
+      {/* The list is capped; without this the older conversations are unreachable. */}
+      <button
+        type="button"
+        onClick={onSeeAllConversations}
+        className="mt-1 cursor-pointer rounded-md border-0 bg-transparent px-3 py-[7px] text-left text-[12px] leading-none text-ink3 hover:bg-surface3 hover:text-ink2"
+      >
+        Show all…
+      </button>
 
       <div className="flex-1" />
 

@@ -20,6 +20,7 @@ service Admin {
   rpc ListSessions(Empty) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
   rpc SetSessionArchived(SessionArchiveMutation) returns (Empty);
+  rpc SetSessionTitle(SessionTitleMutation) returns (Empty);
 
   // Scheduled tasks.
   rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
@@ -483,6 +484,12 @@ message SessionRef { string id = 1; }
 message SessionArchiveMutation {
   string id = 1;
   bool archived = 2;
+}
+// Rename one session. An empty title is rejected — a blank row in the picker
+// is indistinguishable from a broken one.
+message SessionTitleMutation {
+  string id = 1;
+  string title = 2;
 }
 message SessionDetail {
   string id = 1;

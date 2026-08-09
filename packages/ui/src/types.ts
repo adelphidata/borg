@@ -19,6 +19,12 @@ export interface AppRoute {
   section: "primary" | "secondary";
   /** Red attention dot next to the nav label */
   hasAlert?: boolean;
+  /**
+   * Where this route is reachable from. A route the sidebar already covers
+   * another way — the conversation list, which the sidebar shows inline — is
+   * still a real page, and on mobile it is the only way in.
+   */
+  nav?: { sidebar?: boolean; tabBar?: boolean };
 }
 
 /** Copy for an `AlertBanner`. Apps supply it; the banner only renders it. */

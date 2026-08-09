@@ -4,6 +4,7 @@ import type { IconProps } from "@borg/ui";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionsPage } from "./features/connections/ConnectionsPage";
 import { HealthPage } from "./features/health/HealthPage";
+import { SessionsPage } from "./features/sessions/SessionsPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
 
 export interface AppRoute {
@@ -19,6 +20,11 @@ export interface AppRoute {
   section: "primary" | "secondary";
   /** Red attention dot next to the nav label */
   hasAlert?: boolean;
+  /**
+   * Where this route appears in navigation. Both default to true; set one to
+   * false for a page the surface already reaches another way.
+   */
+  nav?: { sidebar?: boolean; tabBar?: boolean };
 }
 
 /**
@@ -34,6 +40,19 @@ export const routes: AppRoute[] = [
     icon: ChatIcon,
     page: ConversationPage,
     section: "primary",
+  },
+  {
+    id: "sessions",
+    path: "/sessions",
+    label: "Conversations",
+    tabLabel: "Chats",
+    icon: ChatIcon,
+    page: SessionsPage,
+    section: "primary",
+    // The sidebar lists recents inline, so a nav row for the same thing would
+    // be noise. On mobile there is no sidebar, which makes this tab the only
+    // route to the conversation list.
+    nav: { sidebar: false },
   },
   {
     id: "connections",

@@ -30,6 +30,9 @@ function KeyboardLayer() {
 
   useKeybind("new-conversation", () => navigate("/c/new"));
   useKeybind("open-settings", () => navigate("/settings"));
+  // A page with its own search box rebinds this; this is the fallback that
+  // takes the user somewhere they can actually search.
+  useKeybind("search-sessions", () => navigate("/sessions"));
 
   return null;
 }
@@ -99,6 +102,7 @@ function Shell({ platform }: { platform: Platform }) {
             onArchiveRecent={(id) => void archiveSession.run(id)}
             archiveError={archiveSession.error?.message}
             onNewConversation={() => navigate("/c/new")}
+            onSeeAllConversations={() => navigate("/sessions")}
             user={user}
           />
         )}

@@ -297,6 +297,18 @@ export interface Conversation {
   steer: (text: string) => void;
   cancel: () => void;
   respond: (promptId: string, value: string) => void;
+  /**
+   * Rewrites the nth user message (0-based) and re-runs from there. Everything
+   * after it is discarded, matching what the daemon does to its own history.
+   */
+  editAndResend: (nthUserMessage: number, text: string) => void;
+  /** Summarizes older turns to reclaim context. */
+  compact: () => Promise<unknown>;
+  /** Branches this conversation; resolves with the new session's id. */
+  fork: () => Promise<string | undefined>;
+  /** How full the context window is, refreshed on demand. */
+  context: { used: number; window: number } | undefined;
+  refreshContext: () => void;
 }
 
 /**
@@ -432,6 +444,49 @@ export function useConversation(target: string | undefined): Conversation {
     [steerMutation.run],
   );
   const cancel = useCallback(() => void cancelMutation.run(undefined), [cancelMutation.run]);
+
+  const [context, setContext] = useState<{ used: number; window: number }>();
+  const contextMutation = useMutation(async (borg) => {
+    if (!sessionId) return undefined;
+    const breakdown = await borg.session.getContextBreakdown({ sessionId });
+    // `detail` rows itemize a parent that already counts their tokens, so
+    // including them would double-count and report an impossible total.
+    const used = breakdown.components
+      .filter((c) => !c.detail)
+      .reduce((sum, c) => sum + Number(c.tokens), 0);
+    setContext({ used, window: Number(breakdown.contextWindow) });
+    return breakdown;
+  });
+  const refreshContext = useCallback(
+    () => void contextMutation.run(undefined),
+    [contextMutation.run],
+  );
+
+  const compactMutation = useMutation(
+    (borg) => (sessionId ? borg.session.compact({ sessionId }) : Promise.resolve(undefined)),
+    { onSuccess: () => refreshContext() },
+  );
+  const forkMutation = useMutation((borg) =>
+    sessionId ? borg.session.fork({ sessionId }) : Promise.resolve(undefined),
+  );
+  const rewindMutation = useMutation((borg, n: number) =>
+    sessionId ? borg.session.rewindToNthUserMessage({ sessionId, n }) : Promise.resolve(undefined),
+  );
+
+  const editAndResend = useCallback(
+    (nthUserMessage: number, text: string) => {
+      if (!sessionId) return;
+      // Drop the rewritten turn and everything after it on screen first, so the
+      // transcript matches what the daemon is about to hold.
+      setCells((prev) => {
+        let seen = 0;
+        const cut = prev.findIndex((c) => c.kind === "user" && seen++ === nthUserMessage);
+        return cut === -1 ? prev : prev.slice(0, cut);
+      });
+      void rewindMutation.run(nthUserMessage).then(() => send(text));
+    },
+    [rewindMutation.run, send, sessionId],
+  );
   const respond = useCallback(
     (promptId: string, value: string) => {
       setCells((prev) =>
@@ -446,11 +501,29 @@ export function useConversation(target: string | undefined): Conversation {
     [respondMutation.run],
   );
 
-  // Surface prompt-response and steer failures in the transcript error slot.
+  // Surface every side-channel failure in the transcript error slot; these
+  // paths have no other place to report, and a silent no-op reads as a bug.
   useEffect(() => {
-    const failure = respondMutation.error ?? steerMutation.error;
+    const failure =
+      respondMutation.error ??
+      steerMutation.error ??
+      compactMutation.error ??
+      forkMutation.error ??
+      rewindMutation.error;
     if (failure) setSendError(failure);
-  }, [respondMutation.error, steerMutation.error]);
+  }, [
+    respondMutation.error,
+    steerMutation.error,
+    compactMutation.error,
+    forkMutation.error,
+    rewindMutation.error,
+  ]);
+
+  // The context meter is only meaningful once a session is open, and it should
+  // reflect the turn that just finished rather than the one before it.
+  useEffect(() => {
+    if (sessionId && !busy) refreshContext();
+  }, [sessionId, busy, refreshContext]);
 
   return {
     opened,
@@ -463,5 +536,10 @@ export function useConversation(target: string | undefined): Conversation {
     steer,
     cancel,
     respond,
+    editAndResend,
+    compact: () => compactMutation.run(undefined),
+    fork: () => forkMutation.run(undefined).then((r) => r?.forkedAgentSessionId),
+    context,
+    refreshContext,
   };
 }

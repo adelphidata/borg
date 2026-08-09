@@ -407,6 +407,15 @@ export interface SessionArchiveMutation {
   archived: boolean;
 }
 
+/**
+ * Rename one session. An empty title is rejected — a blank row in the picker
+ * is indistinguishable from a broken one.
+ */
+export interface SessionTitleMutation {
+  id: string;
+  title: string;
+}
+
 export interface SessionDetail {
   id: string;
   title: string;
@@ -5616,6 +5625,82 @@ export const SessionArchiveMutation: MessageFns<SessionArchiveMutation> = {
     const message = createBaseSessionArchiveMutation();
     message.id = object.id ?? "";
     message.archived = object.archived ?? false;
+    return message;
+  },
+};
+
+function createBaseSessionTitleMutation(): SessionTitleMutation {
+  return { id: "", title: "" };
+}
+
+export const SessionTitleMutation: MessageFns<SessionTitleMutation> = {
+  encode(message: SessionTitleMutation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.title !== "") {
+      writer.uint32(18).string(message.title);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionTitleMutation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionTitleMutation();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.id = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.title = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionTitleMutation {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      title: isSet(object.title) ? globalThis.String(object.title) : "",
+    };
+  },
+
+  toJSON(message: SessionTitleMutation): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.title !== "") {
+      obj.title = message.title;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SessionTitleMutation>, I>>(base?: I): SessionTitleMutation {
+    return SessionTitleMutation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SessionTitleMutation>, I>>(object: I): SessionTitleMutation {
+    const message = createBaseSessionTitleMutation();
+    message.id = object.id ?? "";
+    message.title = object.title ?? "";
     return message;
   },
 };
@@ -12842,6 +12927,14 @@ export const AdminDefinition = {
     setSessionArchived: {
       name: "SetSessionArchived",
       requestType: SessionArchiveMutation as typeof SessionArchiveMutation,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    setSessionTitle: {
+      name: "SetSessionTitle",
+      requestType: SessionTitleMutation as typeof SessionTitleMutation,
       requestStream: false,
       responseType: Empty as typeof Empty,
       responseStream: false,
