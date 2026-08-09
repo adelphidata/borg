@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::constants;
 use crate::conversation::{
@@ -62,6 +62,14 @@ pub(crate) const SUMMARY_OUTPUT_TOKENS_FLOOR: u32 = 16_384;
 /// it via [`compaction_cooldown_turns`].
 pub(crate) const COMPACTION_OUTAGE_RETRY_TURNS: u32 = 10;
 
+/// Divisor for the pre-summarizer feasibility floor: when the compressible
+/// middle holds fewer than `history_budget / 10` tokens, an LLM summary cannot
+/// meaningfully shrink the prompt — the protected tail already owns the
+/// tokens — so the pass would pay a full summarizer call to reclaim a sliver.
+/// Applied only after a prior pass was already scored ineffective (see
+/// [`CompactionStrikes::has_ineffective_strike`]); the first pass always runs.
+pub(crate) const COMPACTION_FEASIBILITY_MIDDLE_DIVISOR: usize = 10;
+
 /// Ceiling on the escalated cooldown. Without a cap the ladder would eventually
 /// stop probing altogether within any realistic session; 90 turns keeps a
 /// restored credential recoverable without a restart while making a
@@ -111,6 +119,96 @@ pub(crate) fn load_compaction_outage() -> Option<CompactionOutage> {
 pub(crate) fn store_compaction_outage(outage: Option<CompactionOutage>) {
     if let Ok(mut guard) = COMPACTION_OUTAGE_LATCH.lock() {
         *guard = outage;
+    }
+}
+
+/// `meta`-table key for the durable copy of the outage latch. The `meta` KV
+/// table already exists in every deployed schema, so persistence needs no
+/// migration (worktrees share `~/.borg/borg.db`, where a stranded
+/// `schema_version` can silently skip one).
+const COMPACTION_OUTAGE_META_KEY: &str = "compaction_outage_v1";
+
+/// Wire form for the durable latch: `category|streak|turns_until_retry`.
+/// `announced` is deliberately not persisted — the notice is per-session and
+/// is forced back to `false` on every load anyway.
+fn encode_compaction_outage(outage: &CompactionOutage) -> String {
+    format!(
+        "{}|{}|{}",
+        outage.category, outage.streak, outage.turns_until_retry
+    )
+}
+
+/// Inverse of [`encode_compaction_outage`]. `None` means the value is not in
+/// the expected shape at all; an unrecognized category token alone degrades to
+/// `Unknown` rather than discarding the cooldown, because the cooldown is the
+/// part that stops the re-billing.
+fn decode_compaction_outage(raw: &str) -> Option<CompactionOutage> {
+    let mut parts = raw.split('|');
+    let category = parts.next()?;
+    let streak: u32 = parts.next()?.parse().ok()?;
+    let turns_until_retry: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(CompactionOutage {
+        category: category
+            .parse()
+            .unwrap_or(crate::error_format::ErrorCategory::Unknown),
+        turns_until_retry,
+        streak,
+        announced: false,
+    })
+}
+
+/// Write the latch state through to the `meta` table so a summarizer cooldown
+/// survives a daemon restart and is visible to sibling processes sharing the
+/// DB. `None` deletes the row — a cleared outage must not resurrect on the
+/// next boot. Failures are warned, never silently swallowed: the in-memory
+/// mirror still protects the current process, so continuing is safe.
+pub(crate) async fn persist_compaction_outage(
+    db: &crate::db::Database,
+    outage: Option<&CompactionOutage>,
+) {
+    let result = match outage {
+        Some(o) => {
+            db.set_meta(COMPACTION_OUTAGE_META_KEY, &encode_compaction_outage(o))
+                .await
+        }
+        None => db.delete_meta(COMPACTION_OUTAGE_META_KEY).await,
+    };
+    if let Err(e) = result {
+        warn!("Failed to persist the compaction outage cooldown: {e}");
+    }
+}
+
+/// Seed the process-wide mirror from the durable copy, once per process:
+/// an already-populated mirror is authoritative (it may hold a countdown
+/// fresher than the last DB write), so only an empty mirror is hydrated.
+/// Read failures are warned and skipped — a broken DB must never keep an
+/// agent from booting.
+pub(crate) async fn hydrate_compaction_outage(db: &crate::db::Database) {
+    if load_compaction_outage().is_some() {
+        return;
+    }
+    match db.get_meta(COMPACTION_OUTAGE_META_KEY).await {
+        Ok(Some(raw)) => match decode_compaction_outage(&raw) {
+            Some(outage) => {
+                debug!(
+                    category = %outage.category,
+                    streak = outage.streak,
+                    turns_until_retry = outage.turns_until_retry,
+                    "Restored the summarizer outage cooldown from the database"
+                );
+                store_compaction_outage(Some(outage));
+            }
+            None => {
+                warn!("Persisted compaction outage state is malformed, ignoring: {raw:?}");
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            warn!("Failed to load the persisted compaction outage cooldown: {e}");
+        }
     }
 }
 
@@ -201,6 +299,11 @@ pub(crate) struct CompactionStrikes {
     /// shrinking below this (user rewind, reactive compaction, tool-result
     /// trimming, new session) re-opens the gate.
     skip_baseline: Option<usize>,
+    /// Count of pre-summarizer feasibility skips (tiny compressible middle).
+    /// Deliberately its own counter: a feasibility skip is a cost
+    /// optimization, not an ineffective pass, and must never advance
+    /// `strikes` toward suspending compaction outright.
+    feasibility_skips: u32,
 }
 
 impl CompactionStrikes {
@@ -209,8 +312,28 @@ impl CompactionStrikes {
     }
 
     #[cfg(test)]
-    fn strikes(&self) -> u32 {
+    pub(crate) fn strikes(&self) -> u32 {
         self.strikes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn feasibility_skips(&self) -> u32 {
+        self.feasibility_skips
+    }
+
+    /// True once at least one pass has been scored ineffective. The
+    /// feasibility skip requires this: the first over-budget turn always gets
+    /// a real summarizer attempt, so a genuinely compressible history is never
+    /// denied its first pass by a cheap estimate.
+    pub(crate) fn has_ineffective_strike(&self) -> bool {
+        self.strikes > 0
+    }
+
+    /// Record a pre-summarizer feasibility skip and return the running count.
+    /// Never touches `strikes` — see the field docs.
+    pub(crate) fn record_feasibility_skip(&mut self) -> u32 {
+        self.feasibility_skips += 1;
+        self.feasibility_skips
     }
 
     /// Record the outcome of a proactive compaction pass.
@@ -814,7 +937,8 @@ Rules:
                     // Persist the countdown: without this a fresh `Agent` would
                     // reload the full cooldown every turn and never reach the
                     // probe, turning a temporary outage into a permanent one.
-                    store_compaction_outage(Some(*outage));
+                    let snapshot = *outage;
+                    self.sync_compaction_outage(Some(snapshot)).await;
                     return Ok(());
                 }
                 debug!(
@@ -841,6 +965,34 @@ Rules:
                 CompactionGate::Skipping => return Ok(()),
                 CompactionGate::Proceed => {}
             }
+
+            // Pre-summarizer feasibility check: when the protected tail
+            // already holds nearly all of the tokens, the compressible middle
+            // is too small for a summary to change the outcome — the pass
+            // would pay a full LLM call to reclaim a sliver. Gated on a prior
+            // ineffective strike so the first over-budget turn always gets a
+            // real attempt. The skip keeps its own counter and is exempt from
+            // all failure accounting (no strike, no outage latch): it is a
+            // deliberate cost optimization, not a summarizer failure. Manual
+            // compaction goes through `Agent::compact` directly and never
+            // reaches this gate, so an explicit user request always runs.
+            if self.compaction_strikes.has_ineffective_strike() {
+                let middle_tokens = crate::conversation::plan_compaction(&self.history, max_hist)
+                    .map_or(0, |keep_from| history_tokens(&self.history[..keep_from]));
+                if middle_tokens.saturating_mul(COMPACTION_FEASIBILITY_MIDDLE_DIVISOR) < max_hist {
+                    let skips = self.compaction_strikes.record_feasibility_skip();
+                    info!(
+                        middle_tokens,
+                        threshold = max_hist,
+                        skips,
+                        "Skipping LLM compaction: the compressible middle is too small \
+                         to justify a summarizer call — the protected tail holds the \
+                         tokens. Deterministic trimming already ran this turn."
+                    );
+                    return Ok(());
+                }
+            }
+
             self.metrics.record_memory_pressure("proactive");
             let before_tokens = history_tokens(&self.history);
 
@@ -943,6 +1095,32 @@ Rules:
         Ok(())
     }
 
+    /// Write-through for the outage latch: publish to the process-wide mirror
+    /// and persist to the `meta` table so the cooldown survives a daemon
+    /// restart. A missing DB handle is normal (early init, tests) and means
+    /// mirror-only; an actual DB write failure is warned inside
+    /// [`persist_compaction_outage`], never silently swallowed.
+    pub(super) async fn sync_compaction_outage(&self, outage: Option<CompactionOutage>) {
+        store_compaction_outage(outage);
+        let guard = self.db.lock().await;
+        if let Some(ref db) = *guard {
+            persist_compaction_outage(db, outage.as_ref()).await;
+        }
+    }
+
+    /// Drop the outage latch everywhere it is recorded. The durable row is
+    /// only touched when something was actually latched: every compaction pass
+    /// that neither failed nor found anything to compact lands here, and an
+    /// unconditional `delete_meta` would put a SQLite write behind the shared
+    /// writer mutex on that hot path for nothing.
+    async fn clear_compaction_outage(&mut self) {
+        let had_latch = self.compaction_outage.is_some() || load_compaction_outage().is_some();
+        self.compaction_outage = None;
+        if had_latch {
+            self.sync_compaction_outage(None).await;
+        }
+    }
+
     /// Fold one compaction pass's outcome into the outage latch, announcing a
     /// newly-detected outage exactly once.
     ///
@@ -964,15 +1142,13 @@ Rules:
             // Demonstrated success — whatever was wrong is over. Clearing the
             // mirror resets the ladder so a recovered provider starts from the
             // base cooldown rather than inheriting an old penalty.
-            self.compaction_outage = None;
-            store_compaction_outage(None);
+            self.clear_compaction_outage().await;
             return;
         }
 
         let Some(SummarizeFailure::Persistent(category)) = failure else {
             // Transient, or nothing to compact: keep normal retry semantics.
-            self.compaction_outage = None;
-            store_compaction_outage(None);
+            self.clear_compaction_outage().await;
             return;
         };
 
@@ -1015,10 +1191,14 @@ Rules:
             cooldown,
             "Summarizer outage re-armed with escalated cooldown"
         );
-        store_compaction_outage(Some(*outage));
+        let snapshot = *outage;
+        self.sync_compaction_outage(Some(snapshot)).await;
 
         // Announce once, from whichever path first has a channel to the user.
         let Some(event_tx) = event_tx else { return };
+        let Some(outage) = self.compaction_outage.as_mut() else {
+            return;
+        };
         if outage.announced {
             return;
         }
@@ -1381,7 +1561,7 @@ Rules:
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&extra);
             }
-            HookAction::Skip => {
+            HookAction::Skip { .. } => {
                 // A pre-flight gate (e.g. BudgetHook) refused this LLM
                 // call. Bubble up with `Ok(None)` so the caller can
                 // surface a system message and end the turn cleanly,

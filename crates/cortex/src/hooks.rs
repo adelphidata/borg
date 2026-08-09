@@ -103,7 +103,13 @@ pub enum HookAction {
     /// Append text to the system prompt.
     InjectContext(String),
     /// Skip the current action (e.g., skip a tool call).
-    Skip,
+    Skip {
+        /// Why the action was skipped, surfaced to the model in the tool
+        /// result so a blocked call is never a silent mystery. Producers
+        /// trim and length-bound the text; `None` means the hook gave no
+        /// detail and the consumer falls back to a generic message.
+        reason: Option<String>,
+    },
 }
 
 /// Trait for implementing lifecycle hooks on the agent loop.
@@ -168,9 +174,9 @@ impl HookRegistry {
                         _ => HookAction::InjectContext(text),
                     };
                 }
-                HookAction::Skip => {
+                HookAction::Skip { reason } => {
                     debug!("Hook '{}' returned Skip for {:?}", hook.name(), ctx.point);
-                    return HookAction::Skip;
+                    return HookAction::Skip { reason };
                 }
             }
         }
@@ -274,7 +280,7 @@ mod tests {
         registry.register(Box::new(TestHook {
             name: "skipper".to_string(),
             points: vec![HookPoint::BeforeToolCall],
-            action: HookAction::Skip,
+            action: HookAction::Skip { reason: None },
         }));
         registry.register(Box::new(TestHook {
             name: "injector".to_string(),
@@ -291,7 +297,10 @@ mod tests {
                 args: "{}".to_string(),
             },
         };
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Skip));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Skip { .. }
+        ));
     }
 
     #[tokio::test]
@@ -389,7 +398,7 @@ mod tests {
         registry.register(Box::new(TestHook {
             name: "skipper".to_string(),
             points: vec![HookPoint::AfterLlmResponse],
-            action: HookAction::Skip,
+            action: HookAction::Skip { reason: None },
         }));
         // Inject registered second — should not execute
         registry.register(Box::new(TestHook {
@@ -407,7 +416,10 @@ mod tests {
                 text_length: 100,
             },
         };
-        assert!(matches!(registry.dispatch(&ctx).await, HookAction::Skip));
+        assert!(matches!(
+            registry.dispatch(&ctx).await,
+            HookAction::Skip { .. }
+        ));
     }
 
     #[test]

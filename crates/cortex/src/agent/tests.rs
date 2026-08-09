@@ -709,6 +709,207 @@ async fn compaction_outage_survives_a_fresh_agent() {
     );
 }
 
+/// REGRESSION: the outage mirror was process-memory only, so a daemon restart
+/// forgot the cooldown entirely and the next boot re-probed the dead
+/// summarizer at full price. The cooldown must be rebuilt from its durable
+/// copy in the `meta` table, and clearing must write through so a cleared
+/// outage cannot resurrect on the next boot.
+#[tokio::test]
+async fn compaction_outage_cooldown_survives_a_restart() {
+    use super::prompt_assembly::{
+        hydrate_compaction_outage, load_compaction_outage, persist_compaction_outage,
+        store_compaction_outage, CompactionOutage,
+    };
+
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = crate::db::Database::open_at(&dir.path().join("borg.db"))
+        .await
+        .expect("open test db");
+
+    // "Process one" latches an escalated cooldown and writes it through.
+    persist_compaction_outage(
+        &db,
+        Some(&CompactionOutage {
+            category: crate::error_format::ErrorCategory::Billing,
+            turns_until_retry: 17,
+            streak: 3,
+            announced: true,
+        }),
+    )
+    .await;
+
+    // "Restart": the in-memory mirror is empty, only the DB row remains.
+    store_compaction_outage(None);
+    hydrate_compaction_outage(&db).await;
+
+    let restored = load_compaction_outage()
+        .expect("the cooldown must be rebuilt from the durable copy after a restart");
+    assert_eq!(
+        restored.streak, 3,
+        "the ladder rung must survive the restart, or every boot restarts escalation"
+    );
+    assert_eq!(
+        restored.turns_until_retry, 17,
+        "the remaining cooldown must survive, not reset to the full rung"
+    );
+    assert_eq!(
+        restored.category,
+        crate::error_format::ErrorCategory::Billing,
+        "the failure class drives the user notice and must round-trip"
+    );
+    assert!(
+        !restored.announced,
+        "the notice is per-session and must never be inherited across a restart"
+    );
+
+    // Clearing writes through: after a clear, a restart must NOT resurrect it.
+    persist_compaction_outage(&db, None).await;
+    store_compaction_outage(None);
+    hydrate_compaction_outage(&db).await;
+    assert!(
+        load_compaction_outage().is_none(),
+        "a cleared outage must stay cleared across a restart"
+    );
+
+    // A live mirror is authoritative: hydration must not clobber a fresher
+    // in-process countdown with a staler DB row.
+    persist_compaction_outage(
+        &db,
+        Some(&CompactionOutage {
+            category: crate::error_format::ErrorCategory::Auth,
+            turns_until_retry: 30,
+            streak: 2,
+            announced: false,
+        }),
+    )
+    .await;
+    store_compaction_outage(Some(CompactionOutage {
+        category: crate::error_format::ErrorCategory::Auth,
+        turns_until_retry: 4,
+        streak: 2,
+        announced: false,
+    }));
+    hydrate_compaction_outage(&db).await;
+    assert_eq!(
+        load_compaction_outage()
+            .expect("still latched")
+            .turns_until_retry,
+        4,
+        "an already-populated mirror must win over the durable copy"
+    );
+}
+
+/// Spec: when the protected tail already holds nearly all the tokens and a
+/// prior pass was scored ineffective, the summarizer call is skipped — it
+/// would pay a full LLM call to summarize a sliver. The skip must use its own
+/// counter (never the disabling strike counter) and must not latch the outage.
+#[tokio::test]
+async fn tiny_middle_with_prior_strike_skips_the_summarizer() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let mut config = Config::default();
+    // No provider: reaching the summarizer client build would error, so an
+    // Ok return proves the pass was skipped before any LLM work.
+    config.llm.provider = None;
+    config.conversation.max_history_tokens = 2000;
+    let mut agent = minimal_test_agent(config);
+    // Two tiny old messages + a huge protected tail: the compressible middle
+    // is a sliver of the budget.
+    agent.history = vec![
+        Message::user("old question"),
+        Message::assistant("old answer"),
+        Message::user("x".repeat(20_000)),
+    ];
+    // One prior ineffective pass (post-estimate still over the threshold).
+    agent.compaction_strikes.record_pass(3000, 2000, 100_000);
+    assert_eq!(agent.compaction_strikes.strikes(), 1);
+
+    let (tx, _rx) = mpsc::channel(16);
+    agent
+        .compact_history_if_needed(&tx)
+        .await
+        .expect("a feasibility skip must return cleanly without touching the summarizer");
+
+    assert_eq!(
+        agent.compaction_strikes.strikes(),
+        1,
+        "a feasibility skip must NOT advance the disabling strike counter — one real \
+         strike plus skips must never suspend compaction outright"
+    );
+    assert_eq!(
+        agent.compaction_strikes.feasibility_skips(),
+        1,
+        "the skip must be recorded on its own counter"
+    );
+    assert!(
+        agent.compaction_outage.is_none(),
+        "a deliberate skip is not a summarizer failure — it must never latch the outage"
+    );
+}
+
+/// Spec: without a prior strike the summarizer must still be attempted even
+/// when the middle looks tiny — the first over-budget turn always gets a real
+/// pass, so a cheap estimate can never deny a compressible history its chance.
+#[tokio::test]
+async fn tiny_middle_without_prior_strike_still_attempts_the_summarizer() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let mut config = Config::default();
+    // No provider configured, so the attempt fails at client construction —
+    // reaching that error is itself proof the feasibility gate did not skip.
+    config.llm.provider = None;
+    config.conversation.max_history_tokens = 2000;
+    let mut agent = minimal_test_agent(config);
+    agent.history = vec![
+        Message::user("old question"),
+        Message::assistant("old answer"),
+        Message::user("x".repeat(20_000)),
+    ];
+
+    let (tx, _rx) = mpsc::channel(16);
+    let result = agent.compact_history_if_needed(&tx).await;
+    assert!(
+        result.is_err(),
+        "with no prior strike the pass must reach the summarizer client build"
+    );
+    assert_eq!(
+        agent.compaction_strikes.feasibility_skips(),
+        0,
+        "no skip may be recorded when the gate did not fire"
+    );
+}
+
+/// Spec: an explicit manual compaction request always exercises the
+/// summarizer — the feasibility gate belongs to the proactive path only, so
+/// its failure/auth handling is always exercised on user request.
+#[tokio::test]
+async fn manual_compact_bypasses_the_feasibility_skip() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let mut config = Config::default();
+    config.llm.provider = None;
+    config.conversation.max_history_tokens = 2000;
+    let mut agent = minimal_test_agent(config);
+    agent.history = vec![
+        Message::user("old question"),
+        Message::assistant("old answer"),
+        Message::user("x".repeat(20_000)),
+    ];
+    // Same tiny-middle + prior-strike setup that makes the proactive path skip.
+    agent.compaction_strikes.record_pass(3000, 2000, 100_000);
+
+    let _ = agent.compact().await;
+
+    assert_eq!(
+        agent.compaction_strikes.feasibility_skips(),
+        0,
+        "the manual path must never consult the feasibility gate"
+    );
+    assert_eq!(
+        agent.compaction_strikes.strikes(),
+        1,
+        "a manual attempt must not disturb the proactive strike state either"
+    );
+}
+
 /// The notice must name the failure class. "Compaction is paused" alone sends
 /// the user hunting through context settings for a billing problem.
 #[tokio::test]

@@ -29,7 +29,7 @@ Restart `borgd` (or any `borg` command that respawns it). Hooks are discovered w
 | `SessionStart` | Once when a new session begins. |
 | `SessionEnd` | When a session ends, including explicit session close. |
 | `UserPromptSubmit` | Before the agent starts processing a user message. |
-| `PreToolUse` | Before executing any tool call. Non-zero exit **skips** the tool call. |
+| `PreToolUse` | Before executing any tool call. Non-zero exit **skips** the tool call; the hook's stderr becomes the block reason the model sees. |
 | `PostToolUse` | After a tool call completes. Observer — exit code ignored. |
 | `Stop` | After a full agent turn completes. |
 
@@ -68,7 +68,7 @@ A hook that never reads stdin is fine: borg closes the pipe and ignores the resu
 
 | Event | Zero exit | Non-zero exit | Timeout |
 |---|---|---|---|
-| `PreToolUse` | Tool runs | **Tool is skipped** | **Tool is skipped** |
+| `PreToolUse` | Tool runs | **Tool is skipped** (stderr surfaced as the reason; exit code if stderr is empty) | **Tool is skipped** (reason says the hook timed out) |
 | All others | Continue | Continue (warn logged) | Continue (warn logged) |
 
 Fail-open on PreToolUse **spawn** failures (e.g. typoed command path): a broken hook should never block every tool call. Fail-closed on PreToolUse **timeouts**: a hung hook on a tool-gating event aborts the call to avoid ambiguous state.
@@ -80,7 +80,7 @@ Hooks **cannot break the agent.** Every failure path resolves to a safe default 
 - Missing / unreadable / malformed `hooks.json` → zero hooks loaded, agent runs normally.
 - Unknown event names, invalid matcher regex, missing `command` field → that entry is dropped, other hooks still load.
 - Subprocess spawn failure, timeout, non-zero exit, non-UTF-8 output, panic inside the runner → logged, action defaults to `Continue` (or `Skip` for PreToolUse on timeout/non-zero).
-- Hook output is capped at 8 KiB per stream. Stdout is discarded; stderr is logged.
+- Hook output is capped at 8 KiB per stream. Stdout is discarded; stderr is logged, and on a PreToolUse block its first 2000 characters are surfaced to the model as the reason (after secret redaction).
 - A hook that backgrounds a process (`some-daemon &`) leaks the output pipe to that process. Borg stops waiting on the pipe once the hook itself exits, so `timeout` still holds — but that hook's stderr may not make it into the log. Redirect it (`some-daemon >/dev/null 2>&1 &`) if you care.
 
 Check `~/.borg/logs/daemon.log` and `~/.borg/logs/daemon.err` for hook warnings.

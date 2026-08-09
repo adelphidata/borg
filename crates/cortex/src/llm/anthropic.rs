@@ -53,7 +53,11 @@ pub(super) fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
 ///
 /// 1. **Duplicate `tool_call_id`** — a resumed or merged history can repeat an
 ///    id across assistant `tool_calls` or `tool` results (DeepSeek: "Duplicate
-///    value"). Later duplicates are dropped, keeping the first.
+///    value"). An *exact replay* (same id, same call payload — a re-appended
+///    turn) is dropped, keeping the first. A colliding id with a *different*
+///    payload (id-reusing backends, long-context degradation) is renamed
+///    deterministically instead, together with its matching result, so no
+///    call/result pair is silently lost.
 /// 2. **Orphaned `tool` result** — a `Role::Tool` message whose `tool_call_id`
 ///    matches no *preceding* assistant `tool_calls` entry (the assistant turn
 ///    that requested it was compacted away). Dropped.
@@ -120,14 +124,49 @@ fn coalesce_consecutive_assistants(messages: &[Message]) -> Vec<Message> {
     out
 }
 
-/// Drop duplicate `tool_call_id`s and orphaned `tool` results (see
+/// Repair duplicate `tool_call_id`s and drop orphaned `tool` results (see
 /// [`repair_message_sequence`] cases 1 and 2) in a single forward scan.
+///
+/// A colliding call id splits into two cases:
+/// - **Exact replay** — same id *and* same `(name, arguments)` payload as the
+///   first occurrence (a resumed/merged history re-appended the turn). The
+///   later copy and its duplicate result are dropped; nothing is lost.
+/// - **Id reuse** — same id, *different* payload (id-reusing
+///   OpenAI-compatible backends, long-context degradation). Dropping here
+///   would silently lose a real call's output, so the later call is renamed
+///   with a stable occurrence-indexed `_d<n>` suffix and its matching result
+///   (results pair by id, in emission order) is renamed the same way. The
+///   suffix is deterministic — same input → same renames — so replayed
+///   histories stay byte-stable for prompt-cache prefixing.
+///
+/// A rename only happens when the history actually carries an *unclaimed*
+/// result for that id. Renaming a call no result can pair with would trade one
+/// invalid shape (duplicate id) for another (an assistant `tool_call` with no
+/// `tool` message after it), which the same strict providers also 400 on — so
+/// in that case the later call is dropped exactly as before.
 fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    // How many `tool` results the history carries per id, and how many calls
+    // have already claimed one. A rename needs a spare result to pair with.
+    let mut results_per_id: HashMap<&str, usize> = HashMap::new();
+    for m in messages {
+        if m.role == Role::Tool {
+            if let Some(id) = m.tool_call_id.as_deref() {
+                *results_per_id.entry(id).or_default() += 1;
+            }
+        }
+    }
+    let mut claimed_results: HashMap<String, usize> = HashMap::new();
     // Every tool-call id emitted by a *preceding* assistant — a `tool` result
     // is valid only if its id is in here. Accumulates for the whole history
     // since ids are conversation-global.
     let mut seen_call_ids: HashSet<String> = HashSet::new();
+    // `(name, arguments)` of the first call kept under each id, to tell an
+    // exact replay (safe to drop) from id reuse (must rename).
+    let mut first_payload: HashMap<String, (String, String)> = HashMap::new();
+    // Renamed ids per original id, FIFO — consumed by later `tool` results
+    // still carrying the original id so call/result pairs stay paired.
+    let mut pending_result_renames: HashMap<String, VecDeque<String>> = HashMap::new();
     let mut seen_result_ids: HashSet<String> = HashSet::new();
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for m in messages {
@@ -135,19 +174,66 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
             (Role::Assistant, Some(calls)) => {
                 let mut kept: Vec<ToolCall> = Vec::new();
                 for call in calls {
+                    let payload = (call.function.name.clone(), call.function.arguments.clone());
                     if seen_call_ids.insert(call.id.clone()) {
+                        first_payload.insert(call.id.clone(), payload);
+                        *claimed_results.entry(call.id.clone()).or_default() += 1;
                         kept.push(call.clone());
-                    } else {
-                        tracing::debug!(id = %call.id, "repair: dropping duplicate tool_call id");
+                        continue;
                     }
+                    if first_payload.get(&call.id) == Some(&payload) {
+                        // Exact replay of an earlier turn; its duplicate
+                        // result is dropped in the Tool arm below.
+                        tracing::debug!(
+                            id = %call.id,
+                            "repair: dropping replayed duplicate tool_call"
+                        );
+                        continue;
+                    }
+                    // Id reuse, but no spare result to pair a renamed call
+                    // with: keeping it would emit a `tool_call` nothing answers,
+                    // which strict providers reject just as hard. Drop it.
+                    let available = results_per_id.get(call.id.as_str()).copied().unwrap_or(0);
+                    if available <= claimed_results.get(&call.id).copied().unwrap_or(0) {
+                        tracing::debug!(
+                            id = %call.id,
+                            "repair: dropping duplicate tool_call with no result to pair"
+                        );
+                        continue;
+                    }
+                    *claimed_results.entry(call.id.clone()).or_default() += 1;
+                    // Id reuse: rename deterministically, stepping over any
+                    // id that already exists (including a crafted `_d<n>`).
+                    let mut n = 1usize;
+                    let mut candidate = format!("{}_d{n}", call.id);
+                    while !seen_call_ids.insert(candidate.clone()) {
+                        n += 1;
+                        candidate = format!("{}_d{n}", call.id);
+                    }
+                    tracing::warn!(
+                        id = %call.id,
+                        renamed = %candidate,
+                        tool = %call.function.name,
+                        "repair: duplicate tool_call id with different payload; \
+                         renamed call and its result to keep the pair"
+                    );
+                    first_payload.insert(candidate.clone(), payload);
+                    pending_result_renames
+                        .entry(call.id.clone())
+                        .or_default()
+                        .push_back(candidate.clone());
+                    kept.push(ToolCall {
+                        id: candidate,
+                        ..call.clone()
+                    });
                 }
                 let content_empty = m
                     .content
                     .as_ref()
                     .is_none_or(crate::types::MessageContent::is_blank);
                 if kept.is_empty() && content_empty {
-                    // Assistant reduced to nothing (all calls were duplicates,
-                    // no text) — drop it entirely rather than send an empty turn.
+                    // Assistant reduced to nothing (all calls were exact
+                    // replays, no text) — drop it rather than send an empty turn.
                     continue;
                 }
                 out.push(Message {
@@ -161,11 +247,33 @@ fn prune_tool_call_ids(messages: &[Message]) -> Vec<Message> {
                     tracing::debug!(id = %id, "repair: dropping orphaned tool result");
                     continue;
                 }
-                if !seen_result_ids.insert(id.to_string()) {
-                    tracing::debug!(id = %id, "repair: dropping duplicate tool result");
+                if seen_result_ids.insert(id.to_string()) {
+                    out.push(m.clone());
                     continue;
                 }
-                out.push(m.clone());
+                // Id already answered: route this result to the next renamed
+                // call still waiting for one (results pair by id + order), or
+                // drop it as a genuine replayed duplicate.
+                let renamed = pending_result_renames.get_mut(id).and_then(|queue| loop {
+                    match queue.pop_front() {
+                        // Skip renames whose result already arrived under the
+                        // renamed id itself (an already-repaired history).
+                        Some(r) if seen_result_ids.contains(&r) => {}
+                        other => break other,
+                    }
+                });
+                match renamed {
+                    Some(renamed_id) => {
+                        seen_result_ids.insert(renamed_id.clone());
+                        out.push(Message {
+                            tool_call_id: Some(renamed_id),
+                            ..m.clone()
+                        });
+                    }
+                    None => {
+                        tracing::debug!(id = %id, "repair: dropping duplicate tool result");
+                    }
+                }
             }
             _ => out.push(m.clone()),
         }

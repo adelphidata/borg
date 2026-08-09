@@ -421,6 +421,56 @@ def build_type3_pdf():
 
 write_bytes("type3_font.pdf", build_type3_pdf())
 
+
+def build_mixed_pages_pdf():
+    """A three-page PDF where only pages 1 and 3 carry a text layer.
+
+    Page 2 draws nothing but spaces — the shape of a scanned page in an
+    otherwise text-based document — so the read path can prove it warns about
+    partial text coverage instead of silently returning a document with a
+    missing middle."""
+    page_streams = [
+        b"BT /F1 18 Tf 72 720 Td (Quarterly Report) Tj ET\n"
+        b"BT /F1 12 Tf 72 690 Td (Widgets shipped: 4200 units across three regions.) Tj ET",
+        # Whitespace only: must count as "no extractable text".
+        b"BT /F1 12 Tf 72 720 Td (   ) Tj ET",
+        b"BT /F1 12 Tf 72 720 Td (Outlook: expand the Bristol line.) Tj ET",
+    ]
+    n = len(page_streams)
+    # Object layout: 1 catalog, 2 pages, 3 font, then per page i (0-based):
+    # 4+2i page, 5+2i contents.
+    kids = " ".join(f"{4 + 2 * i} 0 R" for i in range(n))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for i, stream in enumerate(page_streams):
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {5 + 2 * i} 0 R >>".encode()
+        )
+        objects.append(
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        )
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+write_bytes("mixed_pages.pdf", build_mixed_pages_pdf())
+
 # A document whose extension lies: real .docx bytes named `.txt`. Reading it
 # must still convert, because format detection reads the content signature.
 #

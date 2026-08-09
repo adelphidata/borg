@@ -152,7 +152,13 @@ impl Hook for BudgetHook {
                     spent.to_display_string(),
                     hard_cap.to_display_string()
                 );
-                HookAction::Skip
+                HookAction::Skip {
+                    reason: Some(format!(
+                        "budget hard cap reached at scope '{scope}': ${} spent of ${} cap",
+                        spent.to_display_string(),
+                        hard_cap.to_display_string()
+                    )),
+                }
             }
             Err(e) => {
                 tracing::warn!("BudgetHook: pre_flight failed: {e}");
@@ -285,7 +291,7 @@ mod tests {
                 prompt_tokens: Some(50),
             },
         ));
-        assert!(matches!(action, HookAction::Skip), "got {action:?}");
+        assert!(matches!(action, HookAction::Skip { .. }), "got {action:?}");
     }
 
     #[test]

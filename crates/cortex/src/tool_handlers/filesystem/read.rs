@@ -30,7 +30,21 @@ pub fn handle_read_pdf(args: &serde_json::Value) -> Result<String> {
         return Ok(format!("File not found: {file_path}"));
     }
     match document::convert(path) {
-        Ok(doc) => Ok(window_text(&doc.markdown, 1, 0, max_chars)),
+        Ok(doc) => {
+            // `coverage_warning` stays silent when *every* page is empty,
+            // deferring to this message — without it a fully-scanned PDF
+            // returns an empty string, which reads as "the document is blank".
+            if doc.markdown.trim().is_empty() {
+                return Ok(format!(
+                    "[No extractable text in {file_path} — the document may be empty, or scanned images with no text layer]"
+                ));
+            }
+            // Same disclosure as the read_file path: a part-scanned PDF must
+            // not present its partial text as the whole document.
+            let mut output = document::coverage_warning(&doc).unwrap_or_default();
+            output.push_str(&window_text(&doc.markdown, 1, 0, max_chars));
+            Ok(output)
+        }
         Err(e) => Ok(format!("Error reading PDF: {e}")),
     }
 }
@@ -95,6 +109,11 @@ fn frame(
     max_chars: usize,
 ) -> String {
     let mut output = document::conversion_header(doc, extension_mismatch);
+    // A part-scanned PDF converts "successfully" while whole sections are
+    // silently missing; the coverage warning discloses the gap up front.
+    if let Some(warning) = document::coverage_warning(doc) {
+        output.push_str(&warning);
+    }
     output.push_str(&window_text(&doc.markdown, offset, limit, max_chars));
     output
 }

@@ -431,6 +431,10 @@ async fn build_common(config: &Config) -> Result<AgentCommon> {
     // Explicit user config (set higher) is preserved via `max`.
     let mut limits = config.security.action_limits.clone();
     if let Some(ref d) = db {
+        // Seed the process-wide summarizer-outage mirror from its durable
+        // copy so a cooldown latched before a daemon restart keeps counting
+        // down instead of re-probing the dead summarizer at full price.
+        prompt_assembly::hydrate_compaction_outage(d).await;
         if let Ok(state) = d.get_evolution_state().await {
             let stage = match state.stage {
                 crate::evolution::Stage::Base => crate::rate_guard::EvolutionStage::Base,

@@ -2303,3 +2303,91 @@ async fn hung_server_is_torn_down_by_idle_liveness_ping() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+
+#[tokio::test]
+async fn blind_call_missing_required_args_refused_before_dispatch() {
+    // Spec: a deferred/MCP tool called without its schema-required arguments
+    // must NOT reach the server. The refusal has to name the missing keys and
+    // echo the parameter schema so the model's immediate retry is informed —
+    // dispatching blind produces an opaque server error that cheap models
+    // loop on. A fully-specified call must still dispatch normally.
+    let _g = begin_test();
+
+    let dispatched = Arc::new(Mutex::new(0u32));
+    let dispatched_probe = Arc::clone(&dispatched);
+
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}
+        },
+        "required": ["path", "content"]
+    });
+
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        let schema_for_list = schema.clone();
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(move |_| tools_list(&[("write", schema_for_list.clone())])),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(move |_| {
+                *dispatched_probe.lock().unwrap() += 1;
+                text_call_result("written")
+            }),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config(vec![], 60, 10);
+    mcp_clients::testing::install_session("fs", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    // Blind call: only one of two required keys supplied.
+    let out = mcp_clients::try_execute_tool("mcp_fs_write", &json!({"path": "a.txt"}))
+        .await
+        .expect("probe refusal is Ok, not Err")
+        .expect("mcp tool must be handled");
+    assert_eq!(
+        *dispatched.lock().unwrap(),
+        0,
+        "blind call must never reach the server; got output: {out}",
+    );
+    let parsed: Value = serde_json::from_str(&out).expect("refusal is structured JSON");
+    let err = parsed["error"].as_str().expect("error field");
+    assert!(
+        err.contains("missing required argument(s)") && err.contains("content"),
+        "refusal must name the missing key(s); got: {err}",
+    );
+    assert!(
+        !err.contains("path,") && !err.contains(": path"),
+        "supplied key must not be reported missing; got: {err}",
+    );
+    assert_eq!(
+        parsed["input_schema"]["required"],
+        json!(["path", "content"]),
+        "refusal must carry the parameter schema so the retry is informed",
+    );
+
+    // Fully-specified call: dispatch proceeds and the real result comes back.
+    let out =
+        mcp_clients::try_execute_tool("mcp_fs_write", &json!({"path": "a.txt", "content": "hi"}))
+            .await
+            .expect("call ok")
+            .expect("got output");
+    assert_eq!(
+        *dispatched.lock().unwrap(),
+        1,
+        "complete args must dispatch to the server",
+    );
+    assert!(out.contains("written"), "server result must surface: {out}");
+}

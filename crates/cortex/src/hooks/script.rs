@@ -20,8 +20,9 @@
 //!
 //! Event names map to [`HookPoint`] variants. Hooks run `sh -c <command>` with the
 //! event payload as `$1` (a JSON object). For `PreToolUse`, a non-zero exit or
-//! timeout returns [`HookAction::Skip`] to abort the tool call; all other events
-//! are observers.
+//! timeout returns [`HookAction::Skip`] to abort the tool call — the hook's
+//! stderr (trimmed, length-bounded) rides along as the skip reason so the
+//! model learns *why* the call was blocked; all other events are observers.
 //!
 //! The payload is delivered on **both** channels: as `$1` and on the hook's
 //! stdin. Claude Code hooks read it from stdin (`input=$(cat)`), so a script
@@ -284,7 +285,7 @@ impl ScriptHook {
         // metadata only; command text, payload, stdout, and stderr are
         // deliberately excluded because they can carry secrets/PII.
         match result {
-            Ok(0) => {
+            Ok((0, _)) => {
                 tracing::debug!(
                     hook = %self.name,
                     point = ?ctx.point,
@@ -294,7 +295,7 @@ impl ScriptHook {
                 );
                 HookAction::Continue
             }
-            Ok(code) => {
+            Ok((code, stderr)) => {
                 tracing::warn!(
                     hook = %self.name,
                     point = ?ctx.point,
@@ -304,7 +305,9 @@ impl ScriptHook {
                     "hook exited nonzero"
                 );
                 if self.is_pre_tool() {
-                    HookAction::Skip
+                    HookAction::Skip {
+                        reason: Some(block_reason(&self.name, code, &stderr)),
+                    }
                 } else {
                     HookAction::Continue
                 }
@@ -330,7 +333,13 @@ impl ScriptHook {
                     self.timeout
                 );
                 if self.is_pre_tool() {
-                    HookAction::Skip
+                    HookAction::Skip {
+                        reason: Some(format!(
+                            "PreToolUse hook '{}' blocked this tool call: hook timed out \
+                             after {:?} without reaching a decision",
+                            self.name, self.timeout
+                        )),
+                    }
                 } else {
                     HookAction::Continue
                 }
@@ -400,6 +409,30 @@ fn compile_matcher(raw: Option<&str>) -> Result<Option<Regex>, regex::Error> {
     }
 }
 
+/// Cap on the block-reason text surfaced to the model when a PreToolUse hook
+/// vetoes a tool call. Keeps a chatty hook from flooding the transcript while
+/// leaving plenty of room for a real explanation.
+const MAX_BLOCK_REASON_CHARS: usize = 2000;
+
+/// Build the reason string surfaced to the model when a PreToolUse hook exits
+/// nonzero. Hooks write their explanation to stderr (the hooks.json-compatible
+/// convention documented in `docs/hooks.md`); an empty stderr falls back to
+/// the exit code so the model at least learns which hook fired and how.
+fn block_reason(hook: &str, exit_code: i32, stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return format!(
+            "PreToolUse hook '{hook}' blocked this tool call \
+             (exit code {exit_code}, no reason given)"
+        );
+    }
+    let mut reason: String = trimmed.chars().take(MAX_BLOCK_REASON_CHARS).collect();
+    if reason.len() < trimmed.len() {
+        reason.push_str(" [truncated]");
+    }
+    format!("PreToolUse hook '{hook}' blocked this tool call (exit code {exit_code}): {reason}")
+}
+
 #[derive(Debug)]
 enum SubprocessError {
     Spawn(std::io::Error),
@@ -428,7 +461,11 @@ const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// `try_wait` never returns `Some`, and a perfectly good hook is SIGKILLed at the
 /// deadline and reported as a timeout. The same reasoning applies in reverse to
 /// the stdin write.
-fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32, SubprocessError> {
+fn run_subprocess(
+    command: &str,
+    payload: &str,
+    timeout: Duration,
+) -> Result<(i32, String), SubprocessError> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -479,19 +516,21 @@ fn run_subprocess(command: &str, payload: &str, timeout: Duration) -> Result<i32
     // closes, and none of them touch state the caller still owns.
     drop(stdin_writer);
     // stdout is drained (to unblock the child) but never surfaced; hooks
-    // communicate via side effects and exit codes, not output.
+    // communicate via side effects, exit codes, and stderr.
     drop(stdout_drain);
+    // stderr is both logged and returned to the caller: on a PreToolUse veto
+    // it becomes the block reason the model sees.
+    let mut stderr_text = String::new();
     if let Some(rx) = stderr_drain {
         if let Ok(buf) = rx.recv_timeout(STREAM_DRAIN_GRACE) {
-            let text = String::from_utf8_lossy(&buf);
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                tracing::warn!("hook stderr: {trimmed}");
+            stderr_text = String::from_utf8_lossy(&buf).trim().to_string();
+            if !stderr_text.is_empty() {
+                tracing::warn!("hook stderr: {stderr_text}");
             }
         }
     }
 
-    outcome
+    outcome.map(|code| (code, stderr_text))
 }
 
 /// Read a child pipe to EOF on a dedicated thread, retaining at most
@@ -655,7 +694,7 @@ mod tests {
 
         let hook = make_hook("exit 3", HookPoint::BeforeToolCall);
         let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
-        assert!(matches!(hook.execute_inner(&ctx), HookAction::Skip));
+        assert!(matches!(hook.execute_inner(&ctx), HookAction::Skip { .. }));
 
         let recorded = events.lock().unwrap();
         assert!(
@@ -958,7 +997,87 @@ mod tests {
         async fn pre_tool_use_nonzero_returns_skip() {
             let hook = make_hook("false", HookPoint::BeforeToolCall);
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
-            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip { .. }));
+        }
+
+        /// A blocking hook's stderr is the reason channel: the skip must carry
+        /// it (plus which hook fired and the exit code) so the model is not
+        /// left staring at an unexplained abort.
+        #[tokio::test]
+        async fn pre_tool_use_block_carries_stderr_as_reason() {
+            let hook = make_hook(
+                "echo 'refusing: workspace is frozen' >&2; exit 2",
+                HookPoint::BeforeToolCall,
+            );
+            let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
+            match hook.execute(&ctx).await {
+                HookAction::Skip { reason: Some(r) } => {
+                    assert!(
+                        r.contains("refusing: workspace is frozen"),
+                        "reason must carry the hook's stderr, got: {r}"
+                    );
+                    assert!(
+                        r.contains(&hook.name) && r.contains("exit code 2"),
+                        "reason must name the hook and exit code, got: {r}"
+                    );
+                }
+                other => panic!("expected Skip with reason, got {other:?}"),
+            }
+        }
+
+        /// Empty stderr falls back to an exit-code message — never a reasonless
+        /// block.
+        #[tokio::test]
+        async fn pre_tool_use_block_without_stderr_reports_exit_code() {
+            let hook = make_hook("exit 3", HookPoint::BeforeToolCall);
+            let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
+            match hook.execute(&ctx).await {
+                HookAction::Skip { reason: Some(r) } => {
+                    assert!(
+                        r.contains("exit code 3") && r.contains("no reason given"),
+                        "empty stderr must fall back to the exit code, got: {r}"
+                    );
+                }
+                other => panic!("expected Skip with fallback reason, got {other:?}"),
+            }
+        }
+
+        /// A timed-out PreToolUse hook still blocks the call, and the reason
+        /// says so — a silent Skip here regressed real users before.
+        #[tokio::test]
+        async fn pre_tool_use_timeout_reason_mentions_timeout() {
+            let mut hook = make_hook("sleep 10", HookPoint::BeforeToolCall);
+            hook.timeout = Duration::from_secs(1);
+            let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
+            match hook.execute(&ctx).await {
+                HookAction::Skip { reason: Some(r) } => {
+                    assert!(
+                        r.contains("timed out"),
+                        "timeout skip must explain itself, got: {r}"
+                    );
+                }
+                other => panic!("expected Skip with timeout reason, got {other:?}"),
+            }
+        }
+
+        /// The surfaced reason is length-bounded so a chatty hook cannot flood
+        /// the transcript, and the truncation is marked.
+        #[test]
+        fn block_reason_is_length_bounded() {
+            let long = "x".repeat(3 * MAX_BLOCK_REASON_CHARS);
+            let reason = block_reason("PreToolUse[0][0]", 1, &long);
+            assert!(
+                reason.len() < MAX_BLOCK_REASON_CHARS + 200,
+                "reason must be bounded, got {} chars",
+                reason.len()
+            );
+            assert!(reason.contains("[truncated]"));
+
+            let short = block_reason("PreToolUse[0][0]", 1, "  keep me  ");
+            assert!(
+                short.ends_with("keep me"),
+                "short stderr is trimmed, not truncated: {short}"
+            );
         }
 
         #[tokio::test]
@@ -1003,7 +1122,7 @@ mod tests {
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
             let start = Instant::now();
             let action = hook.execute(&ctx).await;
-            assert!(matches!(action, HookAction::Skip));
+            assert!(matches!(action, HookAction::Skip { .. }));
             assert!(start.elapsed() < Duration::from_secs(4));
         }
 
@@ -1018,7 +1137,7 @@ mod tests {
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
             // 127 from the shell means "command not found" — still a non-zero exit
             // so we map to Skip for PreToolUse. This matches Claude Code semantics.
-            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip));
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Skip { .. }));
         }
 
         #[tokio::test]
@@ -1191,7 +1310,7 @@ mod tests {
 
             let ctx = make_tool_ctx(HookPoint::BeforeToolCall, "run_shell");
             let action = reg.dispatch(&ctx).await;
-            assert!(matches!(action, HookAction::Skip));
+            assert!(matches!(action, HookAction::Skip { .. }));
             assert!(!marker.exists(), "second hook must not run after Skip");
         }
 
@@ -1355,7 +1474,7 @@ mod tests {
             let dir = tmp();
             let out = dir.path().join("stdin-payload.json");
             let command = format!("cat > {}", out.display());
-            let code = run_subprocess(
+            let (code, _) = run_subprocess(
                 &command,
                 r#"{"event":"SessionStart","turn":7}"#,
                 Duration::from_secs(10),
@@ -1373,7 +1492,7 @@ mod tests {
             let dir = tmp();
             let out = dir.path().join("arg-payload.json");
             let command = format!("printf '%s' \"$1\" > {}", out.display());
-            let code = run_subprocess(
+            let (code, _) = run_subprocess(
                 &command,
                 r#"{"event":"SessionEnd"}"#,
                 Duration::from_secs(10),
@@ -1394,11 +1513,11 @@ mod tests {
             // blocks, but well under `ARG_MAX` — the payload also rides on argv,
             // and a megabyte there fails the spawn outright.
             let big_payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(128 * 1024));
-            let code = run_subprocess("exit 0", &big_payload, Duration::from_secs(10))
+            let (code, _) = run_subprocess("exit 0", &big_payload, Duration::from_secs(10))
                 .expect("broken pipe must not be reported as a subprocess error");
             assert_eq!(code, 0);
 
-            let code = run_subprocess("exit 3", &big_payload, Duration::from_secs(10))
+            let (code, _) = run_subprocess("exit 3", &big_payload, Duration::from_secs(10))
                 .expect("broken pipe must not mask a nonzero exit either");
             assert_eq!(code, 3);
         }
@@ -1409,7 +1528,7 @@ mod tests {
         /// misreported as a timeout.
         #[test]
         fn hook_writing_more_than_the_pipe_buffer_does_not_time_out() {
-            let code = run_subprocess(
+            let (code, _) = run_subprocess(
                 "printf 'x%.0s' $(seq 1 200000); exit 0",
                 "{}",
                 Duration::from_secs(20),
@@ -1426,7 +1545,7 @@ mod tests {
         #[test]
         fn hook_that_backgrounds_a_process_returns_within_its_timeout() {
             let started = Instant::now();
-            let code = run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1))
+            let (code, _) = run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1))
                 .expect("a hook that exits promptly must not be reported as failed");
             let elapsed = started.elapsed();
             assert_eq!(code, 0, "the hook's own exit status must be reported");

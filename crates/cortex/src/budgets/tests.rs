@@ -500,7 +500,7 @@ fn hook_uses_prompt_tokens_estimate_to_refuse_at_hard_cap() {
     };
 
     assert!(
-        matches!(hook.execute(&ctx), HookAction::Skip),
+        matches!(hook.execute(&ctx), HookAction::Skip { .. }),
         "fat prompt must trip the hard cap via prompt_tokens"
     );
 }

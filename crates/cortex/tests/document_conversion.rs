@@ -332,6 +332,37 @@ fn pdf_reading_did_not_regress() {
     );
 }
 
+/// A part-scanned PDF converts "successfully" while whole sections are
+/// silently missing. The read must disclose how many pages yielded no text
+/// and which ones, while still returning the text that was there.
+#[test]
+fn a_part_scanned_pdf_warns_about_its_empty_pages() {
+    let out = read(fixture("mixed_pages.pdf").to_str().unwrap());
+    assert!(
+        out.contains("1 of 3 pages have no extractable text"),
+        "the coverage gap must be counted:\n{out}"
+    );
+    assert!(
+        out.contains("(page 2)"),
+        "the empty page must be named:\n{out}"
+    );
+    assert!(
+        out.contains("Quarterly Report") && out.contains("Bristol"),
+        "the text pages must still come through:\n{out}"
+    );
+}
+
+/// The warning is for partial coverage only: a PDF whose every page has text
+/// must read exactly as before, with no coverage chatter.
+#[test]
+fn a_fully_texted_pdf_gets_no_coverage_warning() {
+    let out = read(fixture("sample.pdf").to_str().unwrap());
+    assert!(
+        !out.contains("no extractable text"),
+        "full coverage must not warn:\n{out}"
+    );
+}
+
 /// A PDF with no text layer has nothing to extract by any engine. It must say
 /// so plainly — an empty success would read as "this document is blank".
 #[test]

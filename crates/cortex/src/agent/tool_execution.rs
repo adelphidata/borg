@@ -246,12 +246,15 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(
-                self.hook_registry.dispatch(&hook_ctx).await,
-                HookAction::Skip
-            ) {
-                self.skip_tool_call(&tool_call.id, "[tool call skipped by hook]")
-                    .await;
+            if let HookAction::Skip { reason } = self.hook_registry.dispatch(&hook_ctx).await {
+                // Surface the hook's explanation (its stderr) to the model —
+                // through the same redaction/truncation as any tool output,
+                // since hook scripts can echo anything.
+                let msg = match reason {
+                    Some(r) => self.truncate_and_redact(&r),
+                    None => "[tool call skipped by hook]".to_string(),
+                };
+                self.skip_tool_call(&tool_call.id, &msg).await;
                 continue;
             }
 
@@ -454,12 +457,13 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(
-                self.hook_registry.dispatch(&hook_ctx).await,
-                HookAction::Skip
-            ) {
+            if let HookAction::Skip { reason } = self.hook_registry.dispatch(&hook_ctx).await {
+                // Same reason-surfacing (and redaction) as the sequential path.
                 slots.push(Slot::Skipped {
-                    reason: "[tool call skipped by hook]".into(),
+                    reason: match reason {
+                        Some(r) => self.truncate_and_redact(&r),
+                        None => "[tool call skipped by hook]".into(),
+                    },
                 });
                 continue;
             }

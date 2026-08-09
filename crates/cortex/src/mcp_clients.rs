@@ -660,6 +660,43 @@ fn missing_required_args(schema: &Value, args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Ceiling on the compact-serialized `input_schema` echoed in a blind-call
+/// refusal. The refusal exists to make the model's *immediate* retry
+/// informed, not to re-transmit an arbitrarily large schema into the
+/// context window every time a cheap model forgets an argument; past this
+/// size the payload lists the `required` keys instead and points the model
+/// at `search_tools` for the full spec.
+const BLIND_CALL_SCHEMA_ECHO_MAX_BYTES: usize = 4096;
+
+/// Build the not-dispatched refusal for a blind call (schema-required
+/// arguments absent — see the probe in [`try_execute_tool`]). Always names
+/// the missing keys; echoes the full `input_schema` only when its compact
+/// serialization fits [`BLIND_CALL_SCHEMA_ECHO_MAX_BYTES`], otherwise the
+/// schema's `required` list stands in so the payload stays bounded.
+fn blind_call_refusal(full_name: &str, input_schema: &Value, missing: &[String]) -> String {
+    let mut payload = serde_json::json!({
+        "error": format!(
+            "missing required argument(s): {}",
+            missing.join(", ")
+        ),
+        "tool": full_name,
+        "note": "The call was not dispatched. Re-call this tool with the required arguments per input_schema.",
+    });
+    let rendered_len = input_schema.to_string().len();
+    if rendered_len <= BLIND_CALL_SCHEMA_ECHO_MAX_BYTES {
+        payload["input_schema"] = input_schema.clone();
+    } else {
+        payload["required"] = input_schema.get("required").cloned().unwrap_or(Value::Null);
+        payload["note"] = format!(
+            "The call was not dispatched. The full input_schema is too large to echo \
+             ({rendered_len} bytes); supply the `required` keys listed here, or fetch \
+             the full spec via search_tools."
+        )
+        .into();
+    }
+    payload.to_string()
+}
+
 /// Attempt to execute an MCP tool. Returns `Ok(None)` if `name` is not an
 /// MCP tool name (so the agent loop's dispatcher can fall through to the
 /// next handler); `Ok(Some(text))` on success (text is already wrapped in
@@ -695,18 +732,11 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     // succeed must not consume a rate token.
     let missing = missing_required_args(&tool.input_schema, args);
     if !missing.is_empty() {
-        return Ok(Some(
-            serde_json::json!({
-                "error": format!(
-                    "missing required argument(s): {}",
-                    missing.join(", ")
-                ),
-                "tool": &tool.full_name,
-                "input_schema": &tool.input_schema,
-                "note": "The call was not dispatched. Re-call this tool with the required arguments per input_schema.",
-            })
-            .to_string(),
-        ));
+        return Ok(Some(blind_call_refusal(
+            &tool.full_name,
+            &tool.input_schema,
+            &missing,
+        )));
     }
 
     // Rate-limit gate. Limits are pinned at session-install time so
@@ -3035,6 +3065,85 @@ mod tests {
             &serde_json::Value::Null
         )
         .is_empty());
+    }
+
+    #[test]
+    fn blind_call_refusal_names_missing_keys_and_echoes_schema() {
+        // Spec: the refusal must be structured JSON that (a) names every
+        // missing key so the model knows what to add, and (b) carries the
+        // parameter schema so the immediate retry is informed rather than
+        // another blind guess.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}},
+            "required": ["owner", "repo"]
+        });
+        let out = blind_call_refusal(
+            "mcp_gh_create_issue",
+            &schema,
+            &["owner".to_string(), "repo".to_string()],
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("structured JSON");
+        let err = v["error"].as_str().expect("error field");
+        assert!(
+            err.contains("owner") && err.contains("repo"),
+            "must name every missing key; got: {err}"
+        );
+        assert_eq!(v["tool"], "mcp_gh_create_issue");
+        assert_eq!(
+            v["input_schema"], schema,
+            "a small schema must be echoed in full"
+        );
+        assert!(
+            v["note"].as_str().unwrap().contains("not dispatched"),
+            "must state the call never ran"
+        );
+    }
+
+    #[test]
+    fn blind_call_refusal_bounds_oversized_schema_to_required_keys() {
+        // Spec: the schema echo is bounded. A pathological multi-KB schema
+        // must not be re-transmitted into the context on every blind call —
+        // past the cap the payload lists the `required` keys instead.
+        let mut props = serde_json::Map::new();
+        for i in 0..64 {
+            props.insert(
+                format!("field_{i}"),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "d".repeat(256),
+                }),
+            );
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": ["field_0", "field_1"]
+        });
+        assert!(
+            schema.to_string().len() > BLIND_CALL_SCHEMA_ECHO_MAX_BYTES,
+            "fixture must exceed the echo cap"
+        );
+        let out = blind_call_refusal("mcp_big_tool", &schema, &["field_0".to_string()]);
+        assert!(
+            out.len() < BLIND_CALL_SCHEMA_ECHO_MAX_BYTES,
+            "bounded payload must stay under the cap; got {} bytes",
+            out.len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("structured JSON");
+        assert!(
+            v.get("input_schema").is_none(),
+            "oversized schema must not be echoed"
+        );
+        assert_eq!(
+            v["required"],
+            serde_json::json!(["field_0", "field_1"]),
+            "required keys stand in for the full schema"
+        );
+        assert!(
+            v["note"].as_str().unwrap().contains("search_tools"),
+            "note must point the model at the full spec"
+        );
     }
 
     #[test]

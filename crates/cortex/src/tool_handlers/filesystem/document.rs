@@ -49,6 +49,25 @@ pub struct ConvertedDocument {
     /// True when `anydoc` could not convert a PDF and `pdf-extract` produced
     /// the text instead. Fallback output is plain text, not Markdown.
     pub used_pdf_fallback: bool,
+    /// Per-page text coverage, PDF only. `None` for non-PDF formats and when
+    /// the coverage pass itself failed (best-effort — a failure is logged and
+    /// must never block the conversion that already succeeded).
+    pub page_coverage: Option<PdfPageCoverage>,
+}
+
+/// Which pages of a converted PDF actually yielded text.
+///
+/// A part-scanned PDF (say 100 image-only pages out of 300) converts
+/// "successfully" while silently missing whole sections. Counting per-page
+/// coverage lets the read path disclose the gap instead of presenting the
+/// partial text as the whole document.
+#[derive(Debug)]
+pub struct PdfPageCoverage {
+    /// Total pages in the document.
+    pub page_count: usize,
+    /// 1-based numbers of pages that yielded no text. Whitespace-only pages
+    /// count as empty — there is nothing extractable on them either.
+    pub empty_pages: Vec<usize>,
 }
 
 /// True when a file with this extension should be converted rather than read
@@ -118,6 +137,9 @@ pub fn convert_bytes(
             markdown,
             format,
             used_pdf_fallback: false,
+            page_coverage: (format == Format::Pdf)
+                .then(|| pdf_page_coverage(bytes))
+                .flatten(),
         }),
         // `anydoc` rejects PDFs it cannot extract structured text from —
         // notably scanned/image-only ones. `pdf-extract` was the previous
@@ -128,6 +150,7 @@ pub fn convert_bytes(
                 markdown: text,
                 format,
                 used_pdf_fallback: true,
+                page_coverage: pdf_page_coverage(bytes),
             }),
             None => Err(DocumentError::Convert(err)),
         },
@@ -171,6 +194,91 @@ fn pdf_fallback(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(text)
+}
+
+/// Measure per-page text coverage of a PDF. Returns `None` when the per-page
+/// pass fails or panics — coverage is advisory, so a failure is logged and
+/// the already-successful conversion is returned without a coverage verdict.
+fn pdf_page_coverage(bytes: &[u8]) -> Option<PdfPageCoverage> {
+    let pages = match without_panicking("pdf-extract", || {
+        pdf_extract::extract_text_from_mem_by_pages(bytes)
+    })? {
+        Ok(pages) => pages,
+        Err(e) => {
+            tracing::warn!(error = %e, "per-page pdf text coverage pass failed");
+            return None;
+        }
+    };
+    let empty_pages = pages
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.trim().is_empty())
+        .map(|(i, _)| i + 1)
+        .collect();
+    Some(PdfPageCoverage {
+        page_count: pages.len(),
+        empty_pages,
+    })
+}
+
+/// Longest page-range list a coverage warning will spell out before eliding
+/// the rest. Keeps the warning bounded on a 300-page document whose scanned
+/// pages alternate with text ones.
+const MAX_EMPTY_PAGE_RANGES: usize = 8;
+
+/// The warning for a PDF where *some but not all* pages yielded no text.
+///
+/// Whole-document-empty stays the caller's "[No extractable text …]" path;
+/// this covers the sneakier case where the conversion looks successful while
+/// whole sections are silently missing. Ends with a blank line so it can sit
+/// directly above the converted text.
+pub fn coverage_warning(doc: &ConvertedDocument) -> Option<String> {
+    let coverage = doc.page_coverage.as_ref()?;
+    let empty = coverage.empty_pages.len();
+    if empty == 0 || empty >= coverage.page_count {
+        return None;
+    }
+    let pages = format_page_ranges(&coverage.empty_pages, MAX_EMPTY_PAGE_RANGES);
+    Some(format!(
+        "[Warning: {empty} of {} pages have no extractable text ({pages}) — likely scanned \
+         images with no text layer. To read them, render those pages to image files (e.g. with \
+         `pdftoppm`) and open the images with read_file for vision analysis]\n\n",
+        coverage.page_count
+    ))
+}
+
+/// Render sorted 1-based page numbers as a compact range list — "pages 12-45,
+/// 60" — spelling out at most `max_ranges` ranges before eliding the rest as
+/// "and N more". A single page reads as "page 7".
+fn format_page_ranges(pages: &[usize], max_ranges: usize) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &page in pages {
+        match ranges.last_mut() {
+            Some((_, end)) if page == *end + 1 => *end = page,
+            _ => ranges.push((page, page)),
+        }
+    }
+
+    let shown = ranges.len().min(max_ranges);
+    let elided: usize = ranges[shown..].iter().map(|(s, e)| e - s + 1).sum();
+    let list = ranges[..shown]
+        .iter()
+        .map(|&(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let label = if pages.len() == 1 { "page" } else { "pages" };
+    if elided > 0 {
+        format!("{label} {list} and {elided} more")
+    } else {
+        format!("{label} {list}")
+    }
 }
 
 /// ZIP-container formats, whose on-disk size says nothing about how much they
@@ -411,6 +519,7 @@ mod tests {
             markdown: String::new(),
             format: Format::Docx,
             used_pdf_fallback: false,
+            page_coverage: None,
         };
         let header = conversion_header(&doc, false);
         assert!(header.contains("Word (.docx)"), "got {header}");
@@ -427,11 +536,89 @@ mod tests {
             markdown: String::new(),
             format: Format::Pdf,
             used_pdf_fallback: false,
+            page_coverage: None,
         };
         let header = conversion_header(&doc, true);
         assert!(
             header.contains("despite the file extension"),
             "got {header}"
+        );
+    }
+
+    fn pdf_doc_with_coverage(page_count: usize, empty_pages: Vec<usize>) -> ConvertedDocument {
+        ConvertedDocument {
+            markdown: "some text".into(),
+            format: Format::Pdf,
+            used_pdf_fallback: false,
+            page_coverage: Some(PdfPageCoverage {
+                page_count,
+                empty_pages,
+            }),
+        }
+    }
+
+    /// The gap this feature closes: a part-scanned PDF must disclose how many
+    /// pages are missing, which ones, and how to recover them — not present
+    /// its partial text as the whole document.
+    #[test]
+    fn partial_coverage_warns_with_counts_pages_and_recovery_path() {
+        let doc = pdf_doc_with_coverage(6, vec![2, 3, 5]);
+        let warning = coverage_warning(&doc).expect("partial coverage must warn");
+        assert!(
+            warning.contains("3 of 6 pages"),
+            "counts missing: {warning}"
+        );
+        assert!(
+            warning.contains("pages 2-3, 5"),
+            "consecutive pages must collapse to a range: {warning}"
+        );
+        assert!(
+            warning.contains("read_file"),
+            "must name the recovery tool: {warning}"
+        );
+        assert!(
+            warning.ends_with("\n\n"),
+            "must separate cleanly from the text below it: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_empty_page_reads_as_page_not_pages() {
+        let doc = pdf_doc_with_coverage(3, vec![2]);
+        let warning = coverage_warning(&doc).expect("partial coverage must warn");
+        assert!(warning.contains("1 of 3 pages"), "got {warning}");
+        assert!(warning.contains("(page 2)"), "got {warning}");
+    }
+
+    /// Full coverage must stay silent, and whole-document-empty stays the
+    /// caller's "[No extractable text …]" path — warning there too would say
+    /// the same thing twice.
+    #[test]
+    fn full_and_zero_coverage_produce_no_warning() {
+        assert!(coverage_warning(&pdf_doc_with_coverage(4, vec![])).is_none());
+        assert!(coverage_warning(&pdf_doc_with_coverage(4, vec![1, 2, 3, 4])).is_none());
+
+        let no_coverage = ConvertedDocument {
+            markdown: "some text".into(),
+            format: Format::Docx,
+            used_pdf_fallback: false,
+            page_coverage: None,
+        };
+        assert!(coverage_warning(&no_coverage).is_none());
+    }
+
+    /// The warning must stay bounded: a 300-page half-scanned document whose
+    /// empty pages alternate with text ones would otherwise spell out ~150
+    /// ranges.
+    #[test]
+    fn long_page_lists_are_elided_not_spelled_out() {
+        // Odd pages 1..=40 empty: 20 single-page ranges.
+        let empty: Vec<usize> = (1..=40).step_by(2).collect();
+        let doc = pdf_doc_with_coverage(40, empty);
+        let warning = coverage_warning(&doc).expect("partial coverage must warn");
+        assert!(
+            warning.contains("pages 1, 3, 5, 7, 9, 11, 13, 15 and 12 more"),
+            "list must cap at {MAX_EMPTY_PAGE_RANGES} ranges and count the rest: {warning}"
         );
     }
 
@@ -444,6 +631,7 @@ mod tests {
             markdown: String::new(),
             format: Format::Pdf,
             used_pdf_fallback: true,
+            page_coverage: None,
         };
         let header = conversion_header(&doc, false);
         assert!(header.contains("fallback"), "got {header}");

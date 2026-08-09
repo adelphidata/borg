@@ -53,6 +53,28 @@ impl fmt::Display for ErrorCategory {
     }
 }
 
+impl std::str::FromStr for ErrorCategory {
+    type Err = ();
+
+    /// Inverse of [`Display`](fmt::Display) — used to rehydrate persisted
+    /// category tokens (e.g. the durable compaction-outage latch). Must stay
+    /// in lockstep with the `Display` arms above or a round-trip silently
+    /// downgrades to `Err`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "rate_limit" => Self::RateLimit,
+            "billing" => Self::Billing,
+            "auth" => Self::Auth,
+            "overloaded" => Self::Overloaded,
+            "transport" => Self::Transport,
+            "context_overflow" => Self::ContextOverflow,
+            "timeout" => Self::Timeout,
+            "unknown" => Self::Unknown,
+            _ => return Err(()),
+        })
+    }
+}
+
 /// Classify a raw error string into an `ErrorCategory`.
 ///
 /// Delegates to the central LLM-error classifier (`classify_error_text`) so

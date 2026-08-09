@@ -72,21 +72,28 @@ async fn e2e_post_tool_use_fires() {
     assert!(marker.exists(), "hook side effect must be observable");
 }
 
-/// PreToolUse hook exiting non-zero must map to Skip (the agent-loop's tool-skip path).
+/// PreToolUse hook exiting non-zero must map to Skip (the agent-loop's
+/// tool-skip path), and the hook's stderr must survive registry dispatch as
+/// the skip reason so the agent loop can surface it to the model.
 #[tokio::test]
 async fn e2e_pre_tool_use_blocks_tool() {
     let tmp = tempfile::TempDir::new().expect("tmp");
-    let body = r#"{"hooks":{"PreToolUse":[{"matcher":"run_shell","hooks":[{"type":"command","command":"exit 1"}]}]}}"#;
+    let body = r#"{"hooks":{"PreToolUse":[{"matcher":"run_shell","hooks":[{"type":"command","command":"echo 'shell disabled during release freeze' >&2; exit 1"}]}]}}"#;
     let cfg = write_hooks(tmp.path(), body);
     let reg = register_all(&cfg);
 
     let action = reg
         .dispatch(&tool_call_ctx(HookPoint::BeforeToolCall, "run_shell"))
         .await;
-    assert!(
-        matches!(action, HookAction::Skip),
-        "PreToolUse non-zero exit must produce Skip"
-    );
+    match action {
+        HookAction::Skip { reason: Some(r) } => {
+            assert!(
+                r.contains("shell disabled during release freeze"),
+                "skip reason must carry the hook's stderr, got: {r}"
+            );
+        }
+        other => panic!("PreToolUse non-zero exit must produce Skip with a reason, got {other:?}"),
+    }
 }
 
 /// PreToolUse hook only blocks tools that match its `matcher`.
@@ -200,7 +207,7 @@ async fn e2e_skip_short_circuits_later_hooks() {
     let action = reg
         .dispatch(&tool_call_ctx(HookPoint::BeforeToolCall, "run_shell"))
         .await;
-    assert!(matches!(action, HookAction::Skip));
+    assert!(matches!(action, HookAction::Skip { .. }));
     assert!(
         !marker.exists(),
         "second hook MUST NOT run after first returns Skip"

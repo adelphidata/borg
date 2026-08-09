@@ -1924,6 +1924,159 @@ fn repair_dedups_duplicate_tool_call_ids() {
     assert_eq!(result_count, 1, "exactly one tool result must survive");
 }
 
+/// Assistant message issuing one tool call per `(id, name, args)` triple.
+fn repair_asst_calls(calls: &[(&str, &str, &str)]) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: None,
+        tool_calls: Some(
+            calls
+                .iter()
+                .map(|(id, name, args)| ToolCall {
+                    id: (*id).to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: (*name).to_string(),
+                        arguments: (*args).to_string(),
+                    },
+                })
+                .collect(),
+        ),
+        tool_call_id: None,
+        timestamp: None,
+        seq: None,
+    }
+}
+
+#[test]
+fn repair_renames_id_reusing_calls_and_keeps_both_pairs() {
+    // An id-reusing backend emitted two *different* calls under one id in a
+    // single batch. Dropping the later one (the old behavior) silently loses
+    // its result and the model confabulates the missing output. Repair must
+    // instead rename the later call deterministically and re-pair its result
+    // (results match by id + order) so both pairs survive intact.
+    let messages = vec![
+        Message::user("a"),
+        repair_asst_calls(&[
+            ("call_1", "read_file", "{\"path\": \"a.txt\"}"),
+            ("call_1", "read_file", "{\"path\": \"b.txt\"}"),
+        ]),
+        Message::tool_result("call_1", "contents of a"),
+        Message::tool_result("call_1", "contents of b"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(
+        repaired.len(),
+        4,
+        "no message may be dropped: {repaired:#?}"
+    );
+    assert_eq!(
+        repair_all_call_ids(&repaired),
+        vec!["call_1", "call_1_d1"],
+        "later colliding call gets a stable occurrence-indexed suffix"
+    );
+    // Pairing: first result stays with the original id, second follows its
+    // renamed call — contents must land on the right call.
+    let results: Vec<(String, String)> = repaired
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| {
+            (
+                m.tool_call_id.clone().unwrap(),
+                m.content.as_ref().unwrap().text().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![
+            ("call_1".to_string(), "contents of a".to_string()),
+            ("call_1_d1".to_string(), "contents of b".to_string()),
+        ],
+        "each result must stay paired with its own call"
+    );
+    // Determinism: same input → same renames (prompt-cache prefix stability).
+    let again = repair_message_sequence(&messages);
+    assert_eq!(repair_all_call_ids(&repaired), repair_all_call_ids(&again));
+    let result_ids = |msgs: &[Message]| -> Vec<String> {
+        msgs.iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.tool_call_id.clone().unwrap())
+            .collect()
+    };
+    assert_eq!(result_ids(&repaired), result_ids(&again));
+}
+
+#[test]
+fn repair_does_not_rename_a_colliding_call_that_has_no_result() {
+    // Regression: renaming trades one invalid shape for another when the
+    // history carries only ONE result for the reused id — an interrupted turn
+    // re-appended on resume, whose second result never landed. A renamed
+    // `call_1_d1` with no `tool` message after it 400s on the same strict
+    // providers this repair exists for, so the extra call must be dropped.
+    let messages = vec![
+        Message::user("a"),
+        repair_asst_calls(&[
+            ("call_1", "read_file", "{\"path\": \"a.txt\"}"),
+            ("call_1", "read_file", "{\"path\": \"b.txt\"}"),
+        ]),
+        Message::tool_result("call_1", "contents of a"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    assert_eq!(
+        repair_all_call_ids(&repaired),
+        vec!["call_1"],
+        "a call with no result to pair must be dropped, not renamed: {repaired:#?}"
+    );
+    let result_ids: Vec<String> = repaired
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.tool_call_id.clone().unwrap())
+        .collect();
+    assert_eq!(
+        repair_all_call_ids(&repaired),
+        result_ids,
+        "every surviving call must be answered by exactly one result"
+    );
+}
+
+#[test]
+fn repair_renames_id_reuse_across_turns_without_dropping_assistant() {
+    // Regression: the old drop path could reduce a later assistant turn to
+    // zero calls and delete the whole message. With id reuse across turns
+    // (different payloads), both assistant messages and both results must
+    // survive, with the later pair renamed.
+    let messages = vec![
+        Message::user("a"),
+        repair_asst_calls(&[("call_1", "run_shell", "{\"cmd\": \"ls\"}")]),
+        Message::tool_result("call_1", "r1"),
+        repair_asst_calls(&[("call_1", "run_shell", "{\"cmd\": \"pwd\"}")]),
+        Message::tool_result("call_1", "r2"),
+    ];
+    let repaired = repair_message_sequence(&messages);
+    let assistant_count = repaired
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .count();
+    assert_eq!(
+        assistant_count, 2,
+        "no assistant message may be dropped: {repaired:#?}"
+    );
+    assert_eq!(repair_all_call_ids(&repaired), vec!["call_1", "call_1_d1"]);
+    let last = repaired.last().unwrap();
+    assert_eq!(last.role, Role::Tool);
+    assert_eq!(
+        last.tool_call_id.as_deref(),
+        Some("call_1_d1"),
+        "the second result must follow its renamed call"
+    );
+    assert_eq!(
+        last.content.as_ref().unwrap().text().unwrap(),
+        "r2",
+        "result content must stay with its own call"
+    );
+}
+
 #[test]
 fn repair_drops_orphaned_tool_result() {
     // A tool result whose requesting assistant turn was compacted away — no
