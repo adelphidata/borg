@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+/*
+ * Theme tokens. Light is the default; [data-theme="dark"] swaps the palette at
+ * runtime (see src/lib/theme.tsx), so these stay plain CSS variables and the
+ * @theme block below maps them into Tailwind utilities (bg-surface, text-ink…).
+ */
+:root {
+  --canvas: #e9eae4;
+  --surface: #ffffff;
+  --surface2: #f5f6f1;
+  --surface3: #edefe8;
+  --line: rgba(12, 16, 13, 0.12);
+  --line2: rgba(12, 16, 13, 0.06);
+  --ink: #0c100d;
+  --ink2: rgba(12, 16, 13, 0.56);
+  --ink3: rgba(12, 16, 13, 0.54);
+  --neon: #8fd400;
+  --neonInk: #3e6b00;
+  --navOnBg: rgba(143, 212, 0, 0.2);
+  --navOnInk: #2f5400;
+  --alert: #c4304e;
+  --alertSoft: rgba(196, 48, 78, 0.1);
+  --glow: none;
+  --plateGlow: none;
+  --barTrack: rgba(12, 16, 13, 0.08);
+  --frameShadow: 0 1px 2px rgba(12, 16, 13, 0.05), 0 18px 44px -18px rgba(12, 16, 13, 0.22);
+}
+[data-theme="dark"] {
+  --canvas: #050706;
+  --surface: #0b0e0b;
+  --surface2: #10140f;
+  --surface3: #161b13;
+  --line: rgba(180, 255, 0, 0.13);
+  --line2: rgba(255, 255, 255, 0.055);
+  --ink: #e9efe3;
+  --ink2: rgba(233, 239, 227, 0.55);
+  --ink3: rgba(233, 239, 227, 0.54);
+  --neon: #b4ff00;
+  --neonInk: #b4ff00;
+  --navOnBg: rgba(180, 255, 0, 0.09);
+  --navOnInk: #b4ff00;
+  --alert: #ff4d6d;
+  --alertSoft: rgba(255, 77, 109, 0.1);
+  --glow: 0 0 18px rgba(180, 255, 0, 0.35);
+  --plateGlow: 0 0 60px -14px rgba(180, 255, 0, 0.22);
+  --barTrack: rgba(233, 239, 227, 0.1);
+  --frameShadow: 0 0 0 1px rgba(180, 255, 0, 0.07), 0 30px 80px -30px rgba(0, 0, 0, 0.9);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface2: var(--surface2);
+  --color-surface3: var(--surface3);
+  --color-line: var(--line);
+  --color-line2: var(--line2);
+  --color-ink: var(--ink);
+  --color-ink2: var(--ink2);
+  --color-ink3: var(--ink3);
+  --color-neon: var(--neon);
+  --color-neon-ink: var(--neonInk);
+  --color-nav-on-bg: var(--navOnBg);
+  --color-nav-on-ink: var(--navOnInk);
+  --color-alert: var(--alert);
+  --color-alert-soft: var(--alertSoft);
+  --color-bar-track: var(--barTrack);
+}
+
+@theme {
+  --font-sans: "Space Grotesk", system-ui, sans-serif;
+  /* The pre-Tailwind stylesheet transitioned with the CSS default curve. */
+  --default-transition-timing-function: ease;
+  --animate-bpulse: bpulse 2.6s ease-in-out infinite;
+  @keyframes bpulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.22;
+    }
+  }
+}
+
+@layer base {
+  html {
+    line-height: normal;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    -webkit-font-smoothing: antialiased;
+    background: var(--surface);
+    color: var(--ink);
+    overflow: hidden;
+    user-select: none;
+    cursor: default;
+  }
+  a {
+    color: var(--neonInk);
+    text-decoration: none;
+  }
+  a:hover {
+    color: var(--ink);
+  }
+}
