@@ -73,8 +73,8 @@ fn make_git_non_interactive(cmd: &mut tokio::process::Command) {
 }
 
 /// [`make_git_non_interactive`] for the blocking `std::process` git runners in
-/// the patch applicator. Those have no timeout at all, so a credential prompt
-/// there hangs the tool call outright rather than merely delaying it.
+/// the patch applicator (which run under [`run_sync_with_timeout`]). A
+/// credential prompt there would still burn the whole budget before erroring.
 pub(crate) fn make_git_non_interactive_sync(cmd: &mut std::process::Command) {
     cmd.stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
@@ -125,6 +125,59 @@ async fn run_with_budget(
             Err(elapsed)
         }
     }
+}
+
+/// [`run_with_timeout`] for the blocking `std::process` git runners in the
+/// patch applicator. Same contract: the budget expiring kills the whole
+/// process tree, and the caller gets `ErrorKind::TimedOut` instead of a wedge.
+/// Before this existed, those runners called `.output()` bare — a git stalled
+/// on a dead NFS mount (or a filter that ignored the hardening prelude) held a
+/// runtime worker hostage indefinitely.
+pub(crate) fn run_sync_with_timeout(
+    cmd: std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    run_sync_with_budget(cmd, GIT_COMMAND_TIMEOUT)
+}
+
+/// [`run_sync_with_timeout`] with an explicit budget for tests.
+pub(crate) fn run_sync_with_budget(
+    mut cmd: std::process::Command,
+    budget: Duration,
+) -> std::io::Result<std::process::Output> {
+    crate::util::process_tree::spawn_in_own_group_std(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    // Drain both pipes on their own threads while waiting, exactly as the
+    // async path does via `wait_with_output`. Joining after the group kill is
+    // safe: SIGKILL to the group closes every write end.
+    fn drain(stream: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut stream = stream;
+            let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
+            buf
+        })
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .map(drain)
+        .ok_or_else(|| std::io::Error::other("stdout was piped above"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(drain)
+        .ok_or_else(|| std::io::Error::other("stderr was piped above"))?;
+
+    let status = crate::util::process_tree::wait_or_kill_group(&mut child, budget)?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// Parse `git config --null --name-only --get-regexp` output (NUL-separated
@@ -1063,6 +1116,51 @@ mod tests {
             .expect("pid");
         let gone = crate::util::process_tree::wait_for_pid_exit(pid).await;
         assert!(gone, "descendant {pid} outlived the timed-out command");
+    }
+
+    /// [`run_with_timeout_kills_the_whole_process_tree`] for the blocking
+    /// runner behind the patch applicator. Same spec: the budget expiring must
+    /// surface `TimedOut` (not wedge the worker) and must not leave the
+    /// command's descendants running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_with_budget_times_out_and_kills_the_tree() {
+        const BUDGET: Duration = Duration::from_millis(500);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("child.pid");
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 120 & echo $! > {}; sleep 120",
+            pid_file.to_string_lossy()
+        ));
+
+        let err = tokio::task::spawn_blocking(move || run_sync_with_budget(cmd, BUDGET))
+            .await
+            .expect("join")
+            .expect_err("a command that outlives the budget must report the timeout");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("shell should have recorded its background job's pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let gone = crate::util::process_tree::wait_for_pid_exit(pid).await;
+        assert!(gone, "descendant {pid} outlived the timed-out command");
+    }
+
+    /// Output larger than the ~64 KiB pipe buffer must not deadlock the
+    /// blocking runner: draining only after `try_wait` reports exit would
+    /// block the child in `write` forever and misreport it as a timeout.
+    #[cfg(unix)]
+    #[test]
+    fn run_sync_with_budget_captures_output_larger_than_the_pipe_buffer() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("yes x | head -c 262144");
+        let output = run_sync_with_budget(cmd, Duration::from_secs(10)).expect("run");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 262144);
     }
 
     #[test]

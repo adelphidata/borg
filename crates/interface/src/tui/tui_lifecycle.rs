@@ -516,8 +516,9 @@ impl Tui {
     }
 
     /// Write any buffered history lines above the viewport and clear the buffer.
-    /// Returns `true` when newline-fallback mode was used, signaling that the
-    /// caller must invalidate the diff buffer for a full repaint.
+    /// Returns `true` when the insert reports it may have written through the
+    /// viewport, signaling that the caller must invalidate the diff buffer for
+    /// a full repaint.
     fn flush_pending_history_lines(
         terminal: &mut Terminal,
         pending_history_lines: &mut Vec<Line<'static>>,
@@ -527,13 +528,13 @@ impl Tui {
             return Ok(false);
         }
 
-        super::insert_history::insert_history_lines_with_mode(
+        let clobbered_viewport = super::insert_history::insert_history_lines_with_mode(
             terminal,
             pending_history_lines.clone(),
             super::insert_history::InsertHistoryMode::new(newline_fallback),
         )?;
         pending_history_lines.clear();
-        Ok(newline_fallback)
+        Ok(clobbered_viewport)
     }
 
     /// Draw a single frame at the requested viewport `height`. Flushes any

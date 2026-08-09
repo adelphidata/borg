@@ -426,3 +426,53 @@ async fn session_id_refreshes_when_server_rotates_it() {
     let _ = transport.recv().await.expect("recv 2");
     assert_eq!(transport.session_id(), Some("session-new"));
 }
+
+#[tokio::test]
+async fn error_status_with_endless_body_fails_fast_without_buffering() {
+    // Spec: non-2xx bodies are display-only color for the error message, so
+    // the transport must read at most a small capped prefix. Before the cap,
+    // the whole error body was buffered via `resp.text()` — a hostile server
+    // answering `initialize` with a 400 plus an endless chunked body could
+    // hold the transport (and its memory) hostage until the client timeout.
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            let stream = futures_util::stream::repeat_with(|| {
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(&[b'x'; 8192]))
+            });
+            (
+                StatusCode::BAD_REQUEST,
+                axum::body::Body::from_stream(stream),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    // A generous client timeout: an uncapped read of the endless body only
+    // returns once this expires, so finishing well before it proves the cap.
+    let mut cfg = config(format!("http://{addr}/mcp"));
+    cfg.timeout = Duration::from_secs(30);
+    let mut transport = open(cfg).await.expect("open");
+
+    let started = std::time::Instant::now();
+    let err = transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect_err("HTTP 400 must surface as an error");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "error body read did not stop at the cap (took {:?})",
+        started.elapsed()
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("400"), "unexpected error: {msg}");
+    assert!(
+        msg.len() < 1024,
+        "error message must stay bounded, got {} bytes",
+        msg.len()
+    );
+}

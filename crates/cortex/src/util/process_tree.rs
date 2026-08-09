@@ -22,6 +22,55 @@ pub(crate) fn spawn_in_own_group(cmd: &mut tokio::process::Command) {
     let _ = cmd;
 }
 
+/// [`spawn_in_own_group`] for blocking `std::process` spawns (hooks run on a
+/// dedicated thread, not the tokio runtime).
+pub(crate) fn spawn_in_own_group_std(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+/// Wait for a [`spawn_in_own_group_std`]-spawned child until `budget` elapses;
+/// on expiry, kill its whole process group and report `TimedOut`.
+///
+/// Ordering is load-bearing: the group kill must land *before* `child.kill()`
+/// / `child.wait()`, because the wait reaps the pid and a recycled pgid would
+/// then be signalled. Callers must drain the child's pipes on their own
+/// threads *while* this polls — draining after exit deadlocks any child whose
+/// output exceeds the pipe buffer.
+///
+/// Polls with exponential backoff (0.5 ms doubling to 25 ms) so short-lived
+/// commands don't pay a fixed sleep floor on hot paths.
+pub(crate) fn wait_or_kill_group(
+    child: &mut std::process::Child,
+    budget: std::time::Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut poll = std::time::Duration::from_micros(500);
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    kill_process_group(Some(child.id()));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {budget:?}"),
+                    ));
+                }
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 /// Send `sig` to every process in `pgid`.
 ///
 /// Best-effort: `ESRCH` (the group is already gone) and every other failure are
