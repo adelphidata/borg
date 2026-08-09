@@ -111,7 +111,12 @@ impl TelegramClient {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
+        // Telegram's 4096 cap is UTF-16 code units; the char-budgeted chunks
+        // need a re-split when astral-plane content makes units outrun chars.
+        let chunks = chunker::resplit_utf16(
+            chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?,
+            DEFAULT_MESSAGE_CHUNK_SIZE,
+        );
 
         for (i, chunk) in chunks.iter().enumerate() {
             // Only reply to the original message on the first chunk

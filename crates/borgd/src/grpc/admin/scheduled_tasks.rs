@@ -113,25 +113,43 @@ pub(super) async fn run_scheduled_task_now(
     req: Request<ScheduledTaskRef>,
 ) -> Result<Response<Empty>, TStatus> {
     let id = req.into_inner().id;
-    let id_for_err = id.clone();
-    let found = async {
+    let outcome = async {
         let db = Database::open().await?;
-        if db.get_task_by_id(&id).await?.is_none() {
-            return anyhow::Ok(false);
-        }
-        let now = chrono::Utc::now().timestamp();
-        db.update_task_next_run(&id, Some(now)).await?;
-        db.clear_task_retry(&id).await?;
-        Ok(true)
+        cortex::tasks::run_task_now(&db, &id).await
     }
     .await
     .map_err(map_internal("run_scheduled_task_now"))?;
-    if !found {
-        return Err(TStatus::not_found(format!(
-            "scheduled task `{id_for_err}` not found"
-        )));
+    match outcome {
+        cortex::tasks::RunNowOutcome::NotFound => Err(TStatus::not_found(format!(
+            "scheduled task `{id}` not found"
+        ))),
+        cortex::tasks::RunNowOutcome::Refused { status } => Err(TStatus::failed_precondition(
+            format!("scheduled task `{id}` is {status}; resume it before running"),
+        )),
+        cortex::tasks::RunNowOutcome::Queued => Ok(Response::new(Empty {})),
     }
-    Ok(Response::new(Empty {}))
+}
+
+pub(super) async fn resume_scheduled_task(
+    req: Request<ScheduledTaskRef>,
+) -> Result<Response<Empty>, TStatus> {
+    let id = req.into_inner().id;
+    let outcome = async {
+        let db = Database::open().await?;
+        cortex::tasks::resume_task(&db, &id).await
+    }
+    .await
+    // `{e:#}` keeps the cause chain: "stays paused: rescheduling failed"
+    // without the underlying parse error would leave the operator guessing.
+    .map_err(|e| TStatus::internal(format!("resume_scheduled_task failed: {e:#}")))?;
+    match outcome {
+        cortex::tasks::ResumeOutcome::NotFound => Err(TStatus::not_found(format!(
+            "scheduled task `{id}` not found"
+        ))),
+        cortex::tasks::ResumeOutcome::AlreadyActive | cortex::tasks::ResumeOutcome::Resumed => {
+            Ok(Response::new(Empty {}))
+        }
+    }
 }
 
 pub(super) async fn get_scheduled_task_runs(

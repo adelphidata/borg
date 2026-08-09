@@ -105,6 +105,30 @@ pub fn is_storage_exhausted(err: &anyhow::Error) -> bool {
     false
 }
 
+/// True for the lock-contention class: `SQLITE_BUSY` / `SQLITE_LOCKED` (and
+/// their extended codes), or the "database is locked" message when remote
+/// wrapping loses the numeric code. Contention is neither exhaustion nor an
+/// I/O fault — another connection holds the write lock — so callers use this
+/// to *name* the cause in diagnostics rather than to change retry behavior
+/// (the connection-level `busy_timeout` already waited before this surfaced).
+pub fn is_lock_contention(err: &anyhow::Error) -> bool {
+    /// `SQLITE_BUSY` — another connection holds the lock.
+    const SQLITE_BUSY: i32 = 5;
+    /// `SQLITE_LOCKED` — a table-level lock within this connection.
+    const SQLITE_LOCKED: i32 = 6;
+
+    if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
+        if matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED) {
+            return true;
+        }
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("database is locked") || lower.contains("database table is locked") {
+            return true;
+        }
+    }
+    false
+}
+
 /// True for the *possibly transient* I/O error class: `SQLITE_IOERR` (and its
 /// extended codes), or a raw `EIO` from the `std::fs` session-save path.
 ///
@@ -1702,6 +1726,73 @@ mod recovery_tests {
         assert_eq!(Database::take_recovery_notice(), Some(notice));
         // One-shot: a second drain sees nothing.
         assert_eq!(Database::take_recovery_notice(), None);
+    }
+}
+
+#[cfg(test)]
+mod lock_contention_tests {
+    use super::is_lock_contention;
+
+    /// The busy/locked class must be disjoint from exhaustion: misclassifying
+    /// contention as full-disk tells the operator to free space while the
+    /// real fix is finding the process holding the write lock.
+    #[test]
+    fn classifies_only_lock_contention() {
+        let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+            (
+                "SQLITE_BUSY",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    5,
+                    "database is locked".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_LOCKED",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    6,
+                    "database table is locked".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_BUSY_SNAPSHOT (extended)",
+                anyhow::Error::new(libsql::Error::SqliteFailure(517, "busy".to_string())),
+                true,
+            ),
+            (
+                "message-only wrapping (code lost)",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    1,
+                    "database is locked".to_string(),
+                )),
+                true,
+            ),
+            (
+                "SQLITE_FULL is exhaustion, not contention",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    13,
+                    "database or disk is full".to_string(),
+                )),
+                false,
+            ),
+            (
+                "SQLITE_IOERR is I/O, not contention",
+                anyhow::Error::new(libsql::Error::SqliteFailure(
+                    10,
+                    "disk I/O error".to_string(),
+                )),
+                false,
+            ),
+            (
+                "non-libsql error",
+                anyhow::anyhow!("something else entirely"),
+                false,
+            ),
+        ];
+        for (label, err, want) in cases {
+            assert_eq!(is_lock_contention(&err), want, "{label} classified wrong");
+        }
     }
 }
 

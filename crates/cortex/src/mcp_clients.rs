@@ -2043,8 +2043,9 @@ async fn audit_registrations(server_name: &str, outcomes: &[ToolRegistrationOutc
 
 /// Tear down a dead session: emit the audit row, drop the sender from the
 /// global map so future dispatches fail fast with an operator-readable
-/// error, and unregister the server's tools. Re-init requires the operator
-/// to `borg settings set` or restart the daemon; auto-reconnect lives in a
+/// error, and unregister the server's tools. A torn-down server is absent
+/// from the session map, so `reload_from_config` (TUI `/reload mcp`)
+/// re-starts it without a daemon restart; auto-reconnect lives in a
 /// follow-up.
 async fn teardown_dead_session(
     server_name: &str,
@@ -2055,7 +2056,7 @@ async fn teardown_dead_session(
     tracing::warn!(
         server = %server_name,
         reason,
-        "MCP session dead; tearing down (re-init requires daemon restart)",
+        "MCP session dead; tearing down (recover with `/reload mcp` — no daemon restart needed)",
     );
     crate::db::try_emit_global(
         crate::db::audit_events::MCP_SERVER_FAILED,

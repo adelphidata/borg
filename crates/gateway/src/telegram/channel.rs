@@ -157,9 +157,9 @@ impl NativeChannel for TelegramChannel {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("attachment");
-        // Telegram caps captions at 1024 chars; truncate rather than let the
-        // whole send 400.
-        let caption = caption.map(|c| c.chars().take(1024).collect::<String>());
+        // Telegram caps captions at 1024 UTF-16 code units (not chars —
+        // emoji count double); truncate rather than let the whole send 400.
+        let caption = caption.map(|c| crate::message_processing::chunker::truncate_utf16(c, 1024));
         let source = super::types::MediaSource::Bytes {
             bytes: &bytes,
             filename,

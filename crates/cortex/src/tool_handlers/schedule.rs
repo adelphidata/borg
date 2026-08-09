@@ -80,7 +80,7 @@ pub async fn handle_manage_tasks(args: &serde_json::Value, config: &Config) -> R
         }
         "resume" => {
             let task_id = require_str_param(args, "task_id")?.to_string();
-            update_task_status(&task_id, tasks::TASK_STATUS_ACTIVE, "resumed").await
+            manage_tasks_resume(&task_id).await
         }
         "cancel" => {
             let task_id = require_str_param(args, "task_id")?.to_string();
@@ -431,28 +431,45 @@ async fn manage_tasks_runs(args: &serde_json::Value) -> Result<String> {
     .await
 }
 
+/// Resume a paused task (delegates to [`tasks::resume_task`]).
+async fn manage_tasks_resume(task_id: &str) -> Result<String> {
+    let task_id = task_id.to_string();
+    with_db(move |db| async move { Ok(resume_task_in(&db, &task_id).await) }).await
+}
+
+/// Map [`tasks::resume_task`] onto the tool's string reply.
+pub(crate) async fn resume_task_in(db: &Database, task_id: &str) -> String {
+    match tasks::resume_task(db, task_id).await {
+        Ok(tasks::ResumeOutcome::Resumed) => format!("Task {task_id} resumed."),
+        Ok(tasks::ResumeOutcome::AlreadyActive) => format!("Task {task_id} is already active."),
+        Ok(tasks::ResumeOutcome::NotFound) => format!("Task {task_id} not found."),
+        // `{e:#}` keeps the cause chain — "stays paused: rescheduling failed"
+        // alone would hide *why* the stored schedule no longer parses.
+        Err(e) => format!("Error: {e:#}"),
+    }
+}
+
 async fn manage_tasks_run_now(args: &serde_json::Value) -> Result<String> {
     let task_id = require_str_param(args, "task_id")?.to_string();
     if let Some(msg) = reject_system_task(&task_id, "run_now") {
         return Ok(msg);
     }
-    with_db(move |db| async move {
-        match db.get_task_by_id(&task_id).await {
-            Ok(Some(_)) => {
-                let now = chrono::Utc::now().timestamp();
-                if let Err(e) = db.update_task_next_run(&task_id, Some(now)).await {
-                    return Ok(format!("Error: {e}"));
-                }
-                if let Err(e) = db.clear_task_retry(&task_id).await {
-                    tracing::warn!("schedule.run_now: clear_task_retry({task_id}) failed: {e}");
-                }
-                Ok(format!("Task {task_id} queued for immediate execution."))
-            }
-            Ok(None) => Ok(format!("Task {task_id} not found.")),
-            Err(e) => Ok(format!("Error: {e}")),
+    with_db(move |db| async move { Ok(run_task_now_in(&db, &task_id).await) }).await
+}
+
+/// Map [`tasks::run_task_now`] onto the tool's string reply.
+pub(crate) async fn run_task_now_in(db: &Database, task_id: &str) -> String {
+    match tasks::run_task_now(db, task_id).await {
+        Ok(tasks::RunNowOutcome::Queued) => {
+            format!("Task {task_id} queued for immediate execution.")
         }
-    })
-    .await
+        Ok(tasks::RunNowOutcome::Refused { status }) => format!(
+            "Error: task {task_id} is {status} — the scheduler only claims active \
+             tasks, so queueing it would silently do nothing. Resume it first."
+        ),
+        Ok(tasks::RunNowOutcome::NotFound) => format!("Task {task_id} not found."),
+        Err(e) => format!("Error: {e:#}"),
+    }
 }
 
 pub async fn handle_manage_cron(args: &serde_json::Value, config: &Config) -> Result<String> {
@@ -795,6 +812,161 @@ mod tests {
         assert!(
             out.contains("Invalid schedule"),
             "allowed command must fall through to schedule validation, got: {out}"
+        );
+    }
+
+    async fn seed_task(db: &Database, id: &str, next_run: Option<i64>) {
+        seed_task_with(db, id, next_run, tasks::SCHEDULE_TYPE_INTERVAL, "1h").await;
+    }
+
+    async fn seed_task_with(
+        db: &Database,
+        id: &str,
+        next_run: Option<i64>,
+        schedule_type: &str,
+        schedule_expr: &str,
+    ) {
+        db.create_task(&crate::db::NewTask {
+            id,
+            name: "t",
+            prompt: "do the thing",
+            schedule_type,
+            schedule_expr,
+            timezone: "",
+            next_run,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .await
+        .expect("seed task");
+    }
+
+    /// Pause must be authoritative: `run_now` on a paused task previously set
+    /// `next_run` and reported "queued", but the scheduler only claims active
+    /// rows — nothing would ever fire. The refusal (and the untouched
+    /// `next_run`) is the contract.
+    #[tokio::test]
+    async fn run_now_refuses_a_paused_task_and_leaves_next_run_alone() {
+        let db = Database::test_db().await;
+        let stale = chrono::Utc::now().timestamp() - 10_000;
+        seed_task(&db, "task-paused", Some(stale)).await;
+        db.update_task_status("task-paused", tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+
+        let out = run_task_now_in(&db, "task-paused").await;
+        assert!(
+            out.starts_with("Error:") && out.contains("paused"),
+            "expected a pause refusal, got: {out}"
+        );
+        let task = db
+            .get_task_by_id("task-paused")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            task.next_run,
+            Some(stale),
+            "a refused run_now must not move next_run"
+        );
+    }
+
+    /// Resuming a recurring task must reschedule it from now: the stored
+    /// `next_run` went stale while paused, and firing immediately on resume
+    /// was the half-paused failure mode.
+    #[tokio::test]
+    async fn resume_reschedules_a_recurring_task_instead_of_firing_immediately() {
+        let db = Database::test_db().await;
+        let stale = chrono::Utc::now().timestamp() - 10_000;
+        seed_task(&db, "task-resume", Some(stale)).await;
+        db.update_task_status("task-resume", tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+
+        let out = resume_task_in(&db, "task-resume").await;
+        assert_eq!(out, "Task task-resume resumed.");
+        let task = db
+            .get_task_by_id("task-resume")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(task.status, tasks::TASK_STATUS_ACTIVE);
+        let next = task.next_run.expect("recurring task keeps a next_run");
+        assert!(
+            next > chrono::Utc::now().timestamp(),
+            "resume must push next_run into the future, got {next} (stale was {stale})"
+        );
+    }
+
+    /// A stored schedule that no longer parses must fail the resume loudly
+    /// and leave the task paused. Silently writing `next_run = NULL` while
+    /// flipping to active would report success for a task the scheduler can
+    /// never claim again.
+    #[tokio::test]
+    async fn resume_of_a_bad_schedule_fails_loud_and_leaves_the_task_paused() {
+        let db = Database::test_db().await;
+        let stale = chrono::Utc::now().timestamp() - 10_000;
+        seed_task_with(
+            &db,
+            "task-bad-cron",
+            Some(stale),
+            tasks::SCHEDULE_TYPE_CRON,
+            "not a cron expr",
+        )
+        .await;
+        db.update_task_status("task-bad-cron", tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+
+        let out = resume_task_in(&db, "task-bad-cron").await;
+        assert!(
+            out.starts_with("Error:") && out.contains("rescheduling failed"),
+            "expected a loud reschedule failure, got: {out}"
+        );
+        let task = db
+            .get_task_by_id("task-bad-cron")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            task.status,
+            tasks::TASK_STATUS_PAUSED,
+            "a failed resume must not half-activate the task"
+        );
+        assert_eq!(
+            task.next_run,
+            Some(stale),
+            "a failed resume must not touch next_run"
+        );
+    }
+
+    /// Resuming a task that is already active must be a no-op: rescheduling
+    /// it from now would silently push out an imminent fire.
+    #[tokio::test]
+    async fn resume_of_an_already_active_task_leaves_next_run_alone() {
+        let db = Database::test_db().await;
+        let imminent = chrono::Utc::now().timestamp() + 5;
+        seed_task(&db, "task-active", Some(imminent)).await;
+
+        let out = resume_task_in(&db, "task-active").await;
+        assert_eq!(out, "Task task-active is already active.");
+        let task = db
+            .get_task_by_id("task-active")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            task.next_run,
+            Some(imminent),
+            "resume of an active task must not delay its next fire"
         );
     }
 }

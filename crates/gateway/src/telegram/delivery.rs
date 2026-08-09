@@ -521,7 +521,13 @@ fn plan_render_chunks(response_text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     while let Some(chunk) = queue.pop_front() {
         let html = crate::telegram::format::markdown_to_telegram_html(&chunk);
-        if html.chars().count() > DEFAULT_MESSAGE_CHUNK_SIZE {
+        // Telegram's cap is UTF-16 code units: emoji-heavy content overflows
+        // the wire while under the char budget. Measure both renderings — the
+        // per-chunk plain-text fallback re-sends the markdown source, so it
+        // has to fit too.
+        let units = crate::message_processing::chunker::utf16_len(&html)
+            .max(crate::message_processing::chunker::utf16_len(&chunk));
+        if units > DEFAULT_MESSAGE_CHUNK_SIZE {
             let smaller = chunk.chars().count() / 2;
             if smaller >= 64 {
                 let sub =
@@ -572,6 +578,37 @@ mod chunked_send_tests {
         // Content preserved across the re-splits.
         let total_amps: usize = planned.iter().map(|(c, _)| c.matches('&').count()).sum();
         assert_eq!(total_amps, 700, "escaped content lost in re-split");
+    }
+
+    /// Telegram's 4096 cap is UTF-16 code units, and every emoji counts as
+    /// two. A chunk within the 3500-char markdown budget can therefore
+    /// overflow the wire and get 400-rejected — and the plain-text fallback
+    /// re-sent the same oversized chunk. The planner must bound every chunk
+    /// (markdown source and rendered HTML alike) in UTF-16 units.
+    #[test]
+    fn emoji_heavy_chunks_are_resplit_to_fit_the_utf16_wire_cap() {
+        // 3300 chars but 5400 UTF-16 units: under the char budget, over the cap.
+        let mut text = String::new();
+        for _ in 0..300 {
+            text.push_str("\u{1F600}\u{1F680}\u{1F389}\u{1F914}\u{1F4A1}\u{1F525}\u{1F44D} ok\n");
+        }
+        let planned = plan_render_chunks(&text);
+        assert!(planned.len() > 1, "expected a re-split");
+        for (chunk, html) in &planned {
+            for (label, s) in [("markdown", chunk), ("html", html)] {
+                assert!(
+                    crate::message_processing::chunker::utf16_len(s)
+                        <= crate::constants::DEFAULT_MESSAGE_CHUNK_SIZE,
+                    "{label} rendering exceeds the UTF-16 wire cap: {} units",
+                    crate::message_processing::chunker::utf16_len(s)
+                );
+            }
+        }
+        let total: usize = planned
+            .iter()
+            .map(|(c, _)| c.matches('\u{1F600}').count())
+            .sum();
+        assert_eq!(total, 300, "emoji content lost in re-split");
     }
 
     /// Regression: recovery from a rejected chunk used to re-send the ENTIRE

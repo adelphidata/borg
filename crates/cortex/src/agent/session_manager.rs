@@ -274,7 +274,18 @@ impl Agent {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to persist message batch to SQLite: {e}");
+                        // Name the cause: an undifferentiated warn sent
+                        // operators hunting for disk space when the actual
+                        // problem was another process holding the write lock.
+                        if crate::db::is_lock_contention(&e) {
+                            warn!(
+                                "Failed to persist message batch: SQLite lock contention \
+                                 (another borg process holds the write lock). The turn's \
+                                 messages stay in memory but are NOT durable: {e}"
+                            );
+                        } else {
+                            warn!("Failed to persist message batch to SQLite: {e}");
+                        }
                         if crate::db::is_storage_exhausted(&e) {
                             fault = Some(storage_fault_message(&e));
                         }
@@ -294,12 +305,23 @@ impl Agent {
 }
 
 /// Operator-facing explanation for an exhausted-storage write failure. Names
-/// the cause and the fix — "write failed" alone sends people hunting.
+/// the cause and the fix — "write failed" alone sends people hunting, and
+/// telling someone with a flaky disk to "free space" sends them hunting in
+/// the wrong place: the exhausted class covers both `SQLITE_FULL` and
+/// `SQLITE_IOERR`, which have different remedies.
 fn storage_fault_message(err: &anyhow::Error) -> String {
-    format!(
-        "Turn aborted: session storage is full, so the assistant's reply was NOT saved. \
-         Free space on the volume holding ~/.borg/borg.db and retry. ({err})"
-    )
+    if crate::db::is_transient_io_error(err) {
+        format!(
+            "Turn aborted: a disk I/O error prevented saving the assistant's reply. \
+             The volume holding ~/.borg/borg.db may be failing, full of bad blocks, \
+             or unmounted — check the disk before retrying. ({err})"
+        )
+    } else {
+        format!(
+            "Turn aborted: session storage is full, so the assistant's reply was NOT saved. \
+             Free space on the volume holding ~/.borg/borg.db and retry. ({err})"
+        )
+    }
 }
 
 /// Project a [`Message`] onto the durable-log row shape. Shared by the
@@ -335,5 +357,44 @@ fn draft_from_message(msg: &Message) -> crate::db::SessionEventDraft {
         timestamp: msg.timestamp.clone(),
         content_parts_json,
         event_json: None,
+    }
+}
+
+#[cfg(test)]
+mod storage_fault_message_tests {
+    use super::storage_fault_message;
+
+    /// The exhausted class covers both full-disk and I/O errors, but the
+    /// remedies differ: telling someone with a failing disk to "free space"
+    /// misdirects the recovery. The message must name the actual cause.
+    #[test]
+    fn names_the_actual_cause_full_vs_io() {
+        let full = anyhow::Error::new(libsql::Error::SqliteFailure(
+            13,
+            "database or disk is full".to_string(),
+        ));
+        let msg = storage_fault_message(&full);
+        assert!(
+            msg.contains("storage is full") && msg.contains("Free space"),
+            "full-disk fault must prescribe freeing space: {msg}"
+        );
+        assert!(
+            !msg.contains("I/O error"),
+            "full-disk fault must not claim an I/O error: {msg}"
+        );
+
+        let ioerr = anyhow::Error::new(libsql::Error::SqliteFailure(
+            778, // SQLITE_IOERR_WRITE
+            "disk I/O error".to_string(),
+        ));
+        let msg = storage_fault_message(&ioerr);
+        assert!(
+            msg.contains("disk I/O error") && msg.contains("check the disk"),
+            "I/O fault must point at the disk, not free space: {msg}"
+        );
+        assert!(
+            !msg.contains("Free space"),
+            "I/O fault must not prescribe freeing space: {msg}"
+        );
     }
 }

@@ -19,6 +19,46 @@ pub fn chunks_for_delivery(text: &str, max_chars: usize) -> anyhow::Result<Vec<S
     Ok(chunks)
 }
 
+/// UTF-16 code units in `s`. Telegram measures its wire caps (4096-unit
+/// messages, 1024-unit captions) in UTF-16 code units, so non-BMP content
+/// (emoji, rare CJK) counts double against those limits while `chars()`
+/// counts it once.
+pub fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Truncate `s` to at most `max_units` UTF-16 code units on a char boundary.
+pub fn truncate_utf16(s: &str, max_units: usize) -> String {
+    let mut units = 0usize;
+    s.chars()
+        .take_while(|ch| {
+            units += ch.len_utf16();
+            units <= max_units
+        })
+        .collect()
+}
+
+/// Re-split any chunk exceeding `max_units` UTF-16 code units.
+///
+/// The chunkers budget in chars, so for a platform whose cap is UTF-16 units
+/// a within-budget chunk of astral-plane text can still overflow the wire —
+/// a 4000-char emoji chunk is 8000 units, and the API rejects it. Chunks
+/// already within the cap pass through untouched (BMP-only text never pays);
+/// overflowing chunks are re-split at `max_units / 2` chars, which bounds
+/// every piece at `max_units` units even if every char is a surrogate pair
+/// while keeping [`chunk_text`]'s boundary-aware splitting.
+pub fn resplit_utf16(chunks: Vec<String>, max_units: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        if utf16_len(&chunk) <= max_units {
+            out.push(chunk);
+        } else {
+            out.extend(chunk_text(&chunk, (max_units / 2).max(1)));
+        }
+    }
+    out
+}
+
 /// Split text into non-empty chunks. Falls back to a single-element vec containing
 /// the original text if `chunk_text` returns empty (e.g. for empty input).
 pub fn chunk_text_nonempty(text: &str, max_chars: usize) -> Vec<String> {
@@ -579,6 +619,42 @@ mod tests {
         assert!(chunks_for_delivery("", 100).is_err());
         assert_eq!(chunks_for_delivery("hi", 100).unwrap(), vec!["hi"]);
         assert_eq!(chunks_for_delivery("   ", 100).unwrap(), vec!["   "]);
+    }
+
+    /// Telegram's wire caps are UTF-16 code units. A char-budgeted chunk of
+    /// astral-plane text (every emoji = 2 units) overflows the cap and the
+    /// API rejects the send — the re-split must bound every piece in units,
+    /// while BMP-only chunks pass through byte-identical.
+    #[test]
+    fn resplit_utf16_bounds_astral_chunks_and_passes_bmp_through() {
+        let emoji = "\u{1F600}".repeat(300); // 300 chars, 600 UTF-16 units
+        let chunks = resplit_utf16(vec![emoji.clone()], 400);
+        assert!(chunks.len() > 1, "600-unit chunk must be re-split");
+        for c in &chunks {
+            assert!(
+                utf16_len(c) <= 400,
+                "piece exceeds the unit cap: {} units",
+                utf16_len(c)
+            );
+        }
+        assert_eq!(chunks.concat(), emoji, "content must survive the re-split");
+
+        let ascii = "a".repeat(400);
+        assert_eq!(
+            resplit_utf16(vec![ascii.clone()], 400),
+            vec![ascii],
+            "a chunk within the unit cap must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn truncate_utf16_counts_units_not_chars() {
+        // 3 emoji = 6 units: a 5-unit budget must keep only 2 whole emoji —
+        // a char-counted take(5) would keep all three and overflow the cap.
+        let s = "\u{1F600}\u{1F601}\u{1F602}";
+        assert_eq!(truncate_utf16(s, 5), "\u{1F600}\u{1F601}");
+        assert_eq!(truncate_utf16(s, 6), s);
+        assert_eq!(truncate_utf16("abc", 2), "ab");
     }
 
     #[test]

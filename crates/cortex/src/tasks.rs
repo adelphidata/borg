@@ -328,6 +328,92 @@ pub async fn advance_next_run(task: &ScheduledTaskRow, db: &Database) -> Result<
     advance_next_run_raw(db.conn(), task).await
 }
 
+/// Outcome of [`resume_task`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// No task row with that id.
+    NotFound,
+    /// The task was already active. Nothing was written — in particular the
+    /// pending `next_run` stays put, so resuming an active task never delays
+    /// an imminent fire.
+    AlreadyActive,
+    /// The task is active again; recurring schedules got a fresh `next_run`.
+    Resumed,
+}
+
+/// Resume a paused task. Recurring schedules get a fresh `next_run`: a task
+/// paused for weeks carries a stale past timestamp, and flipping only the
+/// status would make it fire the moment it resumes. One-shots keep their
+/// stored time — if it already passed, firing immediately is the closest
+/// honest reading of "run once at T".
+///
+/// Shared by the `manage_tasks` tool handler and the daemon admin RPC so the
+/// two lanes cannot drift. If the stored schedule no longer parses, the task
+/// stays paused and the error propagates — resuming it with a `NULL`
+/// `next_run` would report success for a task the scheduler will never claim.
+pub async fn resume_task(db: &Database, task_id: &str) -> Result<ResumeOutcome> {
+    let Some(task) = db.get_task_by_id(task_id).await? else {
+        return Ok(ResumeOutcome::NotFound);
+    };
+    if task.status == TASK_STATUS_ACTIVE {
+        return Ok(ResumeOutcome::AlreadyActive);
+    }
+    // Reschedule BEFORE flipping the status: the moment the row turns active
+    // the scheduler may claim it, and with the stale past `next_run` still in
+    // place it would fire immediately — the exact bug this recompute exists
+    // to prevent. While paused, the new `next_run` is invisible to the
+    // scheduler, so this order has no race.
+    if matches!(
+        task.schedule_type.as_str(),
+        SCHEDULE_TYPE_CRON | SCHEDULE_TYPE_INTERVAL
+    ) {
+        let next = calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone)
+            .with_context(|| {
+                format!("task {task_id} stays {}: rescheduling failed", task.status)
+            })?;
+        db.update_task_next_run(task_id, next).await?;
+    }
+    if !db.update_task_status(task_id, TASK_STATUS_ACTIVE).await? {
+        anyhow::bail!("task {task_id} disappeared while resuming");
+    }
+    Ok(ResumeOutcome::Resumed)
+}
+
+/// Outcome of [`run_task_now`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunNowOutcome {
+    /// No task row with that id.
+    NotFound,
+    /// The task is not active. The scheduler only claims active rows, so
+    /// queueing it would report success while nothing ever fires.
+    Refused {
+        /// The task's current (non-active) status.
+        status: String,
+    },
+    /// `next_run` was pulled to now; the scheduler will claim it next tick.
+    Queued,
+}
+
+/// Queue a task for immediate execution by pulling `next_run` to now.
+/// Shared by the `manage_tasks` tool handler and the daemon admin RPC so the
+/// active-status gate cannot drift between the two lanes.
+pub async fn run_task_now(db: &Database, task_id: &str) -> Result<RunNowOutcome> {
+    let Some(task) = db.get_task_by_id(task_id).await? else {
+        return Ok(RunNowOutcome::NotFound);
+    };
+    if task.status != TASK_STATUS_ACTIVE {
+        return Ok(RunNowOutcome::Refused {
+            status: task.status,
+        });
+    }
+    let now = Utc::now().timestamp();
+    db.update_task_next_run(task_id, Some(now)).await?;
+    if let Err(e) = db.clear_task_retry(task_id).await {
+        tracing::warn!("run_task_now: clear_task_retry({task_id}) failed: {e}");
+    }
+    Ok(RunNowOutcome::Queued)
+}
+
 /// When more than this many recurring tasks look stalled in a single
 /// sweep, we assume the machine just woke up from sleep (or the clock
 /// jumped forward) and collapse the audit trail into one aggregate

@@ -593,14 +593,75 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
             t.strip_prefix("of=")
                 .is_some_and(|p| token_targets_control_plane_ext(p, bare_leaves))
         }),
-        // `cp`/`mv`/`install` overwrite their *final* argument (the
-        // destination), so a control-plane *source* (`cp <cp> /tmp`) is not
-        // flagged.
-        "cp" | "mv" | "install" => toks
+        // `cp`/`install` overwrite their *final* argument (the destination),
+        // so a control-plane *source* (`cp <cp> /tmp`) is only a read and is
+        // not flagged.
+        "cp" | "install" => toks
             .last()
             .is_some_and(|d| token_targets_control_plane_ext(d, bare_leaves)),
+        // `mv` is deletion-class on the *source* side too: `mv ~/.borg/borg.db
+        // /tmp/x` removes the file from the control plane just as surely as
+        // `rm` would. Match any referenced leaf or the data dir itself.
+        "mv" => any_ref() || toks.iter().any(|t| token_targets_control_plane_dir(t)),
+        // Deletion takes the control plane with it. Unlike the write verbs
+        // above, these also match the control-plane *directory* — `rm -rf
+        // ~/.borg` names no leaf, but removing the directory is the strictly
+        // worse write, and the absolute-path form (`rm -rf /Users/x/.borg`)
+        // dodges the `rm -rf ~*` policy globs entirely.
+        "rm" | "unlink" | "shred" | "rmdir" => {
+            any_ref() || toks.iter().any(|t| token_targets_control_plane_dir(t))
+        }
+        // `rsync --delete` prunes the destination to mirror the source, and
+        // `--remove-source-files` deletes the source after transfer — both are
+        // deletion by another name, so with either flag present any
+        // control-plane reference (source or destination) is flagged.
+        "rsync"
+            if toks
+                .iter()
+                .any(|t| t.starts_with("--delete") || *t == "--remove-source-files") =>
+        {
+            any_ref() || toks.iter().any(|t| token_targets_control_plane_dir(t))
+        }
         _ => false,
     }
+}
+
+/// True if `token` points at a control-plane *directory*: the resolved
+/// `$BORG_HOME` (absolute needles) or any path with a literal `.borg`
+/// component. Component matching — not substring — so `foo.borg`/`.borgrc`
+/// don't trip it. The `.borg` component match deliberately over-approximates:
+/// `rm -rf /some/other/project/.borg` trips it even though that dir is not
+/// this agent's data dir, mirroring the same over-approximation the `cd`
+/// tracking makes — a false deny on a foreign `.borg` dir is cheap, a false
+/// allow on ours is not. Only deletion verbs consult this; the write verbs
+/// need a file target and keep their leaf-needle matching.
+fn token_targets_control_plane_dir(token: &str) -> bool {
+    let expanded = if token.starts_with('~') {
+        std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(token))
+    } else {
+        std::borrow::Cow::Borrowed(token)
+    };
+    // Boundary-aware needle match: the home needle must be followed by `/` or
+    // end-of-token, so `/Users/x/.borg` doesn't swallow `/Users/x/.borgrc`.
+    let at_dir_boundary = |needle: &str| {
+        expanded.match_indices(needle).any(|(i, _)| {
+            expanded[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '/')
+        })
+    };
+    if CONTROL_PLANE_DIR_NEEDLES
+        .iter()
+        .filter(|n| n.starts_with('/'))
+        .any(|n| at_dir_boundary(n))
+    {
+        return true;
+    }
+    expanded
+        .trim_end_matches('/')
+        .split('/')
+        .any(|component| component == ".borg")
 }
 
 /// Report whether any `>`/`>>` redirect *target* in `frag` references a
@@ -937,6 +998,103 @@ mod tests {
             assert!(
                 !shell_command_targets_control_plane(cmd),
                 "control-plane guard should NOT fire for benign command: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_guard_denies_control_plane_deletion() {
+        // Deleting control-plane files or the data dir itself is the strictly
+        // worse write: `rm` was previously absent from the verb list, so
+        // `rm ~/.borg/borg.db` (no -rf, dodging the policy globs) and the
+        // absolute-path form of the home dir slipped through.
+        for cmd in [
+            "rm ~/.borg/borg.db",
+            "rm -f ~/.borg/hooks.json",
+            "rm -rf ~/.borg/secrets",
+            "rm -rf ~/.borg",
+            "rm -rf ~/.borg/",
+            "unlink ~/.borg/hooks.json",
+            "shred -u ~/.borg/secrets/kek.enc",
+            "rmdir ~/.borg",
+            // Relative and cd-based forms.
+            "rm -rf .borg",
+            "cd ~/.borg && rm hooks.json",
+            "cd ~/.borg/secrets && rm -f kek.enc",
+            // Wrapped / chained forms.
+            "sudo rm -rf ~/.borg",
+            "busybox rm ~/.borg/borg.db",
+            "ls && rm -rf ~/.borg",
+            // rsync --delete mirrors an (empty) source over the destination.
+            "rsync -a --delete /tmp/empty/ ~/.borg/",
+            "rsync -a --delete-after /tmp/empty/ ~/.borg/secrets",
+            // Deletion by relocation: the source side leaves the control plane.
+            "mv ~/.borg/borg.db /tmp/x",
+            "mv ~/.borg /tmp/borg-backup",
+            "rsync -a --remove-source-files ~/.borg/ /tmp/backup/",
+        ] {
+            assert!(
+                shell_command_targets_control_plane(cmd),
+                "expected control-plane guard to fire for deletion: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_guard_deletion_does_not_overblock() {
+        // Deletion of unrelated paths — including names that merely *contain*
+        // ".borg" as a substring — must keep auto-approving.
+        for cmd in [
+            "rm -rf /tmp/build",
+            "rm foo.borg",
+            "rm -rf ~/.borgrc",
+            "rm -rf ./my.borg/cache",
+            "unlink /tmp/x",
+            "shred -u /tmp/secret-notes.txt",
+            "rmdir /tmp/empty",
+            // rsync without --delete only writes what it carries.
+            "rsync -a /tmp/src/ /tmp/dst/",
+            // rsync --delete elsewhere.
+            "rsync -a --delete /tmp/a/ /tmp/b/",
+            // mv of unrelated paths, including .borg-substring names.
+            "mv /tmp/a /tmp/b",
+            "mv foo.borg bar.borg",
+            "mv ~/.borgrc /tmp/x",
+            // rsync --remove-source-files elsewhere.
+            "rsync -a --remove-source-files /tmp/a/ /tmp/b/",
+        ] {
+            assert!(
+                !shell_command_targets_control_plane(cmd),
+                "control-plane guard should NOT fire for benign deletion: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_guard_denies_absolute_home_deletion() {
+        // `rm -rf /Users/<user>/.borg` names no `~` and no `.borg/<leaf>`
+        // suffix, so it previously slipped both the policy globs and the leaf
+        // needles. The resolved-home dir needles must catch it. Read the home
+        // from the cached needles: they resolve once per process, so a fresh
+        // `resolve_borg_home_readonly` here could disagree under parallel
+        // tests that move $BORG_DATA_DIR.
+        let Some(home) = CONTROL_PLANE_DIR_NEEDLES
+            .iter()
+            .find(|n| n.starts_with('/'))
+            .cloned()
+        else {
+            return;
+        };
+        for cmd in [
+            format!("rm -rf {home}"),
+            format!("rm -rf {home}/"),
+            format!("rm {home}/borg.db"),
+            format!("shred -u {home}/secrets/kek.enc"),
+        ] {
+            assert!(
+                shell_command_targets_control_plane(&cmd),
+                "expected control-plane guard to fire for: {cmd:?}"
             );
         }
     }

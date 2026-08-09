@@ -419,7 +419,9 @@ impl Admin for AdminSvc {
         &self,
         req: Request<ScheduledTaskRef>,
     ) -> Result<Response<Empty>, TStatus> {
-        update_task_status(req.into_inner().id, "active").await
+        // Not `update_task_status`: resuming must also refresh a recurring
+        // task's stale `next_run`, or it fires the moment it turns active.
+        scheduled_tasks::resume_scheduled_task(req).await
     }
 
     async fn run_scheduled_task_now(
