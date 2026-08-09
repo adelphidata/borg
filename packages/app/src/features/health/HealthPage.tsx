@@ -1,17 +1,158 @@
 import { useState } from "react";
 import { CheckIcon, MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from "@borg/ui";
-import { checks } from "../../data/mock";
-import { useQuery } from "../../lib/useDaemon";
+import type { BorgClient, admin } from "@borg/client";
+import { useMutation, useQuery } from "../../lib/useDaemon";
 import { DaemonState } from "../../components/DaemonState";
+
+interface HealthCheck {
+  id: string;
+  name: string;
+  value: string;
+  ok: boolean;
+  /** Plain-language explanation revealed when the row is expanded. */
+  detail: string;
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function fmtDuration(secs: number): string {
+  if (secs >= 86_400) return plural(Math.floor(secs / 86_400), "day");
+  if (secs >= 3_600) return plural(Math.floor(secs / 3_600), "hour");
+  if (secs >= 60) return plural(Math.floor(secs / 60), "minute");
+  return plural(Math.max(0, Math.floor(secs)), "second");
+}
+
+function fmtAgo(unixTs: number): string {
+  if (unixTs === 0) return "never";
+  const secs = Math.max(0, Date.now() / 1000 - unixTs);
+  return `${fmtDuration(secs)} ago`;
+}
+
+/** Everything the check rows need, fetched together so one refetch renews it all. */
+async function loadHealth(borg: BorgClient) {
+  const [daemon, warnings, subprocesses, posture, heartbeat, tokens, cost] = await Promise.all([
+    borg.admin.getDaemonStatus({}),
+    borg.admin.getPersistentWarnings({}),
+    borg.admin.getSubprocesses({}),
+    borg.status.getPosture({}),
+    borg.status.getHeartbeat({}),
+    borg.admin.getMonthlyTokenTotal({}),
+    borg.admin.getMonthlyTotalCost({}),
+  ]);
+  return { daemon, warnings, subprocesses, posture, heartbeat, tokens, cost };
+}
+
+type HealthData = Awaited<ReturnType<typeof loadHealth>>;
+
+function buildChecks(d: HealthData): HealthCheck[] {
+  const running = d.subprocesses.running.length;
+  const posture = d.posture.posture || "default";
+  const heartbeatOn = d.heartbeat.nextInSeconds > 0;
+
+  return [
+    {
+      id: "daemon",
+      name: "Borg is running",
+      value: `${fmtDuration(d.daemon.uptimeSecs)} without a restart`,
+      ok: true,
+      detail:
+        `Version ${d.daemon.version}, up for ${fmtDuration(d.daemon.uptimeSecs)}. ` +
+        (d.daemon.llmProvider
+          ? `Thinking with ${d.daemon.llmModel || "the default model"} on ${d.daemon.llmProvider}.`
+          : "No model provider is configured yet."),
+    },
+    {
+      id: "warnings",
+      name: "Warnings",
+      value:
+        d.warnings.warnings.length === 0 ? "None" : plural(d.warnings.warnings.length, "warning"),
+      ok: d.warnings.warnings.length === 0,
+      detail:
+        d.warnings.warnings.length === 0
+          ? "The last check-up found nothing that needs you."
+          : d.warnings.warnings.join(" · "),
+    },
+    {
+      id: "posture",
+      name: "Security posture",
+      value: posture.charAt(0).toUpperCase() + posture.slice(1),
+      ok: posture !== "reduced",
+      detail:
+        posture === "reduced"
+          ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust."
+          : `Protections are at their normal level. XP multiplier ×${d.posture.xpMultiplier.toFixed(2)}.`,
+    },
+    {
+      id: "heartbeat",
+      name: "Proactive check-ins",
+      value: heartbeatOn ? `next in ${fmtDuration(d.heartbeat.nextInSeconds)}` : "off",
+      ok: true,
+      detail: heartbeatOn
+        ? `Borg checks in on its own. Last one ${fmtAgo(d.heartbeat.lastUnixTs)}, next in ${fmtDuration(d.heartbeat.nextInSeconds)}.`
+        : "Proactive check-ins are off, so Borg only acts when you ask.",
+    },
+    {
+      id: "work",
+      name: "Background work",
+      value: `${plural(d.daemon.activeTasks, "schedule")} · ${plural(running, "process")}`,
+      ok: true,
+      detail:
+        `${plural(d.daemon.activeTasks, "scheduled task")} active` +
+        (d.daemon.pausedTasks > 0 ? `, ${d.daemon.pausedTasks} paused` : "") +
+        `. ${plural(running, "subprocess")} running right now.`,
+    },
+    {
+      id: "usage",
+      name: "Usage this month",
+      value:
+        `${d.tokens.total.toLocaleString()} tokens` +
+        (d.cost.present ? ` · $${d.cost.cost.toFixed(2)}` : ""),
+      ok: true,
+      detail: d.cost.present
+        ? `Borg has used ${d.tokens.total.toLocaleString()} tokens this month, costing about $${d.cost.cost.toFixed(2)}.`
+        : `Borg has used ${d.tokens.total.toLocaleString()} tokens this month. No price data yet, so there is no cost estimate.`,
+    },
+  ];
+}
+
+function summariseHeal(report: admin.HealReport): string {
+  if (report.skipped) return "Nothing to tidy — the last sweep already ran recently.";
+  const parts = [
+    [report.prunedLogs, "log entries pruned"],
+    [report.prunedActivity, "activity rows pruned"],
+    [report.evictedEmbeddings, "embeddings evicted"],
+    [report.healedTasks, "stalled tasks healed"],
+    [report.messagesPurged, "old messages purged"],
+    [report.wedgedRunsRecovered, "wedged runs recovered"],
+    [report.backupsPruned, "backups pruned"],
+  ].filter(([n]) => (n as number) > 0);
+  return parts.length === 0
+    ? "Tidy-up done. Nothing needed cleaning."
+    : `Tidy-up done: ${parts.map(([n, what]) => `${n} ${what}`).join(", ")}.`;
+}
 
 export function HealthPage() {
   const isMobile = useIsMobile();
   const [openId, setOpenId] = useState<string | null>(null);
-  const [refresh, setRefresh] = useState(0);
-  // TODO(daemon): the per-check rows still come from mock data. Vitals are live.
-  const vitals = useQuery((borg) => borg.status.getVitals({}), [refresh]);
+  const vitals = useQuery((borg) => borg.status.getVitals({}));
+  const health = useQuery(loadHealth);
+  const heal = useMutation((borg) => borg.admin.heal({}), {
+    onSuccess: () => health.refetch(),
+  });
+
+  const refreshing = vitals.refreshing || health.refreshing;
+  const lastChecked = refreshing ? "checking…" : "just now";
+  const checks = health.state === "ready" ? buildChecks(health.data) : [];
   const failing = checks.filter((c) => !c.ok);
-  const lastChecked = vitals.state === "loading" ? "checking…" : "just now";
+  const healReport = heal.error
+    ? `Tidy-up failed: ${heal.error.message}`
+    : heal.pending
+      ? "Tidying up…"
+      : heal.data
+        ? summariseHeal(heal.data)
+        : undefined;
 
   return (
     <PageChrome title="Health" meta={`last checked ${lastChecked}`}>
@@ -20,15 +161,19 @@ export function HealthPage() {
           <MobileTitle>Health</MobileTitle>
 
           <div className="flex items-start gap-[22px]">
-            <span className="flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] border-neon shadow-(--plateGlow)">
+            <span
+              className={`flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] ${
+                failing.length > 0 ? "border-alert" : "border-neon shadow-(--plateGlow)"
+              }`}
+            >
               <CheckIcon size={22} />
             </span>
             <div className="flex-1 pt-0.5">
               <h1 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">
-                Borg is healthy.
+                {failing.length > 0 ? "Borg needs a look." : "Borg is healthy."}
               </h1>
               <p className="mt-[9px] mb-0 text-[14.5px] leading-[1.6] text-pretty text-ink2">
-                {failing.length > 0 && <>One thing needs you: the {failing[0].name}. </>}
+                {failing.length > 0 && <>Needs you: {failing.map((c) => c.name).join(", ")}. </>}
                 Everything else checked out {lastChecked}.
               </p>
             </div>
@@ -59,43 +204,58 @@ export function HealthPage() {
             )}
           </DaemonState>
 
-          <div>
-            {checks.map((c) => {
-              const open = openId === c.id;
-              return (
-                <div key={c.id}>
-                  <div
-                    className="flex items-center gap-[15px] border-b border-line2 px-0.5 py-[15px]"
-                    onClick={() => setOpenId((id) => (id === c.id ? null : c.id))}
-                  >
-                    <span
-                      className={`h-[7px] w-[7px] flex-none rounded-full ${
-                        c.ok ? "bg-neon" : "bg-alert"
-                      }`}
-                    />
-                    <span className="flex-1 text-[14px] leading-[1.35] text-ink">{c.name}</span>
-                    <span className="text-right text-[12.5px] leading-[1.35] text-ink3">
-                      {c.value}
-                    </span>
-                  </div>
-                  {open && (
-                    <div className="flex flex-col items-start gap-3 border-b border-line2 pt-1 pr-0.5 pb-4 pl-[22px]">
-                      <p className="mt-2.5 mb-0 text-[13px] leading-[1.6] text-pretty text-ink2">
-                        {c.detail}
-                      </p>
-                      {c.action && <Pill variant="danger">{c.action}</Pill>}
+          <DaemonState query={health} label="health checks">
+            {() => (
+              <div>
+                {checks.map((c) => {
+                  const open = openId === c.id;
+                  return (
+                    <div key={c.id}>
+                      <div
+                        className="flex cursor-pointer items-center gap-[15px] border-b border-line2 px-0.5 py-[15px]"
+                        onClick={() => setOpenId((id) => (id === c.id ? null : c.id))}
+                      >
+                        <span
+                          className={`h-[7px] w-[7px] flex-none rounded-full ${
+                            c.ok ? "bg-neon" : "bg-alert"
+                          }`}
+                        />
+                        <span className="flex-1 text-[14px] leading-[1.35] text-ink">{c.name}</span>
+                        <span className="text-right text-[12.5px] leading-[1.35] text-ink3">
+                          {c.value}
+                        </span>
+                      </div>
+                      {open && (
+                        <div className="flex flex-col items-start gap-3 border-b border-line2 pt-1 pr-0.5 pb-4 pl-[22px]">
+                          <p className="mt-2.5 mb-0 text-[13px] leading-[1.6] text-pretty text-ink2">
+                            {c.detail}
+                          </p>
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+                  );
+                })}
+              </div>
+            )}
+          </DaemonState>
+
+          {healReport && (
+            <div className="text-[13px] leading-[1.6] text-pretty text-ink2">{healReport}</div>
+          )}
 
           <div className="flex gap-[9px]">
-            <Pill variant="primary" onClick={() => setRefresh((n) => n + 1)}>
+            <Pill
+              variant="primary"
+              onClick={() => {
+                vitals.refetch();
+                health.refetch();
+              }}
+            >
               Check again
             </Pill>
-            <Pill>Tidy up now</Pill>
+            <Pill onClick={() => !heal.pending && void heal.run(undefined)}>
+              {heal.pending ? "Tidying…" : "Tidy up now"}
+            </Pill>
           </div>
         </div>
       </div>

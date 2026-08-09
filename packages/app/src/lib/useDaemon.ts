@@ -96,8 +96,10 @@ export interface Mutation<Vars, T> {
   /** Resolves with the response, or `undefined` when the call failed (see `error`). */
   run: (vars: Vars) => Promise<T | undefined>;
   pending: boolean;
+  /** Response of the most recent successful run. */
+  data: T | undefined;
   error: BorgError | undefined;
-  /** Clears a stored error, e.g. when the user edits the input again. */
+  /** Clears a stored error and result, e.g. when the user edits the input again. */
   reset: () => void;
 }
 
@@ -113,6 +115,7 @@ export function useMutation<Vars, T>(
 ): Mutation<Vars, T> {
   const borg = useBorg();
   const [pending, setPending] = useState(false);
+  const [data, setData] = useState<T>();
   const [error, setError] = useState<BorgError>();
   const mutateRef = useRef(mutate);
   mutateRef.current = mutate;
@@ -124,9 +127,10 @@ export function useMutation<Vars, T>(
       setPending(true);
       setError(undefined);
       try {
-        const data = await mutateRef.current(borg, vars);
-        onSuccessRef.current?.(data, vars);
-        return data;
+        const result = await mutateRef.current(borg, vars);
+        setData(result);
+        onSuccessRef.current?.(result, vars);
+        return result;
       } catch (e) {
         setError(asBorgError(e));
         return undefined;
@@ -137,9 +141,12 @@ export function useMutation<Vars, T>(
     [borg],
   );
 
-  const reset = useCallback(() => setError(undefined), []);
+  const reset = useCallback(() => {
+    setError(undefined);
+    setData(undefined);
+  }, []);
 
-  return useMemo(() => ({ run, pending, error, reset }), [run, pending, error, reset]);
+  return useMemo(() => ({ run, pending, data, error, reset }), [run, pending, data, error, reset]);
 }
 
 /** Where a mount-scoped server stream currently stands. */
