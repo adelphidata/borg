@@ -46,3 +46,6 @@ issues/
 
 # Stray test artifacts (e.g. legacy apply_patch tests that wrote to CWD)
 borg_*.txt
+
+# Playwright MCP session artifacts (local only)
+/.playwright-mcp/
