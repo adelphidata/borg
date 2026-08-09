@@ -720,3 +720,29 @@ async fn monthly_aggregates_distinguish_no_rows_from_zero_cost() {
         cost.cost
     );
 }
+
+#[tokio::test]
+async fn daemon_status_reports_elapsed_uptime() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    // The service was constructed moments ago; after a real one-second wait
+    // the reported uptime must have advanced past zero. Regression guard for
+    // the hardcoded `uptime_secs: 0` this replaced.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let status = admin
+        .get_daemon_status(AdminEmpty {})
+        .await
+        .expect("daemon status")
+        .into_inner();
+    assert!(
+        status.uptime_secs >= 1,
+        "uptime must track elapsed wall-clock; got {}",
+        status.uptime_secs
+    );
+    assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+}

@@ -14,7 +14,8 @@ interface HealthCheck {
 }
 
 function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (n === 1) return `1 ${word}`;
+  return `${n} ${word.endsWith("s") ? `${word}es` : `${word}s`}`;
 }
 
 function fmtDuration(secs: number): string {
@@ -48,7 +49,8 @@ type HealthData = Awaited<ReturnType<typeof loadHealth>>;
 
 function buildChecks(d: HealthData): HealthCheck[] {
   const running = d.subprocesses.running.length;
-  const posture = d.posture.posture || "default";
+  // The daemon sends "Reduced" / "Default" / "Boosted"; compare case-blind.
+  const posture = (d.posture.posture || "default").toLowerCase();
   const heartbeatOn = d.heartbeat.nextInSeconds > 0;
 
   return [

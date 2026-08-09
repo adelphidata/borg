@@ -58,6 +58,8 @@ pub struct AdminSvc {
     process_registry: WiredSlot<ProcessRegistry>,
     goal_bus: WiredSlot<GoalEventBus>,
     tunnel_supervisor: WiredSlot<TunnelSupervisor>,
+    /// Construction time, so `GetDaemonStatus` can report a real uptime.
+    started_at: std::time::Instant,
 }
 
 impl AdminSvc {
@@ -73,6 +75,7 @@ impl AdminSvc {
             process_registry: WiredSlot::empty(),
             goal_bus: WiredSlot::empty(),
             tunnel_supervisor: WiredSlot::empty(),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -574,7 +577,7 @@ impl Admin for AdminSvc {
         let (cfg, active, paused, pending) = snapshot;
         Ok(Response::new(DaemonStatus {
             version: env!("CARGO_PKG_VERSION").into(),
-            uptime_secs: 0,
+            uptime_secs: self.started_at.elapsed().as_secs(),
             live_session_count: live_count,
             llm_provider: cfg.llm.provider.unwrap_or_default(),
             llm_model: cfg.llm.model,
