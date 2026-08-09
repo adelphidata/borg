@@ -4,7 +4,13 @@ import { pathToFileURL } from "node:url";
 import { registerBorgIpc } from "./ipc";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
-const indexHtml = path.join(__dirname, "..", "dist", "index.html");
+// Resolve against the app root (the directory holding package.json), not
+// __dirname: bun's bundler rewrites __dirname to the *source* directory
+// (electron/), which pointed the preload path at a file that only exists
+// in dist-electron/.
+const appRoot = app.getAppPath();
+const indexHtml = path.join(appRoot, "dist", "index.html");
+const preloadJs = path.join(appRoot, "dist-electron", "preload.js");
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -17,7 +23,7 @@ function createWindow() {
     trafficLightPosition: { x: 15, y: 14 },
     backgroundColor: "#0B0E0B", // matches dark theme so pre-paint frames don't flash white
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: preloadJs,
       contextIsolation: true,
       nodeIntegration: false,
     },
