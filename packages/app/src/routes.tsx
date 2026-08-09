@@ -5,7 +5,6 @@ import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionsPage } from "./features/connections/ConnectionsPage";
 import { HealthPage } from "./features/health/HealthPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
-import { routeAlerts } from "./data/mock";
 
 export interface AppRoute {
   id: string;
@@ -44,7 +43,6 @@ export const routes: AppRoute[] = [
     icon: PlugIcon,
     page: ConnectionsPage,
     section: "primary",
-    hasAlert: routeAlerts.connections,
   },
   {
     id: "health",
@@ -54,7 +52,6 @@ export const routes: AppRoute[] = [
     icon: ShieldIcon,
     page: HealthPage,
     section: "secondary",
-    hasAlert: routeAlerts.health,
   },
   {
     id: "settings",

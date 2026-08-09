@@ -10,8 +10,6 @@ import { PlatformProvider, type Platform } from "./lib/platform";
 import { useQuery } from "./lib/useDaemon";
 import { routes } from "./routes";
 
-const ONBOARDED_KEY = "borg.onboarded";
-
 // TODO(daemon): no RPC carries an operator identity yet; the footer stays static.
 const user = { name: "Operator", initials: "OP" };
 
@@ -19,11 +17,35 @@ function Shell({ platform }: { platform: Platform }) {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  // Re-listed on every navigation so fresh conversations appear immediately.
+  // Re-fetched on every navigation so fresh conversations and cleared
+  // warnings appear without a reload.
   const sessions = useQuery((borg) => borg.admin.listSessions({}), [location.key]);
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)
     .map((s) => ({ id: s.id, title: s.title || "Untitled" }));
+
+  // Attention dots: doctor warnings light Health, pending pairings light
+  // Connections. Unreachable daemon lights nothing — the pages say it better.
+  const alerts = useQuery(
+    async (borg) => {
+      const [warnings, pairings] = await Promise.all([
+        borg.admin.getPersistentWarnings({}),
+        borg.admin.listPairingRequests({}),
+      ]);
+      return {
+        health: warnings.warnings.length > 0,
+        connections: pairings.requests.some((r) => r.status === "pending"),
+      };
+    },
+    [location.key],
+  );
+  const navRoutes = routes.map((r) => ({
+    ...r,
+    hasAlert:
+      alerts.state === "ready" &&
+      ((r.id === "health" && alerts.data.health) ||
+        (r.id === "connections" && alerts.data.connections)),
+  }));
 
   return (
     <div className="flex h-full flex-col bg-surface transition-[background] duration-[250ms]">
@@ -34,7 +56,7 @@ function Shell({ platform }: { platform: Platform }) {
       <div className="flex min-h-0 flex-1">
         {!isMobile && (
           <Sidebar
-            routes={routes}
+            routes={navRoutes}
             recents={recents}
             onOpenRecent={(id) => navigate(`/c/${id}`)}
             onNewConversation={() => navigate("/c/new")}
@@ -52,7 +74,7 @@ function Shell({ platform }: { platform: Platform }) {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </div>
-      {isMobile && <TabBar routes={routes} />}
+      {isMobile && <TabBar routes={navRoutes} />}
     </div>
   );
 }
@@ -63,25 +85,32 @@ function Shell({ platform }: { platform: Platform }) {
  * Surfaces differ only in the `platform` they pass: the transport used to reach
  * borgd, and whether the window needs a custom title-bar drag strip.
  */
-export function BorgApp({ platform }: { platform: Platform }) {
-  const [onboarded, setOnboarded] = useState(() => localStorage.getItem(ONBOARDED_KEY) === "1");
+/**
+ * Gates the shell behind the daemon's onboarding flag. Only a positive
+ * "not onboarded yet" answer shows the wizard — when the daemon is down the
+ * shell renders and its pages explain the outage properly.
+ */
+function OnboardingGate({ platform }: { platform: Platform }) {
+  const onboarding = useQuery((borg) => borg.admin.getOnboardingState({}));
+  const [justFinished, setJustFinished] = useState(false);
 
+  if (onboarding.state === "loading") return null;
+  if (onboarding.state === "ready" && !onboarding.data.onboarded && !justFinished) {
+    return <OnboardingPage onDone={() => setJustFinished(true)} />;
+  }
+  return (
+    <HashRouter>
+      <Shell platform={platform} />
+    </HashRouter>
+  );
+}
+
+export function BorgApp({ platform }: { platform: Platform }) {
   return (
     <PlatformProvider platform={platform}>
       <ThemeProvider>
         <SettingsProvider>
-          {onboarded ? (
-            <HashRouter>
-              <Shell platform={platform} />
-            </HashRouter>
-          ) : (
-            <OnboardingPage
-              onDone={() => {
-                localStorage.setItem(ONBOARDED_KEY, "1");
-                setOnboarded(true);
-              }}
-            />
-          )}
+          <OnboardingGate platform={platform} />
         </SettingsProvider>
       </ThemeProvider>
     </PlatformProvider>
