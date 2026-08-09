@@ -20,6 +20,7 @@ export const CHORDS: Readonly<Record<string, string>> = {
   "new-conversation": "mod+n",
   "search-sessions": "mod+shift+f",
   "open-settings": "mod+,",
+  "toggle-activity": "mod+j",
   "cancel-turn": "escape",
   // No chord: reachable from the Help menu only. Dispatchable all the same.
 };

@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { PageChrome, useIsMobile } from "@borg/ui";
+import { AgentsIcon, PageChrome, useIsMobile } from "@borg/ui";
+import { AgentPanel } from "../agents/AgentPanel";
 import { DaemonState } from "../../components/DaemonState";
+import { useKeybind } from "../../lib/keybinds";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
 import { PlanPanel } from "./cells/PlanPanel";
@@ -14,6 +16,7 @@ export function ConversationPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const [compacting, setCompacting] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
   const {
     opened,
     cells,
@@ -33,6 +36,7 @@ export function ConversationPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useTurnNotifications(cells, busy, target);
+  useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
   // Follow the newest cell, like any chat surface.
   useEffect(() => {
@@ -43,7 +47,30 @@ export function ConversationPage() {
   const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
 
   return (
-    <PageChrome title={title} meta={meta} mobileBrandHeader>
+    <PageChrome
+      title={title}
+      meta={meta}
+      mobileBrandHeader
+      headerActions={
+        <button
+          type="button"
+          aria-label="Toggle activity panel"
+          aria-pressed={activityOpen}
+          onClick={() => setActivityOpen((v) => !v)}
+          className={`flex h-7 w-7 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent ${
+            activityOpen ? "text-neon-ink" : "text-ink3 hover:text-ink"
+          }`}
+        >
+          <AgentsIcon size={15} />
+        </button>
+      }
+      aside={
+        activityOpen ? (
+          // Empty resolves to the daemon's active session, which is this one.
+          <AgentPanel sessionId="" onClose={() => setActivityOpen(false)} />
+        ) : undefined
+      }
+    >
       <div className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}>
         <div
           className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
