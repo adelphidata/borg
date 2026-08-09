@@ -1,6 +1,15 @@
 @import "tailwindcss";
 
 /*
+ * Tailwind's auto-detection stops at node_modules, and every surface reaches
+ * these packages through a workspace symlink — without these the shared
+ * components ship with no utility classes at all. Paths are relative to this
+ * file; each app's own src/ is still auto-detected.
+ */
+@source "../../src";
+@source "../../../app/src";
+
+/*
  * Theme tokens. Light is the default; [data-theme="dark"] swaps the palette at
  * runtime (see src/lib/theme.tsx), so these stay plain CSS variables and the
  * @theme block below maps them into Tailwind utilities (bg-surface, text-ink…).
