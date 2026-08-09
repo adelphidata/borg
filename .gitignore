@@ -4,8 +4,7 @@ node_modules/
 dist-electron/
 release/
 *.tsbuildinfo
-apps/*/dist/*
-!apps/web/dist/.gitkeep
+apps/*/dist/
 
 # OS files
 .DS_Store

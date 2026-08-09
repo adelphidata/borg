@@ -10,8 +10,8 @@ use rust_embed::RustEmbed;
 /// is picked up without recompiling borgd. Release builds bake the files in, so
 /// one `borgd` binary is the daemon *and* its web UI.
 ///
-/// `apps/web/dist` is committed with a `.gitkeep` so a clean checkout compiles
-/// before anyone has run the web build; an empty set falls back to
+/// `build.rs` creates the folder when it is missing, so a clean checkout
+/// compiles before anyone has run the web build; an empty set falls back to
 /// [`not_bundled`] rather than 404ing.
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/../../apps/web/dist"]

@@ -2,7 +2,7 @@
   "name": "@borg/client",
   "version": "0.1.0",
   "private": true,
-  "description": "Generated gRPC client for borgd — one typed API, node (UDS) and browser (gRPC-Web) transports",
+  "description": "Generated gRPC client for borgd \u2014 one typed API, node (UDS) and browser (gRPC-Web) transports",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -11,7 +11,8 @@
     "./web": "./src/web.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "bun scripts/smoke.mjs"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.10.1",
