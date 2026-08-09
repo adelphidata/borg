@@ -2,7 +2,11 @@ import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerBorgIpc } from "./ipc";
+import { installApplicationMenu } from "./menu";
 import { registerNativeIpc } from "./native";
+import { registerQuickEntry } from "./quick-entry";
+import { registerUpdater } from "./updater";
+import { loadWindowState, trackWindowState } from "./window-state";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 // Resolve against the app root (the directory holding package.json), not
@@ -13,10 +17,18 @@ const appRoot = app.getAppPath();
 const indexHtml = path.join(appRoot, "dist", "index.html");
 const preloadJs = path.join(appRoot, "dist-electron", "preload.js");
 
+/** Summons the quick-entry panel from anywhere in the OS. */
+const QUICK_ENTRY_HOTKEY = "CmdOrCtrl+Shift+Space";
+
+let mainWindow: BrowserWindow | null = null;
+
 function createWindow() {
+  const saved = loadWindowState();
   const win = new BrowserWindow({
-    width: 1240,
-    height: 800,
+    width: saved.width ?? 1240,
+    height: saved.height ?? 800,
+    x: saved.x,
+    y: saved.y,
     minWidth: 360,
     minHeight: 600,
     show: false, // shown on ready-to-show to avoid a blank-window flash
@@ -30,7 +42,11 @@ function createWindow() {
     },
   });
 
-  win.once("ready-to-show", () => win.show());
+  win.once("ready-to-show", () => {
+    if (saved.maximized) win.maximize();
+    win.show();
+  });
+  trackWindowState(win);
 
   // Security: only hand http(s) URLs to the OS — file:, smb:, custom schemes stay blocked.
   const openExternally = (url: string) => {
@@ -75,21 +91,58 @@ function createWindow() {
   } else {
     win.loadFile(indexHtml);
   }
+
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+    // `window-all-closed` never fires while the hidden quick-entry panel
+    // exists, so closing the last real window would otherwise leave an
+    // invisible app running on Windows and Linux.
+    if (process.platform !== "darwin") app.quit();
+  });
+  mainWindow = win;
+  return win;
 }
 
-app.whenReady().then(() => {
-  const borg = registerBorgIpc();
-  const native = registerNativeIpc();
-  app.once("will-quit", () => {
-    borg.dispose();
-    native.dispose();
+// A second launch — from the dock, a file open, or a stray CLI invocation —
+// must raise the window that already exists rather than start a rival instance
+// fighting it for the same daemon socket.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
 
-  createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  app.whenReady().then(() => {
+    const borg = registerBorgIpc();
+    const native = registerNativeIpc(() => mainWindow);
+    // In dev there is no published feed, so checking would only log failures.
+    const updater = registerUpdater({ enabled: !isDev && app.isPackaged });
+    const quickEntry = registerQuickEntry({
+      accelerator: QUICK_ENTRY_HOTKEY,
+      isDev,
+      devServerUrl: process.env.VITE_DEV_SERVER_URL,
+      indexHtml,
+      preload: preloadJs,
+    });
+
+    app.once("will-quit", () => {
+      borg.dispose();
+      native.dispose();
+      updater.dispose();
+      quickEntry.dispose();
+    });
+
+    installApplicationMenu();
+    createWindow();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

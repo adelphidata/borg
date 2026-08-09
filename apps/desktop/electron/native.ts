@@ -27,7 +27,14 @@ export function activateSession(window: BrowserWindow, sessionId: string): void 
   window.webContents.send(CHANNELS.activateSession, sessionId);
 }
 
-export function registerNativeIpc(): { dispose(): void } {
+/**
+ * Registers the native handlers.
+ *
+ * `mainWindow` is read lazily rather than captured: the window can be closed
+ * and recreated (macOS dock activate), and a stale reference would send the
+ * reveal to a destroyed window.
+ */
+export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dispose(): void } {
   ipcMain.handle(CHANNELS.notify, (event, notification: WireNotification) => {
     if (!Notification.isSupported()) return;
 
@@ -58,6 +65,17 @@ export function registerNativeIpc(): { dispose(): void } {
     shown.show();
   });
 
+  // The quick-entry panel starts a turn and then gets out of the way; the
+  // conversation itself belongs in the main window.
+  ipcMain.handle(CHANNELS.revealSession, (_event, sessionId: string) => {
+    const win = mainWindow();
+    if (win) activateSession(win, sessionId);
+  });
+
+  ipcMain.handle(CHANNELS.hideWindow, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.hide();
+  });
+
   ipcMain.handle(CHANNELS.setBadge, (_event, count: number) => {
     // Linux support depends on the desktop environment; Electron no-ops there.
     if (typeof app.setBadgeCount === "function") app.setBadgeCount(Math.max(0, count));
@@ -68,6 +86,8 @@ export function registerNativeIpc(): { dispose(): void } {
       for (const notification of live.values()) notification.close();
       live.clear();
       ipcMain.removeHandler(CHANNELS.notify);
+      ipcMain.removeHandler(CHANNELS.revealSession);
+      ipcMain.removeHandler(CHANNELS.hideWindow);
       ipcMain.removeHandler(CHANNELS.setBadge);
     },
   };

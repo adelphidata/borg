@@ -79,6 +79,12 @@ const native: NativeBridge = {
   notify: (notification) => {
     void ipcRenderer.invoke(CHANNELS.notify, notification satisfies WireNotification);
   },
+  revealSession: (sessionId) => {
+    void ipcRenderer.invoke(CHANNELS.revealSession, sessionId);
+  },
+  hideWindow: () => {
+    void ipcRenderer.invoke(CHANNELS.hideWindow);
+  },
   setBadgeCount: (count) => {
     void ipcRenderer.invoke(CHANNELS.setBadge, count);
   },

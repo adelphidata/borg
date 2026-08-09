@@ -1,9 +1,12 @@
 # Packaging for the Borg desktop app. Driven by .github/workflows/release-desktop.yml
 # on a `desktop-v*` tag.
 #
-# TODO(signing): artifacts are unsigned. macOS needs a Developer ID cert plus
-# notarization (set CSC_LINK/CSC_KEY_PASSWORD and notarize.teamId); Windows needs
-# an Authenticode cert. Until then users must clear Gatekeeper/SmartScreen by hand.
+# Signing is credential-gated, not code-gated. macOS signs and notarizes when
+# CSC_LINK / CSC_KEY_PASSWORD / APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+# APPLE_TEAM_ID are present, and Windows signs when CSC_LINK is; a local build
+# with none of them set still produces working (unsigned) artifacts, so a
+# contributor without certificates is never blocked. Users of an unsigned build
+# still have to clear Gatekeeper/SmartScreen by hand.
 appId: dev.borg.desktop
 productName: Borg
 copyright: Borg Contributors
@@ -17,13 +20,25 @@ files:
   - dist/**
   - dist-electron/**
 
+# Where electron-updater looks for new builds. It reads the same block, so the
+# feed and the release target can never disagree.
+publish:
+  provider: github
+  owner: borganization
+  repo: borg
+
 mac:
   category: public.app-category.productivity
   target:
     - dmg
     - zip
-  # No Developer ID yet; see TODO(signing) above.
-  identity: null
+  # Hardened runtime is a prerequisite for notarization.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Signed when a Developer ID is available; unsigned local builds still work.
+  notarize: true
 
 win:
   target:

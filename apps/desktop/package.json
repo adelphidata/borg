@@ -2,7 +2,7 @@
   "name": "@borg/desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop client for Borg \u2014 your personal assistant, employee, developer, analyst, and sidekick",
+  "description": "Desktop client for Borg — your personal assistant, employee, developer, analyst, and sidekick",
   "license": "MIT",
   "author": "Borg Contributors",
   "main": "dist-electron/main.js",
@@ -33,9 +33,10 @@
     "electron-builder": "^26.0.12"
   },
   "dependencies": {
-    "@borg/client": "workspace:*",
     "@borg/app": "workspace:*",
+    "@borg/client": "workspace:*",
     "@borg/ui": "workspace:*",
+    "electron-updater": "^6.8.9",
     "lucide-react": "^1.30.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

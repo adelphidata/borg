@@ -21,6 +21,7 @@ export const CHORDS: Readonly<Record<string, string>> = {
   "search-sessions": "mod+shift+f",
   "open-settings": "mod+,",
   "cancel-turn": "escape",
+  // No chord: reachable from the Help menu only. Dispatchable all the same.
 };
 
 type Handler = () => void;

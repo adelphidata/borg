@@ -5,7 +5,9 @@ import { dispatchKeybind, installKeybinds, useKeybind } from "./lib/keybinds";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
+import { QuickEntryPage } from "./features/quick/QuickEntryPage";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
+import { UpdatePill } from "./components/UpdatePill";
 import { SettingsProvider } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useMutation, useQuery } from "./lib/useDaemon";
@@ -27,6 +29,11 @@ function KeyboardLayer() {
 
   useEffect(() => installKeybinds(window, /macintosh|mac os x/i.test(navigator.userAgent)), []);
   useEffect(() => native.onMenuCommand((action) => void dispatchKeybind(action)), [native]);
+  // A clicked notification, or a turn started from the quick-entry panel.
+  useEffect(
+    () => native.onActivateSession((sessionId) => navigate(`/c/${sessionId}`)),
+    [native, navigate],
+  );
 
   useKeybind("new-conversation", () => navigate("/c/new"));
   useKeybind("open-settings", () => navigate("/settings"));
@@ -118,6 +125,7 @@ function Shell({ platform }: { platform: Platform }) {
         </Routes>
       </div>
       {isMobile && <TabBar routes={navRoutes} />}
+      <UpdatePill />
     </div>
   );
 }
@@ -148,7 +156,29 @@ function OnboardingGate({ platform }: { platform: Platform }) {
   );
 }
 
+/**
+ * True when this renderer is the quick-entry panel.
+ *
+ * Read from the hash once rather than routed: the panel is its own
+ * `BrowserWindow` loaded at `#/quick` and never navigates, and keeping it
+ * outside the router means it skips the onboarding gate and the settings
+ * fetch — neither of which a one-line capture box has any use for.
+ */
+function isQuickEntry(): boolean {
+  return window.location.hash.startsWith("#/quick");
+}
+
 export function BorgApp({ platform }: { platform: Platform }) {
+  if (isQuickEntry()) {
+    return (
+      <PlatformProvider platform={platform}>
+        <ThemeProvider>
+          <QuickEntryPage />
+        </ThemeProvider>
+      </PlatformProvider>
+    );
+  }
+
   return (
     <PlatformProvider platform={platform}>
       <ThemeProvider>

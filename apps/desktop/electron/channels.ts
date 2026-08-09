@@ -16,6 +16,8 @@ export const CHANNELS = {
   menuCommand: "borg:native:menu", // main → renderer, carries a keybind action id
   activateSession: "borg:native:activate", // main → renderer, focus this session
   notify: "borg:native:notify", // renderer → main
+  revealSession: "borg:native:reveal", // renderer → main, raise the main window
+  hideWindow: "borg:native:hide", // renderer → main, dismiss this window
   setBadge: "borg:native:badge", // renderer → main
   updateStatus: "borg:native:update:status", // main → renderer
   updateCheck: "borg:native:update:check", // renderer → main

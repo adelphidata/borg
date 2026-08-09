@@ -38,6 +38,10 @@ export interface NativeBridge {
   notify(notification: NativeNotification): void;
   /** The user clicked a notification, or the quick-entry window sent a turn. */
   onActivateSession(handler: (sessionId: string) => void): () => void;
+  /** Brings the main window forward and opens `sessionId` there. */
+  revealSession(sessionId: string): void;
+  /** Dismisses the window this renderer is in. Used by the quick-entry panel. */
+  hideWindow(): void;
   /** Dock/taskbar badge. 0 clears it. */
   setBadgeCount(count: number): void;
   updates: {
@@ -56,6 +60,8 @@ export const NO_NATIVE: NativeBridge = {
   onMenuCommand: unsubscribe,
   notify: noop,
   onActivateSession: unsubscribe,
+  revealSession: noop,
+  hideWindow: noop,
   setBadgeCount: noop,
   updates: {
     subscribe: unsubscribe,

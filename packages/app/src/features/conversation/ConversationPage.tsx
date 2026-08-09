@@ -7,6 +7,7 @@ import { ContextBar } from "./ContextBar";
 import { PlanPanel } from "./cells/PlanPanel";
 import { TranscriptCell } from "./cells";
 import { useConversation } from "./useConversation";
+import { useTurnNotifications } from "./useTurnNotifications";
 
 export function ConversationPage() {
   const { sessionId: target } = useParams();
@@ -30,6 +31,8 @@ export function ConversationPage() {
     context,
   } = useConversation(target);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  useTurnNotifications(cells, busy, target);
 
   // Follow the newest cell, like any chat surface.
   useEffect(() => {
