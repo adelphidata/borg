@@ -1,0 +1,56 @@
+import type { ReactNode } from "react";
+import { Pill } from "@borg/ui";
+import { usePlatform } from "../lib/platform";
+import { signOut } from "../lib/session";
+import type { Query } from "../lib/useDaemon";
+
+/**
+ * Renders the three outcomes of a daemon call so pages do not each invent their
+ * own spinner and error copy.
+ *
+ * The two failures worth distinguishing are the two a user can act on:
+ * borgd being down, and the browser's token being rejected. Everything else is
+ * reported verbatim.
+ */
+export function DaemonState<T>({
+  query,
+  label,
+  children,
+}: {
+  query: Query<T>;
+  /** What was being fetched, used in the failure line: "Could not load {label}." */
+  label: string;
+  children: (data: T) => ReactNode;
+}) {
+  const { kind } = usePlatform();
+
+  if (query.state === "loading") {
+    return <div className="text-[13px] leading-none text-ink3">Loading {label}…</div>;
+  }
+
+  if (query.state === "error") {
+    const { error } = query;
+    const message = error.isUnavailable
+      ? "Borg is not running. Start it with `borg daemon`."
+      : error.isUnauthenticated
+        ? "This token was rejected. Issue a new one with `borg client-token issue web`."
+        : error.message;
+
+    return (
+      <div className="flex flex-col items-start gap-3 rounded-xl border border-alert bg-alert-soft px-4 py-[15px]">
+        <div className="text-[13px] leading-[1.3] font-medium text-ink">
+          Could not load {label}.
+        </div>
+        <div className="text-[12.5px] leading-[1.4] text-ink2">{message}</div>
+        {/* Only the browser holds a token, so only it can clear one. */}
+        {kind === "web" && error.isUnauthenticated && (
+          <Pill variant="danger" onClick={signOut}>
+            Sign in again
+          </Pill>
+        )}
+      </div>
+    );
+  }
+
+  return <>{children(query.data)}</>;
+}

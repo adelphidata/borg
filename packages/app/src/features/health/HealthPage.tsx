@@ -1,13 +1,17 @@
 import { useState } from "react";
 import { CheckIcon, MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from "@borg/ui";
 import { checks } from "../../data/mock";
+import { useQuery } from "../../lib/useDaemon";
+import { DaemonState } from "../../components/DaemonState";
 
 export function HealthPage() {
   const isMobile = useIsMobile();
   const [openId, setOpenId] = useState<string | null>(null);
-  // No daemon yet — "Check again" just refreshes the mock timestamp.
-  const [lastChecked, setLastChecked] = useState("a few minutes ago");
+  const [refresh, setRefresh] = useState(0);
+  // TODO(daemon): the per-check rows still come from mock data. Vitals are live.
+  const vitals = useQuery((borg) => borg.status.getVitals({}), [refresh]);
   const failing = checks.filter((c) => !c.ok);
+  const lastChecked = vitals.state === "loading" ? "checking…" : "just now";
 
   return (
     <PageChrome title="Health" meta={`last checked ${lastChecked}`}>
@@ -29,6 +33,31 @@ export function HealthPage() {
               </p>
             </div>
           </div>
+
+          <DaemonState query={vitals} label="vitals">
+            {(v) => (
+              <div className="flex flex-wrap gap-x-8 gap-y-3">
+                {(
+                  [
+                    ["Stage", v.stage],
+                    ["XP", v.xp],
+                    ["Stability", v.stability],
+                    ["Focus", v.focus],
+                    ["Sync", v.sync],
+                    ["Growth", v.growth],
+                    ["Happiness", v.happiness],
+                  ] as const
+                ).map(([name, value]) => (
+                  <div key={name}>
+                    <div className="text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
+                      {name}
+                    </div>
+                    <div className="mt-1.5 text-[15px] leading-none text-ink">{value}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </DaemonState>
 
           <div>
             {checks.map((c) => {
@@ -64,7 +93,7 @@ export function HealthPage() {
           </div>
 
           <div className="flex gap-[9px]">
-            <Pill variant="primary" onClick={() => setLastChecked("just now")}>
+            <Pill variant="primary" onClick={() => setRefresh((n) => n + 1)}>
               Check again
             </Pill>
             <Pill>Tidy up now</Pill>

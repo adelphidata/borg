@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BorgApp, type Platform } from "@borg/app";
 import { createWebTransport } from "@borg/client/web";
 import { STORAGE_KEYS } from "@borg/ui";
+import { TokenGate } from "./TokenGate";
 import "@borg/ui/styles/fonts.css";
 import "@borg/ui/styles/app.css";
 
@@ -12,7 +13,7 @@ import "@borg/ui/styles/app.css";
  *
  * The browser can speak neither borgd's unix socket nor its mTLS TCP port, so
  * it goes through the gateway's gRPC-Web mount and authenticates with a client
- * token (issue one with `borg token issue`).
+ * token (issue one with `borg client-token issue <label>`).
  */
 const platform: Platform = {
   kind: "web",
@@ -25,6 +26,11 @@ const platform: Platform = {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BorgApp platform={platform} />
+    {/* The gate sits outside BorgApp (which owns ThemeProvider). It needs no
+        theme context — the pre-paint script has already set data-theme, and its
+        colours come from the same CSS variables. */}
+    <TokenGate>
+      <BorgApp platform={platform} />
+    </TokenGate>
   </StrictMode>,
 );
