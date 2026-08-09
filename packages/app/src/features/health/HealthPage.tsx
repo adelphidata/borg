@@ -11,6 +11,15 @@ interface HealthCheck {
   ok: boolean;
   /** Plain-language explanation revealed when the row is expanded. */
   detail: string;
+  /** Optional lines rendered as a bullet list under the detail. */
+  items?: string[];
+}
+
+/** Splits a `Category:message` warning into its two halves. */
+export function splitWarning(warning: string): { label: string; text: string } {
+  const colon = warning.indexOf(":");
+  if (colon <= 0) return { label: "", text: warning.trim() };
+  return { label: warning.slice(0, colon).trim(), text: warning.slice(colon + 1).trim() };
 }
 
 function plural(n: number, word: string): string {
@@ -74,7 +83,8 @@ function buildChecks(d: HealthData): HealthCheck[] {
       detail:
         d.warnings.warnings.length === 0
           ? "The last check-up found nothing that needs you."
-          : d.warnings.warnings.join(" · "),
+          : "These checks need a look:",
+      items: d.warnings.warnings.length === 0 ? undefined : d.warnings.warnings,
     },
     {
       id: "posture",
@@ -232,6 +242,27 @@ export function HealthPage() {
                           <p className="mt-2.5 mb-0 text-[13px] leading-[1.6] text-pretty text-ink2">
                             {c.detail}
                           </p>
+                          {c.items && (
+                            <ul className="m-0 flex list-none flex-col gap-[7px] p-0">
+                              {c.items.map((item) => {
+                                const { label, text } = splitWarning(item);
+                                return (
+                                  <li
+                                    key={item}
+                                    className="flex gap-[9px] text-[13px] leading-[1.5] text-ink2"
+                                  >
+                                    <span className="mt-[7px] h-[3px] w-[3px] flex-none rounded-full bg-ink3" />
+                                    <span className="text-pretty">
+                                      {label && (
+                                        <span className="text-ink3">{label}&thinsp;—&thinsp;</span>
+                                      )}
+                                      {text}
+                                    </span>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
                         </div>
                       )}
                     </div>
