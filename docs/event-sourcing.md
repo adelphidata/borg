@@ -275,7 +275,7 @@ for a real reason. Coverage targets:
 - **Migration test**: `migrate_v10` is idempotent and a v9 DB with existing
   vitals/bond/evolution/audit chains still verifies after upgrade.
 
-CI continues to gate at 80% line coverage (`cargo llvm-cov --fail-under-lines 80`);
+CI continues to gate at 85% line coverage (`cargo llvm-cov --fail-under-lines 85`);
 the engine consolidation should *raise* coverage by collapsing five lightly-
 tested loops into one heavily-tested one.
 
