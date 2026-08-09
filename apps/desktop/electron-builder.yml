@@ -1,0 +1,36 @@
+# Packaging for the Borg desktop app. Driven by .github/workflows/release-desktop.yml
+# on a `desktop-v*` tag.
+#
+# TODO(signing): artifacts are unsigned. macOS needs a Developer ID cert plus
+# notarization (set CSC_LINK/CSC_KEY_PASSWORD and notarize.teamId); Windows needs
+# an Authenticode cert. Until then users must clear Gatekeeper/SmartScreen by hand.
+appId: dev.borg.desktop
+productName: Borg
+copyright: Borg Contributors
+
+directories:
+  output: release
+  buildResources: build
+
+# Only the built output ships — Vite and Bun have already bundled everything.
+files:
+  - dist/**
+  - dist-electron/**
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+  # No Developer ID yet; see TODO(signing) above.
+  identity: null
+
+win:
+  target:
+    - nsis
+
+linux:
+  category: Utility
+  target:
+    - AppImage
+    - deb

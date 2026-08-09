@@ -10,8 +10,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Which surfaces did this change touch? Filtering here (rather than with
+  # top-level `paths:`) keeps every job present as a required check — a skipped
+  # job still reports success, a filtered-out workflow reports nothing.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deny.toml'
+              - '.github/workflows/**'
+            web:
+              - 'apps/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'buf.gen.yaml'
+              - '.github/workflows/**'
+              # Proto changes flip both: Rust regenerates via build.rs, and the
+              # committed TypeScript client must be regenerated to match.
+              - 'crates/protocols/proto/**'
+
   fmt:
     name: Format
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -23,6 +58,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -44,6 +81,8 @@ jobs:
 
   test:
     name: Test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -64,6 +103,8 @@ jobs:
 
   build:
     name: Build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -84,6 +125,8 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,6 +158,8 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -132,6 +177,8 @@ jobs:
 
   deny:
     name: Dependency Check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -151,6 +198,8 @@ jobs:
   # `release.yml`.
   windows-sandbox:
     name: Windows Sandbox
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -178,3 +227,35 @@ jobs:
         # the runner. See `crates/sandbox/tests/windows_ffi_smoke.rs`
         # for the carve-out vs full-VM validation.
         run: cargo test -p sandbox --test windows_ffi_smoke
+
+  gen-drift:
+    name: Proto codegen drift
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # The committed TypeScript client must match crates/protocols/proto. If it
+      # does not, a proto change landed without regenerating — run `just gen`.
+      - run: bun x buf generate
+      - run: git diff --exit-code packages/client/src/gen
+
+  web:
+    name: Web surfaces
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Format check
+        run: bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
+      - name: Typecheck every package
+        run: bun run --filter '*' typecheck
+      - name: Build browser SPA
+        run: bun run --cwd apps/web build
+      - name: Build desktop app
+        run: bun run --cwd apps/desktop build

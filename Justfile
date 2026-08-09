@@ -129,3 +129,44 @@ clean:
 # Wipe all config/data so you can re-run onboarding from scratch
 reset:
     rm -rf ~/.borg
+
+# ── Web surfaces (apps/, packages/) ──────────────────────────────────────────
+# The desktop app, the browser SPA, and their shared packages are one Bun
+# workspace. `just gen` regenerates the TypeScript client from the same protos
+# `crates/protocols/build.rs` compiles for Rust.
+
+# Install workspace dependencies
+web-install:
+    bun install
+
+# Regenerate the TypeScript gRPC client from crates/protocols/proto
+gen:
+    bun x buf generate
+
+# Fail if the committed client is out of date with the protos
+gen-check: gen
+    git diff --exit-code packages/client/src/gen
+
+# Typecheck + format-check every TypeScript package
+web-lint:
+    bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
+    bun run --filter '*' typecheck
+
+# Build the browser SPA. Run before `cargo build` — borgd embeds apps/web/dist.
+web-build:
+    bun run --cwd apps/web build
+
+# Browser SPA dev server (proxies /grpc to a local borgd on :7842)
+web-dev:
+    bun run --cwd apps/web dev
+
+# Desktop app in dev (Vite + Electron with hot reload)
+desktop-dev:
+    bun run --cwd apps/desktop dev
+
+# Build the desktop app (renderer + Electron main)
+desktop-build:
+    bun run --cwd apps/desktop build
+
+# Everything CI runs for the web surfaces
+web-ci: web-install gen-check web-lint web-build desktop-build

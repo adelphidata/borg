@@ -1,4 +1,4 @@
-name: Release
+name: Release (borg + borgd)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
   push:
-    tags: ["v*"]
+    tags: ["borg-v*", "v*"]
 
 permissions:
   contents: write
@@ -22,7 +22,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
-      tag: v${{ inputs.version }}
+      tag: borg-v${{ inputs.version }}
     steps:
       - name: Validate version format
         run: |
@@ -35,14 +35,14 @@ jobs:
           fetch-depth: 0
       - name: Check tag does not exist
         run: |
-          if git tag -l "v${{ inputs.version }}" | grep -q .; then
-            echo "::error::Tag v${{ inputs.version }} already exists"
+          if git tag -l "borg-v${{ inputs.version }}" | grep -q .; then
+            echo "::error::Tag borg-v${{ inputs.version }} already exists"
             exit 1
           fi
       - name: Create and push tag
         run: |
-          git tag "v${{ inputs.version }}"
-          git push origin "v${{ inputs.version }}"
+          git tag "borg-v${{ inputs.version }}"
+          git push origin "borg-v${{ inputs.version }}"
 
   build:
     name: Build (${{ matrix.asset }})
@@ -86,6 +86,14 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
+      - uses: oven-sh/setup-bun@v2
+      - name: Build web UI
+        # ORDER MATTERS: borgd embeds apps/web/dist via rust-embed at compile
+        # time. Building this after cargo would ship a binary with no web UI.
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd apps/web build
+          test -f apps/web/dist/index.html
       - name: Run tests
         run: cargo test --target ${{ matrix.target }}
       - name: Build release binaries

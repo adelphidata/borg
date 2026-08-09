@@ -21,6 +21,38 @@ Cargo workspace, no-prefix crate names:
 
 iMessage is macOS-only via `#[cfg(target_os = "macos")]`. Smaller crates (apply-patch, sandbox, heartbeat, plugins) enforce `#![warn(missing_docs)]`.
 
+### Web surfaces (TypeScript)
+
+A Bun workspace alongside the crates. **Package manager is Bun**, not npm/yarn/pnpm.
+
+| Package | Purpose |
+|---------|---------|
+| `apps/desktop` | Electron shell. Main process holds the gRPC channel to borgd's unix socket; the renderer reaches it over a typed IPC bridge |
+| `apps/web` | Browser SPA. Served by the gateway at `/ui/`, embedded into `borgd` via rust-embed |
+| `packages/app` | The product: routes, feature pages, providers. Shared verbatim by both apps |
+| `packages/ui` | Design system. Presentational only — every component takes data via props |
+| `packages/client` | Generated gRPC client + the `BorgTransport` seam, with a node (UDS) and a web (gRPC-Web) implementation |
+
+Both apps are thin shells: they build a transport, name their platform, and mount `<BorgApp/>`. A feature is written once in `packages/app` and appears on both.
+
+**The transport seam is the invariant.** Feature code calls `createBorgClient(transport)` and never learns which surface it is on. Desktop goes IPC → unix socket (authenticated by file permissions); the browser goes gRPC-Web → the gateway's `/grpc` mount (authenticated by a client token). Adding a second hand-written client is the failure mode to avoid.
+
+### Web surfaces (TypeScript)
+
+A Bun workspace alongside the crates. **Package manager is Bun**, not npm/yarn/pnpm.
+
+| Package | Purpose |
+|---------|---------|
+| `apps/desktop` | Electron shell. Main process holds the gRPC channel to borgd's unix socket; the renderer reaches it over a typed IPC bridge |
+| `apps/web` | Browser SPA. Served by the gateway at `/ui/`, embedded into `borgd` via rust-embed |
+| `packages/app` | The product: routes, feature pages, providers. Shared verbatim by both apps |
+| `packages/ui` | Design system. Presentational only — every component takes data via props |
+| `packages/client` | Generated gRPC client + the `BorgTransport` seam, with a node (UDS) and a web (gRPC-Web) implementation |
+
+Both apps are thin shells: they build a transport, name their platform, and mount `<BorgApp/>`. A feature is written once in `packages/app` and appears on both.
+
+**The transport seam is the invariant.** Feature code calls `createBorgClient(transport)` and never learns which surface it is on. Desktop goes IPC → unix socket (authenticated by file permissions); the browser goes gRPC-Web → the gateway's `/grpc` mount (authenticated by a client token). Adding a second hand-written client is the failure mode to avoid.
+
 ## Build & Test
 
 ```sh
@@ -39,6 +71,44 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 **Autofixing lints.** Prefer `cargo fixit` over `cargo clippy --fix` — it's a drop-in replacement and dramatically faster (up to ~120x on large workspaces). Install with `cargo install cargo-fixit`; it's a local convenience, not wired into CI or the `justfile`. The maintainer is a contributor to it, so bug reports and rough edges are worth surfacing rather than working around.
 
 **Live-LLM/live-MCP lanes (real network) are opt-in** — see `crates/cortex/tests/live_network_integration.rs` and `crates/mcp/tests/live_mcp.rs`. Default `cargo test` stays hermetic.
+
+### Web surfaces
+
+```sh
+just web-install     # bun install (workspace)
+just gen             # regenerate packages/client/src/gen from crates/protocols/proto
+just gen-check       # fail if the committed client drifted from the protos
+just web-lint        # prettier --check + typecheck every package
+just web-build       # build apps/web (REQUIRED before cargo build — borgd embeds it)
+just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
+just desktop-dev     # Vite + Electron with hot reload
+just web-ci          # everything CI runs for the web side
+```
+
+**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. CI's `gen-drift` job fails otherwise.
+
+**Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
+
+**Two release trains.** `borg-v*` tags build the Rust binaries (with the SPA embedded); `desktop-v*` tags build the Electron installers. Neither triggers the other.
+
+### Web surfaces
+
+```sh
+just web-install     # bun install (workspace)
+just gen             # regenerate packages/client/src/gen from crates/protocols/proto
+just gen-check       # fail if the committed client drifted from the protos
+just web-lint        # prettier --check + typecheck every package
+just web-build       # build apps/web (REQUIRED before cargo build — borgd embeds it)
+just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
+just desktop-dev     # Vite + Electron with hot reload
+just web-ci          # everything CI runs for the web side
+```
+
+**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. CI's `gen-drift` job fails otherwise.
+
+**Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
+
+**Two release trains.** `borg-v*` tags build the Rust binaries (with the SPA embedded); `desktop-v*` tags build the Electron installers. Neither triggers the other.
 
 LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude Code CLI.
 

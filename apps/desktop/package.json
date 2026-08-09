@@ -2,7 +2,7 @@
   "name": "@borg/desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop client for Borg — your personal assistant, employee, developer, analyst, and sidekick",
+  "description": "Desktop client for Borg \u2014 your personal assistant, employee, developer, analyst, and sidekick",
   "license": "MIT",
   "author": "Borg Contributors",
   "main": "dist-electron/main.js",
@@ -13,7 +13,9 @@
     "build:electron": "bun build ./electron/main.ts ./electron/preload.ts --outdir dist-electron --target node --format cjs --external electron",
     "build": "vite build && bun run build:electron",
     "start": "bun run build && electron .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dist": "bun run build && electron-builder --config electron-builder.yml",
+    "pack": "bun run build && electron-builder --config electron-builder.yml --dir"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
@@ -27,7 +29,8 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
-    "wait-on": "^9.1.0"
+    "wait-on": "^9.1.0",
+    "electron-builder": "^26.0.12"
   },
   "dependencies": {
     "@borg/client": "workspace:*",
