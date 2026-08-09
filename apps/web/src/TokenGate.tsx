@@ -45,7 +45,7 @@ export function TokenGate({ children }: { children: ReactNode }) {
           className="w-full rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon"
         />
 
-        <Pill variant="primary" style={{ alignSelf: "flex-start" }} onClick={save}>
+        <Pill variant="primary" className="self-start" onClick={save}>
           Continue
         </Pill>
       </div>

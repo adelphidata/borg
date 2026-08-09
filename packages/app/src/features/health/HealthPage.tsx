@@ -23,7 +23,7 @@ export function HealthPage() {
             <span className="flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] border-neon shadow-(--plateGlow)">
               <CheckIcon size={22} />
             </span>
-            <div style={{ flex: 1, paddingTop: 2 }}>
+            <div className="flex-1 pt-0.5">
               <h1 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">
                 Borg is healthy.
               </h1>
@@ -69,10 +69,9 @@ export function HealthPage() {
                     onClick={() => setOpenId((id) => (id === c.id ? null : c.id))}
                   >
                     <span
-                      className="h-[7px] w-[7px] flex-none rounded-full"
-                      style={{
-                        background: c.ok ? "var(--neon)" : "var(--alert)",
-                      }}
+                      className={`h-[7px] w-[7px] flex-none rounded-full ${
+                        c.ok ? "bg-neon" : "bg-alert"
+                      }`}
                     />
                     <span className="flex-1 text-[14px] leading-[1.35] text-ink">{c.name}</span>
                     <span className="text-right text-[12.5px] leading-[1.35] text-ink3">

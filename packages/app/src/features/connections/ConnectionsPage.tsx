@@ -47,7 +47,7 @@ function ConnList({ open }: { open: (id: string) => void }) {
           onClick={() => open(c.id)}
         >
           <Badge sizeClasses="h-[30px] w-[30px] rounded-[9px] text-[10.5px]">{c.badge}</Badge>
-          <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="min-w-0 flex-1">
             <div className="text-[13.5px] leading-[1.25] font-medium text-ink">{c.name}</div>
             <div className="mt-[3px] text-[11.5px] leading-[1.3] text-ink3">{c.sub}</div>
           </div>

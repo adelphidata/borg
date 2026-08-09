@@ -37,7 +37,7 @@ export function PageChrome({ title, meta, mobileBrandHeader = false, children }:
           <span className="text-[12.5px] leading-none font-semibold tracking-[0.2em] text-ink">
             BORG
           </span>
-          <span style={{ flex: 1 }} />
+          <span className="flex-1" />
           <span className="h-1.5 w-1.5 animate-bpulse rounded-full bg-neon shadow-(--glow)" />
         </header>
       )}

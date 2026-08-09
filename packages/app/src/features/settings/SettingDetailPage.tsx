@@ -1,8 +1,15 @@
 import { useParams } from "react-router-dom";
-import { BackLink, CheckIcon, DETAIL_COL, PageChrome, scrollCol, useIsMobile } from "@borg/ui";
+import {
+  BackLink,
+  CheckIcon,
+  DETAIL_COL,
+  PageChrome,
+  SETTINGS_SCROLL_DESKTOP_PADDING,
+  scrollCol,
+  useIsMobile,
+} from "@borg/ui";
 import { findSetting } from "../../data/mock";
 import { useSettingControl } from "../../lib/settings";
-import { SETTINGS_SCROLL_DESKTOP_PADDING } from "./SettingsPage";
 
 /** One setting, expanded into a picker. Selections persist locally until borgd lands. */
 export function SettingDetailPage() {
@@ -54,7 +61,7 @@ export function SettingDetailPage() {
                   className="flex cursor-pointer items-center gap-4 border-b border-line2 px-4 py-3.5 transition-[background] duration-150 last:border-b-0 hover:bg-surface3"
                   onClick={() => select(setting.id, o.value)}
                 >
-                  <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="min-w-0 flex-1">
                     <div
                       className={`text-[13.5px] leading-[1.3] font-medium ${
                         on ? "text-neon-ink" : "text-ink"

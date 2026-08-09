@@ -25,7 +25,7 @@ export function AlertBanner({
           <div className="text-[13px] leading-[1.3] font-medium text-ink">{alert.stackedTitle}</div>
         </div>
         <div className={sub}>{alert.sub}</div>
-        <Pill variant="danger" style={{ alignSelf: "flex-start" }} onClick={onAction}>
+        <Pill variant="danger" className="self-start" onClick={onAction}>
           {alert.action}
         </Pill>
       </div>
@@ -35,7 +35,7 @@ export function AlertBanner({
   return (
     <div className="flex items-center gap-3.5 rounded-[11px] border border-alert bg-alert-soft px-[18px] py-[15px]">
       <span className={dot} />
-      <div style={{ flex: 1, minWidth: 0 }}>
+      <div className="min-w-0 flex-1">
         <div className="text-[13.5px] leading-[1.3] font-medium text-ink">{alert.title}</div>
         <div className={sub}>{alert.sub}</div>
       </div>

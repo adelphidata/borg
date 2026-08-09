@@ -5,14 +5,12 @@ import {
   MobileTitle,
   PageChrome,
   SECTION_LABEL,
+  SETTINGS_SCROLL_DESKTOP_PADDING,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
 import { advancedGroups, basicSettings } from "../../data/mock";
 import { useSettingControl } from "../../lib/settings";
-
-/** Settings pages share edge-to-edge 38px desktop padding. */
-export const SETTINGS_SCROLL_DESKTOP_PADDING = "p-[38px]";
 
 export function SettingsPage() {
   const isMobile = useIsMobile();
@@ -32,14 +30,14 @@ export function SettingsPage() {
               className="flex cursor-pointer items-center gap-[18px] border-b border-line2 px-0.5 py-[18px]"
               onClick={() => navigate(`/settings/${s.id}`)}
             >
-              <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="min-w-0 flex-1">
                 <div className="text-[14px] leading-[1.3] font-medium text-ink">{s.name}</div>
                 {s.desc && (
                   <div className="mt-1 text-[12.5px] leading-[1.45] text-ink3">{s.desc}</div>
                 )}
               </div>
               <div className="flex-none text-[13px] leading-none text-ink2">{current(s.id)}</div>
-              <ChevronIcon size={13} style={{ color: "var(--ink3)" }} />
+              <ChevronIcon size={13} className="text-ink3" />
             </div>
           ))}
 
@@ -50,7 +48,7 @@ export function SettingsPage() {
             <span
               className={`flex transition-transform duration-[180ms] ${advOpen ? "[transform:rotate(90deg)]" : ""}`}
             >
-              <ChevronIcon size={13} style={{ color: "var(--neon)" }} />
+              <ChevronIcon size={13} className="text-neon" />
             </span>
             <span className="text-[10px] leading-none font-medium tracking-[0.16em] uppercase text-ink2">
               Advanced
@@ -74,7 +72,7 @@ export function SettingsPage() {
                         key={r.key}
                         className="flex items-center justify-between gap-[18px] border-b border-line2 px-4 py-[13px] last:border-b-0"
                       >
-                        <div style={{ minWidth: 0 }}>
+                        <div className="min-w-0">
                           <div className="text-[13px] leading-[1.3] font-medium text-ink">
                             {r.key}
                           </div>

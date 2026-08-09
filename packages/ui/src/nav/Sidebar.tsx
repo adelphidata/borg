@@ -89,13 +89,13 @@ export function Sidebar({ routes, recents, user }: SidebarProps) {
         ))}
       </div>
 
-      <div style={{ flex: 1 }} />
+      <div className="flex-1" />
 
       <div className="flex items-center gap-[11px] border-t border-line2 px-2 pt-3">
         <span className="flex h-[26px] w-[26px] items-center justify-center rounded-full border border-line bg-surface3 text-[10.5px] leading-none font-semibold text-ink2">
           {user.initials}
         </span>
-        <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="min-w-0 flex-1">
           <div className="text-[12.5px] leading-[1.2] font-medium text-ink">{user.name}</div>
         </div>
       </div>

@@ -54,7 +54,7 @@ export function ConnectionDetailPage() {
             <Badge on={isConnected} sizeClasses="h-10 w-10 rounded-xl text-[12.5px]">
               {conn.badge}
             </Badge>
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="min-w-0 flex-1">
               <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
                 {conn.name}
               </div>

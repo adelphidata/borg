@@ -27,7 +27,12 @@ export {
   ShieldIcon,
 } from "./components/icons";
 export type { IconProps } from "./components/icons";
-export { DETAIL_COL, SECTION_LABEL, scrollCol } from "./components/pageClasses";
+export {
+  DETAIL_COL,
+  SECTION_LABEL,
+  SETTINGS_SCROLL_DESKTOP_PADDING,
+  scrollCol,
+} from "./components/pageClasses";
 
 export { Sidebar } from "./nav/Sidebar";
 export type { SidebarProps } from "./nav/Sidebar";

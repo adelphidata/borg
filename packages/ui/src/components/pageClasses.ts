@@ -6,6 +6,9 @@ export const SECTION_LABEL =
 /** Narrow column used by the connection + setting detail pages. */
 export const DETAIL_COL = "flex max-w-[620px] flex-col gap-7";
 
+/** Both settings pages share edge-to-edge 38px desktop padding. */
+export const SETTINGS_SCROLL_DESKTOP_PADDING = "p-[38px]";
+
 /** Scrollable page body. Mobile padding is uniform; desktop varies slightly per page. */
 export const scrollCol = (isMobile: boolean, desktopPadding: string) =>
   `flex-1 overflow-y-auto ${isMobile ? "px-[22px] py-4" : desktopPadding}`;
