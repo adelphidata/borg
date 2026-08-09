@@ -84,6 +84,7 @@ pub mod twilio;
 pub(crate) mod typing_keepalive;
 pub mod verify_common;
 pub mod voice;
+pub mod webui;
 
 pub use channel::registry::ChannelRegistry;
 pub use error::{Error, Result};

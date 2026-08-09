@@ -108,6 +108,9 @@ pub struct GatewayServer {
     shutdown: CancellationToken,
     metrics: BorgMetrics,
     poke_tx: Option<mpsc::Sender<()>>,
+    /// Filled in by borgd once its tonic services exist; `None` when the
+    /// gateway runs standalone, which leaves the browser surface unmounted.
+    grpc_web: Option<crate::webui::GrpcWebSlot>,
 }
 
 /// Native-channel clients and credentials produced once at startup by
@@ -146,6 +149,7 @@ impl GatewayServer {
         metrics: BorgMetrics,
         poke_tx: Option<mpsc::Sender<()>>,
         executor: Option<crate::SessionExecutorHandle>,
+        grpc_web: Option<crate::webui::GrpcWebSlot>,
     ) -> Result<Self> {
         if let Some(exec) = executor {
             crate::session_executor::set_global(exec);
@@ -155,6 +159,7 @@ impl GatewayServer {
             shutdown,
             metrics,
             poke_tx,
+            grpc_web,
         })
     }
 
@@ -206,7 +211,7 @@ impl GatewayServer {
             shutdown: self.shutdown.clone(),
         });
 
-        let app = build_router(state.clone(), &self.config);
+        let app = build_router(state.clone(), &self.config, self.grpc_web.clone());
 
         // Probe before bind: another borgd already serving this port is an
         // idempotent no-op (parent will park on `shutdown`), avoiding a
@@ -1016,8 +1021,16 @@ async fn run_channel_poll_loop(
 
 /// Build the gateway's axum router: health/introspection routes, internal
 /// control routes, webhook routes, plus the merged OpenAI-compat, generic
-/// webhook, and MCP HTTP sub-routers.
-fn build_router(state: Arc<AppState>, config: &Config) -> Router {
+/// webhook, MCP HTTP, and browser (SPA + gRPC-Web) sub-routers.
+fn build_router(
+    state: Arc<AppState>,
+    config: &Config,
+    grpc_web: Option<crate::webui::GrpcWebSlot>,
+) -> Router {
+    let web_surface = grpc_web
+        .map(|slot| crate::webui::router(slot, db_open_factory()))
+        .unwrap_or_default();
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/healthz", get(health_handler))
@@ -1036,6 +1049,7 @@ fn build_router(state: Arc<AppState>, config: &Config) -> Router {
         .merge(build_openai_compat_router(config))
         .merge(build_generic_webhook_router(config))
         .merge(build_mcp_http_router(config))
+        .merge(web_surface)
 }
 
 /// Probe `http://{addr}/healthz` to detect an already-running gateway

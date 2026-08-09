@@ -51,7 +51,8 @@ async fn run_issue(label: &str, scopes: &str) -> Result<()> {
     println!(
         "Copy it now — the plaintext is not stored and cannot be recovered. \
          Use it as `Authorization: Bearer <token>` against the OpenAI-compat \
-         and MCP HTTP endpoints."
+         and MCP HTTP endpoints, or paste it into the web UI at \
+         http://127.0.0.1:7842/ui/ to sign in."
     );
     Ok(())
 }

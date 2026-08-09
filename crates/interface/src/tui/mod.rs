@@ -103,7 +103,8 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
     let gw_shutdown = shutdown.clone();
     let gw_metrics = metrics;
     tokio::spawn(async move {
-        match gateway::GatewayServer::new(gw_config, gw_shutdown, gw_metrics, None, None) {
+        // No daemon in this path, so no gRPC services to expose to a browser.
+        match gateway::GatewayServer::new(gw_config, gw_shutdown, gw_metrics, None, None, None) {
             Ok(server) => {
                 if let Err(e) = server.run().await {
                     let msg = e.to_string();

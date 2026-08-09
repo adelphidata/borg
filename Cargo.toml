@@ -77,6 +77,8 @@ shellexpand = "3"
 sha2 = "0.10"
 hmac = "0.12"
 axum = "0.8"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
 tower = { version = "0.5", features = ["limit"] }
 tracing-appender = "0.2"
 throbber-widgets-tui = "0.9"
@@ -101,8 +103,9 @@ rand = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 wasmparser = "0.244"
 wasmtime = "36"
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.12"
+tonic = { version = "0.13", features = ["tls-ring"] }
+tonic-build = "0.13"
+tonic-web = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 time = { version = "0.3", features = ["macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

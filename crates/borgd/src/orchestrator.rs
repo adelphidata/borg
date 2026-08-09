@@ -23,6 +23,7 @@ fn spawn_gateway(
     shutdown: CancellationToken,
     poke_tx: Option<mpsc::Sender<()>>,
     executor: Arc<DaemonSessionExecutor>,
+    grpc_web: gateway::webui::GrpcWebSlot,
 ) -> tokio::task::JoinHandle<()> {
     let gw_config = config.clone();
     tokio::spawn(async move {
@@ -32,6 +33,7 @@ fn spawn_gateway(
             cortex::telemetry::BorgMetrics::noop(),
             poke_tx,
             Some(executor),
+            Some(grpc_web),
         ) {
             Ok(gateway) => {
                 if let Err(e) = gateway.run().await {
@@ -124,6 +126,7 @@ pub async fn start(
     config_rx: watch::Receiver<Config>,
     cost_event_sink: Arc<dyn CostEventSink>,
     goal_bus: GoalEventBus,
+    grpc_web: gateway::webui::GrpcWebSlot,
 ) -> OrchestratorHandles {
     // Cloned before the executor takes ownership; the session-heartbeat poller
     // needs the same live-session map to decide what is hosted and idle.
@@ -190,6 +193,7 @@ pub async fn start(
     let gw_outer_shutdown = shutdown.clone();
     let gw_config = config.clone();
     let gw_executor = executor.clone();
+    let gw_grpc_web_outer = grpc_web.clone();
     spawn_supervised(
         gw_cfg,
         gw_outer_shutdown.clone(),
@@ -198,13 +202,21 @@ pub async fn start(
             let gw_config = gw_config.clone();
             let gw_poke_tx = gw_poke_tx.clone();
             let gw_executor = gw_executor.clone();
+            // The slot survives gateway restarts: borgd installs the router
+            // once, and every respawned gateway serves the same one.
+            let gw_grpc_web = gw_grpc_web_outer.clone();
             // Per-iteration child token — cancels when the outer
             // shutdown does AND when this iteration's future drops, so
             // we don't leak a long-lived bridge task across respawns.
             let inner_shutdown = gw_outer_shutdown.child_token();
             async move {
-                let handle =
-                    spawn_gateway(&gw_config, inner_shutdown, Some(gw_poke_tx), gw_executor);
+                let handle = spawn_gateway(
+                    &gw_config,
+                    inner_shutdown,
+                    Some(gw_poke_tx),
+                    gw_executor,
+                    gw_grpc_web.clone(),
+                );
                 // Treat any inner error or panic as a supervisor-level
                 // restart; convert into a Result so the supervisor's
                 // restart logic kicks in.
@@ -398,6 +410,7 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         config_rx,
         cost_event_sink,
         GoalEventBus::new(),
+        gateway::webui::GrpcWebSlot::default(),
     )
     .await;
     shutdown.cancelled().await;

@@ -182,6 +182,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     });
     let capability_router = Arc::new(CapabilityRouter::new());
 
+    // The gateway starts (inside `orchestrator::start`) before the tonic
+    // services below exist, so the browser's gRPC-Web mount is handed over
+    // through this slot instead of at construction time. `/grpc` answers 503
+    // until `install` runs.
+    let grpc_web_slot = gateway::webui::GrpcWebSlot::default();
+
     // Single shutdown signal fanned out to every transport so SIGTERM drains
     // both UDS and TCP listeners in parallel rather than aborting the slower one.
     // Signal-handler spawn is deferred until after the AuditWriter exists so the
@@ -306,6 +312,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 config_watcher.subscribe(),
                 cost_event_sink.clone(),
                 goal_bus.clone(),
+                grpc_web_slot.clone(),
             )
             .await;
             grpc::AdminExtras {
@@ -648,6 +655,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         cost_event_bus.clone(),
         extras,
     );
+
+    // Browser surface: a subset of the services above, wrapped for gRPC-Web.
+    // See `grpc_web::build_grpc_web_router` for why Capability and Pki are out.
+    grpc_web_slot.install(crate::grpc_web::build_grpc_web_router(&services));
 
     let uds_stream = UnixListenerStream::new(uds);
 

@@ -27,6 +27,8 @@ hex = "0.4"
 subtle = "2.6"
 regex = { workspace = true }
 axum = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
 tower = { workspace = true }
 reqwest = { workspace = true }
 tokio-util = { workspace = true }

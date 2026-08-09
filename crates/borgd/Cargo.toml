@@ -37,6 +37,8 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
+tonic-web = { workspace = true }
+axum = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }

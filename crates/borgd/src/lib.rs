@@ -29,6 +29,7 @@ pub mod discovery;
 pub mod error;
 pub mod goal_bus;
 pub mod grpc;
+pub mod grpc_web;
 pub mod heartbeat;
 pub mod heartbeat_augmenters;
 pub(crate) mod maintenance;

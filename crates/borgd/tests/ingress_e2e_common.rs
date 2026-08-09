@@ -109,6 +109,7 @@ pub async fn boot_gateway(with_executor: bool) -> GatewayHarness {
             metrics,
             None,
             None,
+            None,
         ) {
             Ok(s) => s,
             Err(e) => {
