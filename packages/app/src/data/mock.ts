@@ -33,24 +33,6 @@ interface HealthCheck {
   action?: string;
 }
 
-export interface SettingOption {
-  value: string;
-  desc?: string;
-}
-
-export interface Setting {
-  id: string;
-  name: string;
-  desc: string;
-  value: string;
-  options?: SettingOption[];
-}
-
-interface AdvancedGroup {
-  name: string;
-  rows: { key: string; desc: string; value: string }[];
-}
-
 interface OnboardingStep {
   title: string;
   body: string;
@@ -251,95 +233,6 @@ export const routeAlerts: Record<string, boolean> = {
   connections: connected.some((c) => c.needsAttention),
   health: checks.some((c) => !c.ok),
 };
-
-export const basicSettings: Setting[] = [
-  {
-    id: "model",
-    name: "Model",
-    desc: "Which brain Borg thinks with",
-    value: "Sonnet 4.6",
-    options: [
-      { value: "Sonnet 4.6", desc: "Quick and sharp. The default." },
-      { value: "Opus 4.5", desc: "Slower, deeper. For the hard stuff." },
-      { value: "Haiku 4.5", desc: "Instant answers, lighter thinking." },
-      { value: "Local", desc: "A model running on this Mac. Nothing leaves." },
-    ],
-  },
-  {
-    id: "notifications",
-    name: "Notifications",
-    desc: "How Borg reaches you when it finds something",
-    value: "On",
-    options: [
-      { value: "On", desc: "Anything worth knowing, as it happens." },
-      { value: "Important only", desc: "Only things that need a decision from you." },
-      { value: "Off", desc: "Borg stays quiet. Check in when you like." },
-    ],
-  },
-  {
-    id: "check-in",
-    name: "Check in on me",
-    desc: "Borg starts the conversation when it has news",
-    value: "Mornings",
-    options: [
-      { value: "Mornings", desc: "One quiet summary with your coffee." },
-      { value: "Morning and evening", desc: "Bookends on the day." },
-      { value: "Only when urgent", desc: "Silence unless something can't wait." },
-      { value: "Never", desc: "You'll always start the conversation." },
-    ],
-  },
-  {
-    // Store default only — the live value reads and writes the theme (see useResolvedSettings).
-    id: "appearance",
-    name: "Appearance",
-    desc: "",
-    value: "Dark",
-    options: [
-      { value: "Light", desc: "Paper and ink." },
-      { value: "Dark", desc: "Neon on black. The classic." },
-    ],
-  },
-  {
-    id: "start-login",
-    name: "Start when I log in",
-    desc: "",
-    value: "On",
-    options: [
-      { value: "On", desc: "Borg is already running when you sit down." },
-      { value: "Off", desc: "Start it yourself when you want it." },
-    ],
-  },
-];
-
-export function findSetting(id: string): Setting | undefined {
-  return basicSettings.find((s) => s.id === id);
-}
-
-export const advancedGroups: AdvancedGroup[] = [
-  {
-    name: "Safety",
-    rows: [
-      { key: "Sandbox", desc: "What Borg is allowed to touch", value: "Strict" },
-      { key: "Protected files", desc: "Keys, credentials and env files", value: "12 rules" },
-      { key: "Where secrets live", desc: "", value: "Keychain" },
-    ],
-  },
-  {
-    name: "Access",
-    rows: [
-      { key: "Other devices", desc: "Pair a phone or a second Mac", value: "Off" },
-      { key: "Encrypted connections only", desc: "", value: "Required" },
-    ],
-  },
-  {
-    name: "Behaviour",
-    rows: [
-      { key: "Retry limit", desc: "Stop Borg repeating itself", value: "3" },
-      { key: "Quiet hours", desc: "", value: "10pm – 7am" },
-      { key: "Nightly tidy-up", desc: "", value: "2:00 am" },
-    ],
-  },
-];
 
 export const onboardingSteps: OnboardingStep[] = [
   {

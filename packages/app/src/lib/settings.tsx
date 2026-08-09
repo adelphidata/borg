@@ -1,55 +1,72 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react";
-import { basicSettings } from "../data/mock";
-import { useTheme } from "@borg/ui";
+import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
+import type { BorgError } from "@borg/client";
+import { useMutation, useQuery, type QueryResult } from "./useDaemon";
+
+/** One daemon setting: its effective value and whether it differs from the default. */
+export interface DaemonSetting {
+  key: string;
+  value: string;
+  /** True when the value is a DB override rather than the compiled default. */
+  overridden: boolean;
+}
 
 interface SettingsContextValue {
-  /** Current value per setting id (mock defaults until borgd lands). */
-  values: Record<string, string>;
-  setValue: (id: string, value: string) => void;
+  /** Full registry snapshot from `Admin.GetSettings`, keyed by setting key. */
+  settings: QueryResult<Map<string, DaemonSetting>>;
+  /** Writes one key via `Admin.SetSetting`, then refreshes the snapshot. */
+  save: (key: string, value: string) => Promise<boolean>;
+  /** Clears one key back to its default via `Admin.UnsetSetting`, then refreshes. */
+  clear: (key: string) => Promise<boolean>;
+  saving: boolean;
+  saveError: BorgError | undefined;
+  resetSaveError: () => void;
 }
 
 const SettingsContext = createContext<SettingsContextValue | null>(null);
-const STORAGE_KEY = "borg.settings";
 
-const defaults = Object.fromEntries(basicSettings.map((s) => [s.id, s.value]));
-
-function load(): Record<string, string> {
-  try {
-    const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
-    // Shape-check — a stored scalar/array would otherwise spread garbage keys into the map.
-    if (typeof stored !== "object" || stored === null || Array.isArray(stored)) {
-      return { ...defaults };
-    }
-    const valid = Object.entries(stored).filter(
-      ([id, v]) => id in defaults && typeof v === "string",
-    );
-    return { ...defaults, ...Object.fromEntries(valid) };
-  } catch {
-    return { ...defaults };
-  }
-}
-
+/**
+ * The daemon is the source of truth for every setting except the theme, which
+ * stays in localStorage because it must apply before first paint.
+ */
 export function SettingsProvider({ children }: { children: ReactNode }) {
-  const [values, setValues] = useState<Record<string, string>>(load);
+  const settings = useQuery(async (borg) => {
+    const snapshot = await borg.admin.getSettings({});
+    return new Map(
+      snapshot.entries.map((e) => [
+        e.key,
+        { key: e.key, value: e.value, overridden: e.category === "db" },
+      ]),
+    );
+  });
 
-  // Persist outside the state updater — updaters must stay pure (StrictMode runs them twice).
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(values));
-  }, [values]);
+  const write = useMutation(
+    (borg, vars: { key: string; value: string | null }) =>
+      vars.value === null
+        ? borg.admin.unsetSetting({ key: vars.key })
+        : borg.admin.setSetting({ key: vars.key, value: vars.value }),
+    { onSuccess: () => settings.refetch() },
+  );
 
-  const setValue = useCallback((id: string, value: string) => {
-    setValues((v) => ({ ...v, [id]: value }));
-  }, []);
+  const save = useCallback(
+    async (key: string, value: string) => (await write.run({ key, value })) !== undefined,
+    [write.run],
+  );
+  const clear = useCallback(
+    async (key: string) => (await write.run({ key, value: null })) !== undefined,
+    [write.run],
+  );
 
-  const value = useMemo(() => ({ values, setValue }), [values, setValue]);
+  const value = useMemo(
+    () => ({
+      settings,
+      save,
+      clear,
+      saving: write.pending,
+      saveError: write.error,
+      resetSaveError: write.reset,
+    }),
+    [settings, save, clear, write.pending, write.error, write.reset],
+  );
 
   return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
 }
@@ -58,34 +75,4 @@ export function useSettings(): SettingsContextValue {
   const ctx = useContext(SettingsContext);
   if (!ctx) throw new Error("useSettings must be used within SettingsProvider");
   return ctx;
-}
-
-interface SettingControl {
-  /** Current display value for a setting id. */
-  current: (id: string) => string;
-  /** Apply a picked option for a setting id. */
-  select: (id: string, value: string) => void;
-}
-
-/**
- * Bridges setting ids to their backing store: "appearance" reads and writes the
- * real theme, everything else the local settings map. Helpers take the id so
- * pages can resolve many settings without calling hooks in a loop.
- */
-export function useSettingControl(): SettingControl {
-  const { values, setValue } = useSettings();
-  const { theme, toggleTheme } = useTheme();
-
-  const current = (id: string) =>
-    id === "appearance" ? (theme === "light" ? "Light" : "Dark") : values[id];
-
-  const select = (id: string, value: string) => {
-    if (id === "appearance") {
-      if (value !== current(id)) toggleTheme();
-    } else {
-      setValue(id, value);
-    }
-  };
-
-  return { current, select };
 }

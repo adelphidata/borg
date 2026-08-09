@@ -67,7 +67,8 @@ export function useQuery<T>(
     setResult((prev) => (prev.state === "ready" ? prev : { state: "loading" }));
     setRefreshing(true);
 
-    callRef.current(borg)
+    callRef
+      .current(borg)
       .then((data) => {
         if (!live) return;
         setResult({ state: "ready", data });
