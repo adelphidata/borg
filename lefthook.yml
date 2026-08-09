@@ -7,6 +7,12 @@ pre-commit:
     clippy:
       glob: "*.rs"
       run: cargo clippy --workspace --all-targets -- -D warnings
+    prettier:
+      glob: "*.{ts,tsx,css,json,md,html}"
+      run: bun x prettier --check {staged_files}
+    typecheck-ts:
+      glob: "*.{ts,tsx}"
+      run: bun run typecheck
 
 pre-push:
   commands:

@@ -1,0 +1,23 @@
+{
+  "name": "borg-workspace",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "bun run --filter '*' typecheck",
+    "gen": "buf generate"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.50.0",
+    "prettier": "^3.9.6",
+    "ts-proto": "^2.6.1",
+    "typescript": "^7.0.2"
+  },
+  "trustedDependencies": [
+    "electron"
+  ]
+}

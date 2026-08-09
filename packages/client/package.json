@@ -1,0 +1,27 @@
+{
+  "name": "@borg/client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generated gRPC client for borgd — one typed API, node (UDS) and browser (gRPC-Web) transports",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node": "./src/node.ts",
+    "./web": "./src/web.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.10.1",
+    "@grpc/grpc-js": "^1.14.3",
+    "nice-grpc": "^2.1.12",
+    "nice-grpc-common": "^2.0.2",
+    "nice-grpc-web": "^3.3.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  }
+}

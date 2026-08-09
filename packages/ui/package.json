@@ -1,0 +1,37 @@
+{
+  "name": "@borg/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared Borg UI: components, theme, breakpoint hook, design tokens, fonts",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles/app.css": "./src/styles/app.css",
+    "./styles/fonts.css": "./src/styles/fonts.css",
+    "./vite": "./vite.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^1.30.0"
+  },
+  "peerDependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2",
+    "vite": "^8.2.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  }
+}

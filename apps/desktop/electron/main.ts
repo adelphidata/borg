@@ -1,6 +1,7 @@
 import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { registerBorgIpc } from "./ipc";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 const indexHtml = path.join(__dirname, "..", "dist", "index.html");
@@ -70,6 +71,9 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  const borg = registerBorgIpc();
+  app.once("will-quit", () => borg.dispose());
+
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

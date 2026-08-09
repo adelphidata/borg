@@ -1,0 +1,6 @@
+{
+  "theme": "borg.theme",
+  "onboarded": "borg.onboarded",
+  "settings": "borg.settings",
+  "token": "borg.token"
+}

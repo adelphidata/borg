@@ -20,3 +20,7 @@ indent_style = tab
 [Justfile]
 indent_style = space
 indent_size = 4
+
+# Web surfaces (apps/, packages/) follow JS/TS convention, not the Rust default above.
+[*.{ts,tsx,js,jsx,mjs,json,css,html}]
+indent_size = 2

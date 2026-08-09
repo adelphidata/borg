@@ -1,0 +1,9 @@
+target/
+node_modules/
+dist/
+dist-electron/
+release/
+bun.lock
+crates/
+packages/client/src/gen/
+apps/web/dist/

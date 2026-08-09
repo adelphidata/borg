@@ -1,0 +1,22 @@
+# Generates the TypeScript client from the SAME protos that build.rs compiles for
+# Rust (crates/protocols/proto). Output is committed; CI runs `just gen-check` and
+# fails on drift, so a proto change can never land with a stale TS client.
+#
+#   just gen        regenerate
+#   just gen-check  regenerate + fail if the tree moved
+version: v2
+inputs:
+  - directory: crates/protocols/proto
+plugins:
+  - local: ["bun", "x", "protoc-gen-ts_proto"]
+    out: packages/client/src/gen
+    opt:
+      # Service definitions as plain data, consumed by BOTH nice-grpc (node/UDS)
+      # and nice-grpc-web (browser). One generated artifact, two runtimes.
+      - outputServices=generic-definitions
+      - outputClientImpl=false
+      - esModuleInterop=true
+      - importSuffix=.js
+      - useDate=false
+      - useOptionals=messages
+      - env=both

@@ -1,5 +1,11 @@
 # Build artifacts
 /target
+node_modules/
+dist-electron/
+release/
+*.tsbuildinfo
+apps/*/dist/*
+!apps/web/dist/.gitkeep
 
 # OS files
 .DS_Store

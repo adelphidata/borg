@@ -12,5 +12,5 @@
     "resolveJsonModule": true,
     "useDefineForClassFields": true
   },
-  "include": ["src", "electron"]
+  "include": ["src", "electron", "vite.config.ts"]
 }
