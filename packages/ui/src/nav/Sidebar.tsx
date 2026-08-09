@@ -1,12 +1,16 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import { LogoIcon } from "../components/icons";
-import type { AppRoute, NavUser } from "../types";
+import type { AppRoute, NavUser, RecentItem } from "../types";
 
 export interface SidebarProps {
   routes: AppRoute[];
-  /** Recent conversation titles listed under the nav sections. */
-  recents: string[];
+  /** Recent conversations listed under the nav sections. */
+  recents: RecentItem[];
+  /** Opens one recent conversation. */
+  onOpenRecent: (id: string) => void;
+  /** Starts a fresh conversation. */
+  onNewConversation: () => void;
   user: NavUser;
 }
 
@@ -59,7 +63,7 @@ function Rule({ className = "mb-4" }: { className?: string }) {
   return <div className={`mx-1.5 h-px bg-line2 ${className}`} />;
 }
 
-export function Sidebar({ routes, recents, user }: SidebarProps) {
+export function Sidebar({ routes, recents, onOpenRecent, onNewConversation, user }: SidebarProps) {
   return (
     <aside className="flex w-[236px] flex-none flex-col border-r border-line2 bg-surface2 px-[14px] pt-[18px] pb-4">
       <div className="flex items-center gap-[11px] px-2 pt-0.5 pb-5">
@@ -75,16 +79,25 @@ export function Sidebar({ routes, recents, user }: SidebarProps) {
       <NavSection routes={routes} section="secondary" />
       <Rule className="mt-4 mb-3.5" />
 
-      <div className="px-2 pb-2 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
-        Recent
+      <div className="flex items-center px-2 pb-2">
+        <span className="flex-1 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
+          Recent
+        </span>
+        <span
+          className="cursor-pointer rounded px-1.5 py-0.5 text-[11px] leading-none text-ink3 hover:bg-surface3 hover:text-ink"
+          onClick={onNewConversation}
+        >
+          + New
+        </span>
       </div>
       <div className="flex flex-col gap-px">
         {recents.map((r) => (
           <div
-            key={r}
+            key={r.id}
             className="cursor-pointer overflow-hidden rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ellipsis whitespace-nowrap text-ink3 hover:bg-surface3 hover:text-ink2"
+            onClick={() => onOpenRecent(r.id)}
           >
-            {r}
+            {r.title}
           </div>
         ))}
       </div>

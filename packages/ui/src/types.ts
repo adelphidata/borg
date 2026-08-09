@@ -32,6 +32,12 @@ export interface BannerAlert {
   action: string;
 }
 
+/** One recent conversation in the sidebar. Apps supply the list and handle opens. */
+export interface RecentItem {
+  id: string;
+  title: string;
+}
+
 /** Signed-in identity shown in the sidebar footer. */
 export interface NavUser {
   name: string;

@@ -40,10 +40,6 @@ interface OnboardingStep {
   alt: string;
 }
 
-export const user = { name: "Rob Keane", initials: "RK" };
-
-export const recents = ["Release check", "Rewrite the onboarding email", "Weekly board summary"];
-
 export const connected: Connection[] = [
   {
     id: "imessage",

@@ -20,7 +20,8 @@ export function useBorg(): BorgClient {
   return useMemo(() => createBorgClient(transport), [transport]);
 }
 
-function asBorgError(error: unknown): BorgError {
+/** Normalizes anything a call path throws into a `BorgError` the UI can branch on. */
+export function asBorgError(error: unknown): BorgError {
   return error instanceof BorgError
     ? error
     : new BorgError(GrpcStatus.Internal, error instanceof Error ? error.message : String(error));
