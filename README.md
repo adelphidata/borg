@@ -18,6 +18,24 @@ The installer detects your OS, downloads the right binary, and walks you through
 
 Or download manually from [Releases](https://github.com/adelphidata/borg/releases), or [build from source](CONTRIBUTING.md#development-setup).
 
+## Desktop App
+
+A native window over the same Borg. Install the CLI first — the app talks to the daemon at `~/.borg/borgd.sock`.
+
+```sh
+borg service install     # keep the daemon running (launchd/systemd)
+```
+
+Then grab the `desktop-v*` build for your OS from [Releases](https://github.com/adelphidata/borg/releases) — `.dmg` (macOS), `.exe` (Windows), `.AppImage` (Linux). Builds are not code-signed yet: on macOS right-click → Open the first time.
+
+From source:
+
+```sh
+just web-install         # bun install (Bun, not npm)
+just desktop-build       # installer lands in apps/desktop/release/
+just desktop-dev         # or run it with hot reload
+```
+
 ## Commands
 
 **Core**
