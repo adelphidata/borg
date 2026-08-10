@@ -127,6 +127,18 @@ LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Ve
 
 **The agent just executes.** No per-tool-call approval prompts or confirmation dialogs. Shell commands auto-execute; only catastrophic commands (rm -rf /, mkfs, dd, curl|sh) are denied at the sandbox layer. Sandboxing and rate limiting are security boundaries, not approval dialogs.
 
+### UX — Progressive Disclosure
+
+**Non-technical user first, on every surface (TUI, web, desktop).** Power users come second, never at the first pass's cost. Think Apple: minimal, opinionated, depth available but not at the door.
+
+Default view shows the smallest control set that finishes the job; the rest sits one deliberate step deeper (collapsed "Advanced", secondary panel, or `borg settings`).
+
+- Good default beats a knob — a `define_settings!` row is not a mandate to ship UI for it.
+- Label by outcome ("Let Borg act on its own"), not subsystem (`heartbeat.min_interval_secs`).
+- Errors name the next action in plain words, never a raw code.
+- Two controls, one outcome → delete one.
+- A fresh install reaches a working conversation with credentials as the only input, no docs.
+
 ### Mouse Interaction — Hard Invariant
 
 **Native click+drag text selection MUST work in the transcript with no modifier keys.** Has regressed multiple times.

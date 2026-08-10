@@ -2,6 +2,8 @@
 
 Local rules only. Workspace layout, the transport seam, `just` targets, and release trains are in the root `CLAUDE.md`.
 
+**Read "UX — Progressive Disclosure" in the root `CLAUDE.md` before you add UI here.** It is the design thesis for this surface.
+
 ## Invariants
 
 **The renderer never touches Node.** `contextIsolation: true`, `nodeIntegration: false`. The gRPC channel lives in `electron/ipc.ts`.
@@ -9,6 +11,8 @@ Local rules only. Workspace layout, the transport seam, `just` targets, and rele
 **`window.borg` is `{ platform, transport, native }` — and nothing else.** `native` is the OS-affordance bridge (menu commands, notifications, dock badge, updater) declared as `NativeBridge` in `packages/app/src/lib/native.ts`. It may carry only things borgd has no part in, and never a Node API, a filesystem path, or a shell. Anything the daemon can answer belongs on the transport instead.
 
 Feature code must not read `window.borg`. It calls `useNative()`, which hands back the real bridge on desktop and `NO_NATIVE` no-ops in the browser — that is what keeps `packages/app` identical on both surfaces. Adding a capability means extending `NativeBridge` *and* giving `NO_NATIVE` a no-op for it, or the web build breaks at runtime rather than at the type level.
+
+**The desktop app installs and runs with zero setup.** The unix socket is the auth, so no token screen, no config file, no terminal step. Native affordances (menus, notifications, dock badge) should make the app feel like a Mac app, not a browser in a frame — but each one still needs a `NO_NATIVE` no-op, so it can never be the only way to reach a feature.
 
 **Errors cross IPC as data.** An `Error` instance loses its gRPC status through structured clone. Keep the `UnaryReply` / `StreamEvent` envelopes in `channels.ts` and rehydrate `BorgError` on the preload side.
 
