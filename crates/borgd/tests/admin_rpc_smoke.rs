@@ -30,7 +30,8 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ScheduledTaskUpdate, SessionArchiveMutation,
+    ScheduledTaskCreate, ScheduledTaskUpdate, SessionArchiveMutation, SessionRef,
+    SessionTitleMutation,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
@@ -953,5 +954,143 @@ async fn archiving_a_live_session_closes_its_host_and_a_missing_one_closes_nothi
         other_calls.load(Ordering::SeqCst),
         0,
         "a rejected archive must not have closed anything"
+    );
+}
+
+/// A scheduled task whose expression the scheduler cannot parse must be
+/// rejected outright.
+///
+/// Before this, `create_scheduled_task` stored whatever it was handed and left
+/// `next_run` NULL when the caller passed none. The row landed as `active`, the
+/// scheduler — which only claims rows with a due `next_run` — never picked it
+/// up, and the task silently never ran. Nothing surfaced the mistake, so the
+/// only symptom was a schedule that quietly did nothing forever.
+#[tokio::test]
+async fn creating_a_scheduled_task_resolves_its_first_run_and_rejects_a_bad_expression() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    let create = |name: &str, expr: &str| ScheduledTaskCreate {
+        name: name.into(),
+        prompt: "say hello".into(),
+        schedule_type: "cron".into(),
+        schedule_expr: expr.into(),
+        timezone: "UTC".into(),
+        task_type: "prompt".into(),
+        delivery_channel: String::new(),
+        delivery_target: String::new(),
+        next_run_unix: 0,
+        max_retries: -1,
+        timeout_ms: 0,
+        allowed_tools: String::new(),
+        pre_run_command: String::new(),
+        pre_run_cwd: String::new(),
+        pre_run_timeout_ms: 0,
+    };
+
+    // Six fields, seconds first — the dialect the `cron` crate actually parses.
+    let good = admin
+        .create_scheduled_task(create("good", "0 0 8 * * *"))
+        .await
+        .expect("valid cron accepted")
+        .into_inner();
+    assert!(
+        good.next_run_unix > chrono::Utc::now().timestamp(),
+        "a created task must know when it next fires, or the scheduler skips it forever"
+    );
+
+    // The five-field crontab dialect is not what the parser accepts.
+    let status = admin
+        .create_scheduled_task(create("bad", "0 8 * * *"))
+        .await
+        .expect_err("unparseable cron must be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("cron"),
+        "the error must name the offending expression, got: {}",
+        status.message()
+    );
+
+    let names = admin
+        .list_scheduled_tasks(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner()
+        .tasks
+        .into_iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"good".to_string()));
+    assert!(
+        !names.contains(&"bad".to_string()),
+        "a refused task must not be left behind in the table"
+    );
+}
+
+/// Renaming is what the conversation list's Rename action calls.
+///
+/// `update_session_title` is a no-op for an unknown id, so the handler has to
+/// check first — a rename that silently did nothing is indistinguishable from
+/// one that worked, and the row would snap back on the next refetch.
+#[tokio::test]
+async fn setting_a_session_title_persists_and_rejects_blank_or_unknown() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("s1", 1, 10, 0, "m", "Original")
+            .await
+            .expect("seed");
+    }
+
+    admin
+        .set_session_title(SessionTitleMutation {
+            id: "s1".into(),
+            title: "  Renamed  ".into(),
+        })
+        .await
+        .expect("rename");
+    let detail = admin
+        .get_session(SessionRef { id: "s1".into() })
+        .await
+        .expect("get")
+        .into_inner();
+    assert_eq!(detail.title, "Renamed", "the stored title must be trimmed");
+
+    let blank = admin
+        .set_session_title(SessionTitleMutation {
+            id: "s1".into(),
+            title: "   ".into(),
+        })
+        .await
+        .expect_err("a blank title must be refused");
+    assert_eq!(blank.code(), tonic::Code::InvalidArgument);
+
+    let missing = admin
+        .set_session_title(SessionTitleMutation {
+            id: "nope".into(),
+            title: "Whatever".into(),
+        })
+        .await
+        .expect_err("an unknown session must be refused");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let after = admin
+        .get_session(SessionRef { id: "s1".into() })
+        .await
+        .expect("get")
+        .into_inner();
+    assert_eq!(
+        after.title, "Renamed",
+        "a refused rename must change nothing"
     );
 }

@@ -21,17 +21,28 @@ import {
 
 /** Placeholder and helper text per schedule kind, so the field explains itself. */
 const EXPR_HELP: Record<ScheduleType, { placeholder: string; hint: string }> = {
-  cron: { placeholder: "0 8 * * *", hint: "Cron expression — minute hour day month weekday" },
-  interval: { placeholder: "3600", hint: "Seconds between runs" },
+  // Six fields, seconds first — the daemon's cron parser is not the five-field
+  // crontab dialect, and a five-field expression is rejected outright.
+  cron: {
+    placeholder: "0 0 8 * * *",
+    hint: "second minute hour day month weekday — this example is 08:00 daily",
+  },
+  interval: { placeholder: "30m", hint: "How long between runs, e.g. 90s, 30m, 6h" },
   once: { placeholder: "2026-08-10T09:00", hint: "When to run, once" },
 };
 
-function NewSchedule({ onCreate }: { onCreate: (task: ReturnType<typeof draftOf>) => void }) {
+function NewSchedule({
+  onCreate,
+}: {
+  /** Resolves true when the task was stored; false leaves the form as it is. */
+  onCreate: (task: ReturnType<typeof draftOf>) => Promise<boolean>;
+}) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [scheduleType, setScheduleType] = useState<ScheduleType>("cron");
   const [scheduleExpr, setScheduleExpr] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const ready = name.trim() !== "" && prompt.trim() !== "" && scheduleExpr.trim() !== "";
 
@@ -96,16 +107,23 @@ function NewSchedule({ onCreate }: { onCreate: (task: ReturnType<typeof draftOf>
         <Pill
           square
           variant="primary"
-          disabled={!ready}
+          disabled={!ready || saving}
           onClick={() => {
-            onCreate(draftOf(name, prompt, scheduleType, scheduleExpr));
-            setOpen(false);
-            setName("");
-            setPrompt("");
-            setScheduleExpr("");
+            setSaving(true);
+            void onCreate(draftOf(name, prompt, scheduleType, scheduleExpr))
+              .then((stored) => {
+                // A rejected schedule keeps the form — and everything typed
+                // into it — so the expression can be corrected in place.
+                if (!stored) return;
+                setOpen(false);
+                setName("");
+                setPrompt("");
+                setScheduleExpr("");
+              })
+              .finally(() => setSaving(false));
           }}
         >
-          Create
+          {saving ? "Creating…" : "Create"}
         </Pill>
       </div>
     </div>
@@ -193,7 +211,7 @@ export function SchedulesPage() {
   return (
     <PageChrome title="Scheduled" mobileBrandHeader>
       <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
-        <NewSchedule onCreate={(task) => void schedules.create(task)} />
+        <NewSchedule onCreate={(task) => schedules.create(task).then((r) => r !== undefined)} />
 
         {schedules.error && (
           <div role="alert" className="mb-3 text-[11.5px] leading-[1.4] text-alert">

@@ -30,6 +30,20 @@ pub(super) async fn create_scheduled_task(
         } else {
             req.task_type.as_str()
         };
+        // Resolve the first fire time here when the caller did not supply one.
+        // Without this an unparseable expression is stored as an `active` task
+        // with a NULL `next_run`, which the scheduler never claims — the task
+        // silently never runs, and nothing anywhere says why. Computing it also
+        // makes the expression validated at creation, which is the only moment
+        // the user is still looking at the form.
+        let next_run = match opt_if_positive_i64(req.next_run_unix) {
+            Some(explicit) => Some(explicit),
+            None => cortex::tasks::calculate_next_run(
+                &req.schedule_type,
+                &req.schedule_expr,
+                &req.timezone,
+            )?,
+        };
         let new_task = NewTask {
             id: &id,
             name: &req.name,
@@ -37,7 +51,7 @@ pub(super) async fn create_scheduled_task(
             schedule_type: &req.schedule_type,
             schedule_expr: &req.schedule_expr,
             timezone: &req.timezone,
-            next_run: opt_if_positive_i64(req.next_run_unix),
+            next_run,
             max_retries: opt_if_non_negative_i32(req.max_retries),
             timeout_ms: opt_if_positive_i64(req.timeout_ms),
             delivery_channel: opt_if_not_empty(&req.delivery_channel),

@@ -36,10 +36,9 @@ use protocols::admin::{
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
     ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SessionTitleMutation, SetCredentialStrategyRequest,
-    SetSubprocessPinnedRequest, SettingEntry,
-    SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
-    TunnelStatusReply, WarningList, WebhookRef,
+    SessionSummary, SessionTitleMutation, SetCredentialStrategyRequest, SetSubprocessPinnedRequest,
+    SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot,
+    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -417,7 +416,10 @@ impl Admin for AdminSvc {
             .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?
             .is_some();
         if !known {
-            return Err(TStatus::not_found(format!("session `{}` not found", req.id)));
+            return Err(TStatus::not_found(format!(
+                "session `{}` not found",
+                req.id
+            )));
         }
         db.update_session_title(&req.id, title)
             .await

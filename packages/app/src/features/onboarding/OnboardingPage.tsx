@@ -42,6 +42,10 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
       if (vars.model !== "") {
         await borg.admin.setSetting({ key: "model", value: vars.model });
       }
+      // `useMutation.run` reports failure as `undefined`, so a void return
+      // would be indistinguishable from an error and the flow would never
+      // advance. Return something.
+      return true as const;
     },
   );
 
@@ -51,9 +55,8 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
 
   const saveAndFinish = async () => {
     if (!provider) return;
-    const stored = await save.run({ provider, apiKey, model });
     // A failed write must not be papered over by marking onboarding done.
-    if (stored !== undefined) finish();
+    if ((await save.run({ provider, apiKey, model })) === true) finish();
   };
 
   const steps = [
