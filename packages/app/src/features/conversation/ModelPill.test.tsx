@@ -1,0 +1,144 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { ModelPill } from "./ModelPill";
+
+const save = vi.fn(() => Promise.resolve(true));
+
+/** The settings the daemon currently reports, rewritten per test. */
+let stored: Record<string, string> = {};
+/** False stands in for a snapshot that has not arrived yet. */
+let ready = true;
+/** A rejected write, as the daemon reports one. */
+let saveError: { message: string } | undefined;
+const resetSaveError = vi.fn();
+
+vi.mock("../../lib/settings", () => ({
+  useSettings: () => ({
+    settings: ready
+      ? {
+          state: "ready",
+          data: new Map(
+            Object.entries(stored).map(([key, value]) => [key, { key, value, overridden: true }]),
+          ),
+          refetch: () => {},
+          refreshing: false,
+        }
+      : { state: "loading", refetch: () => {}, refreshing: false },
+    save,
+    clear: vi.fn(),
+    saving: false,
+    saveError,
+    resetSaveError,
+  }),
+}));
+
+beforeEach(() => {
+  save.mockClear();
+  resetSaveError.mockClear();
+  saveError = undefined;
+  ready = true;
+  stored = { provider: "anthropic", model: "claude-opus-5", "llm.thinking": "medium" };
+});
+
+afterEach(cleanup);
+
+/** The pill itself, found by the one label that never changes. */
+function pill() {
+  return screen.queryByRole("button", { name: "Model and thinking level" });
+}
+
+/** Opens the menu the way a user does. */
+function openMenu() {
+  fireEvent.click(pill()!);
+}
+
+describe("ModelPill", () => {
+  it("shows the model's short name, not its id", () => {
+    render(<ModelPill />);
+    expect(pill()!.textContent).toContain("Opus 5");
+    expect(pill()!.textContent).not.toContain("claude-opus-5");
+  });
+
+  it("falls back to the raw id for a model the shortlist does not know", () => {
+    stored.model = "some-provider/experimental-v3";
+    render(<ModelPill />);
+    expect(pill()!.textContent).toContain("some-provider/experimental-v3");
+  });
+
+  it("names the thinking level beside the model, unless it is off", () => {
+    render(<ModelPill />);
+    expect(pill()!.textContent).toContain("medium");
+    cleanup();
+
+    // "off" is the absence of a claim, not a badge worth carrying.
+    stored["llm.thinking"] = "off";
+    render(<ModelPill />);
+    expect(pill()!.textContent).not.toContain("off");
+  });
+
+  it("stays hidden until a model is configured", () => {
+    stored = {};
+    render(<ModelPill />);
+    expect(pill()).toBeNull();
+  });
+
+  it("stays hidden while the settings snapshot is still loading", () => {
+    ready = false;
+    render(<ModelPill />);
+    expect(pill()).toBeNull();
+  });
+
+  it("writes the model through the same mutation Settings uses", () => {
+    render(<ModelPill />);
+    openMenu();
+    fireEvent.click(screen.getByRole("button", { name: /Sonnet 5/ }));
+    expect(save).toHaveBeenCalledWith("model", "claude-sonnet-5");
+  });
+
+  it("writes the thinking level under the daemon's own key", () => {
+    render(<ModelPill />);
+    openMenu();
+    fireEvent.click(screen.getByRole("button", { name: /high/ }));
+    expect(save).toHaveBeenCalledWith("llm.thinking", "high");
+  });
+
+  it("closes the menu once a choice is made", () => {
+    render(<ModelPill />);
+    openMenu();
+    fireEvent.click(screen.getByRole("button", { name: /Sonnet 5/ }));
+    expect(screen.queryByRole("button", { name: /Sonnet 5/ })).toBeNull();
+  });
+
+  it("offers thinking levels even for a provider with no model shortlist", () => {
+    stored.provider = "openrouter";
+    render(<ModelPill />);
+    openMenu();
+    // No opinion on this provider's models, so that section is simply absent —
+    // rather than an empty list or a lecture about where to go instead.
+    expect(screen.queryByText("Model")).toBeNull();
+    expect(screen.getByText("Thinking")).toBeTruthy();
+  });
+
+  it("closes on an outside click without choosing anything", () => {
+    render(<ModelPill />);
+    openMenu();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("button", { name: /Sonnet 5/ })).toBeNull();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("says so when the daemon refuses the change", () => {
+    // The menu closes on click, so without this the pill would keep naming the
+    // old model with nothing anywhere to say the switch did not take.
+    saveError = { message: "connection refused" };
+    render(<ModelPill />);
+    expect(screen.getByRole("alert").textContent).toContain("Could not change the model");
+  });
+
+  it("clears a stale failure when the menu is reopened", () => {
+    saveError = { message: "connection refused" };
+    render(<ModelPill />);
+    openMenu();
+    expect(resetSaveError).toHaveBeenCalled();
+  });
+});

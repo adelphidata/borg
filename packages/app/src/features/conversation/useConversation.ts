@@ -8,6 +8,7 @@ import {
   useServerStream,
   type QueryResult,
 } from "../../lib/useDaemon";
+import { draftKeyFor, moveDraft } from "./draftStore";
 
 /** An image riding along with a turn. */
 export interface Attachment {
@@ -283,7 +284,7 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
 
 export interface Conversation {
   /** Open + state + history, routed through DaemonState by the page. */
-  opened: QueryResult<{ title: string; model: string }>;
+  opened: QueryResult<{ title: string; model: string; agentSessionId: string }>;
   cells: Cell[];
   /** Current todo list, empty when the agent has not published one. */
   plan: PlanStep[];
@@ -362,7 +363,25 @@ export function useConversation(target: string | undefined): Conversation {
       lastSeq.current = Number(open.lastEventSeq);
       setSessionId(open.sessionId);
       setBusy(state.turnInFlight);
-      return { title: state.title, model: state.llmModel };
+      // A conversation opened at `/c/new` has no id to file a draft under, so
+      // the composer types into a key named for the route. Carry that text over
+      // now the real id has landed, before anything re-reads it.
+      //
+      // This belongs here rather than in the page: `moveDraft` notifies the
+      // session lists, and a store write during render would update a sibling
+      // React had already rendered. It cannot run in an effect either — those
+      // fire child-first, so the composer would be handed the new key a frame
+      // before the text arrived under it, blanking the box mid-sentence.
+      if (state.agentSessionId) {
+        moveDraft(draftKeyFor(target ?? "latest"), draftKeyFor(state.agentSessionId));
+      }
+      // `agentSessionId` is the id the session lists key on. The page needs it
+      // to file this conversation's draft where those lists will look.
+      return {
+        title: state.title,
+        model: state.llmModel,
+        agentSessionId: state.agentSessionId,
+      };
     },
     [target],
   );

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AttachIcon, CloseIcon, Pill, SendIcon, useIsMobile } from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
 import { collectImages } from "./attachments";
+import { publishDraft } from "./draftStore";
+import { ModelPill } from "./ModelPill";
 import type { Attachment } from "./useConversation";
 
 /** Grows with its content up to a ceiling, then scrolls. */
@@ -23,6 +25,11 @@ interface ComposerProps {
   busy: boolean;
   /** Persists the draft per session so switching conversations does not lose it. */
   draftKey: string;
+  /**
+   * Identifies the conversation itself. Unlike `draftKey` it does not change
+   * when a new conversation is issued its id, so attachments survive that.
+   */
+  conversationKey: string;
   onSend: (text: string, attachments: Attachment[]) => void;
   onSteer: (text: string) => void;
   onCancel: () => void;
@@ -36,7 +43,14 @@ interface ComposerProps {
  * turn — that path steers the running agent instead of queueing, which is the
  * one thing the daemon supports and the UI never exposed.
  */
-export function Composer({ busy, draftKey, onSend, onSteer, onCancel }: ComposerProps) {
+export function Composer({
+  busy,
+  draftKey,
+  conversationKey,
+  onSend,
+  onSteer,
+  onCancel,
+}: ComposerProps) {
   const isMobile = useIsMobile();
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -60,21 +74,33 @@ export function Composer({ busy, draftKey, onSend, onSteer, onCancel }: Composer
     [],
   );
 
-  // Restore this session's draft, and stash it again when the session changes.
+  // Restore this session's draft whenever the key changes — including the
+  // provisional → real migration a new conversation makes once the daemon
+  // answers, where the text has already been moved across for us.
   useEffect(() => {
     setDraft(sessionStorage.getItem(draftKey) ?? "");
-    // Dropping the chips is not enough: the blobs behind them stay alive until
-    // the document unloads, so hopping between conversations would pile up a
-    // full copy of every abandoned image.
+  }, [draftKey]);
+
+  // Attachments belong to the conversation, not to the key naming it. Clearing
+  // them on any key change would silently bin an image attached in the moment
+  // between opening a new conversation and the daemon issuing its id.
+  //
+  // Dropping the chips is not enough: the blobs behind them stay alive until
+  // the document unloads, so hopping between conversations would pile up a
+  // full copy of every abandoned image.
+  useEffect(() => {
     for (const url of objectUrls.current) URL.revokeObjectURL(url);
     objectUrls.current = [];
     setAttachments([]);
     setError(undefined);
-  }, [draftKey]);
+  }, [conversationKey]);
 
   useEffect(() => {
     if (draft === "") sessionStorage.removeItem(draftKey);
     else sessionStorage.setItem(draftKey, draft);
+    // Session lists render beside this box and name unsent rows after it;
+    // same-tab writes raise no storage event, so tell them directly.
+    publishDraft(draftKey, draft);
   }, [draft, draftKey]);
 
   useKeybind("cancel-turn", onCancel, { enabled: busy, inInputs: true });
@@ -225,6 +251,12 @@ export function Composer({ busy, draftKey, onSend, onSteer, onCancel }: Composer
               <SendIcon size={14} />
             </button>
           )}
+        </div>
+
+        {/* Under the box, not in it: choosing the model is part of asking the
+            question, but it is not the question. */}
+        <div className="mt-1.5 flex items-center px-1">
+          <ModelPill />
         </div>
       </div>
     </div>

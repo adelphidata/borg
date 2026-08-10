@@ -6,8 +6,13 @@ import { DaemonState } from "../../components/DaemonState";
 import { useKeybind } from "../../lib/keybinds";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
+import { draftKeyFor } from "./draftStore";
+import { ChangedFilesCard } from "./cells/ChangedFilesCard";
 import { PlanPanel } from "./cells/PlanPanel";
+import { ToolRunCell } from "./cells/ToolRunCell";
 import { TranscriptCell } from "./cells";
+import { groupCells } from "./cells/toolRuns";
+import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
 import { useTurnNotifications } from "./useTurnNotifications";
 
@@ -42,6 +47,18 @@ export function ConversationPage() {
     return cells.map((cell) => (cell.kind === "user" ? ++nth : -1));
   }, [cells]);
 
+  // What this turn changed on disk, read off the patch calls it already made.
+  // Only once the turn settles — that is the only time the card renders, and
+  // parsing every diff again on each streaming delta would cost the whole
+  // transcript's frame rate to build something nobody is looking at.
+  const edits = useMemo(() => (busy ? [] : collectEdits(turnEditCells(cells))), [cells, busy]);
+  const uncounted = useMemo(
+    () => (busy ? 0 : truncatedPatchCount(turnEditCells(cells))),
+    [cells, busy],
+  );
+  // Settled tool calls fold into runs so a tool-heavy turn stays readable.
+  const items = useMemo(() => groupCells(cells, busy), [cells, busy]);
+
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
@@ -52,6 +69,13 @@ export function ConversationPage() {
 
   const title = opened.state === "ready" && opened.data.title ? opened.data.title : "Conversation";
   const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
+
+  // Session lists look for a draft under the agent session id, but a
+  // conversation opened at `/c/new` has no id until the daemon answers, so the
+  // composer types under a key named for the route until then. `useConversation`
+  // carries the text across as the id lands; this only follows it.
+  const agentSessionId = opened.state === "ready" ? opened.data.agentSessionId : "";
+  const draftKey = agentSessionId ? draftKeyFor(agentSessionId) : draftKeyFor(target ?? "latest");
 
   return (
     <PageChrome
@@ -92,16 +116,25 @@ export function ConversationPage() {
                     Nothing here yet. Ask Borg anything.
                   </div>
                 )}
-                {cells.map((cell, i) => (
-                  <TranscriptCell
-                    key={i}
-                    cell={cell}
-                    respond={respond}
-                    ordinal={ordinals[i]!}
-                    editable={cell.kind === "user" && !busy}
-                    onEdit={editAndResend}
-                  />
-                ))}
+                {items.map((item) =>
+                  item.type === "run" ? (
+                    <ToolRunCell key={item.key} tools={item.tools} live={item.live} />
+                  ) : (
+                    <TranscriptCell
+                      key={item.index}
+                      cell={item.cell}
+                      respond={respond}
+                      ordinal={ordinals[item.index]!}
+                      editable={item.cell.kind === "user" && !busy}
+                      onEdit={editAndResend}
+                    />
+                  ),
+                )}
+                {/* Only once the turn settles: mid-turn the tool rows narrate,
+                    and a card rebuilt on every patch would thrash. */}
+                {!busy && (edits.length > 0 || uncounted > 0) && (
+                  <ChangedFilesCard edits={edits} uncounted={uncounted} />
+                )}
                 {busy && (
                   <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
                 )}
@@ -145,7 +178,8 @@ export function ConversationPage() {
 
       <Composer
         busy={busy}
-        draftKey={`borg:draft:${target ?? "latest"}`}
+        draftKey={draftKey}
+        conversationKey={target ?? "latest"}
         onSend={send}
         onSteer={steer}
         onCancel={cancel}

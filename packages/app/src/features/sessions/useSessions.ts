@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import type { admin as adminPb } from "@borg/client";
+import { draftsVersion, rowTitle, subscribeDrafts } from "../conversation/draftStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 export interface SessionRow {
@@ -53,13 +54,30 @@ export function filterSessions(sessions: SessionRow[], query: string): SessionRo
   return sessions.filter((s) => s.title.toLowerCase().includes(needle));
 }
 
+/** Carries the daemon's title through untouched; naming happens at render. */
 function toRow(s: adminPb.SessionSummary): SessionRow {
   return {
     id: s.id,
-    title: s.title || "Untitled",
+    title: s.title,
     messageCount: Number(s.messageCount),
     updatedAt: Number(s.updatedUnixTs),
   };
+}
+
+/**
+ * Names each row.
+ *
+ * A session nobody has written to yet is named after whatever sits unsent in
+ * its composer, so a row of drafts says which is which instead of repeating
+ * "Untitled". Applied here rather than at fetch time so typing renames the row
+ * live, and applied before the search filter so a draft is findable by what it
+ * says.
+ */
+export function resolveTitles(sessions: SessionRow[]): SessionRow[] {
+  return sessions.map((s) => {
+    const title = rowTitle(s.title, s.messageCount, s.id);
+    return title === s.title ? s : { ...s, title };
+  });
 }
 
 export interface Sessions {
@@ -126,9 +144,14 @@ export function useSessions(deps: unknown[] = []): Sessions {
   });
 
   const sessions = query.state === "ready" ? query.data : NO_SESSIONS;
+  // Re-runs the naming pass whenever a composer publishes, so an unsent row is
+  // renamed as it is typed.
+  const drafts = useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
   const groups = useMemo(
-    () => groupSessions(filterSessions(sessions, search), Date.now()),
-    [sessions, search],
+    () => groupSessions(filterSessions(resolveTitles(sessions), search), Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `drafts` is a
+    // version counter: it names no value used here, it only says one changed.
+    [sessions, search, drafts],
   );
 
   return {

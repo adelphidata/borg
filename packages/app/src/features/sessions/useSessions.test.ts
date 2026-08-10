@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { filterSessions, groupSessions, type SessionRow } from "./useSessions";
+import { beforeEach, describe, expect, it } from "vitest";
+import { draftKeyFor, publishDraft } from "../conversation/draftStore";
+import { filterSessions, groupSessions, resolveTitles, type SessionRow } from "./useSessions";
 
 /** 2026-08-09 14:00 local — the reference "now" for every case below. */
 const NOW = new Date(2026, 7, 9, 14, 0, 0).getTime();
@@ -71,5 +72,41 @@ describe("filterSessions", () => {
 
   it("returns nothing when the query matches no title", () => {
     expect(filterSessions(rows, "kubernetes")).toEqual([]);
+  });
+});
+
+describe("resolveTitles", () => {
+  const draft = (id: string): SessionRow => ({
+    id,
+    title: "New conversation",
+    messageCount: 0,
+    updatedAt: 0,
+  });
+
+  beforeEach(() => {
+    for (const id of ["d1", "d2"]) publishDraft(draftKeyFor(id), "");
+  });
+
+  it("names an unsent row after its draft", () => {
+    publishDraft(draftKeyFor("d1"), "Port the gateway to the new seam");
+    expect(resolveTitles([draft("d1")])[0]!.title).toBe("Port the gateway to the new seam");
+  });
+
+  it("leaves a used conversation's title alone", () => {
+    publishDraft(draftKeyFor("d1"), "half-written reply");
+    const used: SessionRow = { id: "d1", title: "Deploy notes", messageCount: 6, updatedAt: 0 };
+    expect(resolveTitles([used])[0]!.title).toBe("Deploy notes");
+  });
+
+  it("makes a draft findable by what it says", () => {
+    publishDraft(draftKeyFor("d1"), "Cortex bug hunt");
+    publishDraft(draftKeyFor("d2"), "Something else entirely");
+    const found = filterSessions(resolveTitles([draft("d1"), draft("d2")]), "bug");
+    expect(found.map((s) => s.id)).toEqual(["d1"]);
+  });
+
+  it("keeps row identity when nothing was renamed, so memos still hold", () => {
+    const rows = [draft("d1")];
+    expect(resolveTitles(rows)[0]).toBe(rows[0]);
   });
 });

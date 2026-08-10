@@ -49,3 +49,6 @@ borg_*.txt
 
 # Playwright MCP session artifacts (local only)
 /.playwright-mcp/
+
+# Local scratch list of deferred work (not a roadmap)
+/TODO.md

@@ -38,6 +38,21 @@ export interface BasicSetting {
   options?: SettingOption[];
 }
 
+/**
+ * How hard Borg thinks, as offered to the user.
+ *
+ * A curated subset of the levels the daemon accepts — the composer's picker and
+ * the settings page read this same list, so the two surfaces can never drift
+ * into offering different answers to the same question.
+ */
+export const THINKING_OPTIONS: SettingOption[] = [
+  { value: "off", desc: "Answer straight away." },
+  { value: "low", desc: "A moment's thought." },
+  { value: "medium", desc: "Thinks it through." },
+  { value: "high", desc: "Slow and deep. For the hard stuff." },
+  { value: "adaptive", desc: "Borg decides per question." },
+];
+
 export const basicSettings: BasicSetting[] = [
   {
     id: "provider",
@@ -56,13 +71,7 @@ export const basicSettings: BasicSetting[] = [
     key: "llm.thinking",
     name: "Thinking level",
     desc: "How long Borg reasons before it answers",
-    options: [
-      { value: "off", desc: "Answer straight away." },
-      { value: "low", desc: "A moment's thought." },
-      { value: "medium", desc: "Thinks it through." },
-      { value: "high", desc: "Slow and deep. For the hard stuff." },
-      { value: "adaptive", desc: "Borg decides per question." },
-    ],
+    options: THINKING_OPTIONS,
   },
   {
     id: "mode",

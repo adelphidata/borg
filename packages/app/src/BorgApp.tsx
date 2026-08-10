@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { ConversationPage } from "./features/conversation/ConversationPage";
+import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
@@ -52,9 +53,12 @@ function Shell({ platform }: { platform: Platform }) {
   // Re-fetched on every navigation so fresh conversations and cleared
   // warnings appear without a reload.
   const sessions = useQuery((borg) => borg.admin.listSessions({}), [location.key]);
+  // Same naming rule as the full list: an unsent session is called after what
+  // has been typed into it. The version counter re-renders as that changes.
+  useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)
-    .map((s) => ({ id: s.id, title: s.title || "Untitled" }));
+    .map((s) => ({ id: s.id, title: rowTitle(s.title, Number(s.messageCount), s.id) }));
 
   // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`
   // brings a conversation back. The daemon also closes the session if it is
