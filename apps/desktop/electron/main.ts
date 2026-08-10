@@ -139,7 +139,16 @@ if (!app.requestSingleInstanceLock()) {
     installApplicationMenu();
     createWindow();
     app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      // Must test the main window, not the window count: the hidden
+      // quick-entry panel is a BrowserWindow too, so once it has been summoned
+      // `getAllWindows()` is never empty and clicking the dock icon after
+      // closing the last real window would do nothing at all.
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show();
+        mainWindow.focus();
+        return;
+      }
+      createWindow();
     });
   });
 }

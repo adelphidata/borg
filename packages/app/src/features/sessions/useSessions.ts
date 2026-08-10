@@ -113,7 +113,9 @@ export function useSessions(deps: unknown[] = []): Sessions {
     link.href = url;
     link.download = result.suggestedFilename || `session.${vars.format}`;
     link.click();
-    URL.revokeObjectURL(url);
+    // `click()` only *schedules* the download; revoking in the same tick can
+    // pull the blob out from under it and produce a zero-byte or failed file.
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
     return result;
   });
 

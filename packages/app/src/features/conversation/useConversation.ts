@@ -436,9 +436,10 @@ export function useConversation(target: string | undefined): Conversation {
 
   const steer = useCallback(
     (text: string) => {
-      // Echoed locally rather than waiting for `steerReceived`, so the message
-      // appears the moment it is sent like every other user turn.
-      setCells((prev) => [...prev, { kind: "user", text }]);
+      // Deliberately NOT echoed locally: the daemon persists a steer as a real
+      // user message and replays it as `steerReceived` on this same stream, so
+      // a local echo renders the turn twice and — worse — shifts every later
+      // user cell's ordinal away from the one `rewindToNthUserMessage` counts.
       void steerMutation.run(text);
     },
     [steerMutation.run],
@@ -476,14 +477,20 @@ export function useConversation(target: string | undefined): Conversation {
   const editAndResend = useCallback(
     (nthUserMessage: number, text: string) => {
       if (!sessionId) return;
-      // Drop the rewritten turn and everything after it on screen first, so the
-      // transcript matches what the daemon is about to hold.
-      setCells((prev) => {
-        let seen = 0;
-        const cut = prev.findIndex((c) => c.kind === "user" && seen++ === nthUserMessage);
-        return cut === -1 ? prev : prev.slice(0, cut);
+      // Rewind FIRST. `useMutation.run` reports failure as `undefined` rather
+      // than rejecting, so resending unconditionally would append the rewritten
+      // turn to a history the daemon never truncated — a duplicate turn on a
+      // transcript the UI had already cut short. Only once the daemon confirms
+      // is it safe to drop the cells and send.
+      void rewindMutation.run(nthUserMessage).then((result) => {
+        if (result === undefined) return;
+        setCells((prev) => {
+          let seen = 0;
+          const cut = prev.findIndex((c) => c.kind === "user" && seen++ === nthUserMessage);
+          return cut === -1 ? prev : prev.slice(0, cut);
+        });
+        send(text);
       });
-      void rewindMutation.run(nthUserMessage).then(() => send(text));
     },
     [rewindMutation.run, send, sessionId],
   );

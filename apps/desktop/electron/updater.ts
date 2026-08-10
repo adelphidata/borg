@@ -23,6 +23,7 @@ function broadcast(status: WireUpdateStatus): void {
 
 export function registerUpdater(options: { enabled: boolean }): { dispose(): void } {
   let timer: ReturnType<typeof setInterval> | undefined;
+  let firstCheck: ReturnType<typeof setTimeout> | undefined;
 
   // The renderer drives the restart, so never quit out from under a live turn.
   autoUpdater.autoDownload = true;
@@ -65,12 +66,15 @@ export function registerUpdater(options: { enabled: boolean }): { dispose(): voi
 
   if (options.enabled) {
     // Late enough that it never competes with the first paint.
-    setTimeout(check, 8_000);
+    firstCheck = setTimeout(check, 8_000);
     timer = setInterval(check, DAY_MS);
   }
 
   return {
     dispose() {
+      // The startup check is a timeout, not the interval — leaving it armed
+      // lets a torn-down updater fire a check into removed handlers.
+      clearTimeout(firstCheck);
       clearInterval(timer);
       autoUpdater.removeAllListeners();
       ipcMain.removeHandler(CHANNELS.updateCheck);

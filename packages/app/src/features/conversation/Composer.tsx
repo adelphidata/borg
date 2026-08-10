@@ -47,18 +47,6 @@ export function Composer({ busy, draftKey, onSend, onSteer, onCancel }: Composer
   const history = useRef<string[]>([]);
   const historyAt = useRef<number | null>(null);
 
-  // Restore this session's draft, and stash it again when the session changes.
-  useEffect(() => {
-    setDraft(sessionStorage.getItem(draftKey) ?? "");
-    setAttachments([]);
-    setError(undefined);
-  }, [draftKey]);
-
-  useEffect(() => {
-    if (draft === "") sessionStorage.removeItem(draftKey);
-    else sessionStorage.setItem(draftKey, draft);
-  }, [draft, draftKey]);
-
   // Object URLs are only freed by hand. Tracking them in a ref rather than an
   // effect on `attachments` matters: an effect keyed on the array would revoke
   // the previous images every time a new one is added, blanking the thumbnails
@@ -71,6 +59,23 @@ export function Composer({ busy, draftKey, onSend, onSteer, onCancel }: Composer
     },
     [],
   );
+
+  // Restore this session's draft, and stash it again when the session changes.
+  useEffect(() => {
+    setDraft(sessionStorage.getItem(draftKey) ?? "");
+    // Dropping the chips is not enough: the blobs behind them stay alive until
+    // the document unloads, so hopping between conversations would pile up a
+    // full copy of every abandoned image.
+    for (const url of objectUrls.current) URL.revokeObjectURL(url);
+    objectUrls.current = [];
+    setAttachments([]);
+    setError(undefined);
+  }, [draftKey]);
+
+  useEffect(() => {
+    if (draft === "") sessionStorage.removeItem(draftKey);
+    else sessionStorage.setItem(draftKey, draft);
+  }, [draft, draftKey]);
 
   useKeybind("cancel-turn", onCancel, { enabled: busy, inInputs: true });
 
