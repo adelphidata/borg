@@ -56,7 +56,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_KEY, preference);
   }, [theme, preference]);
 
-  const setPreference = useCallback((next: ThemePreference) => setPreferenceState(next), []);
   const toggleTheme = useCallback(() => {
     // From "system", flip to the opposite of what is showing — anything else
     // would look like the toggle did nothing.
@@ -66,7 +65,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [systemDark]);
 
   return (
-    <ThemeContext.Provider value={{ theme, preference, setPreference, toggleTheme }}>
+    <ThemeContext.Provider
+      value={{ theme, preference, setPreference: setPreferenceState, toggleTheme }}
+    >
       {children}
     </ThemeContext.Provider>
   );

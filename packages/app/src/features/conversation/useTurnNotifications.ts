@@ -40,11 +40,16 @@ export function useTurnNotifications(cells: Cell[], busy: boolean, sessionId: st
 
   useEffect(() => {
     const pending = pendingPrompts(cells);
-    const appeared = pending > lastPromptCount.current;
+    const previous = lastPromptCount.current;
+    if (pending === previous) return;
     lastPromptCount.current = pending;
 
+    // Only on an actual change: `cells` is a new array on every streamed
+    // token, and `setBadgeCount` is an IPC round trip to the main process.
+    // Setting the badge to the same 0 a few thousand times per turn is pure
+    // cost.
     native.setBadgeCount(pending);
-    if (!appeared || document.hasFocus()) return;
+    if (pending <= previous || document.hasFocus()) return;
     native.notify({
       title: "Borg needs you",
       body: "Borg is waiting on an answer.",

@@ -3,6 +3,7 @@ import { CheckIcon, MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from
 import type { BorgClient, admin } from "@borg/client";
 import { useMutation, useQuery } from "../../lib/useDaemon";
 import { DaemonState } from "../../components/DaemonState";
+import { formatDuration as fmtDuration, plural } from "../../lib/format";
 
 interface HealthCheck {
   id: string;
@@ -20,18 +21,6 @@ export function splitWarning(warning: string): { label: string; text: string } {
   const colon = warning.indexOf(":");
   if (colon <= 0) return { label: "", text: warning.trim() };
   return { label: warning.slice(0, colon).trim(), text: warning.slice(colon + 1).trim() };
-}
-
-function plural(n: number, word: string): string {
-  if (n === 1) return `1 ${word}`;
-  return `${n} ${word.endsWith("s") ? `${word}es` : `${word}s`}`;
-}
-
-function fmtDuration(secs: number): string {
-  if (secs >= 86_400) return plural(Math.floor(secs / 86_400), "day");
-  if (secs >= 3_600) return plural(Math.floor(secs / 3_600), "hour");
-  if (secs >= 60) return plural(Math.floor(secs / 60), "minute");
-  return plural(Math.max(0, Math.floor(secs)), "second");
 }
 
 function fmtAgo(unixTs: number): string {

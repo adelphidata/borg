@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { admin as adminPb } from "@borg/client";
-import { useBorg, useMutation, useServerStream } from "../../lib/useDaemon";
+import { asBorgError, useBorg, useMutation, useServerStream } from "../../lib/useDaemon";
 
 /** Statuses that mean the agent is still doing something. */
 export function isLive(status: string): boolean {
@@ -33,7 +33,10 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
   const [agents, setAgents] = useState<adminPb.AgentEntry[]>([]);
   const [goal, setGoal] = useState<adminPb.GoalDetail>();
   const [gates, setGates] = useState<adminPb.GoalGate[]>([]);
-  const [lastSeq, setLastSeq] = useState(0);
+  // A ref, not state: the sequence number is only ever compared, never
+  // rendered. In state it forced a second render per event and — worse — the
+  // stream callback would compare against whatever value its closure captured.
+  const lastSeq = useRef(0);
   const [error, setError] = useState<string>();
 
   const refresh = useCallback(async () => {
@@ -62,7 +65,7 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
       }
       setError(undefined);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(asBorgError(e).message);
     }
   }, [borg, sessionId]);
 
@@ -70,7 +73,7 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
     setAgents([]);
     setGoal(undefined);
     setGates([]);
-    setLastSeq(0);
+    lastSeq.current = 0;
     void refresh();
   }, [refresh]);
 
@@ -83,12 +86,12 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
       const seq = Number(event.seq);
       // A gap means the broadcast lagged and events were dropped; patching
       // deltas onto a tree that missed some would silently diverge.
-      if (lastSeq !== 0 && seq !== lastSeq + 1) {
-        setLastSeq(seq);
+      if (lastSeq.current !== 0 && seq !== lastSeq.current + 1) {
+        lastSeq.current = seq;
         void refresh();
         return;
       }
-      setLastSeq(seq);
+      lastSeq.current = seq;
       const agent = event.agent;
       if (!agent) return;
       setAgents((prev) => {

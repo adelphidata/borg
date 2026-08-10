@@ -1,4 +1,5 @@
 import type { admin as adminPb } from "@borg/client";
+import { plural } from "../../lib/format";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 /** Schedule kinds the daemon understands (`crates/cortex/src/tasks.rs`). */
@@ -12,19 +13,29 @@ export interface NewSchedule {
   scheduleExpr: string;
 }
 
+/**
+ * Parses an interval expression into seconds, mirroring `parse_interval` in
+ * `crates/cortex/src/tasks.rs`: a suffix of s/m/h/d, or a bare seconds count.
+ * Returns null for anything the daemon would also reject.
+ */
+export function intervalSeconds(expr: string): number | null {
+  const match = /^(\d+)([smhd]?)$/.exec(expr.trim());
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const unit = match[2];
+  const scale = unit === "m" ? 60 : unit === "h" ? 3600 : unit === "d" ? 86_400 : 1;
+  return value * scale;
+}
+
 /** Renders a schedule the way a person would say it. */
 export function describeSchedule(type: string, expr: string): string {
   if (type === "interval") {
-    const seconds = Number(expr);
-    if (!Number.isFinite(seconds) || seconds <= 0) return expr;
-    if (seconds % 3600 === 0) {
-      const hours = seconds / 3600;
-      return `every ${hours} hour${hours === 1 ? "" : "s"}`;
-    }
-    if (seconds % 60 === 0) {
-      const minutes = seconds / 60;
-      return `every ${minutes} minute${minutes === 1 ? "" : "s"}`;
-    }
+    const seconds = intervalSeconds(expr);
+    if (seconds === null) return expr;
+    if (seconds % 86_400 === 0) return `every ${plural(seconds / 86_400, "day")}`;
+    if (seconds % 3600 === 0) return `every ${plural(seconds / 3600, "hour")}`;
+    if (seconds % 60 === 0) return `every ${plural(seconds / 60, "minute")}`;
     return `every ${seconds}s`;
   }
   if (type === "once") return expr === "" ? "once" : `once — ${expr}`;

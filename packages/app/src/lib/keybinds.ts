@@ -1,4 +1,7 @@
 import { useEffect, useRef } from "react";
+import { CHORDS } from "./chords";
+
+export { CHORDS, hintFor, isMacPlatform } from "./chords";
 
 /**
  * The one keyboard layer.
@@ -13,17 +16,6 @@ import { useEffect, useRef } from "react";
  * unregister as they mount. Last registration wins, which is what a modal
  * wants — it takes Escape while it is open and hands it back on close.
  */
-
-/** Actions with a chord. Anything else is dispatchable but has no key. */
-export const CHORDS: Readonly<Record<string, string>> = {
-  "command-palette": "mod+k",
-  "new-conversation": "mod+n",
-  "search-sessions": "mod+shift+f",
-  "open-settings": "mod+,",
-  "toggle-activity": "mod+j",
-  "cancel-turn": "escape",
-  // No chord: reachable from the Help menu only. Dispatchable all the same.
-};
 
 type Handler = () => void;
 

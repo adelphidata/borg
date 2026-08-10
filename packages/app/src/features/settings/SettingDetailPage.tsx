@@ -10,11 +10,11 @@ import {
   scrollCol,
   useIsMobile,
   useTheme,
-  THEME_PREFERENCES,
 } from "@borg/ui";
+import type { ThemePreference } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
-import { APPEARANCE_LABELS, findBasicSetting, type SettingOption } from "./catalog";
+import { findBasicSetting, type SettingOption } from "./catalog";
 
 function DetailShell({ title, children }: { title: string; children: ReactNode }) {
   const isMobile = useIsMobile();
@@ -81,7 +81,7 @@ function OptionPicker({
                   on ? "text-neon-ink" : "text-ink"
                 }`}
               >
-                {o.value}
+                {o.label ?? o.value}
               </div>
               {o.desc && (
                 <div className="mt-[3px] text-[12px] leading-[1.45] text-ink3">{o.desc}</div>
@@ -134,18 +134,17 @@ function ValueEditor({
 function AppearanceDetail() {
   const { preference, setPreference } = useTheme();
   const setting = findBasicSetting("appearance")!;
-  const value = APPEARANCE_LABELS[preference];
 
   return (
     <DetailShell title={setting.name}>
       <Heading name={setting.name} desc={setting.desc} />
       <OptionPicker
         options={setting.options ?? []}
-        value={value}
+        value={preference}
         disabled={false}
         onPick={(picked) => {
-          const next = THEME_PREFERENCES.find((p) => APPEARANCE_LABELS[p] === picked);
-          if (next && next !== preference) setPreference(next);
+          // The options are built from `THEME_PREFERENCES`, so `picked` is one.
+          if (picked !== preference) setPreference(picked as ThemePreference);
         }}
       />
       <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">

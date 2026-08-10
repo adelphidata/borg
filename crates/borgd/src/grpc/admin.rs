@@ -405,25 +405,24 @@ impl Admin for AdminSvc {
         if title.is_empty() {
             return Err(TStatus::invalid_argument("title must not be empty"));
         }
-        let db = Database::open()
-            .await
-            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?;
         // `update_session_title` is a no-op for an unknown id, so check first:
         // a rename that quietly did nothing looks identical to one that worked.
-        let known = db
-            .session_by_id(&req.id)
-            .await
-            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?
-            .is_some();
+        let known = async {
+            let db = Database::open().await?;
+            let known = db.session_by_id(&req.id).await?.is_some();
+            if known {
+                db.update_session_title(&req.id, title).await?;
+            }
+            anyhow::Ok(known)
+        }
+        .await
+        .map_err(map_internal("set_session_title"))?;
         if !known {
             return Err(TStatus::not_found(format!(
                 "session `{}` not found",
                 req.id
             )));
         }
-        db.update_session_title(&req.id, title)
-            .await
-            .map_err(|e| TStatus::internal(format!("set_session_title failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 

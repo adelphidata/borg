@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { telemetry as telemetryPb } from "@borg/client";
 import { accumulate } from "./useUsage";
-import { formatCost } from "./UsagePage";
+import { formatCost } from "../../lib/format";
 
 function costEvent(over: Partial<telemetryPb.CostEvent> = {}): telemetryPb.CostEvent {
   return {

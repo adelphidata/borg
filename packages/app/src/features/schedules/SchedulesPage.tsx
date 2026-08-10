@@ -4,6 +4,7 @@ import {
   PageChrome,
   Pill,
   PlusIcon,
+  StatusDot,
   SETTINGS_SCROLL_DESKTOP_PADDING,
   TrashIcon,
   scrollCol,
@@ -157,11 +158,7 @@ function TaskRow({
 
   return (
     <div className="group flex items-start gap-3 rounded-[10px] border border-line2 px-4 py-3">
-      <span
-        className={`mt-[6px] h-1.5 w-1.5 flex-none rounded-full ${
-          finished ? "bg-ink3" : paused ? "bg-bar-track" : "bg-neon"
-        }`}
-      />
+      <StatusDot tone={finished ? "idle" : paused ? "paused" : "ok"} className="mt-[6px]" />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13.5px] leading-[1.35] text-ink">{task.name}</div>
         <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">

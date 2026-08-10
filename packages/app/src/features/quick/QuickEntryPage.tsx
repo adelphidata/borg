@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { LogoIcon, SendIcon } from "@borg/ui";
-import { useBorg } from "../../lib/useDaemon";
+import { asBorgError, useBorg } from "../../lib/useDaemon";
 import { useNative } from "../../lib/platform";
 
 /**
@@ -49,7 +49,7 @@ export function QuickEntryPage() {
       // The reply belongs where the transcript is.
       native.revealSession(open.sessionId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(asBorgError(e).message);
     } finally {
       setSending(false);
     }

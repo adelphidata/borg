@@ -1,14 +1,22 @@
-import { AgentsIcon, CheckIcon, CloseIcon, Pill } from "@borg/ui";
+import {
+  AgentsIcon,
+  CheckIcon,
+  CloseIcon,
+  Meter,
+  Pill,
+  SECTION_LABEL_TEXT,
+  StatusDot,
+  type DotTone,
+} from "@borg/ui";
 import type { admin as adminPb } from "@borg/client";
+import { formatTokens } from "../../lib/format";
 import { isLive, useAgentTree } from "./useAgentTree";
 
-const TOKENS = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
-
-function statusColor(status: string): string {
-  if (status === "running") return "animate-bpulse bg-neon";
-  if (status === "errored") return "bg-alert";
-  if (status === "paused") return "bg-bar-track";
-  return "bg-ink3";
+function statusTone(status: string): DotTone {
+  if (status === "running") return "busy";
+  if (status === "errored") return "alert";
+  if (status === "paused") return "paused";
+  return "idle";
 }
 
 function AgentRow({
@@ -32,16 +40,14 @@ function AgentRow({
       // Depth is the tree; indenting is what makes it readable as one.
       style={{ paddingLeft: agent.depth * 14 }}
     >
-      <span
-        className={`mt-[5px] h-1.5 w-1.5 flex-none rounded-full ${statusColor(agent.status)}`}
-      />
+      <StatusDot tone={statusTone(agent.status)} className="mt-[5px]" />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[12.5px] leading-[1.35] text-ink">
           {agent.nickname || agent.role || agent.id}
         </div>
         <div className="mt-[2px] truncate text-[11px] leading-none text-ink3">
           {agent.status}
-          {tokens > 0 && <> · {TOKENS.format(tokens)} tok</>}
+          {tokens > 0 && <> · {formatTokens(tokens)} tok</>}
           {metrics && metrics.toolCalls > 0n && <> · {Number(metrics.toolCalls)} calls</>}
         </div>
         {agent.status === "errored" && agent.error && (
@@ -82,19 +88,13 @@ function Gates({ gates }: { gates: adminPb.GoalGate[] }) {
   if (gates.length === 0) return null;
   return (
     <div className="mt-2.5 border-t border-line2 pt-2.5">
-      <div className="mb-1.5 text-[9.5px] leading-none font-medium tracking-[0.16em] text-ink3 uppercase">
-        Gates
-      </div>
+      <div className={`${SECTION_LABEL_TEXT} mb-1.5`}>Gates</div>
       {gates.map((gate) => {
         const ran = gate.lastExitCodePresent;
         const passed = ran && Number(gate.lastExitCode) === 0;
         return (
           <div key={Number(gate.ordinal)} className="flex items-start gap-2 py-[3px]">
-            <span
-              className={`mt-[5px] h-1.5 w-1.5 flex-none rounded-full ${
-                !ran ? "bg-ink3" : passed ? "bg-neon" : "bg-alert"
-              }`}
-            />
+            <StatusDot tone={!ran ? "idle" : passed ? "ok" : "alert"} className="mt-[5px]" />
             <span className="min-w-0 flex-1 truncate font-mono text-[11px] leading-[1.4] text-ink2">
               {gate.command}
             </span>
@@ -119,22 +119,15 @@ function GoalCard({ goal, gates }: { goal: adminPb.GoalDetail; gates: adminPb.Go
   return (
     <div className="mb-3 rounded-[9px] border border-line2 bg-surface3 px-3 py-2.5">
       <div className="flex items-baseline gap-2">
-        <span className="text-[9.5px] leading-none font-medium tracking-[0.16em] text-ink3 uppercase">
-          Goal
-        </span>
+        <span className={SECTION_LABEL_TEXT}>Goal</span>
         <span className="flex-1 text-right text-[11px] leading-none text-ink3">{goal.status}</span>
       </div>
       <div className="mt-2 text-[12.5px] leading-[1.45] text-ink">{goal.objective}</div>
       {percent !== undefined && (
         <>
-          <div className="mt-2 h-1 overflow-hidden rounded-full bg-bar-track">
-            <div
-              className={`h-full rounded-full ${percent >= 90 ? "bg-alert" : "bg-neon"}`}
-              style={{ width: `${percent}%` }}
-            />
-          </div>
+          <Meter percent={percent} warnAt={90} className="mt-2" />
           <div className="mt-1.5 text-[11px] leading-none text-ink3">
-            {TOKENS.format(used)} of {TOKENS.format(budget!)} tokens
+            {formatTokens(used)} of {formatTokens(budget!)} tokens
           </div>
         </>
       )}
@@ -147,9 +140,9 @@ function GoalCard({ goal, gates }: { goal: adminPb.GoalDetail; gates: adminPb.Go
  * What Borg has running underneath this conversation.
  *
  * A panel rather than a page: sub-agents and a goal are live state of the
- * session on screen, not a place you navigate to. It hides itself entirely
- * when there is nothing delegated and no goal set, which is most of the time —
- * an empty tree permanently occupying a third of the window would be the
+ * session on screen, not a place you navigate to. The panel is opened and
+ * closed by the caller (⌘J, or the header button) and stays closed by default
+ * — an empty tree permanently occupying a third of the window would be the
  * opposite of what this is for.
  */
 export function AgentPanel({
@@ -166,9 +159,7 @@ export function AgentPanel({
     <aside className="flex w-[280px] flex-none flex-col border-l border-line2 bg-surface2 px-3.5 pt-4 pb-3">
       <div className="mb-3 flex items-center gap-2">
         <AgentsIcon size={15} />
-        <span className="flex-1 text-[9.5px] leading-none font-medium tracking-[0.16em] text-ink3 uppercase">
-          Activity
-        </span>
+        <span className={`${SECTION_LABEL_TEXT} flex-1`}>Activity</span>
         <button
           type="button"
           aria-label="Hide activity"

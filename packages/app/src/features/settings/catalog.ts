@@ -4,10 +4,28 @@
  * `Admin.GetSettings` snapshot instead of a hand-written list.
  */
 
+import { THEME_PREFERENCES, type ThemePreference } from "@borg/ui";
+
 export interface SettingOption {
+  /** What gets stored, and what `onPick` hands back. */
   value: string;
+  /** Shown instead of `value` when the stored form is not presentable. */
+  label?: string;
   desc?: string;
 }
+
+/** Display label per theme preference, shared by the settings list and the editor. */
+export const APPEARANCE_LABELS: Record<ThemePreference, string> = {
+  light: "Light",
+  dark: "Dark",
+  system: "System",
+};
+
+const APPEARANCE_DESC: Record<ThemePreference, string> = {
+  light: "Paper and ink.",
+  dark: "Neon on black. The classic.",
+  system: "Follow this machine.",
+};
 
 export interface BasicSetting {
   /** Route segment under `/settings/`. */
@@ -61,20 +79,13 @@ export const basicSettings: BasicSetting[] = [
     key: null,
     name: "Appearance",
     desc: "",
-    options: [
-      { value: "Light", desc: "Paper and ink." },
-      { value: "Dark", desc: "Neon on black. The classic." },
-      { value: "System", desc: "Follow this machine." },
-    ],
+    options: THEME_PREFERENCES.map((p) => ({
+      value: p,
+      label: APPEARANCE_LABELS[p],
+      desc: APPEARANCE_DESC[p],
+    })),
   },
 ];
-
-/** Display label for each theme preference, shared by the list and the editor. */
-export const APPEARANCE_LABELS: Record<"light" | "dark" | "system", string> = {
-  light: "Light",
-  dark: "Dark",
-  system: "System",
-};
 
 export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);

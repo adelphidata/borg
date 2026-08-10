@@ -19,18 +19,13 @@ const HEIGHT = 148;
 /** Roughly a third down the screen — where a spotlight-style panel belongs. */
 const VERTICAL_BIAS = 0.28;
 
-export interface QuickEntry {
-  toggle(): void;
-  dispose(): void;
-}
-
 export function registerQuickEntry(options: {
   accelerator: string;
   isDev: boolean;
   devServerUrl?: string;
   indexHtml: string;
   preload: string;
-}): QuickEntry {
+}): { dispose(): void } {
   let win: BrowserWindow | null = null;
 
   const place = (target: BrowserWindow) => {
@@ -99,7 +94,6 @@ export function registerQuickEntry(options: {
   app.on("will-quit", () => globalShortcut.unregister(options.accelerator));
 
   return {
-    toggle,
     dispose() {
       globalShortcut.unregister(options.accelerator);
       if (win && !win.isDestroyed()) win.destroy();

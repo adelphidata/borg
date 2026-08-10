@@ -33,17 +33,17 @@ describe("patchOf", () => {
 
 describe("summarize", () => {
   it("picks whichever identifying field the tool used", () => {
-    expect(summarize("fs_read", { path: "src/main.rs" })).toBe("src/main.rs");
-    expect(summarize("run_shell", { command: "cargo test" })).toBe("cargo test");
-    expect(summarize("web_search", { query: "borg" })).toBe("borg");
+    expect(summarize({ path: "src/main.rs" })).toBe("src/main.rs");
+    expect(summarize({ command: "cargo test" })).toBe("cargo test");
+    expect(summarize({ query: "borg" })).toBe("borg");
   });
 
   it("prefers the more specific field when several are present", () => {
-    expect(summarize("x", { name: "n", path: "p" })).toBe("p");
+    expect(summarize({ name: "n", path: "p" })).toBe("p");
   });
 
   it("has nothing to say about an argumentless call", () => {
-    expect(summarize("heartbeat", {})).toBeNull();
-    expect(summarize("heartbeat", null)).toBeNull();
+    expect(summarize({})).toBeNull();
+    expect(summarize(null)).toBeNull();
   });
 });

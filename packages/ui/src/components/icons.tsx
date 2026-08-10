@@ -8,7 +8,6 @@ import {
   ChevronRight,
   Copy,
   GitBranch,
-  Image,
   ListTree,
   MessageCircle,
   MoreHorizontal,
@@ -65,7 +64,6 @@ export const SearchIcon = lucide(Search, 15);
 export const PlusIcon = lucide(Plus, 15);
 export const CloseIcon = lucide(X, 15);
 export const AttachIcon = lucide(Paperclip, 15);
-export const ImageIcon = lucide(Image, 15);
 export const MoreIcon = lucide(MoreHorizontal, 15);
 export const TrashIcon = lucide(Trash2, 14);
 export const PencilIcon = lucide(Pencil, 14);

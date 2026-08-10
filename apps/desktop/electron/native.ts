@@ -18,12 +18,18 @@ export function sendMenuCommand(action: string): void {
   if (win && !win.isDestroyed()) win.webContents.send(CHANNELS.menuCommand, action);
 }
 
-/** Brings `window` forward and asks the renderer to open `sessionId`. */
-export function activateSession(window: BrowserWindow, sessionId: string): void {
+/** Brings a window forward from any state — minimised, hidden, or behind. */
+export function raise(window: BrowserWindow): void {
   if (window.isDestroyed()) return;
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
+}
+
+/** Brings `window` forward and asks the renderer to open `sessionId`. */
+export function activateSession(window: BrowserWindow, sessionId: string): void {
+  if (window.isDestroyed()) return;
+  raise(window);
   window.webContents.send(CHANNELS.activateSession, sessionId);
 }
 
@@ -55,11 +61,7 @@ export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dis
       const win = BrowserWindow.fromWebContents(event.sender);
       if (!win) return;
       if (notification.sessionId) activateSession(win, notification.sessionId);
-      else {
-        if (win.isMinimized()) win.restore();
-        win.show();
-        win.focus();
-      }
+      else raise(win);
     });
 
     shown.show();

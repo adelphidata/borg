@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ChevronIcon,
   MobileTitle,
   PageChrome,
   SECTION_LABEL,
+  SECTION_LABEL_TEXT,
   SETTINGS_SCROLL_DESKTOP_PADDING,
   scrollCol,
   useIsMobile,
@@ -18,6 +19,9 @@ import { APPEARANCE_LABELS, advancedGroupOf, basicSettings } from "./catalog";
 /** Registry keys already surfaced by the curated list above the fold. */
 const CURATED_KEYS = new Set(basicSettings.flatMap((s) => (s.key ? [s.key] : [])));
 
+/** `localeCompare` builds a collator per call; ~500 rows makes that measurable. */
+const BY_NAME = new Intl.Collator();
+
 function groupAdvanced(settings: Map<string, DaemonSetting>) {
   const groups = new Map<string, DaemonSetting[]>();
   for (const entry of settings.values()) {
@@ -28,10 +32,10 @@ function groupAdvanced(settings: Map<string, DaemonSetting>) {
     groups.set(group, rows);
   }
   return [...groups.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
+    .sort(([a], [b]) => BY_NAME.compare(a, b))
     .map(([name, rows]) => ({
       name,
-      rows: rows.sort((a, b) => a.key.localeCompare(b.key)),
+      rows: rows.sort((a, b) => BY_NAME.compare(a.key, b.key)),
     }));
 }
 
@@ -41,6 +45,13 @@ export function SettingsPage() {
   const { settings } = useSettings();
   const { preference } = useTheme();
   const [advOpen, setAdvOpen] = useState(false);
+
+  // Grouping walks the whole registry (~500 rows) and sorts twice. Doing that
+  // in the render body re-ran it on every keystroke elsewhere on the page.
+  const advanced = useMemo(
+    () => (settings.state === "ready" ? groupAdvanced(settings.data) : []),
+    [settings],
+  );
 
   return (
     <PageChrome title="Settings">
@@ -122,11 +133,9 @@ export function SettingsPage() {
                       Borg works without changing any of this. Everything below is on a sensible
                       default; anything shown in green has been changed.
                     </div>
-                    {groupAdvanced(map).map((g) => (
+                    {advanced.map((g) => (
                       <div key={g.name}>
-                        <div className={SECTION_LABEL} style={{ marginBottom: 11 }}>
-                          {g.name}
-                        </div>
+                        <div className={`${SECTION_LABEL_TEXT} mb-[11px]`}>{g.name}</div>
                         <div className="overflow-hidden rounded-[10px] border border-line2 bg-surface2">
                           {g.rows.map((r) => (
                             <div

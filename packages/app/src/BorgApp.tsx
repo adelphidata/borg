@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
-import { dispatchKeybind, installKeybinds, useKeybind } from "./lib/keybinds";
+import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
@@ -28,7 +28,7 @@ function KeyboardLayer() {
   const navigate = useNavigate();
   const native = useNative();
 
-  useEffect(() => installKeybinds(window, /macintosh|mac os x/i.test(navigator.userAgent)), []);
+  useEffect(() => installKeybinds(window, isMacPlatform()), []);
   useEffect(() => native.onMenuCommand((action) => void dispatchKeybind(action)), [native]);
   // A clicked notification, or a turn started from the quick-entry panel.
   useEffect(
@@ -133,12 +133,6 @@ function Shell({ platform }: { platform: Platform }) {
 }
 
 /**
- * The whole Borg product, shared verbatim by `apps/desktop` and `apps/web`.
- *
- * Surfaces differ only in the `platform` they pass: the transport used to reach
- * borgd, and whether the window needs a custom title-bar drag strip.
- */
-/**
  * Gates the shell behind the daemon's onboarding flag. Only a positive
  * "not onboarded yet" answer shows the wizard — when the daemon is down the
  * shell renders and its pages explain the outage properly.
@@ -170,6 +164,12 @@ function isQuickEntry(): boolean {
   return window.location.hash.startsWith("#/quick");
 }
 
+/**
+ * The whole Borg product, shared verbatim by `apps/desktop` and `apps/web`.
+ *
+ * Surfaces differ only in the `platform` they pass: the transport used to reach
+ * borgd, and whether the window needs a custom title-bar drag strip.
+ */
 export function BorgApp({ platform }: { platform: Platform }) {
   if (isQuickEntry()) {
     return (

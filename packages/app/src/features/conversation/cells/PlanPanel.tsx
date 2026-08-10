@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronIcon } from "@borg/ui";
+import { CheckIcon, ChevronDownIcon, ChevronIcon, StatusDot } from "@borg/ui";
 import type { PlanStep } from "../useConversation";
 
 /** Status strings the agent publishes, normalised for display. */
@@ -53,11 +53,7 @@ export function PlanPanel({ steps }: { steps: PlanStep[] }) {
                 {isDone(step.status) ? (
                   <CheckIcon size={12} />
                 ) : (
-                  <span
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      isActive(step.status) ? "animate-bpulse bg-neon" : "bg-ink3"
-                    }`}
-                  />
+                  <StatusDot tone={isActive(step.status) ? "busy" : "idle"} />
                 )}
               </span>
               <span className={isDone(step.status) ? "text-ink3 line-through" : "text-ink2"}>

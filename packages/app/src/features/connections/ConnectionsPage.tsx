@@ -72,7 +72,7 @@ function ConnCards({ cards, open }: { cards: Card[]; open: (id: string) => void 
           >
             <div className="mb-[11px] flex items-center justify-between">
               <Badge>{c.badge}</Badge>
-              <StatusDot needsAttention={c.needsAttention} />
+              <StatusDot tone={c.needsAttention ? "alert" : "ok"} />
             </div>
             <div className="text-[13.5px] leading-[1.2] font-medium text-ink">{c.name}</div>
             <div className="mt-[5px] text-[11.5px] leading-[1.4] text-ink3">{c.sub}</div>
@@ -98,7 +98,7 @@ function ConnList({ cards, open }: { cards: Card[]; open: (id: string) => void }
             <div className="text-[13.5px] leading-[1.25] font-medium text-ink">{c.name}</div>
             <div className="mt-[3px] text-[11.5px] leading-[1.3] text-ink3">{c.sub}</div>
           </div>
-          <StatusDot needsAttention={c.needsAttention} />
+          <StatusDot tone={c.needsAttention ? "alert" : "ok"} />
         </div>
       ))}
     </div>

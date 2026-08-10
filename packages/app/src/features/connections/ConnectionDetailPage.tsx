@@ -90,7 +90,7 @@ function ProviderDetail({
         </div>
         {isConnected && (
           <StatusDot
-            needsAttention={entries.length > 0 && entries.every((e) => e.status !== "ok")}
+            tone={entries.length > 0 && entries.every((e) => e.status !== "ok") ? "alert" : "ok"}
           />
         )}
       </div>
@@ -215,7 +215,7 @@ function ChannelDetail({ conn, refetch }: { conn: ChannelConnection; refetch: ()
             {conn.senders.length} approved sender{conn.senders.length === 1 ? "" : "s"}
           </div>
         </div>
-        <StatusDot needsAttention={conn.pending.length > 0} />
+        <StatusDot tone={conn.pending.length > 0 ? "alert" : "ok"} />
       </div>
 
       <ErrorLine error={approve.error ?? revoke.error} />

@@ -17,7 +17,8 @@ export { Markdown } from "./components/Markdown";
 export { MobileTitle } from "./components/MobileTitle";
 export { PageChrome } from "./components/PageChrome";
 export { Pill } from "./components/Pill";
-export { StatusDot } from "./components/StatusDot";
+export { StatusDot, type DotTone } from "./components/StatusDot";
+export { Meter } from "./components/Meter";
 export {
   AgentsIcon,
   ArchiveIcon,
@@ -30,7 +31,6 @@ export {
   CloseIcon,
   CopyIcon,
   GearIcon,
-  ImageIcon,
   LogoIcon,
   MoreIcon,
   PencilIcon,
@@ -47,6 +47,7 @@ export type { IconProps } from "./components/icons";
 export {
   DETAIL_COL,
   SECTION_LABEL,
+  SECTION_LABEL_TEXT,
   SETTINGS_SCROLL_DESKTOP_PADDING,
   scrollCol,
 } from "./components/pageClasses";

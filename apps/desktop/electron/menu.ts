@@ -1,4 +1,5 @@
 import { Menu, app, shell, type MenuItemConstructorOptions } from "electron";
+import { acceleratorFor } from "@borg/app/chords";
 import { sendMenuCommand } from "./native";
 
 /**
@@ -9,15 +10,17 @@ import { sendMenuCommand } from "./native";
  * the whole point — ⌘N from this menu and ⌘N from the keyboard must never be
  * two implementations that drift apart.
  *
- * Accelerators here mirror `CHORDS` in `packages/app/src/lib/keybinds.ts`. When
- * a menu item owns an accelerator, Electron consumes the chord before the web
- * contents ever sees it, so the renderer's listener never fires for these —
- * which is exactly why they must resolve to the same action.
+ * Accelerators are derived from the same `CHORDS` table the renderer binds, so
+ * rebinding a chord moves the menu with it. That matters more here than it
+ * looks: when a menu item owns an accelerator, Electron consumes the chord
+ * before the web contents ever sees it, so the renderer's listener never fires
+ * for these. A hand-typed accelerator that drifted from the table would leave
+ * the old chord working and the new one dead.
  */
 
-/** A menu item that dispatches a keybind action. */
-function action(label: string, id: string, accelerator?: string): MenuItemConstructorOptions {
-  return { label, accelerator, click: () => sendMenuCommand(id) };
+/** A menu item that dispatches a keybind action, under that action's chord. */
+function action(label: string, id: string): MenuItemConstructorOptions {
+  return { label, accelerator: acceleratorFor(id), click: () => sendMenuCommand(id) };
 }
 
 export function installApplicationMenu(): void {
@@ -30,7 +33,7 @@ export function installApplicationMenu(): void {
           submenu: [
             { role: "about" },
             { type: "separator" },
-            action("Settings…", "open-settings", "Cmd+,"),
+            action("Settings…", "open-settings"),
             { type: "separator" },
             { role: "services" },
             { type: "separator" },
@@ -49,11 +52,9 @@ export function installApplicationMenu(): void {
     {
       label: "File",
       submenu: [
-        action("New Conversation", "new-conversation", "CmdOrCtrl+N"),
+        action("New Conversation", "new-conversation"),
         { type: "separator" },
-        ...(isMac
-          ? []
-          : [action("Settings…", "open-settings", "Ctrl+,") as MenuItemConstructorOptions]),
+        ...(isMac ? [] : [action("Settings…", "open-settings") as MenuItemConstructorOptions]),
         isMac ? { role: "close" as const } : { role: "quit" as const },
       ],
     },
@@ -74,8 +75,8 @@ export function installApplicationMenu(): void {
     {
       label: "View",
       submenu: [
-        action("Find Conversation…", "search-sessions", "CmdOrCtrl+Shift+F"),
-        action("Command Palette…", "command-palette", "CmdOrCtrl+K"),
+        action("Find Conversation…", "search-sessions"),
+        action("Command Palette…", "command-palette"),
         { type: "separator" },
         { role: "reload" },
         { role: "toggleDevTools" },

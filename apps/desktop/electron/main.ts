@@ -3,7 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerBorgIpc } from "./ipc";
 import { installApplicationMenu } from "./menu";
-import { registerNativeIpc } from "./native";
+import { raise, registerNativeIpc } from "./native";
 import { registerQuickEntry } from "./quick-entry";
 import { registerUpdater } from "./updater";
 import { loadWindowState, trackWindowState } from "./window-state";
@@ -25,8 +25,8 @@ let mainWindow: BrowserWindow | null = null;
 function createWindow() {
   const saved = loadWindowState();
   const win = new BrowserWindow({
-    width: saved.width ?? 1240,
-    height: saved.height ?? 800,
+    width: saved.width,
+    height: saved.height,
     x: saved.x,
     y: saved.y,
     minWidth: 360,
@@ -110,10 +110,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+    if (mainWindow) raise(mainWindow);
   });
 
   app.whenReady().then(() => {
@@ -144,8 +141,7 @@ if (!app.requestSingleInstanceLock()) {
       // `getAllWindows()` is never empty and clicking the dock icon after
       // closing the last real window would do nothing at all.
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.show();
-        mainWindow.focus();
+        raise(mainWindow);
         return;
       }
       createWindow();

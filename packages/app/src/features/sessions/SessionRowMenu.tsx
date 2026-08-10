@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArchiveIcon, MoreIcon, PencilIcon } from "@borg/ui";
+import { useKeybind } from "../../lib/keybinds";
 
 export interface SessionRowMenuProps {
   onRename: () => void;
@@ -20,16 +21,15 @@ export function SessionRowMenu({ onRename, onArchive, onExport }: SessionRowMenu
     const onPointerDown = (e: PointerEvent) => {
       if (!root.current?.contains(e.target as Node)) setOpen(false);
     };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
     document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
+    return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [open]);
+
+  // Through the registry rather than a raw listener: the registry is stacked,
+  // so an open menu takes Escape and hands it back on close. A bare listener
+  // would close the menu *and* let the composer's cancel through, killing a
+  // running turn with the same keypress.
+  useKeybind("cancel-turn", () => setOpen(false), { enabled: open, inInputs: true });
 
   const choose = (action: () => void) => () => {
     setOpen(false);

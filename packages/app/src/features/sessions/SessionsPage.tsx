@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   PageChrome,
+  SECTION_LABEL_TEXT,
   PlusIcon,
   SearchIcon,
   SETTINGS_SCROLL_DESKTOP_PADDING,
@@ -146,9 +147,7 @@ export function SessionsPage() {
               )}
               {sessions.groups.map((group) => (
                 <div key={group.label} className="mb-5">
-                  <div className="mb-1 px-3 text-[9.5px] leading-none font-medium tracking-[0.16em] text-ink3 uppercase">
-                    {group.label}
-                  </div>
+                  <div className={`${SECTION_LABEL_TEXT} mb-1 px-3`}>{group.label}</div>
                   {group.sessions.map((session) => (
                     <Row
                       key={session.id}

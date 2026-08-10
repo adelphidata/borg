@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { CodeBlock } from "@borg/ui";
+import { useMemo, useState } from "react";
+import { CodeBlock, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
 
 /** Tools whose output is terminal text rather than structured data. */
@@ -32,14 +32,13 @@ export function patchOf(args: Record<string, unknown> | null): string | null {
 }
 
 /** A one-line gist of the call, so a collapsed row still says what it did. */
-export function summarize(name: string, args: Record<string, unknown> | null): string | null {
+export function summarize(args: Record<string, unknown> | null): string | null {
   if (!args) return null;
   // Whichever identifying field this tool happens to use.
   for (const field of ["path", "file_path", "command", "query", "url", "pattern", "name"]) {
     const value = args[field];
     if (typeof value === "string" && value.trim() !== "") return value;
   }
-  void name;
   return null;
 }
 
@@ -71,8 +70,11 @@ function ArgsView({
  */
 export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
   const [open, setOpen] = useState(false);
-  const args = parseArgs(cell.args);
-  const subtitle = summarize(cell.name, args);
+  // Memoised because this runs on every render, and a streaming turn
+  // re-renders the transcript on every delta: without it a long tool-heavy
+  // turn re-parses the same JSON thousands of times.
+  const args = useMemo(() => parseArgs(cell.args), [cell.args]);
+  const subtitle = useMemo(() => summarize(args), [args]);
   const expanded = open || !cell.done;
   const summary = cell.output.length > 400 ? `${cell.output.slice(0, 400)}…` : cell.output;
 
@@ -84,11 +86,7 @@ export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
         onClick={() => setOpen((v) => !v)}
         className="flex w-full cursor-pointer items-center gap-2 border-0 bg-transparent px-4 py-3 text-left"
       >
-        <span
-          className={`h-1.5 w-1.5 flex-none rounded-full ${
-            cell.done ? (cell.stderr ? "bg-alert" : "bg-neon") : "animate-bpulse bg-ink3"
-          }`}
-        />
+        <StatusDot tone={cell.done ? (cell.stderr ? "alert" : "ok") : "busy"} />
         <span className="text-[11px] leading-none font-medium tracking-[0.08em] text-ink3 uppercase">
           {cell.name}
         </span>

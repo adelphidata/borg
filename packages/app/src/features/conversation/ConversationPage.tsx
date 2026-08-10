@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { AgentsIcon, PageChrome, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
@@ -34,6 +34,13 @@ export function ConversationPage() {
     context,
   } = useConversation(target);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // The daemon rewinds by user-message ordinal, so each user cell needs its
+  // position among user cells rather than its index in the list.
+  const ordinals = useMemo(() => {
+    let nth = -1;
+    return cells.map((cell) => (cell.kind === "user" ? ++nth : -1));
+  }, [cells]);
 
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
@@ -85,27 +92,16 @@ export function ConversationPage() {
                     Nothing here yet. Ask Borg anything.
                   </div>
                 )}
-                {/* The daemon rewinds by user-message ordinal, so each user
-                    cell needs its position among user cells, not in the list. */}
-                {(() => {
-                  let nth = -1;
-                  return cells.map((cell, i) => {
-                    if (cell.kind === "user") nth += 1;
-                    const ordinal = nth;
-                    return (
-                      <TranscriptCell
-                        key={i}
-                        cell={cell}
-                        respond={respond}
-                        onEdit={
-                          cell.kind === "user" && !busy
-                            ? (text) => editAndResend(ordinal, text)
-                            : undefined
-                        }
-                      />
-                    );
-                  });
-                })()}
+                {cells.map((cell, i) => (
+                  <TranscriptCell
+                    key={i}
+                    cell={cell}
+                    respond={respond}
+                    ordinal={ordinals[i]!}
+                    editable={cell.kind === "user" && !busy}
+                    onEdit={editAndResend}
+                  />
+                ))}
                 {busy && (
                   <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
                 )}

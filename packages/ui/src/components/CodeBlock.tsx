@@ -5,11 +5,16 @@ import { CheckIcon, CopyIcon } from "./icons";
 /**
  * A fenced code block: highlighted, horizontally scrollable, copyable.
  *
- * Highlighting is async (grammars load on demand) and streams re-run it as the
- * fence grows, so the raw text renders immediately and the coloured markup
- * replaces it when ready. That keeps a streaming reply readable instead of
- * blank.
+ * Highlighting is async (grammars load on demand), so the raw text renders
+ * immediately and the coloured markup replaces it when ready. That keeps a
+ * streaming reply readable instead of blank.
+ *
+ * The pass is debounced because tokenising is O(block), not O(delta): a fence
+ * that arrives over hundreds of deltas would otherwise re-tokenise itself from
+ * the top hundreds of times and throw away every result but the last.
  */
+const HIGHLIGHT_DEBOUNCE_MS = 100;
+
 export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
   const [html, setHtml] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -17,16 +22,19 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 
   useEffect(() => {
     let live = true;
-    highlight(code, lang)
-      .then((result) => {
-        if (live) setHtml(result);
-      })
-      .catch(() => {
-        // An unloadable grammar is not worth surfacing — plain text still reads.
-        if (live) setHtml(null);
-      });
+    const pending = setTimeout(() => {
+      highlight(code, lang)
+        .then((result) => {
+          if (live) setHtml(result);
+        })
+        .catch(() => {
+          // An unloadable grammar is not worth surfacing — plain text still reads.
+          if (live) setHtml(null);
+        });
+    }, HIGHLIGHT_DEBOUNCE_MS);
     return () => {
       live = false;
+      clearTimeout(pending);
     };
   }, [code, lang]);
 

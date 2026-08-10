@@ -83,6 +83,12 @@ export interface Sessions {
  * delete has no RPC and no undo, so offering one would be a worse promise than
  * the product can keep.
  */
+/**
+ * Stable empty list. A fresh `[]` while the query is loading or errored would
+ * give `groups` a new dependency every render and defeat its memo.
+ */
+const NO_SESSIONS: SessionRow[] = [];
+
 export function useSessions(deps: unknown[] = []): Sessions {
   const [search, setSearch] = useState("");
 
@@ -119,7 +125,7 @@ export function useSessions(deps: unknown[] = []): Sessions {
     return result;
   });
 
-  const sessions = query.state === "ready" ? query.data : [];
+  const sessions = query.state === "ready" ? query.data : NO_SESSIONS;
   const groups = useMemo(
     () => groupSessions(filterSessions(sessions, search), Date.now()),
     [sessions, search],

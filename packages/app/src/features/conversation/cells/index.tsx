@@ -1,12 +1,11 @@
-import { useState } from "react";
-import { Brackets, Markdown, PencilIcon, Pill } from "@borg/ui";
+import { memo, useState } from "react";
+import { Brackets, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
+import { formatTokens } from "../../../lib/format";
+import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
-
-const KICKER =
-  "text-[10px] leading-none font-medium tracking-[0.16em] uppercase text-ink3 mb-[13px]";
 
 /** Assistant reply in the bracketed-card style. */
 function ReplyCard({ kicker, children }: { kicker: string; children: React.ReactNode }) {
@@ -46,15 +45,13 @@ function ShellConfirmCell({
   );
 }
 
-const COMPACT = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
-
 /** Per-turn token accounting, deliberately quiet. */
 function UsageCell({ cell }: { cell: Cell & { kind: "usage" } }) {
   const cached = cell.cacheRead + cell.cacheWrite;
   return (
     <div className="px-1 text-[11px] leading-none text-ink3">
-      {COMPACT.format(cell.input)} in · {COMPACT.format(cell.output)} out
-      {cached > 0 && <> · {COMPACT.format(cached)} cached</>}
+      {formatTokens(cell.input)} in · {formatTokens(cell.output)} out
+      {cached > 0 && <> · {formatTokens(cached)} cached</>}
     </div>
   );
 }
@@ -63,9 +60,7 @@ function SubAgentCell({ cell }: { cell: Cell & { kind: "sub-agent" } }) {
   const running = cell.status.toLowerCase() === "running";
   return (
     <div className="flex items-center gap-2 rounded-[10px] border border-line2 px-4 py-2.5">
-      <span
-        className={`h-1.5 w-1.5 flex-none rounded-full ${running ? "animate-bpulse bg-neon" : "bg-ink3"}`}
-      />
+      <StatusDot tone={running ? "busy" : "idle"} />
       <span className="text-[11px] leading-none font-medium tracking-[0.08em] text-ink3 uppercase">
         Agent
       </span>
@@ -164,19 +159,37 @@ function UserCell({
   );
 }
 
-export function TranscriptCell({
+/**
+ * One row of the transcript.
+ *
+ * Memoised: the reducer replaces only the cell a stream event touches and
+ * leaves the rest of the array identity-stable, so a token arriving mid-turn
+ * re-renders one cell instead of the whole conversation. Callers must pass
+ * stable `respond`/`onEdit` callbacks for this to hold.
+ */
+export const TranscriptCell = memo(function TranscriptCell({
   cell,
   respond,
+  ordinal,
+  editable,
   onEdit,
 }: {
   cell: Cell;
   respond: (promptId: string, value: string) => void;
-  /** Absent when this turn cannot be rewritten — mid-turn, or not a user cell. */
-  onEdit?: (text: string) => void;
+  /**
+   * This cell's position among *user* cells, which is what the daemon rewinds
+   * by. -1 for every other kind.
+   */
+  ordinal: number;
+  /** False mid-turn, when rewriting a turn would race the one in flight. */
+  editable: boolean;
+  onEdit: (nthUserMessage: number, text: string) => void;
 }) {
   switch (cell.kind) {
     case "user":
-      return <UserCell cell={cell} onEdit={onEdit} />;
+      return (
+        <UserCell cell={cell} onEdit={editable ? (text) => onEdit(ordinal, text) : undefined} />
+      );
     case "assistant":
       return (
         <ReplyCard kicker="Borg">
@@ -204,4 +217,4 @@ export function TranscriptCell({
     case "input-request":
       return <InputRequestCell cell={cell} respond={respond} />;
   }
-}
+});

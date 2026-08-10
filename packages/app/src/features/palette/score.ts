@@ -45,6 +45,9 @@ export function score(text: string, query: string): number | null {
   return total - haystack.length * 0.05;
 }
 
+/** How much a keyword-only match gives up to a match on the visible label. */
+const KEYWORD_PENALTY = 4;
+
 /** Ranks commands against a query, dropping the ones that do not match. */
 export function rank(commands: Command[], query: string): Command[] {
   if (query.trim() === "") return commands;
@@ -54,11 +57,9 @@ export function rank(commands: Command[], query: string): Command[] {
       // Keywords can match but never out-rank the visible label.
       const direct = score(command.label, q);
       const viaKeywords = command.keywords ? score(command.keywords, q) : null;
-      const best =
-        direct !== null && viaKeywords !== null
-          ? Math.max(direct, viaKeywords - 4)
-          : (direct ?? (viaKeywords === null ? null : viaKeywords - 4));
-      return best === null ? null : { command, best };
+      const candidates = [direct, viaKeywords === null ? null : viaKeywords - KEYWORD_PENALTY];
+      const hits = candidates.filter((n): n is number => n !== null);
+      return hits.length === 0 ? null : { command, best: Math.max(...hits) };
     })
     .filter((r): r is { command: Command; best: number } => r !== null)
     .sort((a, b) => b.best - a.best)

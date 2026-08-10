@@ -1,39 +1,22 @@
 import { useLocation } from "react-router-dom";
 import {
+  Meter,
   PageChrome,
   SECTION_LABEL,
+  SECTION_LABEL_TEXT,
   SETTINGS_SCROLL_DESKTOP_PADDING,
   StatusDot,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
+import { formatCost, formatTokens, plural } from "../../lib/format";
 import { useUsage, type ModelSpend } from "./useUsage";
-
-const TOKENS = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
-const MONEY = new Intl.NumberFormat(undefined, {
-  style: "currency",
-  currency: "USD",
-  maximumFractionDigits: 2,
-});
-/** Sub-cent spend rounds to $0.00, which reads as "nothing happened". */
-const SMALL_MONEY = new Intl.NumberFormat(undefined, {
-  style: "currency",
-  currency: "USD",
-  maximumFractionDigits: 4,
-});
-
-export function formatCost(costUsd: number): string {
-  if (costUsd === 0) return MONEY.format(0);
-  return costUsd < 0.01 ? SMALL_MONEY.format(costUsd) : MONEY.format(costUsd);
-}
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div className="flex-1 rounded-[10px] border border-line2 px-4 py-3.5">
-      <div className="text-[9.5px] leading-none font-medium tracking-[0.16em] text-ink3 uppercase">
-        {label}
-      </div>
+      <div className={SECTION_LABEL_TEXT}>{label}</div>
       <div className="mt-2 text-[22px] leading-none text-ink">{value}</div>
       {sub && <div className="mt-1.5 text-[11.5px] leading-none text-ink3">{sub}</div>}
     </div>
@@ -50,15 +33,13 @@ function ModelRow({ spend, of }: { spend: ModelSpend; of: number }) {
           {spend.model || "unknown"}
         </span>
         <span className="flex-none text-[11.5px] leading-none text-ink3">
-          {TOKENS.format(spend.tokens)} tok
+          {formatTokens(spend.tokens)} tok
         </span>
         <span className="w-[70px] flex-none text-right text-[12.5px] leading-none text-ink2">
           {formatCost(spend.costUsd)}
         </span>
       </div>
-      <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-bar-track">
-        <div className="h-full rounded-full bg-neon" style={{ width: `${share}%` }} />
-      </div>
+      <Meter percent={share} className="mt-1.5" />
     </div>
   );
 }
@@ -90,15 +71,15 @@ export function UsagePage() {
                   value={month.costUsd === undefined ? "—" : formatCost(month.costUsd)}
                   sub={month.costUsd === undefined ? "No priced calls yet" : undefined}
                 />
-                <Stat label="Tokens" value={TOKENS.format(month.tokens)} />
+                <Stat label="Tokens" value={formatTokens(month.tokens)} />
               </div>
             </>
           )}
         </DaemonState>
 
         <div className="mb-3.5 flex items-center gap-2">
-          <span className={`${SECTION_LABEL} mb-0`}>Live, by model</span>
-          <StatusDot needsAttention={!usage.streaming} />
+          <span className={SECTION_LABEL_TEXT}>Live, by model</span>
+          <StatusDot tone={usage.streaming ? "ok" : "alert"} />
           <span className="flex-1" />
           {usage.live.events > 0 && (
             <button
@@ -123,7 +104,7 @@ export function UsagePage() {
               <ModelRow key={spend.key} spend={spend} of={usage.live.costUsd} />
             ))}
             <div className="mt-1 border-t border-line2 pt-2.5 pb-1 text-[11.5px] leading-none text-ink3">
-              {usage.live.events} call{usage.live.events === 1 ? "" : "s"} since this page opened ·{" "}
+              {plural(usage.live.events, "call")} since this page opened ·{" "}
               {formatCost(usage.live.costUsd)}
             </div>
           </div>

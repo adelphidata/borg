@@ -1,5 +1,4 @@
-import { createHighlighterCore, type HighlighterCore } from "shiki/core";
-import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import type { HighlighterCore } from "shiki/core";
 
 /**
  * Syntax highlighting for fenced code blocks.
@@ -8,6 +7,12 @@ import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
  * carries every grammar and theme it ships and would dominate the app's
  * download. This registers one theme pair and the languages Borg actually
  * emits, and loads the highlighter only when a code block first appears.
+ *
+ * Shiki's core and regex engine are imported dynamically for the same reason
+ * the grammars are: `CodeBlock` sits on a static path from the router, so a
+ * top-level import would put ~100 KB of highlighter in the entry chunk and
+ * parse it before first paint for every user, including the ones who never
+ * scroll past a code block.
  *
  * The JavaScript regex engine replaces the default Oniguruma one, which needs
  * a WASM payload. It cannot compile a handful of exotic grammars; none of the
@@ -69,11 +74,17 @@ let highlighter: Promise<HighlighterCore> | undefined;
 const loaded = new Set<string>();
 
 function getHighlighter(): Promise<HighlighterCore> {
-  highlighter ??= createHighlighterCore({
-    themes: [import("@shikijs/themes/github-light"), import("@shikijs/themes/github-dark")],
-    langs: [],
-    engine: createJavaScriptRegexEngine(),
-  });
+  highlighter ??= (async () => {
+    const [{ createHighlighterCore }, { createJavaScriptRegexEngine }] = await Promise.all([
+      import("shiki/core"),
+      import("shiki/engine/javascript"),
+    ]);
+    return createHighlighterCore({
+      themes: [import("@shikijs/themes/github-light"), import("@shikijs/themes/github-dark")],
+      langs: [],
+      engine: createJavaScriptRegexEngine(),
+    });
+  })();
   return highlighter;
 }
 

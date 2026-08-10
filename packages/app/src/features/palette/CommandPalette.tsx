@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { SearchIcon } from "@borg/ui";
-import { useKeybind } from "../../lib/keybinds";
+import { dispatchKeybind, hintFor, useKeybind } from "../../lib/keybinds";
 import { useQuery } from "../../lib/useDaemon";
 import { useSettings } from "../../lib/settings";
 import { routes } from "../../routes";
@@ -48,9 +48,11 @@ export function CommandPalette() {
       {
         id: "action:new",
         label: "New conversation",
-        hint: "⌘N",
+        // Both the hint and the behaviour come from the keybind layer, so the
+        // palette can never advertise or perform a stale version of either.
+        hint: hintFor("new-conversation"),
         keywords: "chat start fresh",
-        run: () => navigate("/c/new"),
+        run: () => dispatchKeybind("new-conversation"),
       },
     ];
 

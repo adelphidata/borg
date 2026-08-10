@@ -1,4 +1,4 @@
-import { BranchIcon, Pill } from "@borg/ui";
+import { BranchIcon, Meter, Pill } from "@borg/ui";
 
 /** Only worth showing once the window is filling up. */
 const SHOW_AT = 0.5;
@@ -39,12 +39,7 @@ export function ContextBar({ context, busy, onCompact, onFork, compacting }: Con
             {percent}% full
           </span>
         </div>
-        <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-bar-track">
-          <div
-            className={`h-full rounded-full ${warn ? "bg-alert" : "bg-neon"}`}
-            style={{ width: `${percent}%` }}
-          />
-        </div>
+        <Meter percent={percent} warnAt={WARN_AT * 100} className="mt-1.5" />
       </div>
       <Pill square className="flex flex-none items-center gap-1.5" onClick={onFork}>
         <BranchIcon size={12} /> Fork
