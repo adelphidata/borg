@@ -101,7 +101,7 @@ base64 = "0.22"
 async-trait = "0.1"
 rand = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-wasmparser = "0.244"
+wasmparser = "0.255"
 wasmtime = "36"
 tonic = { version = "0.13", features = ["tls-ring"] }
 tonic-build = "0.13"
