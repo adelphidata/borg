@@ -293,20 +293,8 @@ impl Database {
             }
             Ok(())
         }.await;
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "plugins: rollback after insert_wasm_plugin failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "plugins insert_wasm_plugin")
+            .await
     }
 
     /// Return a WASM plugin row by id.

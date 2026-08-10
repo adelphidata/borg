@@ -150,18 +150,7 @@ impl Database {
             Ok(seq)
         }
         .await;
-        match result {
-            Ok(seq) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(seq)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("audit: rollback after append failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "audit append").await
     }
 
     /// Tombstone an audit event in place. Rewrites `event_json` to the
@@ -210,18 +199,7 @@ impl Database {
             Ok(())
         }
         .await;
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("audit: rollback after tombstone failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "audit tombstone").await
     }
 
     pub async fn verify_audit_chain(&self) -> Result<AuditChainOutcome> {

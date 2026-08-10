@@ -193,7 +193,7 @@ pub async fn parse_event(
                     mime_type: f
                         .mimetype
                         .clone()
-                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                        .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string()),
                     data: f.url_private.clone().unwrap_or_default(),
                     filename: f.name.clone(),
                 })

@@ -95,7 +95,6 @@ pub async fn drag(
     let esc_src = source_selector.replace('\\', "\\\\").replace('\'', "\\'");
     let esc_tgt = target_selector.replace('\\', "\\\\").replace('\'', "\\'");
 
-    // Get bounding box centers for both elements
     let js = format!(
         r#"(() => {{
             const src = document.querySelector('{esc_src}');
@@ -153,7 +152,6 @@ pub async fn drag(
             .await
             .context("Mouse move failed")?;
 
-        // Mouse up at target
         let mouse_up = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MouseReleased)
             .x(tx)

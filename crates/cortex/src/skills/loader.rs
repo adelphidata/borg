@@ -157,7 +157,9 @@ pub fn load_all_skills(
                                         );
                                     }
 
-                                    // Load references from references/*.md
+                                    // References are loaded before validation so the
+                                    // security scan sees them too — an injection payload
+                                    // hides just as well in a reference file as in the body.
                                     let mut references = Vec::new();
                                     let refs_dir = skill_dir.join("references");
                                     if refs_dir.is_dir() {
@@ -180,7 +182,6 @@ pub fn load_all_skills(
                                         }
                                     }
 
-                                    // Security validation for user skills
                                     let skill_config = skills_config.entries.get(&name);
                                     let outcome = skill_security::validate_user_skill(
                                         &name,
@@ -199,7 +200,6 @@ pub fn load_all_skills(
                                         );
                                         continue;
                                     }
-                                    // Wrap body if flagged for injection
                                     if matches!(outcome.threat_level, ThreatLevel::Flagged { .. }) {
                                         body = sanitize::wrap_with_injection_warning(&name, &body);
                                     }

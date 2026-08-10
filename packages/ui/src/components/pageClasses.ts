@@ -1,4 +1,4 @@
-/** Class strings shared across pages (the Tailwind successors to .section-label & co). */
+/** Class strings shared across pages. */
 
 /**
  * The uppercase micro-label, typography only.

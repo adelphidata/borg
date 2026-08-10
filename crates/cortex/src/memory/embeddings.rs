@@ -100,7 +100,6 @@ impl EmbeddingProvider {
             return None;
         }
 
-        // Determine provider and API key
         let (provider_name, api_key) = if let Some(ref explicit_provider) = config.provider {
             let default_env = find_provider_meta(explicit_provider)
                 .map(|m| m.env_var)

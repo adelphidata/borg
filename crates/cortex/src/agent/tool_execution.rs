@@ -238,7 +238,6 @@ impl Agent {
             let name = &tool_call.function.name;
             let args = &tool_call.function.arguments;
 
-            // Fire BeforeToolCall hook
             let hook_ctx = self.hook_ctx(
                 HookPoint::BeforeToolCall,
                 HookData::ToolCall {

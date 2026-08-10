@@ -42,6 +42,11 @@ impl std::fmt::Display for HmacError {
 
 impl std::error::Error for HmacError {}
 
+/// Header carrying `v1=<hex>` HMAC-SHA256 of `"{ts}.{body}"`.
+const SIGNATURE_HEADER: &str = "X-Borg-Signature";
+/// Header carrying the unix timestamp bound into the signed payload.
+const TIMESTAMP_HEADER: &str = "X-Borg-Timestamp";
+
 /// Verify a Borg-signed webhook payload.
 ///
 /// Signature is computed as `HMAC-SHA256(secret, "{ts}.{body}")` and
@@ -60,12 +65,12 @@ pub fn verify_signature(
     if secret.is_empty() {
         return Err(HmacError::EmptySecret);
     }
-    let signature = signature_header.ok_or(HmacError::MissingHeader("X-Borg-Signature"))?;
-    let timestamp = timestamp_header.ok_or(HmacError::MissingHeader("X-Borg-Timestamp"))?;
+    let signature = signature_header.ok_or(HmacError::MissingHeader(SIGNATURE_HEADER))?;
+    let timestamp = timestamp_header.ok_or(HmacError::MissingHeader(TIMESTAMP_HEADER))?;
 
     let ts: i64 = timestamp
         .parse()
-        .map_err(|_| HmacError::MalformedHeader("X-Borg-Timestamp"))?;
+        .map_err(|_| HmacError::MalformedHeader(TIMESTAMP_HEADER))?;
     let skew = (now_unix - ts).abs();
     if skew > REPLAY_WINDOW_SECONDS {
         return Err(HmacError::Replay { skew_seconds: skew });
@@ -73,11 +78,11 @@ pub fn verify_signature(
 
     let hex = signature
         .strip_prefix("v1=")
-        .ok_or(HmacError::MalformedHeader("X-Borg-Signature"))?;
-    let presented = decode_hex(hex).ok_or(HmacError::MalformedHeader("X-Borg-Signature"))?;
+        .ok_or(HmacError::MalformedHeader(SIGNATURE_HEADER))?;
+    let presented = decode_hex(hex).ok_or(HmacError::MalformedHeader(SIGNATURE_HEADER))?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|_| HmacError::MalformedHeader("X-Borg-Signature"))?;
+        .map_err(|_| HmacError::MalformedHeader(SIGNATURE_HEADER))?;
     mac.update(format!("{ts}.").as_bytes());
     mac.update(body);
     mac.verify_slice(&presented)

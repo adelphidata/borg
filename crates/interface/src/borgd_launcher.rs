@@ -28,6 +28,20 @@ const LAUNCHD_LABEL: &str = cortex::constants::LAUNCHD_SERVICE_LABEL;
 #[cfg(test)]
 const BORGD_INSTALL_PATH: &str = "/usr/local/bin/borgd";
 
+/// How long a directly-spawned `borgd` gets to bind its UDS. Covers process
+/// start plus first-run DB migrations; exceeding it means the spawn failed
+/// rather than that it is merely slow.
+const DIRECT_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a service-manager start gets. Longer than a direct spawn because
+/// launchd/systemd add their own scheduling latency before the process runs.
+const SERVICE_START_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on waiting for a stopped daemon to release its socket during restart.
+/// Bounded so a wedged daemon that never closes its socket still lets the
+/// restart proceed rather than hanging the CLI indefinitely.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 const LAUNCHD_PLIST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -195,14 +209,14 @@ async fn daemon_reachable() -> bool {
     daemon_client::connect(Some(&path)).await.is_ok()
 }
 
-/// Wait for the daemon UDS to become reachable, polling at 50ms intervals.
+/// Wait for the daemon UDS to become reachable.
 async fn wait_for_daemon(timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if daemon_reachable().await {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(daemon_client::SOCKET_POLL_INTERVAL).await;
     }
     false
 }
@@ -240,7 +254,7 @@ pub async fn ensure_running() -> Result<()> {
     cmd.spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 
-    if wait_for_daemon(Duration::from_secs(5)).await {
+    if wait_for_daemon(DIRECT_SPAWN_READY_TIMEOUT).await {
         Ok(())
     } else {
         anyhow::bail!(
@@ -278,14 +292,12 @@ pub async fn restart_service() -> Result<()> {
     if let Err(e) = stop_service().await {
         tracing::warn!("Stop during restart failed: {e}");
     }
-    // Bounded so a wedged daemon that never closes its socket still lets the
-    // restart proceed rather than hanging the CLI indefinitely.
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let drain_deadline = std::time::Instant::now() + RESTART_DRAIN_TIMEOUT;
     while std::time::Instant::now() < drain_deadline {
         if !daemon_reachable().await {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(daemon_client::SOCKET_POLL_INTERVAL).await;
     }
     ensure_running().await
 }
@@ -306,7 +318,7 @@ pub async fn start_service() -> Result<()> {
             tracing::warn!("platform_start failed, falling back to direct spawn: {e}");
             ensure_running().await?;
         }
-        if wait_for_daemon(Duration::from_secs(10)).await {
+        if wait_for_daemon(SERVICE_START_READY_TIMEOUT).await {
             println!("Service started.");
             return Ok(());
         }

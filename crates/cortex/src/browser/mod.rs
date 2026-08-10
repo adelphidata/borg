@@ -294,8 +294,6 @@ impl BrowserSession {
         )
     }
 
-    // -- Health & Recovery --
-
     /// Check if the browser process is still alive and responsive.
     #[instrument(skip_all, fields(browser.action = "health_check"))]
     pub async fn health_check(&self) -> Result<()> {
@@ -372,8 +370,6 @@ impl BrowserSession {
             )
         })
     }
-
-    // -- Core Actions --
 
     /// Navigate to a URL after running it through the URL policy
     /// classifier. The handler at [`crate::tool_handlers::media`] runs
@@ -649,8 +645,6 @@ impl BrowserSession {
         Ok(())
     }
 
-    // -- New Actions --
-
     /// Hover over an element.
     pub async fn hover(&self, selector: &str, timeout: Duration) -> Result<String> {
         actions::hover(self.tab_manager.active_page(), selector, timeout).await
@@ -877,8 +871,6 @@ impl BrowserSession {
         .context("Resize timed out")?
     }
 
-    // -- Tab Management --
-
     /// Open a new tab. The URL (if any) is gated by `policy` so SSRF /
     /// allow / deny checks apply identically to `navigate`.
     #[instrument(skip_all, fields(browser.action = "new_tab"))]
@@ -919,8 +911,6 @@ impl BrowserSession {
         self.tab_manager.list_tabs().await
     }
 
-    // -- Console Logs --
-
     /// Get captured console logs and errors.
     pub fn get_console_logs(&self) -> String {
         self.event_buffers.format_console_output()
@@ -930,8 +920,6 @@ impl BrowserSession {
     pub fn event_buffers(&self) -> &console::EventBuffers {
         &self.event_buffers
     }
-
-    // -- Lifecycle --
 
     /// Close the browser gracefully: CDP close → await handler → abort.
     #[instrument(skip_all, fields(browser.action = "close"))]

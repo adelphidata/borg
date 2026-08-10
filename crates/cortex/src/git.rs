@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-/// Timeout for git subprocess calls.
+/// Every git call here sits on the agent's turn path, so the ceiling is set by
+/// how long a user will wait, not by how slow git can be: a cold `git status`
+/// on a huge tree is better abandoned than allowed to stall the turn.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Disable a repository's filesystem monitor: `core.fsmonitor` can name a
@@ -157,6 +159,8 @@ pub(crate) fn run_sync_with_budget(
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let mut stream = stream;
+            // A truncated read is the expected outcome once the group is
+            // killed; the caller only needs whatever bytes already arrived.
             let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
             buf
         })

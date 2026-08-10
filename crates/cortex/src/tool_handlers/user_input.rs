@@ -83,7 +83,8 @@ pub async fn handle_update_plan(
     let steps: Vec<crate::types::PlanStep> = serde_json::from_value(steps_val.clone())
         .map_err(|e| anyhow::anyhow!("Invalid steps format: {e}. Each step needs 'title' (string) and 'status' (pending|in_progress|completed)."))?;
 
-    // Validate: at most one step may be in_progress
+    // At most one in_progress step: the surface renders it as "what Borg is
+    // doing right now", which stops meaning anything if two can be current.
     let in_progress_count = steps
         .iter()
         .filter(|s| s.status == PlanStepStatus::InProgress)
@@ -211,7 +212,8 @@ pub async fn handle_request_user_input(
         anyhow::bail!("Failed to dispatch UserInputRequest event: {e}");
     }
 
-    // Wait for user response with a 5-minute timeout.
+    // 5 minutes: long enough that a user who stepped away can still answer,
+    // short enough that an abandoned prompt cannot pin the turn indefinitely.
     let answers = match tokio::time::timeout(std::time::Duration::from_secs(300), respond_rx).await
     {
         Ok(Ok(map)) => map,

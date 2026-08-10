@@ -329,7 +329,6 @@ where
         // Buffer. Thus, we're taking the important data out of the Frame and dropping it.
         let cursor_position = frame.cursor_position;
 
-        // Draw to stdout
         self.flush()?;
 
         match cursor_position {

@@ -618,7 +618,6 @@ impl Agent {
             return self.load_memory(max_tokens, LoadStrategy::Recency).await;
         }
 
-        // Generate query embedding once for ranking
         let (_provider, query_embedding) =
             match crate::memory::embeddings::generate_query_embedding(&self.config, &query).await {
                 Ok(result) => result,

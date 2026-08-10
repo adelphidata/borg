@@ -8,6 +8,13 @@
  *
  * `mod` is ⌘ on macOS and Ctrl everywhere else.
  */
+/**
+ * Hash the quick-entry window loads. A cross-process contract: the main
+ * process appends it to the bundle URL and the renderer tests for it to skip
+ * the full shell, so the two spellings must never drift.
+ */
+export const QUICK_ENTRY_HASH = "#/quick";
+
 export const CHORDS: Readonly<Record<string, string>> = {
   "command-palette": "mod+k",
   "new-conversation": "mod+n",

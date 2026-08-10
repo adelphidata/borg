@@ -21,7 +21,6 @@ pub fn parse_webhook(body: &str) -> Result<TwilioInbound> {
 
     let channel_type = webhook.channel_type();
 
-    // Extract audio media info
     let (audio_url, audio_mime) = if webhook.has_audio_media() {
         (
             webhook.media_url_0.clone(),

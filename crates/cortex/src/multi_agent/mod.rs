@@ -1180,7 +1180,8 @@ impl AgentControl {
 
     /// Drain any pending completions without blocking.
     pub fn drain_completions(&mut self) -> Vec<SubAgentCompletion> {
-        // Start with any buffered completions from wait_for_agent
+        // Buffered completions come first: `wait_for_agent` parks completions
+        // it did not ask for here, and they predate anything still in the channel.
         let mut completions: Vec<SubAgentCompletion> = self.completion_buffer.drain(..).collect();
         while let Ok(completion) = self.completion_rx.try_recv() {
             if let Some(handle) = self.agents.get_mut(&completion.agent_id) {

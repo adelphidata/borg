@@ -54,7 +54,7 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         .or(env.source_number.as_deref())
         .or(env.source_uuid.as_deref())?;
 
-    // Filter own messages (loop protection)
+    // Loop protection: our own outbound message echoes back on the SSE feed.
     if sender == own_account {
         return None;
     }
@@ -201,7 +201,7 @@ pub async fn enrich_attachments(
                 let mime_type = att
                     .content_type
                     .clone()
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                    .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string());
                 msg.attachments.push(InboundAttachment {
                     mime_type,
                     data,

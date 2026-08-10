@@ -16,6 +16,21 @@ use super::line_utils::{prefix_lines, LIVE_PREFIX_COLS};
 use super::markdown;
 use super::theme;
 
+/// Columns reserved for the tool/shell body gutter (indent + trailing slack).
+const BODY_GUTTER_COLS: usize = 6;
+
+/// Floor for the body wrap cap. Below this a narrow terminal would hard-split
+/// nearly every line mid-token, so we let the body overflow instead — the
+/// terminal's own wrapping degrades more gracefully than character chopping.
+const BODY_MIN_WRAP_COLS: usize = 80;
+
+/// Hard wrap cap for tool and shell output bodies.
+fn body_hard_cap(width: u16) -> usize {
+    (width as usize)
+        .saturating_sub(BODY_GUTTER_COLS)
+        .max(BODY_MIN_WRAP_COLS)
+}
+
 /// Footer line shown under a collapsed tool result, nudging toward the
 /// Ctrl+T transcript pager for the hidden `extra` rows.
 fn collapse_footer(extra: usize) -> String {
@@ -691,7 +706,7 @@ fn render_shell_result(
     width: u16,
 ) -> Vec<Line<'static>> {
     let dim = theme::dim();
-    let hard_cap = (width as usize).saturating_sub(6).max(80);
+    let hard_cap = body_hard_cap(width);
     let content_width = (width as usize).saturating_sub(4).max(1);
     let row_cost = |line: &Line<'_>| -> usize {
         let w = line_utils::line_width(line);
@@ -1116,7 +1131,7 @@ impl HistoryCell {
                         } else {
                             theme::dim()
                         };
-                        let hard_cap = (width as usize).saturating_sub(6).max(80);
+                        let hard_cap = body_hard_cap(width);
                         // If the full output is pretty-printed JSON, collapse to a
                         // compact form first so `textwrap` has `: ` / `, ` break
                         // points and doesn't have to hard-split inside objects.
@@ -1318,7 +1333,7 @@ impl HistoryCell {
                         theme::dim(),
                     )));
                 }
-                let hard_cap = (width as usize).saturating_sub(6).max(80);
+                let hard_cap = body_hard_cap(width);
                 for (line_text, is_stderr) in tool_lines.iter().skip(skip) {
                     let style = if *is_stderr {
                         theme::error_style()
@@ -1429,7 +1444,6 @@ fn parse_at_mentions(
             continue;
         }
 
-        // Push text before the @
         if at_pos > 0 {
             spans.push(Span::styled(rest[..at_pos].to_string(), normal));
         }

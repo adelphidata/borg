@@ -227,7 +227,8 @@ fn extract_delimited(chars: &[char], start: usize, delim: [char; 2]) -> Option<(
 /// Ensures this isn't actually a double delimiter (e.g. `**`).
 fn extract_single_delimited(chars: &[char], start: usize, delim: char) -> Option<(String, usize)> {
     let len = chars.len();
-    // Check it's not a double delimiter
+    // A doubled delimiter belongs to the two-char form (`**`), so bail and let
+    // that parser claim it.
     if start + 1 < len && chars[start + 1] == delim {
         return None;
     }
@@ -237,7 +238,6 @@ fn extract_single_delimited(chars: &[char], start: usize, delim: char) -> Option
 
     while i < len {
         if chars[i] == delim {
-            // Check it's not a double delimiter closing
             if i + 1 < len && chars[i + 1] == delim {
                 i += 2;
                 continue;

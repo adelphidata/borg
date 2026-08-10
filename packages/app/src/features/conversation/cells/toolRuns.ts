@@ -1,6 +1,7 @@
 import type { Cell } from "../useConversation";
 import { collectEdits } from "../turnEdits";
 import { parseArgs, summarize } from "./ToolCell";
+import { capitalize } from "../../../lib/format";
 
 /** A tool cell, narrowed once so the grouping code stops re-proving it. */
 export type ToolCellData = Cell & { kind: "tool" };
@@ -117,7 +118,7 @@ export function runSummary(tools: ToolCellData[], live: boolean): string {
 
   if (parts.length === 0) return live ? "Working" : "Did nothing";
   const sentence = parts.join(", ");
-  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  return capitalize(sentence);
 }
 
 /** The shortest run worth collapsing. One row is already one line. */

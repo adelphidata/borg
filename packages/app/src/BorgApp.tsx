@@ -2,6 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
+import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
@@ -165,7 +166,7 @@ function OnboardingGate({ platform }: { platform: Platform }) {
  * fetch — neither of which a one-line capture box has any use for.
  */
 function isQuickEntry(): boolean {
-  return window.location.hash.startsWith("#/quick");
+  return window.location.hash.startsWith(QUICK_ENTRY_HASH);
 }
 
 /**

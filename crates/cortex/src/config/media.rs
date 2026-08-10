@@ -254,7 +254,6 @@ pub struct BrowserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_url: Option<String>,
 
-    // ── Browserbase remote backend ──
     /// Browserbase API key (`X-BB-API-Key`). Required when `backend =
     /// browserbase`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,7 +267,6 @@ pub struct BrowserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browserbase_base_url: Option<String>,
 
-    // ── Browser Use remote backend ──
     /// Browser Use API key (`Authorization: Bearer`). Required when `backend =
     /// browser_use`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,7 +275,6 @@ pub struct BrowserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_use_base_url: Option<String>,
 
-    // ── Firecrawl remote backend ──
     /// Firecrawl API key (`Authorization: Bearer`). Required when `backend =
     /// firecrawl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1453,8 +1450,6 @@ mod tests {
         assert!(config.allowed_env.is_empty());
         assert!(!config.enabled);
     }
-
-    // ── Telemetry (OpenTelemetry export pipeline) settings ──
 
     #[test]
     fn telemetry_defaults_all_off() {

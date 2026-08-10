@@ -30,6 +30,9 @@ fn validate_emoji(emoji: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shared transport-failure context for every Discord HTTP call.
+const API_REQUEST_FAILED: &str = "Discord API request failed";
+
 /// Discord API error codes that will never succeed on retry — the caller must
 /// intervene (fix token, grant permissions, etc.).
 const FATAL_DISCORD_ERROR_CODES: &[u64] = &[
@@ -159,7 +162,7 @@ impl DiscordClient {
                     .json(&response)
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -196,7 +199,7 @@ impl DiscordClient {
                     .json(&json!({ "content": chunk0 }))
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -216,7 +219,7 @@ impl DiscordClient {
                         .json(&json!({ "content": chunk }))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -249,7 +252,7 @@ impl DiscordClient {
                         .json(&body)
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -277,7 +280,7 @@ impl DiscordClient {
                     .header("Content-Length", "0")
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -312,7 +315,7 @@ impl DiscordClient {
                     .header("Content-Length", "0")
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -344,7 +347,7 @@ impl DiscordClient {
                     .json(&body)
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -404,7 +407,7 @@ impl DiscordClient {
                         .query(&params)
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -438,7 +441,7 @@ impl DiscordClient {
                     .json(&body)
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -464,7 +467,7 @@ impl DiscordClient {
                     .header("Authorization", format!("Bot {token}"))
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -495,7 +498,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -534,7 +537,7 @@ impl DiscordClient {
                     .header("Authorization", format!("Bot {token}"))
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -569,7 +572,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -598,7 +601,7 @@ impl DiscordClient {
                     .header("Content-Length", "0")
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -624,7 +627,7 @@ impl DiscordClient {
                     .header("Authorization", format!("Bot {token}"))
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;
@@ -650,7 +653,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -688,7 +691,7 @@ impl DiscordClient {
                         .json(&body)
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -716,7 +719,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -753,7 +756,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -781,7 +784,7 @@ impl DiscordClient {
                         .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await
-                        .context("Discord API request failed")
+                        .context(API_REQUEST_FAILED)
                 }
             })
             .await?;
@@ -822,7 +825,7 @@ impl DiscordClient {
                     .multipart(form)
                     .send()
                     .await
-                    .context("Discord API request failed")
+                    .context(API_REQUEST_FAILED)
             }
         })
         .await?;

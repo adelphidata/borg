@@ -697,18 +697,8 @@ impl Database {
             Ok(updated)
         }
         .await;
-        match result {
-            Ok(updated) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(updated)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("tasks: rollback after recover_stale_runs failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "tasks recover_stale_runs")
+            .await
     }
 
     // ── Daemon Lock ──

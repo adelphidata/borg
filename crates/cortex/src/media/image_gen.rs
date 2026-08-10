@@ -8,6 +8,18 @@ use crate::config::ImageGenConfig;
 use crate::constants;
 use crate::media::core::ensure_success;
 
+/// Square fallback edge, in pixels, when `size` is missing or unparseable.
+/// Every supported provider accepts 1024x1024, so it can never 400.
+const DEFAULT_IMAGE_EDGE: u32 = 1024;
+
+/// FAL polls at [`FAL_POLL_INTERVAL`]; 60 attempts ≈ 2 minutes, which
+/// comfortably covers the slowest supported model without wedging a turn.
+const FAL_MAX_POLL_ATTEMPTS: u32 = 60;
+
+/// Matches FAL's own recommended queue poll cadence — faster just burns
+/// requests against the rate limit without arriving sooner.
+const FAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Supported image generation providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageGenProviderKind {
@@ -277,10 +289,10 @@ async fn generate_fal(
     let mut attempts = 0;
     let result_url = loop {
         attempts += 1;
-        if attempts > 60 {
-            bail!("FAL image generation timed out after 60 poll attempts");
+        if attempts > FAL_MAX_POLL_ATTEMPTS {
+            bail!("FAL image generation timed out after {FAL_MAX_POLL_ATTEMPTS} poll attempts");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(FAL_POLL_INTERVAL).await;
 
         let status_resp = client
             .get(format!("{status_url}/status"))
@@ -354,11 +366,11 @@ async fn generate_fal(
 fn parse_size(size: &str) -> (u32, u32) {
     let parts: Vec<&str> = size.split('x').collect();
     if parts.len() == 2 {
-        let w = parts[0].parse().unwrap_or(1024);
-        let h = parts[1].parse().unwrap_or(1024);
+        let w = parts[0].parse().unwrap_or(DEFAULT_IMAGE_EDGE);
+        let h = parts[1].parse().unwrap_or(DEFAULT_IMAGE_EDGE);
         (w, h)
     } else {
-        (1024, 1024)
+        (DEFAULT_IMAGE_EDGE, DEFAULT_IMAGE_EDGE)
     }
 }
 

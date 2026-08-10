@@ -229,20 +229,8 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "vitals: rollback after record_vitals_event failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "vitals record_vitals_event")
+            .await
     }
 
     /// Get vitals events since a given timestamp (for display, not replay).
@@ -446,18 +434,8 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("vitals: rollback after record_bond_event failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "vitals record_bond_event")
+            .await
     }
 
     /// Get bond events since a given timestamp (for display, DESC order).
@@ -845,20 +823,8 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "vitals: rollback after record_evolution_event failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "vitals record_evolution_event")
+            .await
     }
 
     /// Get evolution events since a given timestamp (for display).

@@ -10,6 +10,11 @@ pub use cortex::constants::DEFAULT_HTTP_TIMEOUT as GATEWAY_HTTP_TIMEOUT;
 /// fallback route from a user-configured one.
 pub const DEFAULT_BINDING_ID: &str = "default";
 
+/// MIME type assumed for an inbound attachment whose channel supplied none.
+/// Every channel parser falls back to this so downstream media handling sees
+/// one unknown-type value instead of per-channel variants.
+pub const DEFAULT_ATTACHMENT_MIME: &str = "application/octet-stream";
+
 /// Default message chunk size for platforms with ~4000 char limits.
 /// Why: Telegram caps a single sendMessage at 4096 chars; rounding to 4000
 /// leaves headroom for trailing metadata appended by the sender path.

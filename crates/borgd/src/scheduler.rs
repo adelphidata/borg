@@ -307,7 +307,6 @@ pub async fn run(
             }
         };
 
-        // Claim due tasks.
         match db.claim_due_tasks(now).await {
             Ok(claimed) => {
                 for ct in claimed {

@@ -125,7 +125,6 @@ pub(in crate::doctor) async fn check_heartbeat(config: &Config, checks: &mut Vec
         format!("interval: {}", config.heartbeat.interval),
     ));
 
-    // Check last heartbeat from activity log
     match crate::db::Database::open().await {
         Ok(db) => {
             match db.query_activity(1, Some("info"), Some("heartbeat")).await {
@@ -169,7 +168,6 @@ pub(in crate::doctor) async fn check_heartbeat(config: &Config, checks: &mut Vec
                 }
             }
 
-            // Check if daemon is running (heartbeat runs in daemon or TUI)
             if db.is_daemon_lock_held().await {
                 checks.push(DiagnosticCheck::pass(
                     "Heartbeat",

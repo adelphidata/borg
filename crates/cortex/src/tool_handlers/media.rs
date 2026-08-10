@@ -120,7 +120,8 @@ pub async fn handle_browser(
         return Ok(ToolOutput::Text(format!("Error: {err_msg}")));
     }
 
-    // Handle close without needing a session
+    // Close runs before the session is required: closing an already-dead
+    // browser must succeed, not fail with "no session".
     if action == "close" {
         if let Some(s) = session.take() {
             // Close is best-effort: the CDP channel may already be dead.

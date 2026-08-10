@@ -1615,7 +1615,6 @@ async fn run_event_loop(
                         }
                         plugins_popup::PluginAction::Uninstall { id } => {
                             if let Some(def) = plugins::catalog::find_by_id(&id) {
-                                // Remove keychain entries
                                 if let Err(e) = plugins::installer::uninstall(def, &data_dir) {
                                     results.push(format!("Failed to remove {}: {e}", def.name));
                                     continue;

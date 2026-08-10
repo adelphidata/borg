@@ -34,7 +34,6 @@ pub fn truncate_output(text: &str, max_tokens: usize) -> String {
     let prefix_end = floor_char_boundary(text, left_budget);
     let suffix_start = ceil_char_boundary(text, text.len().saturating_sub(right_budget));
 
-    // Ensure suffix doesn't overlap prefix
     let suffix_start = suffix_start.max(prefix_end);
 
     let omitted_bytes = suffix_start - prefix_end;

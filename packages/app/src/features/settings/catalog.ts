@@ -5,6 +5,7 @@
  */
 
 import { THEME_PREFERENCES, type ThemePreference } from "@borg/ui";
+import { capitalize } from "../../lib/format";
 
 export interface SettingOption {
   /** What gets stored, and what `onPick` hands back. */
@@ -105,5 +106,5 @@ export function advancedGroupOf(key: string): string {
   const dot = key.indexOf(".");
   if (dot === -1) return "General";
   const head = key.slice(0, dot);
-  return head.charAt(0).toUpperCase() + head.slice(1);
+  return capitalize(head);
 }

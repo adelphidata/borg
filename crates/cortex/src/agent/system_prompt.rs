@@ -203,7 +203,6 @@ impl Agent {
         system.push_str(Self::build_tool_call_style_section());
         system.push_str(Self::build_skill_usage_section());
 
-        // Safety / security policy
         use std::fmt::Write as _;
         let _ = write!(
             system,
@@ -227,22 +226,11 @@ impl Agent {
 
         system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
 
-        // Reply tags for message threading (channels)
         system.push_str(Self::build_reply_tags_section());
-
-        // Messaging / channel routing guidance
         system.push_str(&self.build_messaging_section());
-
-        // Silent reply protocol
         system.push_str(&Self::build_silent_reply_section());
-
-        // Media attachment marker (channels)
         system.push_str(Self::build_media_attachment_section());
-
-        // Heartbeat ack protocol
         system.push_str(&self.build_heartbeat_section());
-
-        // Reasoning format (conditional on thinking level)
         system.push_str(&self.build_reasoning_section());
 
         // Project documentation (AGENTS.md / CLAUDE.md)

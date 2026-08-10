@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+/// Twilio addresses WhatsApp endpoints as `whatsapp:+1555…`; SMS numbers carry
+/// no prefix. The prefix is both the wire format and the channel discriminator.
+pub const WHATSAPP_PREFIX: &str = "whatsapp:";
+
 /// Distinguishes SMS vs WhatsApp for routing and response logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TwilioChannelType {
@@ -52,7 +56,7 @@ pub struct TwilioWebhook {
 impl TwilioWebhook {
     /// Returns the channel type based on the From number prefix.
     pub fn channel_type(&self) -> TwilioChannelType {
-        if self.from.starts_with("whatsapp:") {
+        if self.from.starts_with(WHATSAPP_PREFIX) {
             TwilioChannelType::WhatsApp
         } else {
             TwilioChannelType::Sms
@@ -66,12 +70,14 @@ impl TwilioWebhook {
 
     /// Returns the sender number without the "whatsapp:" prefix.
     pub fn sender_number(&self) -> &str {
-        self.from.strip_prefix("whatsapp:").unwrap_or(&self.from)
+        self.from
+            .strip_prefix(WHATSAPP_PREFIX)
+            .unwrap_or(&self.from)
     }
 
     /// Returns the recipient number without the "whatsapp:" prefix.
     pub fn recipient_number(&self) -> &str {
-        self.to.strip_prefix("whatsapp:").unwrap_or(&self.to)
+        self.to.strip_prefix(WHATSAPP_PREFIX).unwrap_or(&self.to)
     }
 
     /// Returns the first media (URL, content-type) if present.

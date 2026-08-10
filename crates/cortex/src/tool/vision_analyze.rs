@@ -158,7 +158,7 @@ async fn fetch_remote(
     // return the body. Mirrors `web::web_fetch`.
     let redirect_policy_cfg = policy.clone();
     let redirect = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
+        if attempt.previous().len() >= constants::MEDIA_FETCH_REDIRECT_LIMIT {
             return attempt.error("too many redirects");
         }
         let next_url = attempt.url().to_string();
@@ -171,6 +171,8 @@ async fn fetch_remote(
         }
     });
 
+    // Shorter than `video_analyze`'s 120s: images are small, so a stall here
+    // is a dead host rather than a slow transfer.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .redirect(redirect)

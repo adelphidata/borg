@@ -12,10 +12,9 @@ use super::{AgentControl, AgentRoleKind};
 /// `<tooling>` section. Mirrors [`crate::tool::definitions::TOOL_SUMMARIES`]
 /// but lives here so the prose stays next to the definitions.
 ///
-/// **Intentionally narrow.** `send_to_agent` is *not* listed because
-/// `tool_definitions` does not emit its definition (the receive path is a
-/// stub — see the NOTE block in [`tool_definitions`]); summarising a tool
-/// the LLM cannot call would be dead text in the prompt. `list_agents` and
+/// **Intentionally narrow.** `send_to_agent` is *not* listed because no
+/// definition is emitted for it (see `build_multi_agent_tools`); summarising
+/// a tool the LLM cannot call would be dead text in the prompt. `list_agents` and
 /// `manage_roles` are intentional fallbacks — `system_prompt`'s
 /// description-first-sentence path renders an acceptable summary for them
 /// without needing a hand-crafted entry here.
@@ -81,7 +80,8 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
         ),
     ];
 
-    // Only add spawn/interact tools if we haven't hit depth limit
+    // Withholding the definitions at the depth cap is the enforcement point:
+    // a tool the model cannot see is a tree it cannot grow deeper.
     if spawn_depth < max_spawn_depth {
         defs.push(ToolDefinition::new(
             "spawn_agent",
@@ -157,8 +157,10 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
             }),
         ));
 
-        // NOTE: send_to_agent is intentionally excluded — the receiving end in
-        // run_sub_agent silently drops messages. Re-add when properly implemented.
+        // `send_to_agent` is dispatchable (`handle_send_to_agent`) but no
+        // definition is emitted, so the model cannot reach it: steering a live
+        // child is an operator/orchestrator path, not something a parent LLM
+        // should discover on its own.
 
         defs.push(ToolDefinition::new(
             "wait_for_agent",

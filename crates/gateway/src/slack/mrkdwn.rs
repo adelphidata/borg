@@ -103,16 +103,10 @@ fn convert_segment(text: &str) -> String {
     // Escape HTML entities (but preserve existing Slack angle-bracket tokens)
     result = escape_entities(&result);
 
-    // Convert **bold** to *bold*
     result = RE_BOLD.replace_all(&result, "*$1*").to_string();
-
-    // Convert ~~strike~~ to ~strike~
     result = RE_STRIKE.replace_all(&result, "~$1~").to_string();
-
-    // Convert [text](url) to <url|text>
     result = RE_LINK.replace_all(&result, "<$2|$1>").to_string();
-
-    // Convert # Heading to *Heading* (bold, since mrkdwn has no headings)
+    // mrkdwn has no heading syntax, so headings degrade to bold.
     result = RE_HEADING.replace_all(&result, "*$1*").to_string();
 
     result

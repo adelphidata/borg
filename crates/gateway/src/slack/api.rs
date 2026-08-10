@@ -373,7 +373,7 @@ impl SlackClient {
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
+            .unwrap_or(crate::constants::DEFAULT_ATTACHMENT_MIME)
             .to_string();
 
         // Streamed read with a running cap — Content-Length can lie or be

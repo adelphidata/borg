@@ -43,7 +43,8 @@ async fn apply_config_changes(plan: &MigrationPlan, result: &mut MigrationResult
         .context("Failed to open database for migration")?;
 
     for change in &active_changes {
-        // Use apply_setting for validation, then write to DB
+        // Validate against a scratch Config first: a bad key must not land
+        // in the settings table where it would warn on every reload.
         let mut scratch = crate::config::Config::default();
         match scratch.apply_setting(&change.key, &change.new_value) {
             Ok(_) => match db.set_setting(&change.key, &change.new_value).await {
@@ -84,7 +85,6 @@ async fn apply_credentials(
 
     for key_name in &plan.credentials_to_add {
         if data.credentials.iter().any(|(k, _)| k == key_name) {
-            // Store as env var reference in DB credentials
             creds.insert(
                 key_name.clone(),
                 crate::config::CredentialValue::EnvVar(key_name.clone()),

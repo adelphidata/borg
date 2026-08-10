@@ -53,8 +53,6 @@ use system_prompt_cache::SystemPromptCache;
 pub use btw::{parse_btw_command, run_btw};
 pub use prompt_assembly::{ContextBreakdown, ContextComponent};
 pub use tool_classification::{conditionally_mutating_tool_names, mutating_tool_names};
-// `tool_classification` is consumed by `agent::tool_execution`; nothing in
-// this module references it directly.
 
 /// Spawn a background task that logs panics instead of silently swallowing them.
 pub(crate) fn spawn_logged(
@@ -466,11 +464,6 @@ impl Agent {
         self.db.lock().await
     }
 
-    // Credential cache + skill-runtime refresh helpers
-    // (`ensure_credentials_cached`, `credentials_cached`,
-    // `refresh_skill_runtime_state`, `maybe_refresh_skills_after_tool`)
-    // live in `agent::credentials`.
-
     pub(super) fn latest_user_message_text(&self) -> &str {
         // Compaction markers are Role::User rows — skip them so callers get
         // the user's actual latest message, never the summary text.
@@ -589,7 +582,6 @@ impl Agent {
             None
         };
 
-        // Best-effort embedding cache pruning on startup
         Self::prune_embedding_cache_on_startup(&config).await;
 
         Ok(Self::build_agent(
@@ -837,12 +829,6 @@ impl Agent {
     pub fn hook_registry_mut(&mut self) -> &mut HookRegistry {
         &mut self.hook_registry
     }
-
-    // Session lifecycle (`load_session`, `new_session`, `end_session`,
-    // `flush_short_term_memory`, `auto_save`) and message persistence
-    // (`persist_message`, `log_and_persist`, `skip_tool_call`,
-    // `append_assistant_message`, `maybe_redact`, `truncate_and_redact`)
-    // live in `agent::session_manager`.
 
     pub fn session(&self) -> &Session {
         &self.session
@@ -1653,7 +1639,6 @@ impl Agent {
         }
         let text_content = tag_filter.full_clean();
 
-        // Fire AfterLlmResponse hook
         let hook_ctx = self.hook_ctx(
             HookPoint::AfterLlmResponse,
             HookData::LlmResponse {

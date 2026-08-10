@@ -41,7 +41,7 @@
 use std::io;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{FALSE, HANDLE};
+use windows_sys::Win32::Foundation::FALSE;
 use windows_sys::Win32::System::Threading::{
     DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
@@ -226,10 +226,3 @@ pub unsafe fn install_default_mitigations(
         )
     }
 }
-
-// Suppress an "unused HANDLE import on non-Windows" warning that
-// surfaces when the file is built on a host that hides Windows types
-// behind cfg. The type is referenced in the unsafe-fn signatures via
-// LPPROC_THREAD_ATTRIBUTE_LIST.
-#[allow(dead_code)]
-fn _suppress_handle_unused(_h: HANDLE) {}

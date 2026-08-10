@@ -163,6 +163,8 @@ impl CapabilityRouter {
         };
         match tx {
             Some(tx) => {
+                // Safe to drop: `Err` only means the caller timed out or was
+                // cancelled and already dropped its receiver.
                 let _ = tx.send(result);
             }
             None => tracing::warn!(

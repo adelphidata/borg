@@ -65,7 +65,6 @@ impl Agent {
         // reload on the next turn.
         self.caches = super::system_prompt_cache::SystemPromptCache::default();
 
-        // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(
             HookPoint::SessionStart,
             HookData::SessionStart {
@@ -343,6 +342,9 @@ fn draft_from_message(msg: &Message) -> crate::db::SessionEventDraft {
                 .content
                 .as_ref()
                 .map(crate::types::MessageContent::full_text);
+            // The plain-text `full` above is the load-bearing copy; the parts
+            // blob is a replay nicety, so a serialization failure loses
+            // fidelity rather than the message.
             let parts_json = serde_json::to_string(parts).ok();
             (full, parts_json)
         }

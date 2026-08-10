@@ -35,6 +35,8 @@ function createWindow() {
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 15, y: 14 },
     backgroundColor: "#0B0E0B", // matches dark theme so pre-paint frames don't flash white
+    // Renderer sandbox invariant: context isolation on, node integration off.
+    // The typed preload bridge is the renderer's only route to the daemon.
     webPreferences: {
       preload: preloadJs,
       contextIsolation: true,

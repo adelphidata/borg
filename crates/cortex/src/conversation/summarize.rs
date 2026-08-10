@@ -370,7 +370,8 @@ async fn summarize_chunked(
         return Err(worst_failure.unwrap_or(SummarizeFailure::Transient));
     }
 
-    // If only one chunk succeeded, use it directly
+    // A single surviving chunk is already the whole summary — a second
+    // combine pass would only re-summarize it and lose detail.
     if let [only] = chunk_summaries.as_slice() {
         return Ok(only.clone());
     }

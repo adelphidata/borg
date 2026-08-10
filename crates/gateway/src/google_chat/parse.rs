@@ -51,7 +51,7 @@ pub fn parse_event(event: &ChatEvent) -> Option<InboundMessage> {
                 mime_type: att
                     .content_type
                     .clone()
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string()),
                 data: name.clone(),
                 filename: att.content_name.clone(),
             });

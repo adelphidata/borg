@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::constants;
 use crate::media;
 use crate::types::{ContentPart, MediaData, ToolOutput};
 use crate::url_policy::{self, ClassifyOutcome};
@@ -207,7 +208,7 @@ async fn fetch_remote(
 
     let redirect_policy_cfg = policy.clone();
     let redirect = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
+        if attempt.previous().len() >= constants::MEDIA_FETCH_REDIRECT_LIMIT {
             return attempt.error("too many redirects");
         }
         let next_url = attempt.url().to_string();
@@ -220,6 +221,8 @@ async fn fetch_remote(
         }
     });
 
+    // Double `vision_analyze`'s 60s: a legitimate video transfer is simply
+    // slower, so the same ceiling would abort healthy fetches.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .redirect(redirect)

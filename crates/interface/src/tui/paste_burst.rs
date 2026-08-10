@@ -47,7 +47,6 @@ impl PasteBurst {
 
     /// Feed a plain character event. Returns whether to insert normally or buffer.
     pub fn on_char(&mut self, ch: char, now: Instant) -> CharAction {
-        // Track inter-key timing
         match self.last_char_time {
             Some(prev) if now.duration_since(prev) <= BURST_CHAR_INTERVAL => {
                 self.consecutive_fast_chars = self.consecutive_fast_chars.saturating_add(1);

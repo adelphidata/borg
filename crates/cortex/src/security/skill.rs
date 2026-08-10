@@ -376,8 +376,6 @@ mod tests {
         }
     }
 
-    // -- check_builtin_name_collision --
-
     #[test]
     fn builtin_collision_detected() {
         assert!(check_builtin_name_collision("git"));
@@ -392,8 +390,6 @@ mod tests {
         assert!(!check_builtin_name_collision("internal-deploy"));
         assert!(!check_builtin_name_collision(""));
     }
-
-    // -- validate_skill_env --
 
     #[test]
     fn env_blocks_api_keys() {
@@ -462,8 +458,6 @@ mod tests {
         assert!(denied.is_empty());
     }
 
-    // -- scan_skill_content --
-
     #[test]
     fn scan_flags_high_risk_content() {
         // Combine multiple patterns to reach high-risk threshold (score >= 50)
@@ -516,8 +510,6 @@ mod tests {
         );
     }
 
-    // -- check_file_permissions --
-
     #[cfg(unix)]
     #[test]
     fn permissions_world_writable() {
@@ -553,8 +545,6 @@ mod tests {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(check_file_permissions(tmp.path()));
     }
-
-    // -- validate_user_skill (orchestrator) --
 
     #[test]
     fn validate_blocks_builtin_collision() {
@@ -628,8 +618,6 @@ mod tests {
         assert!(outcome.allowed);
     }
 
-    // -- audit_user_skills --
-
     fn write_skill(dir: &Path, name: &str, body: &str) {
         let skill_dir = dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -700,8 +688,6 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].name, "real-skill");
     }
-
-    // -- higher_threat --
 
     #[test]
     fn higher_threat_ordering() {

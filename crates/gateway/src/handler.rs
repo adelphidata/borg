@@ -1223,7 +1223,8 @@ async fn process_message(
         .context("Failed to open database")?;
 
     for (i, chunk) in chunks.iter().enumerate() {
-        // Build payload without secrets for persistence
+        // The persisted copy is snapshotted before credentials are added, so the
+        // delivery queue never stores a token.
         let mut outbound = serde_json::json!({
             "text": chunk,
             "sender_id": inbound.sender_id,
@@ -1237,7 +1238,6 @@ async fn process_message(
 
         let persist_str = outbound.to_string();
 
-        // Add secrets for runtime sending only
         outbound["token"] = serde_json::json!(token);
         outbound["secret"] = serde_json::json!(secret);
         let outbound_str = outbound.to_string();

@@ -428,9 +428,6 @@ pub(super) fn skill_relevance_score(skill: &Skill, user_request: &str) -> u32 {
     )
 }
 
-// `collect_skill_env`, `collect_required_env_vars`, `install_skill_deps`,
-// and the test-only `format_skill_info` live in `skills::environment`.
-
 #[cfg(test)]
 mod marker_tests {
     use super::*;

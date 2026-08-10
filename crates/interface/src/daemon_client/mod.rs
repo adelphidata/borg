@@ -15,7 +15,7 @@
 mod connect;
 mod event_stream;
 
-pub use connect::{connect, connect_default, default_socket_path};
+pub use connect::{connect, connect_default, default_socket_path, SOCKET_POLL_INTERVAL};
 pub use event_stream::{forward_event_stream, spawn_event_adapter};
 
 use anyhow::{anyhow, Context, Result};

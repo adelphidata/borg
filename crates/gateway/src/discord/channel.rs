@@ -153,10 +153,9 @@ impl NativeChannel for DiscordChannel {
                                     let mut line_text = m.content.clone();
                                     if let Some(ref t) = transcriber {
                                         for att in &m.attachments {
-                                            let mime = att
-                                                .content_type
-                                                .as_deref()
-                                                .unwrap_or("application/octet-stream");
+                                            let mime = att.content_type.as_deref().unwrap_or(
+                                                crate::constants::DEFAULT_ATTACHMENT_MIME,
+                                            );
                                             if !mime.starts_with("audio/") {
                                                 continue;
                                             }

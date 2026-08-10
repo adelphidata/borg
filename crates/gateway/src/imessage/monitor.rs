@@ -94,7 +94,6 @@ async fn monitor_loop(
     let mut echo_cache = EchoCache::new();
     let mut self_chat_cache = SelfChatCache::new();
 
-    // Load channel manifest for handler reuse
     let manifest_path = channel_dir.join("channel.toml");
     let manifest = crate::manifest::ChannelManifest::load_async(&manifest_path)
         .await
@@ -414,7 +413,7 @@ fn load_attachments(metas: &[AttachmentMeta]) -> Vec<InboundAttachment> {
         let mime = meta
             .mime_type
             .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+            .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string());
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         out.push(InboundAttachment {
             mime_type: mime,

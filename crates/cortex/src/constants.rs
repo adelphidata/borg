@@ -568,6 +568,13 @@ pub const WEB_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Max HTTP redirects to follow.
 pub const WEB_REDIRECT_LIMIT: usize = 5;
 
+/// Redirect cap for the media fetchers (`vision_analyze`, `video_analyze`).
+/// Higher than [`WEB_REDIRECT_LIMIT`] because CDN-hosted assets routinely
+/// chain several hops; still bounded so a hostile host cannot stall the fetch
+/// forever. Both fetchers must share it — a security bound kept in two copies
+/// is the classic drift hazard.
+pub const MEDIA_FETCH_REDIRECT_LIMIT: usize = 10;
+
 // ── Project docs ──────────────────────────────────────────────────
 
 /// Maximum total bytes to read from project docs (32 KiB).

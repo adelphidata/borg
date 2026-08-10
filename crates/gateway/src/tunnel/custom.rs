@@ -16,6 +16,9 @@ use crate::tunnel::{
 /// rather than assuming a fast local agent.
 const URL_DEADLINE: Duration = Duration::from_secs(30);
 const PER_LINE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Health probe budget. Short on purpose: a wedged tunnel must report unhealthy
+/// well before the supervisor's next poll rather than stalling it.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Operator-supplied tunnel command. Substitutes `{host}` and `{port}`
 /// before splitting; the URL is scraped from the child's stdout via
@@ -212,12 +215,7 @@ impl Tunnel for CustomTunnel {
         let Some(url) = self.health_url.as_ref() else {
             return alive;
         };
-        match timeout(
-            Duration::from_secs(5),
-            reqwest::Client::new().get(url).send(),
-        )
-        .await
-        {
+        match timeout(HEALTH_TIMEOUT, reqwest::Client::new().get(url).send()).await {
             Ok(Ok(resp)) => resp.status().is_success(),
             _ => false,
         }

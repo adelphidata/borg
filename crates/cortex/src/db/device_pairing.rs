@@ -86,18 +86,8 @@ impl Database {
             Ok(outcome)
         }
         .await;
-        match result {
-            Ok(outcome) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(outcome)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("device_pairing: rollback after consume failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "device_pairing consume")
+            .await
     }
 
     pub async fn bump_pairing_attempts(&self, code: &str) -> Result<()> {

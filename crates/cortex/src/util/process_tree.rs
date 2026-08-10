@@ -65,6 +65,8 @@ pub(crate) fn wait_or_kill_group(
                     ));
                 }
                 std::thread::sleep(poll);
+                // Capped backoff: short-lived commands still reap in a few ms,
+                // while a long-running one costs at most 40 wakeups/sec.
                 poll = (poll * 2).min(std::time::Duration::from_millis(25));
             }
         }

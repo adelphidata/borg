@@ -444,6 +444,8 @@ impl Session for SessionSvc {
                 let mut pending = pending_for_inbound.lock().await;
                 std::mem::take(&mut *pending)
             };
+            // Failing every pending waiter here is what stops an fs request from
+            // hanging forever when the client disconnects mid-turn.
             for (_id, tx) in pending {
                 let _ = tx.send(Err("ACP fs stream closed before client replied".to_string()));
             }

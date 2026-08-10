@@ -303,6 +303,8 @@ pub fn set_modes() -> Result<()> {
             PushKeyboardEnhancementFlags(resolved_keyboard_enhancement_flags())
         );
     }
+    // Focus reporting is a nicety (it only pauses the throbber when unfocused);
+    // terminals that reject the mode still give a fully working TUI.
     let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
 }

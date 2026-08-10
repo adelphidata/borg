@@ -9,6 +9,18 @@ use super::{
     require_str_param, with_db,
 };
 
+/// One wording for "no such task", shared by every action. The model treats a
+/// changed reply as a changed outcome, so the phrasing must not drift per call
+/// site.
+fn task_not_found(task_id: &str) -> String {
+    format!("Task {task_id} not found.")
+}
+
+/// One wording for a rejected cron/interval spec, for the same reason.
+fn invalid_schedule(e: impl std::fmt::Display) -> String {
+    format!("Error: Invalid schedule: {e}")
+}
+
 /// Unified schedule handler: dispatches to manage_tasks or manage_cron based on `type` field.
 pub async fn handle_schedule(args: &serde_json::Value, config: &Config) -> Result<String> {
     let job_type = optional_str_param(args, "type").unwrap_or("").to_string();
@@ -97,7 +109,7 @@ pub async fn handle_manage_tasks(args: &serde_json::Value, config: &Config) -> R
             with_db(move |db| async move {
                 match db.delete_task(&task_id).await {
                     Ok(true) => Ok(format!("Task {task_id} deleted.")),
-                    Ok(false) => Ok(format!("Task {task_id} not found.")),
+                    Ok(false) => Ok(task_not_found(&task_id)),
                     Err(e) => Ok(format!("Error: {e}")),
                 }
             })
@@ -175,11 +187,11 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
         .unwrap_or("local")
         .to_string();
     if let Err(e) = tasks::validate_schedule(&schedule_type, &schedule_expr) {
-        return Ok(format!("Error: Invalid schedule: {e}"));
+        return Ok(invalid_schedule(e));
     }
     let next_run = match tasks::calculate_next_run(&schedule_type, &schedule_expr, &timezone) {
         Ok(nr) => nr,
-        Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
+        Err(e) => return Ok(invalid_schedule(e)),
     };
     let id = uuid::Uuid::new_v4().to_string();
     if let Some(ch) = optional_str_param(args, "delivery_channel") {
@@ -303,7 +315,7 @@ async fn manage_tasks_get(args: &serde_json::Value) -> Result<String> {
                 }
                 Ok(output)
             }
-            Ok(None) => Ok(format!("Task {task_id} not found.")),
+            Ok(None) => Ok(task_not_found(&task_id)),
             Err(e) => Ok(format!("Error: {e}")),
         }
     })
@@ -330,7 +342,7 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
     if let Some(st) = schedule_type.as_deref() {
         let expr = schedule_expr.as_deref().unwrap_or("");
         if let Err(e) = tasks::validate_schedule(st, expr) {
-            return Ok(format!("Error: Invalid schedule: {e}"));
+            return Ok(invalid_schedule(e));
         }
     } else if let Some(expr) = schedule_expr.as_deref() {
         let task_id_v = task_id.clone();
@@ -339,7 +351,7 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
             match db.get_task_by_id(&task_id_v).await {
                 Ok(Some(existing)) => {
                     if let Err(e) = tasks::validate_schedule(&existing.schedule_type, &expr_v) {
-                        return Ok(format!("Error: Invalid schedule: {e}"));
+                        return Ok(invalid_schedule(e));
                     }
                     Ok(String::new())
                 }
@@ -367,7 +379,7 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
                     ));
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => return Ok(format!("Task {task_id} not found.")),
+                Ok(None) => return Ok(task_not_found(&task_id)),
                 Err(e) => return Ok(format!("Error: {e}")),
             }
         }
@@ -397,7 +409,7 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
                 }
                 Ok(format!("Task {task_id} updated."))
             }
-            Ok(false) => Ok(format!("Task {task_id} not found.")),
+            Ok(false) => Ok(task_not_found(&task_id)),
             Err(e) => Ok(format!("Error: {e}")),
         }
     })
@@ -442,7 +454,7 @@ pub(crate) async fn resume_task_in(db: &Database, task_id: &str) -> String {
     match tasks::resume_task(db, task_id).await {
         Ok(tasks::ResumeOutcome::Resumed) => format!("Task {task_id} resumed."),
         Ok(tasks::ResumeOutcome::AlreadyActive) => format!("Task {task_id} is already active."),
-        Ok(tasks::ResumeOutcome::NotFound) => format!("Task {task_id} not found."),
+        Ok(tasks::ResumeOutcome::NotFound) => task_not_found(task_id),
         // `{e:#}` keeps the cause chain — "stays paused: rescheduling failed"
         // alone would hide *why* the stored schedule no longer parses.
         Err(e) => format!("Error: {e:#}"),
@@ -467,7 +479,7 @@ pub(crate) async fn run_task_now_in(db: &Database, task_id: &str) -> String {
             "Error: task {task_id} is {status} — the scheduler only claims active \
              tasks, so queueing it would silently do nothing. Resume it first."
         ),
-        Ok(tasks::RunNowOutcome::NotFound) => format!("Task {task_id} not found."),
+        Ok(tasks::RunNowOutcome::NotFound) => task_not_found(task_id),
         Err(e) => format!("Error: {e:#}"),
     }
 }
@@ -638,12 +650,12 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
 
     let cron_7 = tasks::convert_5_to_7_field(&schedule);
     if let Err(e) = tasks::validate_schedule("cron", &cron_7) {
-        return Ok(format!("Error: Invalid schedule: {e}"));
+        return Ok(invalid_schedule(e));
     }
 
     let next_run = match tasks::calculate_next_run("cron", &cron_7, "local") {
         Ok(nr) => nr,
-        Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
+        Err(e) => return Ok(invalid_schedule(e)),
     };
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -720,7 +732,7 @@ pub async fn update_task_status(task_id: &str, status: &str, verb: &str) -> Resu
     with_db(move |db| async move {
         match db.update_task_status(&task_id, &status).await {
             Ok(true) => Ok(format!("Task {task_id} {verb}.")),
-            Ok(false) => Ok(format!("Task {task_id} not found.")),
+            Ok(false) => Ok(task_not_found(&task_id)),
             Err(e) => Ok(format!("Error: {e}")),
         }
     })

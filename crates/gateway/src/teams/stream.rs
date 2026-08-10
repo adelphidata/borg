@@ -57,7 +57,6 @@ impl<'a> TeamsStream<'a> {
     pub async fn send_chunk(&mut self, partial_text: &str) -> Result<()> {
         self.buffer.push_str(partial_text);
 
-        // Wait for minimum content before first send
         if !self.sent_first && self.buffer.chars().count() < MIN_FIRST_CHUNK_CHARS {
             return Ok(());
         }

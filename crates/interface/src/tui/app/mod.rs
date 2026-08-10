@@ -969,10 +969,15 @@ impl<'a> App<'a> {
                 match std::fs::File::open(&log_path) {
                     Ok(mut f) => {
                         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        // Seek/read failures degrade to showing less (or no) log
+                        // tail, which the empty-buffer path below already
+                        // handles — never worth failing the /logs view over.
                         if len > TAIL_BYTES {
                             let _ = f.seek(SeekFrom::End(-(TAIL_BYTES as i64)));
                         }
                         let mut buf = String::new();
+                        // A mid-file seek can land inside a UTF-8 sequence; the
+                        // first partial line is dropped by `start` below.
                         let _ = f.read_to_string(&mut buf);
                         let lines: Vec<&str> = buf.lines().collect();
                         let start = if len > TAIL_BYTES {

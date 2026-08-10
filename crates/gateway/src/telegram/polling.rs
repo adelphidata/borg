@@ -39,7 +39,8 @@ pub async fn run_polling(
     callback: PollCallback,
     shutdown: CancellationToken,
 ) {
-    // Ensure no webhook is set before starting polling
+    // Telegram rejects `getUpdates` while a webhook is registered, so drop any
+    // leftover webhook before the first poll.
     if let Err(e) = client.delete_webhook().await {
         warn!("Failed to delete webhook before polling: {e}");
     }

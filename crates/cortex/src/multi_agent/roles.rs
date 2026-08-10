@@ -71,7 +71,6 @@ pub async fn load_role(name: &str) -> Option<AgentRole> {
             });
         }
     }
-    // Fallback to built-in
     builtin_role(name)
 }
 
@@ -80,7 +79,8 @@ pub async fn list_all_roles() -> Vec<AgentRole> {
     let mut roles = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // DB roles take priority
+    // DB roles are inserted first so a same-named built-in is skipped below:
+    // an operator-defined role must be able to shadow the shipped one.
     if let Ok(db) = Database::open().await {
         if let Ok(db_roles) = db.list_roles().await {
             for row in db_roles {

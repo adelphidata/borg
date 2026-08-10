@@ -107,7 +107,6 @@ pub fn compress_image(
         validate_base64(base64_data).ok_or_else(|| anyhow::anyhow!("invalid base64 data"))?;
     let raw_bytes = engine.decode(&validated)?;
 
-    // Handle HEIC/HEIF
     let (bytes, _effective_mime) = if is_heic(mime_type) {
         match convert_heic_to_jpeg(&raw_bytes) {
             Ok(jpeg_bytes) => (jpeg_bytes, "image/jpeg".to_string()),
@@ -261,7 +260,6 @@ pub fn validate_base64(data: &str) -> Option<String> {
     // Strip whitespace (canonicalize)
     let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
 
-    // Check valid base64 charset
     let engine = base64::engine::general_purpose::STANDARD;
     if engine.decode(&cleaned).is_err() {
         return None;

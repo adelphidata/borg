@@ -666,18 +666,8 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(v) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(v)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("sessions: rollback after claim_session_lease failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "sessions claim_session_lease")
+            .await
     }
 
     /// Extend a held lease's deadline. Returns `false` if the lease was

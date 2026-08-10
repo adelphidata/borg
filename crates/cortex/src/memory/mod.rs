@@ -1000,7 +1000,11 @@ fn path_has_blocked_component(path: &std::path::Path, blocked: &[String]) -> boo
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
         for entry in blocked {
-            // Support multi-component entries like ".config/gh"
+            // Only single-component entries match here. Multi-component
+            // entries (".config/gh") and the dotted-family suffix rule
+            // (".env" also blocking ".env.local") are the canonical-path
+            // check's job — this pass exists solely to catch a symlink
+            // whose *link name* is blocked before canonicalize hides it.
             let entry_path = std::path::Path::new(entry.as_str());
             let entry_components: Vec<_> = entry_path
                 .components()

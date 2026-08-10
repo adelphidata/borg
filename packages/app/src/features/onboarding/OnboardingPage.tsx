@@ -60,7 +60,6 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
   };
 
   const steps = [
-    // ── Welcome ──────────────────────────────────────────────────────────
     () => (
       <>
         <h1 className={TITLE}>Hello. I’m Borg.</h1>
@@ -81,7 +80,6 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
       </>
     ),
 
-    // ── Provider + key ───────────────────────────────────────────────────
     () => (
       <>
         <h1 className={TITLE}>Pick a brain.</h1>
@@ -137,7 +135,6 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
       </>
     ),
 
-    // ── Model ────────────────────────────────────────────────────────────
     () => {
       const choices = provider ? modelsFor(provider) : [];
       return (

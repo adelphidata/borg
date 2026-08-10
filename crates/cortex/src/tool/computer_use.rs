@@ -1498,6 +1498,8 @@ static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
 /// misbehaving cua-driver build or oversized synthesized summary from
 /// pumping megabytes into LLM context.
 fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
+    // Equal by coincidence, not by invariant: one bounds what the driver may
+    // contribute, the other the merged result. Tune them independently.
     const MAX_DRIVER_TEXT_BYTES: usize = 4096;
     const MAX_TOOL_TEXT_BYTES: usize = 4096;
     let mut driver_text = String::new();

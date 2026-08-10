@@ -151,6 +151,8 @@ const MAX_CATALOG_DESCRIPTION_CHARS: usize = 320;
 /// longer than what the catalog renders is text no model ever reads.
 pub const MAX_SKILL_DESCRIPTION_CHARS: usize = MAX_CATALOG_DESCRIPTION_CHARS;
 
+/// Triggers listed per skill in the catalog. Past a handful they stop helping
+/// selection and just spend prompt budget on every turn.
 const MAX_CATALOG_TRIGGERS: usize = 8;
 const TRUNCATION_SUFFIX: &str = "…";
 

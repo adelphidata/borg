@@ -139,7 +139,6 @@ pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
 
     out.push_str(&empty());
 
-    // Vitals
     out.push_str(&line("  Vitals"));
     out.push_str(&line(&format!(
         "    STB: {:>3}  FOC: {:>3}  SYN: {:>3}",
@@ -153,7 +152,6 @@ pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
 
     out.push_str(&empty());
 
-    // Description
     if let Some(ref desc) = payload.evolution_description {
         let max_line = w - 6;
         let words: Vec<&str> = desc.split_whitespace().collect();
@@ -181,7 +179,6 @@ pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
         out.push_str(&empty());
     }
 
-    // Bottom border
     out.push_str(&format!("\u{255A}{border}\u{255D}\n"));
 
     out

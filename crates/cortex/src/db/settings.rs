@@ -37,18 +37,8 @@ impl Database {
         }
         .await;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(rb) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("settings rollback failed: {rb} (original: {e})");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "settings ensure_all")
+            .await
     }
 
     /// Returns SQLite's `PRAGMA data_version` — a connection-local counter

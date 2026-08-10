@@ -143,22 +143,12 @@ impl Database {
 
             Ok(request)
         }.await;
-        match result {
-            Ok(request) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(PairingRequestRow {
-                    status: "approved".into(),
-                    approved_at: Some(now),
-                    ..request
-                })
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("pairing: rollback after approve failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        let request = self.finish_immediate_tx(result, "pairing approve").await?;
+        Ok(PairingRequestRow {
+            status: "approved".into(),
+            approved_at: Some(now),
+            ..request
+        })
     }
 
     /// Mark every pending pairing request for `(channel, sender)` as

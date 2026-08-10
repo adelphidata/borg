@@ -268,18 +268,8 @@ impl Database {
             }
             Ok(())
         }.await;
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("memory: rollback after upsert_chunks failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "memory upsert_chunks")
+            .await
     }
 
     /// Retrieve all chunks for a given scope, optionally limited to `limit` rows.
@@ -490,20 +480,8 @@ impl Database {
             .await?;
             Ok(())
         }.await;
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "memory: rollback after upsert_memory_entry failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "memory upsert_memory_entry")
+            .await
     }
 
     /// Retrieve a memory entry by scope and name.
@@ -561,20 +539,10 @@ impl Database {
             Ok(count)
         }
         .await;
-        match result {
-            Ok(count) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(count > 0)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "memory: rollback after delete_memory_entry failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        let count = self
+            .finish_immediate_tx(result, "memory delete_memory_entry")
+            .await?;
+        Ok(count > 0)
     }
 
     /// List all memory entries for a scope, ordered by updated_at DESC.
@@ -652,20 +620,8 @@ impl Database {
             .await?;
             Ok(())
         }.await;
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!(
-                        "memory: rollback after append_memory_entry failure failed: {re}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "memory append_memory_entry")
+            .await
     }
 
     /// List all distinct scopes that have at least one memory entry.

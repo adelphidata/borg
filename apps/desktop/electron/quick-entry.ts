@@ -1,6 +1,7 @@
 import { BrowserWindow, app, globalShortcut, screen } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { QUICK_ENTRY_HASH } from "@borg/app/chords";
 
 /**
  * The global capture window.
@@ -54,6 +55,8 @@ export function registerQuickEntry(options: {
       alwaysOnTop: true,
       transparent: true,
       backgroundColor: "#00000000",
+      // Same renderer sandbox invariant as the main window — isolated context,
+      // no node integration, preload bridge only.
       webPreferences: {
         preload: options.preload,
         contextIsolation: true,
@@ -67,8 +70,8 @@ export function registerQuickEntry(options: {
     created.on("blur", () => created.hide());
 
     const target = options.isDev
-      ? `${options.devServerUrl}#/quick`
-      : `${pathToFileURL(options.indexHtml).href}#/quick`;
+      ? `${options.devServerUrl}${QUICK_ENTRY_HASH}`
+      : `${pathToFileURL(options.indexHtml).href}${QUICK_ENTRY_HASH}`;
     void created.loadURL(target);
     return created;
   };

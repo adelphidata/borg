@@ -67,6 +67,11 @@ pub const MAX_PROPERTIES: usize = 64;
 /// [`ToolFilter::DEFAULT_MAX`]: crate::manifest::ToolFilter::DEFAULT_MAX
 pub const DEFAULT_GLOBAL_TOOL_CAP: usize = 128;
 
+/// Lock names passed to the poison-recovering helpers; they appear verbatim
+/// in the warning logged when a poisoned lock is recovered.
+const INNER_LOCK: &str = "registry.inner";
+const GLOBAL_CAP_LOCK: &str = "registry.global_cap";
+
 /// One registered MCP tool, ready for the agent loop to dispatch.
 #[derive(Debug, Clone)]
 pub struct RegisteredTool {
@@ -194,7 +199,7 @@ impl McpRegistry {
         builtin_names: &[&str],
     ) -> Vec<ToolRegistrationOutcome> {
         let mut outcomes = Vec::new();
-        let global_cap = *read_recovering(&self.global_cap, "registry.global_cap");
+        let global_cap = *read_recovering(&self.global_cap, GLOBAL_CAP_LOCK);
 
         // Surface glob entries that matched nothing in the server's declared
         // catalog — an unmatched pattern used to silently match nothing, so a
@@ -215,7 +220,7 @@ impl McpRegistry {
             }
         }
 
-        let mut inner = write_recovering(&self.inner, "registry.inner");
+        let mut inner = write_recovering(&self.inner, INNER_LOCK);
 
         // Drop existing entries for this server first — `tools/list_changed`
         // is a full re-declaration, not a diff.
@@ -389,7 +394,7 @@ impl McpRegistry {
     /// Remove all tools belonging to `server` (e.g. on disconnect /
     /// disable). Idempotent.
     pub fn drop_server(&self, server: &str) {
-        let mut inner = write_recovering(&self.inner, "registry.inner");
+        let mut inner = write_recovering(&self.inner, INNER_LOCK);
         if let Some(names) = inner.by_server.remove(server) {
             for n in names {
                 inner.tools.remove(&n);
@@ -401,7 +406,7 @@ impl McpRegistry {
     /// Mark a server's health (without touching its tools — used when the
     /// session is reconnecting and we want to keep the catalog warm).
     pub fn set_health(&self, server: &str, health: ServerHealth) {
-        let mut inner = write_recovering(&self.inner, "registry.inner");
+        let mut inner = write_recovering(&self.inner, INNER_LOCK);
         let entry = inner
             .status
             .entry(server.to_string())
@@ -436,13 +441,13 @@ impl McpRegistry {
     /// Cheaper than [`Self::status`] for the dispatch path, which asks about
     /// one server and would otherwise clone every server's status.
     pub fn health(&self, server: &str) -> Option<ServerHealth> {
-        let inner = read_recovering(&self.inner, "registry.inner");
+        let inner = read_recovering(&self.inner, INNER_LOCK);
         inner.status.get(server).map(|s| s.health.clone())
     }
 
     /// Record server-info from a successful handshake.
     pub fn set_server_info(&self, server: &str, info: Option<String>) {
-        let mut inner = write_recovering(&self.inner, "registry.inner");
+        let mut inner = write_recovering(&self.inner, INNER_LOCK);
         let entry = inner
             .status
             .entry(server.to_string())
@@ -457,19 +462,19 @@ impl McpRegistry {
 
     /// Snapshot of all currently-registered tools.
     pub fn tools(&self) -> Vec<RegisteredTool> {
-        let inner = read_recovering(&self.inner, "registry.inner");
+        let inner = read_recovering(&self.inner, INNER_LOCK);
         inner.tools.values().cloned().collect()
     }
 
     /// Look up a tool by its namespaced name.
     pub fn lookup(&self, full_name: &str) -> Option<RegisteredTool> {
-        let inner = read_recovering(&self.inner, "registry.inner");
+        let inner = read_recovering(&self.inner, INNER_LOCK);
         inner.tools.get(full_name).cloned()
     }
 
     /// Status snapshot for `borg mcp status`.
     pub fn status(&self) -> RegistryStatus {
-        let inner = read_recovering(&self.inner, "registry.inner");
+        let inner = read_recovering(&self.inner, INNER_LOCK);
         RegistryStatus {
             servers: inner.status.clone(),
             total_tools: inner.tools.len(),
@@ -478,7 +483,7 @@ impl McpRegistry {
 
     /// Adjust the global cap at runtime.
     pub fn set_global_cap(&self, cap: usize) {
-        *write_recovering(&self.global_cap, "registry.global_cap") = cap;
+        *write_recovering(&self.global_cap, GLOBAL_CAP_LOCK) = cap;
     }
 }
 

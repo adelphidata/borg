@@ -20,7 +20,10 @@ impl Default for BackoffConfig {
         Self {
             initial: Duration::from_millis(200),
             factor: 2.0,
-            max_delay: Duration::from_secs(300), // 5 minutes
+            // Caps the doubling at ~5 min: long enough that a wedged remote
+            // dependency stops being hammered, short enough that recovery is
+            // noticed within one heartbeat interval.
+            max_delay: Duration::from_secs(300),
             jitter_fraction: 0.1,
         }
     }

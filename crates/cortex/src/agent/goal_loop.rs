@@ -142,6 +142,8 @@ impl Agent {
         if self.in_plan_mode() {
             // Drop any stale baseline so a future Execute turn doesn't pick
             // up a Plan-mode start that would double-charge.
+            // The `0` is a discard, not a measurement: taking the delta clears
+            // the baseline, and the returned value is meaningless in Plan mode.
             let _ = self.goal_runtime.take_turn_delta(0);
             return None;
         }

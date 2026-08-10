@@ -6,7 +6,7 @@
  * `apps/desktop` and `apps/web` render the same components from here.
  */
 
-export type { AppRoute, BannerAlert, NavUser } from "./types";
+export type { AppRoute, BannerAlert, NavUser, RecentItem } from "./types";
 
 export { AlertBanner } from "./components/AlertBanner";
 export { BackLink } from "./components/BackLink";

@@ -16,6 +16,11 @@ use tokio::net::UnixStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 
+/// Poll interval while waiting for the daemon's UDS to accept connections.
+/// Short enough that a warm spawn feels instant, long enough that a cold
+/// spawn (~1s) costs a bounded number of connect attempts rather than a spin.
+pub const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Server name validated against the daemon's server cert SAN.
 /// `borgd` mints its server cert with `localhost` in the SAN
 /// (`crates/borgd/src/daemon.rs:237`); changing one side requires changing the
@@ -185,7 +190,7 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
         if path.exists() && UnixStream::connect(path).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
     }
     Err(anyhow!(
         "timed out after {:?} waiting for borgd UDS at {}",

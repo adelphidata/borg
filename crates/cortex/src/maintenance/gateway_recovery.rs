@@ -42,6 +42,8 @@ pub async fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Res
             return Ok(());
         }
     };
+    // Loopback-only liveness probe, so 500ms is generous; a longer wait would
+    // stall the whole daily sweep behind a port nobody is listening on.
     let probe =
         std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500));
     match probe {

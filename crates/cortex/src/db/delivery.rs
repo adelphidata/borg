@@ -59,18 +59,7 @@ impl Database {
 
             Ok(rows)
         }.await;
-        match result {
-            Ok(rows) => {
-                self.conn.execute_batch("COMMIT").await?;
-                Ok(rows)
-            }
-            Err(e) => {
-                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
-                    tracing::warn!("delivery: rollback after claim failure failed: {re}");
-                }
-                Err(e)
-            }
-        }
+        self.finish_immediate_tx(result, "delivery claim").await
     }
 
     pub async fn mark_delivered(&self, id: &str) -> Result<()> {

@@ -350,6 +350,8 @@ pub fn find_where<'a>(
     accept: impl Fn(&Worktree) -> bool,
 ) -> Option<&'a Worktree> {
     let as_path = PathBuf::from(target);
+    // A target that does not exist on disk is not an error here — it simply
+    // isn't a path, so it falls through to the name/branch matching below.
     let canonical = as_path.canonicalize().ok();
     if let Some(exact) = worktrees
         .iter()
@@ -758,9 +760,8 @@ branch refs/heads/shared
         );
     }
 
-    // ---- End-to-end against a real repository -------------------------------
-    //
-    // The parse tests above pin the format; these pin the behavior, because the
+    // End-to-end against a real repository: the parse tests above pin the
+    // format; these pin the behavior, because the
     // guards that matter (never remove main, refuse a dirty tree) are only real
     // if `git worktree` actually agrees with what we think we asked for.
 

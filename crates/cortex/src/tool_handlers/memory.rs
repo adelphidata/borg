@@ -31,7 +31,8 @@ pub async fn handle_write_memory(args: &serde_json::Value, config: &Config) -> R
         WriteMode::Overwrite
     };
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    // Strip .md extension for DB entry names (backward compat with old tool calls)
+    // DB entry names carry no extension, so `notes` and `notes.md` must
+    // resolve to the same entry however the model spelled it.
     let name = filename.strip_suffix(".md").unwrap_or(filename);
 
     // Dispatch on the resolved provider, not the config kind. If the
@@ -458,7 +459,8 @@ pub(crate) async fn native_memory_search(
     let mut all_results = search_knowledge_files(config, query, max_results * 2, min_score)?;
     let scopes = resolved_memory_scopes(config);
 
-    // Pre-compute query embedding once for all scopes
+    // Dropped on error rather than propagated: no embedding provider is a
+    // supported configuration, and the search degrades to FTS-only below.
     let query_embedding = embeddings::generate_query_embedding(config, query)
         .await
         .map(|(_prov, emb)| emb)
@@ -534,7 +536,6 @@ pub(crate) async fn native_memory_search(
     // Pre-truncate before MMR to limit O(n^2) work
     all_results.truncate(max_results * 3);
 
-    // Apply MMR diversity re-ranking if enabled
     if config.memory.embeddings.mmr_enabled && all_results.len() > 1 {
         let items: Vec<(usize, f32, &str)> = all_results
             .iter()

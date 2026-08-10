@@ -37,6 +37,11 @@ export function formatCost(costUsd: number): string {
   return costUsd < 0.01 ? SMALL_MONEY.format(costUsd) : MONEY.format(costUsd);
 }
 
+/** Upper-cases the first character only; the rest of the string is untouched. */
+export function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 /** "1 warning" / "2 warnings", with the -es plural English needs for sibilants. */
 export function plural(n: number, word: string): string {
   if (n === 1) return `1 ${word}`;

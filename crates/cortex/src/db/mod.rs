@@ -59,6 +59,20 @@ use tracing::instrument;
 
 use crate::config::Config;
 
+/// SQLite primary result codes used by the error classifiers below. Compare
+/// against `code & 0xff` so extended codes (`SQLITE_IOERR_WRITE` = 778, …)
+/// fold into their primary code.
+mod sqlite_code {
+    /// `SQLITE_BUSY` — another connection holds the lock.
+    pub const BUSY: i32 = 5;
+    /// `SQLITE_LOCKED` — a table-level lock within this connection.
+    pub const LOCKED: i32 = 6;
+    /// `SQLITE_IOERR` — a disk I/O error occurred.
+    pub const IOERR: i32 = 10;
+    /// `SQLITE_FULL` — database or disk is full.
+    pub const FULL: i32 = 13;
+}
+
 /// True only for the durable-storage-exhausted error class: the write cannot
 /// succeed by retrying, because the filesystem or the DB's page budget is
 /// full.
@@ -75,13 +89,8 @@ use crate::config::Config;
 /// their primary code. The message fallbacks catch remote/Hrana wrapping that
 /// loses the numeric code entirely.
 pub fn is_storage_exhausted(err: &anyhow::Error) -> bool {
-    /// `SQLITE_FULL` — database or disk is full.
-    const SQLITE_FULL: i32 = 13;
-    /// `SQLITE_IOERR` — a disk I/O error occurred.
-    const SQLITE_IOERR: i32 = 10;
-
     if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
-        if matches!(code & 0xff, SQLITE_FULL | SQLITE_IOERR) {
+        if matches!(code & 0xff, sqlite_code::FULL | sqlite_code::IOERR) {
             return true;
         }
         let lower = msg.to_ascii_lowercase();
@@ -112,13 +121,8 @@ pub fn is_storage_exhausted(err: &anyhow::Error) -> bool {
 /// to *name* the cause in diagnostics rather than to change retry behavior
 /// (the connection-level `busy_timeout` already waited before this surfaced).
 pub fn is_lock_contention(err: &anyhow::Error) -> bool {
-    /// `SQLITE_BUSY` — another connection holds the lock.
-    const SQLITE_BUSY: i32 = 5;
-    /// `SQLITE_LOCKED` — a table-level lock within this connection.
-    const SQLITE_LOCKED: i32 = 6;
-
     if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
-        if matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED) {
+        if matches!(code & 0xff, sqlite_code::BUSY | sqlite_code::LOCKED) {
             return true;
         }
         let lower = msg.to_ascii_lowercase();
@@ -145,11 +149,8 @@ pub fn is_lock_contention(err: &anyhow::Error) -> bool {
 /// `database or disk is full`, and `ENOSPC`/`EDQUOT`/`EROFS` never succeed on
 /// retry and must stay immediately fatal.
 pub fn is_transient_io_error(err: &anyhow::Error) -> bool {
-    /// `SQLITE_IOERR` — a disk I/O error occurred.
-    const SQLITE_IOERR: i32 = 10;
-
     if let Some(libsql::Error::SqliteFailure(code, msg)) = err.downcast_ref::<libsql::Error>() {
-        if code & 0xff == SQLITE_IOERR {
+        if code & 0xff == sqlite_code::IOERR {
             return true;
         }
         // Remote/Hrana wrapping can lose the numeric code; fall back on the
@@ -347,6 +348,34 @@ impl Database {
     /// True if this handle was opened read-only.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Close a hand-rolled `BEGIN IMMEDIATE` transaction: `COMMIT` on success,
+    /// best-effort `ROLLBACK` on failure.
+    ///
+    /// Submodules open transactions with raw SQL rather than libsql's
+    /// `Transaction` API, which needs `&mut Connection` while they hold the
+    /// connection behind `&self`. `label` names the operation in the rollback
+    /// warning. A failed ROLLBACK is logged and dropped — the original error is
+    /// the one worth surfacing, and there is no further recovery available on a
+    /// connection whose rollback did not take.
+    ///
+    /// A *failed* COMMIT here propagates without a rollback. `append_session_events`
+    /// deliberately does not use this helper for exactly that reason — see its
+    /// inline note on unwedging the shared connection.
+    pub(crate) async fn finish_immediate_tx<T>(&self, result: Result<T>, label: &str) -> Result<T> {
+        match result {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("{label}: rollback after failure failed: {re} (original: {e})");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Default busy timeout for CLI usage (5 seconds).
@@ -1041,6 +1070,7 @@ impl Database {
         rand::rng().fill(&mut salt[..]);
         let hex: String = salt.iter().fold(String::new(), |mut s, b| {
             use std::fmt::Write;
+            // `fmt::Write` on a `String` never fails — it only allocates.
             let _ = write!(s, "{b:02x}");
             s
         });

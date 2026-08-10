@@ -4,6 +4,15 @@ use reqwest::Client;
 use std::time::Duration;
 
 use crate::constants::{GATEWAY_HTTP_TIMEOUT, TWILIO_API_BASE};
+use crate::twilio::types::WHATSAPP_PREFIX;
+
+fn with_whatsapp_prefix(number: &str) -> String {
+    if number.starts_with(WHATSAPP_PREFIX) {
+        number.to_string()
+    } else {
+        format!("{WHATSAPP_PREFIX}{number}")
+    }
+}
 
 /// Client for sending messages via the Twilio REST API.
 pub struct TwilioClient {
@@ -41,19 +50,11 @@ impl TwilioClient {
         self.send_message(from, to, &stripped).await
     }
 
-    /// Send a WhatsApp message.
-    /// Prefixes numbers with "whatsapp:" if not already present.
+    /// Send a WhatsApp message, applying the `whatsapp:` address prefix
+    /// idempotently so a caller may pass either form.
     pub async fn send_whatsapp(&self, from: &str, to: &str, body: &str) -> Result<String> {
-        let from = if from.starts_with("whatsapp:") {
-            from.to_string()
-        } else {
-            format!("whatsapp:{from}")
-        };
-        let to = if to.starts_with("whatsapp:") {
-            to.to_string()
-        } else {
-            format!("whatsapp:{to}")
-        };
+        let from = with_whatsapp_prefix(from);
+        let to = with_whatsapp_prefix(to);
         self.send_message(&from, &to, body).await
     }
 

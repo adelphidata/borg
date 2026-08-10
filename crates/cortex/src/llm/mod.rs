@@ -1047,7 +1047,6 @@ impl LlmClient {
                 None
             };
 
-        // Build provider-level failover slots
         let mut provider_slots = Vec::new();
         for fb in &config.llm.fallback {
             match Self::resolve_fallback_slot(fb, config).await {

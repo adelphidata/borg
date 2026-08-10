@@ -3,7 +3,7 @@ import { CheckIcon, MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from
 import type { BorgClient, admin } from "@borg/client";
 import { useMutation, useQuery } from "../../lib/useDaemon";
 import { DaemonState } from "../../components/DaemonState";
-import { formatDuration as fmtDuration, plural } from "../../lib/format";
+import { capitalize, formatDuration as fmtDuration, plural } from "../../lib/format";
 
 interface HealthCheck {
   id: string;
@@ -78,7 +78,7 @@ function buildChecks(d: HealthData): HealthCheck[] {
     {
       id: "posture",
       name: "Security posture",
-      value: posture.charAt(0).toUpperCase() + posture.slice(1),
+      value: capitalize(posture),
       ok: posture !== "reduced",
       detail:
         posture === "reduced"

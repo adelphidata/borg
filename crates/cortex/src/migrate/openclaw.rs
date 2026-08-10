@@ -275,7 +275,6 @@ fn strip_trailing_commas(input: &str) -> String {
 }
 
 fn parse_credentials(root: &Path, data: &mut SourceData) -> Result<()> {
-    // Parse .env file
     let env_path = root.join(".env");
     if env_path.exists() {
         let content = std::fs::read_to_string(&env_path)?;
