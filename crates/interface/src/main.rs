@@ -25,7 +25,7 @@
 
 use std::io::IsTerminal;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -78,6 +78,12 @@ struct Cli {
     /// `logs -c`.)
     #[arg(long = "continue", global = true, conflicts_with = "resume")]
     continue_session: bool,
+
+    /// Run inside an isolated git worktree instead of this checkout.
+    /// Creates it on the first use and reuses it afterwards, so the same
+    /// name always lands in the same place. Manage them with `borg worktree`.
+    #[arg(long, short = 'w', global = true, value_name = "NAME")]
+    worktree: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -206,6 +212,12 @@ enum Commands {
     Sessions {
         #[command(subcommand)]
         action: Option<commands::sessions::SessionsAction>,
+    },
+    /// Manage isolated git worktrees to code in
+    #[command(alias = "wt")]
+    Worktree {
+        #[command(subcommand)]
+        action: Option<commands::worktree::WorktreeAction>,
     },
     /// Trigger an immediate heartbeat check-in
     #[command(alias = "wake")]
@@ -507,6 +519,27 @@ async fn async_main() -> Result<()> {
         return commands::acp::run_acp_stdio().await;
     }
 
+    // `--worktree NAME` is applied by moving the process into the worktree
+    // before anything reads the current directory. Everything downstream —
+    // session workspace identity, the agent's cwd, git context, project docs —
+    // derives from it, so one chdir here is what makes the whole run isolated.
+    // Deliberately skipped for `borg worktree ...` itself: resolving a worktree
+    // in order to manage worktrees would make `--worktree` create the very
+    // thing the operator may be about to remove.
+    let requested_worktree = cli
+        .worktree
+        .as_deref()
+        .filter(|_| !matches!(cli.command, Some(Commands::Worktree { .. })));
+    let mut worktree_dir: Option<std::path::PathBuf> = None;
+    if let Some(name) = requested_worktree {
+        let dir = commands::worktree::resolve_or_create(name).await?;
+        std::env::set_current_dir(&dir)
+            .with_context(|| format!("entering worktree at {}", dir.display()))?;
+        // Kept for the session-open calls below: moving this process is not
+        // enough, because the agent runs inside the long-lived `borgd`.
+        worktree_dir = Some(dir);
+    }
+
     let tui_mode = matches!(cli.command, Some(Commands::Start) | None);
 
     // _guard and _telemetry_guard must live for the program's duration to flush logs
@@ -631,10 +664,15 @@ async fn async_main() -> Result<()> {
     }
 
     // Ensure daemon service is installed and running on every command
-    // (skip commands that manage the service themselves)
+    // (skip commands that manage the service themselves, and `worktree`, which
+    // is pure local git work — waiting seconds on a daemon that has nothing to
+    // do would make listing worktrees feel broken)
     if !matches!(
         cli.command,
-        Some(Commands::Init) | Some(Commands::Uninstall) | Some(Commands::Service { .. })
+        Some(Commands::Init)
+            | Some(Commands::Uninstall)
+            | Some(Commands::Service { .. })
+            | Some(Commands::Worktree { .. })
     ) {
         if let Err(e) = borgd_launcher::ensure_running().await {
             tracing::warn!("Auto-start borgd: {e}");
@@ -651,7 +689,7 @@ async fn async_main() -> Result<()> {
             } else {
                 None
             };
-            if let Some(hint) = repl::run(resume).await? {
+            if let Some(hint) = repl::run(resume, worktree_dir.clone()).await? {
                 println!();
                 println!("Session: {} ({})", hint.title, hint.short_id);
                 println!("Resume with: borg --resume {}", hint.short_id);
@@ -664,7 +702,7 @@ async fn async_main() -> Result<()> {
             message,
             json,
             mode,
-        }) => repl::one_shot(&message, json, mode.as_deref()).await?,
+        }) => repl::one_shot(&message, json, mode.as_deref(), worktree_dir.clone()).await?,
         Some(Commands::Status { action }) => commands::status::dispatch_status(action).await?,
         Some(Commands::Bond { action }) => commands::status::dispatch_bond(action).await?,
         Some(Commands::Doctor {
@@ -679,6 +717,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Sessions { action }) => {
             commands::sessions::dispatch_sessions(action).await?
         }
+        Some(Commands::Worktree { action }) => commands::worktree::dispatch(action).await?,
         Some(Commands::Service { action }) => commands::misc::dispatch_service(action).await?,
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
@@ -1232,6 +1271,81 @@ mod tests {
                 assert!(category.is_none());
             }
             _ => panic!("Expected Logs"),
+        }
+    }
+
+    /// `--worktree` has to be reachable both bare (`borg -w x`, the TUI) and
+    /// after a subcommand, because it is declared `global`. If it stopped being
+    /// global, `borg ask -w fix "..."` would fail to parse rather than run in
+    /// the worktree.
+    #[test]
+    fn test_parse_global_worktree_flag() {
+        let cli = Cli::try_parse_from(["borg", "--worktree", "fix-login"]).unwrap();
+        assert_eq!(cli.worktree.as_deref(), Some("fix-login"));
+        assert!(
+            cli.command.is_none(),
+            "the bare form still launches the TUI"
+        );
+
+        let cli = Cli::try_parse_from(["borg", "ask", "hello", "-w", "fix-login"]).unwrap();
+        assert_eq!(cli.worktree.as_deref(), Some("fix-login"));
+
+        let cli = Cli::try_parse_from(["borg", "status"]).unwrap();
+        assert_eq!(cli.worktree, None, "no flag means no worktree redirection");
+    }
+
+    /// `borg worktree` with no action must list rather than error, and `wt`
+    /// must stay an alias — both are the shapes documented to operators.
+    #[test]
+    fn test_parse_worktree_subcommands() {
+        let cli = Cli::try_parse_from(["borg", "worktree"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worktree { action: None })
+        ));
+
+        let cli = Cli::try_parse_from(["borg", "wt", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worktree {
+                action: Some(commands::worktree::WorktreeAction::List)
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "borg", "worktree", "add", "spike", "-b", "feat/x", "--from", "HEAD~2",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Worktree {
+                action:
+                    Some(commands::worktree::WorktreeAction::Add {
+                        name,
+                        branch,
+                        from,
+                        existing,
+                        print_path,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "spike");
+                assert_eq!(branch.as_deref(), Some("feat/x"));
+                assert_eq!(from.as_deref(), Some("HEAD~2"));
+                assert!(!existing);
+                assert!(!print_path);
+            }
+            other => panic!("expected worktree add, got {:?}", other.is_some()),
+        }
+
+        let cli = Cli::try_parse_from(["borg", "worktree", "rm", "spike", "-f"]).unwrap();
+        match cli.command {
+            Some(Commands::Worktree {
+                action: Some(commands::worktree::WorktreeAction::Remove { target, force }),
+            }) => {
+                assert_eq!(target, "spike");
+                assert!(force);
+            }
+            other => panic!("expected worktree remove, got {:?}", other.is_some()),
         }
     }
 

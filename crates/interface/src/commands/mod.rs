@@ -26,6 +26,7 @@ pub(crate) mod tunnel;
 pub(crate) mod update_args;
 pub(crate) mod wasm_plugin;
 pub(crate) mod webhook;
+pub(crate) mod worktree;
 
 /// Canonical short timestamp format used across CLI/TUI surfaces.
 pub(crate) const TS_FMT: &str = "%Y-%m-%d %H:%M";

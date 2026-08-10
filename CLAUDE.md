@@ -219,6 +219,7 @@ Server cert SAN is `localhost` — exposing beyond loopback needs operator's hos
 | Self-Healing | `crates/cortex/src/maintenance/` | Daily 02:00 — prune logs, evict embeddings, heal stalled tasks. No LLM call. Sweep also runs `PRAGMA wal_checkpoint(TRUNCATE)` always + conditional `VACUUM` (fragmentation >15% AND `maintenance.vacuum_interval_days=7` elapsed). Mutating actions capped by `maintenance.heal_action_budget=1000` |
 | Prompt Injection | various | 5 layers: input sanitization, XML trust boundaries, prompt hardening, rate limiting, secret redaction |
 | Git Utilities | `crates/cortex/src/git.rs` | Ghost commits (snapshot via temp index, atomic undo) |
+| Worktrees | `crates/cortex/src/worktree.rs` + `crates/interface/src/commands/worktree.rs` | Isolated checkouts under `~/.borg-worktrees/<repo>/<name>` — a **sibling** of the data dir, never inside it (sandbox denies writes to all of `~/.borg`, and `borg backup` tars it). **Git is the source of truth — no DB table**; "managed" is a path-prefix test. `remove` never touches the main checkout at any force level. `borg --worktree <name>` must both chdir the client *and* send the dir as the session's workspace at `Session.Open` — `borgd` is long-lived, so skipping the second half silently edits the main tree. See `docs/worktrees.md` |
 
 ## Debugging
 

@@ -14,8 +14,11 @@ use cortex::config::Config;
 
 use crate::daemon_client::{connect_or_spawn, spawn_event_adapter};
 
-pub async fn run(resume: Option<String>) -> Result<Option<crate::tui::ResumeHint>> {
-    crate::tui::run(resume).await
+pub async fn run(
+    resume: Option<String>,
+    workspace: Option<std::path::PathBuf>,
+) -> Result<Option<crate::tui::ResumeHint>> {
+    crate::tui::run(resume, workspace).await
 }
 
 /// Runtime-degradation warnings derivable cheaply from persisted config, for
@@ -55,13 +58,18 @@ pub(crate) fn runtime_degradation_warnings(config: &Config) -> Vec<String> {
 /// `mode` is currently informational — collaboration mode now lives in the
 /// daemon's persisted config; CLI-level mode override is reserved for a
 /// future Admin RPC and ignored here so the call still succeeds.
-pub async fn one_shot(message: &str, json_output: bool, _mode: Option<&str>) -> Result<()> {
+pub async fn one_shot(
+    message: &str,
+    json_output: bool,
+    _mode: Option<&str>,
+    workspace: Option<std::path::PathBuf>,
+) -> Result<()> {
     let client = connect_or_spawn()
         .await
         .context("connect to borgd for one-shot")?;
     let mut session_client = client.clone();
     let (session_id, _last_seq) = session_client
-        .open_session(None)
+        .open_session_with_workspace(None, workspace.as_deref(), None, false)
         .await
         .context("open one-shot session")?;
     let stream = session_client

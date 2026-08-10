@@ -408,7 +408,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 /// Run a git command with timeout, returns stdout on success.
-async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
+pub(crate) async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
     run_git_inner(args, cwd, &[]).await
 }
 

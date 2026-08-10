@@ -214,6 +214,16 @@ impl App<'_> {
             return Some(self.cmd_plan_with_message(rest.trim()));
         }
 
+        // `/wt` is the alias, matching the `borg wt` CLI shorthand.
+        for name in ["/worktree", "/wt"] {
+            if trimmed == name {
+                return Some(self.cmd_worktree(""));
+            }
+            if let Some(rest) = trimmed.strip_prefix(&format!("{name} ")) {
+                return Some(self.cmd_worktree(rest.trim()));
+            }
+        }
+
         if trimmed == "/goal" {
             return Some(self.cmd_goal_show());
         }
@@ -421,6 +431,7 @@ impl App<'_> {
              /save      - Save current session\n  \
              /new       - Start new session\n  \
              /fork      - Branch the current session into a new one (preserves history up to now)\n  \
+             /worktree  - Isolated git checkouts to code in (alias: /wt)\n  \
              /resume <id> - Resume a saved session by id (prefix ok)\n  \
              /export [fmt] - Export current session (fmt: json|csv|txt|md, default json)\n\
              \n  \
@@ -1200,6 +1211,20 @@ impl App<'_> {
     /// Reads the DB directly (read-only) and looks up the most-recently-active
     /// session. The daemon may be writing concurrently, but `Database::open_readonly`
     /// is safe under WAL.
+    /// `/worktree [new <name> | remove <name> [--force]]`.
+    ///
+    /// Bare form reports where this session is working and what else exists;
+    /// the two subcommands are the only mutations, and both are one deliberate
+    /// step past the overview rather than options on the first screen.
+    fn cmd_worktree(&mut self, args: &str) -> Result<AppAction> {
+        let body = match parse_worktree_command(args) {
+            Ok(cmd) => crate::async_bridge::block_on(run_worktree_command(cmd)),
+            Err(usage) => usage,
+        };
+        self.push_system_message(body);
+        Ok(AppAction::Continue)
+    }
+
     fn cmd_goal_show(&mut self) -> Result<AppAction> {
         let body = match self.fetch_goal_summary_via_rpc() {
             Ok(text) => text,
@@ -1977,6 +2002,77 @@ pub(super) fn parse_interval_secs(raw: &str) -> Option<i64> {
     n.checked_mul(mult)
 }
 
+/// What `/worktree` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WorktreeCommand {
+    /// Report the current worktree and list the others.
+    Overview,
+    /// Create a worktree named `name`.
+    Create { name: String },
+    /// Delete the worktree matching `target`.
+    Delete { target: String, force: bool },
+}
+
+/// Usage text shown for anything this parser does not recognize.
+const WORKTREE_USAGE: &str = "Usage:\n  \
+     /worktree                    where this session is working, and what else exists\n  \
+     /worktree new <name>         create an isolated checkout on its own branch\n  \
+     /worktree remove <name>      delete one (add --force to discard changes)";
+
+/// Parse the text after `/worktree`.
+///
+/// `Err` carries the usage text rather than an error type: every rejection here
+/// ends the same way — showing the operator the three forms that work.
+pub(super) fn parse_worktree_command(rest: &str) -> Result<WorktreeCommand, String> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "list" || rest == "status" {
+        return Ok(WorktreeCommand::Overview);
+    }
+    let (verb, arg) = match rest.split_once(char::is_whitespace) {
+        Some((v, a)) => (v, a.trim()),
+        None => (rest, ""),
+    };
+    match verb {
+        "new" | "add" | "create" => {
+            if arg.is_empty() {
+                return Err(WORKTREE_USAGE.to_string());
+            }
+            Ok(WorktreeCommand::Create {
+                name: arg.to_string(),
+            })
+        }
+        "remove" | "rm" | "delete" => {
+            // `--force` is accepted on either side of the name so an operator
+            // retrying after a refusal can just append it to what they typed.
+            let mut force = false;
+            let mut words: Vec<&str> = Vec::new();
+            for word in arg.split_whitespace() {
+                if word == "--force" || word == "-f" {
+                    force = true;
+                } else {
+                    words.push(word);
+                }
+            }
+            let target = words.join(" ");
+            if target.is_empty() {
+                return Err(WORKTREE_USAGE.to_string());
+            }
+            Ok(WorktreeCommand::Delete { target, force })
+        }
+        _ => Err(WORKTREE_USAGE.to_string()),
+    }
+}
+
+/// Execute a parsed `/worktree` command and return the text to display.
+pub(super) async fn run_worktree_command(cmd: WorktreeCommand) -> String {
+    use crate::commands::worktree::tui;
+    match cmd {
+        WorktreeCommand::Overview => tui::overview().await,
+        WorktreeCommand::Create { name } => tui::create(&name).await,
+        WorktreeCommand::Delete { target, force } => tui::delete(&target, force).await,
+    }
+}
+
 /// Parse the text after `/heartbeat`.
 pub(super) fn parse_heartbeat_subcommand(rest: &str) -> HeartbeatSubcommand {
     let rest = rest.trim();
@@ -2419,6 +2515,77 @@ pub(super) fn snapshot_cells_as_messages(cells: &[HistoryCell]) -> Vec<Message> 
 mod tests {
     use super::*;
     use cortex::types::Role;
+
+    /// The bare form and its read-only synonyms must never mutate anything —
+    /// an operator typing `/worktree` to look around must not create one.
+    #[test]
+    fn parse_worktree_bare_forms_are_read_only() {
+        for input in ["", "  ", "list", "status"] {
+            assert_eq!(
+                parse_worktree_command(input),
+                Ok(WorktreeCommand::Overview),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// All three creation verbs are accepted because operators arrive from
+    /// different tools; the name is taken verbatim so slugging stays in one
+    /// place (the core module), not duplicated in the parser.
+    #[test]
+    fn parse_worktree_create_accepts_each_verb_and_keeps_the_name_verbatim() {
+        for verb in ["new", "add", "create"] {
+            assert_eq!(
+                parse_worktree_command(&format!("{verb} Fix Login Bug")),
+                Ok(WorktreeCommand::Create {
+                    name: "Fix Login Bug".to_string()
+                }),
+                "verb {verb}"
+            );
+        }
+    }
+
+    /// `--force` is the difference between refusing and discarding uncommitted
+    /// work, so it must be recognized wherever the operator puts it — and must
+    /// never be mistaken for the worktree's name.
+    #[test]
+    fn parse_worktree_remove_reads_force_from_either_side() {
+        assert_eq!(
+            parse_worktree_command("remove spike"),
+            Ok(WorktreeCommand::Delete {
+                target: "spike".to_string(),
+                force: false
+            })
+        );
+        for input in [
+            "remove spike --force",
+            "rm --force spike",
+            "delete -f spike",
+        ] {
+            assert_eq!(
+                parse_worktree_command(input),
+                Ok(WorktreeCommand::Delete {
+                    target: "spike".to_string(),
+                    force: true
+                }),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A verb with no target, or an unknown verb, must show usage rather than
+    /// guess. Guessing here deletes the wrong checkout.
+    #[test]
+    fn parse_worktree_rejects_incomplete_and_unknown_commands() {
+        for input in ["new", "add   ", "remove", "rm --force", "switch fix", "-f"] {
+            let got = parse_worktree_command(input);
+            assert_eq!(
+                got,
+                Err(WORKTREE_USAGE.to_string()),
+                "input {input:?} must show usage, got {got:?}"
+            );
+        }
+    }
 
     #[test]
     fn parse_goal_budget_prefix_extracts_numeric_budget() {

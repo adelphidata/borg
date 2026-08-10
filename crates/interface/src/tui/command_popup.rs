@@ -34,6 +34,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "/heartbeat",
         "Recurring prompt that re-enters this session when idle (alias: /hb)",
     ),
+    (
+        "/worktree",
+        "Isolated git checkouts to code in (alias: /wt)",
+    ),
     ("/mode", "Switch collaboration mode"),
     ("/model", "Switch LLM provider/model"),
     ("/theme", "Pick TUI theme (alias: /skin)"),

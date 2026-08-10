@@ -261,7 +261,18 @@ async fn stamp_session_workspace(session_id: &str) {
     }
 }
 
-pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
+/// Run the TUI.
+///
+/// `workspace` is the directory the *agent* must work in, sent to the daemon at
+/// `Session.Open`. It is `Some` only for `borg --worktree <name>`: `borgd` is a
+/// long-lived process with its own current directory, so without this the agent
+/// would edit the main checkout while the client sat in the worktree — the flag
+/// would look like it worked and quietly change the wrong tree. `None` keeps
+/// the daemon's existing default.
+pub async fn run(
+    resume: Option<String>,
+    workspace: Option<std::path::PathBuf>,
+) -> Result<Option<ResumeHint>> {
     // Kick off a background fetch of the OpenRouter model catalog so the
     // `/model` picker reflects the live list (dropping stale IDs, tagging
     // free models). Fire-and-forget: if it fails, the picker falls back to
@@ -330,7 +341,9 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // activity, bond, evolution, budget, script), and config watcher all live
     // inside `borgd` now — registered in `AgentBackend::new` rather than here.
     let mut client = crate::daemon_client::connect_or_spawn().await?;
-    let (session_id, _last_seq) = client.open_session(resume.as_deref()).await?;
+    let (session_id, _last_seq) = client
+        .open_session_with_workspace(resume.as_deref(), workspace.as_deref(), None, false)
+        .await?;
 
     // Stamp the session's workspace identity with the TUI process's real cwd.
     // The daemon stamps its own process cwd at open, which is wrong whenever

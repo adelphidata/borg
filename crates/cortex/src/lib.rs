@@ -197,5 +197,7 @@ pub mod vitals;
 pub mod wasm_plugins;
 /// Web fetching and search capabilities.
 pub mod web;
+/// Managed git worktrees: isolated checkouts the agent codes in.
+pub mod worktree;
 
 pub use error::{Error, Result};
