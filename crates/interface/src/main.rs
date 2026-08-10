@@ -503,6 +503,33 @@ fn run_windows_sandbox_runner(argv_after_subcommand: &[String]) -> u32 {
     }
 }
 
+/// Decide what `--worktree` means for this invocation.
+///
+/// Three outcomes, and the two non-obvious ones are the point:
+///
+/// * `borg worktree ...` ignores the flag. Resolving a worktree in order to
+///   manage worktrees would create the very thing the operator may be about to
+///   remove.
+/// * `borg acp` **refuses** it. ACP sessions take their directory from the
+///   editor, per session, so the flag cannot be honored — and an ignored flag
+///   would leave the editor patching the main checkout while the operator
+///   believed the run was isolated. Silence is the dangerous outcome here, so
+///   this is the one case that errors rather than skipping.
+fn resolve_worktree_request(cli: &Cli) -> Result<Option<&str>> {
+    let Some(name) = cli.worktree.as_deref() else {
+        return Ok(None);
+    };
+    match cli.command {
+        Some(Commands::Worktree { .. }) => Ok(None),
+        Some(Commands::Acp) => anyhow::bail!(
+            "--worktree does not apply to `borg acp` — the editor supplies each \
+             session's directory. Point the editor at the worktree instead \
+             (`borg worktree list` prints its path)."
+        ),
+        _ => Ok(Some(name)),
+    }
+}
+
 async fn async_main() -> Result<()> {
     // Missing .env is the common case — silent best-effort load.
     let _ = dotenvy::dotenv();
@@ -515,6 +542,8 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let requested_worktree = resolve_worktree_request(&cli)?.map(str::to_string);
+
     if matches!(cli.command, Some(Commands::Acp)) {
         return commands::acp::run_acp_stdio().await;
     }
@@ -526,12 +555,8 @@ async fn async_main() -> Result<()> {
     // Deliberately skipped for `borg worktree ...` itself: resolving a worktree
     // in order to manage worktrees would make `--worktree` create the very
     // thing the operator may be about to remove.
-    let requested_worktree = cli
-        .worktree
-        .as_deref()
-        .filter(|_| !matches!(cli.command, Some(Commands::Worktree { .. })));
     let mut worktree_dir: Option<std::path::PathBuf> = None;
-    if let Some(name) = requested_worktree {
+    if let Some(name) = requested_worktree.as_deref() {
         let dir = commands::worktree::resolve_or_create(name).await?;
         std::env::set_current_dir(&dir)
             .with_context(|| format!("entering worktree at {}", dir.display()))?;
@@ -1294,6 +1319,41 @@ mod tests {
         assert_eq!(cli.worktree, None, "no flag means no worktree redirection");
     }
 
+    /// The two exceptions to `--worktree` are the whole risk surface: skipping
+    /// it for `borg worktree` keeps a management command from creating what it
+    /// is about to remove, and refusing it for `borg acp` keeps an editor from
+    /// silently patching the main checkout.
+    #[test]
+    fn worktree_request_skips_management_and_refuses_acp() {
+        let cli = Cli::try_parse_from(["borg", "--worktree", "fix"]).unwrap();
+        assert_eq!(resolve_worktree_request(&cli).unwrap(), Some("fix"));
+
+        let cli = Cli::try_parse_from(["borg", "ask", "hi", "-w", "fix"]).unwrap();
+        assert_eq!(resolve_worktree_request(&cli).unwrap(), Some("fix"));
+
+        let cli = Cli::try_parse_from(["borg", "worktree", "list", "-w", "fix"]).unwrap();
+        assert_eq!(
+            resolve_worktree_request(&cli).unwrap(),
+            None,
+            "managing worktrees must not resolve one"
+        );
+
+        let cli = Cli::try_parse_from(["borg", "acp", "-w", "fix"]).unwrap();
+        let err = resolve_worktree_request(&cli)
+            .expect_err("acp must refuse rather than silently ignore the flag");
+        assert!(
+            err.to_string().contains("does not apply to `borg acp`"),
+            "the error must say why: {err}"
+        );
+
+        let cli = Cli::try_parse_from(["borg", "acp"]).unwrap();
+        assert_eq!(
+            resolve_worktree_request(&cli).unwrap(),
+            None,
+            "plain acp is unaffected"
+        );
+    }
+
     /// `borg worktree` with no action must list rather than error, and `wt`
     /// must stay an alias — both are the shapes documented to operators.
     #[test]
@@ -1336,6 +1396,15 @@ mod tests {
             }
             other => panic!("expected worktree add, got {:?}", other.is_some()),
         }
+
+        // `--from` names a commit to fork a NEW branch from; `--existing`
+        // checks a branch out at its own tip. Accepting both would report
+        // success with the tree on a revision the operator did not ask for.
+        assert!(
+            Cli::try_parse_from(["borg", "worktree", "add", "x", "--existing", "--from", "v1"])
+                .is_err(),
+            "--from and --existing must not be accepted together"
+        );
 
         let cli = Cli::try_parse_from(["borg", "worktree", "rm", "spike", "-f"]).unwrap();
         match cli.command {

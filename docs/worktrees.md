@@ -65,6 +65,15 @@ sat in the worktree.
 `borg worktree ...` itself ignores `--worktree` — resolving a worktree in order
 to manage worktrees would create the very thing you may be about to remove.
 
+`borg acp` **refuses** it. ACP sessions take their directory from the editor, per
+session, so the flag could not be honored; refusing beats ignoring, which would
+leave the editor patching the main checkout. Point the editor at the worktree
+path instead.
+
+A name that matches only the main checkout is never attached to. `borg -w main`
+does not silently run in your live tree — it falls through to creation, which
+git refuses because a branch cannot be checked out twice.
+
 ## Inside the TUI
 
 ```
@@ -83,13 +92,19 @@ command that starts a session in the new tree.
 
 ## Safety
 
-Removal refuses three cases:
+Removal refuses four cases:
 
 | Case | Behavior |
 |---|---|
 | The main checkout | Refused always. `--force` does not override it. |
 | A locked worktree | Refused. Run `git worktree unlock <path>` first. |
 | Uncommitted changes | Refused unless `--force`, which discards them. |
+| An `external` checkout | A bare name or branch never reaches it. Give its full path. |
+
+That last row is why removal resolves names only among worktrees Borg manages: a
+checkout you made yourself is yours, and deleting it because a word happened to
+match would be a surprise. The full path still works — typing it is a deliberate
+act rather than a guess.
 
 Untracked files count as uncommitted work — they are just as unrecoverable once
 the directory is gone. Removing a worktree never deletes its branch.
@@ -111,7 +126,7 @@ reported nothing and changed nothing would read as broken.
 | `borg worktree add <name>` | Create a checkout on a new branch |
 | `borg worktree add <name> -b <branch>` | Name the branch explicitly |
 | `borg worktree add <name> --from <commit>` | Fork the branch from a specific commit, tag, or branch |
-| `borg worktree add <name> --existing` | Check out a branch that already exists |
+| `borg worktree add <name> --existing` | Check out a branch that already exists (refuses `--from`) |
 | `borg worktree add <name> --path <dir>` | Put the checkout somewhere other than the managed root |
 | `borg worktree add <name> --print-path` | Print only the path, for `cd "$(...)"` |
 | `borg worktree remove <target> [-f]` | Delete a checkout by name, branch, or path |

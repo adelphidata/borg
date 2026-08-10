@@ -27,7 +27,9 @@ pub(crate) enum WorktreeAction {
         #[arg(long, short = 'b')]
         branch: Option<String>,
         /// Commit, tag, or branch the new branch starts from. Defaults to HEAD.
-        #[arg(long, value_name = "COMMIT")]
+        /// Meaningless with --existing, which checks a branch out at its own
+        /// tip, so the two are refused together rather than one being ignored.
+        #[arg(long, value_name = "COMMIT", conflicts_with = "existing")]
         from: Option<String>,
         /// Check out a branch that already exists instead of creating one
         #[arg(long)]
@@ -90,11 +92,20 @@ fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Repository root for the current directory, with an error that names the
-/// next action rather than a git internal.
+/// The *main* repository root for the current directory.
+///
+/// `resolve_main_repo_root` rather than `find_repo_root`, because the latter
+/// stops at the first `.git` and so returns the *worktree* when we are already
+/// inside one. Every managed path is namespaced by this value, so the weaker
+/// resolver would file `alpha`'s worktrees under the name of whichever worktree
+/// the operator happened to be standing in — and two repos would then collide
+/// on a name neither of them had used. It returns `None` for a checkout whose
+/// `.git` points somewhere that is not a worktree (a submodule), so fall back
+/// rather than refusing to work there.
 fn repo_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
-    cortex::git::find_repo_root(&cwd)
+    cortex::git::resolve_main_repo_root(&cwd)
+        .or_else(|| cortex::git::find_repo_root(&cwd))
         .context("this directory is not inside a git repository — cd into one first")
 }
 
@@ -230,7 +241,8 @@ async fn run_add(opts: &AddOptions, print_path: bool) -> Result<()> {
 
 async fn run_remove(target: &str, force: bool) -> Result<()> {
     let repo = repo_root()?;
-    let path = worktree::remove(&repo, target, force).await?;
+    let root = canonical(&worktree::worktrees_root()?);
+    let path = worktree::remove(&repo, &root, target, force).await?;
     println!("Removed worktree at {}", path.display());
     println!("The branch is untouched — delete it with: git branch -d <branch>");
     Ok(())
@@ -265,7 +277,15 @@ pub(crate) async fn resolve_or_create(name: &str) -> Result<PathBuf> {
     // Without it, `borg -w "Fix Login"` would create on the first run and fail
     // as "already exists" on every run after.
     let slug = worktree::slugify(name);
-    if let Some(wt) = worktree::find(&existing, name).or_else(|| worktree::find(&existing, &slug)) {
+    // `is_main` is excluded deliberately. `find` falls back to a branch match,
+    // so `-w main` would otherwise resolve to the operator's live checkout and
+    // run the agent there while reporting nothing — the precise accident this
+    // feature exists to prevent. Excluded, the name falls through to `add`,
+    // which fails loudly because git will not check a branch out twice.
+    let attachable = |wt: &worktree::Worktree| !wt.is_main;
+    if let Some(wt) = worktree::find_where(&existing, name, attachable)
+        .or_else(|| worktree::find_where(&existing, &slug, attachable))
+    {
         return Ok(wt.path.clone());
     }
     let root = worktree::worktrees_root()?;
@@ -353,7 +373,11 @@ pub(crate) mod tui {
         let Some(repo) = cortex::git::find_repo_root(&cwd) else {
             return "Not inside a git repository — worktrees need one.".to_string();
         };
-        match worktree::remove(&repo, target, force).await {
+        let root = match worktree::worktrees_root() {
+            Ok(r) => canonical(&r),
+            Err(e) => return format!("Cannot resolve the worktree directory: {e:#}"),
+        };
+        match worktree::remove(&repo, &root, target, force).await {
             Ok(path) => format!(
                 "Removed worktree at {}\nThe branch is untouched.",
                 path.display()

@@ -20,11 +20,12 @@
 //!
 //! # Safety
 //!
-//! Removal is the only destructive operation here, and it refuses three cases
+//! Removal is the only destructive operation here, and it refuses four cases
 //! outright: the main checkout (that is the operator's repository), a worktree
-//! holding uncommitted changes, and a locked one. `force` overrides the dirty
-//! check only — the main checkout is never removable through this module, at
-//! any force level.
+//! holding uncommitted changes, a locked one, and any checkout Borg does not
+//! manage when the target is a bare name or branch rather than a full path.
+//! `force` overrides the dirty check only — the main checkout is never
+//! removable through this module, at any force level.
 
 use std::path::{Path, PathBuf};
 
@@ -73,7 +74,12 @@ impl Worktree {
     /// a worktree the operator created elsewhere is theirs to manage, and
     /// deleting it because a name happened to match would be a surprise.
     pub fn is_managed(&self, worktrees_root: &Path) -> bool {
-        self.path.starts_with(worktrees_root)
+        // An empty root means the caller could not resolve one. Guarding here
+        // rather than at each call site matters because `Path::starts_with("")`
+        // is true for *every* path: an unresolvable root would silently promote
+        // every hand-made checkout to "managed", which is the permissive
+        // direction on a test that gates deletion.
+        !worktrees_root.as_os_str().is_empty() && self.path.starts_with(worktrees_root)
     }
 }
 
@@ -281,6 +287,16 @@ pub async fn add(repo_root: &Path, root: &Path, opts: &AddOptions) -> Result<Wor
     let path_str = path.to_string_lossy().to_string();
     let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
     if opts.existing_branch {
+        // Checking out an existing branch puts the worktree at that branch's
+        // tip; there is no base to fork from. Accepting `base` silently here
+        // would report success while leaving the tree on a different revision
+        // than the operator asked for.
+        if opts.base.as_deref().is_some_and(|b| !b.trim().is_empty()) {
+            bail!(
+                "a base commit cannot be combined with an existing branch — \
+                 '{branch}' is checked out at its own tip"
+            );
+        }
         args.push(path_str);
         args.push(branch.clone());
     } else {
@@ -318,15 +334,37 @@ pub async fn add(repo_root: &Path, root: &Path, opts: &AddOptions) -> Result<Wor
 /// trailing directory name, then the branch. A target that matches nothing
 /// returns `None` so callers can phrase their own error.
 pub fn find<'a>(worktrees: &'a [Worktree], target: &str) -> Option<&'a Worktree> {
+    find_where(worktrees, target, |_| true)
+}
+
+/// [`find`], restricted to checkouts satisfying `accept`.
+///
+/// The filter applies to the *name* and *branch* passes only — an exact path
+/// always resolves. That split is the whole point: a bare word is a guess about
+/// which checkout the operator meant, and a guess must not be allowed to land on
+/// the main checkout or on a tree Borg does not own. A full path is not a guess,
+/// so it stays usable as the deliberate escape hatch.
+pub fn find_where<'a>(
+    worktrees: &'a [Worktree],
+    target: &str,
+    accept: impl Fn(&Worktree) -> bool,
+) -> Option<&'a Worktree> {
     let as_path = PathBuf::from(target);
     let canonical = as_path.canonicalize().ok();
-    worktrees
+    if let Some(exact) = worktrees
         .iter()
         .find(|wt| Some(&wt.path) == canonical.as_ref() || wt.path == as_path)
-        .or_else(|| worktrees.iter().find(|wt| wt.name() == target))
+    {
+        return Some(exact);
+    }
+    worktrees
+        .iter()
+        .filter(|wt| accept(wt))
+        .find(|wt| wt.name() == target)
         .or_else(|| {
             worktrees
                 .iter()
+                .filter(|wt| accept(wt))
                 .find(|wt| wt.branch.as_deref() == Some(target))
         })
 }
@@ -337,11 +375,35 @@ pub fn find<'a>(worktrees: &'a [Worktree], target: &str) -> Option<&'a Worktree>
 /// refuses one with uncommitted changes unless `force`. The branch is left
 /// alone — deleting a branch is a separate, far less recoverable act than
 /// deleting a checkout that git can recreate.
+///
+/// `target` resolves by name or branch only among worktrees Borg manages (see
+/// [`Worktree::is_managed`]); a checkout the operator created elsewhere is
+/// theirs, and deleting it because a bare word happened to match would be a
+/// surprise. Their full path still resolves, so removing one is possible but
+/// has to be deliberate.
 #[instrument(skip_all, fields(worktree.target = %target))]
-pub async fn remove(repo_root: &Path, target: &str, force: bool) -> Result<PathBuf> {
+pub async fn remove(
+    repo_root: &Path,
+    worktrees_root: &Path,
+    target: &str,
+    force: bool,
+) -> Result<PathBuf> {
     let worktrees = list(repo_root).await?;
-    let wt = find(&worktrees, target)
-        .with_context(|| format!("no worktree matches '{target}'"))?
+    // Canonicalize here rather than trusting the caller: git reports resolved
+    // paths, so a root that traverses a symlink (`/tmp`, `/var` on macOS)
+    // would match nothing and make every managed worktree look external —
+    // failing closed, but on every removal.
+    let root = worktrees_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktrees_root.to_path_buf());
+    let wt = find_where(&worktrees, target, |wt| !wt.is_main && wt.is_managed(&root))
+        .with_context(|| {
+            format!(
+                "no worktree Borg manages matches '{target}' — \
+             `borg worktree list` shows them, and one tagged `external` \
+             needs its full path"
+            )
+        })?
         .clone();
 
     if wt.is_main {
@@ -893,7 +955,7 @@ branch refs/heads/shared
         let main_path = repo.canonicalize().unwrap();
 
         for force in [false, true] {
-            let err = remove(&repo, main_path.to_str().unwrap(), force)
+            let err = remove(&repo, &root, main_path.to_str().unwrap(), force)
                 .await
                 .expect_err("the main checkout must never be removable");
             assert!(
@@ -923,7 +985,9 @@ branch refs/heads/shared
         .await
         .unwrap();
 
-        let removed = remove(&repo, "scratch", false).await.expect("remove");
+        let removed = remove(&repo, &root, "scratch", false)
+            .await
+            .expect("remove");
         assert_eq!(removed, wt.path);
         assert!(!wt.path.exists(), "the directory must be gone");
         assert_eq!(
@@ -950,7 +1014,7 @@ branch refs/heads/shared
         .unwrap();
         std::fs::write(wt.path.join("a.txt"), "edited\n").unwrap();
 
-        let err = remove(&repo, "dirty", false)
+        let err = remove(&repo, &root, "dirty", false)
             .await
             .expect_err("a dirty worktree must not be removed silently");
         assert!(
@@ -959,7 +1023,7 @@ branch refs/heads/shared
         );
         assert!(wt.path.exists(), "nothing may be deleted on the refusal");
 
-        remove(&repo, "dirty", true)
+        remove(&repo, &root, "dirty", true)
             .await
             .expect("force must discard the changes");
         assert!(!wt.path.exists());
@@ -981,7 +1045,7 @@ branch refs/heads/shared
         .unwrap();
         std::fs::write(wt.path.join("notes.md").as_path(), "draft\n").unwrap();
 
-        let err = remove(&repo, "untracked", false)
+        let err = remove(&repo, &root, "untracked", false)
             .await
             .expect_err("an untracked file is unsaved work too");
         assert!(err.to_string().contains("uncommitted changes"), "{err:#}");
@@ -1006,7 +1070,7 @@ branch refs/heads/shared
             .await
             .unwrap();
 
-        let err = remove(&repo, "pinned", true)
+        let err = remove(&repo, &root, "pinned", true)
             .await
             .expect_err("a locked worktree must survive force");
         assert!(
@@ -1020,11 +1084,133 @@ branch refs/heads/shared
     /// success.
     #[tokio::test]
     async fn remove_reports_an_unknown_target() {
-        let (_tmp, repo, _root) = fixture();
-        let err = remove(&repo, "ghost", true)
+        let (_tmp, repo, root) = fixture();
+        let err = remove(&repo, &root, "ghost", true)
             .await
             .expect_err("an unknown worktree is not a silent success");
-        assert!(err.to_string().contains("no worktree matches"), "{err:#}");
+        assert!(
+            err.to_string().contains("no worktree Borg manages matches"),
+            "{err:#}"
+        );
+    }
+
+    /// A checkout the operator made themselves is theirs. A bare name or branch
+    /// must not reach it — that is how `remove fix` deletes a review checkout
+    /// nobody asked Borg to touch. Its full path still works, because typing
+    /// the path is a deliberate act rather than a guess.
+    #[tokio::test]
+    async fn remove_refuses_an_external_checkout_by_name_but_allows_it_by_path() {
+        let (tmp, repo, root) = fixture();
+        let outside = tmp.path().join("hand-made");
+        let external = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "hand-made".to_string(),
+                branch: Some("review".to_string()),
+                path: Some(outside.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an external worktree can still be created with an explicit path");
+        assert!(
+            !external.is_managed(&root),
+            "the fixture must actually be outside the managed root"
+        );
+
+        for target in ["hand-made", "review"] {
+            let err = remove(&repo, &root, target, true)
+                .await
+                .expect_err("a bare name must not reach an external checkout")
+                .to_string();
+            assert!(
+                err.contains("no worktree Borg manages matches"),
+                "'{target}' must not reach an external checkout: {err}"
+            );
+        }
+        assert!(external.path.exists(), "nothing may have been deleted");
+
+        remove(&repo, &root, external.path.to_str().unwrap(), true)
+            .await
+            .expect("the full path is an explicit instruction and must work");
+        assert!(!external.path.exists());
+    }
+
+    /// An unresolvable worktrees root must mean "Borg manages nothing", not
+    /// "Borg manages everything". `Path::starts_with("")` is true for every
+    /// path, so the naive test fails open on the check that gates deletion.
+    #[test]
+    fn an_empty_managed_root_marks_nothing_as_managed() {
+        let wt = parse_worktree_list("worktree /code/alpha\n").pop().unwrap();
+        assert!(
+            !wt.is_managed(Path::new("")),
+            "an empty root must not promote every checkout to managed"
+        );
+    }
+
+    /// `--existing` checks a branch out at its own tip, so a base has nowhere
+    /// to apply. Silently ignoring it would report success with the tree on a
+    /// different revision than the operator named.
+    #[tokio::test]
+    async fn add_refuses_a_base_together_with_an_existing_branch() {
+        let (_tmp, repo, root) = fixture();
+        run_git(&["branch", "handoff"], &repo).await.unwrap();
+
+        let err = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "handoff".to_string(),
+                base: Some("HEAD~0".to_string()),
+                existing_branch: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a base plus an existing branch is a contradiction");
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "the error must name the conflict: {err:#}"
+        );
+    }
+
+    /// `find_where` must never let a bare word land on a filtered-out checkout,
+    /// while an exact path still resolves to anything. That split is what keeps
+    /// `-w main` from attaching to the operator's live tree.
+    #[test]
+    fn find_where_filters_bare_words_but_never_an_exact_path() {
+        let wts = parse_worktree_list(
+            "\
+worktree /code/alpha
+HEAD aaa
+branch refs/heads/main
+
+worktree /wt/side
+HEAD bbb
+branch refs/heads/side
+",
+        );
+        let not_main = |wt: &Worktree| !wt.is_main;
+
+        assert!(
+            find_where(&wts, "main", not_main).is_none(),
+            "the main checkout's branch must not resolve"
+        );
+        assert!(
+            find_where(&wts, "alpha", not_main).is_none(),
+            "the main checkout's directory name must not resolve"
+        );
+        assert_eq!(
+            find_where(&wts, "side", not_main).map(|w| w.head.as_deref()),
+            Some(Some("bbb")),
+            "an allowed worktree still resolves by name"
+        );
+        assert_eq!(
+            find_where(&wts, "/code/alpha", not_main).map(|w| w.head.as_deref()),
+            Some(Some("aaa")),
+            "an exact path is explicit and bypasses the filter"
+        );
     }
 
     /// When a checkout directory is deleted out from under git, `prune` clears
@@ -1099,7 +1285,7 @@ branch refs/heads/shared
         .unwrap();
         std::fs::remove_dir_all(&wt.path).unwrap();
 
-        remove(&repo, "gone", false)
+        remove(&repo, &root, "gone", false)
             .await
             .expect("a missing checkout has no work to lose");
         assert_eq!(list(&repo).await.unwrap().len(), 1);

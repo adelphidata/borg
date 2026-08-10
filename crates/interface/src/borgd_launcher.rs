@@ -207,6 +207,20 @@ async fn wait_for_daemon(timeout: Duration) -> bool {
     false
 }
 
+/// Directory a freshly spawned `borgd` should start in, or `None` to inherit.
+///
+/// Anchoring to the data dir matters because `borgd` outlives the client that
+/// spawned it and falls back to its own cwd for any session that sends no
+/// workspace. Inheriting the client's directory would let `borg --worktree x`
+/// on a cold start pin the daemon inside that worktree for every later
+/// heartbeat, scheduled, and web session — and leave it rooted in a directory
+/// that no longer exists once the worktree is removed.
+fn daemon_spawn_dir() -> Option<std::path::PathBuf> {
+    cortex::paths::resolve_borg_home_readonly(None)
+        .ok()
+        .filter(|home| home.is_dir())
+}
+
 /// Spawn the `borgd` binary as a detached background process and wait briefly
 /// for its UDS to come up. Idempotent: if the daemon is already running, this
 /// is a no-op.
@@ -220,6 +234,9 @@ pub async fn ensure_running() -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if let Some(dir) = daemon_spawn_dir() {
+        cmd.current_dir(dir);
+    }
     cmd.spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 
@@ -1103,6 +1120,36 @@ fn stop_systemd() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon must never be spawned into the client's current directory.
+    /// It outlives the client and treats its cwd as the default workspace, so
+    /// a `borg --worktree x` cold start would otherwise pin every later
+    /// heartbeat, scheduled, and web session inside that worktree — and strand
+    /// the daemon in a deleted directory once the worktree is removed.
+    #[test]
+    fn the_daemon_is_spawned_in_the_data_dir_not_the_clients_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("borg-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let elsewhere = tmp.path().join("some-worktree");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let previous = std::env::var_os("BORG_HOME");
+        // SAFETY: single-threaded within this test; restored before returning.
+        unsafe { std::env::set_var("BORG_HOME", &home) };
+        let got = daemon_spawn_dir();
+        match previous {
+            Some(p) => unsafe { std::env::set_var("BORG_HOME", p) },
+            None => unsafe { std::env::remove_var("BORG_HOME") },
+        }
+
+        assert_eq!(got.as_deref(), Some(home.as_path()));
+        assert_ne!(
+            got.as_deref(),
+            Some(elsewhere.as_path()),
+            "the spawn dir must not track wherever the client happens to be"
+        );
+    }
 
     /// The status string is the operator's only diagnostic surface for
     /// "is the daemon healthy?". Each cell of the (uds × platform-state)
