@@ -32,7 +32,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 eventsource-stream = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 anyhow = "1"
