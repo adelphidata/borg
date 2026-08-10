@@ -9,7 +9,7 @@
 # still have to clear Gatekeeper/SmartScreen by hand.
 appId: dev.borg.desktop
 productName: Borg
-copyright: Borg Contributors
+copyright: Adelphi Data, Inc.
 
 directories:
   output: release
@@ -24,7 +24,7 @@ files:
 # feed and the release target can never disagree.
 publish:
   provider: github
-  owner: borganization
+  owner: adelphidata
   repo: borg
 
 mac:

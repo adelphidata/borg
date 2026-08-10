@@ -4,7 +4,7 @@
   "private": true,
   "description": "Desktop client for Borg — your personal assistant, employee, developer, analyst, and sidekick",
   "license": "MIT",
-  "author": "Borg Contributors",
+  "author": "Adelphi Data, Inc.",
   "main": "dist-electron/main.js",
   "type": "commonjs",
   "scripts": {

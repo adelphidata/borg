@@ -68,7 +68,7 @@ Any skill can be added as a plugin too — drop in a skill and Borg learns a new
 
 ## Documentation
 
-Browse the docs site at <https://docs.borganization.ai>, or see the [docs/](docs/) directory for detailed guides on configuration, architecture, memory, skills, tools, sandboxing, and provider setup.
+See the [docs/](docs/) directory for detailed guides on configuration, architecture, memory, skills, tools, sandboxing, and provider setup.
 
 ## Contributing
 

@@ -99,7 +99,7 @@ export function installApplicationMenu(): void {
       submenu: [
         {
           label: "Borg on GitHub",
-          click: () => void shell.openExternal("https://github.com/borganization/borg"),
+          click: () => void shell.openExternal("https://github.com/adelphidata/borg"),
         },
         action("Check for Updates…", "check-for-updates"),
       ],
