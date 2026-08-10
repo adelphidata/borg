@@ -6,6 +6,7 @@ import {
   PlusIcon,
   SearchIcon,
   SETTINGS_SCROLL_DESKTOP_PADDING,
+  StatusDot,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
@@ -71,10 +72,21 @@ function Row({
       }}
       className="group flex cursor-pointer items-center gap-2 rounded-[9px] px-3 py-2.5 hover:bg-surface3"
     >
+      {/* "Working" is already spelled out in the line below, so labelling the
+          dot too would make a screen reader say it twice. "Unsent draft" is
+          not written anywhere, so that one keeps its label. */}
+      {session.activity && (
+        <StatusDot
+          tone={session.activity}
+          label={session.activity === "draft" ? "Unsent draft" : undefined}
+        />
+      )}
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13.5px] leading-[1.35] text-ink">{session.title}</div>
         <div className="mt-[3px] text-[11px] leading-none text-ink3">
-          {session.messageCount} message{session.messageCount === 1 ? "" : "s"}
+          {session.activity === "working"
+            ? "Working…"
+            : `${session.messageCount} message${session.messageCount === 1 ? "" : "s"}`}
         </div>
       </div>
       <SessionRowMenu

@@ -8,6 +8,7 @@ fn make_session(id: &str, title: &str) -> SessionSummary {
         updated_unix_ts: 1_735_689_600, // 2025-01-01T00:00:00Z
         message_count: 5,
         pinned: false,
+        turn_active: false,
     }
 }
 

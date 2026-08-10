@@ -574,7 +574,7 @@ impl Session for SessionSvc {
             llm_provider: snap.llm_provider,
             llm_model: snap.llm_model,
             collab_mode: snap.collab_mode,
-            turn_in_flight: false,
+            turn_in_flight: host.is_busy(),
         }))
     }
 

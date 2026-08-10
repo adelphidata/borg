@@ -43,6 +43,7 @@ pub mod pki_grpc;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
+pub mod session_activity;
 pub mod session_heartbeat;
 pub mod supervisor;
 pub mod task_runner;

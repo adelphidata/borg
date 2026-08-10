@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import { LogoIcon } from "../components/icons";
+import { StatusDot } from "../components/StatusDot";
 import type { AppRoute, NavUser, RecentItem } from "../types";
 
 export interface SidebarProps {
@@ -91,6 +92,12 @@ function RecentRow({
       className="group flex cursor-pointer items-center gap-1 rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
       onClick={onOpen}
     >
+      {item.activity && (
+        <StatusDot
+          tone={item.activity}
+          label={item.activity === "working" ? "Working" : "Unsent draft"}
+        />
+      )}
       <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
         {item.title}
       </span>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { AgentsIcon, PageChrome, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
@@ -12,6 +12,8 @@ import { PlanPanel } from "./cells/PlanPanel";
 import { ToolRunCell } from "./cells/ToolRunCell";
 import { TranscriptCell } from "./cells";
 import { groupCells } from "./cells/toolRuns";
+import { INITIAL_BUDGET, budgetCutIndex, cutHidesEverything, revealEarlier } from "./renderBudget";
+import { describeSendFailure } from "./sendFailure";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
 import { useTurnNotifications } from "./useTurnNotifications";
@@ -29,6 +31,7 @@ export function ConversationPage() {
     busy,
     sendError,
     streamError,
+    streamOutageSustained,
     send,
     steer,
     cancel,
@@ -58,6 +61,51 @@ export function ConversationPage() {
   );
   // Settled tool calls fold into runs so a tool-heavy turn stays readable.
   const items = useMemo(() => groupCells(cells, busy), [cells, busy]);
+
+  // How much of a long history is mounted. Held as a cell index rather than
+  // recomputed per render: the budget is spent once, when the conversation
+  // opens, so a streaming reply cannot push history the user is reading back
+  // over the line and hide it mid-sentence.
+  const [cutIndex, setCutIndex] = useState(0);
+  const budgeted = useRef(false);
+  useEffect(() => {
+    budgeted.current = false;
+    setCutIndex(0);
+  }, [target]);
+  useEffect(() => {
+    if (budgeted.current || items.length === 0) return;
+    budgeted.current = true;
+    setCutIndex(budgetCutIndex(items, INITIAL_BUDGET));
+  }, [items]);
+  // Editing a message rewinds the transcript, so the cut can end up past
+  // everything left. Showing all of it is the safe answer — the history is
+  // short again.
+  useEffect(() => {
+    if (cutHidesEverything(items, cutIndex)) setCutIndex(0);
+  }, [items, cutIndex]);
+
+  const visible = useMemo(
+    () => (cutIndex > 0 ? items.filter((item) => item.index >= cutIndex) : items),
+    [items, cutIndex],
+  );
+  const hiddenCount = items.length - visible.length;
+
+  // Revealing older history mounts cells ABOVE the reading position, which
+  // would otherwise shove the page down by however much they turned out to be.
+  // Distance from the bottom is the one measure that survives that.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fromBottom = useRef<number | undefined>(undefined);
+  const showEarlier = () => {
+    const el = scrollRef.current;
+    fromBottom.current = el ? el.scrollHeight - el.scrollTop : undefined;
+    setCutIndex((current) => revealEarlier(items, current));
+  };
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || fromBottom.current === undefined) return;
+    el.scrollTop = el.scrollHeight - fromBottom.current;
+    fromBottom.current = undefined;
+  }, [cutIndex]);
 
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
@@ -102,7 +150,10 @@ export function ConversationPage() {
         ) : undefined
       }
     >
-      <div className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}>
+      <div
+        ref={scrollRef}
+        className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
+      >
         <div
           className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
             isMobile ? "px-[22px]" : "px-[30px]"
@@ -116,7 +167,16 @@ export function ConversationPage() {
                     Nothing here yet. Ask Borg anything.
                   </div>
                 )}
-                {items.map((item) =>
+                {hiddenCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={showEarlier}
+                    className="mx-auto cursor-pointer rounded-full border border-line bg-surface2 px-3.5 py-1.5 text-[11.5px] leading-none text-ink3 hover:text-ink"
+                  >
+                    Show earlier messages
+                  </button>
+                )}
+                {visible.map((item) =>
                   item.type === "run" ? (
                     <ToolRunCell key={item.key} tools={item.tools} live={item.live} />
                   ) : (
@@ -140,7 +200,7 @@ export function ConversationPage() {
                 )}
                 {sendError && (
                   <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2">
-                    {sendError.message}
+                    {describeSendFailure(sendError)}
                   </div>
                 )}
                 <div ref={bottomRef} />
@@ -156,7 +216,11 @@ export function ConversationPage() {
         {/* A silent stall used to look identical to an idle agent. */}
         {streamError && (
           <div className="mb-2 rounded-[10px] border border-alert bg-alert-soft px-3.5 py-2 text-[11.5px] leading-[1.5] text-ink2">
-            Lost the connection to Borg. Reconnecting…
+            {/* After a while "reconnecting" stops being news and starts
+                hiding the fact that nothing is coming back. */}
+            {streamOutageSustained
+              ? "Still cannot reach Borg. Check that the Borg app is running, then try again."
+              : "Lost the connection to Borg. Reconnecting…"}
           </div>
         )}
         <ContextBar

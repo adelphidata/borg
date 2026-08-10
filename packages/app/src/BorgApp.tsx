@@ -9,6 +9,12 @@ import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPag
 import { CommandPalette } from "./features/palette/CommandPalette";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
 import { QuickEntryPage } from "./features/quick/QuickEntryPage";
+import {
+  activityVersion,
+  sessionActivity,
+  subscribeActivity,
+} from "./features/sessions/activityStore";
+import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { UpdatePill } from "./components/UpdatePill";
 import { SettingsProvider } from "./lib/settings";
@@ -57,9 +63,16 @@ function Shell({ platform }: { platform: Platform }) {
   // Same naming rule as the full list: an unsent session is called after what
   // has been typed into it. The version counter re-renders as that changes.
   useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
+  // One subscription for the whole app; every list reads the store it fills.
+  useSessionActivityFeed();
+  useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)
-    .map((s) => ({ id: s.id, title: rowTitle(s.title, Number(s.messageCount), s.id) }));
+    .map((s) => ({
+      id: s.id,
+      title: rowTitle(s.title, Number(s.messageCount), s.id),
+      activity: sessionActivity(s.id, Number(s.messageCount)),
+    }));
 
   // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`
   // brings a conversation back. The daemon also closes the session if it is

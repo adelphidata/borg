@@ -1094,3 +1094,110 @@ async fn setting_a_session_title_persists_and_rejects_blank_or_unknown() {
         "a refused rename must change nothing"
     );
 }
+
+/// Backend for the turn-activity case: `run_turn` parks until the test
+/// releases it, so the host stays observably busy for the whole assertion.
+struct BlockingBackend {
+    id: String,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for BlockingBackend {
+    async fn run_turn(
+        &self,
+        _text: String,
+        _images: Vec<InlineImage>,
+        _event_tx: tokio::sync::mpsc::Sender<cortex::agent::AgentEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+        _text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
+    ) {
+        self.release.notified().await;
+    }
+
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A session list has to answer "which conversation is working right now"
+/// two ways: as a snapshot on every row, and as a live feed. Both are asserted
+/// here because a client trusts the feed only as far as the snapshot can
+/// correct it — if the snapshot lied, a dropped stream would strand the dot.
+#[tokio::test]
+async fn turn_activity_is_reported_by_both_the_listing_and_the_feed() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("busy-one", 1, 10, 0, "m", "Working")
+            .await
+            .expect("seed session");
+    }
+
+    let mut feed = admin
+        .subscribe_session_activity(AdminEmpty {})
+        .await
+        .expect("subscribe")
+        .into_inner();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let host = SessionHost::new(Arc::new(BlockingBackend {
+        id: "busy-one".into(),
+        release: Arc::clone(&release),
+    }));
+    h.registry.insert(host.clone());
+
+    let turn_active_in_listing = |admin: &mut AdminClient<tonic::transport::Channel>| {
+        let mut admin = admin.clone();
+        async move {
+            admin
+                .list_sessions(AdminEmpty {})
+                .await
+                .expect("list")
+                .into_inner()
+                .sessions
+                .into_iter()
+                .find(|s| s.id == "busy-one")
+                .expect("the seeded session must be listed")
+                .turn_active
+        }
+    };
+
+    assert!(
+        !turn_active_in_listing(&mut admin).await,
+        "an idle session must not be reported as working"
+    );
+
+    host.start_turn("go".into(), Vec::new(), None, None).await;
+
+    let started = tokio::time::timeout(Duration::from_secs(2), feed.message())
+        .await
+        .expect("a transition within 2s")
+        .expect("stream open")
+        .expect("an event");
+    assert_eq!(started.session_id, "busy-one");
+    assert!(started.turn_active, "the feed must announce the start");
+    assert!(
+        turn_active_in_listing(&mut admin).await,
+        "the listing must agree with the feed while the turn runs"
+    );
+
+    release.notify_waiters();
+
+    let settled = tokio::time::timeout(Duration::from_secs(2), feed.message())
+        .await
+        .expect("a transition within 2s")
+        .expect("stream open")
+        .expect("an event");
+    assert!(!settled.turn_active, "the feed must announce the settle");
+    assert!(
+        !turn_active_in_listing(&mut admin).await,
+        "a settled session must drop out of the working set"
+    );
+}

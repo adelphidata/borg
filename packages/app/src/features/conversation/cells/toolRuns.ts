@@ -12,7 +12,7 @@ export type ToolCellData = Cell & { kind: "tool" };
  */
 export type RenderItem =
   | { type: "cell"; cell: Cell; index: number }
-  | { type: "run"; key: string; tools: ToolCellData[]; live: boolean };
+  | { type: "run"; key: string; tools: ToolCellData[]; live: boolean; index: number };
 
 /** How a tool call reads in a summary line. */
 type Category = "edit" | "explore" | "lookup" | "command" | "other";
@@ -149,6 +149,9 @@ export function groupCells(cells: Cell[], busy: boolean): RenderItem[] {
       i++;
       continue;
     }
+    // Where the run starts, so a caller that trims the transcript can cut at
+    // item boundaries in the same coordinate space the cells use.
+    const start = i;
     const run: ToolCellData[] = [];
     while (i < cells.length && collapsible(cells[i]!)) {
       run.push(cells[i] as ToolCellData);
@@ -158,7 +161,7 @@ export function groupCells(cells: Cell[], busy: boolean): RenderItem[] {
       items.push({ type: "cell", cell: run[0]!, index: i - 1 });
       continue;
     }
-    items.push({ type: "run", key: `run:${run[0]!.id}`, tools: run, live: false });
+    items.push({ type: "run", key: `run:${run[0]!.id}`, tools: run, live: false, index: start });
   }
 
   // Only the trailing run of a turn still in flight is live; an earlier one has

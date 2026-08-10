@@ -5,7 +5,7 @@ import {
   useBorg,
   useMutation,
   useQuery,
-  useServerStream,
+  useRetryingServerStream,
   type QueryResult,
 } from "../../lib/useDaemon";
 import { draftKeyFor, moveDraft } from "./draftStore";
@@ -293,6 +293,12 @@ export interface Conversation {
   sendError: BorgError | undefined;
   /** Set when the event stream dropped; the hook retries on its own. */
   streamError: BorgError | undefined;
+  /**
+   * True when the retries have gone on long enough that the daemon is probably
+   * down rather than blipping — the point at which the notice should stop
+   * saying "reconnecting" and tell the user what to check.
+   */
+  streamOutageSustained: boolean;
   send: (text: string, attachments?: Attachment[]) => void;
   /** Mid-turn nudge. Only meaningful while `busy`. */
   steer: (text: string) => void;
@@ -330,8 +336,6 @@ export function useConversation(target: string | undefined): Conversation {
   const [busy, setBusy] = useState(false);
   const [sendError, setSendError] = useState<BorgError>();
   const [streamError, setStreamError] = useState<BorgError>();
-  /** Bumped to force a resubscribe after the stream drops. */
-  const [attempt, setAttempt] = useState(0);
   /**
    * Highest event seq applied. Resuming from this — not from the seq captured
    * at open — is what stops a reconnect from replaying the whole turn.
@@ -386,7 +390,7 @@ export function useConversation(target: string | undefined): Conversation {
     [target],
   );
 
-  const state = useServerStream<sessionPb.AgentEvent>(
+  const state = useRetryingServerStream<sessionPb.AgentEvent>(
     (borg, handlers) => {
       if (!sessionId) return () => {};
       return borg.session.stream({ sessionId, sinceEventSeq: lastSeq.current }, handlers);
@@ -399,16 +403,19 @@ export function useConversation(target: string | undefined): Conversation {
       if (event.planUpdated) setPlan(event.planUpdated.steps);
       setCells((prev) => reduceEvent(prev, event));
     },
-    [sessionId, attempt],
+    [sessionId],
   );
 
   // A dropped stream leaves the transcript frozen with no explanation. Surface
-  // it and retry — resuming from `lastSeq` means nothing is missed or doubled.
+  // it; `useRetryingServerStream` schedules the resubscribe, and resuming from
+  // `lastSeq` means nothing is missed or doubled.
+  //
+  // A clean `closed` counts as dropped: a turn stream ends when the daemon goes
+  // away as readily as when it errors, and the silent case is the worse one —
+  // the reply simply stops mid-sentence with nothing on screen to say why.
   useEffect(() => {
-    if (state.status !== "error" || !sessionId) return;
-    setStreamError(state.error);
-    const timer = setTimeout(() => setAttempt((n) => n + 1), 2000);
-    return () => clearTimeout(timer);
+    if (state.status === "open" || !sessionId) return;
+    setStreamError(state.error ?? asBorgError("The connection to Borg ended."));
   }, [state.status, state.error, sessionId]);
 
   const send = useCallback(
@@ -558,6 +565,7 @@ export function useConversation(target: string | undefined): Conversation {
     busy,
     sendError,
     streamError,
+    streamOutageSustained: state.sustained,
     send,
     steer,
     cancel,

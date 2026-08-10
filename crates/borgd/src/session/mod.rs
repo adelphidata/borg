@@ -22,6 +22,7 @@ pub mod scripted;
 
 pub use executor::DaemonSessionExecutor;
 
+use crate::session_activity::{SessionActivity, SessionActivityBus};
 use anyhow::{anyhow, Result};
 use backend::SessionBackend;
 use buffer::SequencedBuffer;
@@ -29,7 +30,7 @@ use cortex::agent::AgentEvent;
 use prompts::PromptRegistry;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -55,6 +56,62 @@ struct HostInner {
     /// forwarder drains. Read by [`SessionHost::is_busy`] so an internal/
     /// system turn can decline to interrupt a live turn.
     busy: AtomicBool,
+    /// Fan-out for `busy` transitions, installed by
+    /// [`SessionRegistry::insert`]. A host built outside a registry (tests,
+    /// one-shot executions) simply never publishes.
+    activity: OnceLock<SessionActivityBus>,
+    /// Gate on [`Self::activity`]. Cleared when this host is replaced or
+    /// removed so a retiring host's final drain cannot publish "settled" for
+    /// an id that a fresh host has already taken over.
+    publishes_activity: AtomicBool,
+}
+
+impl HostInner {
+    /// Store `busy` and announce the transition. Only a real change is
+    /// published, so repeated settles (drain, then `close`) stay one event.
+    fn set_busy(&self, busy: bool) {
+        if self.busy.swap(busy, Ordering::SeqCst) == busy {
+            return;
+        }
+        if !self.publishes_activity.load(Ordering::SeqCst) {
+            return;
+        }
+        self.publish(busy);
+    }
+
+    /// Final settle for a host leaving the registry: close the gate, then
+    /// announce.
+    ///
+    /// The order matters. `set_busy` reads the gate after it swaps `busy`, so
+    /// closing it first means a `start_turn` racing this removal either wins
+    /// the `busy` swap outright (and we publish nothing, because it was already
+    /// busy) or finds the gate shut. Announcing first and closing after leaves
+    /// a window where that turn publishes "working" *behind* our settle, for a
+    /// host that is no longer reachable — a dot lit forever on a dead session.
+    ///
+    /// The settle is announced on the gate alone, not on `busy` having been
+    /// set. A forwarder draining its terminal event concurrently can clear
+    /// `busy` first and then find the gate already shut, so both writers would
+    /// see "nothing to announce" and the earlier "working" would never be
+    /// retracted. A duplicate `false` for an already-idle host costs nothing:
+    /// every consumer treats it as a no-op.
+    fn settle_and_mute(&self) {
+        let was_publishing = self.publishes_activity.swap(false, Ordering::SeqCst);
+        self.busy.store(false, Ordering::SeqCst);
+        if was_publishing {
+            self.publish(false);
+        }
+    }
+
+    fn publish(&self, turn_active: bool) {
+        if let Some(bus) = self.activity.get() {
+            bus.publish(SessionActivity {
+                session_id: self.session_id.clone(),
+                turn_active,
+                emitted_at_unix: crate::goal_bus::now_unix(),
+            });
+        }
+    }
 }
 
 struct TurnState {
@@ -82,8 +139,31 @@ impl SessionHost {
                     forwarder: None,
                 }),
                 busy: AtomicBool::new(false),
+                activity: OnceLock::new(),
+                publishes_activity: AtomicBool::new(true),
             }),
         }
+    }
+
+    /// Point this host's turn-activity transitions at `bus`. Called once, by
+    /// [`SessionRegistry::insert`]; a second call is ignored.
+    pub fn attach_activity(&self, bus: SessionActivityBus) {
+        let _ = self.inner.activity.set(bus);
+    }
+
+    /// Stop publishing turn activity, without announcing a settle. For a host
+    /// being REPLACED: its successor already owns the id, and a late settle
+    /// from the outgoing host would clear a dot the new turn just lit.
+    pub fn mute_activity(&self) {
+        self.inner.publishes_activity.store(false, Ordering::SeqCst);
+    }
+
+    /// Announce that this session is no longer working, then stop publishing.
+    /// For a host being REMOVED with nothing taking its place — without this,
+    /// a session killed mid-turn would keep its dot until a client reconciled
+    /// against a fresh listing.
+    pub fn settle_activity(&self) {
+        self.inner.settle_and_mute();
     }
 
     /// True while a turn is in flight (its events are still streaming). Used by
@@ -290,7 +370,7 @@ impl SessionHost {
             // anything appended after this store would let `prior.await` resolve
             // while `busy` is momentarily stale — reopening a window where
             // `is_busy()` wrongly reports idle during a live turn.
-            inner_fwd.busy.store(false, Ordering::SeqCst);
+            inner_fwd.set_busy(false);
         });
 
         // Critical section: await prior forwarder's drain, install our turn
@@ -310,7 +390,7 @@ impl SessionHost {
             state.forwarder = Some(forwarder);
             // Mark busy under the same lock that installs the turn, so a
             // concurrent `is_busy()` can't observe a half-installed state.
-            inner.busy.store(true, Ordering::SeqCst);
+            inner.set_busy(true);
             inner.buffer.last_seq()
         };
 
@@ -468,6 +548,8 @@ struct RegistryEntry {
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     inner: Arc<Mutex<HashMap<String, RegistryEntry>>>,
+    /// Turn-activity fan-out shared by every host in this registry.
+    activity: SessionActivityBus,
 }
 
 impl SessionRegistry {
@@ -482,6 +564,7 @@ impl SessionRegistry {
     /// background so this call stays sync).
     pub fn insert(&self, host: SessionHost) {
         let id = host.id().to_string();
+        host.attach_activity(self.activity.clone());
         let entry = RegistryEntry {
             host,
             last_activity: std::time::Instant::now(),
@@ -491,11 +574,35 @@ impl SessionRegistry {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.insert(id, entry)
+            let prior = guard.insert(id.clone(), entry);
+            if let Some(prior) = &prior {
+                // The incoming host owns this id now, so the outgoing one must
+                // go quiet before its cancelled turn drains.
+                prior.host.mute_activity();
+                // Muting it also swallows the settle its cancelled turn would
+                // have sent. Nothing else will retract that dot — the successor
+                // publishes only its own turns — so retract it here, from the
+                // registry. Done under the lock, before the successor is
+                // reachable, so it can never land behind that turn's "working".
+                if prior.host.is_busy() && !guard.get(&id).is_some_and(|e| e.host.is_busy()) {
+                    self.activity.publish(SessionActivity {
+                        session_id: id,
+                        turn_active: false,
+                        emitted_at_unix: crate::goal_bus::now_unix(),
+                    });
+                }
+            }
+            prior
         };
         if let Some(prior) = prior {
             tokio::spawn(async move { prior.host.close().await });
         }
+    }
+
+    /// Subscribe to turn-activity transitions across every session in this
+    /// registry. Backs `Admin.SubscribeSessionActivity`.
+    pub fn subscribe_activity(&self) -> tokio::sync::broadcast::Receiver<SessionActivity> {
+        self.activity.subscribe()
     }
 
     /// Look up a session by id, refreshing its last-activity stamp. Every
@@ -525,13 +632,20 @@ impl SessionRegistry {
 
     /// Remove and return a session host.
     pub fn remove_host(&self, id: &str) -> Option<SessionHost> {
-        {
+        let host = {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.remove(id).map(|e| e.host)
+        };
+        // Nothing takes this id over, so a session removed mid-turn has to
+        // announce that it stopped working — no listing may be fetched for a
+        // while, and until one is the dot would sit lit on a dead host.
+        if let Some(host) = &host {
+            host.settle_activity();
         }
+        host
     }
 
     /// Evict idle-expired entries and enforce the entry cap, LRU-first.
@@ -615,6 +729,10 @@ impl SessionRegistry {
                 idle_secs = idle_for.as_secs(),
                 "evicting idle session host (history persisted; a later turn rebuilds it)"
             );
+            // An evicted host is idle by construction (`evictable` skips busy
+            // ones), so there is no settle to announce — just retire the
+            // publisher so a rebuilt host owns the id cleanly.
+            host.mute_activity();
             tokio::spawn(async move { host.close().await });
         }
         n
@@ -895,17 +1013,155 @@ mod tests {
         assert!(host.is_busy(), "must be busy while a turn is in flight");
 
         drain_until_terminal(&mut rx).await;
-        // The forwarder clears `busy` after the terminal event drains — allow a
-        // few ticks for that task to run.
+        wait_until_idle(&host).await;
+    }
+
+    /// The forwarder clears `busy` after the terminal event drains, so a test
+    /// that just drained has to give that task a few ticks to run.
+    async fn wait_until_idle(host: &SessionHost) {
         for _ in 0..100 {
             if !host.is_busy() {
-                break;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("must be idle again after the turn completes");
+    }
+
+    /// Wait for the next activity transition, or fail the test.
+    async fn next_activity(
+        rx: &mut tokio::sync::broadcast::Receiver<SessionActivity>,
+    ) -> SessionActivity {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an activity transition within 2s")
+            .expect("the bus is open")
+    }
+
+    #[tokio::test]
+    async fn registry_publishes_both_ends_of_a_turn() {
+        // Real failure mode: a session list that never learns a turn started
+        // (or never learns it finished) shows a dot that is either always dark
+        // or permanently lit.
+        let registry = SessionRegistry::new();
+        let host = SessionHost::new(stub("s-act", &["a", "b"], 20));
+        registry.insert(host.clone());
+        let mut activity = registry.subscribe_activity();
+
+        let mut events = host.subscribe();
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        let started = next_activity(&mut activity).await;
+        assert_eq!(started.session_id, "s-act");
+        assert!(started.turn_active, "starting a turn must announce itself");
+
+        drain_until_terminal(&mut events).await;
+        let settled = next_activity(&mut activity).await;
         assert!(
-            !host.is_busy(),
-            "must be idle again after the turn completes"
+            !settled.turn_active,
+            "the drained forwarder must announce the settle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_outside_a_registry_runs_turns_without_a_bus() {
+        // `SessionHost::new` is used directly by one-shot execution paths; a
+        // missing bus must be silence, not a panic.
+        let host = SessionHost::new(stub("s-nobus", &["a"], 10));
+        let mut rx = host.subscribe();
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(
+            host.is_busy(),
+            "the turn still runs without anywhere to say so"
+        );
+        drain_until_terminal(&mut rx).await;
+        // The busy flag is what `GetState.turn_in_flight` and
+        // `ListSessions.turn_active` read, so it has to settle on its own.
+        wait_until_idle(&host).await;
+    }
+
+    #[tokio::test]
+    async fn removing_a_busy_host_announces_that_it_settled() {
+        // Real failure mode: a session killed mid-turn keeps its dot lit until
+        // some client happens to refetch a listing.
+        let registry = SessionRegistry::new();
+        let host = SessionHost::new(stub("s-removed", &["a", "b", "c"], 500));
+        registry.insert(host.clone());
+        let mut activity = registry.subscribe_activity();
+
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(next_activity(&mut activity).await.turn_active);
+
+        registry.remove_host("s-removed");
+        let settled = next_activity(&mut activity).await;
+        assert!(
+            !settled.turn_active,
+            "removing a busy host must announce the settle"
+        );
+        assert_eq!(settled.session_id, "s-removed");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_drains_as_its_host_is_removed_still_settles() {
+        // The window this closes: the forwarder clears `busy` while
+        // `remove_host` is between closing the publish gate and clearing
+        // `busy` itself. Each writer then sees the other's work and concludes
+        // there is nothing to announce — and the "working" published earlier is
+        // never retracted, leaving a lit dot on a session that no longer
+        // exists. Reproduced directly, because the real interleaving is a few
+        // instructions wide.
+        let registry = SessionRegistry::new();
+        let host = SessionHost::new(stub("s-drain-race", &["a"], 10));
+        registry.insert(host.clone());
+        let mut activity = registry.subscribe_activity();
+
+        host.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(next_activity(&mut activity).await.turn_active);
+
+        // Stand in for the forwarder winning the `busy` clear: the turn is over
+        // as far as the flag is concerned, but nothing has been published.
+        host.inner.busy.store(false, Ordering::SeqCst);
+
+        registry.remove_host("s-drain-race");
+        let settled = next_activity(&mut activity).await;
+        assert!(
+            !settled.turn_active,
+            "the settle must be announced even when `busy` was already cleared"
+        );
+        assert_eq!(settled.session_id, "s-drain-race");
+    }
+
+    #[tokio::test]
+    async fn a_replaced_host_cannot_clear_its_successors_dot() {
+        // Real failure mode: both hosts answer to one id, so the outgoing
+        // host's cancelled turn would publish "settled" over the incoming
+        // host's live turn and blank the dot mid-conversation.
+        let registry = SessionRegistry::new();
+        let old = SessionHost::new(stub("s-dup", &["a", "b", "c"], 500));
+        registry.insert(old.clone());
+        let mut activity = registry.subscribe_activity();
+        old.start_turn("go".into(), Vec::new(), None, None).await;
+        assert!(next_activity(&mut activity).await.turn_active);
+
+        // Replacing the host cancels the old turn, which drains and would
+        // otherwise publish `false` for an id the new host now owns. The
+        // registry retracts the dot itself, exactly once...
+        let fresh = SessionHost::new(stub("s-dup", &["x"], 10));
+        registry.insert(fresh);
+        let retraction = next_activity(&mut activity).await;
+        assert!(
+            !retraction.turn_active,
+            "replacing a busy host must retract its dot — muting it alone \
+             leaves the dot lit with nothing left to clear it"
+        );
+
+        // ...and the retiring host stays silent as its cancelled turn drains.
+        old.cancel_turn().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), activity.recv())
+                .await
+                .is_err(),
+            "a retired host must stay silent"
         );
     }
 

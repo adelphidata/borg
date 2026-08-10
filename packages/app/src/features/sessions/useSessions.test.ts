@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { draftKeyFor, publishDraft } from "../conversation/draftStore";
+import { applyActivity, resetActivity } from "./activityStore";
 import { filterSessions, groupSessions, resolveTitles, type SessionRow } from "./useSessions";
 
 /** 2026-08-09 14:00 local — the reference "now" for every case below. */
@@ -108,5 +109,29 @@ describe("resolveTitles", () => {
   it("keeps row identity when nothing was renamed, so memos still hold", () => {
     const rows = [draft("d1")];
     expect(resolveTitles(rows)[0]).toBe(rows[0]);
+  });
+
+  it("stamps each row with its status", () => {
+    applyActivity("d2", true);
+    publishDraft(draftKeyFor("d1"), "not sent yet");
+    const used: SessionRow = { id: "d3", title: "Deploy notes", messageCount: 6, updatedAt: 0 };
+
+    const rows = resolveTitles([draft("d1"), draft("d2"), used]);
+
+    expect(rows.map((r) => r.activity)).toEqual(["draft", "working", undefined]);
+    resetActivity();
+  });
+
+  it("gives a row a new identity when only its status changed", () => {
+    // The list memoises on row identity, so a turn starting elsewhere has to
+    // produce a new object or the dot would never appear.
+    const rows = [draft("d1")];
+    const settled = resolveTitles(rows);
+    applyActivity("d1", true);
+    const working = resolveTitles(rows);
+
+    expect(working[0]).not.toBe(settled[0]);
+    expect(working[0]!.activity).toBe("working");
+    resetActivity();
   });
 });

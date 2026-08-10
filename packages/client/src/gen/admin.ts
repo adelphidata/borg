@@ -392,6 +392,13 @@ export interface SessionSummary {
    * stale auto-archive; always present in listings).
    */
   pinned: boolean;
+  /**
+   * True while a turn runs in this session. Only a live (registry-resident)
+   * host can be busy; an evicted session always reports false. This is the
+   * snapshot half of the activity feed — `SubscribeSessionActivity` carries
+   * the deltas, and a listing reconciles anything a dropped stream missed.
+   */
+  turnActive: boolean;
 }
 
 export interface SessionRef {
@@ -1131,6 +1138,13 @@ export function sessionHeartbeatMutation_OpToJSON(object: SessionHeartbeatMutati
     default:
       return "UNRECOGNIZED";
   }
+}
+
+/** One transition of a session between "a turn is running" and "settled". */
+export interface SessionActivityEvent {
+  sessionId: string;
+  turnActive: boolean;
+  emittedAtUnix: number;
 }
 
 export interface GoalEvent {
@@ -5364,7 +5378,7 @@ export const SessionList: MessageFns<SessionList> = {
 };
 
 function createBaseSessionSummary(): SessionSummary {
-  return { id: "", title: "", messageCount: 0, updatedUnixTs: 0, pinned: false };
+  return { id: "", title: "", messageCount: 0, updatedUnixTs: 0, pinned: false, turnActive: false };
 }
 
 export const SessionSummary: MessageFns<SessionSummary> = {
@@ -5383,6 +5397,9 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     }
     if (message.pinned !== false) {
       writer.uint32(40).bool(message.pinned);
+    }
+    if (message.turnActive !== false) {
+      writer.uint32(48).bool(message.turnActive);
     }
     return writer;
   },
@@ -5434,6 +5451,14 @@ export const SessionSummary: MessageFns<SessionSummary> = {
           message.pinned = reader.bool();
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.turnActive = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5458,6 +5483,11 @@ export const SessionSummary: MessageFns<SessionSummary> = {
         ? globalThis.Number(object.updated_unix_ts)
         : 0,
       pinned: isSet(object.pinned) ? globalThis.Boolean(object.pinned) : false,
+      turnActive: isSet(object.turnActive)
+        ? globalThis.Boolean(object.turnActive)
+        : isSet(object.turn_active)
+        ? globalThis.Boolean(object.turn_active)
+        : false,
     };
   },
 
@@ -5478,6 +5508,9 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     if (message.pinned !== false) {
       obj.pinned = message.pinned;
     }
+    if (message.turnActive !== false) {
+      obj.turnActive = message.turnActive;
+    }
     return obj;
   },
 
@@ -5491,6 +5524,7 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     message.messageCount = object.messageCount ?? 0;
     message.updatedUnixTs = object.updatedUnixTs ?? 0;
     message.pinned = object.pinned ?? false;
+    message.turnActive = object.turnActive ?? false;
     return message;
   },
 };
@@ -12297,6 +12331,110 @@ export const SessionHeartbeatMutation: MessageFns<SessionHeartbeatMutation> = {
   },
 };
 
+function createBaseSessionActivityEvent(): SessionActivityEvent {
+  return { sessionId: "", turnActive: false, emittedAtUnix: 0 };
+}
+
+export const SessionActivityEvent: MessageFns<SessionActivityEvent> = {
+  encode(message: SessionActivityEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.turnActive !== false) {
+      writer.uint32(16).bool(message.turnActive);
+    }
+    if (message.emittedAtUnix !== 0) {
+      writer.uint32(24).int64(message.emittedAtUnix);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionActivityEvent {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionActivityEvent();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.turnActive = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.emittedAtUnix = longToNumber(reader.int64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionActivityEvent {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      turnActive: isSet(object.turnActive)
+        ? globalThis.Boolean(object.turnActive)
+        : isSet(object.turn_active)
+        ? globalThis.Boolean(object.turn_active)
+        : false,
+      emittedAtUnix: isSet(object.emittedAtUnix)
+        ? globalThis.Number(object.emittedAtUnix)
+        : isSet(object.emitted_at_unix)
+        ? globalThis.Number(object.emitted_at_unix)
+        : 0,
+    };
+  },
+
+  toJSON(message: SessionActivityEvent): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.turnActive !== false) {
+      obj.turnActive = message.turnActive;
+    }
+    if (message.emittedAtUnix !== 0) {
+      obj.emittedAtUnix = Math.round(message.emittedAtUnix);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SessionActivityEvent>, I>>(base?: I): SessionActivityEvent {
+    return SessionActivityEvent.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SessionActivityEvent>, I>>(object: I): SessionActivityEvent {
+    const message = createBaseSessionActivityEvent();
+    message.sessionId = object.sessionId ?? "";
+    message.turnActive = object.turnActive ?? false;
+    message.emittedAtUnix = object.emittedAtUnix ?? 0;
+    return message;
+  },
+};
+
 function createBaseGoalEvent(): GoalEvent {
   return { sessionId: "", kind: "", goal: undefined, emittedAtUnix: 0 };
 }
@@ -12938,6 +13076,19 @@ export const AdminDefinition = {
       requestStream: false,
       responseType: Empty as typeof Empty,
       responseStream: false,
+      options: {},
+    },
+    /**
+     * Live turn-activity feed across every session, so a listing can show which
+     * conversation is working without polling each one. Deltas only — clients
+     * reconcile against `ListSessions.turn_active` whenever the stream opens.
+     */
+    subscribeSessionActivity: {
+      name: "SubscribeSessionActivity",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SessionActivityEvent as typeof SessionActivityEvent,
+      responseStream: true,
       options: {},
     },
     /** Scheduled tasks. */

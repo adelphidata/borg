@@ -35,10 +35,11 @@ use protocols::admin::{
     RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
-    ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SessionTitleMutation, SetCredentialStrategyRequest, SetSubprocessPinnedRequest,
-    SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot,
-    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
+    ScheduledTaskUpdate, SessionActivityEvent as PbSessionActivityEvent, SessionArchiveMutation,
+    SessionDetail, SessionList, SessionRef, SessionSummary, SessionTitleMutation,
+    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
+    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
+    TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,6 +47,12 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status as TStatus};
+
+/// Boxed session-activity stream; the `Admin::SubscribeSessionActivityStream`
+/// associated type. No `WiredSlot` guard here — the bus lives on the session
+/// registry every `AdminSvc` is built with, so the feed can never be unwired.
+pub type SessionActivityStream =
+    Pin<Box<dyn Stream<Item = Result<PbSessionActivityEvent, TStatus>> + Send + 'static>>;
 
 /// Admin service implementation.
 pub struct AdminSvc {
@@ -336,12 +343,17 @@ impl Admin for AdminSvc {
                 if live.contains(&r.id) && !title.contains("(live)") {
                     title = format!("{title} (live)");
                 }
+                // `peek`, not `get`: a listing is inspection, and refreshing
+                // last-activity here would keep every listed session resident
+                // past its TTL.
+                let turn_active = self.registry.peek(&r.id).is_some_and(|h| h.is_busy());
                 sessions.push(SessionSummary {
                     id: r.id,
                     title,
                     message_count: count as u64,
                     updated_unix_ts: r.updated_at as u64,
                     pinned: r.pinned,
+                    turn_active,
                 });
             }
             anyhow::Ok(sessions)
@@ -1259,6 +1271,8 @@ impl Admin for AdminSvc {
 
     type SubscribeGoalEventsStream = goals::GoalEventsStream;
 
+    type SubscribeSessionActivityStream = SessionActivityStream;
+
     type SubscribeAgentTreeEventsStream = agents::AgentTreeEventsStream;
 
     async fn subscribe_goal_events(
@@ -1266,6 +1280,38 @@ impl Admin for AdminSvc {
         req: Request<Empty>,
     ) -> Result<Response<Self::SubscribeGoalEventsStream>, TStatus> {
         goals::subscribe_goal_events(self, req).await
+    }
+
+    async fn subscribe_session_activity(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<Self::SubscribeSessionActivityStream>, TStatus> {
+        let mut sub = self.registry.subscribe_activity();
+        let (tx, rx) = mpsc::channel::<Result<PbSessionActivityEvent, TStatus>>(16);
+        tokio::spawn(async move {
+            loop {
+                match sub.recv().await {
+                    Ok(evt) => {
+                        let pb = PbSessionActivityEvent {
+                            session_id: evt.session_id,
+                            turn_active: evt.turn_active,
+                            emitted_at_unix: evt.emitted_at_unix,
+                        };
+                        if tx.send(Ok(pb)).await.is_err() {
+                            return; // client gone
+                        }
+                    }
+                    // Dropped transitions are recoverable: the client reads
+                    // `ListSessions.turn_active` whenever this stream opens,
+                    // so keep the feed alive rather than failing it.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("session activity subscriber lagged by {n}; continuing");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn tunnel_start(

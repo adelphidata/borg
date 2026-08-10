@@ -7,6 +7,7 @@ import {
   type StreamHandlers,
   type Unsubscribe,
 } from "@borg/client";
+import { OUTAGE_ESCALATION_MS, retryDelayMs } from "./backoff";
 import { useTransport } from "./platform";
 
 /**
@@ -194,4 +195,73 @@ export function useServerStream<T>(
   }, [borg, ...deps]);
 
   return state;
+}
+
+export type RetryingStreamState = StreamState & {
+  /** True once the outage has lasted long enough to stop looking like a blip. */
+  sustained: boolean;
+};
+
+/**
+ * A [`useServerStream`] that resubscribes itself after a drop, with
+ * full-jitter backoff (see `./backoff`).
+ *
+ * A subscribe function that returns a no-op — the usual way to wait for an id
+ * — simply never errors, so the retry loop stays dormant until there is
+ * something to subscribe to.
+ */
+export function useRetryingServerStream<T>(
+  subscribe: (borg: BorgClient, handlers: StreamHandlers<T>) => Unsubscribe,
+  onMessage: (message: T) => void,
+  deps: unknown[] = [],
+): RetryingStreamState {
+  const [attempt, setAttempt] = useState(0);
+  const [sustained, setSustained] = useState(false);
+  /** Consecutive failures since the last received message; drives the delay. */
+  const failures = useRef(0);
+  /** Start of the current outage, for escalation. */
+  const outageSince = useRef<number | undefined>(undefined);
+
+  const state = useServerStream<T>(
+    subscribe,
+    (message) => {
+      // Receiving data is the only proof the connection works, so it is what
+      // resets the backoff. `status: "open"` is set the moment we subscribe,
+      // so a stream that dies on every open would otherwise reset the delay
+      // forever and redial at full speed.
+      failures.current = 0;
+      outageSince.current = undefined;
+      setSustained(false);
+      onMessage(message);
+    },
+    [...deps, attempt],
+  );
+
+  // A fresh subscription target is a fresh outage clock — carrying the last
+  // conversation's failure count into this one would open with a long delay
+  // and an escalated notice for a connection that was never tried.
+  useEffect(() => {
+    failures.current = 0;
+    outageSince.current = undefined;
+    setSustained(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...deps]);
+
+  useEffect(() => {
+    // These streams are unbounded, so a clean `onComplete` is an outage too:
+    // the daemon went away without an error frame. Only `open` means healthy.
+    if (state.status === "open") return;
+    const startedAt = outageSince.current ?? Date.now();
+    outageSince.current = startedAt;
+    const retry = setTimeout(() => setAttempt((n) => n + 1), retryDelayMs(failures.current));
+    failures.current += 1;
+    const untilEscalation = Math.max(0, OUTAGE_ESCALATION_MS - (Date.now() - startedAt));
+    const escalate = setTimeout(() => setSustained(true), untilEscalation);
+    return () => {
+      clearTimeout(retry);
+      clearTimeout(escalate);
+    };
+  }, [state.status, state.error]);
+
+  return useMemo(() => ({ ...state, sustained }), [state, sustained]);
 }

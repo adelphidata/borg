@@ -21,6 +21,10 @@ service Admin {
   rpc GetSession(SessionRef) returns (SessionDetail);
   rpc SetSessionArchived(SessionArchiveMutation) returns (Empty);
   rpc SetSessionTitle(SessionTitleMutation) returns (Empty);
+  // Live turn-activity feed across every session, so a listing can show which
+  // conversation is working without polling each one. Deltas only — clients
+  // reconcile against `ListSessions.turn_active` whenever the stream opens.
+  rpc SubscribeSessionActivity(Empty) returns (stream SessionActivityEvent);
 
   // Scheduled tasks.
   rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
@@ -477,6 +481,11 @@ message SessionSummary {
   // True when the user pinned this session (exempt from retention purge and
   // stale auto-archive; always present in listings).
   bool pinned = 5;
+  // True while a turn runs in this session. Only a live (registry-resident)
+  // host can be busy; an evicted session always reports false. This is the
+  // snapshot half of the activity feed — `SubscribeSessionActivity` carries
+  // the deltas, and a listing reconciles anything a dropped stream missed.
+  bool turn_active = 6;
 }
 message SessionRef { string id = 1; }
 // Archive (soft-hide) one session, or restore it. Archiving never deletes —
@@ -968,6 +977,13 @@ message SessionHeartbeatMutation {
     OP_RESUME = 4;
     OP_CLEAR = 5;
   }
+}
+
+// One transition of a session between "a turn is running" and "settled".
+message SessionActivityEvent {
+  string session_id = 1;
+  bool turn_active = 2;
+  int64 emitted_at_unix = 3;
 }
 
 message GoalEvent {

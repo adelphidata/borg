@@ -1,6 +1,12 @@
 import { useMemo, useState, useSyncExternalStore } from "react";
 import type { admin as adminPb } from "@borg/client";
 import { draftsVersion, rowTitle, subscribeDrafts } from "../conversation/draftStore";
+import {
+  activityVersion,
+  sessionActivity,
+  subscribeActivity,
+  type SessionActivity,
+} from "./activityStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 export interface SessionRow {
@@ -8,6 +14,8 @@ export interface SessionRow {
   title: string;
   messageCount: number;
   updatedAt: number;
+  /** Status mark for the row, absent when the conversation is settled. */
+  activity?: SessionActivity;
 }
 
 /** A run of sessions sharing a heading, newest group first. */
@@ -76,7 +84,8 @@ function toRow(s: adminPb.SessionSummary): SessionRow {
 export function resolveTitles(sessions: SessionRow[]): SessionRow[] {
   return sessions.map((s) => {
     const title = rowTitle(s.title, s.messageCount, s.id);
-    return title === s.title ? s : { ...s, title };
+    const activity = sessionActivity(s.id, s.messageCount);
+    return title === s.title && activity === s.activity ? s : { ...s, title, activity };
   });
 }
 
@@ -147,11 +156,14 @@ export function useSessions(deps: unknown[] = []): Sessions {
   // Re-runs the naming pass whenever a composer publishes, so an unsent row is
   // renamed as it is typed.
   const drafts = useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
+  // Same shape for the working set: a turn starting elsewhere lights this row.
+  const activity = useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
   const groups = useMemo(
     () => groupSessions(filterSessions(resolveTitles(sessions), search), Date.now()),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `drafts` is a
-    // version counter: it names no value used here, it only says one changed.
-    [sessions, search, drafts],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `drafts` and
+    // `activity` are version counters: they name no value used here, they only
+    // say one changed.
+    [sessions, search, drafts, activity],
   );
 
   return {

@@ -21,7 +21,8 @@ use protocols::session::agent_event::Kind;
 use protocols::session::session_client::SessionClient;
 use protocols::session::session_server::SessionServer;
 use protocols::session::{
-    CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest, StreamRequest,
+    CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest, SessionStateRequest,
+    StreamRequest,
 };
 use std::future::Future;
 use std::path::PathBuf;
@@ -102,6 +103,22 @@ impl SessionBackend for ScriptedBackend {
 
     fn session_id(&self) -> &str {
         &self.id
+    }
+
+    /// Enough of a snapshot for `Session.GetState` to answer. The interesting
+    /// half of that response — `turn_in_flight` — comes from the host, not
+    /// from here.
+    fn snapshot_state(&self) -> anyhow::Result<borgd::session::backend::SessionStateSnapshot> {
+        Ok(borgd::session::backend::SessionStateSnapshot {
+            agent_session_id: self.id.clone(),
+            title: String::new(),
+            message_count: 0,
+            user_message_count: 0,
+            token_estimate: 0,
+            llm_provider: String::new(),
+            llm_model: String::new(),
+            collab_mode: String::new(),
+        })
     }
 }
 
@@ -589,4 +606,88 @@ async fn close_returns_not_found_for_unknown_session() {
         .await
         .expect_err("must fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn get_state_reports_whether_a_turn_is_in_flight() {
+    // Real failure mode: a client that reopens a conversation mid-reply reads
+    // this field to decide whether the composer is waiting on the agent. A
+    // constant `false` here renders an idle UI over a running turn — the user
+    // types into a session that is already working and sees nothing happen.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (release, held) = oneshot::channel::<()>();
+    let held = Mutex::new(Some(held));
+    let backend = ScriptedBackend::new("s-inflight", move |_text, tx, _cancel| {
+        let held = held.lock().expect("release poisoned").take();
+        tokio::spawn(async move {
+            if let Some(held) = held {
+                let _ = held.await;
+            }
+            let _ = tx.send(CoreEvent::TurnComplete).await;
+        })
+    });
+    let factory = StubFactory::new(backend);
+    let (socket, _shutdown) = spawn_session_service(tmp.path(), factory).await;
+
+    let mut client = SessionClient::new(uds_channel(socket).await);
+    let opened = client
+        .open(OpenRequest {
+            resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
+        })
+        .await
+        .expect("open ok")
+        .into_inner();
+
+    let turn_in_flight = |client: &mut SessionClient<Channel>, id: String| {
+        let mut client = client.clone();
+        async move {
+            client
+                .get_state(SessionStateRequest { session_id: id })
+                .await
+                .expect("get_state ok")
+                .into_inner()
+                .turn_in_flight
+        }
+    };
+
+    assert!(
+        !turn_in_flight(&mut client, opened.session_id.clone()).await,
+        "a session with no turn must not report one in flight"
+    );
+
+    let mut stream = client
+        .send(SendRequest {
+            session_id: opened.session_id.clone(),
+            text: "go".into(),
+            images: Vec::new(),
+        })
+        .await
+        .expect("send ok")
+        .into_inner();
+
+    assert!(
+        turn_in_flight(&mut client, opened.session_id.clone()).await,
+        "a turn that has started must be reported as in flight"
+    );
+
+    let _ = release.send(());
+    while let Some(item) = stream.next().await {
+        if matches!(item.expect("evt ok").kind, Some(Kind::TurnComplete(_))) {
+            break;
+        }
+    }
+
+    // The forwarder clears the flag after the terminal event drains.
+    let mut settled = false;
+    for _ in 0..100 {
+        if !turn_in_flight(&mut client, opened.session_id.clone()).await {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(settled, "the flag must clear once the turn completes");
 }

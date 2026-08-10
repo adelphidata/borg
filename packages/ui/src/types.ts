@@ -42,6 +42,12 @@ export interface BannerAlert {
 export interface RecentItem {
   id: string;
   title: string;
+  /**
+   * Optional status mark. Absent for a settled conversation, which is most of
+   * them — the dot is there to pick two rows out of a list, not to decorate
+   * every row.
+   */
+  activity?: "working" | "draft";
 }
 
 /** Signed-in identity shown in the sidebar footer. */
